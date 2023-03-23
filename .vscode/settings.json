@@ -1,8 +1,11 @@
 {
   "cSpell.words": [
+    "chaincfg",
     "chainhash",
     "emptypb",
+    "errgroup",
     "ldflags",
+    "libsv",
     "opentracing",
     "progname",
     "promhttp",
