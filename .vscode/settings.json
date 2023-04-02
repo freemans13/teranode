@@ -2,6 +2,7 @@
   "cSpell.words": [
     "chaincfg",
     "chainhash",
+    "dialing",
     "emptypb",
     "errgroup",
     "ldflags",
@@ -10,8 +11,11 @@
     "progname",
     "promhttp",
     "protobuf",
+    "safemap",
+    "stretchr",
     "TAAL",
     "timestamppb",
+    "ubsv",
     "utxostore",
     "Uxto"
   ]
