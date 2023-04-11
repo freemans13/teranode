@@ -1,10 +1,12 @@
 {
   "cSpell.words": [
+    "aerospike",
     "chaincfg",
     "chainhash",
     "dialing",
     "emptypb",
     "errgroup",
+    "foundationdb",
     "ldflags",
     "libsv",
     "opentracing",
@@ -17,6 +19,7 @@
     "timestamppb",
     "ubsv",
     "utxostore",
-    "Uxto"
+    "Uxto",
+    "xtxo"
   ]
 }
