@@ -3,6 +3,8 @@
     "aerospike",
     "chaincfg",
     "chainhash",
+    "dbmode",
+    "defaultvalidator",
     "dialing",
     "emptypb",
     "errgroup",
@@ -18,6 +20,8 @@
     "TAAL",
     "timestamppb",
     "ubsv",
+    "utxos",
+    "utxoservice",
     "utxostore",
     "Uxto",
     "xtxo"
