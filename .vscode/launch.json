@@ -24,6 +24,13 @@
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/poc/client/client.go"
+    },
+    {
+      "name": "validation_spike",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/playground/validation_spike/main.go"
     }
   ]
 }
