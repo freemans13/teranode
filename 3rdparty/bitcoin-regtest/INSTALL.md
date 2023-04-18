@@ -19,7 +19,7 @@ docker run --platform=linux/amd64 -d --rm \
   --name bitcoin-regtest \
   -p 18332:18332 -p 18333:18333 -p 28332:28332 \
   -v bitcoin-regtest:/bitcoin \
-  eu.gcr.io/ubsv-383015/bitcoin-regtest
+  eu.gcr.io/ubsv-383015/bitcoin-regtest:1.0.14
 
 
 # Stop the container
