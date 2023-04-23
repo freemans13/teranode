@@ -19,6 +19,7 @@
     "promauto",
     "promhttp",
     "protobuf",
+    "regtest",
     "resp",
     "respend",
     "safemap",
