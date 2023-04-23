@@ -15,6 +15,7 @@
     "ldflags",
     "libsv",
     "opentracing",
+    "otel",
     "progname",
     "promauto",
     "promhttp",
