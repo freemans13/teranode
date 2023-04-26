@@ -1,0 +1,6 @@
+github.com/apple/foundationdb/bindings/go v0.0.0-20211021221027-903f8dfe1013 h1:7RAvo5kOhWrFZBX696u9n0AKwIH+gQbmSAnyP61OGOI=
+github.com/apple/foundationdb/bindings/go v0.0.0-20211021221027-903f8dfe1013/go.mod h1:w63jdZTFCtvdjsUj5yrdKgjxaAD5uXQX6hJ7EaiLFRs=
+github.com/apple/foundationdb/bindings/go v0.0.0-20230425003856-08fffd3bc24b h1:CtPcL8E1E9FeS342pYazUtp2Druv/sBZ38Er8lL2oCE=
+github.com/apple/foundationdb/bindings/go v0.0.0-20230425003856-08fffd3bc24b/go.mod h1:OMVSB21p9+xQUIqlGizHPZfjK+SHws1ht+ZytVDoz9U=
+golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543 h1:E7g+9GITq07hpfrRu66IVDexMakfv52eLZ2CXBWiKr4=
+golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
