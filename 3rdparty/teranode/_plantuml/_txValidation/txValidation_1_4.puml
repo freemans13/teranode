@@ -1,0 +1,37 @@
+@startuml teranode transaction validation pipeline 1.4
+
+title Transaction Validation Pipeline - Validate Tx
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "ValidateTxHandler" as validatetxhandler <<pipeline>>
+participant "TxValidator" as txvalidator <<pipeline>>
+
+loop message consumed by TxValidator ( validatetxMsg )
+|||
+    note over validatetxhandler
+        Creates two messages which get injected
+        into the pipeline
+
+        For Review:
+            This handler and its function should be
+            removed and the 2 messages created where the 
+            validateTxMsg is created
+    end note
+    eventbus o--> validatetxhandler : consume validateTxMsg
+    activate validatetxhandler
+        validatetxhandler --> txvalidator : validateNewTx
+    deactivate validatetxhandler 
+    activate txvalidator
+        txvalidator --> txvalidator : create\nUtxoFetchCollectionProcessMsg
+        txvalidator --> eventbus : publish UtxoFetchCollectionProcessMsg
+        |||
+        loop for all inputs
+            txvalidator --> txvalidator : create UtxoFetchMsg
+            txvalidator --> eventbus : publish UtxoFetchMsg
+        |||
+        end loop
+    deactivate txvalidator             
+|||
+end loop
+@enduml

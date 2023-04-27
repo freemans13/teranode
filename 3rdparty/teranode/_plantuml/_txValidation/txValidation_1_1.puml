@@ -1,0 +1,79 @@
+@startuml teranode transaction validation pipeline 1.1
+
+title Transaction Validation Pipeline - Store Tx
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "NewTxHandler" as newtxhandler <<pipeline>>
+participant "TxManager" as txmanager <<component>>
+participant "TxValidator" as txvalidator <<component>>
+participant "TxStorage" as txstorage <<component>>
+database "TxStore\n(kv store)" as txstore <<external>>
+
+
+loop message consumed by TxManager ( newTxMsg )
+|||
+    eventbus o--> newtxhandler : consume newTxMsg
+    activate newtxhandler
+        newtxhandler --> txmanager : processNewTx
+    deactivate newtxhandler
+    activate txmanager
+        note over txmanager
+            Skip if the transaction has already been seen
+        end note
+        alt if transaction recently seen
+            txmanager --> txmanager : sendValidationFailedMsg
+            activate txmanager
+                txmanager --> eventbus : publish TxInvalidEvent
+            deactivate txmanager
+        else
+            note over txmanager
+                validate transaction and check rules
+                RBT221, RMT211, RMT222, RMT223
+            end note
+            txmanager --> txvalidator : validatenewTransaction
+            activate txvalidator
+                txvalidator --> txvalidator : validate
+                activate txvalidator
+                    txvalidator --> txvalidator : checkTransactionIsNotBeCoinbase
+                    txvalidator --> txvalidator : checkP2SHTransactionOutputs
+                    txvalidator --> txvalidator : checkCoinbaseInputs
+                    txvalidator --> txvalidator : checkTransactionCommon
+                    txvalidator --> txmanager : return validationResult
+                deactivate txvalidator
+            deactivate txvalidator
+            alt if validationResult is Valid
+                note over txmanager
+                    Check f previous checks were successful
+                    Check rule RMT241
+                end note
+                txmanager --> txvalidator : isStandardTx
+            else else validationResult is Invalid
+                txmanager --> txmanager : sendValidationFailedMsg
+                activate txmanager
+                    txmanager --> eventbus : publish TxInvalidEvent
+                deactivate txmanager
+            end
+            txmanager --> txmanager : storeTx
+            activate txmanager
+                txmanager --> txstorage : txPut
+                activate txstorage
+                    txstorage --> txstore : add to store
+                deactivate txstorage
+            deactivate txmanager
+            note over txmanager
+                Transaction has been stored, 
+                trigger the store of the utxo
+            end note
+            txmanager --> txmanager : storeUtxos
+            activate txmanager
+                txmanager --> txmanager : create\nutxoStoreCollectionProcessMsg
+                txmanager --> eventbus : publish utxoStoreCollectionProcessMsg
+                txmanager --> txmanager : create UtxoStoreMsg
+                txmanager --> eventbus : publish UtxoStoreMsg
+            deactivate txmanager
+        end
+    deactivate txmanager
+|||
+end loop
+@enduml

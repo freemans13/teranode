@@ -1,0 +1,92 @@
+@startuml teranode block validation pipeline
+
+title Block Validation Pipeline
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "UtxoStoreBlockGroupedHandler" as utxoStoreBlockGroupedHandler <<pipeline>>
+participant "UtxoStorage\n(read only)" as utxostorage <<component>>
+participant "SegmentManager" as segmentmanager <<component>>
+database "UtxoCache\n(in-memory)" as utxocache <<component>>
+
+
+loop message consumed by utxoStoreBlockGroupedHandler ( utxoStoreBlockGroupedMsg )
+|||
+    eventbus o--> utxoStoreBlockGroupedHandler : consume utxoStoreBlockGroupedMsg
+    activate utxoStoreBlockGroupedHandler
+        utxoStoreBlockGroupedHandler --> utxostorage : storeUtxoBlock
+        activate utxostorage
+            utxostorage --> utxostorage :check tip active
+            alt if tip inactive
+                utxostorage --> utxostorage : throw utxoException error
+            end
+            loop for each item in the utxo data list
+                utxostorage --> utxostorage : get validationstate
+                utxostorage --> segmentmanager : tryGetOrPut
+                activate segmentmanager
+                    segmentmanager --> utxocache ++: getOrPut
+                        return utxo
+                    segmentmanager --> utxostorage : return utxo
+                deactivate segmentmanager
+                alt if utxo code is intermin
+                    note over segmentmanager
+                        Delay the processing until the UTXO is either loaded 
+                        (in which case do c.) or failed to be found 
+                        (in which case do b.)
+                    
+                        If this partial UtxoItem was just created 
+                        (merge callback list contains only just added entry)
+                        then trigger the asynchronous search for the item
+                    end note
+                    utxostorage --> utxostorage : addBelatedProcessor
+                    alt if processor size is 1
+                        utxostorage --> segmentmanager : goSearchAndGet
+                    end
+                else if utxo code is placeholder
+                    note over segmentmanager
+                        The UTXO is known to not exist. This is a simple 
+                        case, just make it CompleteUtxoItem. State
+                        calculator needs not be consulted in this case 
+                        as there is no UTXO yet, ergo no state to check.
+                    end note
+                    utxostorage --> utxostorage : create new aol
+                    utxostorage --> utxostorage : append ops (stored /\nproducer tx accepted)
+                    utxostorage --> segmentmanager : put
+                    activate segmentmanager
+                        segmentmanager --> utxocache : put
+                    deactivate segmentmanager
+                    utxostorage --> segmentmanager : putScript
+                    activate segmentmanager
+                        segmentmanager --> segmentmanager : scriptForWrite.put
+                    deactivate segmentmanager
+                else if utxo code is complete
+                    note over segmentmanager
+                        This UTXO already exists, and since UTXO only 
+                        stores script/value and creates OpStored AOL 
+                        entry, all left to do is to mark the producer 
+                        transaction accepted. 
+                        
+                        Note that "canStore" in the context of block 
+                        validation really means "can-spend".
+                    end note
+                    utxostorage --> utxostorage : check is utxo can be\nstored for this tip
+                    alt if can be stored
+                        utxostorage --> utxostorage : append op\n(producer tx accepted)
+                        utxostorage --> utxostorage : setAolDirty
+                        utxostorage --> segmentmanager : put
+                        activate segmentmanager
+                            segmentmanager --> utxocache : put
+                        deactivate segmentmanager
+                    else
+                        utxostorage --> utxostorage : mark as failed
+                    end
+                end                    
+            end loop
+            utxostorage --> utxoStoreBlockGroupedHandler : return GroupedStoreResponseData
+        deactivate utxostorage
+        utxoStoreBlockGroupedHandler --> utxoStoreBlockGroupedHandler : create ReturnUtxoStoreGroupedMsg
+        utxoStoreBlockGroupedHandler --> eventbus : publish ReturnUtxoStoreGroupedMsg
+    deactivate utxoStoreBlockGroupedHandler
+|||
+end loop
+@enduml

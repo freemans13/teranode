@@ -1,0 +1,53 @@
+@startuml teranode block assembly pipeline 2.1
+
+title Block Assembly Pipeline - Add to Block Template
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+'participant "ValidateTxResultHandler" as validatetxresulthandler <<pipeline>>
+'participant "Mempool" as mempool <<component>>
+participant "AddToBlockTemplateHandler" as addtoblocktemplatehandler <<pipeline>>
+participant "BlockAssembler" as blockassembler <<component>>
+participant "BlockTemplate" as blocktemplate <<component>>
+participant "TransactionShuffleInfo" as transactionshuffleinfo <<component>>
+
+|||
+loop message consumed by BlockAssembler ( addToBlockTemplateMsg )
+|||
+    |||
+    note over addtoblocktemplatehandler, blockassembler
+        Instructs BlockAssembler to add transaction to the mining block template identified with 
+        tmplTipId. Mempool also supplies seqNo, which is an monotonically increasing number. 
+        BlockAssembler can use the seqNo to identify transaction gaps that are caused by message 
+        reordering in the framework.   
+    end note
+    |||
+    eventbus o--> addtoblocktemplatehandler : consume addToBlockTemplateMsg
+    activate addtoblocktemplatehandler
+        addtoblocktemplatehandler --> blockassembler : addToBlockTemplateMsg\nsent for processing
+        activate blockassembler
+            blockassembler --> blocktemplate ** : create if null
+            blocktemplate --> transactionshuffleinfo ** : create if null
+            blockassembler --> blocktemplate : add transactions
+            par
+            activate blocktemplate
+                blockassembler --> blockassembler : create pipeline\nmessage 
+                blockassembler --> addtoblocktemplatehandler : return message
+        deactivate blockassembler
+        addtoblocktemplatehandler --> eventbus : publish getActiveTipMsg to topic
+        deactivate addtoblocktemplatehandler
+        |||
+        else
+        |||
+            loop
+            |||
+                blocktemplate --> transactionshuffleinfo ++: order transactions
+                    return ordered transactions
+                blocktemplate --> eventbus : publish utxoSpendMsg to topic
+            deactivate blocktemplate
+        |||
+        end loop
+    end   
+|||
+end loop
+@enduml

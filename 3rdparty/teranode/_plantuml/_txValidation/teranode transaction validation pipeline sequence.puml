@@ -1,0 +1,436 @@
+@startuml teranode transaction validation pipeline
+
+title Transaction Validation Pipeline
+hide footbox
+
+
+entity "BSV\nNetwork" as bsv
+
+participant "Bitcoin\nServer Network" as bsn <<component>>
+participant "Event Bus" as eventbus <<external>>
+participant "NewTxHandler" as newtxhandler <<pipeline>>
+participant "TxManager" as txmanager <<component>>
+participant "TxManagerSupplier" as txmanagersupplier <<pipeline>>
+participant "TxStorage" as txstorage <<component>>
+database "TxStore\n(kv store)" as txstore <<external>>
+participant "TxValidator" as txvalidator <<component>>
+participant "UtxoFetchCollectionProcessHandler" as utxofetchcollectionprocesshandler <<pipeline>>
+participant "UtxoStoreCollectionProcessHandler" as utxostorecollectionprocesshandler <<pipeline>>
+participant "UtxoStoreHandler" as storeutxohandler <<pipeline>>
+participant "UtxoStorage\n(write only)" as utxostorage <<component>>
+participant "UtxoStorage\n(read only)" as utxostorage2 <<component>>
+participant "SegmentManager" as segmentmanager <<component>>
+
+database "UtxoCache\n(in-memory)" as utxocache <<component>>
+database "UtxoStore\n(kv store)" as utxostore <<external>>
+participant "ValidateTxHandler" as validatetxhandler <<pipeline>>
+participant "TxValidatorSupplier" as txvalidatorsupplier <<pipeline>>
+
+participant "UtxoFetchHandler" as utxofetchhandler <<pipeline>>
+
+
+
+
+participant "ValidateTxResultHandler" as validatetxresulthandler <<pipeline>>
+participant "MempoolSupplier" as mempoolsupplier <<pipeline>>
+participant "Mempool" as mempool <<component>>
+database "MempoolCache\n(in-memory)" as mempoolcache <<component>>
+
+
+loop Messages received by Teranode
+|||
+note over bsn, eventbus
+    All in-memory Cache's and KV Stores depicted in this 
+    diagram are sharded.
+
+    Aditionally the EventBus is sharded with multiple 
+    partitions per topic, in order to handle demand
+end note
+    bsv o--> bsn : tx bitcoin protocol\nmessage received
+    activate bsn
+        bsn --> bsn : deserialise message
+        bsn --> eventbus : publish message\nto newTxMsg topic
+    deactivate bsn
+
+|||
+end loop
+|||
+note over eventbus, newtxhandler
+    storeTxMsg, storeUtxoMsg, ValidatetxMsg are published and consumed in parallel
+    as there are no dependencies which will cause a failure in operation
+end note
+loop message consumed by TxManager ( newTxMsg )
+|||
+    eventbus o--> newtxhandler : consume newTxMsg
+    activate newtxhandler
+        newtxhandler --> txmanager : processNewTx
+    deactivate newtxhandler
+    activate txmanager
+        alt if transaction recently seen
+            txmanager --> txmanager : sendValidationFailedMsg
+            activate txmanager
+                txmanager --> eventbus : publish TxInvalidEvent
+            deactivate txmanager
+        else
+            txmanager --> txvalidator : validatenewTransaction
+            activate txvalidator
+                txvalidator --> txvalidator : validate
+                activate txvalidator
+                    txvalidator --> txvalidator : checkTransactionIsNotBeCoinbase
+                    txvalidator --> txvalidator : checkP2SHTransactionOutputs
+                    txvalidator --> txvalidator : checkCoinbaseInputs
+                    txvalidator --> txvalidator : checkTransactionCommon
+                    txvalidator --> txmanager : return validationResult
+                deactivate txvalidator
+            deactivate txvalidator
+            alt if validationResult is Valid
+                txmanager --> txvalidator : isStandardTx
+            else else validationResult is Invalid
+                txmanager --> txmanager : sendValidationFailedMsg
+                activate txmanager
+                    txmanager --> eventbus : publish TxInvalidEvent
+                deactivate txmanager
+            end
+            txmanager --> txmanager : storeTx
+            activate txmanager
+                txmanager --> txstorage : txPut
+                activate txstorage
+                    txstorage --> txstore : add to store
+                deactivate txstorage
+            deactivate txmanager
+
+            txmanager --> txmanager : storeUtxos
+            activate txmanager
+                txmanager --> txmanagersupplier :  broadcast handleStoreUtxoEvent(StoreUtxosEvent)
+                activate txmanagersupplier
+                    txmanagersupplier --> txmanagersupplier : create utxoStoreCollectionProcessMsg
+                    txmanagersupplier --> eventbus : publish utxoStoreCollectionProcessMsg
+                    txmanagersupplier --> txmanagersupplier : create UtxoStoreMsg
+                    txmanagersupplier --> eventbus : publish UtxoStoreMsg
+                deactivate txmanagersupplier
+            deactivate txmanager
+        end
+    deactivate txmanager
+|||
+end loop
+par
+    note over utxostorage, utxostorage2
+        UtxoStorage component has been separated to include a read only instance and a write only
+        instance for separation of concerns; allowing UtxoStorage to write, whilst fetching utxo's
+        for TxValidation
+    end note
+    loop message consumed by UtxoStorage ( UtxoStoreMsg )
+    |||
+        eventbus o--> storeutxohandler : consume UtxoStoreMsg
+        activate storeutxohandler
+            storeutxohandler --> utxostorage : storeUtxo
+            activate utxostorage
+                alt if data is empty
+                    utxostorage --> storeutxohandler : return state
+                end
+                loop for each utxo list size
+                    utxostorage --> utxostorage : set store to false
+                    utxostorage --> utxostorage : get utxoKey
+                    utxostorage --> utxostorage : doStoreUtxo
+                    activate utxostorage
+                        utxostorage --> segmentmanager : tryGetPut
+                        activate segmentmanager
+                            segmentmanager --> utxocache ++: getOrPut
+                                return utxo
+                            segmentmanager --> utxostorage : return utxo
+                        deactivate segmentmanager
+                        alt if utxo code is intermin
+                            note over segmentmanager
+                                If this partial UtxoItem was just created (merge callback list contains 
+                                only just added entry) then trigger the asynchronous search for the item
+                            end note
+                            utxostorage --> utxostorage : set store to true
+                            utxostorage --> utxostorage : addBelatedProcessor
+                            alt if processor size is 1
+                                utxostorage --> segmentmanager : goSearchAndGet
+                            end
+                        else if utxo code is placeholder
+                            utxostorage --> utxostorage : set store to true
+                            utxostorage --> utxostorage : create new aol
+                            utxostorage --> utxostorage : append ops (stored /\nproducer tx accepted)
+                            utxostorage --> segmentmanager : put
+                            activate segmentmanager
+                                segmentmanager --> utxocache : put
+                            deactivate segmentmanager
+                            
+                        else if utxo code is complete
+                            note over segmentmanager
+                                UTXO is already in the database, which implies the script being 
+                                already stored, nothing to do
+                            end note
+                        end 
+                        alt if store is true
+                            utxostorage --> segmentmanager : putScript
+                            activate segmentmanager
+                                segmentmanager --> segmentmanager : scriptForWrite.put
+                            deactivate segmentmanager
+                        end
+                        utxostorage --> storeutxohandler : return state
+                    deactivate utxostorage
+                end loop
+            deactivate utxostorage
+            storeutxohandler --> storeutxohandler : create returnUtxoStoreMsg
+            storeutxohandler --> eventbus : publish returnUtxoStoreMsg to topic
+        deactivate storeutxohandler
+    |||
+    end loop
+    |||
+else
+|||
+    loop message consumed by TxManager ( utxStoreCollectionProcessMsg )
+    |||
+        eventbus o--> utxostorecollectionprocesshandler : consume utxStoreCollectionProcessMsg
+        activate utxostorecollectionprocesshandler
+        alt if item size is 1
+            utxostorecollectionprocesshandler --> utxostorecollectionprocesshandler : get first item
+            alt if item has no failures
+                utxostorecollectionprocesshandler --> txmanager : onStoreUtxosDone
+                activate txmanager
+                    txmanager --> txmanagersupplier : broadcast(ValidateTxEvent)
+                deactivate txmanager
+                activate txmanagersupplier
+                    txmanagersupplier --> txmanagersupplier : create ValidateTxMsg
+                    txmanagersupplier --> eventbus : publish ValidateTxMsg
+                    |||
+                deactivate txmanagersupplier
+            else
+                utxostorecollectionprocesshandler --> utxostorecollectionprocesshandler : log error
+            end
+        else
+            utxostorecollectionprocesshandler --> utxostorecollectionprocesshandler : log error
+        end
+        deactivate utxostorecollectionprocesshandler
+    |||
+    end loop
+    |||
+    loop message consumed by TxValidator ( validatetxMsg )
+    |||
+        eventbus o--> validatetxhandler : consume validateTxMsg
+        activate validatetxhandler
+            validatetxhandler --> txvalidatorsupplier : broadcast(validateTxMsg)
+        deactivate validatetxhandler 
+        activate txvalidatorsupplier
+            txvalidatorsupplier --> txvalidatorsupplier : handleFetchUtxoEvent
+            activate txvalidatorsupplier
+                txvalidatorsupplier --> txvalidatorsupplier : create UtxoFetchCollectionProcessMsg
+                txvalidatorsupplier --> eventbus : publish UtxoFetchCollectionProcessMsg
+                |||
+                loop for all inputs
+                    txvalidatorsupplier --> txvalidatorsupplier : create UtxoFetchMsg
+                    txvalidatorsupplier --> eventbus : publish UtxoFetchMsg
+                |||
+                end loop
+            deactivate txvalidatorsupplier
+        deactivate txvalidatorsupplier             
+    |||
+    end loop
+end
+|||
+loop message consumed by x (UtxoFetchMsg)
+    eventbus --> utxofetchhandler : consume UtxoFetchMsg
+    activate utxofetchhandler
+        utxofetchhandler --> utxostorage2 : fetchUtxo
+        activate utxostorage2
+            utxostorage2 --> utxostorage2 : doFetchUtxo
+            activate utxostorage2
+                utxostorage2 --> segmentmanager :getScriptAsync
+                activate segmentmanager
+                    alt if script is available in the cache
+                        segmentmanager --> segmentmanager : resultProcessor.Accept(key, utxo)
+                    else script is not availabl in the acche
+                        segmentmanager --> segmentmanager : resultProcessor.Accept(key, null)
+                    end
+                    segmentmanager --> utxostorage2 :return
+                deactivate segmentmanager
+                alt if either script was found or no store flag was requested then !return
+                    utxostorage2 --> utxofetchhandler : return
+                end
+                utxostorage2 --> segmentmanager : tryGetOrPut
+                activate segmentmanager
+                    segmentmanager --> utxocache : getOrPut
+                    activate utxocache
+                        utxocache --> utxocache : get item
+                        alt if item was not found
+                            utxocache --> utxocache : put item
+                        end
+                        utxocache --> segmentmanager : return item    
+                    deactivate utxocache
+                    segmentmanager --> utxostorage2 : return utxoItem
+                deactivate segmentmanager
+                    alt if utxo code is intermin
+                        alt if (item.getBelatedProcessors().size() == 0)
+                            utxostorage2 --> utxostorage2 : addStoreEventTarget(txId);
+                            utxostorage2 --> segmentmanager : put(newItem);
+                            utxostorage2 --> utxostorage2 : setTxo(null);
+                            utxostorage2 --> utxostorage2 : response state\nset to complete
+                        end
+                        utxostorage2 --> utxostorage2 : addBelatedProcessor
+                    else if utxo code is placeholder
+                        utxostorage2 --> utxostorage2 : item add store event target
+                        utxostorage2 --> utxostorage2 : set txo null
+                        utxostorage2 --> utxostorage2 : response state\nset to complete
+                    else if utxo code is complete
+                        alt if item hasUtxo
+                            utxostorage2 --> utxostorage2 : setTxo
+                        else
+                            utxostorage2 --> utxostorage2 : log error
+                        end
+                        utxostorage2 --> utxostorage2 : response state\nset to complete
+                    end 
+            deactivate utxostorage2
+            utxostorage2 --> utxofetchhandler : return response state
+        deactivate utxostorage2
+        utxofetchhandler --> utxofetchhandler : create ReturnUtxoFetchMsg
+        utxofetchhandler --> eventbus : publish ReturnUtxoFetchMsg
+    deactivate utxofetchhandler
+end loop
+|||
+loop messaged consumed by x (ReturnUtxoFetchMsg)
+|||
+    eventbus --> utxofetchcollectionprocesshandler : consume ReturnUtxoFetchMsg
+    activate utxofetchcollectionprocesshandler
+    utxofetchcollectionprocesshandler --> utxofetchcollectionprocesshandler : create hashmap
+    loop for each item in collection
+        alt if item hasTxOutput and is not null
+            utxofetchcollectionprocesshandler --> utxofetchcollectionprocesshandler : put item into hashmap
+        end
+    end loop
+    utxofetchcollectionprocesshandler --> txvalidator : onFetchReturnUtxo
+    activate txvalidator
+        alt if returned utxo size is less than the envelope inputs
+
+        else
+            txvalidator--> txvalidator : validateAndProcessResult
+            activate txvalidator
+                alt if validation state is validate
+                    txvalidator --> txvalidator : sendValidateTxResult
+                    activate txvalidator
+                        txvalidator --> txvalidatorsupplier : broadcast(ValidateTxResultEvent)
+                        activate txvalidatorsupplier
+                            txvalidatorsupplier --> eventbus : publish ValidateTxResultMsg
+                        deactivate txvalidatorsupplier
+                    deactivate txvalidator
+                else
+                    txvalidator --> txvalidator : sendTxInvalid
+                    activate txvalidator
+                        txvalidator --> txvalidatorsupplier : broadcast(TxInvalidEvent)
+                        activate txvalidatorsupplier
+                            txvalidatorsupplier --> eventbus : publish TxStateResponseMsg
+                        deactivate txvalidatorsupplier
+                    deactivate txvalidator
+                end
+            deactivate txvalidator
+        end
+        'txvalidator
+    deactivate txvalidator
+    deactivate utxofetchcollectionprocesshandler
+|||
+end loop
+|||
+loop message consumed by Mempool ( ValidateTxResultMsg )
+|||
+    eventbus o--> validatetxresulthandler : consume ValidateTxResultMsg
+    activate validatetxresulthandler
+        validatetxresulthandler --> mempool : addTransaction
+        activate mempool
+            mempool --> mempool : addTransactionImpl 
+            '[[http://plantuml.com/start{Tooltip for message} some link]]
+            activate mempool
+                alt if not acceptingTransactions
+                    mempool --> mempool : log info
+                    mempool --> mempool : return
+                end
+                alt if txPool containsKey
+                    mempool --> mempool : log trace 
+                    mempool --> mempool : return
+                else
+                    mempool --> mempool : log trace 
+                end
+                mempool --> mempoolcache : put
+                mempool --> mempool : populate transactions\ngraph
+                alt if validation state is validate
+                    alt if any known parent is rejected
+                        mempool --> mempool : rejectSubTree
+                        activate mempool
+                            loop while stack not empty
+                                mempool --> mempool : stack pop
+                                mempool --> mempool : emitTxnRejected
+                                activate mempool
+                                    mempool --> mempoolsupplier : supply TxRejected
+                                    activate mempoolsupplier
+                                        mempoolsupplier --> eventbus : publish TxStateResponseMsg
+                                    deactivate mempoolsupplier
+                                deactivate mempool
+                                alt if spenders is not null
+                                    mempool --> mempool : spenders stream
+                                end
+                            end loop 
+                        deactivate mempool
+                    else
+                        alt if rebasing is null
+                            alt if isIndependent
+                                mempool --> mempool : emitSpendTxnInputs
+                                activate mempool
+                                    mempool --> mempoolsupplier : supply SpendTxnInputs
+                                    activate mempoolsupplier
+                                        mempoolsupplier --> mempoolsupplier : create MsgCollection
+                                        mempoolsupplier --> mempoolsupplier : create MemPoolCollectorMsg
+                                        mempoolsupplier --> mempoolsupplier : add MemPoolCollectorMsg to collection
+                                        loop for txoIds
+                                            mempoolsupplier --> mempoolsupplier : create UtxoSpendMsg
+                                            mempoolsupplier --> mempoolsupplier : add to UtxoSpendMsg to collection
+                                        end loop
+                                        mempoolsupplier --> eventbus : publish MsgCollection
+                                    deactivate mempoolsupplier
+                                deactivate mempool
+                            else
+                                alt areKnownParentsAccepted
+                                    mempool --> mempool : emitSpendTxnInputs
+                                    activate mempool
+                                        mempool --> mempoolsupplier : supply SpendTxnInputs
+                                        activate mempoolsupplier
+                                            mempoolsupplier --> mempoolsupplier : create MsgCollection
+                                            mempoolsupplier --> mempoolsupplier : create MemPoolCollectorMsg
+                                            mempoolsupplier --> mempoolsupplier : add MemPoolCollectorMsg to collection
+                                            loop for txoIds
+                                                mempoolsupplier --> mempoolsupplier : create UtxoSpendMsg
+                                                mempoolsupplier --> mempoolsupplier : add to UtxoSpendMsg to collection
+                                            end loop
+                                            mempoolsupplier --> eventbus : publish MsgCollection
+                                        deactivate mempoolsupplier
+                                    deactivate mempool
+                                else 
+                                    mempool --> mempool : log trace
+                                end
+                        else
+                            mempool --> mempool : log trace
+                    end
+                else
+                    mempool --> mempool : rejectSubTree
+                    activate mempool
+                        loop while stack not empty
+                            mempool --> mempool : stack pop
+                            mempool --> mempool : emitTxnRejected
+                            activate mempool
+                                mempool --> mempoolsupplier : supply TxRejected
+                                activate mempoolsupplier
+                                    mempoolsupplier --> eventbus : publish TxStateResponseMsg
+                                deactivate mempoolsupplier
+                            deactivate mempool
+                            alt if spenders is not null
+                                mempool --> mempool : spenders stream
+                            end
+                        end loop 
+                    deactivate mempool
+                end
+            deactivate mempool
+        deactivate mempool
+    deactivate validatetxresulthandler
+|||
+end loop
+@enduml

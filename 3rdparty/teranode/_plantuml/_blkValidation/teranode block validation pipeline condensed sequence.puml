@@ -1,0 +1,163 @@
+@startuml teranode block validation pipeline
+
+title Block Validation Pipeline
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+
+box "ChainTracker Service" #white
+    participant "ChainTracker" as chaintracker <<component>>
+end box
+
+box "Block Downloader Service" #white
+    participant "BlockDownloader" as blockdownloader <<component>>
+end box
+
+box "Block Validation Service" #white
+    participant "BlockValidationManager" as blockvalidationManager <<component>>
+    participant "BlockValidator" as blockvalidator <<component>>
+    participant "StreamingMerkleRootCalculator" as streamingmerklerootcalculator <<component>>
+end box
+
+box "Utxo Storage Service" #white
+    participant "UtxoStorage\n(read only)" as utxostorage <<component>>
+    participant "SegmentManager" as segmentmanager <<component>>
+    database "UtxoCache\n(in-memory)" as utxocache <<component>>
+end box
+
+|||
+    chaintracker o--> eventbus : publish BDownloaderValidateBlockMsg
+|||
+    eventbus o--> blockdownloader : consume BDownloaderValidateBlockMsg
+    activate blockdownloader
+        blockdownloader --> blockdownloader : ValidateBlockHeader
+        blockdownloader --> eventbus : publish blockValidationStartMsg
+    deactivate blockdownloader
+|||
+    eventbus o--> blockvalidationManager : consume blockValidationStartMsg
+    activate blockvalidationManager
+        blockvalidationManager --> blockvalidator : createNewBlockValidator( tipId, blockHeader)
+            activate blockvalidator
+            alt if tipId exists
+                blockvalidator --> blockvalidationManager : return blockValidator
+            else
+                blockvalidator --> blockvalidator : new BlockValidator(tipId, blockHeader)
+                blockvalidator --> blockvalidationManager : return blockValidator
+            end
+        deactivate blockvalidator
+        blockvalidationManager --> blockvalidator : start
+        activate blockvalidator
+            blockvalidator --> blockvalidator ++: validate (POW, BlockTime,\nCheckpoint, NotInvalid,\nDuplicate, PrevHash, Version)
+                return return validationResult
+            alt if validationstate is validate
+                blockvalidator --> blockvalidator : check more than one transaction
+            else
+                blockvalidator --> blockvalidator : setInvalid
+            end
+        deactivate blockvalidator
+        blockvalidationManager --> blockvalidationManager : runValidation
+        activate blockvalidationManager
+        loop for each transaction
+            blockvalidationManager --> blockvalidator ++: poll_chunks
+                return ValidateTxsData
+            blockvalidationManager --> blockvalidationManager : getTxs
+            blockvalidationManager --> blockvalidationManager : startChunkValidation
+            activate blockvalidationManager
+            loop for each tx in chunck
+            blockvalidationManager --> blockvalidationManager : startTransactionValidation
+            activate blockvalidationManager
+            blockvalidationManager --> blockvalidationManager : hashAndCompact
+            blockvalidationManager --> blockvalidator ++: startNewTransaction
+                return batch of utxo to store
+            loop for each item in batch
+                blockvalidationManager --> eventbus : publish storeBlockTxOutputsMsg
+                blockvalidationManager --> eventbus : publish utxoStoreBlockGroupedMsg
+                deactivate blockvalidationManager
+                deactivate blockvalidationManager
+                deactivate blockvalidationManager
+                deactivate blockvalidationManager
+                end loop
+            end loop
+        end loop
+|||
+par
+|||
+    eventbus o--> blockvalidationManager : consume storeBlockTxOutputsMsg
+    loop for each item in the storeBlockTxOutputMsg
+        alt if item instanceof CollectionExecutionErrorMsg or ReturnUtxoGroupedMsg
+            activate blockvalidationManager
+                    blockvalidationManager --> blockvalidationManager : check valid
+                    activate blockvalidationManager
+                        blockvalidationManager --> blockvalidator : setInvalidState
+                    deactivate blockvalidationManager
+                activate blockvalidator
+                    blockvalidator --> streamingmerklerootcalculator ++: hasFinished
+                        return return boolean
+                    alt if has Finished is true
+                        blockvalidator --> blockvalidator :finishBlockValidation
+                    end
+                deactivate blockvalidator
+        end 
+    end loop
+    blockvalidationManager --> blockvalidationManager : OutputsStored
+    activate blockvalidationManager
+        blockvalidationManager --> blockvalidator ++: get batchStored
+            return batch of utxo to store
+    loop for each item in batch
+        blockvalidationManager --> eventbus : publish storeBlockTxOutputsMsg
+        blockvalidationManager --> eventbus : publish utxoStoreBlockGroupedMsg
+        deactivate blockvalidationManager
+    end loop
+    deactivate blockvalidationManager
+|||
+else
+|||
+    eventbus o--> utxostorage : consume utxoStoreBlockGroupedMsg
+        activate utxostorage
+        utxostorage --> utxostorage :check tip active
+        alt if tip inactive
+            utxostorage --> utxostorage : throw utxoException error
+        end
+        loop for each item in the utxo data list
+            utxostorage --> utxostorage : get validationstate
+            utxostorage --> segmentmanager : tryGetOrPut
+            activate segmentmanager
+                segmentmanager --> utxocache ++: getOrPut
+                    return utxo
+                segmentmanager --> utxostorage : return utxo
+            deactivate segmentmanager
+            alt if utxo code is intermin
+                utxostorage --> utxostorage : addBelatedProcessor
+                alt if processor size is 1
+                    utxostorage --> segmentmanager : goSearchAndGet
+                end
+            else if utxo code is placeholder
+                utxostorage --> utxostorage : create new aol
+                utxostorage --> utxostorage : append ops (stored /\nproducer tx accepted)
+                utxostorage --> segmentmanager : put
+                activate segmentmanager
+                    segmentmanager --> utxocache : put
+                deactivate segmentmanager
+                utxostorage --> segmentmanager : putScript
+                activate segmentmanager
+                    segmentmanager --> segmentmanager : scriptForWrite.put
+                deactivate segmentmanager
+            else if utxo code is complete
+                utxostorage --> utxostorage : check is utxo can be\nstored for this tip
+                alt if can be stored
+                    utxostorage --> utxostorage : append op\n(producer tx accepted)
+                    utxostorage --> utxostorage : setAolDirty
+                    utxostorage --> segmentmanager : put
+                    activate segmentmanager
+                        segmentmanager --> utxocache : put
+                    deactivate segmentmanager
+                else
+                    utxostorage --> utxostorage : mark as failed
+                end
+            end                    
+        end loop
+        utxostorage --> eventbus : publish ReturnUtxoStoreGroupedMsg
+    deactivate utxostorage
+|||
+end
+@enduml

@@ -1,0 +1,75 @@
+@startuml teranode block assembly pipeline
+
+title Block Assembly Pipeline
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "Mempool" as mempool <<component>>
+participant "BlockAssembler" as blockassembler <<component>>
+participant "UtxoStorage\n(write only)" as utxostorage <<component>>
+
+|||
+loop message published by Mempool ( addToBlockTemplateMsg )
+|||
+    mempool o--> eventbus : publish addToBlockTemplateMsg
+|||
+end loop
+|||
+loop message consumed by BlockAssembler ( addToBlockTemplateMsg )
+|||
+    |||
+    note over blockassembler, mempool
+        Instructs BlockAssembler to add transaction to the mining block template identified with 
+        tmplTipId. Mempool also supplies seqNo, which is an monotonically increasing number. 
+        BlockAssembler can use the seqNo to identify transaction gaps that are caused by message 
+        reordering in the framework.   
+    end note
+    |||
+    eventbus o--> blockassembler : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/block_assembly/block_assembly_2_1.svg?csf=1&web=1&e=MqmEXC{Tooltip for message} addToBlockTemplateMsg]]
+    activate blockassembler
+        par
+            blockassembler --> blockassembler : create getActiveTipMsg 
+            blockassembler --> eventbus : publish getActiveTipMsg
+        |||
+        else
+        |||
+            loop
+            |||
+                blockassembler --> blockassembler : create utxoSpendMsg
+                blockassembler --> eventbus : publish utxoSpendMsg
+            |||
+            end loop
+        end  
+    deactivate blockassembler 
+|||
+end loop
+|||
+loop message consumed by UtxoStorage ( utxoSpendMsg )
+|||
+    note over mempool
+        UTXO verifies that coin is accepted and not
+        yet spent in the given tmplTipId chain by 
+        some other transaction.     
+    end note
+    eventbus o--> utxostorage :  consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/block_assembly/block_assembly_2_2.svg?csf=1&web=1&e=8sACDd{Tooltip for message} utxoSpendMsg]] 
+    activate utxostorage
+        utxostorage --> utxostorage : create\nReturnUtxoSpendMsg
+        utxostorage --> eventbus : publish ReturnUtxoSpendMsg
+    deactivate utxostorage
+|||
+end loop
+|||
+loop message consumed by UtxoStorage ( returnUtxoSpendMsg)
+|||
+    eventbus o--> utxostorage : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/block_assembly/block_assembly_2_3.svg?csf=1&web=1&e=IercLU{Tooltip for message} returnUtxoSpendMsg]] 
+    note over mempool
+        Record to accept transaction’s outputs 
+        is written into AOL.     
+    end note
+    activate utxostorage
+        utxostorage --> utxostorage : create responseMsg 
+        utxostorage --> eventbus : publish responseMsg 
+    deactivate utxostorage
+|||
+end loop
+@enduml

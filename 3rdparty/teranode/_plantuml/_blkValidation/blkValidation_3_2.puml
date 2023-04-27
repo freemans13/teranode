@@ -1,0 +1,83 @@
+@startuml teranode block validation pipeline 3_2
+
+title Block Validation Pipeline - Block Validator
+hide footbox
+
+
+'entity "BSV\nNetwork" as bsv
+
+'participant "Bitcoin\nServer Network" as bsn <<component>>
+participant "Event Bus" as eventbus <<external>>
+participant "BlockValidationStartHandler" as blockvalidationstarthandler <<pipeline>>
+participant "BlockValidationManager" as blockvalidationManager <<component>>
+participant "BlockValidator" as blockvalidator <<component>>
+participant "BlockValidationSupplier" as blockvalidationsupplier <<pipeline>>
+
+loop message consumed by BlockValidationManager ( addToBlockTemplateMsg )
+|||
+    eventbus o--> blockvalidationstarthandler : consume blockValidationStartMsg
+    activate blockvalidationstarthandler
+        blockvalidationstarthandler --> blockvalidationManager : startNewBlock
+    deactivate blockvalidationstarthandler
+    activate blockvalidationManager
+        blockvalidationManager --> blockvalidator : createNewBlockValidator( tipId, blockHeader)
+            activate blockvalidator
+            alt if tipId exists
+                blockvalidator --> blockvalidationManager : return blockValidator
+            else
+                blockvalidator --> blockvalidator : new BlockValidator(tipId, blockHeader)
+                blockvalidator --> blockvalidationManager : return blockValidator
+            end
+        deactivate blockvalidator
+        blockvalidationManager --> blockvalidator : start
+        activate blockvalidator
+            blockvalidator --> blockvalidator : validate
+            activate blockvalidator
+                blockvalidator --> blockvalidator : validatePow
+                blockvalidator --> blockvalidator : validateBlockTime
+                blockvalidator --> blockvalidator : validateCheckpoint
+                blockvalidator --> blockvalidator : validateBlockNotMarkedInvalid
+                blockvalidator --> blockvalidator : validateDuplicateBlock
+                blockvalidator --> blockvalidator : validatePreviousHash
+                blockvalidator --> blockvalidator : validateExpectedTarget
+                blockvalidator --> blockvalidator : checkBlockVersionIsLatest
+                blockvalidator --> blockvalidator : return validationResult
+            deactivate blockvalidator
+            alt if validationstate is validate
+                blockvalidator --> blockvalidator : check more than one transaction
+            else
+                blockvalidator --> blockvalidator : setInvalid
+            end
+        deactivate blockvalidator
+        blockvalidationManager --> blockvalidationManager : runValidation
+        activate blockvalidationManager
+        loop for each transaction
+            blockvalidationManager --> blockvalidator ++: poll_chunks
+                return ValidateTxsData
+            blockvalidationManager --> blockvalidationManager : getTxs
+            blockvalidationManager --> blockvalidationManager : startChunkValidation
+            activate blockvalidationManager
+            blockvalidationManager --> blockvalidator : addToMerkleRoot
+            blockvalidationManager --> blockvalidator : validateChunkOfTransactions
+            loop for each tx in chunck
+            blockvalidationManager --> blockvalidationManager : startTransactionValidation
+            activate blockvalidationManager
+            blockvalidationManager --> blockvalidationManager : hashAndCompact
+            blockvalidationManager --> blockvalidator ++: startNewTransaction
+                return batch of utxo to store
+            loop for each item in batch
+                blockvalidationManager --> blockvalidationsupplier :storeUtxoBatch
+                deactivate blockvalidationManager
+                deactivate blockvalidationManager
+                deactivate blockvalidationManager
+                activate blockvalidationsupplier
+                    blockvalidationsupplier --> eventbus : publish storeBlockTxOutputsMsg
+                    blockvalidationsupplier --> eventbus : publish utxoStoreBlockGroupedMsg
+                deactivate blockvalidationsupplier
+                deactivate blockvalidationManager
+                end loop
+            end loop
+        end loop
+|||
+end loop
+@enduml

@@ -1,0 +1,79 @@
+@startuml teranode block validation pipeline
+
+title Block Validation Pipeline
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "ChainTracker" as chaintracker <<component>>
+participant "ChainTrackerSupplier" as chaintrackersupplier <<pipeline>>
+participant "BlockDownloader" as blockdownloader <<component>>
+participant "BlockValidator" as blockvalidator <<component>>
+participant "UtxoStorage\n(read only)" as utxostorage <<component>>
+
+loop Block Validation triggered by ChainTracker
+|||
+    chaintracker --> chaintracker : register\nonValidateBlockEvent
+    activate chaintracker
+        chaintracker --> chaintrackersupplier **: create if null
+        chaintracker--> chaintrackersupplier : CTrackerValidateBlockEvent sent
+    deactivate chaintracker
+    activate chaintrackersupplier
+        chaintrackersupplier --> chaintrackersupplier : create\nBDownloaderValidateBlockMsg
+        chaintrackersupplier --> eventbus : publish BDownloaderValidateBlockMsg
+    deactivate chaintrackersupplier
+
+|||
+end loop
+|||
+loop message consumed by BlockDownloader  ( BDownloaderValidateBlockMsg )
+|||
+    eventbus o--> blockdownloader : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/block_validation/block_validation_3_1.svg?csf=1&web=1&e=vbTfa1{Tooltip for message} BDownloaderValidateBlockMsg]] 
+    activate blockdownloader
+        blockdownloader --> blockdownloader : create\nblockValidationStartMsg
+        blockdownloader --> eventbus : publish blockValidationStartMsg
+        blockdownloader --> blockdownloader : create\nBlockValidationTxsMsg
+        blockdownloader --> eventbus : publish BlockValidationTxsMsg
+    deactivate blockdownloader
+|||
+end loop
+|||
+loop message consumed by BlockValidator ( addToBlockTemplateMsg )
+|||
+    eventbus o--> blockvalidator : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/block_validation/block_validation_3_2.svg?csf=1&web=1&e=0MLvqv{Tooltip for message} blockValidationStartMsg]] 
+        activate blockvalidator
+            blockvalidator --> blockvalidator : create\nstoreBlockTxOutputsMsg
+            blockvalidator --> eventbus : publish storeBlockTxOutputsMsg
+            blockvalidator --> blockvalidator : create\nutxoStoreBlockGroupedMsg
+            blockvalidator --> eventbus : publish utxoStoreBlockGroupedMsg
+        deactivate blockvalidator
+|||
+end loop
+|||
+par
+|||
+    loop message consumed by blockvalidator ( storeBlockTxOutputsMsg )
+    |||
+        eventbus o--> blockvalidator : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/block_validation/block_validation_3_3.svg?csf=1&web=1&e=bRk7M8{Tooltip for message} storeBlockTxOutputsMsg]] 
+        activate blockvalidator
+            blockvalidator --> blockvalidator : create\nstoreBlockTxOutputsMsg
+            blockvalidator --> eventbus : publish storeBlockTxOutputsMsg
+            blockvalidator --> blockvalidator : create\nutxoStoreBlockGroupedMsg
+            blockvalidator --> eventbus : publish utxoStoreBlockGroupedMsg
+        deactivate blockvalidator
+    |||
+    end loop
+|||
+else
+|||
+    loop message consumed by utxoStorage ( utxoStoreBlockGroupedMsg )
+    |||
+        eventbus o--> utxostorage : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/block_validation/block_validation_3_4.svg?csf=1&web=1&e=JRo0oe{Tooltip for message} utxoStoreBlockGroupedMsg]] 
+        activate utxostorage
+            utxostorage --> utxostorage : create\nReturnUtxoStoreGroupedMsg
+            utxostorage --> eventbus : publish ReturnUtxoStoreGroupedMsg
+        deactivate utxostorage
+    |||
+    end loop
+|||
+end
+@enduml

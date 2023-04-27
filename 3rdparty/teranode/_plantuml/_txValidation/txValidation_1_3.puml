@@ -1,0 +1,32 @@
+@startuml teranode transaction validation pipeline 1.3
+
+title Transaction Validation Pipeline - Store Utxo Collection
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "UtxoStoreCollectionProcessHandler" as utxostorecollectionprocesshandler <<pipeline>>
+
+loop message consumed by TxManager ( utxStoreCollectionProcessMsg )
+|||
+    eventbus o--> utxostorecollectionprocesshandler : consume utxStoreCollectionProcessMsg
+    activate utxostorecollectionprocesshandler
+    alt if item size is 1
+        utxostorecollectionprocesshandler --> utxostorecollectionprocesshandler : get returnUtxoStore from\nmsg first item
+        alt if returnUtxoStore has no failures
+            note over utxostorecollectionprocesshandler
+                no failures found in the item,
+                therefore we can validate the 
+                transaction
+            end note
+            utxostorecollectionprocesshandler --> utxostorecollectionprocesshandler : create ValidateTxMsg
+            utxostorecollectionprocesshandler --> eventbus : publish ValidateTxMsg
+        else
+            utxostorecollectionprocesshandler --> utxostorecollectionprocesshandler : log error
+        end
+    else
+        utxostorecollectionprocesshandler --> utxostorecollectionprocesshandler : log error
+    end
+    deactivate utxostorecollectionprocesshandler
+|||
+end loop
+@enduml

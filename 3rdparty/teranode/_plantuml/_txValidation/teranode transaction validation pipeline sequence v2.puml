@@ -1,0 +1,123 @@
+@startuml teranode transaction validation pipeline
+
+title Transaction Validation Pipeline
+hide footbox
+
+
+entity "BSV\nNetwork" as bsv
+
+participant "Bitcoin\nServer Network" as bsn <<component>>
+participant "Event Bus" as eventbus <<external>>
+participant "TxManager" as txmanager <<component>>
+participant "TxStorage" as txstorage <<component>>
+database "TxStore\n(KV store)" as txstore <<external>>
+participant "UtxoStorage\n(write only)" as utxostorage <<component>>
+participant "UtxoStorage\n(read only)" as utxostorage2 <<component>>
+database "UtxoCache\n(in-memory)" as utxocache <<component>>
+database "UtxoStore\n(KV store)" as utxostore <<external>>
+participant "TxValidator" as txvalidator <<component>>
+participant "Mempool" as mempool <<component>>
+database "MempoolCache\n(in-memory)" as mempoolcache <<component>>
+
+
+loop Messages received by Teranode
+|||
+note over bsn, eventbus
+    All in-memory Cache's and KV Stores depicted in this 
+    diagram are sharded.
+
+    Aditionally the EventBus is sharded with multiple 
+    partitions per topic
+end note
+    bsv o--> bsn : tx bitcoin protocol\nmessage received
+    activate bsn
+        bsn --> bsn : deserialise message
+        bsn --> eventbus : publish message\nto newTxMsg topic
+    deactivate bsn
+
+|||
+end loop
+|||
+loop message consumed by TxManager ( newTxMsg )
+|||
+    eventbus o--> txmanager : consume newTxMsg
+    activate txmanager
+        txmanager --> txmanager : create pipeline\nmessages
+        txmanager --> eventbus : publish storeTxMsg,\nstoreUtxoMsg,\nvalidateTxMsg to\ntopics
+    deactivate txmanager
+|||
+end loop
+note over eventbus
+    storeTxMsg, storeUtxoMsg, ValidatetxMsg
+    are published and consumed in parallel
+    as there are no dependencies which will 
+    cause a failure in operation
+end note
+par
+|||
+    |||
+    loop message consumed by txstorage ( storeTxMsg )
+    |||
+        eventbus o--> txstorage : consume storeTxMsg
+        activate txstorage
+            txstorage --> txstore : add to store
+        deactivate txstorage
+    |||
+    end loop
+    |||
+else
+    |||
+    note over utxostorage, utxostorage2
+        UtxoStorage component has been separated to 
+        include a read only instance and a write only
+        instance for separation of concerns; allowing
+        UtxoStorage to write, whilst fetching utxo's
+        for TxValidation
+    end note
+    loop message consumed by UtxoStorage ( storeUtxoMsg )
+    |||
+        eventbus o--> utxostorage : consume storeUtxoMsg
+        activate utxostorage
+            utxostorage --> utxocache ++: add to cache
+            return result
+            utxostorage --> utxostorage : create pipeline\nmessage
+            utxostorage --> eventbus : publish returnUtxoStoreMsg to topic
+        deactivate utxostorage
+    |||
+    end loop
+    |||
+else
+    |||
+    loop message consumed by TxValidator ( validatetxMsg )
+    |||
+        eventbus o--> txvalidator : consume validateTxMsg
+        activate txvalidator
+            txvalidator --> utxostorage2 : fetch utxos
+            activate utxostorage2
+                alt if utxo in cache
+                    utxostorage2 --> utxocache ++: fetch utxos
+                        return utxos
+                else if utxo not in cache
+                    utxostorage2 --> utxostore ++: fetch utxos
+                        return utxos
+                end
+            utxostorage2 --> txvalidator : return fetched utxos
+            deactivate utxostorage2
+            txvalidator --> txvalidator : create pipeline\nmessage
+            txvalidator --> eventbus : publish validateTxResultMsg to topic
+        deactivate txvalidator
+    |||
+    end loop
+end
+|||
+loop message consumed by Mempool ( validatetxResultMsg )
+|||
+    eventbus o--> mempool : consume validatetxResultMsg
+    activate mempool
+        mempool --> mempoolcache : add tx to cache
+        mempool --> mempool : create pipeline\nmessage
+        mempool --> eventbus : publish addToBlockTemplateMsg
+    deactivate mempool
+|||
+end loop
+@enduml

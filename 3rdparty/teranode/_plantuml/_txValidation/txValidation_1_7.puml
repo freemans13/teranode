@@ -1,0 +1,112 @@
+@startuml teranode transaction validation pipeline 1.7
+
+title Transaction Validation Pipeline - Mempool Validation
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "ValidateTxResultHandler" as validatetxresulthandler <<pipeline>>
+participant "Mempool" as mempool <<component>>
+database "MempoolCache\n(in-memory)" as mempoolcache <<component>>
+participant "MempoolSupplier" as mempoolsupplier <<pipeline>>
+
+
+loop message consumed by Mempool ( ValidateTxResultMsg )
+|||
+    eventbus o--> validatetxresulthandler : consume ValidateTxResultMsg
+end loop
+    activate validatetxresulthandler
+        validatetxresulthandler --> mempool : addTransaction
+    deactivate validatetxresulthandler
+    activate mempool
+        mempool --> mempool : addTransactionImpl 
+        activate mempool
+            alt if not acceptingTransactions
+                mempool --> mempool : log info
+                mempool --> mempool : return
+            end
+            alt if txPool containsKey
+                mempool --> mempool : log trace 
+                mempool --> mempool : return
+            else
+                mempool --> mempool : log trace 
+            end
+            mempool --> mempoolcache : put
+            mempool --> mempool : populate transactions\ngraph
+            alt if validation state is validate
+                alt if any known parent is rejected
+                    mempool --> mempool : rejectSubTree
+                    activate mempool
+                        loop while stack not empty
+                            mempool --> mempool : stack pop
+                            mempool --> mempool : emitTxnRejected
+                            activate mempool
+                                mempool --> mempoolsupplier : supply TxRejected
+                                activate mempoolsupplier
+                                    mempoolsupplier --> eventbus : publish TxStateResponseMsg
+                                deactivate mempoolsupplier
+                            deactivate mempool
+                            alt if spenders is not null
+                                mempool --> mempool : spenders stream
+                            end
+                        end loop 
+                    deactivate mempool
+                else
+                    alt if rebasing is null
+                        alt if isIndependent
+                            mempool --> mempool : emitSpendTxnInputs
+                            activate mempool
+                                mempool --> mempoolsupplier : supply SpendTxnInputs
+                                activate mempoolsupplier
+                                    mempoolsupplier --> mempoolsupplier : create MsgCollection
+                                    mempoolsupplier --> mempoolsupplier : create MemPoolCollectorMsg
+                                    mempoolsupplier --> mempoolsupplier : add MemPoolCollectorMsg\nto collection
+                                    loop for txoIds
+                                        mempoolsupplier --> mempoolsupplier : create UtxoSpendMsg
+                                        mempoolsupplier --> mempoolsupplier : add to UtxoSpendMsg\nto collection
+                                    end loop
+                                    mempoolsupplier --> eventbus : publish MsgCollection
+                                deactivate mempoolsupplier
+                            deactivate mempool
+                        else
+                            alt areKnownParentsAccepted
+                                mempool --> mempool : emitSpendTxnInputs
+                                activate mempool
+                                    mempool --> mempoolsupplier : supply SpendTxnInputs
+                                    activate mempoolsupplier
+                                        mempoolsupplier --> mempoolsupplier : create MsgCollection
+                                        mempoolsupplier --> mempoolsupplier : create MemPoolCollectorMsg
+                                        mempoolsupplier --> mempoolsupplier : add MemPoolCollectorMsg\nto collection
+                                        loop for txoIds
+                                            mempoolsupplier --> mempoolsupplier : create UtxoSpendMsg
+                                            mempoolsupplier --> mempoolsupplier : add to UtxoSpendMsg\nto collection
+                                        end loop
+                                        mempoolsupplier --> eventbus : publish MsgCollection
+                                    deactivate mempoolsupplier
+                                deactivate mempool
+                            else 
+                                mempool --> mempool : log trace
+                            end
+                    else
+                        mempool --> mempool : log trace
+                end
+            else
+                mempool --> mempool : rejectSubTree
+                activate mempool
+                    loop while stack not empty
+                        mempool --> mempool : stack pop
+                        mempool --> mempool : emitTxnRejected
+                        activate mempool
+                            mempool --> mempoolsupplier : supply TxRejected
+                            activate mempoolsupplier
+                                mempoolsupplier --> eventbus : publish TxStateResponseMsg
+                            deactivate mempoolsupplier
+                        deactivate mempool
+                        alt if spenders is not null
+                            mempool --> mempool : spenders stream
+                        end
+                    end loop 
+                deactivate mempool
+            end
+        deactivate mempool
+    deactivate mempool
+@enduml

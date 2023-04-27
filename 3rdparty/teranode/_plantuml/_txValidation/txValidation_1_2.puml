@@ -1,0 +1,80 @@
+@startuml teranode transaction validation pipeline 1.2
+
+title Transaction Validation Pipeline - Store Utxo
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "UtxoStoreHandler" as storeutxohandler <<pipeline>>
+participant "UtxoStorage\n(write only)" as utxostorage <<component>>
+'participant "UtxoStorage\n(read only)" as utxostorage2 <<component>>
+participant "SegmentManager" as segmentmanager <<component>>
+database "UtxoCache\n(in-memory)" as utxocache <<component>>
+
+loop message consumed by UtxoStorage ( UtxoStoreMsg )
+|||
+    eventbus o--> storeutxohandler : consume UtxoStoreMsg
+    activate storeutxohandler
+        note over utxostorage
+            Stores the information about the UTXO, identified with key, 
+            into the UTXO database. The UTXO information consists of the 
+            script and the satoshi value, and is provided via parameter coin. 
+            The UTXO is stored in the context of the chain tip identified 
+            with the tipId
+        end note
+        storeutxohandler --> utxostorage : storeUtxo
+        activate utxostorage
+            alt if data is empty
+                utxostorage --> storeutxohandler : return state
+            end
+            loop for each utxo list size
+                utxostorage --> utxostorage : set store to false
+                utxostorage --> utxostorage : get utxoKey
+                utxostorage --> utxostorage : doStoreUtxo
+                activate utxostorage
+                    utxostorage --> segmentmanager : tryGetPut
+                    activate segmentmanager
+                        segmentmanager --> utxocache ++: getOrPut
+                            return utxo
+                        segmentmanager --> utxostorage : return utxo
+                    deactivate segmentmanager
+                    alt if utxo code is intermin
+                        note over segmentmanager
+                            If this partial UtxoItem was just created (merge callback list contains 
+                            only just added entry) then trigger the asynchronous search for the item
+                        end note
+                        utxostorage --> utxostorage : set store to true
+                        utxostorage --> utxostorage : addBelatedProcessor
+                        alt if processor size is 1
+                            utxostorage --> segmentmanager : goSearchAndGet
+                        end
+                    else if utxo code is placeholder
+                        utxostorage --> utxostorage : set store to true
+                        utxostorage --> utxostorage : create new aol
+                        utxostorage --> utxostorage : append ops (stored /\nproducer tx accepted)
+                        utxostorage --> segmentmanager : put
+                        activate segmentmanager
+                            segmentmanager --> utxocache : put
+                        deactivate segmentmanager
+                        
+                    else if utxo code is complete
+                        note over segmentmanager
+                            UTXO is already in the database, which implies the script being 
+                            already stored, nothing to do
+                        end note
+                    end 
+                    alt if store is true
+                        utxostorage --> segmentmanager : putScript
+                        activate segmentmanager
+                            segmentmanager --> segmentmanager : scriptForWrite.put
+                        deactivate segmentmanager
+                    end
+                    utxostorage --> storeutxohandler : return state
+                deactivate utxostorage
+            end loop
+        deactivate utxostorage
+        storeutxohandler --> storeutxohandler : create returnUtxoStoreMsg
+        storeutxohandler --> eventbus : publish returnUtxoStoreMsg to topic
+    deactivate storeutxohandler
+|||
+end loop
+@enduml

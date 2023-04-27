@@ -1,0 +1,39 @@
+@startuml teranode block validation pipeline 3_1
+
+title Block Validation Pipeline - Block Download
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "BDownloaderValidateBlockHandler" as bdownloadervalidateblockhandler <<pipeline>>
+participant "BlockDownloader" as blockdownloader <<component>>
+participant "BlocksReceiver" as blocksreceiver <<component>>
+participant "BlockDownloaderSupplier" as blockdownloadersupplier <<pipeline>>
+
+loop message consumed by BlockDownloader  ( BDownloaderValidateBlockMsg )
+|||
+    eventbus o--> bdownloadervalidateblockhandler : consume BDownloaderValidateBlockMsg
+    activate bdownloadervalidateblockhandler
+        bdownloadervalidateblockhandler --> blockdownloader : ValidateBlock
+        activate blockdownloader
+            blockdownloader --> blocksreceiver ++: getBlockChunksReceiver.getHeader
+                return BlockHeaderReceived
+            blockdownloader --> blockdownloadersupplier : ValidateBlockHeader
+            activate blockdownloadersupplier
+                blockdownloadersupplier --> blockdownloadersupplier : create\nblockValidationStartMsg
+                blockdownloadersupplier --> eventbus : publish blockValidationStartMsg
+            deactivate blockdownloadersupplier
+            blockdownloader --> blocksreceiver :getTxsReceived
+            blocksreceiver --> blockdownloader : txsReceived
+            loop while txsRececived
+                blockdownloader --> blockdownloader : get txsToValidate
+                blockdownloader --> blockdownloadersupplier : validateBlockTxs
+                activate blockdownloadersupplier
+
+                deactivate blockdownloadersupplier
+            end loop
+        deactivate blockdownloader
+    deactivate bdownloadervalidateblockhandler
+
+|||
+end loop
+@enduml

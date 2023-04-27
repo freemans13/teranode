@@ -1,0 +1,97 @@
+@startuml framework messaging routing
+
+title Framework Message Routing
+hide footbox
+
+
+entity "BSV\nNetwork" as bsv
+box "cnode 1" #white
+    participant "Bitcoin\nServer Network" as bsn <<component>>
+    participant "Message\nInjector" as msgInjectorc1 <<framework>>
+    participant "Message\nRouter" as msgRouterc1 <<framework>>
+    participant "Step\nProcessor" as stepProcessorc1 <<framework>>
+    participant "Message\nHandler" as handlerc1 <<pipeline>>
+    participant "Bitcoin\nComponent" as componentc1 <<component>>
+    participant "Message\nSink" as msgSinkc1 <<framework>>
+end box
+
+box "cnode 2" #white
+    participant "Message\nInjector" as msgInjectorc2 <<framework>>
+    participant "Message\nRouter" as msgRouterc2 <<framework>>
+    participant "Step\nProcessor" as stepProcessorc2 <<framework>>
+    participant "Message\nHandler" as handlerc2 <<pipeline>>
+    participant "Bitcoin\nComponent" as componentc2 <<component>>
+    participant "Message\nSink" as msgSinkc2 <<framework>>
+end box
+
+loop Messages received by Teranode
+|||
+    bsv --> bsn : bitcoin protocol\nmessage received
+    activate bsn
+        bsn --> bsn : deserialise message
+        bsn --> msgInjectorc1 : inject message into pipeline
+    deactivate bsn
+    activate msgInjectorc1
+|||
+end loop
+|||
+loop message injected into a pipeline
+    |||
+    alt if local - shard 0
+        msgInjectorc1 --> msgRouterc1 : injects message into\npipeline for processing
+        deactivate msgInjectorc1
+        activate msgRouterc1
+            msgRouterc1 --> stepProcessorc1 : routes the message to\nstep processor\ninternal queue
+        deactivate msgRouterc1
+        activate stepProcessorc1
+            stepProcessorc1 --> stepProcessorc1 : message drained\nfrom internal queue
+            stepProcessorc1 --> handlerc1 : message sent to handler\nfor processing
+        deactivate stepProcessorc1
+        activate handlerc1
+            handlerc1 --> handlerc1 : processing
+            handlerc1 --> componentc1 : processing
+        deactivate handlerc1
+        activate componentc1
+            componentc1 --> componentc1 : processing
+            componentc1 --> msgSinkc1 : new pipeline\nmessage created
+        deactivate componentc1
+        activate msgSinkc1
+            msgSinkc1 --> stepProcessorc1 : message routed to routing queue
+        deactivate msgSinkc1
+        activate stepProcessorc1
+            stepProcessorc1 --> stepProcessorc1  : message drained\nfrom routing queue
+            stepProcessorc1 --> msgInjectorc1 : inject message into pipeline
+        deactivate stepProcessorc1
+    |||
+    else else remote - shard 1
+    |||
+        msgInjectorc1 --> msgRouterc2 : injects message into pipeline for processing
+        deactivate msgInjectorc2
+        activate msgRouterc2
+            msgRouterc2 --> stepProcessorc2 : routes the message to\nstep processor\ninternal queue
+        deactivate msgRouterc2
+        activate stepProcessorc2
+            stepProcessorc2 --> stepProcessorc2 : message drained\nfrom internal queue
+            stepProcessorc2 --> handlerc2 : message sent to handler\nfor processing
+        deactivate stepProcessorc2
+        activate handlerc2
+            handlerc2 --> handlerc2 : processing
+            handlerc2 --> componentc2 : processing
+        deactivate handlerc2
+        activate componentc2
+            componentc2 --> componentc2 : processing
+            componentc2 --> msgSinkc2 : new pipeline\nmessage created
+        deactivate componentc2
+        activate msgSinkc2
+            msgSinkc2 --> stepProcessorc2 : message routed to routing queue
+        deactivate msgSinkc2
+        activate stepProcessorc2
+            stepProcessorc2 --> stepProcessorc2  : message drained\nfrom routing queue
+            stepProcessorc2 --> msgInjectorc2 : inject message into pipeline
+        deactivate stepProcessorc2
+    |||
+    end
+|||
+end loop
+
+@enduml

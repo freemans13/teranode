@@ -1,0 +1,42 @@
+@startuml framework messaging routing
+
+title Framework Message Routing with Middleware
+hide footbox
+
+
+entity "BSV\nNetwork" as bsv
+
+participant "Bitcoin\nServer Network" as bsn <<component>>
+participant "Event\nBus" as eventbus <<external>>
+participant "Bitcoin\nComponent" as componentc1 <<component>>
+participant "Bitcoin\nComponent" as componentc2 <<component>>
+
+
+loop Messages received by Teranode
+|||
+    bsv o--> bsn : bitcoin protocol\nmessage received
+    activate bsn
+        bsn --> bsn : deserialise message
+        bsn --> eventbus : publish msg_a
+    deactivate bsn
+
+|||
+end loop
+|||
+loop message consumed by component
+|||
+    eventbus o--> componentc1 : consume msg_a
+    activate componentc1
+        componentc1 --> componentc1 : do work
+        componentc1 --> eventbus : publish msg_b
+    deactivate componentc1
+
+    eventbus o--> componentc2 : consume msg b
+    activate componentc2
+        componentc2 --> componentc2 : do work
+        componentc2 --> eventbus : publish msg_c
+    deactivate componentc2
+|||
+end loop
+
+@enduml

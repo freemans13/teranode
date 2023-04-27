@@ -1,0 +1,68 @@
+@startuml teranode block validation pipeline 3_3
+
+title Block Validation Pipeline - Block Validator
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "StoreBlockTxOutputsHandler" as storeblocktxoutputshandler <<pipeline>>
+participant "BlockValidationManager" as blockvalidationManager <<component>>
+participant "BlockValidator" as blockvalidator <<component>>
+participant "StreamingMerkleRootCalculator" as streamingmerklerootcalculator <<component>>
+participant "BlockValidationSupplier" as blockvalidationsupplier <<pipeline>>
+
+loop message consumed by Block Validation Manager ( storeBlockTxOutputsMsg )
+|||
+    eventbus o--> storeblocktxoutputshandler : consume storeBlockTxOutputsMsg
+    loop for each item in the storeBlockTxOutputMsg
+        alt if item instanceof CollectionExecutionErrorMsg
+            activate storeblocktxoutputshandler
+                storeblocktxoutputshandler --> blockvalidationManager : failValidation
+                activate blockvalidationManager
+                    blockvalidationManager --> blockvalidator : setInvalidState
+                deactivate blockvalidationManager
+                activate blockvalidator
+                    blockvalidator --> streamingmerklerootcalculator ++: hasFinished
+                        return return boolean
+                    alt if has Finished is true
+                        blockvalidator --> blockvalidator :finishBlockValidation
+                    end
+                deactivate blockvalidator
+        else if item is an instance of ReturnUtxoStoreGroupedMsg
+            storeblocktxoutputshandler --> storeblocktxoutputshandler : getUtxoStoreFailureResultList
+            alt if  failures > 0
+                storeblocktxoutputshandler --> blockvalidationManager : failValidation
+                activate blockvalidationManager
+                    blockvalidationManager --> blockvalidator : setInvalidState
+                deactivate blockvalidationManager
+                activate blockvalidator
+                    blockvalidator --> streamingmerklerootcalculator ++: hasFinished
+                        return return boolean
+                    alt if has Finished is true
+                        blockvalidator --> blockvalidator :finishBlockValidation
+                    end
+                deactivate blockvalidator
+            end
+        end 
+    end loop
+    note over blockvalidationManager
+        Called when all outputs of a given batch were 
+        successfully stored.  This can trigger fetching 
+        the batch inputs and storing outputs of other batches.
+    end note
+    storeblocktxoutputshandler --> blockvalidationManager : OutputsStored
+    deactivate storeblocktxoutputshandler
+    activate blockvalidationManager
+        blockvalidationManager --> blockvalidator ++: get batchStored
+            return batch of utxo to store
+    loop for each item in batch
+        blockvalidationManager --> blockvalidationsupplier :storeUtxoBatch
+        deactivate blockvalidationManager
+        activate blockvalidationsupplier
+            blockvalidationsupplier --> eventbus : publish storeBlockTxOutputsMsg
+            blockvalidationsupplier --> eventbus : publish utxoStoreBlockGroupedMsg
+        deactivate blockvalidationsupplier
+    end loop
+    deactivate blockvalidationManager
+|||
+end loop
+@enduml

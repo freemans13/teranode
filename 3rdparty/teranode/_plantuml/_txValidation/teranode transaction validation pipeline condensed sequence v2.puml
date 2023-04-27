@@ -1,0 +1,87 @@
+@startuml teranode transaction validation pipeline
+
+title Transaction Validation Pipeline
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+
+box "Transaction Validation Service" #white
+    participant "TxManager" as txmanager <<component>>
+    participant "TxStorage" as txstorage <<component>>
+    participant "TxValidator" as txvalidator <<component>>
+    database "TxStore\n(KV store)" as txstore <<external>>
+end box 
+
+box "Utxo Storage Service" #white
+    participant "UtxoStorage\n(write only)" as utxostorage <<component>>
+    participant "UtxoStorage\n(read only)" as utxostorage2 <<component>>
+    database "UtxoCache\n(in-memory)" as utxocache <<component>>
+    database "UtxoStore\n(KV store)" as utxostore <<external>>
+end box
+
+box "Mempool Service" #white
+    participant "Mempool" as mempool <<component>>
+    database "MempoolCache\n(in-memory)" as mempoolcache <<component>>
+end box
+
+loop message consumed by TxManager ( newTxMsg )
+|||
+    eventbus o--> txmanager : consume newTxMsg
+    activate txmanager
+        txmanager --> txmanager : create pipeline\nmessages
+        txmanager --> txstorage : add to store
+        activate txstorage
+            txstorage --> txstore : add to store
+        deactivate txstorage
+        txmanager --> eventbus : publish storeUtxoMsg,\nvalidateTxMsg to\ntopics
+
+    deactivate txmanager
+|||
+end loop
+par
+|||
+    |||
+    loop message consumed by UtxoStorage ( storeUtxoMsg )
+    |||
+        eventbus o--> utxostorage : consume storeUtxoMsg
+        activate utxostorage
+            utxostorage --> utxocache ++: add to cache
+                return result
+            utxostorage --> eventbus : publish returnUtxoStoreMsg to topic
+        deactivate utxostorage
+    |||
+    end loop
+    |||
+else
+    |||
+    loop message consumed by TxValidator ( validatetxMsg )
+    |||
+        eventbus o--> txvalidator : consume validateTxMsg
+        activate txvalidator
+            txvalidator --> utxostorage2 : fetch utxos
+            activate utxostorage2
+                alt if utxo in cache
+                    utxostorage2 --> utxocache ++: fetch utxos
+                        return utxos
+                else if utxo not in cache
+                    utxostorage2 --> utxostore ++: fetch utxos
+                        return utxos
+                end
+                utxostorage2 --> txvalidator : return fetched utxos
+            deactivate utxostorage2
+            txvalidator --> eventbus : publish validateTxResultMsg to topic
+        deactivate txvalidator
+    |||
+    end loop
+end
+|||
+loop message consumed by Mempool ( validatetxResultMsg )
+|||
+    eventbus o--> mempool : consume validatetxResultMsg
+    activate mempool
+        mempool --> mempoolcache : add tx to cache
+        mempool --> eventbus : publish addToBlockTemplateMsg
+    deactivate mempool
+|||
+end loop
+@enduml

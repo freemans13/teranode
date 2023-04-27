@@ -1,0 +1,70 @@
+@startuml teranode transaction validation pipeline 1.6
+
+title Transaction Validation Pipeline - Tx Validation
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "UtxoFetchCollectionProcessHandler" as utxofetchcollectionprocesshandler <<pipeline>>
+participant "TxValidator" as txvalidator <<component>>
+participant "BSVScriptEngine" as scriptengine <<component>>
+
+loop messaged consumed by TxValidator (ReturnUtxoFetchMsg)
+|||
+    eventbus --> utxofetchcollectionprocesshandler : consume ReturnUtxoFetchMsg
+    activate utxofetchcollectionprocesshandler
+        utxofetchcollectionprocesshandler --> utxofetchcollectionprocesshandler : create hashmap
+        loop for each item in collection
+            alt if item hasTxOutput and is not null
+                utxofetchcollectionprocesshandler --> utxofetchcollectionprocesshandler : put item into hashmap
+            end
+        end loop
+        utxofetchcollectionprocesshandler --> txvalidator : onFetchReturnUtxo
+    deactivate utxofetchcollectionprocesshandler
+    activate txvalidator
+        alt if returned utxo size is less than the envelope inputs
+            txvalidator --> txvalidator : return TxnWaitingCtx
+        else
+            txvalidator--> txvalidator : validateAndProcessResult
+            txvalidator --> txvalidator : ValidateTransaction
+            activate txvalidator
+                loop for each inputUtxo
+                    txvalidator --> txvalidator : ValidateAllInputsAreWithinRange
+                    alt if not within range
+                        txvalidator --> txvalidator :return ValidationState
+                    end
+                    txvalidator --> txvalidator : increment inputValue by inputCoin value
+                end loop
+                loop for each output
+                    txvalidator --> txvalidator : increment outValue by output value
+                end loop
+                txvalidator --> txvalidator : setInValue
+                txvalidator --> txvalidator : setOutValue
+                note over txvalidator
+                    Check rule RMT314
+                end note
+                txvalidator --> txvalidator : validateInAndOutValueMatch    
+                alt if they do not match
+                        txvalidator --> txvalidator :return ValidationState
+                end
+                txvalidator --> scriptengine : verifyScript
+                activate scriptengine
+                    scriptengine --> scriptengine ++: verify
+                        return status
+                    alt if status not ok
+                        scriptengine --> scriptengine : set validationstate\ninvalid
+                    end
+                deactivate scriptengine
+                txvalidator --> txvalidator : return ValidationState
+            deactivate txvalidator
+            alt if validation state is validate
+                txvalidator --> txvalidator : create ValidateTxResultMsg
+                txvalidator --> eventbus : publish ValidateTxResultMsg
+            else
+                txvalidator --> txvalidator : create TxStateResponseMsg
+                txvalidator --> eventbus : publish TxStateResponseMsg
+            end
+        end
+    deactivate txvalidator
+|||
+end loop
+@enduml

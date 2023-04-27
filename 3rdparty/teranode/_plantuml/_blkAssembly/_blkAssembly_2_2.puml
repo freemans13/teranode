@@ -1,0 +1,34 @@
+@startuml teranode block assembly pipeline
+
+title Block Assembly Pipeline - Spend the UTXO
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "UtxoSpendHandler" as utxospendhandler <<pipeline>>
+participant "UtxoStorage\n(write only)" as utxostorage <<component>>
+
+|||
+loop message consumed by UtxoStorage ( utxoSpendMsg )
+|||
+    |||
+    note over utxospendhandler
+        UTXO verifies that coin is accepted and not
+        yet spent in the given tmplTipId chain by 
+        some other transaction. 
+        
+        AOL Record to spend the utxo is added to the AOL.     
+    end note
+    |||
+    eventbus o--> utxospendhandler :  consume utxoSpendMsg
+    activate utxospendhandler
+        utxospendhandler --> utxostorage : utxoSpendMsg\nsent for processing
+        activate utxostorage
+            utxostorage --> utxostorage : doSpendUtxo
+            utxostorage --> utxospendhandler : return spendResponseData
+        deactivate utxostorage
+        utxospendhandler --> utxospendhandler : create ReturnUtxoSpendMsg
+        utxospendhandler --> eventbus : publish ReturnUtxoSpendMsg
+    deactivate utxospendhandler
+|||
+end loop
+@enduml

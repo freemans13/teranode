@@ -1,0 +1,37 @@
+@startuml teranode block assembly pipeline
+
+title Block Assembly Pipeline - UTXO Accepted
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "CollectUtxoSpendHandler" as collectutxospendhandler <<pipeline>>
+participant "UtxoProducerAcceptedHandler" as utxoproducerracceptedhandler <<pipeline>>
+participant "UtxoStorage\n(write only)" as utxostorage <<component>>
+
+loop message consumed by UtxoStorage ( returnUtxoSpendMsg)
+|||
+    eventbus o--> collectutxospendhandler : consume returnUtxoSpendMsg
+    activate collectutxospendhandler
+        collectutxospendhandler --> eventbus : publish utxoProducerAcceptMsg
+    deactivate collectutxospendhandler
+    loop collect utxos for spending
+        |||
+        note over utxoproducerracceptedhandler
+            Record to accept transaction’s outputs 
+            is written into AOL.     
+        end note
+        |||
+        eventbus o--> utxoproducerracceptedhandler : consume utxoProducerAcceptedMsg
+        activate utxoproducerracceptedhandler
+            utxoproducerracceptedhandler --> utxostorage : utxoProducerAcceptMsg\nsent for processing
+            activate utxostorage
+                utxostorage --> utxostorage : producerAccepted
+                utxostorage --> utxoproducerracceptedhandler : return responseMsg 
+            deactivate utxostorage
+            utxoproducerracceptedhandler --> eventbus : publish responseMsg to collection target
+        deactivate utxoproducerracceptedhandler
+    end loop
+    
+|||
+end loop
+@enduml

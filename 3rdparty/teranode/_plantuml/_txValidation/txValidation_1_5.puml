@@ -1,0 +1,86 @@
+@startuml teranode transaction validation pipeline 1.5
+
+title Transaction Validation Pipeline - Fetch Utxos
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+participant "UtxoFetchHandler" as utxofetchhandler <<pipeline>>
+participant "UtxoStorage\n(read only)" as utxostorage2 <<component>>
+participant "SegmentManager" as segmentmanager <<component>>
+database "UtxoCache\n(in-memory)" as utxocache <<component>>
+database "UtxoStore\n(kv store)" as utxostore <<external>>
+
+loop message consumed by UtxoStorage (UtxoFetchMsg)
+    eventbus --> utxofetchhandler : consume UtxoFetchMsg
+    activate utxofetchhandler
+        note over utxofetchhandler
+            Retrieves the requested UTXO from the database,  
+            with the state of the retrieved UTXO unmodified.
+
+            The call may return immediately if the UTXO is located 
+            in nearby storage, or may be belated if several storage 
+            levels need to be searched. 
+            
+            In the later case tha call context will provide a 
+            CompletableFuture to wait on until the search completes.
+        end note
+        utxofetchhandler --> utxostorage2 : fetchUtxo
+        activate utxostorage2
+            utxostorage2 --> utxostorage2 : doFetchUtxo
+            activate utxostorage2
+                utxostorage2 --> segmentmanager :getScriptAsync
+                activate segmentmanager
+                    alt if script is available in the cache
+                        segmentmanager --> segmentmanager : resultProcessor.Accept(key, utxo)
+                    else script is not availabl in the acche
+                        segmentmanager --> segmentmanager : resultProcessor.Accept(key, null)
+                    end
+                    segmentmanager --> utxostorage2 :return
+                deactivate segmentmanager
+                alt if either script was found or no store flag was requested then !return
+                    utxostorage2 --> utxofetchhandler : return
+                end
+                note over utxostorage2
+                    The txo must be null which suggests 
+                    that it is not the database.
+                end note
+                utxostorage2 --> segmentmanager : tryGetOrPut
+                activate segmentmanager
+                    segmentmanager --> utxocache : getOrPut
+                    activate utxocache
+                        utxocache --> utxocache : get item
+                        alt if item was not found
+                            utxocache --> utxocache : put item
+                        end
+                        utxocache --> segmentmanager : return item    
+                    deactivate utxocache
+                    segmentmanager --> utxostorage2 : return utxoItem
+                deactivate segmentmanager
+                    alt if utxo code is intermin
+                        alt if (item.getBelatedProcessors().size() == 0)
+                            utxostorage2 --> utxostorage2 : addStoreEventTarget(txId);
+                            utxostorage2 --> segmentmanager : put(newItem);
+                            utxostorage2 --> utxostorage2 : setTxo(null);
+                            utxostorage2 --> utxostorage2 : response state\nset to complete
+                        end
+                        utxostorage2 --> utxostorage2 : addBelatedProcessor
+                    else if utxo code is placeholder
+                        utxostorage2 --> utxostorage2 : item add store event target
+                        utxostorage2 --> utxostorage2 : set txo null
+                        utxostorage2 --> utxostorage2 : response state\nset to complete
+                    else if utxo code is complete
+                        alt if item hasUtxo
+                            utxostorage2 --> utxostorage2 : setTxo
+                        else
+                            utxostorage2 --> utxostorage2 : log error
+                        end
+                        utxostorage2 --> utxostorage2 : response state\nset to complete
+                    end 
+            deactivate utxostorage2
+            utxostorage2 --> utxofetchhandler : return response state
+        deactivate utxostorage2
+        utxofetchhandler --> utxofetchhandler : create ReturnUtxoFetchMsg
+        utxofetchhandler --> eventbus : publish ReturnUtxoFetchMsg
+    deactivate utxofetchhandler
+end loop
+@enduml

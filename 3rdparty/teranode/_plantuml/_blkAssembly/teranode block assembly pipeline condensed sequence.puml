@@ -1,0 +1,58 @@
+@startuml teranode block assembly pipeline
+
+title Block Assembly Pipeline
+hide footbox
+
+participant "Event Bus" as eventbus <<external>>
+box "Mempool Service" #white
+    participant "Mempool" as mempool <<component>>
+end box
+
+box "Block Assembler Service" #white
+    participant "BlockAssembler" as blockassembler <<component>>
+    participant "BlockTemplate" as blocktemplate <<component>>
+    participant "TransactionShuffleInfo" as transactionshuffleinfo <<component>>
+end box
+
+box "Utxo Storage Service" #white
+    participant "UtxoSpendHandler" as utxospendhandler <<pipeline>>
+    participant "UtxoStorage\n(write only)" as utxostorage <<component>>
+end box
+
+    mempool o--> eventbus : publish addToBlockTemplateMsg
+    |||
+    eventbus o--> blockassembler : consume addToBlockTemplateMsg
+    activate blockassembler
+        blockassembler --> blocktemplate ** : create if null
+        blocktemplate --> transactionshuffleinfo ** : create if null
+        blockassembler --> blocktemplate : add transactions
+        par
+            activate blocktemplate
+                blockassembler --> eventbus : publish getActiveMsg
+            deactivate blockassembler
+        |||
+        else
+        |||
+            blocktemplate --> transactionshuffleinfo ++: order transactions
+                return ordered transactions
+            blocktemplate --> eventbus : publish utxoSpendMsg
+            deactivate blocktemplate
+        |||
+    end   
+|||
+    eventbus o--> utxostorage :  consume utxoSpendMsg
+    activate utxostorage
+        utxostorage --> utxostorage : doSpendUtxo
+        utxostorage --> eventbus : publish ReturnUtxoSpendMsg
+    deactivate utxostorage
+
+|||
+    eventbus o--> blockassembler : consume returnUtxoSpendMsg
+    |||
+    eventbus o--> utxostorage : consume utxoProducerAcceptedMsg
+    activate utxostorage
+        utxostorage --> utxostorage : producerAccepted
+        utxostorage --> eventbus : publish responseMsg to collection target
+    deactivate utxostorage
+
+@enduml
