@@ -2,6 +2,7 @@
   "cSpell.words": [
     "aerospike",
     "blockassembly",
+    "CFLAGS",
     "chaincfg",
     "chainhash",
     "dbmode",
@@ -14,6 +15,7 @@
     "InvVect",
     "ldflags",
     "libsv",
+    "lsecp256k1",
     "opentracing",
     "otel",
     "progname",
@@ -24,6 +26,8 @@
     "resp",
     "respend",
     "safemap",
+    "secp256k1",
+    "stdlib",
     "stretchr",
     "TAAL",
     "timestamppb",
@@ -32,6 +36,7 @@
     "utxoservice",
     "utxostore",
     "Uxto",
+    "verifysignature",
     "xtxo"
   ]
 }

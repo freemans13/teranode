@@ -6,20 +6,28 @@ This is a simple docker setup for running a Bitcoin regtest node.  Please note t
 
 ```bash
 # Build the image
-docker build --platform=linux/amd64 -t eu.gcr.io/ubsv-383015/bitcoin-regtest:1.0.14 .
+docker build --platform=linux/amd64 -t eu.gcr.io/ubsv-383015/bitcoin-regtest:1.0.15 .
 
-docker push eu.gcr.io/ubsv-383015/bitcoin-regtest:1.0.14
+docker push eu.gcr.io/ubsv-383015/bitcoin-regtest:1.0.15
 
 
 # Create a volume
 docker volume create bitcoin-regtest
 
-# Start the container
+# Start the container (using a Docker volume)
 docker run --platform=linux/amd64 -d --rm \
   --name bitcoin-regtest \
   -p 18332:18332 -p 18333:18333 -p 28332:28332 \
   -v bitcoin-regtest:/bitcoin \
-  eu.gcr.io/ubsv-383015/bitcoin-regtest:1.0.14
+  eu.gcr.io/ubsv-383015/bitcoin-regtest:1.0.15
+
+
+# Start the container (using a local folder)
+docker run --platform=linux/amd64 -d --rm \
+  --name bitcoin-regtest \
+  -p 18332:18332 -p 18333:18333 -p 28332:28332 \
+  -v $(pwd)/bitcoin-data:/bitcoin \
+  eu.gcr.io/ubsv-383015/bitcoin-regtest:1.0.15
 
 
 # Stop the container
