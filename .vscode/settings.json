@@ -2,6 +2,7 @@
   "cSpell.words": [
     "aerospike",
     "blockassembly",
+    "blockstore",
     "CFLAGS",
     "chaincfg",
     "chainhash",
@@ -12,6 +13,7 @@
     "emptypb",
     "errgroup",
     "foundationdb",
+    "getsentry",
     "InvVect",
     "ldflags",
     "libsv",
@@ -31,6 +33,7 @@
     "stretchr",
     "TAAL",
     "timestamppb",
+    "txstore",
     "ubsv",
     "utxos",
     "utxoservice",
