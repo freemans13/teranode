@@ -1,6 +1,7 @@
 {
   "cSpell.words": [
     "aerospike",
+    "Alives",
     "blockassembly",
     "blockstore",
     "bscript",
@@ -36,6 +37,7 @@
     "stretchr",
     "TAAL",
     "timestamppb",
+    "txblaster",
     "txstore",
     "ubsv",
     "unlocker",
