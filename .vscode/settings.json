@@ -18,8 +18,10 @@
     "getsentry",
     "InvVect",
     "ldflags",
+    "lgmp",
     "libsv",
     "lsecp256k1",
+    "merkles",
     "opentracing",
     "otel",
     "Priv",
@@ -27,6 +29,7 @@
     "promauto",
     "promhttp",
     "protobuf",
+    "pubkey",
     "regtest",
     "resp",
     "respend",
@@ -40,6 +43,7 @@
     "txblaster",
     "txstore",
     "ubsv",
+    "uchar",
     "unlocker",
     "utxos",
     "utxoservice",
@@ -47,5 +51,6 @@
     "Uxto",
     "verifysignature",
     "xtxo"
-  ]
+  ],
+  "cmake.configureOnOpen": false
 }
