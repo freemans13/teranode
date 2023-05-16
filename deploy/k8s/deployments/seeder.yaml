@@ -27,7 +27,8 @@ spec:
           - name: seeder_grpcAddress
             value: 0.0.0.0:8083
           - name: utxostore
-            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
+            value: aerospike://aerospike-aerospike.aerospike.svc.cluster.local:3000/test
+#            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
           - name: profilerAddr
             value: 0.0.0.0:9091
           - name: JAEGER_AGENT_HOST
@@ -50,28 +51,3 @@ spec:
             limits:
               memory: 2Gi
               cpu: "2"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: seeder-service
-  namespace: seeder-service
-  labels:
-    app: seeder
-    monitor: prometheus
-spec:
-  clusterIP: None
-  ipFamilyPolicy: SingleStack
-  ipFamilies:
-  - IPv4
-  selector:
-    app: seeder
-  ports:
-    - name: tcp
-      port: 8083
-      targetPort: 8083
-      protocol: TCP
-    - name: profiler
-      port: 9091
-      targetPort: 9091
-      protocol: TCP

@@ -1,33 +1,33 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: validation
+  name: kafka-validation
   namespace: validation-service
   labels:
     monitor: prometheus
-    app: validation
+    app: kafka-validation
 spec:
-  replicas: 0
+  replicas: 1
   selector:
     matchLabels:
-      app: validation
+      app: kafka-validation
   template:
     metadata:
       labels:
-        app: validation
+        app: kafka-validation
         monitor: prometheus
     spec:
       containers:
-        - name: validation
+        - name: kafka-validation
           image: eu.gcr.io/PROJECT/IMAGE:TAG
-          args: ["-validator=1"]
+          args: ["-validator=1", "-kafka=kafka://kafka-cluster-headless.kafka.svc.cluster.local:9092/txs"]
           env:
           - name: SETTINGS_CONTEXT
             value: "kubernetes"
           - name: utxostore
-            #value: aerospike://aerospike-aerospike.aerospike.svc.cluster.local:3000/test
-            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
-            #value: foundationdb://foundationdb-exporter-service:9444
+            value: aerospike://aerospike-aerospike.aerospike.svc.cluster.local:3000/test
+#            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
+#            value: foundationdb://foundationdb-exporter-service:9444
           - name: validator_grpcAddress
             value: 0.0.0.0:8081
           - name: profilerAddr
@@ -37,7 +37,7 @@ spec:
           - name: JAEGER_AGENT_PORT
             value: "6831"
           - name: SERVICE_NAME
-            value: validation-service
+            value: kafka-validation-service
           - name: use_cgo_verifier
             value: "true"
           ports:
@@ -54,28 +54,3 @@ spec:
             limits:
               memory: 2Gi
               cpu: "2"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: validation-service
-  namespace: validation-service
-  labels:
-    app: validation
-    monitor: prometheus
-spec:
-  clusterIP: None
-  ipFamilyPolicy: SingleStack
-  ipFamilies:
-  - IPv4
-  selector:
-    app: validation
-  ports:
-    - name: tcp
-      port: 8081
-      targetPort: 8081
-      protocol: TCP
-    - name: profiler
-      port: 9091
-      targetPort: 9091
-      protocol: TCP
