@@ -32,6 +32,8 @@ spec:
               value: k8s:///seeder-service.seeder-service.svc.cluster.local:8083
             - name: profilerAddr
               value: 0.0.0.0:9091
+            - name: tx_blaster_profilerAddr
+              value: 0.0.0.0:9091
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
