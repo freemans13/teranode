@@ -1,5 +1,6 @@
 {
   "cSpell.words": [
+    "Acks",
     "aerospike",
     "Alives",
     "blockassembly",
@@ -17,6 +18,8 @@
     "foundationdb",
     "getsentry",
     "InvVect",
+    "Kustomization",
+    "kustomize",
     "ldflags",
     "lgmp",
     "libsv",
@@ -34,8 +37,10 @@
     "resp",
     "respend",
     "safemap",
+    "sarama",
     "secp256k1",
     "Serialise",
+    "sresolver",
     "stdlib",
     "stretchr",
     "TAAL",
