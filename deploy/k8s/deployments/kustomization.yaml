@@ -9,4 +9,3 @@ resources:
 - seeder.yaml
 - kafka-tx-blaster.yaml
 - kafka-validation.yaml
-- kafka-propagation.yaml
