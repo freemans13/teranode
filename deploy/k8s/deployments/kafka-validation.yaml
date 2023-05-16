@@ -20,7 +20,7 @@ spec:
       containers:
         - name: kafka-validation
           image: eu.gcr.io/PROJECT/IMAGE:TAG
-          args: ["-validator=1", "-kafka=kafka://kafka-cluster-headless.kafka.svc.cluster.local:9092/txs"]
+          args: ["-validator=1"]
           env:
           - name: SETTINGS_CONTEXT
             value: "kubernetes"
@@ -30,6 +30,8 @@ spec:
 #            value: foundationdb://foundationdb-exporter-service:9444
           - name: validator_grpcAddress
             value: 0.0.0.0:8081
+          - name: validator_kafkaBrokers
+            value: kafka://kafka-cluster-headless.kafka.svc.cluster.local:9092/txs
           - name: profilerAddr
             value: 0.0.0.0:9091
           - name: JAEGER_AGENT_HOST

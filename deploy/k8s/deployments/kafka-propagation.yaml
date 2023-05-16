@@ -20,7 +20,7 @@ spec:
       containers:
         - name: kafka-propagation
           image: eu.gcr.io/PROJECT/IMAGE:TAG
-          args: ["-propagation=1", "-kafka=kafka://kafka-cluster-headless.kafka.svc.cluster.local:9092/txs"]
+          args: ["-propagation=1"]
           # command: "You can override the entrypoint with a command."
           #command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
           #command: ["./ubsv.run"]
@@ -29,6 +29,8 @@ spec:
               value: "kubernetes"
             - name: validator_grpcAddress
               value: k8s:///validation-service.validation-service.svc.cluster.local:8081
+            - name: validator_kafkaBrokers
+              value: kafka://kafka-cluster-headless.kafka.svc.cluster.local:9092/txs
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: JAEGER_AGENT_HOST
