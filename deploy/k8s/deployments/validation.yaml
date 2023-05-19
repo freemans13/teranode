@@ -30,6 +30,8 @@ spec:
             #value: foundationdb://foundationdb-exporter-service:9444
           - name: validator_grpcAddress
             value: 0.0.0.0:8081
+          - name: blockassembly_grpcAddress
+            value: k8s:///blockassembly-service.blockassembly-service.svc.cluster.local:8085
           - name: profilerAddr
             value: 0.0.0.0:9091
           - name: JAEGER_AGENT_HOST
