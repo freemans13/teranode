@@ -41,6 +41,7 @@
     "sarama",
     "secp256k1",
     "Serialise",
+    "splitbyhash",
     "sresolver",
     "stdlib",
     "stretchr",
