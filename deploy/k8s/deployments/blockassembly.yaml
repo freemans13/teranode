@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockassembly
+  namespace: blockassembly-service
+  labels:
+    monitor: prometheus
+    app: blockassembly
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blockassembly
+  template:
+    metadata:
+      labels:
+        app: blockassembly
+        monitor: prometheus
+    spec:
+      containers:
+        - name: blockassembly
+          image: eu.gcr.io/PROJECT/IMAGE:TAG
+          args: ["-blockassembly=1"]
+          env:
+          - name: SETTINGS_CONTEXT
+            value: "kubernetes"
+          - name: utxostore
+            #value: memory://:8082
+            value: memory://:8082/splitbyhash
+          - name: JAEGER_AGENT_HOST
+            value: jaeger-cluster-agent.jaeger.svc.cluster.local
+          - name: JAEGER_AGENT_PORT
+            value: "6831"
+          - name: profilerAddr
+            value: 0.0.0.0:9091
+          - name: SERVICE_NAME
+            value: blockassembly-mem
+          ports:
+            - containerPort: 8055
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "0.2"
+            limits:
+              memory: 2Gi
+              cpu: "1"

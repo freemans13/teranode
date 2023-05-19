@@ -5,6 +5,7 @@ resources:
 - propagation.yaml
 - validation.yaml
 - tx-blaster.yaml
+- blockassembly.yaml
 - utxostore.yaml
 - seeder.yaml
 - kafka-tx-blaster.yaml

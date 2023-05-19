@@ -9,6 +9,7 @@
     "CFLAGS",
     "chaincfg",
     "chainhash",
+    "chaintip",
     "dbmode",
     "Debugf",
     "defaultvalidator",
