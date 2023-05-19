@@ -24,16 +24,19 @@ spec:
           env:
           - name: SETTINGS_CONTEXT
             value: "kubernetes"
+          - name: blockassembly_grpcAddress
+            value: 0.0.0.0:8085
           - name: utxostore
             value: aerospike://aerospike-aerospike.aerospike.svc.cluster.local:3000/test
+#            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082          
+          - name: profilerAddr
+            value: 0.0.0.0:9091
           - name: JAEGER_AGENT_HOST
             value: jaeger-cluster-agent.jaeger.svc.cluster.local
           - name: JAEGER_AGENT_PORT
             value: "6831"
-          - name: profilerAddr
-            value: 0.0.0.0:9091
           - name: SERVICE_NAME
-            value: blockassembly-mem
+            value: blockassembly-service
           ports:
             - containerPort: 8055
               protocol: TCP
