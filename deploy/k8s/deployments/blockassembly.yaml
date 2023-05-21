@@ -17,6 +17,15 @@ spec:
         app: blockassembly
         monitor: prometheus
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: blockassembly
+                topologyKey: "kubernetes.io/hostname"
       containers:
         - name: blockassembly
           image: eu.gcr.io/PROJECT/IMAGE:TAG
@@ -45,7 +54,7 @@ spec:
           resources:
             requests:
               memory: 1Gi
-              cpu: "0.2"
+              cpu: "1"
             limits:
               memory: 2Gi
               cpu: "1"

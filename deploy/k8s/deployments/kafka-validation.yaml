@@ -17,6 +17,15 @@ spec:
         app: kafka-validation
         monitor: prometheus
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: kafka-validation
+                topologyKey: "kubernetes.io/hostname"
       containers:
         - name: kafka-validation
           image: eu.gcr.io/PROJECT/IMAGE:TAG
@@ -52,7 +61,7 @@ spec:
           resources:
             requests:
               memory: 500Mi
-              cpu: "0.2"
+              cpu: "2"
             limits:
               memory: 1Gi
               cpu: "2"

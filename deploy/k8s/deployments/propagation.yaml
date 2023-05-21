@@ -17,6 +17,15 @@ spec:
         app: propagation
         monitor: prometheus
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: propagation
+                topologyKey: "kubernetes.io/hostname"
       containers:
         - name: propagation
           image: eu.gcr.io/PROJECT/IMAGE:TAG
@@ -45,7 +54,7 @@ spec:
           resources:
             requests:
               memory: 4Gi
-              cpu: "0.5"
+              cpu: "2"
             limits:
               memory: 8Gi
               cpu: "2"
