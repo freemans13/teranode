@@ -7,7 +7,7 @@ metadata:
     monitor: prometheus
     app: kafka-validation
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: kafka-validation
@@ -34,7 +34,7 @@ spec:
           - name: SETTINGS_CONTEXT
             value: "kubernetes"
           - name: utxostore
-            value: aerospike://admin:admin123@aerospike-aerospike.aerospike.svc.cluster.local:3000/test
+            value: aerospike://admin:admin123@aerospike.aerospike.svc.cluster.local:3000/test
 #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
 #            value: foundationdb://foundationdb-exporter-service:9444
           - name: validator_grpcAddress
