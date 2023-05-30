@@ -44,6 +44,13 @@
       "program": "${workspaceFolder}/playground/validation_spike/main.go"
     },
     {
+      "name": "aero_spike",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/poc/aero_tls/main.go"
+    },
+    {
       "name": "validation_spike",
       "type": "go",
       "request": "launch",
