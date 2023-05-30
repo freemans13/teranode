@@ -6,7 +6,12 @@ resources:
 - validation.yaml
 - tx-blaster.yaml
 - blockassembly.yaml
-- utxostore.yaml
 - seeder.yaml
+- propagation-aerospike.yaml
+- validation-aerospike.yaml
+- tx-blaster-aerospike.yaml
+- blockassembly-aerospike.yaml
+- seeder-aerospike.yaml
+- utxostore.yaml
 - kafka-tx-blaster.yaml
 - kafka-validation.yaml
