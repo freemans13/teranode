@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: seeder
+    monitor: prometheus
+  name: seeder
+  namespace: aerospike-test
+spec:
+  selector:
+    matchLabels:
+      app: seeder
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: seeder
+        monitor: prometheus
+    spec:
+      containers:
+      - args:
+        - -seeder=1
+        env:
+        - name: SETTINGS_CONTEXT
+          value: kubernetes
+        - name: seeder_grpcAddress
+          value: 0.0.0.0:8083
+        - name: utxostore
+          value: aerospike://10.138.0.29:3000/test
+        - name: profilerAddr
+          value: 0.0.0.0:9091
+        - name: JAEGER_AGENT_HOST
+          value: jaeger-cluster-agent.jaeger.svc.cluster.local
+        - name: JAEGER_AGENT_PORT
+          value: "6831"
+        - name: SERVICE_NAME
+          value: seeder-service
+        image: eu.gcr.io/PROJECT/IMAGE:TAG
+        imagePullPolicy: IfNotPresent
+        name: seeder
+        ports:
+        - containerPort: 8083
+          protocol: TCP
+        - containerPort: 9091
+          protocol: TCP
+        - containerPort: 4040
+          protocol: TCP
+        resources:
+          limits:
+            cpu: "2"
+            memory: 2Gi
+          requests:
+            cpu: "2"
+            memory: 1Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

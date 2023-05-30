@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: tx-blaster
+    monitor: prometheus
+  name: tx-blaster
+  namespace: aerospike-test
+spec:
+  selector:
+    matchLabels:
+      app: tx-blaster
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: tx-blaster
+        monitor: prometheus
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: tx-blaster
+              topologyKey: kubernetes.io/hostname
+            weight: 100
+      containers:
+      - args:
+        - -workers=1000
+        - -print=10000
+        command:
+        - ./blaster.run
+        env:
+        - name: SETTINGS_CONTEXT
+          value: kubernetes
+        - name: propagation_grpcAddress
+          value: k8s:///propagation-service.aerospike-test.svc.cluster.local:8084
+        - name: seeder_grpcAddress
+          value: k8s:///seeder-service.aerospike-test.svc.cluster.local:8083
+        - name: profilerAddr
+          value: 0.0.0.0:9091
+        - name: tx_blaster_profilerAddr
+          value: 0.0.0.0:9091
+        - name: JAEGER_AGENT_HOST
+          value: jaeger-cluster-agent.jaeger.svc.cluster.local
+        - name: JAEGER_AGENT_PORT
+          value: "6831"
+        - name: SERVICE_NAME
+          value: tx-blaster-service
+        - name: number_of_outputs
+          value: "5000"
+        - name: use_cgo_signer
+          value: "true"
+        image: eu.gcr.io/PROJECT/IMAGE:TAG
+        imagePullPolicy: IfNotPresent
+        name: tx-blaster
+        ports:
+        - containerPort: 8086
+          protocol: TCP
+        - containerPort: 9091
+          protocol: TCP
+        - containerPort: 4040
+          protocol: TCP
+        resources:
+          limits:
+            cpu: "1"
+            memory: 2Gi
+          requests:
+            cpu: "1"
+            memory: 1Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

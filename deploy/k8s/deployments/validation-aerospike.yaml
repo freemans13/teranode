@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: validation
+    monitor: prometheus
+  name: validation
+  namespace: aerospike-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: validation
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: validation
+        monitor: prometheus
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: validation
+              topologyKey: kubernetes.io/hostname
+            weight: 100
+      containers:
+      - args:
+        - -validator=1
+        command:
+        - ./ubsv.run
+        env:
+        - name: SETTINGS_CONTEXT
+          value: kubernetes
+        - name: utxostore
+          value: aerospike://10.138.0.29:3000/test
+        - name: validator_grpcAddress
+          value: 0.0.0.0:8081
+        - name: blockassembly_grpcAddress
+          value: k8s:///blockassembly-service.aerospike-test.svc.cluster.local:8085
+        - name: profilerAddr
+          value: 0.0.0.0:9091
+        - name: JAEGER_AGENT_HOST
+          value: jaeger-cluster-agent.jaeger.svc.cluster.local
+        - name: JAEGER_AGENT_PORT
+          value: "6831"
+        - name: SERVICE_NAME
+          value: validation-service
+        - name: use_cgo_verifier
+          value: "true"
+        image: eu.gcr.io/PROJECT/IMAGE:TAG
+        imagePullPolicy: IfNotPresent
+        name: validation
+        ports:
+        - containerPort: 8081
+          protocol: TCP
+        - containerPort: 9091
+          protocol: TCP
+        - containerPort: 4040
+          protocol: TCP
+        resources:
+          limits:
+            cpu: "2"
+            memory: 2Gi
+          requests:
+            cpu: "2"
+            memory: 1Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
