@@ -28,7 +28,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: tx-blaster
-          image: eu.gcr.io/PROJECT/IMAGE:TAG
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command:
             - ./blaster.run
           args: ["-workers=1000", "-print=10000"]

@@ -40,7 +40,7 @@ spec:
         - name: SETTINGS_CONTEXT
           value: kubernetes
         - name: utxostore
-          value: aerospike://10.138.0.29:3000/test
+          value: aerospike://192.168.13.144:3000/test
         - name: validator_grpcAddress
           value: 0.0.0.0:8081
         - name: blockassembly_grpcAddress
@@ -55,7 +55,7 @@ spec:
           value: validation-service
         - name: use_cgo_verifier
           value: "true"
-        image: eu.gcr.io/PROJECT/IMAGE:TAG
+        image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
         imagePullPolicy: IfNotPresent
         name: validation
         ports:

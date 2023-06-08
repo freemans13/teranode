@@ -30,7 +30,7 @@ spec:
         - name: seeder_grpcAddress
           value: 0.0.0.0:8083
         - name: utxostore
-          value: aerospike://10.138.0.29:3000/test
+          value: aerospike://192.168.13.144:3000/test
         - name: profilerAddr
           value: 0.0.0.0:9091
         - name: JAEGER_AGENT_HOST
@@ -39,7 +39,7 @@ spec:
           value: "6831"
         - name: SERVICE_NAME
           value: seeder-service
-        image: eu.gcr.io/PROJECT/IMAGE:TAG
+        image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
         imagePullPolicy: IfNotPresent
         name: seeder
         ports:

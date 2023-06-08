@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
         - name: utxostore
-          image: eu.gcr.io/PROJECT/IMAGE:TAG
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: ["-utxostore=1"]
           env:
           - name: SETTINGS_CONTEXT

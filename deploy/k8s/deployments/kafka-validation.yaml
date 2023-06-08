@@ -28,13 +28,13 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: kafka-validation
-          image: eu.gcr.io/PROJECT/IMAGE:TAG
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: ["-validator=1"]
           env:
           - name: SETTINGS_CONTEXT
             value: "kubernetes"
           - name: utxostore
-            value: aerospike://10.138.0.29:3000/test
+            value: aerospike://192.168.13.144:3000/test
 #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
 #            value: foundationdb://foundationdb-exporter-service:9444
           - name: validator_grpcAddress
