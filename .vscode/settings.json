@@ -46,6 +46,7 @@
     "sresolver",
     "stdlib",
     "stretchr",
+    "subtreeprocessor",
     "TAAL",
     "timestamppb",
     "txblaster",
