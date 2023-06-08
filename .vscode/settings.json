@@ -5,6 +5,7 @@
     "Alives",
     "blockassembly",
     "blockstore",
+    "blocktx",
     "bscript",
     "CFLAGS",
     "chaincfg",
