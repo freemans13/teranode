@@ -68,4 +68,7 @@
 
   },
   "go.buildTags": "aerospike,native",
+  "go.languageServerFlags": [
+
+  ],
 }
