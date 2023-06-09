@@ -4,7 +4,7 @@ metadata:
   name: tx-blaster
   namespace: tx-blaster-service
   labels:
-    monitor: prometheus
+
     app: tx-blaster
 spec:
   replicas: 0
@@ -15,7 +15,7 @@ spec:
     metadata:
       labels:
         app: tx-blaster
-        monitor: prometheus
+    
     spec:
       affinity:
         podAntiAffinity:

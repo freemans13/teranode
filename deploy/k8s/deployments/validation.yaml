@@ -4,7 +4,7 @@ metadata:
   name: validation
   namespace: validation-service
   labels:
-    monitor: prometheus
+
     app: validation
 spec:
   replicas: 0
@@ -15,7 +15,7 @@ spec:
     metadata:
       labels:
         app: validation
-        monitor: prometheus
+    
     spec:
       affinity:
         podAntiAffinity:
@@ -34,7 +34,7 @@ spec:
           - name: SETTINGS_CONTEXT
             value: "kubernetes"
           - name: utxostore
-            value: aerospike://192.168.13.144:3000/test
+            value: aerospike://192.168.13.144:3000/utxostore
 #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
             #value: foundationdb://foundationdb-exporter-service:9444
           - name: validator_grpcAddress
