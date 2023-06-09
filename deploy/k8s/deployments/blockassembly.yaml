@@ -36,8 +36,8 @@ spec:
           - name: blockassembly_grpcAddress
             value: 0.0.0.0:8085
           - name: utxostore
-            # value: aerospike://192.168.13.144:3000/test
-            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
+            value: aerospike://192.168.13.144:3000/test
+#            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
           - name: profilerAddr
             value: 0.0.0.0:9091
           - name: JAEGER_AGENT_HOST
@@ -47,7 +47,7 @@ spec:
           - name: SERVICE_NAME
             value: blockassembly-service
           ports:
-            - containerPort: 8055git config --global commit.gpgsign false
+            - containerPort: 8055
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
