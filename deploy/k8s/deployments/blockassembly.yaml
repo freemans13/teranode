@@ -36,8 +36,10 @@ spec:
           - name: blockassembly_grpcAddress
             value: 0.0.0.0:8085
           - name: utxostore
-            value: aerospike://192.168.13.144:3000/test
+            value: aerospike://192.168.13.144:3000/utxostore
 #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
+          - name: txstatus_store
+            value: aerospike://192.168.13.144:3000/txstatus_store
           - name: profilerAddr
             value: 0.0.0.0:9091
           - name: JAEGER_AGENT_HOST
