@@ -4,7 +4,7 @@ metadata:
   name: blockassembly
   namespace: blockassembly-service
   labels:
-    monitor: prometheus
+
     app: blockassembly
 spec:
   replicas: 1
@@ -15,7 +15,7 @@ spec:
     metadata:
       labels:
         app: blockassembly
-        monitor: prometheus
+    
     spec:
       affinity:
         podAntiAffinity:

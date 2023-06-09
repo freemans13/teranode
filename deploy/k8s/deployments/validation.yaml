@@ -4,7 +4,7 @@ metadata:
   name: validation
   namespace: validation-service
   labels:
-    monitor: prometheus
+
     app: validation
 spec:
   replicas: 0
@@ -15,7 +15,7 @@ spec:
     metadata:
       labels:
         app: validation
-        monitor: prometheus
+    
     spec:
       affinity:
         podAntiAffinity:

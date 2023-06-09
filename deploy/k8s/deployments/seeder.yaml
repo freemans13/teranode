@@ -4,7 +4,7 @@ metadata:
   name: seeder
   namespace: seeder-service
   labels:
-    monitor: prometheus
+
     app: seeder
 spec:
   replicas: 1
@@ -15,7 +15,7 @@ spec:
     metadata:
       labels:
         app: seeder
-        monitor: prometheus
+    
     spec:
       containers:
         - name: seeder

@@ -4,7 +4,7 @@ metadata:
   name: propagation
   namespace: propagation-service
   labels:
-    monitor: prometheus
+
     app: propagation
 spec:
   replicas: 0
@@ -15,8 +15,12 @@ spec:
     metadata:
       labels:
         app: propagation
-        monitor: prometheus
+    
     spec:
+      volumes:
+        - name: secret-volume
+          secret:
+            secretName: utxo-writer-gcs-sa
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -32,7 +36,7 @@ spec:
           args: ["-propagation=1"]
           # command: "You can override the entrypoint with a command."
           #command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
-          #command: ["./ubsv.run"]
+#          command: [ "./ubsv.run" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
@@ -51,6 +55,11 @@ spec:
               protocol: TCP
             - containerPort: 4040
               protocol: TCP
+          volumeMounts:
+            - name: secret-volume
+              mountPath: /app/keyfile.json
+              readOnly: true
+              subPath: utxo-writer-ubsv-383015-84d57e41cdda.json
           resources:
             requests:
               memory: 4Gi
