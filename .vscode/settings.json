@@ -63,5 +63,9 @@
     "verifysignature",
     "xtxo"
   ],
-  "cmake.configureOnOpen": false
+  "cmake.configureOnOpen": false,
+  "editor.codeActionsOnSave": {
+
+  },
+  "go.buildTags": "aerospike,native",
 }
