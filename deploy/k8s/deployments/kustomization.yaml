@@ -8,5 +8,3 @@ resources:
 - blockassembly.yaml
 - seeder.yaml
 - utxostore.yaml
-- kafka-tx-blaster.yaml
-- kafka-validation.yaml
