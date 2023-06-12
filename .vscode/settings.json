@@ -36,6 +36,7 @@
     "promauto",
     "promhttp",
     "protobuf",
+    "protoc",
     "pubkey",
     "regtest",
     "resp",
