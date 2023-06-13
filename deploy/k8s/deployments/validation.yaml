@@ -34,7 +34,7 @@ spec:
           - name: SETTINGS_CONTEXT
             value: "kubernetes"
           - name: utxostore
-            value: aerospike://192.168.86.103:3000/utxostore
+            value: aerospike://192.168.88.235:3000/utxostore
 #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
             #value: foundationdb://foundationdb-exporter-service:9444
           - name: validator_grpcAddress

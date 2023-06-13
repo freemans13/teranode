@@ -27,7 +27,7 @@ spec:
           - name: seeder_grpcAddress
             value: 0.0.0.0:8083
           - name: utxostore
-            value: aerospike://192.168.86.103:3000/utxostore
+            value: aerospike://192.168.88.235:3000/utxostore
 #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
           - name: profilerAddr
             value: 0.0.0.0:9091
