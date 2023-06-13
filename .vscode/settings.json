@@ -55,6 +55,7 @@
     "timestamppb",
     "txblaster",
     "txstatus",
+    "txstatusstore",
     "txstore",
     "ubsv",
     "uchar",
