@@ -20,6 +20,7 @@
     "errgroup",
     "foundationdb",
     "getsentry",
+    "halvings",
     "InvVect",
     "Kustomization",
     "kustomize",
