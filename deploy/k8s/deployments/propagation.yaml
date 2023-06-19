@@ -1,10 +1,18 @@
+# service-account for s3 upload
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: s3-push-service-account
+  namespace: validation-service
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::434394763103:role/eks-s3-role-pusher
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: propagation
   namespace: propagation-service
   labels:
-
     app: propagation
 spec:
   replicas: 0
@@ -15,8 +23,8 @@ spec:
     metadata:
       labels:
         app: propagation
-    
     spec:
+      serviceAccountName: s3-push-service-account
       volumes:
         - name: secret-volume
           secret:
@@ -50,6 +58,8 @@ spec:
               value: "6831"
             - name: SERVICE_NAME
               value: propagation-service
+            - name: txstore
+              value: s3://ubsv-utxo-store?region=eu-north-1
           ports:
             - containerPort: 8833
               protocol: TCP
