@@ -4,7 +4,6 @@ metadata:
   name: tx-blaster
   namespace: tx-blaster-service
   labels:
-
     app: tx-blaster
 spec:
   replicas: 0
@@ -15,7 +14,6 @@ spec:
     metadata:
       labels:
         app: tx-blaster
-    
     spec:
       affinity:
         podAntiAffinity:
