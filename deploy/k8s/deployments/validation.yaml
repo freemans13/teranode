@@ -1,12 +1,3 @@
-# service-account for s3 upload
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: s3-push-service-account
-  namespace: validation-service
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::434394763103:role/eks-s3-role-pusher
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
