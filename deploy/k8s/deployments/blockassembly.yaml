@@ -4,7 +4,6 @@ metadata:
   name: blockassembly
   namespace: blockassembly-service
   labels:
-
     app: blockassembly
 spec:
   replicas: 1

@@ -53,7 +53,7 @@ spec:
           - name: use_cgo_verifier
             value: "true"
           - name: txstore
-            value: s3://ubsv-utxo-store?region=eu-north-1
+            value: s3:///ubsv-utxo-store?region=eu-north-1
           ports:
             - containerPort: 8081
               protocol: TCP
