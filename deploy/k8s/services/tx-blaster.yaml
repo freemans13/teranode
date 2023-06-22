@@ -6,7 +6,7 @@ metadata:
   labels:
     app: tx-blaster
   annotations:
-    prometheus.io/port: "9091"
+    prometheus.io/port: "9092"
     prometheus.io/scrape: "true"
 spec:
   ipFamilyPolicy: SingleStack
@@ -22,4 +22,8 @@ spec:
     - name: profiler
       port: 9091
       targetPort: 9091
+      protocol: TCP
+    - name: tx-blaster-profiler
+      port: 9092
+      targetPort: 9092
       protocol: TCP

@@ -5,6 +5,7 @@ metadata:
   namespace: tx-blaster-service
   labels:
     app: tx-blaster
+    project: service
 spec:
   replicas: 0
   selector:
@@ -15,6 +16,7 @@ spec:
       labels:
         app: tx-blaster
     spec:
+      serviceAccountName: s3-push-service-account
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -40,7 +42,7 @@ spec:
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: tx_blaster_profilerAddr
-              value: 0.0.0.0:9091
+              value: 0.0.0.0:9092
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
@@ -55,6 +57,8 @@ spec:
             - containerPort: 8086
               protocol: TCP
             - containerPort: 9091
+              protocol: TCP
+            - containerPort: 9092
               protocol: TCP
             - containerPort: 4040
               protocol: TCP

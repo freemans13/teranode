@@ -4,10 +4,10 @@ metadata:
   name: utxostore
   namespace: utxostore-service
   labels:
-
     app: utxostore
+    project: service
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: utxostore
@@ -15,7 +15,6 @@ spec:
     metadata:
       labels:
         app: utxostore
-    
     spec:
       containers:
         - name: utxostore

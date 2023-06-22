@@ -5,6 +5,7 @@ metadata:
   namespace: blockassembly-service
   labels:
     app: blockassembly
+    project: service
 spec:
   replicas: 1
   selector:
@@ -14,8 +15,8 @@ spec:
     metadata:
       labels:
         app: blockassembly
-    
     spec:
+      serviceAccountName: s3-push-service-account
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -25,6 +26,11 @@ spec:
                   matchLabels:
                     app: blockassembly
                 topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: service
+          value: blockassembly
+          operator: Equal
+          effect: NoSchedule
       containers:
         - name: blockassembly
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG

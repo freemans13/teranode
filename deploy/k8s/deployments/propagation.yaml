@@ -5,8 +5,9 @@ metadata:
   namespace: propagation-service
   labels:
     app: propagation
+    project: service
 spec:
-  replicas: 0
+  replicas: 1
   selector:
     matchLabels:
       app: propagation

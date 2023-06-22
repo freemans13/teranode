@@ -4,8 +4,8 @@ metadata:
   name: seeder
   namespace: seeder-service
   labels:
-
     app: seeder
+    project: service
 spec:
   replicas: 1
   selector:
@@ -15,8 +15,8 @@ spec:
     metadata:
       labels:
         app: seeder
-    
     spec:
+      serviceAccountName: s3-push-service-account
       containers:
         - name: seeder
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG

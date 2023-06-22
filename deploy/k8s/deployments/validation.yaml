@@ -5,8 +5,9 @@ metadata:
   namespace: validation-service
   labels:
     app: validation
+    project: service
 spec:
-  replicas: 0
+  replicas: 1
   selector:
     matchLabels:
       app: validation
