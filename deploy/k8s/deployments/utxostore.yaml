@@ -19,21 +19,21 @@ spec:
       containers:
         - name: utxostore
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: ["-utxostore=1"]
+          args: [ "-utxostore=1" ]
           env:
-          - name: SETTINGS_CONTEXT
-            value: "kubernetes"
-          - name: utxostore
-            #value: memory://:8082
-            value: memory://:8082/splitbyhash
-          - name: JAEGER_AGENT_HOST
-            value: jaeger-cluster-agent.jaeger.svc.cluster.local
-          - name: JAEGER_AGENT_PORT
-            value: "6831"
-          - name: profilerAddr
-            value: 0.0.0.0:9091
-          - name: SERVICE_NAME
-            value: utxostore-mem
+            - name: SETTINGS_CONTEXT
+              value: "kubernetes"
+            - name: utxostore
+              #value: memory://:8082
+              value: memory://:8082/splitbyhash
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: profilerAddr
+              value: 0.0.0.0:9091
+            - name: SERVICE_NAME
+              value: utxostore-mem
           ports:
             - containerPort: 8082
               protocol: TCP

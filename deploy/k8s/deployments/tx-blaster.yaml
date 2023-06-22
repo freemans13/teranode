@@ -31,7 +31,7 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command:
             - ./blaster.run
-          args: ["-workers=1000", "-print=10000"]
+          args: [ "-workers=1000", "-print=10000" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"

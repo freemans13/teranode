@@ -20,23 +20,23 @@ spec:
       containers:
         - name: seeder
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: ["-seeder=1"]
+          args: [ "-seeder=1" ]
           env:
-          - name: SETTINGS_CONTEXT
-            value: "kubernetes"
-          - name: seeder_grpcAddress
-            value: 0.0.0.0:8083
-          - name: utxostore
-            value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
-#            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
-          - name: profilerAddr
-            value: 0.0.0.0:9091
-          - name: JAEGER_AGENT_HOST
-            value: jaeger-cluster-agent.jaeger.svc.cluster.local
-          - name: JAEGER_AGENT_PORT
-            value: "6831"
-          - name: SERVICE_NAME
-            value: seeder-service
+            - name: SETTINGS_CONTEXT
+              value: "kubernetes"
+            - name: seeder_grpcAddress
+              value: 0.0.0.0:8083
+            - name: utxostore
+              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
+            #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
+            - name: profilerAddr
+              value: 0.0.0.0:9091
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: SERVICE_NAME
+              value: seeder-service
           ports:
             - containerPort: 8083
               protocol: TCP

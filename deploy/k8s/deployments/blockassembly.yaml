@@ -34,25 +34,25 @@ spec:
       containers:
         - name: blockassembly
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: ["-blockassembly=1"]
+          args: [ "-blockassembly=1" ]
           env:
-          - name: SETTINGS_CONTEXT
-            value: "kubernetes"
-          - name: blockassembly_grpcAddress
-            value: 0.0.0.0:8085
-          - name: utxostore
-            value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
-#            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
-          - name: txstatus_store
-            value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
-          - name: profilerAddr
-            value: 0.0.0.0:9091
-          - name: JAEGER_AGENT_HOST
-            value: jaeger-cluster-agent.jaeger.svc.cluster.local
-          - name: JAEGER_AGENT_PORT
-            value: "6831"
-          - name: SERVICE_NAME
-            value: blockassembly-service
+            - name: SETTINGS_CONTEXT
+              value: "kubernetes"
+            - name: blockassembly_grpcAddress
+              value: 0.0.0.0:8085
+            - name: utxostore
+              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
+            #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
+            - name: txstatus_store
+              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
+            - name: profilerAddr
+              value: 0.0.0.0:9091
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: SERVICE_NAME
+              value: blockassembly-service
           ports:
             - containerPort: 8055
               protocol: TCP
@@ -60,8 +60,8 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1Gi
+              memory: 10Gi
               cpu: "1"
             limits:
-              memory: 2Gi
+              memory: 10Gi
               cpu: "1"
