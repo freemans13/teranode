@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tx-blaster
+  namespace: tx-blaster-service
+  labels:
+    app: tx-blaster
+    project: service
+spec:
+  restartPolicy: Never
+  serviceAccountName: s3-push-service-account
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: tx-blaster
+            topologyKey: "kubernetes.io/hostname"
+  containers:
+    - name: tx-blaster
+      image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:45117788af45101357e8f51b2ccb6284a378f636
+      command:
+        - ./blaster.run
+      args: ["-workers=1", "-print=10000"]
+      env:
+        - name: SETTINGS_CONTEXT
+          value: "kubernetes"
+        - name: propagation_grpcAddress
+          value: k8s:///propagation-service.propagation-service.svc.cluster.local:8084
+        - name: seeder_grpcAddress
+          value: k8s:///seeder-service.seeder-service.svc.cluster.local:8083
+        - name: profilerAddr
+          value: 0.0.0.0:9091
+        - name: tx_blaster_profilerAddr
+          value: 0.0.0.0:9092
+        - name: JAEGER_AGENT_HOST
+          value: jaeger-cluster-agent.jaeger.svc.cluster.local
+        - name: JAEGER_AGENT_PORT
+          value: "6831"
+        - name: SERVICE_NAME
+          value: tx-blaster-service
+        - name: number_of_outputs
+          value: "5000"
+        - name: use_cgo_signer
+          value: "true"
+      ports:
+        - containerPort: 8086
+          protocol: TCP
+        - containerPort: 9091
+          protocol: TCP
+        - containerPort: 9092
+          protocol: TCP
+        - containerPort: 4040
+          protocol: TCP
+      resources:
+        requests:
+          memory: 1Gi
+          cpu: "1"
+        limits:
+          memory: 2Gi
+          cpu: "1"
