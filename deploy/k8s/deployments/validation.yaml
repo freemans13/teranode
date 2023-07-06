@@ -37,8 +37,6 @@ spec:
               value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
             - name: txstatus_store
               value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
-              #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
-              #value: foundationdb://foundationdb-exporter-service:9444
             - name: validator_grpcAddress
               value: 0.0.0.0:8081
             - name: blockassembly_grpcAddress
@@ -69,3 +67,19 @@ spec:
             limits:
               memory: 2Gi
               cpu: "2"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3

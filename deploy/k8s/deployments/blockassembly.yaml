@@ -53,6 +53,8 @@ spec:
               value: "6831"
             - name: SERVICE_NAME
               value: blockassembly-service
+            - name: blockstore
+              value: minio:///minio:minio123@myminio-hl.minio.svc.cluster.local?9000/block-lake
           ports:
             - containerPort: 8055
               protocol: TCP
@@ -65,3 +67,19 @@ spec:
             limits:
               memory: 10Gi
               cpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3

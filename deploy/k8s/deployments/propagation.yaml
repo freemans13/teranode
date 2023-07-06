@@ -51,7 +51,9 @@ spec:
             - name: SERVICE_NAME
               value: propagation-service
             - name: txstore
-              value: s3:///ubsv-utxo-store?region=eu-north-1
+              value: minio:///minio:minio123@myminio-hl.minio.svc.cluster.local?9000/tx-lake
+            - name: blockstore
+              value: minio:///minio:minio123@myminio-hl.minio.svc.cluster.local?9000/block-lake
           ports:
             - containerPort: 8833
               protocol: TCP
@@ -69,3 +71,19 @@ spec:
             limits:
               memory: 8Gi
               cpu: "2"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
