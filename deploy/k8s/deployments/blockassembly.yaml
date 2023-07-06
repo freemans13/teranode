@@ -54,7 +54,7 @@ spec:
             - name: SERVICE_NAME
               value: blockassembly-service
             - name: blockstore
-              value: minio:///minio:minio123@myminio-hl.minio.svc.cluster.local?9000/block-lake
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
           ports:
             - containerPort: 8055
               protocol: TCP

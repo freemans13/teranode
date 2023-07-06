@@ -51,9 +51,9 @@ spec:
             - name: SERVICE_NAME
               value: propagation-service
             - name: txstore
-              value: minio:///minio:minio123@myminio-hl.minio.svc.cluster.local?9000/tx-lake
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             - name: blockstore
-              value: minio:///minio:minio123@myminio-hl.minio.svc.cluster.local?9000/block-lake
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
           ports:
             - containerPort: 8833
               protocol: TCP
