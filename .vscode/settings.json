@@ -4,6 +4,7 @@
     "aerospike",
     "Alives",
     "bchn",
+    "blobserver",
     "blockassembly",
     "blockstore",
     "blocktx",
