@@ -52,7 +52,7 @@ spec:
               value: propagation-service
             - name: txstore
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
-            - name: blockstore
+            - name: subtreestore
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
           ports:
             - containerPort: 8833
