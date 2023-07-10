@@ -35,8 +35,8 @@ spec:
               value: "kubernetes"
             - name: utxostore
               value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
-            - name: txstatus_store
-              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
+            - name: txmeta_store
+              value: aerospike://tx-status-store-0.ubsv.internal:3000/txmeta_store
             - name: validator_grpcAddress
               value: 0.0.0.0:8081
             - name: blockassembly_grpcAddress
