@@ -65,6 +65,7 @@
     "timestamppb",
     "txblaster",
     "txmeta",
+    "txns",
     "txstatus",
     "txstatusstore",
     "txstore",
