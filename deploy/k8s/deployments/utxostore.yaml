@@ -24,8 +24,8 @@ spec:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
             - name: utxostore
-              #value: memory://:8082
-              value: memory://:8082/splitbyhash
+              value: memory://:8082
+#              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore-miner1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
@@ -33,9 +33,9 @@ spec:
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: SERVICE_NAME
-              value: utxostore-mem
+              value: miner1
           ports:
-            - containerPort: 8082
+            - containerPort: 8089
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
