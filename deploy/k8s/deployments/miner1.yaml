@@ -32,10 +32,7 @@ spec:
           args: [ "-utxostore=1", "-blockassembly=1", "-propagation=1", "-seeder=1", "-validator=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "kubernetes"
-            - name: utxostore
-              #value: memory://:8082
-              value: memory://:8082/splitbyhash
+              value: "dev"
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
@@ -55,11 +52,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1Gi
-              cpu: "20"
+              memory: 8Gi
+              cpu: "4"
             limits:
               memory: 8Gi
-              cpu: "20"
+              cpu: "4"
           readinessProbe:
             httpGet:
               path: /health
@@ -86,7 +83,7 @@ metadata:
     app: tx-blaster-miner1
     project: service
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: tx-blaster-miner1
@@ -113,7 +110,7 @@ spec:
           args: [ "-workers=1", "-print=100" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "kubernetes"
+              value: "dev"
             - name: number_of_outputs
               value: "5000"
             - name: use_cgo_signer
@@ -135,7 +132,7 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1Gi
+              memory: 8Gi
               cpu: "2"
             limits:
               memory: 8Gi
