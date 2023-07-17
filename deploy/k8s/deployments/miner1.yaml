@@ -29,7 +29,7 @@ spec:
       containers:
         - name: miner1
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: [ "-utxostore=1", "-blockassembly=1", "-propagation=1", "-seeder=1", "-validator=1" ]
+          args: [ "-utxostore=1", "-blockassembly=1", "-propagation=1", "-seeder=1", "-validator=1", "-blockvalidation=1", "-blockvalidation=1", "-blockchain=1", "-txmeta=1", "-blobserver=1" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "dev"
@@ -52,11 +52,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 8Gi
-              cpu: "4"
+              memory: 12Gi
+              cpu: "6"
             limits:
-              memory: 8Gi
-              cpu: "4"
+              memory: 12Gi
+              cpu: "6"
           readinessProbe:
             httpGet:
               path: /health
