@@ -29,8 +29,25 @@ spec:
       containers:
         - name: miner3
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: [ "-utxostore=1", "-blockassembly=1", "-propagation=1", "-seeder=1", "-validator=1" ]
           env:
+            - name: blobserver_grpcAddress
+              value: ":8091"
+            - name: blobserver_httpAddress
+              value: ":8090"
+            - name: blockassembly_grpcAddress
+              value: ":8085"
+            - name: blockchain_grpcAddress
+              value: ":8087"
+            - name: blockvalidation_grpcAddress
+              value: ":8088"
+            - name: gocore_stats_addr
+              value: ":9092"
+            - name: propagation_grpcAddress
+              value: ":8084"
+            - name: txmeta_grpcAddress
+              value: ":8086"
+            - name: validator_grpcAddress
+              value: ":8081"
             - name: SETTINGS_CONTEXT
               value: "dev"
             - name: JAEGER_AGENT_HOST
@@ -52,11 +69,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 8Gi
-              cpu: "4"
+              memory: 12Gi
+              cpu: "6"
             limits:
-              memory: 8Gi
-              cpu: "4"
+              memory: 12Gi
+              cpu: "6"
           readinessProbe:
             httpGet:
               path: /health
