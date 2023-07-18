@@ -48,6 +48,8 @@ spec:
               value: ":8086"
             - name: validator_grpcAddress
               value: ":8081"
+            - name: seeder_grpcAddress
+              value: ":8083"
             - name: SETTINGS_CONTEXT
               value: "dev"
             - name: JAEGER_AGENT_HOST
