@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: blockassembly
-  namespace: blockassembly-service
+  name: blockchain
+  namespace: blockchain-service
   labels:
-    app: blockassembly
+    app: blockchain
     project: service
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: blockassembly
+      app: blockchain
   template:
     metadata:
       labels:
-        app: blockassembly
+        app: blockchain
     spec:
       serviceAccountName: s3-push-service-account
       affinity:
@@ -24,29 +24,15 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: blockassembly
+                    app: blockchain
                 topologyKey: "kubernetes.io/hostname"
-      tolerations:
-        - key: service
-          value: blockassembly
-          operator: Equal
-          effect: NoSchedule
       containers:
-        - name: blockassembly
+        - name: blockchain
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: [ "-blockassembly=1" ]
+          args: [ "-blockchain=1" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
-            - name: blockassembly_grpcAddress
-              value: 0.0.0.0:8085
-            - name: utxostore
-              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
-            #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
-            - name: blockchain_grpcAddress
-              value: blockchain-service.blockchain-service.svc.cluster.local:8087
-            - name: txmeta_store
-              value: aerospike://tx-status-store-0.ubsv.internal:3000/txmeta_store
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: JAEGER_AGENT_HOST
@@ -54,21 +40,21 @@ spec:
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
-              value: blockassembly-service
-            - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
+              value: blockchain-service
           ports:
-            - containerPort: 8055
+            - containerPort: 8081
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
           resources:
             requests:
-              memory: 10Gi
-              cpu: "1"
+              memory: 1Gi
+              cpu: "2"
             limits:
-              memory: 10Gi
-              cpu: "1"
+              memory: 2Gi
+              cpu: "2"
           readinessProbe:
             httpGet:
               path: /health
