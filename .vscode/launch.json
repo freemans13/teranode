@@ -10,11 +10,7 @@
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/main.go",
-      "buildFlags": "-tags=aerospike",
-      "env": {
-        "SETTINGS_CONTEXT": "lll",
-      },
-      "args": ["-blockchain=1"]
+      "buildFlags": "-tags=aerospike"
     },
     {
       "name": "server",
