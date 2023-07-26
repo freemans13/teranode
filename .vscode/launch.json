@@ -45,6 +45,13 @@
       "program": "${workspaceFolder}/playground/validation_spike/main.go"
     },
     {
+      "name": "graph_db",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/playground/graph_db/main.go"
+    },
+    {
       "name": "aero_spike",
       "type": "go",
       "request": "launch",
