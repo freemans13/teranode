@@ -5,7 +5,7 @@ metadata:
   namespace: miner3
   labels:
     app: miner3
-    project: service
+    project: miner
 spec:
   replicas: 1
   selector:
@@ -28,10 +28,18 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: miner3
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:2db53fa5275606b1d1141a9daa73caf2930b5fa6
           env:
             - name: blobserver_grpcAddress
               value: ":8091"
+            - name: blobserver_remoteAddress
+              value: "miner3.miner3.svc.cluster.local:8091"
+            - name: blobserver_baseURL
+              value: "http://miner3.miner3.svc.cluster.local:8090"
+            - name: startBootstrapServer
+              value: "false"
+            - name: bootstrap_grpcAddress
+              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8089"
             - name: blobserver_httpAddress
               value: ":8090"
             - name: blockassembly_grpcAddress
@@ -67,6 +75,10 @@ spec:
               protocol: TCP
             - containerPort: 8084
               protocol: TCP
+            - containerPort: 8090
+              protocol: TCP
+            - containerPort: 8091
+              protocol: TCP
             - containerPort: 9091
               protocol: TCP
           resources:
@@ -100,7 +112,7 @@ metadata:
   namespace: miner3
   labels:
     app: tx-blaster-miner3
-    project: service
+    project: miner
 spec:
   replicas: 0
   selector:

@@ -28,6 +28,14 @@ spec:
       port: 8089
       targetPort: 8089
       protocol: TCP
+    - name: blob-http
+      port: 8090
+      targetPort: 8090
+      protocol: TCP
+    - name: blob-grpc
+      port: 8091
+      targetPort: 8091
+      protocol: TCP
     - name: profiler
       port: 9091
       targetPort: 9091
