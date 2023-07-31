@@ -28,7 +28,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: miner2
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:2db53fa5275606b1d1141a9daa73caf2930b5fa6
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           env:
             - name: blobserver_grpcAddress
               value: ":8091"
