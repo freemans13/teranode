@@ -13,6 +13,18 @@
       "buildFlags": "-tags=aerospike"
     },
     {
+      "name": "bootstrap",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/main.go",
+      "buildFlags": "-tags=aerospike",
+      "env": {
+        "SETTINGS_CONTEXT": "xxx"
+      },
+      "args": ["-bootstrap=1"]
+    },
+    {
       "name": "server",
       "type": "go",
       "request": "launch",
