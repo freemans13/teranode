@@ -1,25 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: tx-blaster
-  namespace: tx-blaster-service
+  name: coinbasetracker
+  namespace: coinbasetracker-service
   labels:
-    app: tx-blaster
+    app: coinbasetracker
     project: service
 spec:
-  replicas: 0
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+  replicas: 1
   selector:
     matchLabels:
-      app: tx-blaster
+      app: coinbasetracker
   template:
     metadata:
       labels:
-        app: tx-blaster
+        app: coinbasetracker
     spec:
       serviceAccountName: s3-push-service-account
       affinity:
@@ -29,53 +24,74 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: tx-blaster
+                    app: coinbasetracker
                 topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: service
+          value: coinbasetracker
+          operator: Equal
+          effect: NoSchedule
       containers:
-        - name: tx-blaster
+        - name: postgres-sidecar
+          image: postgres:latest
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              value: "really_strong_password_change_me"
+            - name: POSTGRES_DB
+              value: "miner_coinbase"
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "0.5"
+            limits:
+              memory: 2Gi
+              cpu: "1"
+          readinessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+        - name: coinbasetracker
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          command:
-            - ./blaster.run
-          args: [ "-workers=1000", "-print=10000" ]
+          args: [ "-coinbasetracker=1" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
-            - name: propagation_grpcAddress
-              value: k8s:///propagation-service.propagation-service.svc.cluster.local:8084
-            - name: seeder_grpcAddress
-              value: k8s:///seeder-service.seeder-service.svc.cluster.local:8083
             - name: coinbasetracker_grpcAddress
-              value: k8s:///coinbasetracker.coinbasetracker-service.svc.cluster.local:8092
+              value: 0.0.0.0:8092
             - name: profilerAddr
               value: 0.0.0.0:9091
-            - name: tx_blaster_profilerAddr
-              value: 0.0.0.0:9092
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
-              value: tx-blaster-service
-            - name: number_of_outputs
-              value: "5000"
-            - name: use_cgo_signer
-              value: "true"
+              value: coinbasetracker-service
           ports:
-            - containerPort: 8086
+            - containerPort: 8092
               protocol: TCP
             - containerPort: 9091
-              protocol: TCP
-            - containerPort: 9092
-              protocol: TCP
-            - containerPort: 4040
               protocol: TCP
           resources:
             requests:
               memory: 1Gi
-              cpu: "1"
+              cpu: "0.5"
             limits:
-              memory: 2Gi
-              cpu: "1"
+              memory: 1Gi
+              cpu: "0.5"
           readinessProbe:
             httpGet:
               path: /health

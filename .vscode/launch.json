@@ -10,7 +10,10 @@
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/main.go",
-      "buildFlags": "-tags=aerospike"
+      "buildFlags": "-tags=aerospike",
+      "env": {
+        "miner_waitSeconds": "0",
+      }
     },
     {
       "name": "bootstrap",

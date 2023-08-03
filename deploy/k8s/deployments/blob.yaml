@@ -31,8 +31,7 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-blobserver=1" ]
           env:
-            - name: bootstrap_grpcAddress
-              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8089"
+            
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
             - name: profilerAddr
