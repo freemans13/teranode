@@ -27,6 +27,38 @@ spec:
                     app: miner2
                 topologyKey: "kubernetes.io/hostname"
       containers:
+        - name: postgres-sidecar
+          image: postgres:latest
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              value: "really_strong_password_change_me"
+            - name: POSTGRES_DB
+              value: "miner_coinbase"
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "0.5"
+            limits:
+              memory: 2Gi
+              cpu: "1"
+          readinessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
         - name: miner2
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           env:
@@ -34,12 +66,12 @@ spec:
               value: ":8091"
             - name: blobserver_remoteAddress
               value: "miner2.miner2.svc.cluster.local:8091"
+            - name: blobserver_remoteAddresses
+              value: "miner3.miner3.svc.cluster.local:8091|miner1.miner1.svc.cluster.local:8091"
             - name: blobserver_baseURL
               value: "http://miner2.miner2.svc.cluster.local:8090"
             - name: startBootstrapServer
               value: "false"
-            - name: bootstrap_grpcAddress
-              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8089"
             - name: blobserver_httpAddress
               value: ":8090"
             - name: blockassembly_grpcAddress
