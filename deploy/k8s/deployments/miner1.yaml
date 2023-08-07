@@ -30,6 +30,16 @@ spec:
         - name: miner
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           env:
+            - name: utxostore # todo joe to create a better postgres db
+              value: postgres://miner1:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
+            - name: txmeta_store
+              value: postgres://miner1:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
+            - name: blockchain_store
+              value: postgres://miner1:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
+            - name: txstore
+              value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
+            - name: subtreestore
+              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
             - name: blobserver_grpcAddress
               value: ":8091"
             - name: blobserver_remoteAddress

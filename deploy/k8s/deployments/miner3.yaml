@@ -30,6 +30,16 @@ spec:
         - name: miner
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           env:
+            - name: utxostore
+              value: postgres://miner3:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
+            - name: txmeta_store
+              value: postgres://miner3:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
+            - name: blockchain_store
+              value: postgres://miner3:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
+            - name: txstore
+              value: s3:///ubsv-utxo-store?region=eu-north-1
+            - name: subtreestore
+              value: s3:///ubsv-subtree-store?region=eu-north-1
             - name: blobserver_grpcAddress
               value: ":8091"
             - name: blobserver_remoteAddress
