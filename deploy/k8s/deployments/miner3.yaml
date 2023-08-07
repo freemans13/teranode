@@ -79,6 +79,8 @@ spec:
               protocol: TCP
             - containerPort: 8091
               protocol: TCP
+            - containerPort: 8092
+              protocol: TCP
             - containerPort: 9091
               protocol: TCP
           resources:
