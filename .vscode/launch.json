@@ -13,7 +13,8 @@
       "buildFlags": "-tags=aerospike",
       "env": {
         "miner_waitSeconds": "0",
-      }
+      },
+      "args": ["-blockassembly=1"]
     },
     {
       "name": "bootstrap",
