@@ -31,21 +31,26 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           env:
             - name: utxostore
-              value: postgres://miner3:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
+              value: postgres://miner3:randompassword3@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
             - name: txmeta_store
-              value: postgres://miner3:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
+              value: postgres://miner3:randompassword3@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
             - name: blockchain_store
-              value: postgres://miner3:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
+              value: postgres://miner3:randompassword3@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
             - name: txstore
               value: s3:///ubsv-utxo-store?region=eu-north-1
             - name: subtreestore
               value: s3:///ubsv-subtree-store?region=eu-north-1
+            - name: startTxMetaStore
+              value: "false"
+            - name: startCoinbaseTracker
+              value: "false"
             - name: blobserver_grpcAddress
               value: ":8091"
             - name: blobserver_remoteAddress
               value: "miner3.miner3.svc.cluster.local:8091"
             - name: blobserver_remoteAddresses
-              value: "miner2.miner2.svc.cluster.local:8091|miner1.miner1.svc.cluster.local:8091"
+#              value: "miner2.miner2.svc.cluster.local:8091|miner1.miner1.svc.cluster.local:8091"
+              value: ""
             - name: blobserver_baseURL
               value: "http://miner3.miner3.svc.cluster.local:8090"
             - name: startBootstrapServer
@@ -148,3 +153,4 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+

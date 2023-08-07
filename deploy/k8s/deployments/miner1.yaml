@@ -40,12 +40,17 @@ spec:
               value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
             - name: subtreestore
               value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
+            - name: startTxMetaStore
+              value: "false"
+            - name: startCoinbaseTracker
+              value: "false"
             - name: blobserver_grpcAddress
               value: ":8091"
             - name: blobserver_remoteAddress
               value: "miner1.miner1.svc.cluster.local:8091"
             - name: blobserver_remoteAddresses
-              value: "miner2.miner2.svc.cluster.local:8091|miner3.miner3.svc.cluster.local:8091"
+#              value: "miner2.miner2.svc.cluster.local:8091|miner3.miner3.svc.cluster.local:8091"
+              value: ""
             - name: blobserver_baseURL
               value: "http://miner1.miner1.svc.cluster.local:8090"
             - name: startBootstrapServer
@@ -148,3 +153,4 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+
