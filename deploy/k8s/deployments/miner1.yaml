@@ -36,7 +36,7 @@ spec:
               value: postgres://miner1:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
             - name: blockchain_store
               value: postgres://miner1:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
-            - name: txstore
+            - name: txstore # todo change bucket txstore
               value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
             - name: subtreestore
               value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
@@ -44,13 +44,14 @@ spec:
               value: "false"
             - name: startCoinbaseTracker
               value: "false"
+            - name: startUtxoStore
+              value: "false"
             - name: blobserver_grpcAddress
               value: ":8091"
             - name: blobserver_remoteAddress
               value: "miner1.miner1.svc.cluster.local:8091"
             - name: blobserver_remoteAddresses
-#              value: "miner2.miner2.svc.cluster.local:8091|miner3.miner3.svc.cluster.local:8091"
-              value: ""
+              value: "miner2.miner2.svc.cluster.local:8091|miner3.miner3.svc.cluster.local:8091"
             - name: blobserver_baseURL
               value: "http://miner1.miner1.svc.cluster.local:8090"
             - name: startBootstrapServer

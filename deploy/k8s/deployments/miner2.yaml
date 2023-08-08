@@ -44,13 +44,14 @@ spec:
               value: "false"
             - name: startCoinbaseTracker
               value: "false"
+            - name: startUtxoStore
+              value: "false"
             - name: blobserver_grpcAddress
               value: ":8091"
             - name: blobserver_remoteAddress
               value: "miner2.miner2.svc.cluster.local:8091"
             - name: blobserver_remoteAddresses
-#              value: "miner3.miner3.svc.cluster.local:8091|miner1.miner1.svc.cluster.local:8091"
-              value: ""
+              value: "miner3.miner3.svc.cluster.local:8091|miner1.miner1.svc.cluster.local:8091"
             - name: blobserver_baseURL
               value: "http://miner2.miner2.svc.cluster.local:8090"
             - name: startBootstrapServer
