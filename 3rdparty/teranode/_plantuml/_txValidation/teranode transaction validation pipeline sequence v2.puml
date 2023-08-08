@@ -23,10 +23,10 @@ database "MempoolCache\n(in-memory)" as mempoolcache <<component>>
 loop Messages received by Teranode
 |||
 note over bsn, eventbus
-    All in-memory Cache's and KV Stores depicted in this 
+    All in-memory Cache's and KV Stores depicted in this
     diagram are sharded.
 
-    Aditionally the EventBus is sharded with multiple 
+    Aditionally the EventBus is sharded with multiple
     partitions per topic
 end note
     bsv o--> bsn : tx bitcoin protocol\nmessage received
@@ -50,7 +50,7 @@ end loop
 note over eventbus
     storeTxMsg, storeUtxoMsg, ValidatetxMsg
     are published and consumed in parallel
-    as there are no dependencies which will 
+    as there are no dependencies which will
     cause a failure in operation
 end note
 par
@@ -68,7 +68,7 @@ par
 else
     |||
     note over utxostorage, utxostorage2
-        UtxoStorage component has been separated to 
+        UtxoStorage component has been separated to
         include a read only instance and a write only
         instance for separation of concerns; allowing
         UtxoStorage to write, whilst fetching utxo's

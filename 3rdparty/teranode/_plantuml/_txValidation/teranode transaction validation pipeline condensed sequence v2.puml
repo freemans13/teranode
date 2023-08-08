@@ -10,7 +10,7 @@ box "Transaction Validation Service" #white
     participant "TxStorage" as txstorage <<component>>
     participant "TxValidator" as txvalidator <<component>>
     database "TxStore\n(KV store)" as txstore <<external>>
-end box 
+end box
 
 box "Utxo Storage Service" #white
     participant "UtxoStorage\n(write only)" as utxostorage <<component>>

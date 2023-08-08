@@ -14,14 +14,14 @@ loop message consumed by UtxoStorage (UtxoFetchMsg)
     eventbus --> utxofetchhandler : consume UtxoFetchMsg
     activate utxofetchhandler
         note over utxofetchhandler
-            Retrieves the requested UTXO from the database,  
+            Retrieves the requested UTXO from the database,
             with the state of the retrieved UTXO unmodified.
 
-            The call may return immediately if the UTXO is located 
-            in nearby storage, or may be belated if several storage 
-            levels need to be searched. 
-            
-            In the later case tha call context will provide a 
+            The call may return immediately if the UTXO is located
+            in nearby storage, or may be belated if several storage
+            levels need to be searched.
+
+            In the later case tha call context will provide a
             CompletableFuture to wait on until the search completes.
         end note
         utxofetchhandler --> utxostorage2 : fetchUtxo
@@ -41,7 +41,7 @@ loop message consumed by UtxoStorage (UtxoFetchMsg)
                     utxostorage2 --> utxofetchhandler : return
                 end
                 note over utxostorage2
-                    The txo must be null which suggests 
+                    The txo must be null which suggests
                     that it is not the database.
                 end note
                 utxostorage2 --> segmentmanager : tryGetOrPut
@@ -52,7 +52,7 @@ loop message consumed by UtxoStorage (UtxoFetchMsg)
                         alt if item was not found
                             utxocache --> utxocache : put item
                         end
-                        utxocache --> segmentmanager : return item    
+                        utxocache --> segmentmanager : return item
                     deactivate utxocache
                     segmentmanager --> utxostorage2 : return utxoItem
                 deactivate segmentmanager
@@ -75,7 +75,7 @@ loop message consumed by UtxoStorage (UtxoFetchMsg)
                             utxostorage2 --> utxostorage2 : log error
                         end
                         utxostorage2 --> utxostorage2 : response state\nset to complete
-                    end 
+                    end
             deactivate utxostorage2
             utxostorage2 --> utxofetchhandler : return response state
         deactivate utxostorage2

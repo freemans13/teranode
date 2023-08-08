@@ -15,7 +15,7 @@ loop message consumed by TxManager ( utxStoreCollectionProcessMsg )
         alt if returnUtxoStore has no failures
             note over utxostorecollectionprocesshandler
                 no failures found in the item,
-                therefore we can validate the 
+                therefore we can validate the
                 transaction
             end note
             utxostorecollectionprocesshandler --> utxostorecollectionprocesshandler : create ValidateTxMsg

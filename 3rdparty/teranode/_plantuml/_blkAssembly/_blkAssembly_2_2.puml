@@ -13,10 +13,10 @@ loop message consumed by UtxoStorage ( utxoSpendMsg )
     |||
     note over utxospendhandler
         UTXO verifies that coin is accepted and not
-        yet spent in the given tmplTipId chain by 
-        some other transaction. 
-        
-        AOL Record to spend the utxo is added to the AOL.     
+        yet spent in the given tmplTipId chain by
+        some other transaction.
+
+        AOL Record to spend the utxo is added to the AOL.
     end note
     |||
     eventbus o--> utxospendhandler :  consume utxoSpendMsg

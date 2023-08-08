@@ -97,7 +97,7 @@ par
                         blockvalidator --> blockvalidator :finishBlockValidation
                     end
                 deactivate blockvalidator
-        end 
+        end
     end loop
     blockvalidationManager --> blockvalidationManager : OutputsStored
     activate blockvalidationManager
@@ -154,7 +154,7 @@ else
                 else
                     utxostorage --> utxostorage : mark as failed
                 end
-            end                    
+            end
         end loop
         utxostorage --> eventbus : publish ReturnUtxoStoreGroupedMsg
     deactivate utxostorage

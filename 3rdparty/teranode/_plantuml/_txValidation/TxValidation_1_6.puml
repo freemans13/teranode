@@ -42,7 +42,7 @@ loop messaged consumed by TxValidator (ReturnUtxoFetchMsg)
                 note over txvalidator
                     Check rule RMT314
                 end note
-                txvalidator --> txvalidator : validateInAndOutValueMatch    
+                txvalidator --> txvalidator : validateInAndOutValueMatch
                 alt if they do not match
                         txvalidator --> txvalidator :return ValidationState
                 end

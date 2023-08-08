@@ -16,10 +16,10 @@ participant "Mempool" as mempool <<component>>
 loop Messages received by Teranode
 |||
 note over bsn, eventbus
-    All in-memory Cache's and KV Stores depicted in this 
+    All in-memory Cache's and KV Stores depicted in this
     diagram are sharded.
 
-    Aditionally the EventBus is sharded with multiple 
+    Aditionally the EventBus is sharded with multiple
     partitions per topic, in order to handle demand
 end note
     bsv o--> bsn : tx bitcoin protocol\nmessage received
@@ -33,7 +33,7 @@ end loop
 loop message consumed by TxManager ( newTxMsg )
 |||
     note over txmanager
-        An unconfirmed transaction has been sent 
+        An unconfirmed transaction has been sent
         into the pipeline
     end note
     eventbus o--> txmanager : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_1.svg?csf=1&web=1&e=entMsY{Tooltip for message} newTxMsg]]
@@ -47,13 +47,13 @@ loop message consumed by TxManager ( newTxMsg )
 end loop
 par
     note over txmanager
-        In parallel the store of the utxo and 
+        In parallel the store of the utxo and
         the utxo store collection will take place
     end note
     loop message consumed by UtxoStorage ( UtxoStoreMsg )
     |||
         note over txmanager
-            Handles requests to store new TXOs created 
+            Handles requests to store new TXOs created
             by unconfirmed transactions to UtxoStorage
         end note
         eventbus o--> utxostorage : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_2.svg?csf=1&web=1&e=hnemkx{Tooltip for message} UtxoStoreMsg]]
@@ -73,7 +73,7 @@ else
             input transaction.  This is a collection as
             many UTXO's maybe spent
         end note
-        eventbus o--> txmanager : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_3.svg?csf=1&web=1&e=2pmYTr{Tooltip for message} utxoStoreCollectionProcessMsg]] 
+        eventbus o--> txmanager : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_3.svg?csf=1&web=1&e=2pmYTr{Tooltip for message} utxoStoreCollectionProcessMsg]]
         activate txmanager
             txmanager --> txmanager : create ValidateTxMsg
             txmanager --> eventbus : publish ValidateTxMsg
@@ -84,21 +84,21 @@ else
     loop message consumed by TxValidator ( validatetxMsg )
     |||
         note over txmanager
-            Now that the UTXOs have been validated, we can 
+            Now that the UTXOs have been validated, we can
             start validation of the transaction
         end note
-        eventbus o--> txvalidator : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_4.svg?csf=1&web=1&e=a9raFM{Tooltip for message} validateTxMsg]]    
+        eventbus o--> txvalidator : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_4.svg?csf=1&web=1&e=a9raFM{Tooltip for message} validateTxMsg]]
         activate txvalidator
             txvalidator --> txvalidator : create UtxoFetchMsg
-            txvalidator --> eventbus : publish UtxoFetchMsg  
-        deactivate txvalidator        
+            txvalidator --> eventbus : publish UtxoFetchMsg
+        deactivate txvalidator
     |||
     end loop
 end
 |||
 loop message consumed by UtxoStorage (UtxoFetchMsg)
     note over txmanager
-        Handles requests to fetch TXOs that are spent 
+        Handles requests to fetch TXOs that are spent
         by unconfirmed transactions from UtxoStorage
     end note
     eventbus --> utxostorage2 : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_5.svg?csf=1&web=1&e=Nu8Kiq{Tooltip for message} UtxoFetchMsg]]
@@ -111,10 +111,10 @@ end loop
 loop messaged consumed by TxValidator (ReturnUtxoFetchMsg)
 |||
     note over txmanager
-        UTXOs being spent in the transactions are 
+        UTXOs being spent in the transactions are
         returned from different shards
     end note
-    eventbus --> txvalidator : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_6.svg?csf=1&web=1&e=S3mRCB{Tooltip for message} ReturnUtxoFetchMsg]] 
+    eventbus --> txvalidator : consume [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_6.svg?csf=1&web=1&e=S3mRCB{Tooltip for message} ReturnUtxoFetchMsg]]
     activate txvalidator
         txvalidator --> txvalidator : create ValidateTxResultMsg
         txvalidator --> eventbus : publish ValidateTxResultMsg
@@ -126,7 +126,7 @@ loop message consumed by Mempool ( ValidateTxResultMsg )
 |||
     note over txmanager
         the transaction has completed validation and
-        can be inserted into the mempool for an included 
+        can be inserted into the mempool for an included
         in the current block template
     end note
     eventbus o--> mempool : consume  [[https://ncryptnchain.sharepoint.com/:u:/r/sites/Teranode/Shared%20Documents/Architecture/Sequence%20Diagrams/transaction_validation/transaction_validation_1_7.svg?csf=1&web=1&e=Q0k9VE{Tooltip for message} ValidateTxResultMsg]]

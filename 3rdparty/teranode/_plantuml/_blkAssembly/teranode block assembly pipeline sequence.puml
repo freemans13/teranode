@@ -34,10 +34,10 @@ loop message consumed by BlockAssembler ( addToBlockTemplateMsg )
 |||
     |||
     note over validatetxresulthandler
-        Instructs BlockAssembler to add transaction to the mining block template identified with 
-        tmplTipId. Mempool also supplies seqNo, which is an monotonically increasing number. 
-        BlockAssembler can use the seqNo to identify transaction gaps that are caused by message 
-        reordering in the framework.   
+        Instructs BlockAssembler to add transaction to the mining block template identified with
+        tmplTipId. Mempool also supplies seqNo, which is an monotonically increasing number.
+        BlockAssembler can use the seqNo to identify transaction gaps that are caused by message
+        reordering in the framework.
     end note
     |||
     eventbus o--> addtoblocktemplatehandler : consume addToBlockTemplateMsg
@@ -49,7 +49,7 @@ loop message consumed by BlockAssembler ( addToBlockTemplateMsg )
             blockassembler --> blocktemplate : add transactions
             par
             activate blocktemplate
-                blockassembler --> blockassembler : create pipeline\nmessage 
+                blockassembler --> blockassembler : create pipeline\nmessage
                 blockassembler --> addtoblocktemplatehandler : return message
         deactivate blockassembler
         addtoblocktemplatehandler --> eventbus : publish getActiveMsg to topic
@@ -65,7 +65,7 @@ loop message consumed by BlockAssembler ( addToBlockTemplateMsg )
             deactivate blocktemplate
         |||
         end loop
-    end   
+    end
 |||
 end loop
 |||
@@ -74,10 +74,10 @@ loop message consumed by UtxoStorage ( utxoSpendMsg )
     |||
     note over validatetxresulthandler
         UTXO verifies that coin is accepted and not
-        yet spent in the given tmplTipId chain by 
-        some other transaction. 
-        
-        AOL Record to spend the utxo is added to the AOL.     
+        yet spent in the given tmplTipId chain by
+        some other transaction.
+
+        AOL Record to spend the utxo is added to the AOL.
     end note
     |||
     eventbus o--> utxospendhandler :  consume utxoSpendMsg
@@ -102,8 +102,8 @@ loop message consumed by UtxoStorage ( returnUtxoSpendMsg)
     loop collect utxos for spending
         |||
         note over validatetxresulthandler
-            Record to accept transaction’s outputs 
-            is written into AOL.     
+            Record to accept transaction’s outputs
+            is written into AOL.
         end note
         |||
         eventbus o--> utxoproducerracceptedhandler : consume utxoProducerAcceptedMsg
@@ -111,12 +111,12 @@ loop message consumed by UtxoStorage ( returnUtxoSpendMsg)
             utxoproducerracceptedhandler --> utxostorage : utxoProducerAcceptMsg\nsent for processing
             activate utxostorage
                 utxostorage --> utxostorage : producerAccepted
-                utxostorage --> utxoproducerracceptedhandler : return responseMsg 
+                utxostorage --> utxoproducerracceptedhandler : return responseMsg
             deactivate utxostorage
             utxoproducerracceptedhandler --> eventbus : publish responseMsg to collection target
         deactivate utxoproducerracceptedhandler
     end loop
-    
+
 |||
 end loop
 @enduml

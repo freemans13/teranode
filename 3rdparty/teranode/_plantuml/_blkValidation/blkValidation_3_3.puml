@@ -42,11 +42,11 @@ loop message consumed by Block Validation Manager ( storeBlockTxOutputsMsg )
                     end
                 deactivate blockvalidator
             end
-        end 
+        end
     end loop
     note over blockvalidationManager
-        Called when all outputs of a given batch were 
-        successfully stored.  This can trigger fetching 
+        Called when all outputs of a given batch were
+        successfully stored.  This can trigger fetching
         the batch inputs and storing outputs of other batches.
     end note
     storeblocktxoutputshandler --> blockvalidationManager : OutputsStored

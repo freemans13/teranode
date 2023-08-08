@@ -46,4 +46,3 @@ To run bitcoin-cli, run the following command:
 ```bash
 docker exec -it bitcoin-regtest /bitcoin-cli <command>
   ```
-

@@ -15,10 +15,10 @@ loop message consumed by UtxoStorage ( UtxoStoreMsg )
     eventbus o--> storeutxohandler : consume UtxoStoreMsg
     activate storeutxohandler
         note over utxostorage
-            Stores the information about the UTXO, identified with key, 
-            into the UTXO database. The UTXO information consists of the 
-            script and the satoshi value, and is provided via parameter coin. 
-            The UTXO is stored in the context of the chain tip identified 
+            Stores the information about the UTXO, identified with key,
+            into the UTXO database. The UTXO information consists of the
+            script and the satoshi value, and is provided via parameter coin.
+            The UTXO is stored in the context of the chain tip identified
             with the tipId
         end note
         storeutxohandler --> utxostorage : storeUtxo
@@ -39,7 +39,7 @@ loop message consumed by UtxoStorage ( UtxoStoreMsg )
                     deactivate segmentmanager
                     alt if utxo code is intermin
                         note over segmentmanager
-                            If this partial UtxoItem was just created (merge callback list contains 
+                            If this partial UtxoItem was just created (merge callback list contains
                             only just added entry) then trigger the asynchronous search for the item
                         end note
                         utxostorage --> utxostorage : set store to true
@@ -55,13 +55,13 @@ loop message consumed by UtxoStorage ( UtxoStoreMsg )
                         activate segmentmanager
                             segmentmanager --> utxocache : put
                         deactivate segmentmanager
-                        
+
                     else if utxo code is complete
                         note over segmentmanager
-                            UTXO is already in the database, which implies the script being 
+                            UTXO is already in the database, which implies the script being
                             already stored, nothing to do
                         end note
-                    end 
+                    end
                     alt if store is true
                         utxostorage --> segmentmanager : putScript
                         activate segmentmanager

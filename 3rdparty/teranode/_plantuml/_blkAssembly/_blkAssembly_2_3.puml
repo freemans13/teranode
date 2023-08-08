@@ -17,8 +17,8 @@ loop message consumed by UtxoStorage ( returnUtxoSpendMsg)
     loop collect utxos for spending
         |||
         note over utxoproducerracceptedhandler
-            Record to accept transaction’s outputs 
-            is written into AOL.     
+            Record to accept transaction’s outputs
+            is written into AOL.
         end note
         |||
         eventbus o--> utxoproducerracceptedhandler : consume utxoProducerAcceptedMsg
@@ -26,12 +26,12 @@ loop message consumed by UtxoStorage ( returnUtxoSpendMsg)
             utxoproducerracceptedhandler --> utxostorage : utxoProducerAcceptMsg\nsent for processing
             activate utxostorage
                 utxostorage --> utxostorage : producerAccepted
-                utxostorage --> utxoproducerracceptedhandler : return responseMsg 
+                utxostorage --> utxoproducerracceptedhandler : return responseMsg
             deactivate utxostorage
             utxoproducerracceptedhandler --> eventbus : publish responseMsg to collection target
         deactivate utxoproducerracceptedhandler
     end loop
-    
+
 |||
 end loop
 @enduml

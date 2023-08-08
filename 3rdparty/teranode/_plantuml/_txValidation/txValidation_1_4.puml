@@ -15,13 +15,13 @@ loop message consumed by TxValidator ( validatetxMsg )
 
         For Review:
             This handler and its function should be
-            removed and the 2 messages created where the 
+            removed and the 2 messages created where the
             validateTxMsg is created
     end note
     eventbus o--> validatetxhandler : consume validateTxMsg
     activate validatetxhandler
         validatetxhandler --> txvalidator : validateNewTx
-    deactivate validatetxhandler 
+    deactivate validatetxhandler
     activate txvalidator
         txvalidator --> txvalidator : create\nUtxoFetchCollectionProcessMsg
         txvalidator --> eventbus : publish UtxoFetchCollectionProcessMsg
@@ -31,7 +31,7 @@ loop message consumed by TxValidator ( validatetxMsg )
             txvalidator --> eventbus : publish UtxoFetchMsg
         |||
         end loop
-    deactivate txvalidator             
+    deactivate txvalidator
 |||
 end loop
 @enduml

@@ -18,17 +18,17 @@ end loop
         validatetxresulthandler --> mempool : addTransaction
     deactivate validatetxresulthandler
     activate mempool
-        mempool --> mempool : addTransactionImpl 
+        mempool --> mempool : addTransactionImpl
         activate mempool
             alt if not acceptingTransactions
                 mempool --> mempool : log info
                 mempool --> mempool : return
             end
             alt if txPool containsKey
-                mempool --> mempool : log trace 
+                mempool --> mempool : log trace
                 mempool --> mempool : return
             else
-                mempool --> mempool : log trace 
+                mempool --> mempool : log trace
             end
             mempool --> mempoolcache : put
             mempool --> mempool : populate transactions\ngraph
@@ -48,7 +48,7 @@ end loop
                             alt if spenders is not null
                                 mempool --> mempool : spenders stream
                             end
-                        end loop 
+                        end loop
                     deactivate mempool
                 else
                     alt if rebasing is null
@@ -83,7 +83,7 @@ end loop
                                         mempoolsupplier --> eventbus : publish MsgCollection
                                     deactivate mempoolsupplier
                                 deactivate mempool
-                            else 
+                            else
                                 mempool --> mempool : log trace
                             end
                     else
@@ -104,7 +104,7 @@ end loop
                         alt if spenders is not null
                             mempool --> mempool : spenders stream
                         end
-                    end loop 
+                    end loop
                 deactivate mempool
             end
         deactivate mempool

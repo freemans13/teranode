@@ -40,10 +40,10 @@ database "MempoolCache\n(in-memory)" as mempoolcache <<component>>
 loop Messages received by Teranode
 |||
 note over bsn, eventbus
-    All in-memory Cache's and KV Stores depicted in this 
+    All in-memory Cache's and KV Stores depicted in this
     diagram are sharded.
 
-    Aditionally the EventBus is sharded with multiple 
+    Aditionally the EventBus is sharded with multiple
     partitions per topic, in order to handle demand
 end note
     bsv o--> bsn : tx bitcoin protocol\nmessage received
@@ -141,7 +141,7 @@ par
                         deactivate segmentmanager
                         alt if utxo code is intermin
                             note over segmentmanager
-                                If this partial UtxoItem was just created (merge callback list contains 
+                                If this partial UtxoItem was just created (merge callback list contains
                                 only just added entry) then trigger the asynchronous search for the item
                             end note
                             utxostorage --> utxostorage : set store to true
@@ -157,13 +157,13 @@ par
                             activate segmentmanager
                                 segmentmanager --> utxocache : put
                             deactivate segmentmanager
-                            
+
                         else if utxo code is complete
                             note over segmentmanager
-                                UTXO is already in the database, which implies the script being 
+                                UTXO is already in the database, which implies the script being
                                 already stored, nothing to do
                             end note
-                        end 
+                        end
                         alt if store is true
                             utxostorage --> segmentmanager : putScript
                             activate segmentmanager
@@ -213,7 +213,7 @@ else
         eventbus o--> validatetxhandler : consume validateTxMsg
         activate validatetxhandler
             validatetxhandler --> txvalidatorsupplier : broadcast(validateTxMsg)
-        deactivate validatetxhandler 
+        deactivate validatetxhandler
         activate txvalidatorsupplier
             txvalidatorsupplier --> txvalidatorsupplier : handleFetchUtxoEvent
             activate txvalidatorsupplier
@@ -226,7 +226,7 @@ else
                 |||
                 end loop
             deactivate txvalidatorsupplier
-        deactivate txvalidatorsupplier             
+        deactivate txvalidatorsupplier
     |||
     end loop
 end
@@ -258,7 +258,7 @@ loop message consumed by x (UtxoFetchMsg)
                         alt if item was not found
                             utxocache --> utxocache : put item
                         end
-                        utxocache --> segmentmanager : return item    
+                        utxocache --> segmentmanager : return item
                     deactivate utxocache
                     segmentmanager --> utxostorage2 : return utxoItem
                 deactivate segmentmanager
@@ -281,7 +281,7 @@ loop message consumed by x (UtxoFetchMsg)
                             utxostorage2 --> utxostorage2 : log error
                         end
                         utxostorage2 --> utxostorage2 : response state\nset to complete
-                    end 
+                    end
             deactivate utxostorage2
             utxostorage2 --> utxofetchhandler : return response state
         deactivate utxostorage2
@@ -338,7 +338,7 @@ loop message consumed by Mempool ( ValidateTxResultMsg )
     activate validatetxresulthandler
         validatetxresulthandler --> mempool : addTransaction
         activate mempool
-            mempool --> mempool : addTransactionImpl 
+            mempool --> mempool : addTransactionImpl
             '[[http://plantuml.com/start{Tooltip for message} some link]]
             activate mempool
                 alt if not acceptingTransactions
@@ -346,10 +346,10 @@ loop message consumed by Mempool ( ValidateTxResultMsg )
                     mempool --> mempool : return
                 end
                 alt if txPool containsKey
-                    mempool --> mempool : log trace 
+                    mempool --> mempool : log trace
                     mempool --> mempool : return
                 else
-                    mempool --> mempool : log trace 
+                    mempool --> mempool : log trace
                 end
                 mempool --> mempoolcache : put
                 mempool --> mempool : populate transactions\ngraph
@@ -369,7 +369,7 @@ loop message consumed by Mempool ( ValidateTxResultMsg )
                                 alt if spenders is not null
                                     mempool --> mempool : spenders stream
                                 end
-                            end loop 
+                            end loop
                         deactivate mempool
                     else
                         alt if rebasing is null
@@ -404,7 +404,7 @@ loop message consumed by Mempool ( ValidateTxResultMsg )
                                             mempoolsupplier --> eventbus : publish MsgCollection
                                         deactivate mempoolsupplier
                                     deactivate mempool
-                                else 
+                                else
                                     mempool --> mempool : log trace
                                 end
                         else
@@ -425,7 +425,7 @@ loop message consumed by Mempool ( ValidateTxResultMsg )
                             alt if spenders is not null
                                 mempool --> mempool : spenders stream
                             end
-                        end loop 
+                        end loop
                     deactivate mempool
                 end
             deactivate mempool

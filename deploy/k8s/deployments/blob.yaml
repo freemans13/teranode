@@ -31,7 +31,7 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-blobserver=1" ]
           env:
-            
+
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
             - name: profilerAddr

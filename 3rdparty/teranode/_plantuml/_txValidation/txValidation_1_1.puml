@@ -62,7 +62,7 @@ loop message consumed by TxManager ( newTxMsg )
                 deactivate txstorage
             deactivate txmanager
             note over txmanager
-                Transaction has been stored, 
+                Transaction has been stored,
                 trigger the store of the utxo
             end note
             txmanager --> txmanager : storeUtxos

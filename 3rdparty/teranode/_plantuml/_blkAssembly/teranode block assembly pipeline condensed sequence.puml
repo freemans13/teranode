@@ -38,7 +38,7 @@ end box
             blocktemplate --> eventbus : publish utxoSpendMsg
             deactivate blocktemplate
         |||
-    end   
+    end
 |||
     eventbus o--> utxostorage :  consume utxoSpendMsg
     activate utxostorage
