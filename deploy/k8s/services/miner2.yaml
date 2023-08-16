@@ -45,6 +45,6 @@ spec:
       targetPort: 9091
       protocol: TCP
     - name: delve
-      port: 4041
+      port: 4040
       targetPort: 4040
       protocol: TCP

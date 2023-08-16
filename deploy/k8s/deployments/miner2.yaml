@@ -29,13 +29,14 @@ spec:
       containers:
         - name: miner
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          args: [ "-coinbase=0" ]
           env:
             - name: utxostore # todo joe to create a better postgres db
-              value: postgres://miner2:randompassword2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
+              value: postgres://miner2:miner2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
             - name: txmeta_store
-              value: postgres://miner2:randompassword2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
+              value: postgres://miner2:miner2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
             - name: blockchain_store
-              value: postgres://miner2:randompassword2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
+              value: postgres://miner2:miner2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
             - name: txstore
               value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
             - name: subtreestore

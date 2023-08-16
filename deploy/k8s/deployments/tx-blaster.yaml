@@ -36,16 +36,14 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-workers=1000", "-print=10000" ]
+          args: ["-print=10","-workers=1" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
-            - name: propagation_grpcAddress
-              value: k8s:///propagation-service.propagation-service.svc.cluster.local:8084
-            - name: seeder_grpcAddress
-              value: k8s:///seeder-service.seeder-service.svc.cluster.local:8083
-            - name: coinbasetracker_grpcAddress
-              value: k8s:///coinbasetracker.coinbasetracker-service.svc.cluster.local:8092
+            - name: txblaster_propagation_grpcTargets
+              value: "miner1.miner1.svc.cluster.local:8084|miner2.miner2.svc.cluster.local:8084|miner3.miner3.svc.cluster.local:8084"
+            - name: coinbase_grpcAddress
+              value: coinbase-service.coinbase-service.svc.cluster.local:8093
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: tx_blaster_profilerAddr
@@ -54,6 +52,8 @@ spec:
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
+            - name: coinbaseSimpleTracker
+              value: "true"
             - name: SERVICE_NAME
               value: tx-blaster-service
             - name: number_of_outputs

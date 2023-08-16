@@ -29,17 +29,21 @@ spec:
       containers:
         - name: miner
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          args: [ "-coinbase=0" ]
           env:
             - name: utxostore # todo joe to create a better postgres db
-              value: postgres://miner1:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
+              value: postgres://miner1:miner1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
             - name: txmeta_store
-              value: postgres://miner1:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
+              value: postgres://miner1:miner1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
             - name: blockchain_store
-              value: postgres://miner1:randompassword1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
+              value: postgres://miner1:miner1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
             - name: txstore # todo change bucket txstore
               value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
             - name: subtreestore
               value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
+            - name: coinbasetracker_grpcAddress
+              value: "coinbase-service.coinbase-service.svc.cluster.local:8093"
             - name: startTxMetaStore
               value: "false"
             - name: startCoinbaseTracker

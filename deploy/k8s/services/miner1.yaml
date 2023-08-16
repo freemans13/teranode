@@ -28,6 +28,10 @@ spec:
       port: 8089
       targetPort: 8089
       protocol: TCP
+    - name: blockchain
+      port: 8087
+      targetPort: 8087
+      protocol: TCP
     - name: blob-http
       port: 8090
       targetPort: 8090
@@ -45,6 +49,6 @@ spec:
       targetPort: 9091
       protocol: TCP
     - name: delve
-      port: 4041
+      port: 4040
       targetPort: 4040
       protocol: TCP
