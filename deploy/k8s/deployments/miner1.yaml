@@ -46,8 +46,6 @@ spec:
               value: "coinbase-service.coinbase-service.svc.cluster.local:8093"
             - name: startTxMetaStore
               value: "false"
-            - name: startCoinbaseTracker
-              value: "false"
             - name: startUtxoStore
               value: "false"
             - name: blobserver_grpcAddress

@@ -43,8 +43,6 @@ spec:
               value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
             - name: startTxMetaStore
               value: "false"
-            - name: startCoinbaseTracker
-              value: "false"
             - name: startUtxoStore
               value: "false"
             - name: blobserver_grpcAddress

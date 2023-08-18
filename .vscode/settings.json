@@ -17,7 +17,6 @@
     "chainhash",
     "chainintegrity",
     "chaintip",
-    "coinbasetracker",
     "cpuminer",
     "curr",
     "dbmode",

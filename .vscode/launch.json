@@ -14,7 +14,7 @@
       "env": {
         "miner_waitSeconds": "0",
       },
-      "args": ["-blockassembly=1"]
+      "args": ["-miner=0"]
     },
     {
       "name": "bootstrap",
@@ -24,9 +24,10 @@
       "program": "${workspaceFolder}/main.go",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "xxx"
+        "SETTINGS_CONTEXT": "xxx",
+        "blobserver_baseURL" :"http://1.1.1.1:1111"
       },
-      "args": ["-bootstrap=1"]
+      "args": ["-bootstrapserver=1"]
     },
     {
       "name": "server",
