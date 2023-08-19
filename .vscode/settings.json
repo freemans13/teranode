@@ -45,6 +45,7 @@
     "nolint",
     "opentracing",
     "otel",
+    "previousblockhash",
     "Priv",
     "progname",
     "promauto",
