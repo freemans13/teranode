@@ -11,6 +11,7 @@
     "blockstore",
     "blocktx",
     "bscript",
+    "Bulma",
     "bval",
     "CFLAGS",
     "chaincfg",
