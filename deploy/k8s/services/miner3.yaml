@@ -10,6 +10,8 @@ metadata:
     prometheus.io/scrape: "true"
 spec:
   clusterIP: None
+  externalIPs:
+    - 10.100.0.3
   ipFamilyPolicy: SingleStack
   ipFamilies:
   - IPv4
