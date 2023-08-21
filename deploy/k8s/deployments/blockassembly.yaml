@@ -38,8 +38,8 @@ spec:
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
-            - name: blockassembly_grpcAddress
-              value: 0.0.0.0:8085
+            - name: blockassembly_grpcListenAddress
+              value: :8085
             - name: utxostore
               value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
             #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082

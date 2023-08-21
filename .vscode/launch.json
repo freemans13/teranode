@@ -30,17 +30,6 @@
       "args": ["-bootstrapserver=1"]
     },
     {
-      "name": "server",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/main.go",
-      "env": {
-        "seeder_grpcAddress": "localhost:9999"
-      },
-      "args": ["-validator=1", "-propagation=1", "-utxostore=1", "-seeder=1"]
-    },
-    {
       "name": "tx-blaster",
       "type": "go",
       "request": "launch",

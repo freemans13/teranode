@@ -45,7 +45,7 @@ spec:
               value: "false"
             - name: startUtxoStore
               value: "false"
-            - name: blobserver_grpcAddress
+            - name: blobserver_grpcListenAddress
               value: ":8091"
             - name: blobserver_remoteAddress
               value: "miner3.miner3.svc.cluster.local:8091"
@@ -55,23 +55,23 @@ spec:
               value: "http://miner3.miner3.svc.cluster.local:8090"
             - name: startBootstrapServer
               value: "false"
-            - name: blobserver_httpAddress
+            - name: blobserver_httpListenAddress
               value: ":8090"
-            - name: blockassembly_grpcAddress
+            - name: blockassembly_grpcListenAddress
               value: ":8085"
-            - name: blockchain_grpcAddress
+            - name: blockchain_grpcListenAddress
               value: ":8087"
-            - name: blockvalidation_grpcAddress
+            - name: blockvalidation_grpcListenAddress
               value: ":8088"
             - name: gocore_stats_addr
               value: ":9092"
-            - name: propagation_grpcAddress
+            - name: propagation_grpcListenAddress
               value: ":8084"
-            - name: txmeta_grpcAddress
+            - name: txmeta_grpcListenAddress
               value: ":8086"
-            - name: validator_grpcAddress
+            - name: validator_grpcListenAddress
               value: ":8081"
-            - name: seeder_grpcAddress
+            - name: seeder_grpcListenAddress
               value: ":8083"
             - name: SETTINGS_CONTEXT
               value: "dev"

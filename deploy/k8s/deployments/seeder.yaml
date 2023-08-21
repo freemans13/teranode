@@ -24,8 +24,8 @@ spec:
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
-            - name: seeder_grpcAddress
-              value: 0.0.0.0:8083
+            - name: seeder_grpcListenAddress
+              value: :8083
             - name: utxostore
               value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
             #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
