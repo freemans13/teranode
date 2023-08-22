@@ -84,8 +84,6 @@ spec:
               value: ":8081"
             - name: seeder_grpcListenAddress
               value: ":8083"
-            - name: SETTINGS_CONTEXT
-              value: "dev"
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
