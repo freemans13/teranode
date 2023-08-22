@@ -32,6 +32,8 @@ spec:
           command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
           args: [ "-coinbase=0" ]
           env:
+            - name: SETTINGS_CONTEXT
+              value: allinone
             - name: utxostore # todo joe to create a better postgres db
               value: postgres://miner1:miner1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
             - name: txmeta_store
@@ -50,12 +52,8 @@ spec:
               value: "false"
             - name: blobserver_grpcListenAddress
               value: ":8091"
-            - name: blobserver_remoteAddress
-              value: "miner1.miner1.svc.cluster.local:8091"
-            - name: blobserver_remoteAddresses
-              value: "miner2.miner2.svc.cluster.local:8091|miner3.miner3.svc.cluster.local:8091"
-            - name: blobserver_baseURL
-              value: "http://miner1.miner1.svc.cluster.local:8090"
+            - name: blobserver_httpAddress
+              value: "miner1.miner1.svc.cluster.local:8090"
             - name: startBootstrapServer
               value: "false"
             - name: blobserver_httpListenAddress

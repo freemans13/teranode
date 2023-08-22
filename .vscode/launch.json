@@ -17,59 +17,11 @@
       "args": ["-miner=0"]
     },
     {
-      "name": "bootstrap",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/main.go",
-      "buildFlags": "-tags=aerospike",
-      "env": {
-        "SETTINGS_CONTEXT": "xxx",
-        "blobserver_baseURL" :"http://1.1.1.1:1111"
-      },
-      "args": ["-bootstrapserver=1"]
-    },
-    {
       "name": "tx-blaster",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/txblaster/main.go",
-    },
-    {
-      "name": "client",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/poc/client/client.go"
-    },
-    {
-      "name": "validation_spike",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/playground/validation_spike/main.go"
-    },
-    {
-      "name": "graph_db",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/playground/graph_db/main.go"
-    },
-    {
-      "name": "aero_spike",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/poc/aero_tls/main.go"
-    },
-    {
-      "name": "validation_spike",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/playground/validation_spike/main.go"
     },
     {
       "name": "Remote Debug",
