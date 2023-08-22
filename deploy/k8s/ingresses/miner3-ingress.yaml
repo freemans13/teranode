@@ -1,0 +1,44 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: miner3-ingressroute-tcp-8089
+  namespace: miner3
+spec:
+  entryPoints:
+    - bootstrap-grpc
+  routes:
+  - match: Host(`miner3.ubsv.dev`)
+    kind: Rule
+    services:
+    - name: miner3
+      port: 8089
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: miner3-ingressroute-tcp-8090
+  namespace: miner3
+spec:
+  entryPoints:
+    - blob-http
+  routes:
+  - match: Host(`miner3.ubsv.dev`)
+    kind: Rule
+    services:
+    - name: miner3
+      port: 8090
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: miner3-ingressroute-tcp-8091
+  namespace: miner3
+spec:
+  entryPoints:
+    - blob-grpc
+  routes:
+  - match: Host(`miner3.ubsv.dev`)
+    kind: Rule
+    services:
+    - name: miner3
+      port: 8091
