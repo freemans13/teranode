@@ -52,15 +52,13 @@ spec:
             - name: blockassembly_grpcAddress
               value: ":8085"
             - name: blobserver_httpAddress
-              value: "miner2.ubsv.dev:8090"
+              value: "http://miner2.ubsv.dev:8090"
             - name: blobserver_grpcAddress
               value: "miner2.ubsv.dev:8091"
             - name: bootstrap_grpcAddress
-              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8089"
+              value: "bootstrap.ubsv.dev:8089"
             - name: bootstrap_httpAddress
-              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8099"
-            - name: blobserver_httpAddress
-              value: "http://miner2.miner2.svc.cluster.local:8090"
+              value: "bootstrap.ubsv.dev:8099"
             - name: startBootstrapServer
               value: "false"
             - name: blobserver_httpListenAddress

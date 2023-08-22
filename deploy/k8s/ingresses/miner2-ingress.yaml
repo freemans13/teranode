@@ -14,7 +14,7 @@ spec:
       port: 8090
 ---
 apiVersion: traefik.containo.us/v1alpha1
-kind: IngressRoute
+kind: IngressRouteTCP
 metadata:
   name: miner2-ingressroute-tcp-8091
   namespace: miner2
@@ -22,8 +22,11 @@ spec:
   entryPoints:
     - blob-grpc
   routes:
-  - match: Host(`miner2.ubsv.dev`)
-    kind: Rule
+  - match: HostSNI(`miner2.ubsv.dev`)
     services:
     - name: miner2
       port: 8091
+      nativeLB: true
+  tls:
+    # use miner2-cert
+    secretName: miner2-tls
