@@ -50,7 +50,7 @@ spec:
             - name: blobserver_grpcListenAddress
               value: ":8091"
             - name: blobserver_httpAddress
-              value: "miner3.miner3.svc.cluster.local:8090"
+              value: "http://miner3.miner3.svc.cluster.local:8090"
             - name: startBootstrapServer
               value: "false"
             - name: blobserver_httpListenAddress
