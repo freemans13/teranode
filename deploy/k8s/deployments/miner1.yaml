@@ -52,8 +52,16 @@ spec:
               value: "false"
             - name: blobserver_grpcListenAddress
               value: ":8091"
+            - name: blockassembly_grpcAddress
+              value: ":8085"
             - name: blobserver_httpAddress
-              value: "http://miner1.miner1.svc.cluster.local:8090"
+              value: "http://miner1.ubsv.dev:8090"
+            - name: blobserver_grpcAddress
+              value: "miner1.ubsv.dev:8091"
+            - name: bootstrap_grpcAddress
+              value: "bootstrap.ubsv.dev:8089"
+            - name: bootstrap_httpAddress
+              value: "bootstrap.ubsv.dev:8099"
             - name: startBootstrapServer
               value: "false"
             - name: blobserver_httpListenAddress
@@ -74,8 +82,6 @@ spec:
               value: ":8081"
             - name: seeder_grpcListenAddress
               value: ":8083"
-            - name: SETTINGS_CONTEXT
-              value: "dev"
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT

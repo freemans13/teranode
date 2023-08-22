@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: miner2-cert
+  namespace: miner2
+spec:
+  secretName: miner2-tls
+  dnsNames:
+  - miner2.ubsv.dev
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
