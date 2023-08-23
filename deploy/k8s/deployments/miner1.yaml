@@ -55,7 +55,7 @@ spec:
             - name: blockassembly_grpcAddress
               value: ":8085"
             - name: blobserver_httpAddress
-              value: "http://miner1.ubsv.dev:8090"
+              value: "https://miner1.ubsv.dev:8090"
             - name: blobserver_clientName
               value: "Miner 1"
             - name: blobserver_grpcAddress
