@@ -33,7 +33,7 @@ spec:
           args: [ "-coinbase=0" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: allinone
+              value: dev.allinone
             - name: utxostore # todo joe to create a better postgres db
               value: postgres://miner1:miner1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
             - name: txmeta_store

@@ -26,7 +26,6 @@ spec:
     services:
     - name: miner1
       port: 8091
-      nativeLB: true
   tls:
     # use miner1-cert
     secretName: miner1-tls
