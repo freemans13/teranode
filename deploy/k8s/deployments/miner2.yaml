@@ -55,6 +55,8 @@ spec:
               value: "http://miner2.ubsv.dev:8090"
             - name: blobserver_grpcAddress
               value: "miner2.ubsv.dev:8091"
+            - name: blobserver_clientName
+              value: "Miner 2"
             - name: bootstrap_grpcAddress
               value: "bootstrap.ubsv.dev:8089"
             - name: bootstrap_httpAddress
