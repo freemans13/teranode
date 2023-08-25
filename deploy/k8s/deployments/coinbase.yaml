@@ -42,6 +42,8 @@ spec:
               value: :8093
             - name: blobserver_grpcAddress
               value: "miner3.miner3.svc.cluster.local:8091"
+            - name: coinbase_blobserverGrpcAddress
+              value: "miner3.miner3.svc.cluster.local:8091"
             - name: coinbase_store
               value: postgres://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase
             - name: profilerAddr
