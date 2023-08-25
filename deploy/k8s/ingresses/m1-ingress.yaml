@@ -48,4 +48,3 @@ spec:
   tls:
     # use m1-cert
     passthrough: true
-#

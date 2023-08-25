@@ -46,7 +46,7 @@ spec:
             - name: blockchain_grpcAddress
               value: blockchain-service.blockchain-service.svc.cluster.local:8087
             - name: txmeta_store
-              value: aerospike://tx-status-store-0.ubsv.internal:3000/txmeta_store
+              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: JAEGER_AGENT_HOST

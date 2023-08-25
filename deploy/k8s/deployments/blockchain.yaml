@@ -43,6 +43,10 @@ spec:
               value: blockchain-service
             - name: blockchain_store
               value: postgres://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/m1
+            - name: txmeta_store
+              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
+            - name: utxostore
+              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
           ports:
             - containerPort: 8081
               protocol: TCP

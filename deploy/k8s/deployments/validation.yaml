@@ -36,7 +36,7 @@ spec:
             - name: utxostore
               value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
             - name: txmeta_store
-              value: aerospike://tx-status-store-0.ubsv.internal:3000/txmeta_store
+              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
             - name: validator_grpcListenAddress
               value: :8081
             - name: blockassembly_grpcAddress

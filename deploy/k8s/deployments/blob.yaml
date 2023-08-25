@@ -44,6 +44,8 @@ spec:
               value: blob-service
             - name: blockvalidation_grpcAddress
               value: "blockvalidation-service.blockvalidation-service.svc.cluster.local:8088"
+            - name: blockchain_grpcAddress
+              value: "blockchain-service.blockchain-service.svc.cluster.local:8087"
             - name: blobserver_httpAddress
               value: "https://m1.ubsv.dev:8090"
             - name: blobserver_clientName

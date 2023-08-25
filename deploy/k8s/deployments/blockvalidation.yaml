@@ -28,7 +28,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: blockvalidation
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:eb4c9c580be88d299492d0956ee625daec000113
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-blockvalidation=1" ]
           env:
             - name: SETTINGS_CONTEXT
@@ -48,7 +48,7 @@ spec:
             - name: subtreestore
               value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
             - name: txmeta_store
-              value: aerospike://tx-status-store-0.ubsv.internal:3000/txmeta_store
+              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
             - name: utxostore
               value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
           ports:
