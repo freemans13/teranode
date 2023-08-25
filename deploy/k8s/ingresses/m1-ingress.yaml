@@ -9,7 +9,7 @@ spec:
   routes:
   - match: HostSNI(`m1.ubsv.dev`)
     services:
-    - name: m1
+    - name: propagation-service
       port: 8084
   tls:
     passthrough: true
@@ -25,7 +25,7 @@ spec:
   routes:
   - match: HostSNI(`m1.ubsv.dev`)
     services:
-    - name: m1
+    - name: blob-service
       port: 8090
   tls:
     # use m1-cert
@@ -43,7 +43,7 @@ spec:
   routes:
   - match: HostSNI(`m1.ubsv.dev`)
     services:
-    - name: m1
+    - name: blob-service
       port: 8091
   tls:
     # use m1-cert

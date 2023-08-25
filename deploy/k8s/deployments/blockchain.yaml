@@ -29,7 +29,7 @@ spec:
       containers:
         - name: blockchain
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: [ "-blockchain=1" ]
+          args: [ "-blockchain=1", "-seeder=1" ] # todo joe fix we need blockchain to be blocking
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"

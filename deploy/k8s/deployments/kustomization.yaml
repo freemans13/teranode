@@ -11,3 +11,7 @@ resources:
   - miner1.yaml
   - miner2.yaml
   - miner3.yaml
+  - coinbase.yaml
+  - blob.yaml
+  - blockvalidation.yaml
+  - blockchain.yaml

@@ -56,7 +56,8 @@ spec:
             - name: SERVICE_NAME
               value: blockassembly-service
             - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
+#              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
+              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
           ports:
             - containerPort: 8055
               protocol: TCP

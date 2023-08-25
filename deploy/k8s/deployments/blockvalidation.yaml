@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: blob
-  namespace: blob-service
+  name: blockvalidation
+  namespace: blockvalidation-service
   labels:
-    app: blob
+    app: blockvalidation
     project: service
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: blob
+      app: blockvalidation
   template:
     metadata:
       labels:
-        app: blob
+        app: blockvalidation
     spec:
       serviceAccountName: s3-push-service-account
       affinity:
@@ -24,14 +24,13 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: blob
+                    app: blockvalidation
                 topologyKey: "kubernetes.io/hostname"
       containers:
-        - name: blob
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: [ "-blobserver=1" ]
+        - name: blockvalidation
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:eb4c9c580be88d299492d0956ee625daec000113
+          args: [ "-blockvalidation=1" ]
           env:
-
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
             - name: profilerAddr
@@ -41,25 +40,19 @@ spec:
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
-              value: blob-service
-            - name: blockvalidation_grpcAddress
-              value: "blockvalidation-service.blockvalidation-service.svc.cluster.local:8088"
-            - name: blobserver_httpAddress
-              value: "https://m1.ubsv.dev:8090"
-            - name: blobserver_clientName
-              value: "M1"
-            - name: blobserver_grpcAddress
-              value: "m1.ubsv.dev:8091"
-            - name: bootstrap_grpcAddress
-              value: "bootstrap.ubsv.dev:8089"
-            - name: bootstrap_httpAddress
-              value: "bootstrap.ubsv.dev:8099"
+              value: blockvalidation-service
+            - name: blockchain_grpcAddress
+              value: "blockchain-service.blockchain-service.svc.cluster.local:8087"
             - name: txstore
               value: s3:///ubsv-utxo-store?region=eu-north-1
+            - name: subtreestore
+              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
+            - name: txmeta_store
+              value: aerospike://tx-status-store-0.ubsv.internal:3000/txmeta_store
+            - name: utxostore
+              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
           ports:
-            - containerPort: 8090
-              protocol: TCP
-            - containerPort: 8091
+            - containerPort: 8088
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
