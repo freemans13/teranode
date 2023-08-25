@@ -42,10 +42,21 @@ spec:
               value: "6831"
             - name: SERVICE_NAME
               value: blob-service
+
+            - name: blobserver_httpAddress
+              value: "https://m1.ubsv.dev:8090"
+            - name: blobserver_clientName
+              value: "M1"
+            - name: blobserver_grpcAddress
+              value: "m1.ubsv.dev:8091"
+            - name: bootstrap_grpcAddress
+              value: "bootstrap.ubsv.dev:8089"
+            - name: bootstrap_httpAddress
+              value: "bootstrap.ubsv.dev:8099"
           ports:
-            - containerPort: 8081
+            - containerPort: 8090
               protocol: TCP
-            - containerPort: 8087
+            - containerPort: 8091
               protocol: TCP
             - containerPort: 9091
               protocol: TCP

@@ -1,12 +1,12 @@
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: bootstrap-cert
-  namespace: bootstrap-service
+  name: wildcard-cert
+  namespace: traefik
 spec:
-  secretName: bootstrap-tls
+  secretName: wildcard-tls
   dnsNames:
-  - bootstrap.ubsv.dev
+  - "*.ubsv.dev"
   issuerRef:
     name: letsencrypt-prod
     kind: ClusterIssuer

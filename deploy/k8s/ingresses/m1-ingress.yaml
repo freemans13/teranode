@@ -1,15 +1,15 @@
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
-  name: miner1-ingressroute-tcp-8084
-  namespace: miner1
+  name: m1-ingressroute-tcp-8084
+  namespace: propagation-service
 spec:
   entryPoints:
     - prop-grpc
   routes:
-  - match: HostSNI(`miner1.ubsv.dev`)
+  - match: HostSNI(`m1.ubsv.dev`)
     services:
-    - name: miner1
+    - name: m1
       port: 8084
   tls:
     passthrough: true
@@ -17,33 +17,35 @@ spec:
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
-  name: miner1-ingressroute-tcp-8090
-  namespace: miner1
+  name: m1-ingressroute-tcp-8090
+  namespace: blob-service
 spec:
   entryPoints:
     - blob-http
   routes:
-  - match: HostSNI(`miner1.ubsv.dev`)
+  - match: HostSNI(`m1.ubsv.dev`)
     services:
-    - name: miner1
+    - name: m1
       port: 8090
   tls:
+    # use m1-cert
+#    secretName: m1-tls
     passthrough: true
 ---
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
-  name: miner1-ingressroute-tcp-8091
-  namespace: miner1
+  name: m1-ingressroute-tcp-8091
+  namespace: blob-service
 spec:
   entryPoints:
     - blob-grpc
   routes:
-  - match: HostSNI(`miner1.ubsv.dev`)
+  - match: HostSNI(`m1.ubsv.dev`)
     services:
-    - name: miner1
+    - name: m1
       port: 8091
   tls:
-    # use miner1-cert
-#    secretName: miner1-tls
+    # use m1-cert
     passthrough: true
+#

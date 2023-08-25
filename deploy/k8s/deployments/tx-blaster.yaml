@@ -41,7 +41,7 @@ spec:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
             - name: txblaster_propagation_grpcTargets
-              value: "miner1.miner1.svc.cluster.local:8084|miner2.miner2.svc.cluster.local:8084|miner3.miner3.svc.cluster.local:8084"
+              value: "miner1.miner1.svc.cluster.local:8084|miner2.miner2.svc.cluster.local:8084|miner3.miner3.svc.cluster.local:8084|propagation-service.propagation-service.svc.cluster.local:8084"
             - name: coinbase_grpcAddress
               value: coinbase-service.coinbase-service.svc.cluster.local:8093
             - name: profilerAddr

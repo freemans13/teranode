@@ -41,6 +41,8 @@ spec:
               value: "6831"
             - name: SERVICE_NAME
               value: blockchain-service
+            - name: blockchain_store
+              value: postgres://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/m1
           ports:
             - containerPort: 8081
               protocol: TCP
