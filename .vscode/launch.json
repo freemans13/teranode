@@ -19,6 +19,18 @@
       "args": ["-bootstrap=1", "-coinbase=0" "-miner=0", "-blockassembly=0", "-txmeta=0", "-blockvalidation=0", "-validator=0", "-propigation=0", "-seeder=0"]
     },
     {
+      "name": "blockchain",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/main.go",
+      "buildFlags": "-tags=aerospike",
+      "env": {
+        "SETTINGS_CONTEXT": "x"
+      },
+      "args": ["-blockchain=1"]
+    },
+    {
       "name": "tx-blaster",
       "type": "go",
       "request": "launch",
