@@ -16,7 +16,7 @@
         "SETTINGS_CONTEXT": "dev.simon",
         "bootstrap_grpcAddress": "localhost:8089"
       },
-      "args": ["-bootstrap=1", "-coinbase=0" "-miner=0", "-blockassembly=0", "-txmeta=0", "-blockvalidation=0", "-validator=0", "-propigation=0", "-seeder=0"]
+      "args": ["-bootstrap=1", "-coinbase=0", "-seeder=0"]
     },
     {
       "name": "blockchain",
