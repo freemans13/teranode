@@ -40,7 +40,7 @@ spec:
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
-            - name: txblaster_propagation_grpcTargets
+            - name: propagation_grpcAddresses
               value: "miner1.miner1.svc.cluster.local:8084|miner2.miner2.svc.cluster.local:8084|miner3.miner3.svc.cluster.local:8084|propagation-service.propagation-service.svc.cluster.local:8084"
             - name: coinbase_grpcAddress
               value: coinbase-service.coinbase-service.svc.cluster.local:8093
@@ -52,8 +52,6 @@ spec:
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
-            - name: coinbaseSimpleTracker
-              value: "true"
             - name: SERVICE_NAME
               value: tx-blaster-service
             - name: number_of_outputs
