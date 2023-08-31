@@ -13,10 +13,9 @@
       "buildFlags": "-tags=aerospike",
       "env": {
         "miner_waitSeconds": "0",
-        "SETTINGS_CONTEXT": "dev.simon",
-        "bootstrap_grpcAddress": "localhost:8089"
+        "SETTINGS_CONTEXT": "dev.simon"
       },
-      "args": ["-bootstrap=1", "-coinbase=0", "-seeder=0"]
+      "args": ["-coinbase=0", "-seeder=0", "-miner=0"]
     },
     {
       "name": "blockchain",
@@ -36,6 +35,12 @@
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/txblaster/main.go",
+      "env": {
+        "grpc_resolver": "k8s",
+        "propagation_grpcAddresses": "miner1.ubsv.dev:8084",
+        "coinbase_grpcAddress": "coinbase.ubsv.dev:8093",
+      },
+      "args": ["-workers=1", "-print=1"],
     },
     {
       "name": "Remote Debug",
