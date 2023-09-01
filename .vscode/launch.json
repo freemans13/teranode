@@ -37,10 +37,10 @@
       "program": "${workspaceFolder}/cmd/txblaster/main.go",
       "env": {
         "grpc_resolver": "k8s",
-        "propagation_grpcAddresses": "miner1.ubsv.dev:8084",
+        "propagation_grpcAddresses": "miner1.ubsv.dev:8084|miner2.ubsv.dev:8084|miner3.ubsv.dev:8084",
         "coinbase_grpcAddress": "coinbase.ubsv.dev:8093",
       },
-      "args": ["-workers=1", "-print=1"],
+      "args": ["-workers=1000", "-print=1000"],
     },
     {
       "name": "Remote Debug",
