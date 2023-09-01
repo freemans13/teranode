@@ -32,7 +32,7 @@ spec:
           args: [ "-coinbase=0" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: dev.allinone
+              value: dev.miner.3
             - name: utxostore
               value: postgres://miner3:miner3@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv3
             - name: txmeta_store
