@@ -6,7 +6,6 @@ resources:
   - validation.yaml
   - tx-blaster.yaml
   - blockassembly.yaml
-  - seeder.yaml
   - utxostore.yaml
   - miner1.yaml
   - miner2.yaml
