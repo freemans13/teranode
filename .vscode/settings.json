@@ -42,6 +42,7 @@
     "ldflags",
     "lgmp",
     "libsv",
+    "locktime",
     "lsecp256k1",
     "malloc",
     "merkleroot",
