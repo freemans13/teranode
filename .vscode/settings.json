@@ -32,6 +32,7 @@
     "foundationdb",
     "getsentry",
     "halvings",
+    "Infof",
     "InvVect",
     "keyset",
     "kinesiss",
