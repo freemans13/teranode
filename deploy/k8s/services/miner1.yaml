@@ -41,6 +41,13 @@ spec:
     - name: blob-grpc
       port: 8091
       targetPort: 8091
+    - name: bootstrap-grpc
+      port: 8089
+      targetPort: 8089
+      protocol: TCP
+    - name: bootstrap-http
+      port: 8099
+      targetPort: 8099
       protocol: TCP
     - name: profiler
       port: 9091

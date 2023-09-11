@@ -35,7 +35,7 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-propagation=1" ]
           # command: "You can override the entrypoint with a command."
-          #command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          #          command: ["./dlv", "--listen=:4041", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
           #          command: [ "./ubsv.run" ]
           env:
             - name: SETTINGS_CONTEXT
@@ -51,10 +51,10 @@ spec:
             - name: SERVICE_NAME
               value: propagation-service
             - name: txstore
-#              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
+              #              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
               value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
             - name: subtreestore
-#              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
+              #              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
               value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
           ports:
             - containerPort: 8833

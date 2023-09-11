@@ -28,3 +28,7 @@ spec:
       port: 9091
       targetPort: 9091
       protocol: TCP
+    - name: debugger
+      port: 4040
+      targetPort: 4040
+      protocol: TCP

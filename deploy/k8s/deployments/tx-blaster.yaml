@@ -36,12 +36,12 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command:
             - ./blaster.run
-          args: ["-print=10","-workers=1" ]
+          args: [ "-print=10","-workers=1" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
             - name: propagation_grpcAddresses
-              value: "miner1.miner1.svc.cluster.local:8084|miner2.miner2.svc.cluster.local:8084|miner3.miner3.svc.cluster.local:8084|propagation-service.propagation-service.svc.cluster.local:8084"
+              value: "propagation-service.propagation-service.svc.cluster.local:8084"
             - name: coinbase_grpcAddress
               value: coinbase-service.coinbase-service.svc.cluster.local:8093
             - name: profilerAddr

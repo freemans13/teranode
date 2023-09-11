@@ -31,7 +31,6 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-blobserver=1" ]
           env:
-
             - name: SETTINGS_CONTEXT
               value: "kubernetes"
             - name: profilerAddr
@@ -58,6 +57,8 @@ spec:
               value: "bootstrap.ubsv.dev:8099"
             - name: txstore
               value: s3:///ubsv-utxo-store?region=eu-north-1
+            - name: utxostore
+              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
           ports:
             - containerPort: 8090
               protocol: TCP

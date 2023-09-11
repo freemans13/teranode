@@ -27,6 +27,11 @@ spec:
     port: 9091
     protocol: TCP
     targetPort: 9091
+  - name: debugger
+    port: 4040
+    targetPort: 4040
+    protocol: TCP
+
   selector:
     app: bootstrap
   sessionAffinity: None

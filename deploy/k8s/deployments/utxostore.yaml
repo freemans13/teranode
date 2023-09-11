@@ -25,7 +25,7 @@ spec:
               value: "kubernetes"
             - name: utxostore
               value: memory://:8082
-#              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore-miner1
+            #              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore-miner1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT

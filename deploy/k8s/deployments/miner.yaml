@@ -2,18 +2,18 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
-    app: bootstrap
-  name: bootstrap-service
-  namespace: bootstrap-service
+    app: miner
+  name: miner-service
+  namespace: miner-service
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: bootstrap
+      app: miner
   template:
     metadata:
       labels:
-        app: bootstrap
+        app: miner
     spec:
       affinity:
         podAntiAffinity:
@@ -21,17 +21,15 @@ spec:
             - podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: bootstrap
+                    app: miner
                 topologyKey: kubernetes.io/hostname
               weight: 100
       containers:
         - args:
-            - -bootstrap=1
+            - -miner=1
           env:
-            - name: bootstrap_grpcAddress
-              value: :8089
-            - name: bootstrap_httpAddress
-              value: :8099
+            - name: blockassembly_grpcAddress
+              value: k8s:///blockassembly-service.blockassembly-service.svc.cluster.local:8085
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
@@ -41,10 +39,10 @@ spec:
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: SERVICE_NAME
-              value: bootstrap-service
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+              value: miner-service
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:859b8242965a32df96c4bfdf6a7d6e2cdec77aff
           imagePullPolicy: IfNotPresent
-          name: bootstrap-service
+          name: miner-service
           ports:
             - containerPort: 8089
               protocol: TCP
