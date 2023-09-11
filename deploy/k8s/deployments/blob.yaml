@@ -58,7 +58,7 @@ spec:
             - name: txstore
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             - name: utxostore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtree-lake
+              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
           ports:
             - containerPort: 8090
               protocol: TCP

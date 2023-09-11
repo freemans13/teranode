@@ -43,7 +43,7 @@ spec:
             - name: txstore # todo change bucket txstore
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtree-lake
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
             - name: startTxMetaStore
               value: "false"
             - name: startUtxoStore
