@@ -93,6 +93,7 @@
     "ubsv",
     "uchar",
     "unlocker",
+    "upgrader",
     "utxos",
     "utxoservice",
     "utxostore",
