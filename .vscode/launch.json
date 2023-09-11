@@ -30,6 +30,18 @@
       "args": ["-blockchain=1"]
     },
     {
+      "name": "bootstrap",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      "buildFlags": "-tags=aerospike",
+      "env": {
+        "SETTINGS_CONTEXT": "x"
+      },
+      "args": ["-bootstrap=1"]
+    },
+    {
       "name": "tx-blaster",
       "type": "go",
       "request": "launch",
