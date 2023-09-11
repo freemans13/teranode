@@ -8,14 +8,11 @@ psql postgresql://miner3:miner3@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaw
 psql postgresql://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/m1 -c " drop table if exists state ; drop table if exists blocks;"
 
 # todo make key dynamic based on user
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem  ubuntu@aero.utxo0.ubsv.dev
-aql "TRUNCATE utxostore" # todo fix how to run this dynamically
-
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem  ubuntu@aero.tx0.ubsv.dev
-aql "TRUNCATE txstatus_store" # todo fix how to run this dynamically
+ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem  ubuntu@aero.utxo0.ubsv.dev -f "aql -c \"TRUNCATE utxostore\""
+ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem  ubuntu@aero.tx0.ubsv.dev -f "aql -c \"TRUNCATE txstatus_store\""
 
 # scale back up everything
 bash scale_up.sh
 
-
+# scale up tx blaster
 kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1

@@ -40,7 +40,7 @@ spec:
               value: 0.0.0.0:9091
             - name: SERVICE_NAME
               value: miner-service
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:859b8242965a32df96c4bfdf6a7d6e2cdec77aff
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           imagePullPolicy: IfNotPresent
           name: miner-service
           ports:

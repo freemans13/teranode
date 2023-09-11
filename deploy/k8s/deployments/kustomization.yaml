@@ -15,3 +15,4 @@ resources:
   - blockvalidation.yaml
   - blockchain.yaml
   - bootstrap.yaml
+  - miner.yaml
