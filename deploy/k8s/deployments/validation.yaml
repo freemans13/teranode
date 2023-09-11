@@ -52,7 +52,7 @@ spec:
             - name: use_cgo_verifier
               value: "true"
             - name: txstore
-              value: s3:///ubsv-utxo-store?region=eu-north-1
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
           ports:
             - containerPort: 8081
               protocol: TCP

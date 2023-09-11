@@ -56,9 +56,9 @@ spec:
             - name: bootstrap_httpAddress
               value: "bootstrap.ubsv.dev:8099"
             - name: txstore
-              value: s3:///ubsv-utxo-store?region=eu-north-1
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             - name: utxostore
-              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtree-lake
           ports:
             - containerPort: 8090
               protocol: TCP

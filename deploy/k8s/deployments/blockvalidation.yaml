@@ -44,9 +44,9 @@ spec:
             - name: blockchain_grpcAddress
               value: "blockchain-service.blockchain-service.svc.cluster.local:8087"
             - name: txstore
-              value: s3:///ubsv-utxo-store?region=eu-north-1
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             - name: subtreestore
-              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtree-lake
             - name: txmeta_store
               value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
             - name: utxostore

@@ -40,9 +40,9 @@ spec:
             - name: blockchain_store
               value: postgres://miner2:miner2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
             - name: txstore
-              value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             - name: subtreestore
-              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtree-lake
             - name: startTxMetaStore
               value: "false"
             - name: startUtxoStore
