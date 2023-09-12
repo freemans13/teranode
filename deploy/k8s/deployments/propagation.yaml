@@ -54,7 +54,7 @@ spec:
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             #              value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
             - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
           #              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
           ports:
             - containerPort: 8833

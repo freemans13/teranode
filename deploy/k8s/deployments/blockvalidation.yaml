@@ -52,7 +52,7 @@ spec:
             - name: txstore
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/block-lake
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
             - name: txmeta_store
               value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
             - name: utxostore
