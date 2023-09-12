@@ -37,7 +37,7 @@ spec:
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SETTINGS_CONTEXT
-              value: kubernetes
+              value: scaling
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: SERVICE_NAME

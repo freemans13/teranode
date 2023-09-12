@@ -22,7 +22,7 @@ spec:
           args: [ "-utxostore=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "kubernetes"
+              value: "scaling"
             - name: utxostore
               value: memory://:8082
             #              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore-miner1

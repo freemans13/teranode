@@ -51,7 +51,7 @@
       "env": {
         "grpc_resolver": "k8s",
         "propagation_grpcAddresses": "propagation.m1.scaling.ubsv.dev:8084",
-        "coinbase_grpcAddress": "coinbase.ubsv.dev:8093",
+        "coinbase_grpcAddress": "coinbase.allinone.ubsv.dev:8093",
       },
       "args": ["-workers=1000", "-print=1000"],
     },

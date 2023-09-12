@@ -32,7 +32,7 @@ spec:
           args: [ "-blockvalidation=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "kubernetes"
+              value: "scaling"
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: JAEGER_AGENT_HOST

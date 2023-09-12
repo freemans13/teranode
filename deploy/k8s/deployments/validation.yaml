@@ -32,7 +32,7 @@ spec:
           args: [ "-validator=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "kubernetes"
+              value: "scaling"
             - name: utxostore
               value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
             - name: txmeta_store

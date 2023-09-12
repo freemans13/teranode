@@ -39,7 +39,7 @@ spec:
           #          command: [ "./ubsv.run" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "kubernetes"
+              value: "scaling"
             - name: validator_grpcAddress
               value: k8s:///validation-service.validation-service.svc.cluster.local:8081
             - name: profilerAddr

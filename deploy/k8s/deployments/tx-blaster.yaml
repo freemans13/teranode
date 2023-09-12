@@ -39,7 +39,7 @@ spec:
           args: [ "-print=10","-workers=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "kubernetes"
+              value: "scaling"
             - name: propagation_grpcAddresses
               value: "propagation-service.propagation-service.svc.cluster.local:8084"
             - name: coinbase_grpcAddress

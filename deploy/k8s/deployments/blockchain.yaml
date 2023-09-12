@@ -37,7 +37,7 @@ spec:
           args: [ "-blockchain=1", "-seeder=1" ] # todo joe fix we need blockchain to be blocking
           env:
             - name: SETTINGS_CONTEXT
-              value: "kubernetes"
+              value: "scaling"
             - name: profilerAddr
               value: 0.0.0.0:9091
             - name: JAEGER_AGENT_HOST
