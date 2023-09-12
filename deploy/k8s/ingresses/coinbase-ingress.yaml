@@ -7,7 +7,7 @@ spec:
   entryPoints:
     - coin-grpc
   routes:
-  - match: HostSNI(`coinbase.ubsv.dev`)
+  - match: HostSNI(`coinbase.scaling.ubsv.dev`)
     services:
     - name: coinbase-service
       port: 8093

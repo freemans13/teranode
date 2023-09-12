@@ -46,15 +46,15 @@ spec:
             - name: blockchain_grpcAddress
               value: "blockchain-service.blockchain-service.svc.cluster.local:8087"
             - name: blobserver_httpAddress
-              value: "https://m1.ubsv.dev:8090"
+              value: "https://blob-service.blob-service.svc.cluster.local:8090"
             - name: blobserver_clientName
               value: "M1"
             - name: blobserver_grpcAddress
-              value: "m1.ubsv.dev:8091"
+              value: "blob-service.blob-service.svc.cluster.local:8091"
             - name: bootstrap_grpcAddress
-              value: "bootstrap.ubsv.dev:8089"
+              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8089"
             - name: bootstrap_httpAddress
-              value: "bootstrap.ubsv.dev:8099"
+              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8099"
             - name: txstore
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
             - name: utxostore

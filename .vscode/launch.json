@@ -50,7 +50,7 @@
       "program": "${workspaceFolder}/cmd/txblaster/main.go",
       "env": {
         "grpc_resolver": "k8s",
-        "propagation_grpcAddresses": "propagation.m1.ubsv.dev:8084",
+        "propagation_grpcAddresses": "propagation.m1.scaling.ubsv.dev:8084",
         "coinbase_grpcAddress": "coinbase.ubsv.dev:8093",
       },
       "args": ["-workers=1000", "-print=1000"],

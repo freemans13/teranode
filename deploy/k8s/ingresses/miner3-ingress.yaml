@@ -7,7 +7,7 @@ spec:
   entryPoints:
     - prop-grpc
   routes:
-  - match: HostSNI(`miner3.ubsv.dev`)
+  - match: HostSNI(`miner3.allinone.ubsv.dev`)
     services:
     - name: miner3
       port: 8084
@@ -23,7 +23,7 @@ spec:
   entryPoints:
     - blob-http
   routes:
-  - match: HostSNI(`miner3.ubsv.dev`)
+  - match: HostSNI(`miner3.allinone.ubsv.dev`)
     services:
     - name: miner3
       port: 8090
@@ -41,7 +41,7 @@ spec:
   entryPoints:
     - blob-grpc
   routes:
-  - match: HostSNI(`miner3.ubsv.dev`)
+  - match: HostSNI(`miner3.allinone.ubsv.dev`)
     services:
     - name: miner3
       port: 8091

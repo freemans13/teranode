@@ -18,6 +18,10 @@ spec:
   selector:
     app: miner1
   ports:
+    - name: delve
+      port: 4040
+      targetPort: 4040
+      protocol: TCP
     - name: seeder
       port: 8083
       targetPort: 8083
@@ -26,13 +30,13 @@ spec:
       port: 8084
       targetPort: 8084
       protocol: TCP
-    - name: http
-      port: 8089
-      targetPort: 8089
-      protocol: TCP
     - name: blockchain
       port: 8087
       targetPort: 8087
+      protocol: TCP
+    - name: bootstrap-grpc
+      port: 8089
+      targetPort: 8089
       protocol: TCP
     - name: blob-http
       port: 8090
@@ -41,10 +45,9 @@ spec:
     - name: blob-grpc
       port: 8091
       targetPort: 8091
-    - name: bootstrap-grpc
-      port: 8089
-      targetPort: 8089
-      protocol: TCP
+    - name: coinbase-grpc
+      port: 8093
+      targetPort: 8093
     - name: bootstrap-http
       port: 8099
       targetPort: 8099
@@ -52,8 +55,4 @@ spec:
     - name: profiler
       port: 9091
       targetPort: 9091
-      protocol: TCP
-    - name: delve
-      port: 4040
-      targetPort: 4040
       protocol: TCP

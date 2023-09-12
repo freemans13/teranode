@@ -7,7 +7,7 @@ spec:
   entryPoints:
     - prop-grpc
   routes:
-  - match: HostSNI(`miner1.ubsv.dev`)
+  - match: HostSNI(`miner1.allinone.ubsv.dev`)
     services:
     - name: miner1
       port: 8084
@@ -23,7 +23,7 @@ spec:
   entryPoints:
     - blob-http
   routes:
-  - match: HostSNI(`miner1.ubsv.dev`)
+  - match: HostSNI(`miner1.allinone.ubsv.dev`)
     services:
     - name: miner1
       port: 8090
@@ -39,11 +39,43 @@ spec:
   entryPoints:
     - blob-grpc
   routes:
-  - match: HostSNI(`miner1.ubsv.dev`)
+  - match: HostSNI(`miner1.allinone.ubsv.dev`)
     services:
     - name: miner1
       port: 8091
   tls:
     # use miner1-cert
 #    secretName: miner1-tls
+    passthrough: true
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: bootstrap-ingressroute-http-8099
+  namespace: miner1
+spec:
+  entryPoints:
+    - bootstrap-http
+  routes:
+  - match: HostSNI(`bootstrap.allinone.ubsv.dev`)
+    services:
+    - name: miner1
+      port: 8099
+  tls:
+    passthrough: true
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: bootstrap-ingressroute-grpc-8089
+  namespace: miner1
+spec:
+  entryPoints:
+    - bootstrap-grpc
+  routes:
+  - match: HostSNI(`bootstrap.allinone.ubsv.dev`)
+    services:
+    - name: miner1
+      port: 8089
+  tls:
     passthrough: true
