@@ -11,6 +11,12 @@ spec:
   selector:
     matchLabels:
       app: miner1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
   template:
     metadata:
       labels:
@@ -28,7 +34,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: miner
-          image:  434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          image:  434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:c36d86a76e3bf83786eabb2aa6decd4b57df17b0
           command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
           args: [ "-coinbase=1","-bootstrap=1" ]
           env:
@@ -58,14 +64,18 @@ spec:
               value: "Miner 1"
             - name: blobserver_grpcAddress
               value: "miner1.miner1.svc.cluster.local:8091"
+            - name: bootstrap_grpcListenAddress
+              value: ":8089"
+            - name: bootstrap_httpListenAddress
+              value: ":8099"
             - name: bootstrap_grpcAddress
               value: ":8089"
-            - name: bootstrap_httpAddress
-              value: ":8099"
             - name: startBootstrapServer
               value: "True"
             - name: startCoinbase
               value: "True"
+            - name: coinbase_grpcListenAddress
+              value: :8093
             - name: coinbase_store
               value: postgres://coinbase_allinone:coinbase_allinone@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase_allinone
             - name: blobserver_httpListenAddress

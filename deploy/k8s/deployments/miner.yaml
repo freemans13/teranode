@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   labels:
     app: miner
-  name: miner-service
+  name: miner
   namespace: miner-service
 spec:
   replicas: 1
@@ -42,7 +42,7 @@ spec:
               value: miner-service
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           imagePullPolicy: IfNotPresent
-          name: miner-service
+          name: miner
           ports:
             - containerPort: 8089
               protocol: TCP

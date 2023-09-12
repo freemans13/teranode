@@ -58,7 +58,7 @@ spec:
   entryPoints:
     - propagation-grpc
   routes:
-  - match: HostSNI(`propagation.m1.scaling.ubsv.dev`)
+  - match: HostSNI(`m1.scaling.ubsv.dev`)
     services:
     - name: propagation-service
       port: 8084
