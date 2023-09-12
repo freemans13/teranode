@@ -46,7 +46,7 @@ spec:
             - name: blockchain_store
               value: postgres://miner2:miner2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
             - name: txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
             - name: subtreestore
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
             - name: startTxMetaStore
