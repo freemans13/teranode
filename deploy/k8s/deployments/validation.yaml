@@ -31,6 +31,8 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-validator=1" ]
           env:
+            - name: blockchain_grpcAddress
+              value: blockchain-service.blockchain-service.svc.cluster.local:8087
             - name: SETTINGS_CONTEXT
               value: "scaling"
             - name: utxostore

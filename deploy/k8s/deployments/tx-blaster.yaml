@@ -36,7 +36,7 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-print=10","-workers=12" ]
+          args: [ "-print=10","-workers=100" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "scaling"

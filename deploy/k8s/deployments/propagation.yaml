@@ -71,10 +71,10 @@ spec:
           resources:
             requests:
               memory: 2Gi
-              cpu: "8"
+              cpu: "6"
             limits:
               memory: 2Gi
-              cpu: "8"
+              cpu: "6"
           readinessProbe:
             httpGet:
               path: /health
