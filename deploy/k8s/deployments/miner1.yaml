@@ -36,76 +36,14 @@ spec:
         - name: miner
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
-          args: [ "-coinbase=1","-bootstrap=1" ]
+          args: [ ]
           env:
-            - name: startBlobServer
-              value: "true"
             - name: SETTINGS_CONTEXT
               value: allinone.miner.1
-            - name: utxostore # todo joe to create a better postgres db
-              value: postgres://miner1:miner1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
-            - name: txmeta_store
-              value: postgres://miner1:miner1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
-            - name: blockchain_store
-              value: postgres://miner1:miner1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv1
-            - name: txstore # todo change bucket txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
-            - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
-            - name: startTxMetaStore
-              value: "false"
-            - name: startUtxoStore
-              value: "false"
-            - name: blobserver_grpcListenAddress
-              value: ":8091"
-            - name: blockassembly_grpcAddress
-              value: ":8085"
-            - name: blobserver_httpAddress
-              value: "https://miner1.ubsv.dev:8090"
-            - name: blobserver_clientName
-              value: "Miner 1"
-            - name: blobserver_grpcAddress
-              value: "miner1.miner1.svc.cluster.local:8091"
-            - name: bootstrap_grpcListenAddress
-              value: ":8089"
-            - name: bootstrap_httpListenAddress
-              value: ":8099"
-            - name: bootstrap_grpcAddress
-              value: ":8089"
-            - name: startBootstrapServer
-              value: "True"
-            - name: startCoinbase
-              value: "True"
-            - name: coinbase_grpcListenAddress
-              value: :8093
-            - name: coinbase_store
-              value: postgres://coinbase_allinone:coinbase_allinone@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase_allinone
-            - name: blobserver_httpListenAddress
-              value: ":8090"
-            - name: blockassembly_grpcListenAddress
-              value: ":8085"
-            - name: blockchain_grpcListenAddress
-              value: ":8087"
-            - name: blockvalidation_grpcListenAddress
-              value: ":8088"
-            - name: gocore_stats_addr
-              value: ":9092"
-            - name: propagation_grpcListenAddress
-              value: ":8084"
-            - name: txmeta_grpcListenAddress
-              value: ":8086"
-            - name: validator_grpcListenAddress
-              value: ":8081"
-            - name: seeder_grpcListenAddress
-              value: ":8083"
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
-            - name: profilerAddr
-              value: 0.0.0.0:9091
-            - name: SERVICE_NAME
-              value: miner1
           ports:
             - containerPort: 4040
               protocol: TCP

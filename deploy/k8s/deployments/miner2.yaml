@@ -35,68 +35,15 @@ spec:
       containers:
         - name: miner
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: [ "-coinbase=0" ]
+          args: [ ]
           env:
-            - name: startBlobServer
-              value: "true"
+
             - name: SETTINGS_CONTEXT
               value: allinone.miner.2
-            - name: utxostore # todo joe to create a better postgres db
-              value: postgres://miner2:miner2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
-            - name: txmeta_store
-              value: postgres://miner2:miner2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
-            - name: blockchain_store
-              value: postgres://miner2:miner2@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/ubsv2
-            - name: txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
-            - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
-            - name: startTxMetaStore
-              value: "false"
-            - name: startUtxoStore
-              value: "false"
-            - name: blobserver_grpcListenAddress
-              value: ":8091"
-            - name: blockassembly_grpcAddress
-              value: ":8085"
-            - name: blobserver_httpAddress
-              value: "https://miner2.ubsv.dev:8090"
-            - name: blobserver_grpcAddress
-              value: "miner2.miner2.svc.cluster.local:8091"
-            - name: blobserver_clientName
-              value: "Miner 2"
-            - name: bootstrap_grpcAddress
-              value: "miner1.miner1.svc.cluster.local:8089"
-            - name: bootstrap_httpAddress
-              value: "miner1.miner1.svc.cluster.local:8099"
-            - name: startBootstrapServer
-              value: "false"
-            - name: blobserver_httpListenAddress
-              value: ":8090"
-            - name: blockassembly_grpcListenAddress
-              value: ":8085"
-            - name: blockchain_grpcListenAddress
-              value: ":8087"
-            - name: blockvalidation_grpcListenAddress
-              value: ":8088"
-            - name: gocore_stats_addr
-              value: ":9092"
-            - name: propagation_grpcListenAddress
-              value: ":8084"
-            - name: txmeta_grpcListenAddress
-              value: ":8086"
-            - name: validator_grpcListenAddress
-              value: ":8081"
-            - name: seeder_grpcListenAddress
-              value: ":8083"
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
-            - name: profilerAddr
-              value: 0.0.0.0:9091
-            - name: SERVICE_NAME
-              value: miner2
           ports:
             - containerPort: 8082
               protocol: TCP
