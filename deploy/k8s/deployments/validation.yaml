@@ -52,7 +52,8 @@ spec:
             - name: use_cgo_verifier
               value: "true"
             - name: txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
+#              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
+              value: "null://"
           ports:
             - containerPort: 8081
               protocol: TCP
@@ -63,10 +64,10 @@ spec:
           resources:
             requests:
               memory: 2Gi
-              cpu: "2"
+              cpu: "8"
             limits:
               memory: 2Gi
-              cpu: "2"
+              cpu: "8"
           readinessProbe:
             httpGet:
               path: /health

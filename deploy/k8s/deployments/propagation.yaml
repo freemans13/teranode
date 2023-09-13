@@ -51,10 +51,12 @@ spec:
             - name: SERVICE_NAME
               value: propagation-service
             - name: txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
+              value: "null://"
+#              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
             #              value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
             - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
+              value: "null://"
+#              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
           #              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
           ports:
             - containerPort: 8833
@@ -69,10 +71,10 @@ spec:
           resources:
             requests:
               memory: 2Gi
-              cpu: "2"
+              cpu: "8"
             limits:
               memory: 2Gi
-              cpu: "2"
+              cpu: "8"
           readinessProbe:
             httpGet:
               path: /health
