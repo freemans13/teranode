@@ -37,6 +37,8 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-coinbase=0" ]
           env:
+            - name: startBlobServer
+              value: "true"
             - name: SETTINGS_CONTEXT
               value: allinone.miner.3
             - name: utxostore
@@ -58,7 +60,7 @@ spec:
             - name: blockassembly_grpcAddress
               value: ":8085"
             - name: blobserver_httpAddress
-              value: "https://miner3.miner3.svc.cluster.local:8090"
+              value: "https://miner3.ubsv.dev:8090"
             - name: blobserver_grpcAddress
               value: "miner3.miner3.svc.cluster.local:8091"
             - name: blobserver_clientName

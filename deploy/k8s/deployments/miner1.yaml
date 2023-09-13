@@ -34,10 +34,12 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: miner
-          image:  434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:c36d86a76e3bf83786eabb2aa6decd4b57df17b0
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
           args: [ "-coinbase=1","-bootstrap=1" ]
           env:
+            - name: startBlobServer
+              value: "true"
             - name: SETTINGS_CONTEXT
               value: allinone.miner.1
             - name: utxostore # todo joe to create a better postgres db
@@ -59,7 +61,7 @@ spec:
             - name: blockassembly_grpcAddress
               value: ":8085"
             - name: blobserver_httpAddress
-              value: "https://miner1.miner1.svc.cluster.local:8090"
+              value: "https://miner1.ubsv.dev:8090"
             - name: blobserver_clientName
               value: "Miner 1"
             - name: blobserver_grpcAddress
