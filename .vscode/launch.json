@@ -9,7 +9,7 @@
       "type": "go",
       "request": "launch",
       "mode": "auto",
-      "program": "${workspaceFolder}/main.go",
+      "program": "${workspaceFolder}/.",
       "buildFlags": "-tags=aerospike",
       "env": {
         "miner_waitSeconds": "0",
