@@ -71,55 +71,23 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1Gi
-              cpu: "0.5"
+              memory: 5Gi
+              cpu: "1"
             limits:
-              memory: 1Gi
-              cpu: "0.5"
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 9091
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 3
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 9091
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 3
-        - name: postgres-sidecar
-          image: postgres:latest
-          env:
-            - name: POSTGRES_USER
-              value: "postgres"
-            - name: POSTGRES_PASSWORD
-              value: "really_strong_password_change_me"
-            - name: POSTGRES_DB
-              value: "miner_coinbase"
-          ports:
-            - containerPort: 5432
-          resources:
-            requests:
-              memory: 1Gi
-              cpu: "0.5"
-            limits:
-              memory: 2Gi
+              memory: 5Gi
               cpu: "1"
           readinessProbe:
-            tcpSocket:
-              port: 5432
+            httpGet:
+              path: /health
+              port: 9091
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
           livenessProbe:
-            tcpSocket:
-              port: 5432
+            httpGet:
+              path: /health
+              port: 9091
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 5

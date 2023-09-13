@@ -36,7 +36,7 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-print=10","-workers=1" ]
+          args: [ "-print=10","-workers=12" ]
           env:
             - name: SETTINGS_CONTEXT
               value: "scaling"
@@ -55,7 +55,7 @@ spec:
             - name: SERVICE_NAME
               value: tx-blaster-service
             - name: number_of_outputs
-              value: "5000"
+              value: "500"
             - name: use_cgo_signer
               value: "true"
           ports:

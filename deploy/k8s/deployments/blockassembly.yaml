@@ -33,8 +33,8 @@ spec:
                     app: blockassembly
                 topologyKey: "kubernetes.io/hostname"
       tolerations:
-        - key: service
-          value: blockassembly
+        - key: type
+          value: massive
           operator: Equal
           effect: NoSchedule
       containers:
@@ -73,11 +73,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 10Gi
-              cpu: "1"
+              memory: 20Gi
+              cpu: "10"
             limits:
-              memory: 10Gi
-              cpu: "1"
+              memory: 20Gi
+              cpu: "10"
           readinessProbe:
             httpGet:
               path: /health

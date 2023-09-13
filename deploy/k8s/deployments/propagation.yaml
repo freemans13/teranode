@@ -68,10 +68,10 @@ spec:
               subPath: utxo-writer-ubsv-383015-84d57e41cdda.json
           resources:
             requests:
-              memory: 8Gi
+              memory: 2Gi
               cpu: "2"
             limits:
-              memory: 8Gi
+              memory: 2Gi
               cpu: "2"
           readinessProbe:
             httpGet:
