@@ -16,3 +16,4 @@ resources:
   - blockchain.yaml
   - bootstrap.yaml
   - miner.yaml
+  - tx-blaster-allinone.yaml
