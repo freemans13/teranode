@@ -12,12 +12,11 @@
       "program": "${workspaceFolder}/.",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "miner_waitSeconds": "0",
         "SETTINGS_CONTEXT": "dev.simon",
         "securityLevel": "0",
-        "blobserver_httpAddress": "http://localhost:8090"
+        "blobserver_httpAddress": "http://localhost:8090",
       },
-      "args": ["-coinbase=0", "-seeder=0", "-miner=1", "-bootstrap=1"]
+      "args": ["-coinbase=0", "-seeder=0", "-miner=1", "-bootstrap=1", "-utxostore=1"]
     },
     {
       "name": "blockchain",
