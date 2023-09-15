@@ -49,6 +49,7 @@
     "malloc",
     "merkleroot",
     "merkles",
+    "Minio",
     "nolint",
     "opentracing",
     "otel",
