@@ -48,3 +48,19 @@ spec:
   tls:
     # use miner2-cert
     passthrough: true
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: miner2-ingressroute-https
+  namespace: miner2
+spec:
+  entryPoints:
+    - websecure
+  routes:
+  - match: HostSNI(`miner2.allinone.ubsv.dev`)
+    services:
+    - name: miner2
+      port: 8090
+  tls:
+    passthrough: true

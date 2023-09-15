@@ -64,3 +64,20 @@ spec:
       port: 8084
   tls:
     passthrough: true
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: m1-ingressroute-https
+  namespace: blob-service
+spec:
+  entryPoints:
+    - websecure
+  routes:
+  - match: HostSNI(`m1.allinone.ubsv.dev`)
+    services:
+    - name: m1
+      port: 8090
+  tls:
+    passthrough: true
+---

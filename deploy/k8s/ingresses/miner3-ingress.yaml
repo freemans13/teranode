@@ -49,3 +49,19 @@ spec:
     # use miner3-cert
 #    secretName: miner3-tls
     passthrough: true
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: miner3-ingressroute-https
+  namespace: miner3
+spec:
+  entryPoints:
+    - websecure
+  routes:
+  - match: HostSNI(`miner3.allinone.ubsv.dev`)
+    services:
+    - name: miner3
+      port: 8090
+  tls:
+    passthrough: true

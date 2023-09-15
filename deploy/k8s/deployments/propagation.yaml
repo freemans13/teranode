@@ -59,9 +59,11 @@ spec:
 #              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
           #              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
           ports:
+            - containerPort: 4040
+              protocol: TCP
             - containerPort: 8833
               protocol: TCP
-            - containerPort: 4040
+            - containerPort: 9095
               protocol: TCP
           volumeMounts:
             - name: secret-volume

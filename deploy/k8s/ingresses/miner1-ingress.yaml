@@ -17,6 +17,22 @@ spec:
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
+  name: miner1-ingressroute-https
+  namespace: miner1
+spec:
+  entryPoints:
+    - websecure
+  routes:
+  - match: HostSNI(`miner1.allinone.ubsv.dev`)
+    services:
+    - name: miner1
+      port: 8090
+  tls:
+    passthrough: true
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
   name: miner1-ingressroute-tcp-8090
   namespace: miner1
 spec:

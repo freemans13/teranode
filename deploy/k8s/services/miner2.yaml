@@ -46,3 +46,7 @@ spec:
       port: 4040
       targetPort: 4040
       protocol: TCP
+    - name: p2p
+      port: 9095
+      targetPort: 9095
+      protocol: TCP

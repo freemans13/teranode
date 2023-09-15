@@ -45,6 +45,8 @@ spec:
             - name: JAEGER_AGENT_PORT
               value: "6831"
           ports:
+            - containerPort: 4040
+              protocol: TCP
             - containerPort: 8082
               protocol: TCP
             - containerPort: 8083
@@ -59,7 +61,7 @@ spec:
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
-            - containerPort: 4040
+            - containerPort: 9095
               protocol: TCP
           resources:
             requests:
