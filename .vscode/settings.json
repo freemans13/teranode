@@ -60,6 +60,7 @@
     "promhttp",
     "protobuf",
     "protoc",
+    "protogen",
     "pubkey",
     "regtest",
     "resp",
