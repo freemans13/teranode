@@ -54,8 +54,7 @@ spec:
             - name: use_cgo_verifier
               value: "true"
             - name: txstore
-#              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
-              value: "null://"
+              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
           ports:
             - containerPort: 8081
               protocol: TCP

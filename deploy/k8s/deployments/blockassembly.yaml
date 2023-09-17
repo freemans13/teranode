@@ -62,7 +62,6 @@ spec:
             - name: SERVICE_NAME
               value: blockassembly-service
             - name: subtreestore
-              #              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
           ports:
             - containerPort: 8055
