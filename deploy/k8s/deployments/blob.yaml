@@ -46,7 +46,7 @@ spec:
             - name: blockchain_grpcAddress
               value: "blockchain-service.blockchain-service.svc.cluster.local:8087"
             - name: blobserver_httpAddress
-              value: "https://m1.scaling.ubsv.dev:8090"
+              value: "https://m1.scaling.ubsv.dev"
             - name: blobserver_clientName
               value: "M1"
             - name: blobserver_grpcAddress
