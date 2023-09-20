@@ -57,8 +57,6 @@ spec:
               value: "bootstrap-service.bootstrap-service.svc.cluster.local:8099"
             - name: txstore
               value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
-            - name: utxostore
-              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
           ports:
             - containerPort: 8090
               protocol: TCP
