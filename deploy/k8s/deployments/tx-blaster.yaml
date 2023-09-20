@@ -39,25 +39,15 @@ spec:
           args: [ "-print=10","-workers=100" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "scaling"
-            - name: propagation_grpcAddresses
-              value: "propagation-service.propagation-service.svc.cluster.local:8084"
-            - name: coinbase_grpcAddress
-              value: coinbase-service.coinbase-service.svc.cluster.local:8093
-            - name: profilerAddr
-              value: 0.0.0.0:9091
-            - name: tx_blaster_profilerAddr
-              value: 0.0.0.0:9092
+              value: scaling.m1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
               value: tx-blaster-service
-            - name: number_of_outputs
-              value: "500"
-            - name: use_cgo_signer
-              value: "true"
+            - name: tx_blaster_profilerAddr
+              value: 0.0.0.0:9092
           ports:
             - containerPort: 8086
               protocol: TCP

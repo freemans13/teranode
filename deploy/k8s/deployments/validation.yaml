@@ -31,30 +31,14 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-validator=1" ]
           env:
-            - name: blockchain_grpcAddress
-              value: blockchain-service.blockchain-service.svc.cluster.local:8087
             - name: SETTINGS_CONTEXT
-              value: "scaling"
-            - name: utxostore
-              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
-            - name: txmeta_store
-              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
-            - name: validator_grpcListenAddress
-              value: :8081
-            - name: blockassembly_grpcAddress
-              value: k8s:///blockassembly-service.blockassembly-service.svc.cluster.local:8085
-            - name: profilerAddr
-              value: 0.0.0.0:9091
+              value: scaling.m1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
               value: validation-service
-            - name: use_cgo_verifier
-              value: "true"
-            - name: txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
           ports:
             - containerPort: 8081
               protocol: TCP

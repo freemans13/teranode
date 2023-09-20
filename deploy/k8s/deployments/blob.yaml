@@ -32,31 +32,13 @@ spec:
           args: [ "-blobserver=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "scaling"
-            - name: profilerAddr
-              value: 0.0.0.0:9091
+              value: scaling.m1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
               value: blob-service
-            - name: blockvalidation_grpcAddress
-              value: "blockvalidation-service.blockvalidation-service.svc.cluster.local:8088"
-            - name: blockchain_grpcAddress
-              value: "blockchain-service.blockchain-service.svc.cluster.local:8087"
-            - name: blobserver_httpAddress
-              value: "https://m1.scaling.ubsv.dev:8090"
-            - name: blobserver_clientName
-              value: "M1"
-            - name: blobserver_grpcAddress
-              value: "blob-service.blob-service.svc.cluster.local:8091"
-            - name: bootstrap_grpcAddress
-              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8089"
-            - name: bootstrap_httpAddress
-              value: "bootstrap-service.bootstrap-service.svc.cluster.local:8099"
-            - name: txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
           ports:
             - containerPort: 8090
               protocol: TCP

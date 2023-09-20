@@ -19,21 +19,21 @@ spec:
       containers:
         - name: utxostore
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: [ "-utxostore=1" ]
+          args: []
           env:
             - name: SETTINGS_CONTEXT
-              value: "scaling"
-            - name: utxostore
-              value: memory://:8082
-            #              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore-miner1
+              value: scaling.m1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
-            - name: profilerAddr
-              value: 0.0.0.0:9091
             - name: SERVICE_NAME
               value: miner1
+            # Remove the following lines to revert to aerospike as defined in setting_local.conf
+            - name: utxostore
+              value: memory://:8082
+            - name: startUtxoStore
+              value: "true"
           ports:
             - containerPort: 8089
               protocol: TCP
