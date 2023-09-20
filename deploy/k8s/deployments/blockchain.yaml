@@ -37,21 +37,13 @@ spec:
           args: [ "-blockchain=1", "-seeder=1" ] # todo joe fix we need blockchain to be blocking
           env:
             - name: SETTINGS_CONTEXT
-              value: "scaling"
-            - name: profilerAddr
-              value: 0.0.0.0:9091
+              value: scaling.m1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
               value: blockchain-service
-            - name: blockchain_store
-              value: postgres://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/m1
-            - name: txmeta_store
-              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
-            - name: utxostore
-              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
           ports:
             - containerPort: 8081
               protocol: TCP

@@ -43,28 +43,13 @@ spec:
           args: [ "-blockassembly=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "scaling"
-            - name: blockassembly_grpcListenAddress
-              value: :8085
-            - name: utxostore
-              value: aerospike://utxo-store-0.ubsv.internal:3000/utxostore
-            #            value: memory://utxostore-service.utxostore-service.svc.cluster.local:8082
-            - name: blockchain_grpcAddress
-              value: blockchain-service.blockchain-service.svc.cluster.local:8087
-            - name: txmeta_store
-              value: aerospike://tx-status-store-0.ubsv.internal:3000/txstatus_store
-            - name: profilerAddr
-              value: 0.0.0.0:9091
+              value: scaling.m1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
               value: blockassembly-service
-            - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
-            - name: txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
           ports:
             - containerPort: 8055
               protocol: TCP

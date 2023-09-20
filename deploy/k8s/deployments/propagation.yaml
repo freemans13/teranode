@@ -39,23 +39,13 @@ spec:
           #          command: [ "./ubsv.run" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "scaling"
-            - name: validator_grpcAddress
-              value: k8s:///validation-service.validation-service.svc.cluster.local:8081
-            - name: profilerAddr
-              value: 0.0.0.0:9091
+              value: scaling.m1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
               value: propagation-service
-            - name: txstore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/tx-lake?objectLocking=true
-            #              value: s3:///ubsv-utxo-store?region=eu-north-1 # todo separate the data later
-            - name: subtreestore
-              value: minio://minio:minio123@myminio-hl.minio.svc.cluster.local:9000/subtrees-lake?objectLocking=true&tempTTL=true
-          #              value: s3:///ubsv-subtree-store?region=eu-north-1 # todo separate the data later
           ports:
             - containerPort: 4040
               protocol: TCP

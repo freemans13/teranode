@@ -43,19 +43,7 @@ spec:
           args: [ "-coinbase=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "scaling"
-            - name: coinbase_grpcListenAddress
-              value: :8093
-            - name: blobserver_grpcAddress
-              value: "blob-service.blob-service.svc.cluster.local:8091"
-            - name: coinbase_blobserverGrpcAddress
-              value: "blob-service.blob-service.svc.cluster.local:8091"
-            - name: coinbase_store
-              value: postgres://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase
-            - name: profilerAddr
-              value: 0.0.0.0:9091
-            - name: logLevel
-              value: DEBUG
+              value: scaling.m1
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT

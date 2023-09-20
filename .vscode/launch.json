@@ -5,18 +5,14 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Simon",
+      "name": "UBSV",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
-      "buildFlags": "-tags=aerospike",
-      "env": {
-        "SETTINGS_CONTEXT": "dev.simon",
-        "securityLevel": "0",
-        "blobserver_httpAddress": "http://localhost:8090",
-      },
-      "args": ["-coinbase=0", "-seeder=0", "-miner=1", "-bootstrap=1", "-utxostore=1"]
+      // "buildFlags": "-tags=aerospike",
+      "env": {},
+      "args": []
     },
     {
       "name": "blockchain",
@@ -39,7 +35,7 @@
       "buildFlags": "-tags=aerospike",
       "env": {
         "SETTINGS_CONTEXT": "x",
-        "bootstrap_httpListenAddress": "localhost:8099",
+        "bootstrap_httpListenAddress": "localhost:8099"
       },
       "args": ["-bootstrap=1"]
     },
@@ -54,7 +50,7 @@
         "propagation_grpcAddresses": "m1.scaling.ubsv.dev:8084",
         "coinbase_grpcAddress": "coinbase.allinone.ubsv.dev:8093"
       },
-      "args": ["-workers=1000", "-print=1000"],
+      "args": ["-workers=1000", "-print=1000"]
     },
     {
       "name": "Remote Debug",
@@ -62,7 +58,7 @@
       "request": "attach",
       "mode": "remote",
       "port": 4040,
-      "host": "127.0.0.1",
+      "host": "127.0.0.1"
     }
   ]
 }

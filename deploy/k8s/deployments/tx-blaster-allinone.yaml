@@ -38,25 +38,15 @@ spec:
           args: [ "-print=10","-workers=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: "allinone"
-            - name: propagation_grpcAddresses
-              value: "miner1.miner1.svc.cluster.local:8084|miner2.miner2.svc.cluster.local:8084|miner3.miner3.svc.cluster.local:8084"
-            - name: coinbase_grpcAddress
-              value: miner1.miner1.svc.cluster.local:8093
-            - name: profilerAddr
-              value: 0.0.0.0:9091
-            - name: tx_blaster_profilerAddr
-              value: 0.0.0.0:9092
+              value: allinone
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
               value: "6831"
             - name: SERVICE_NAME
               value: tx-blaster-service
-            - name: number_of_outputs
-              value: "500"
-            - name: use_cgo_signer
-              value: "true"
+            - name: tx_blaster_profilerAddr
+              value: 0.0.0.0:9092
           ports:
             - containerPort: 8086
               protocol: TCP
