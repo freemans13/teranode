@@ -13,6 +13,7 @@
     "blockassembly",
     "blockstore",
     "blocktx",
+    "blockvalidation",
     "bscript",
     "Bulma",
     "bval",
@@ -32,6 +33,7 @@
     "extranonce",
     "foundationdb",
     "getsentry",
+    "gocore",
     "halvings",
     "Infof",
     "InvVect",
@@ -52,6 +54,7 @@
     "Minio",
     "nolint",
     "opentracing",
+    "ordishs",
     "otel",
     "previousblockhash",
     "Priv",
@@ -67,6 +70,7 @@
     "respend",
     "safemap",
     "sarama",
+    "Satoshis",
     "Sats",
     "secp256k1",
     "Serialise",
@@ -88,6 +92,7 @@
     "teranode",
     "timestamppb",
     "txblaster",
+    "txid",
     "txmeta",
     "txmetastore",
     "txns",
@@ -100,6 +105,7 @@
     "uchar",
     "unlocker",
     "upgrader",
+    "utxo",
     "utxos",
     "utxoservice",
     "utxostore",
@@ -111,11 +117,7 @@
     "xtxo"
   ],
   "cmake.configureOnOpen": false,
-  "editor.codeActionsOnSave": {
-
-  },
+  "editor.codeActionsOnSave": {},
   "go.buildTags": "aerospike,native",
-  "go.languageServerFlags": [
-
-  ],
+  "go.languageServerFlags": []
 }
