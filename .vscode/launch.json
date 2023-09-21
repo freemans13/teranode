@@ -15,6 +15,18 @@
       "args": []
     },
     {
+      "name": "aerospiketest",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/aerospiketest/main.go",
+      "buildFlags": "-tags=aerospike",
+      "env": {
+        "SETTINGS_CONTEXT": "x",
+      },
+      "args": ["-strategy=direct", "-transactions=1000", "-workers=10", "-timeout=30s"]
+    },
+    {
       "name": "blockchain",
       "type": "go",
       "request": "launch",
