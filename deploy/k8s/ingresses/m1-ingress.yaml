@@ -74,10 +74,9 @@ spec:
   entryPoints:
     - websecure
   routes:
-  - match: HostSNI(`m1.allinone.ubsv.dev`)
+  - match: HostSNI(`m1.scaling.ubsv.dev`)
     services:
-    - name: m1
+    - name: blob-service
       port: 8090
   tls:
     passthrough: true
----
