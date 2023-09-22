@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: bootstrap
+  name: bootstrap
+  namespace: allinone
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bootstrap
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app: bootstrap
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: bootstrap
+                topologyKey: kubernetes.io/hostname
+              weight: 100
+      containers:
+        - args:
+            - -bootstrap=1
+            - -startMiner=0
+            - -startBlockAssembly=0
+            - -startBlobServer=0
+            - -startBlockValidation=0
+            - -startBlockchain=0
+            - -startBootstrap=1
+            - -startCoinbase=0
+            - -startP2P=0
+          env:
+            - name: SETTINGS_CONTEXT
+              value: allinone
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: SERVICE_NAME
+              value: bootstrap-service
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:5938ff663da5638b5f9d513f586944f882b0e16d
+          imagePullPolicy: IfNotPresent
+          name: bootstrap
+          ports:
+            - containerPort: 8089
+              protocol: TCP
+            - containerPort: 8099
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+      serviceAccountName: s3-push-service-account
