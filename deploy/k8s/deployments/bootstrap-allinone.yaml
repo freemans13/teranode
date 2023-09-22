@@ -33,17 +33,16 @@ spec:
       containers:
         - args:
             - -bootstrap=1
-            - -startMiner=0
-            - -startBlockAssembly=0
-            - -startBlobServer=0
-            - -startBlockValidation=0
-            - -startBlockchain=0
-            - -startBootstrap=1
-            - -startCoinbase=0
-            - -startP2P=0
+            - -miner=0
+            - -blockassembly=0
+            - -blobserver=0
+            - -blockvalidation=0
+            - -blockchain=0
+            - -coinbase=0
+            - -p2p=0
           env:
             - name: SETTINGS_CONTEXT
-              value: allinone
+              value: allinone.bootstrap
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT
