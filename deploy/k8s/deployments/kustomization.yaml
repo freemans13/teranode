@@ -17,4 +17,4 @@ resources:
   - bootstrap.yaml
   - miner.yaml
   - tx-blaster-allinone.yaml
-  - bootstrap-allineone.yaml
+  - bootstrap-allinone.yaml
