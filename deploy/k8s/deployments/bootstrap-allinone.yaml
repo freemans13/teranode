@@ -39,6 +39,9 @@ spec:
             - -blockvalidation=0
             - -blockchain=0
             - -coinbase=0
+            - -seeder=0
+            - -validator=0
+            - -propagation=0
             - -p2p=0
           env:
             - name: SETTINGS_CONTEXT
@@ -49,7 +52,7 @@ spec:
               value: "6831"
             - name: SERVICE_NAME
               value: bootstrap-service
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:5938ff663da5638b5f9d513f586944f882b0e16d
           imagePullPolicy: IfNotPresent
           name: bootstrap
           ports:
