@@ -34,7 +34,7 @@ spec:
       containers:
         - name: blockchain
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
-          args: [ "-blockchain=1", "-seeder=1" ] # todo joe fix we need blockchain to be blocking
+          args: [ "-blockchain=1" ]
           env:
             - name: SETTINGS_CONTEXT
               value: scaling.m1
