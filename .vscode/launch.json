@@ -15,6 +15,17 @@
       "args": []
     },
     {
+      "name": "DUMBBLASTER",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/dumb_blaster/main.go",
+      "buildFlags": "-tags=native",
+      "env": {},
+      "args": ["-broadcast"]
+    },
+
+    {
       "name": "aerospiketest",
       "type": "go",
       "request": "launch",
