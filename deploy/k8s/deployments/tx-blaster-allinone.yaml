@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: tx-blaster
-  namespace: allinone
+  namespace: allinone-miner
   labels:
     app: tx-blaster
     project: service
@@ -38,7 +38,7 @@ spec:
           args: [ "-print=10","-workers=1" ]
           env:
             - name: SETTINGS_CONTEXT
-              value: allinone
+              value: allinone-miner
             - name: JAEGER_AGENT_HOST
               value: jaeger-cluster-agent.jaeger.svc.cluster.local
             - name: JAEGER_AGENT_PORT

@@ -1,28 +1,28 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: miner2
-  namespace: miner2
+  name: miner
+  namespace: miner
   labels:
-    app: miner2
+    app: miner
     project: miner
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: miner2
+      app: miner
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-
   template:
     metadata:
       labels:
-        app: miner2
+        app: miner
     spec:
       serviceAccountName: s3-push-service-account
+      # affinity to attempt as much as possible not to schedule same instance types on the same k8s host/node
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -30,34 +30,26 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: miner2
+                    app: miner
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: miner
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          #          command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
           args: [ ]
-          env:
-
-            - name: SETTINGS_CONTEXT
-              value: allinone.miner.2
-            - name: JAEGER_AGENT_HOST
-              value: jaeger-cluster-agent.jaeger.svc.cluster.local
-            - name: JAEGER_AGENT_PORT
-              value: "6831"
+          envFrom:
+            - configMapRef:
+              name: miner-config
           ports:
             - containerPort: 4040
               protocol: TCP
-            - containerPort: 8082
-              protocol: TCP
-            - containerPort: 8083
-              protocol: TCP
             - containerPort: 8084
+              protocol: TCP
+            - containerPort: 8087
               protocol: TCP
             - containerPort: 8090
               protocol: TCP
             - containerPort: 8091
-              protocol: TCP
-            - containerPort: 8092
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
@@ -65,11 +57,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 10Gi
-              cpu: "1"
+              memory: 12Gi
+              cpu: "6"
             limits:
-              memory: 10Gi
-              cpu: "1"
+              memory: 12Gi
+              cpu: "6"
           readinessProbe:
             httpGet:
               path: /health
@@ -82,38 +74,6 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 3
-        - name: postgres-sidecar
-          image: postgres:latest
-          env:
-            - name: POSTGRES_USER
-              value: "postgres"
-            - name: POSTGRES_PASSWORD
-              value: "really_strong_password_change_me"
-            - name: POSTGRES_DB
-              value: "miner_coinbase"
-          ports:
-            - containerPort: 5432
-          resources:
-            requests:
-              memory: 1Gi
-              cpu: "0.5"
-            limits:
-              memory: 2Gi
-              cpu: "1"
-          readinessProbe:
-            tcpSocket:
-              port: 5432
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 3
-          livenessProbe:
-            tcpSocket:
-              port: 5432
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 5

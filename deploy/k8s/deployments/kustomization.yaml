@@ -15,6 +15,6 @@ resources:
   - blockvalidation.yaml
   - blockchain.yaml
   - bootstrap.yaml
-  - miner.yaml
-  - tx-blaster-allinone.yaml
-  - bootstrap-allinone.yaml
+  - bootstrap-deployment.yaml
+  - tx-blaster-allinone-miner.yaml
+  - bootstrap-allinone-miner.yaml
