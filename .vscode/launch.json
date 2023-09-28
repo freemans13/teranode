@@ -11,7 +11,9 @@
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
-      "env": {},
+      "env": {
+        "propagation_use_dumb": "true",
+      },
       "args": []
     },
     {
@@ -22,7 +24,7 @@
       "program": "${workspaceFolder}/cmd/dumb_blaster/main.go",
       "buildFlags": "-tags=native",
       "env": {},
-      "args": ["-broadcast"]
+      "args": ["-broadcast", "-http"]
     },
 
     {
