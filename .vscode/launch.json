@@ -24,7 +24,7 @@
       "program": "${workspaceFolder}/cmd/dumb_blaster/main.go",
       "buildFlags": "-tags=native",
       "env": {},
-      "args": ["-broadcast", "-http"]
+      "args": ["-broadcast=stream"]
     },
 
     {
