@@ -36,7 +36,7 @@ spec:
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-print=10","-workers=100" ]
+          args: [ "-workers=12" ]
           env:
             - name: SETTINGS_CONTEXT
               value: scaling-miner.m1

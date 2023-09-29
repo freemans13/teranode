@@ -10,6 +10,7 @@
     "bestblockheader",
     "blkcC",
     "blobserver",
+    "blockassembler",
     "blockassembly",
     "blockstore",
     "blocktx",
@@ -28,17 +29,23 @@
     "Debugf",
     "defaultvalidator",
     "dialing",
+    "DRPC",
+    "drpcmux",
+    "drpcserver",
     "emptypb",
     "errgroup",
     "extranonce",
     "foundationdb",
+    "frpc",
     "getsentry",
     "gocore",
     "halvings",
     "Infof",
     "InvVect",
+    "jellydator",
     "keyset",
     "kinesiss",
+    "kuberesolver",
     "Kustomization",
     "kustomize",
     "labstack",
@@ -49,6 +56,7 @@
     "locktime",
     "lsecp256k1",
     "malloc",
+    "Merkle",
     "merkleroot",
     "merkles",
     "Minio",
@@ -58,6 +66,7 @@
     "otel",
     "previousblockhash",
     "Priv",
+    "privkey",
     "progname",
     "promauto",
     "promhttp",
@@ -91,7 +100,10 @@
     "TAAL",
     "teranode",
     "timestamppb",
+    "ttlcache",
+    "txblast",
     "txblaster",
+    "txcount",
     "txid",
     "txmeta",
     "txmetastore",
@@ -119,5 +131,23 @@
   "cmake.configureOnOpen": false,
   "editor.codeActionsOnSave": {},
   "go.buildTags": "aerospike,native",
-  "go.languageServerFlags": []
+  "go.languageServerFlags": [],
+  "go.useLanguageServer": true,
+  "[go]": {
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": true
+    }
+  },
+  "gopls": {
+    "staticcheck": true,
+    "lint": "stylecheck",
+    "analyses": {
+      "printf": true,
+      "composites": true
+      // Add more analyses checks here
+    }
+  },
+  "go.lintTool": "golangci-lint",
+  "go.lintFlags": ["--fast"]
 }

@@ -12,7 +12,7 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "propagation_use_dumb": "true",
+        "propagation_use_dumb": "true"
       },
       "args": []
     },
@@ -24,7 +24,7 @@
       "program": "${workspaceFolder}/cmd/dumb_blaster/main.go",
       "buildFlags": "-tags=native",
       "env": {},
-      "args": ["-broadcast", "-http"]
+      "args": ["-broadcast=stream"]
     },
 
     {
@@ -35,7 +35,7 @@
       "program": "${workspaceFolder}/cmd/aerospiketest/main.go",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "x",
+        "SETTINGS_CONTEXT": "x"
       },
       "args": ["-strategy=direct", "-transactions=1000", "-workers=10", "-timeout=30s"]
     },
