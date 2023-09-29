@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: propagation
+
+  labels:
+    app: propagation
+    project: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: propagation
+  template:
+    metadata:
+      labels:
+        app: propagation
+    spec:
+      serviceAccountName: s3-push-service-account
+      volumes:
+        - name: secret-volume
+          secret:
+            secretName: utxo-writer-gcs-sa
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: propagation
+                topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: propagation
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          args: [ "-propagation=1" ]
+          # command: "You can override the entrypoint with a command."
+          #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          #          command: [ "./ubsv.run" ]
+          env:
+            - name: SETTINGS_CONTEXT
+              value: scaling-miner.m1
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: SERVICE_NAME
+              value: propagation-service
+          ports:
+            - containerPort: 4040
+              protocol: TCP
+            - containerPort: 8833
+              protocol: TCP
+            - containerPort: 9095
+              protocol: TCP
+          volumeMounts:
+            - name: secret-volume
+              mountPath: /app/keyfile.json
+              readOnly: true
+              subPath: utxo-writer-ubsv-383015-84d57e41cdda.json
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "6"
+            limits:
+              memory: 2Gi
+              cpu: "6"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3

@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tx-blaster
+  namespace: allinone-miner
+  labels:
+    app: tx-blaster
+    project: service
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: tx-blaster
+  template:
+    metadata:
+      labels:
+        app: tx-blaster
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: tx-blaster
+                topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: tx-blaster
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          command:
+            - ./blaster.run
+          args: [ "-workers=100" ]
+          env:
+            - name: SETTINGS_CONTEXT
+              value: tx-blaster.scaling
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: SERVICE_NAME
+              value: tx-blaster-service
+            - name: tx_blaster_profilerAddr
+              value: 0.0.0.0:9092
+          ports:
+            - containerPort: 8086
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 9092
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "4"
+            limits:
+              memory: 2Gi
+              cpu: "4"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9092
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9092
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3

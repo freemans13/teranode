@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blob
+
+  labels:
+    app: blob
+    project: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blob
+  template:
+    metadata:
+      labels:
+        app: blob
+    spec:
+      serviceAccountName: s3-push-service-account
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: blob
+                topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: blob
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          args: [ "-blobserver=1" ]
+          env:
+            - name: SETTINGS_CONTEXT
+              value: scaling-miner.m1
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: SERVICE_NAME
+              value: blob-service
+          ports:
+            - containerPort: 8090
+              protocol: TCP
+            - containerPort: 8099
+              protocol: TCP
+            - containerPort: 8091
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "2"
+            limits:
+              memory: 2Gi
+              cpu: "2"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3

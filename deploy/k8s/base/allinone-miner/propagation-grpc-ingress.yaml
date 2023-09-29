@@ -1,0 +1,14 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: tcp-8084-propagation-miner
+spec:
+  entryPoints:
+    - prop-grpc
+  routes:
+    - match: HostSNI(`miner.allinone.ubsv.dev`)
+      services:
+        - name: miner
+          port: 8084
+  tls:
+    passthrough: true

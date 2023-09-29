@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockassembly
+
+  labels:
+    app: blockassembly
+    project: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blockassembly
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app: blockassembly
+    spec:
+      serviceAccountName: s3-push-service-account
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: blockassembly
+                topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: type
+          value: massive
+          operator: Equal
+          effect: NoSchedule
+      containers:
+        - name: blockassembly
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          args: [ "-blockassembly=1" ]
+          env:
+            - name: SETTINGS_CONTEXT
+              value: scaling-miner.m1
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: SERVICE_NAME
+              value: blockassembly-service
+          ports:
+            - containerPort: 8055
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 64Gi
+              cpu: "32"
+            limits:
+              memory: 64Gi
+              cpu: "32"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3

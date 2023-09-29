@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base/allinone-miner
+
+namespace: miner7
+
+nameSuffix: "7"
+commonLabels:
+  app: miner7
+
+configMapGenerator:
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=allinone.miner.7
+    name: config-miner
+
+
+patches:
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/match
+        value: HostSNI(`miner7.allinone.ubsv.dev`)
+    target:
+      kind: IngressRouteTCP
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: miner7
+    target:
+      kind: IngressRouteTCP
+  - patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: miner7
+    target:
+      kind: ClusterRoleBinding
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: sa-miner7
+    target:
+      kind: Deployment

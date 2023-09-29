@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: miner
+  name: miner
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: miner
+  template:
+    metadata:
+      labels:
+        app: miner
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: miner
+                topologyKey: kubernetes.io/hostname
+              weight: 100
+      containers:
+        - args:
+            - -miner=1
+          env:
+            - name: SETTINGS_CONTEXT
+              value: scaling-miner.m1
+            - name: JAEGER_AGENT_HOST
+              value: jaeger-cluster-agent.jaeger.svc.cluster.local
+            - name: JAEGER_AGENT_PORT
+              value: "6831"
+            - name: SERVICE_NAME
+              value: miner-service
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          imagePullPolicy: IfNotPresent
+          name: miner
+          ports:
+            - containerPort: 8089
+              protocol: TCP
+            - containerPort: 8099
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 2
+              memory: 2Gi
+            requests:
+              cpu: 2
+              memory: 2Gi
+      serviceAccountName: s3-push-service-account

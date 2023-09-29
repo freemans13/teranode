@@ -1,0 +1,15 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: bootstrap-ingressroute-http-8099
+  namespace: bootstrap-service
+spec:
+  entryPoints:
+    - bootstrap-http
+  routes:
+  - match: HostSNI(`bootstrap.scaling-miner.ubsv.dev`)
+    services:
+    - name: bootstrap-service
+      port: 8099
+  tls:
+    passthrough: true

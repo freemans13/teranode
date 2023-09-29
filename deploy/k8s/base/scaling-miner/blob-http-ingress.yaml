@@ -1,0 +1,15 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: m1-ingressroute-https
+
+spec:
+  entryPoints:
+    - websecure
+  routes:
+  - match: HostSNI(`m1.scaling-miner.ubsv.dev`)
+    services:
+    - name: blob-service
+      port: 8090
+  tls:
+    passthrough: true

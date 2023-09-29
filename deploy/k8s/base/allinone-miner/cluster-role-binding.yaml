@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ubsv-service-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: s3-push-service-account
+    namespace: miner
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
