@@ -52,7 +52,7 @@ spec:
               value: "6831"
             - name: SERVICE_NAME
               value: bootstrap-service
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:cf3cc939b65e7e17a86a0ff3c8798d99b1ae45ae
           imagePullPolicy: IfNotPresent
           name: bootstrap
           ports:

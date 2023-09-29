@@ -32,7 +32,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: tx-blaster
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:cf3cc939b65e7e17a86a0ff3c8798d99b1ae45ae
           command:
             - ./blaster.run
           args: [ "-workers=100" ]
