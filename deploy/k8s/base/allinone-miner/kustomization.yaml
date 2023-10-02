@@ -12,3 +12,5 @@ resources:
   - blob-http-ingress.yaml
   - coinbase-grpc-ingress.yaml
   - coinbase-deployment.yaml
+  - coinbase-service.yaml
+  - tx-blaster-deployment.yaml

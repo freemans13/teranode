@@ -15,12 +15,12 @@ spec:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-
   template:
     metadata:
       labels:
         app: bootstrap
     spec:
+      serviceAccountName: sa-allinone
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
