@@ -34,7 +34,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: blockvalidation
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:d735642cb4f413067d314a0b1dff14b66c1b3adc
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-blockvalidation=1" ]
           env:
             - name: SETTINGS_CONTEXT

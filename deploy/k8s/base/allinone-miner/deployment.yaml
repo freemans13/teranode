@@ -34,7 +34,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: miner
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:d735642cb4f413067d314a0b1dff14b66c1b3adc
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           #          command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
           args: [ ]
           envFrom:

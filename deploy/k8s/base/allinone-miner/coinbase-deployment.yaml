@@ -38,7 +38,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: coinbase
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:d735642cb4f413067d314a0b1dff14b66c1b3adc
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-coinbase=1" ]
           env:
             - name: SETTINGS_CONTEXT
