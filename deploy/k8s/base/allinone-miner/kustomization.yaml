@@ -10,3 +10,5 @@ resources:
   - deployment.yaml
   - propagation-grpc-ingress.yaml
   - blob-http-ingress.yaml
+  - coinbase-grpc-ingress.yaml
+  - coinbase-deployment.yaml

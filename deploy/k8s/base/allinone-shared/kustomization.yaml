@@ -5,9 +5,7 @@ resources:
   - tx-blaster-deployment.yaml
   - bootstrap-deployment.yaml
   - bootstrap-http-ingress.yaml
-  - coinbase-grpc-ingress.yaml
   - bootstrap-grpc-ingress.yaml
-  - coinbase-deployment.yaml
   - tx-blaster-configmap.yaml
   - bootstrap-configmap.yaml
   - bootstrap-service.yaml
