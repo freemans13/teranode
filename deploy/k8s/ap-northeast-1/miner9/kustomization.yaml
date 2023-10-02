@@ -33,12 +33,12 @@ patches:
   - patch: |-
       - op: replace
         path: /subjects/0/namespace
-        value: miner8
+        value: miner9
     target:
       kind: ClusterRoleBinding
   - patch: |-
       - op: replace
         path: /spec/template/spec/serviceAccountName
-        value: sa-miner8
+        value: sa-miner9
     target:
       kind: Deployment
