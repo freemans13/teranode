@@ -37,17 +37,13 @@ spec:
           command:
             - ./blaster.run
           args: [ "-workers=100" ]
+          envFrom:
+            - configMapRef:
+                name: config-miner
           env:
-            - name: SETTINGS_CONTEXT
-              value: tx-blaster.scaling
-            - name: JAEGER_AGENT_HOST
-              value: jaeger-cluster-agent.jaeger.svc.cluster.local
-            - name: JAEGER_AGENT_PORT
-              value: "6831"
             - name: SERVICE_NAME
               value: tx-blaster-service
-            - name: tx_blaster_profilerAddr
-              value: 0.0.0.0:9092
+
           ports:
             - containerPort: 8086
               protocol: TCP

@@ -40,13 +40,10 @@ spec:
         - name: coinbase
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
           args: [ "-coinbase=1" ]
+          envFrom:
+            - configMapRef:
+                name: config-miner
           env:
-            - name: SETTINGS_CONTEXT
-              value: coinbase.scaling
-            - name: JAEGER_AGENT_HOST
-              value: jaeger-cluster-agent.jaeger.svc.cluster.local
-            - name: JAEGER_AGENT_PORT
-              value: "6831"
             - name: SERVICE_NAME
               value: coinbase-service
           ports:
