@@ -4,7 +4,7 @@ metadata:
   name: ubsv-service-role-binding
 subjects:
   - kind: ServiceAccount
-    name: s3-push-service-account
+    name: miner-service-account
     namespace: miner
 roleRef:
   kind: ClusterRole

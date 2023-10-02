@@ -21,7 +21,7 @@ spec:
       labels:
         app: tx-blaster
     spec:
-      serviceAccountName: s3-push-service-account
+      serviceAccountName: miner-service-account
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
