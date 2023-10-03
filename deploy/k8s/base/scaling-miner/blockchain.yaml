@@ -33,7 +33,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: blockchain
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          image: REPO:IMAGE:TAG
           args: [ "-blockchain=1" ]
           env:
             - name: SETTINGS_CONTEXT

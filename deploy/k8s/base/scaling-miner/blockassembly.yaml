@@ -39,7 +39,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: blockassembly
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/IMAGE:TAG
+          image: REPO:IMAGE:TAG
           args: [ "-blockassembly=1" ]
           env:
             - name: SETTINGS_CONTEXT
