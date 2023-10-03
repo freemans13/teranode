@@ -15,6 +15,10 @@ configMapGenerator:
     literals:
       - SETTINGS_CONTEXT=allinone.miner.8
     name: config-miner
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=allinone.coinbase.8
+    name: coinbase-config
 
 
 patches:
