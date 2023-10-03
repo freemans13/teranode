@@ -13,4 +13,5 @@ resources:
   - coinbase-grpc-ingress.yaml
   - coinbase-deployment.yaml
   - coinbase-service.yaml
+  - coinbase-configmap.yaml
   - tx-blaster-deployment.yaml
