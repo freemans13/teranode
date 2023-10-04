@@ -140,15 +140,6 @@
       "source.organizeImports": true
     }
   },
-  "gopls": {
-    "staticcheck": true,
-    "lint": "stylecheck",
-    "analyses": {
-      "printf": true,
-      "composites": true
-      // Add more analyses checks here
-    }
-  },
   "go.lintTool": "golangci-lint",
   "go.lintFlags": ["--fast"]
 }
