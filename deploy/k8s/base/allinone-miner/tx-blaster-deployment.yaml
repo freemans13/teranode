@@ -43,7 +43,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: tx-blaster-service
-
+            - name: SETTINGS_CONTEXT
+              value: scaling.m1
           ports:
             - containerPort: 8086
               protocol: TCP

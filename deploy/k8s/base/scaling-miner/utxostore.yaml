@@ -40,7 +40,7 @@ spec:
           #          command: [ "./ubsv.run" ]
           envFrom:
             - configMapRef:
-                name: utxo-config-m
+                name: utxo-config-m1 # todo fix to dynmaically get numebr of miner
           env:
             - name: SERVICE_NAME
               value: utxostore-service
@@ -54,10 +54,10 @@ spec:
           resources:
             requests:
               memory: 32Gi
-              cpu: "120"
+              cpu: "100"
             limits:
               memory: 32Gi
-              cpu: "120"
+              cpu: "100"
           readinessProbe:
             httpGet:
               path: /health

@@ -1,15 +1,16 @@
 # tx blaster
-kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 0
+kubectl scale deployment -n m1 tx-blaster1 --replicas 0
 
 # m1
-kubectl scale deployment -n blockchain-service blockchain --replicas 0
-kubectl scale deployment -n coinbase-service coinbase --replicas 0
-kubectl scale deployment -n blockassembly-service blockassembly --replicas 0
-kubectl scale deployment -n blob-service blob --replicas 0
-kubectl scale deployment -n blockvalidation-service blockvalidation --replicas 0
-kubectl scale deployment -n validation-service validation --replicas 0
-kubectl scale deployment -n propagation-service propagation --replicas 0
-kubectl scale deployment -n miner-service miner --replicas 0
+kubectl scale deployment -n m1 blockchain1 --replicas 0
+kubectl scale deployment -n m1 coinbase1 --replicas 0
+kubectl scale deployment -n m1 blockassembly1 --replicas 0
+kubectl scale deployment -n m1 blob1 --replicas 0
+kubectl scale deployment -n m1 blockvalidation1 --replicas 0
+kubectl scale deployment -n m1 validation1 --replicas 0
+kubectl scale deployment -n m1 propagation1 --replicas 0
+kubectl scale deployment -n m1 miner1 --replicas 0
+kubectl scale deployment -n m1 utxostore1 --replicas 0
 
 # all in one
 kubectl scale deployment -n miner1 miner1 --replicas 0
