@@ -25,3 +25,7 @@ resources:
   - shared-config-map.yaml
   - service-account.yaml
   - cluster-role-binding.yaml
+  - coinbase-service.yaml
+  - coinbase-deployment.yaml
+  - coinbase-configmap.yaml
+  - coinbase-grpc-ingress.yaml

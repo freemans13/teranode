@@ -1,16 +1,16 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: blockvalidation
-
+  name: coinbase
+  namespace: coinbase-service
   labels:
-    app: blockvalidation
+    app: coinbase
     project: service
 spec:
-  replicas: 0
+  replicas: 1
   selector:
     matchLabels:
-      app: blockvalidation
+      app: coinbase
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -20,9 +20,8 @@ spec:
   template:
     metadata:
       labels:
-        app: blockvalidation
+        app: coinbase
     spec:
-      serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -30,20 +29,25 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: blockvalidation
+                    app: coinbase
                 topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: service
+          value: coinbase
+          operator: Equal
+          effect: NoSchedule
       containers:
-        - name: blockvalidation
+        - name: coinbase
           image: REPO:IMAGE:TAG
-          args: [ "-blockvalidation=1" ]
+          args: [ "-coinbase=1" ]
           envFrom:
             - configMapRef:
-                name: config-miner
+                name: coinbase-config
           env:
             - name: SERVICE_NAME
-              value: blockvalidation-service
+              value: coinbase-service
           ports:
-            - containerPort: 8088
+            - containerPort: 8093
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
@@ -51,11 +55,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 10Gi
-              cpu: "4"
+              memory: 5Gi
+              cpu: "2"
             limits:
-              memory: 10Gi
-              cpu: "4"
+              memory: 5Gi
+              cpu: "2"
           readinessProbe:
             httpGet:
               path: /health

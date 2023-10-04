@@ -16,7 +16,6 @@ configMapGenerator:
       - SETTINGS_CONTEXT=scaling.m1
     name: shared-config-m
 
-
 patches:
   - patch: |-
       - op: replace

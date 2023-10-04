@@ -35,8 +35,10 @@ spec:
         - name: blockchain
           image: REPO:IMAGE:TAG
           args: [ "-blockchain=1" ]
+          envFrom:
+            - configMapRef:
+                name: config-miner
           env:
-
             - name: SERVICE_NAME
               value: blockchain-service
           ports:

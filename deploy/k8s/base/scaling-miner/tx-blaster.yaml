@@ -38,7 +38,6 @@ spec:
             - ./blaster.run
           args: [ "-workers=12" ]
           env:
-
             - name: SERVICE_NAME
               value: tx-blaster-service
             - name: tx_blaster_profilerAddr
