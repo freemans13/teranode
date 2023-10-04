@@ -16,7 +16,7 @@ spec:
       labels:
         app: propagation
     spec:
-      serviceAccountName: miner-service-account
+      serviceAccountName: sa-m
       volumes:
         - name: secret-volume
           secret:

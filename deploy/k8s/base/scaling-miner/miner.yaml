@@ -50,4 +50,4 @@ spec:
             requests:
               cpu: 2
               memory: 2Gi
-      serviceAccountName: miner-service-account
+      serviceAccountName: sa-m

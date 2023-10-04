@@ -15,7 +15,7 @@ spec:
       labels:
         app: blob
     spec:
-      serviceAccountName: miner-service-account
+      serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

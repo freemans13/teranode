@@ -21,7 +21,7 @@ spec:
       labels:
         app: tx-blaster
     spec:
-      serviceAccountName: miner-service-account
+      serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

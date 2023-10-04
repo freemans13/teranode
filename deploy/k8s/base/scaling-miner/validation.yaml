@@ -16,7 +16,7 @@ spec:
       labels:
         app: validation
     spec:
-      serviceAccountName: miner-service-account
+      serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

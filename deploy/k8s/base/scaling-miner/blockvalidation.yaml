@@ -22,7 +22,7 @@ spec:
       labels:
         app: blockvalidation
     spec:
-      serviceAccountName: miner-service-account
+      serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
