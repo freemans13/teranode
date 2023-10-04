@@ -17,10 +17,6 @@ spec:
         app: propagation
     spec:
       serviceAccountName: sa-m
-      volumes:
-        - name: secret-volume
-          secret:
-            secretName: utxo-writer-gcs-sa
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -50,11 +46,6 @@ spec:
               protocol: TCP
             - containerPort: 9095
               protocol: TCP
-          volumeMounts:
-            - name: secret-volume
-              mountPath: /app/keyfile.json
-              readOnly: true
-              subPath: utxo-writer-ubsv-383015-84d57e41cdda.json
           resources:
             requests:
               memory: 2Gi
