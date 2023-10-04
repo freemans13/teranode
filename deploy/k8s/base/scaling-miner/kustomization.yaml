@@ -5,11 +5,13 @@ resources:
   - blob.yaml
   - blockvalidation.yaml
   - propagation-service.yaml
+  - utxostore-service.yaml
   - blockvalidation-service.yaml
   - miner.yaml
   - tx-blaster-service.yaml
   - validation-service.yaml
   - propagation.yaml
+  - utxostore.yaml
   - blockassembly.yaml
   - validation.yaml
   - blob-service.yaml
