@@ -7,7 +7,7 @@ spec:
   entryPoints:
     - websecure
   routes:
-  - match: HostSNI(`m1.scaling-miner.ubsv.dev`)
+  - match: HostSNI(`m1.scaling.ubsv.dev`)
     services:
     - name: blob-service
       port: 8090
