@@ -38,12 +38,7 @@ spec:
           #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
           #          command: [ "./ubsv.run" ]
           env:
-            - name: SETTINGS_CONTEXT
-              value: scaling-miner.m1
-            - name: JAEGER_AGENT_HOST
-              value: jaeger-cluster-agent.jaeger.svc.cluster.local
-            - name: JAEGER_AGENT_PORT
-              value: "6831"
+
             - name: SERVICE_NAME
               value: propagation-service
           ports:

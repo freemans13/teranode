@@ -37,12 +37,7 @@ spec:
           image: REPO:IMAGE:TAG
           args: [ "-blockvalidation=1" ]
           env:
-            - name: SETTINGS_CONTEXT
-              value: scaling-miner.m1
-            - name: JAEGER_AGENT_HOST
-              value: jaeger-cluster-agent.jaeger.svc.cluster.local
-            - name: JAEGER_AGENT_PORT
-              value: "6831"
+
             - name: SERVICE_NAME
               value: blockvalidation-service
           ports:

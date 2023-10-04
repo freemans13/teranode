@@ -4,19 +4,22 @@ kind: Kustomization
 resources:
   - blob.yaml
   - blockvalidation.yaml
-  - blob-service.yaml
-  - validation-service.yaml
+  - propagation-service.yaml
   - blockvalidation-service.yaml
-  - tx-blaster.yaml
-  - propagation-grpc-ingress.yaml
   - miner.yaml
+  - tx-blaster-service.yaml
+  - validation-service.yaml
   - propagation.yaml
   - blockassembly.yaml
+  - validation.yaml
+  - blob-service.yaml
   - blockchain-service.yaml
-  - blockassembly-service.yaml
   - blob-http-ingress.yaml
   - blob-grpc-ingress.yaml
-  - validation.yaml
-  - tx-blaster-service.yaml
+  - tx-blaster.yaml
+  - propagation-grpc-ingress.yaml
   - blockchain.yaml
-  - propagation-service.yaml
+  - blockassembly-service.yaml
+  - shared-config-map.yaml
+  - service-account.yaml
+  - cluster-role-binding.yaml

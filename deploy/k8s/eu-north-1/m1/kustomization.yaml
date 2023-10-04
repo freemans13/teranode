@@ -6,6 +6,7 @@ resources:
 
 namespace: m1
 
+nameSuffix: "1"
 commonLabels:
   app: m1
 
@@ -13,7 +14,7 @@ configMapGenerator:
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1
-    name: config-miner
+    name: shared-config-m
 
 
 patches:
@@ -29,3 +30,16 @@ patches:
         value: m1
     target:
       kind: IngressRouteTCP
+
+  - patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: m1
+    target:
+      kind: ClusterRoleBinding
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: sa-m1
+    target:
+      kind: Deployment
