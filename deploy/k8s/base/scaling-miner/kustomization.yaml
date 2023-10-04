@@ -8,7 +8,7 @@ resources:
   - utxostore-service.yaml
   - utxo-config-map.yaml
   - blockvalidation-service.yaml
-  - miner.yaml
+  - miner-deployment.yaml
   - tx-blaster-service.yaml
   - validation-service.yaml
   - propagation.yaml
