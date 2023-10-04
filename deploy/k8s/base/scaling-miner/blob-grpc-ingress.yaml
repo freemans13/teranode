@@ -9,7 +9,7 @@ spec:
   routes:
   - match: HostSNI(`m1.scaling.ubsv.dev`)
     services:
-    - name: blob-service
+    - name: blob-service1
       port: 8091
   tls:
     # use m1-cert

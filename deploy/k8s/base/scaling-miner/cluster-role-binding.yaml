@@ -4,8 +4,8 @@ metadata:
   name: ubsv-service-role-binding
 subjects:
   - kind: ServiceAccount
-    name: miner-service-account
-    namespace: m
+    name: sa-m1 # todo change
+    namespace: m1
 roleRef:
   kind: ClusterRole
   name: view

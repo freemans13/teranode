@@ -9,7 +9,7 @@ spec:
   routes:
   - match: HostSNI(`m1.scaling.ubsv.dev`)
     services:
-    - name: propagation-service
+    - name: propagation-service1
       port: 8084
   tls:
     passthrough: true
