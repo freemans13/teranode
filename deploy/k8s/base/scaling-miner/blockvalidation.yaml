@@ -38,7 +38,7 @@ spec:
           args: [ "-blockvalidation=1" ]
           envFrom:
             - configMapRef:
-                name: config-miner
+                name: shared-config-m
           env:
             - name: SERVICE_NAME
               value: blockvalidation-service
