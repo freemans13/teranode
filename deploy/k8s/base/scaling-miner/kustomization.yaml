@@ -6,6 +6,7 @@ resources:
   - blockvalidation.yaml
   - propagation-service.yaml
   - utxostore-service.yaml
+  - txmetastore-service.yaml
   - utxo-config-map.yaml
   - blockvalidation-service.yaml
   - miner-deployment.yaml
@@ -13,6 +14,7 @@ resources:
   - validation-service.yaml
   - propagation.yaml
   - utxostore.yaml
+  - txmetastore.yaml
   - blockassembly.yaml
   - validation.yaml
   - blob-service.yaml

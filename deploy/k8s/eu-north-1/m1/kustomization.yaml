@@ -13,7 +13,7 @@ commonLabels:
 configMapGenerator:
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.m1
+      - SETTINGS_CONTEXT=scaling.m1.memory
     name: shared-config-m
 
 patches:
