@@ -12,9 +12,14 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "propagation_use_dumb": "true"
+        "SETTINGS_CONTEXT": "x",
+        "utxostore": "null:///",
+        "propagation_use_dumb": "true",
+        "startUtxoStore": "false",
       },
-      "args": []
+      "args": [
+        "-validator=1"
+      ]
     },
     {
       "name": "DUMBBLASTER",

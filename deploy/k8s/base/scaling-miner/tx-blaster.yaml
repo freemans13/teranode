@@ -36,7 +36,7 @@ spec:
           image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-workers=12" ]
+          args: [ "-workers=100", "-buffer=100000" ]
           env:
             - name: SERVICE_NAME
               value: tx-blaster-service
