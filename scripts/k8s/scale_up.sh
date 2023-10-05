@@ -3,6 +3,8 @@ kubectl scale deployment -n m1 blockchain1 --replicas 1
 sleep 5
 kubectl scale deployment -n m1 utxostore1 --replicas 1
 sleep 5
+kubectl scale deployment -n m1 txmetastore1 --replicas 1
+sleep 5
 kubectl scale deployment -n m1 blockassembly1 --replicas 1
 sleep 5
 kubectl scale deployment -n m1 blockvalidation1 --replicas 1
