@@ -44,6 +44,11 @@ spec:
               value: 0.0.0.0:9092
             - name: SETTINGS_CONTEXT
               value: scaling.m1
+            - name: GRPC_GO_LOG_VERBOSITY
+              value: info
+            - name: GRPC_GO_LOG_SEVERITY
+              value: info
+
           ports:
             - containerPort: 8086
               protocol: TCP
