@@ -24,6 +24,14 @@ spec:
       port: 8084
       targetPort: 8084
       protocol: TCP
+    - name: frpc
+      port: 8284
+      targetPort: 8284
+      protocol: TCP
+    - name: drpc
+      port: 8184
+      targetPort: 8184
+      protocol: TCP
     - name: profiler
       port: 9091
       targetPort: 9091

@@ -48,7 +48,6 @@ spec:
               value: info
             - name: GRPC_GO_LOG_SEVERITY
               value: info
-
           ports:
             - containerPort: 8086
               protocol: TCP
