@@ -11,15 +11,8 @@
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
-      "env": {
-        "SETTINGS_CONTEXT": "x",
-        "utxostore": "null:///",
-        "propagation_use_dumb": "true",
-        "startUtxoStore": "false",
-      },
-      "args": [
-        "-validator=1"
-      ]
+      "env": {},
+      "args": []
     },
     {
       "name": "DUMBBLASTER",
