@@ -24,7 +24,15 @@
       "env": {},
       "args": ["-broadcast=stream"]
     },
-
+    {
+      "name": "BLOCKASSEMBLY_BLASTER",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/blockassembly_blaster/main.go",
+      "env": {},
+      "args": ["-broadcast=frpc"]
+    },
     {
       "name": "aerospiketest",
       "type": "go",
