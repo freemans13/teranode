@@ -20,6 +20,14 @@ spec:
       port: 8081
       targetPort: 8081
       protocol: TCP
+    - name: tcp
+      port: 8181
+      targetPort: 8181
+      protocol: TCP
+    - name: tcp
+      port: 8281
+      targetPort: 8281
+      protocol: TCP
     - name: validation
       port: 8088
       targetPort: 8088
