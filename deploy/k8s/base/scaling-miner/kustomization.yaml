@@ -22,6 +22,7 @@ resources:
   - blockchain-service.yaml
   - blob-http-ingress.yaml
   - blob-grpc-ingress.yaml
+  - blockassembly-blaster.yaml
   - tx-blaster.yaml
   - propagation-grpc-ingress.yaml
   - blockchain.yaml
