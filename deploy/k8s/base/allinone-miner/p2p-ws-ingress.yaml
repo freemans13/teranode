@@ -1,0 +1,14 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: p2p-ws-ingress-9906
+spec:
+  entryPoints:
+    - p2p-ws
+  routes:
+    - match: HostSNI(`miner.allinone.ubsv.dev`)
+      services:
+        - name: miner
+          port: 9906
+  tls:
+    passthrough: true

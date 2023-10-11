@@ -39,7 +39,19 @@ spec:
       containers:
         - name: coinbase
           image: REPO:IMAGE:TAG
-          args: [ "-coinbase=1" ]
+          args:
+            - -coinbase=1
+            - -miner=0
+            - -blockassembly=0
+            - -blobserver=0
+            - -bootstrap=0
+            - -blockvalidation=0
+            - -blockchain=0
+            - -coinbase=0
+            - -seeder=0
+            - -validator=0
+            - -propagation=0
+            - -p2p=0
           envFrom:
             - configMapRef:
                 name: coinbase-config

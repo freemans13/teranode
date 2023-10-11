@@ -9,4 +9,3 @@ data:
   startBootstrap: false
   startP2P: true
   feature_libP2P: true
-  logLevel: "DEBUG"

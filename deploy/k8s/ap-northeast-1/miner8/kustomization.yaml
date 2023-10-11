@@ -17,7 +17,19 @@ configMapGenerator:
     name: config-miner
   - behavior: merge
     literals:
+      - SETTINGS_CONTEXT=allinone.miner.8
+    name: tx-blaster-config
+  - behavior: merge
+    literals:
+      - coinbase_grpcAddress=coinbase-service8.miner8.svc.cluster.local:8093
+    name: tx-blaster-config
+  - behavior: merge
+    literals:
       - SETTINGS_CONTEXT=allinone.coinbase.8
+    name: coinbase-config
+  - behavior: merge
+    literals:
+      - blobserver_httpAddress=miner8.allinone.ubsv.dev
     name: coinbase-config
 
 
