@@ -10,6 +10,7 @@ resources:
   - utxo-config-map.yaml
   - blockvalidation-service.yaml
   - miner-deployment.yaml
+  - blockassembly-blaster-service.yaml
   - tx-blaster-service.yaml
   - validation-service.yaml
   - propagation.yaml
