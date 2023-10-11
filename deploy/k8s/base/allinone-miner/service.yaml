@@ -55,6 +55,6 @@ spec:
       targetPort: 9091
       protocol: TCP
     - name: p2p
-      port: 9095
-      targetPort: 9095
+      port: 9905
+      targetPort: 9905
       protocol: TCP

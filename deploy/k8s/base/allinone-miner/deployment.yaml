@@ -53,7 +53,7 @@ spec:
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
-            - containerPort: 9095
+            - containerPort: 9905
               protocol: TCP
           resources:
             requests:

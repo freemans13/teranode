@@ -8,7 +8,7 @@ spec:
   routes:
     - match: HostSNI(`coinbase.allinone.ubsv.dev`)
       services:
-        - name: miner
+        - name: coinbase-service
           port: 8093
   tls:
     passthrough: true
