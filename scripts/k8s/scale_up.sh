@@ -1,22 +1,30 @@
+wait() {
+  local namespace=$1
+  local deployment_name=$2
+  local timeout=$3
+
+  kubectl -n "$namespace" wait --for=condition=available --timeout="${timeout}s" deployment/"$deployment_name"
+}
+
 # order is important here, do not change unless you know what you're doing
 kubectl scale deployment -n m1 blockchain1 --replicas 1
-sleep 5
+wait m1 blockchain1 10
 kubectl scale deployment -n m1 utxostore1 --replicas 1
-sleep 5
+wait m1 utxostore1 10
 kubectl scale deployment -n m1 txmetastore1 --replicas 1
-sleep 5
+wait m1 txmetastore1 10
 kubectl scale deployment -n m1 blockassembly1 --replicas 1
-sleep 5
+wait m1 blockassembly1 10
 kubectl scale deployment -n m1 blockvalidation1 --replicas 1
-sleep 5
+wait m1 blockvalidation1 10
 kubectl scale deployment -n m1 blob1 --replicas 1
-sleep 5
+wait m1 blob1 10
 kubectl scale deployment -n m1 coinbase1 --replicas 1
-sleep 5
+wait m1 coinbase1 10
 kubectl scale deployment -n m1 validation1 --replicas 1
-sleep 5
+wait m1 validation1 10
 kubectl scale deployment -n m1 propagation1 --replicas 1
-sleep 5
+wait m1 propagation1 10
 kubectl scale deployment -n m1 miner1 --replicas 1
 
 
