@@ -71,7 +71,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: 9092
+              port: 9091
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 5
@@ -79,7 +79,7 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 9092
+              port: 9091
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 5
