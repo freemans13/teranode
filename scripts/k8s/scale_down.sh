@@ -11,6 +11,7 @@ kubectl scale deployment -n m1 validation1 --replicas 0
 kubectl scale deployment -n m1 propagation1 --replicas 0
 kubectl scale deployment -n m1 miner1 --replicas 0
 kubectl scale deployment -n m1 utxostore1 --replicas 0
+kubectl scale deployment -n m1 txmetastore1 --replicas 0
 
 # all in one
 kubectl scale deployment -n miner1 miner1 --replicas 0
