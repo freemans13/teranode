@@ -32,3 +32,11 @@ spec:
       port: 4040
       targetPort: 4040
       protocol: TCP
+    - name: p2p
+      port: 9905
+      targetPort: 9905
+      protocol: TCP
+    - name: p2p-http
+      port: 9906
+      targetPort: 9906
+      protocol: TCP

@@ -36,3 +36,5 @@ resources:
   - coinbase-grpc-ingress.yaml
   - propagation-drpc-ingress.yaml
   - propagation-frpc-ingress.yaml
+  - p2p-ingress.yaml
+  - p2p-ws-ingress.yaml
