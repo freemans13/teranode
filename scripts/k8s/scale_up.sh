@@ -9,10 +9,10 @@ wait() {
 # order is important here, do not change unless you know what you're doing
 kubectl scale deployment -n m1 blockchain1 --replicas 1
 wait m1 blockchain1 30
-kubectl scale deployment -n m1 utxostore1 --replicas 1
-wait m1 utxostore1 30
-kubectl scale deployment -n m1 txmetastore1 --replicas 1
-wait m1 txmetastore1 30
+#kubectl scale deployment -n m1 utxostore1 --replicas 1
+#wait m1 utxostore1 30
+#kubectl scale deployment -n m1 txmetastore1 --replicas 1
+#wait m1 txmetastore1 30
 kubectl scale deployment -n m1 blockassembly1 --replicas 1
 wait m1 blockassembly1 30
 kubectl scale deployment -n m1 blockvalidation1 --replicas 1
