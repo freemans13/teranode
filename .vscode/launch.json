@@ -27,11 +27,11 @@
       ]
     },
     {
-      "name": "dumbblaster",
+      "name": "propagation_blaster",
       "type": "go",
       "request": "launch",
       "mode": "auto",
-      "program": "${workspaceFolder}/cmd/dumb_blaster/main.go",
+      "program": "${workspaceFolder}/cmd/propagation_blaster/main.go",
       "buildFlags": "-tags=native",
       "env": {},
       "args": ["-broadcast=grpc"]
