@@ -34,7 +34,7 @@
       "program": "${workspaceFolder}/cmd/dumb_blaster/main.go",
       "buildFlags": "-tags=native",
       "env": {},
-      "args": ["-broadcast=stream"]
+      "args": ["-broadcast=grpc"]
     },
     {
       "name": "blockassembly_blaster",
