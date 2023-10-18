@@ -70,6 +70,7 @@
     "opentracing",
     "ordishs",
     "otel",
+    "Pipeliner",
     "previousblockhash",
     "Priv",
     "privkey",
