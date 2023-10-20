@@ -1,7 +1,7 @@
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
-  name: miner-ingressroute-tcp-8093
+  name: coinbase-ingressroute-tcp-8093
 spec:
   entryPoints:
     - coin-grpc

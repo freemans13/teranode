@@ -32,7 +32,6 @@ configMapGenerator:
       - blobserver_httpAddress=miner8.allinone.ubsv.dev
     name: coinbase-config
 
-
 patches:
   - patch: |-
       - op: replace
@@ -43,9 +42,17 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
+        value: coinbase-service8
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=coinbase
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
         value: miner8
     target:
       kind: IngressRouteTCP
+      labelSelector: service=miner
   - patch: |-
       - op: replace
         path: /subjects/0/namespace

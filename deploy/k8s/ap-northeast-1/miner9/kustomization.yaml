@@ -29,10 +29,8 @@ configMapGenerator:
     name: coinbase-config
   - behavior: merge
     literals:
-      - blobserver_httpAddress=miner0.allinone.ubsv.dev
+      - blobserver_httpAddress=miner9.allinone.ubsv.dev
     name: coinbase-config
-
-
 
 patches:
   - patch: |-
@@ -44,9 +42,17 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
+        value: coinbase-service9
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=coinbase
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
         value: miner9
     target:
       kind: IngressRouteTCP
+      labelSelector: service=miner
   - patch: |-
       - op: replace
         path: /subjects/0/namespace

@@ -2,6 +2,8 @@ apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
   name: tcp-8084-propagation-miner
+  labels:
+    service: miner
 spec:
   entryPoints:
     - prop-grpc

@@ -4,13 +4,13 @@ metadata:
   name: coinbase
   namespace: coinbase-service
   labels:
-    app: coinbase
+    service: coinbase
     project: service
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: coinbase
+      service: coinbase
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -20,7 +20,7 @@ spec:
   template:
     metadata:
       labels:
-        app: coinbase
+        service: coinbase
     spec:
       affinity:
         podAntiAffinity:
@@ -29,7 +29,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: coinbase
+                    service: coinbase
                 topologyKey: "kubernetes.io/hostname"
       tolerations:
         - key: service

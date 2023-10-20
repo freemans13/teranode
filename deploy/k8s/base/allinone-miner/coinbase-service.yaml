@@ -13,7 +13,7 @@ spec:
   ipFamilies:
   - IPv4
   selector:
-    app: coinbase
+    service: coinbase
   ports:
     - name: tcp
       port: 8093
