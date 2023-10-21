@@ -11,7 +11,12 @@
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
-      "env": {},
+      "env": {
+        "blobserver_httpAddress": "http://localhost:8090",
+        "securityLevel": "0",
+        "feature_libP2P": "true",
+        "miner_waitSeconds":"5"
+      },
       "args": [
         "-blockchain=1",
         "-utxostore=0",
@@ -23,7 +28,8 @@
         "-blockassembly=1",
         "-validator=1",
         "-propagation=1",
-        "-bootstrap=1"
+        "-bootstrap=0",
+        "-p2p=1"
       ]
     },
     {
