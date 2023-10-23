@@ -15,7 +15,7 @@
         "blobserver_httpAddress": "http://localhost:8090",
         "securityLevel": "0",
         "feature_libP2P": "true",
-        "miner_waitSeconds":"5"
+        "miner_waitSeconds":"30"
       },
       "args": [
         "-blockchain=1",
