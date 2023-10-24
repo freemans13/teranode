@@ -116,6 +116,21 @@
       "args": ["-workers=1"]
     },
     {
+      "name": "tx-blaster-miner7",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/txblaster/main.go",
+      "env": {
+        "Xgrpc_resolver": "k8s",
+        "logLevel": "DEBUG",
+        "SETTINGS_CONTEXT": "allinone.miner.7",
+        "Xpropagation_grpcAddresses": "miner1.allinone.ubsv.dev:8084",
+        "Xcoinbase_grpcAddress": "miner1.allinone.ubsv.dev:8093"
+      },
+      "args": ["-workers=1", "-print=1"]
+    },
+    {
       "name": "Remote Debug",
       "type": "go",
       "request": "attach",
