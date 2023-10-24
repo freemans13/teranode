@@ -15,7 +15,7 @@
         "blobserver_httpAddress": "http://localhost:8090",
         "securityLevel": "0",
         "feature_libP2P": "true",
-        "miner_waitSeconds":"30"
+        "miner_waitSeconds": "30"
       },
       "args": [
         "-blockchain=1",
@@ -102,6 +102,18 @@
         "coinbase_grpcAddress": "miner1.allinone.ubsv.dev:8093"
       },
       "args": ["-workers=1000", "-print=1000"]
+    },
+    {
+      "name": "s3-blaster",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/s3_blaster/main.go",
+      "env": {
+        "logLevel": "DEBUG",
+        "SETTINGS_CONTEXT": "dev.stu"
+      },
+      "args": ["-workers=1"]
     },
     {
       "name": "Remote Debug",
