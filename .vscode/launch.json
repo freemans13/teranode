@@ -18,18 +18,7 @@
         "miner_waitSeconds": "30"
       },
       "args": [
-        "-blockchain=1",
-        "-utxostore=0",
-        "-txmetastore=0",
-        "-blobserver=1",
-        "-coinbase=1",
-        "-miner=1",
-        "-blockvalidation=1",
-        "-blockassembly=1",
-        "-validator=1",
-        "-propagation=1",
-        "-bootstrap=0",
-        "-p2p=1"
+        "-miner=1"
       ]
     },
     {
@@ -42,7 +31,7 @@
       "env": {
         "grpc_resolver": "dns",
         "logLevel": "DEBUG",
-        "SETTINGS_CONTEXT": "allinone.coinbase.7",
+        "XSETTINGS_CONTEXT": "allinone.coinbase.7",
       },
       "args": [
         "-blockchain=0",
@@ -54,7 +43,7 @@
         "-blockvalidation=0",
         "-blockassembly=0",
         "-validator=0",
-        "-propagation=0",
+        "-propagation=1",
         "-bootstrap=0",
         "-p2p=0"
       ]
@@ -121,14 +110,7 @@
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/txblaster/main.go",
-      "env": {
-        "Xgrpc_resolver": "k8s",
-        "logLevel": "DEBUG",
-        "SETTINGS_CONTEXT": "allinone.miner.1",
-        "propagation_grpcAddresses": "miner1.allinone.ubsv.dev:8084",
-        "coinbase_grpcAddress": "miner1.allinone.ubsv.dev:8093"
-      },
-      "args": ["-workers=1000", "-print=1000"]
+      "args": ["-workers=1", "-print=1"]
     },
     {
       "name": "s3-blaster",
