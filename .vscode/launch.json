@@ -33,6 +33,33 @@
       ]
     },
     {
+      "name": "coinbase",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      // "buildFlags": "-tags=aerospike",
+      "env": {
+        "grpc_resolver": "dns",
+        "logLevel": "DEBUG",
+        "SETTINGS_CONTEXT": "allinone.coinbase.7",
+      },
+      "args": [
+        "-blockchain=0",
+        "-utxostore=0",
+        "-txmetastore=0",
+        "-blobserver=0",
+        "-coinbase=1",
+        "-miner=0",
+        "-blockvalidation=0",
+        "-blockassembly=0",
+        "-validator=0",
+        "-propagation=0",
+        "-bootstrap=0",
+        "-p2p=0"
+      ]
+    },
+    {
       "name": "propagation_blaster",
       "type": "go",
       "request": "launch",
