@@ -30,7 +30,7 @@ psql postgresql://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:54
 psql postgresql://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase -c "truncate table state CASCADE; truncate table blocks CASCADE; truncate table coinbase_utxos CASCADE;"
 
 # todo make key dynamic based on user
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem  ubuntu@aero.ubsv-store0.eu-north-1.ubsv.dev -f "aql -c \"TRUNCATE utxostore;TRUNCATE txstatus_store"\"
+ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem  ubuntu@aero.ubsv-store0.eu-north-1.ubsv.dev -f "aql -c \"TRUNCATE ubsv-store;"\"
 
 # scale back up everything
 bash scale_up.sh
