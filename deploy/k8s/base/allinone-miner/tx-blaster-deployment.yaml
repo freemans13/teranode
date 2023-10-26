@@ -7,7 +7,7 @@ metadata:
     app: tx-blaster
     project: service
 spec:
-  replicas: 1
+  replicas: 0
   strategy:
     type: RollingUpdate
     rollingUpdate:
