@@ -36,7 +36,7 @@ spec:
           image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-workers=100" ]
+          args: [ "-workers=1" ]
           envFrom:
             - configMapRef:
                 name: tx-blaster-config
