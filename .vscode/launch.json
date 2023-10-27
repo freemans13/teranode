@@ -12,10 +12,7 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "blobserver_httpAddress": "http://localhost:8090",
-        "securityLevel": "0",
-        "feature_libP2P": "true",
-        "miner_waitSeconds": "30"
+        "blobserver_httpAddress": "http://localhost:8090"
       },
       "args": [
         "-miner=1"
