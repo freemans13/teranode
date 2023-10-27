@@ -35,10 +35,6 @@ spec:
           env:
             - name: SERVICE_NAME
               value: blob-service
-            - name: feature_libP2P
-              value: "true"
-            - name: startP2P
-              value: "true"
           ports:
             - containerPort: 8090
               protocol: TCP

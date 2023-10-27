@@ -8,4 +8,3 @@ data:
   JAEGER_AGENT_PORT: "6831"
   startBootstrap: false
   startP2P: true
-  feature_libP2P: true
