@@ -11,9 +11,6 @@ resources:
   - propagation-grpc-ingress.yaml
   - blob-http-ingress.yaml
   - coinbase-grpc-ingress.yaml
-  - coinbase-deployment.yaml
-  - coinbase-service.yaml
-  - coinbase-configmap.yaml
   - tx-blaster-deployment.yaml
   - tx-blaster-configmap.yaml
   - p2p-ingress.yaml

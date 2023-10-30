@@ -21,16 +21,8 @@ configMapGenerator:
     name: tx-blaster-config
   - behavior: merge
     literals:
-      - coinbase_grpcAddress=coinbase-service4.miner4.svc.cluster.local:8093
+      - coinbase_grpcAddress=miner4.miner4.svc.cluster.local:8093
     name: tx-blaster-config
-  - behavior: merge
-    literals:
-      - SETTINGS_CONTEXT=allinone.coinbase.4
-    name: coinbase-config
-  - behavior: merge
-    literals:
-      - blobserver_httpAddress=miner4.allinone.ubsv.dev
-    name: coinbase-config
 
 patches:
   - patch: |-
@@ -39,13 +31,6 @@ patches:
         value: HostSNI(`miner4.allinone.ubsv.dev`)
     target:
       kind: IngressRouteTCP
-  - patch: |-
-      - op: replace
-        path: /spec/routes/0/services/0/name
-        value: coinbase-service4
-    target:
-      kind: IngressRouteTCP
-      labelSelector: service=coinbase
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name

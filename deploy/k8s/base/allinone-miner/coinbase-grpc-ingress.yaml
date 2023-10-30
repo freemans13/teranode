@@ -3,14 +3,14 @@ kind: IngressRouteTCP
 metadata:
   name: coinbase-ingressroute-tcp-8093
   labels:
-    service: coinbase
+    service: miner
 spec:
   entryPoints:
     - coin-grpc
   routes:
-    - match: HostSNI(`coinbase.allinone.ubsv.dev`)
+    - match: HostSNI(`miner.allinone.ubsv.dev`)
       services:
-        - name: coinbase-service
+        - name: miner
           port: 8093
   tls:
     passthrough: true
