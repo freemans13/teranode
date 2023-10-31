@@ -1,4 +1,4 @@
-package main
+package txblaster
 
 import (
 	"bytes"
@@ -10,14 +10,18 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/Shopify/sarama"
 	"github.com/bitcoin-sv/ubsv/cmd/txblaster/worker"
+	_ "github.com/bitcoin-sv/ubsv/k8sresolver"
 	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
 	"github.com/libsv/go-p2p/wire"
@@ -30,9 +34,31 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-var logger = gocore.Log("txblast", gocore.NewLogLevelFromString("INFO"))
+const progname = "tx-blaster"
 
-func main() {
+// // Version & commit strings injected at build with -ldflags -X...
+var version string
+var commit string
+
+var logger utils.Logger
+
+var printProgress uint64
+
+var kafkaProducer sarama.SyncProducer
+var kafkaTopic string
+var ipv6MulticastConn *net.UDPConn
+var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
+var totalTransactions atomic.Uint64
+var startTime time.Time
+
+func Init() {
+	gocore.SetInfo(progname, version, commit)
+
+	var logLevelStr, _ = gocore.Config().Get("logLevel", "INFO")
+	logger = gocore.Log("txblast", gocore.NewLogLevelFromString(logLevelStr))
+}
+
+func Start() {
 	_ = os.Chdir("../../")
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -213,41 +239,38 @@ func main() {
 	for i := 0; i < *workers; i++ {
 		i := i
 
+		logger.Infof("starting worker %d", i)
+		workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
+
+		w, err := worker.NewWorker(
+			workerLogger,
+			rateLimiter,
+			kafkaProducer,
+			kafkaTopic,
+			ipv6MulticastConn,
+			ipv6MulticastChan,
+			printProgress,
+			logIdsFile,
+			&totalTransactions,
+			&startTime,
+		)
+		if err != nil {
+			logger.Errorf("Could not initialise worker %d: %w", i, err)
+			return
+		}
+
+		err = w.Init(ctx)
+		if err != nil {
+			logger.Errorf("Could not initialise worker %d: %w", i, err)
+			return
+		}
+
 		g.Go(func() error {
-			for {
-				logger.Infof("starting worker %d", i)
-				workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
-
-				w, err := worker.NewWorker(
-					workerLogger,
-					rateLimiter,
-					kafkaProducer,
-					kafkaTopic,
-					ipv6MulticastConn,
-					ipv6MulticastChan,
-					printProgress,
-					logIdsFile,
-					&totalTransactions,
-					&startTime,
-				)
-				if err != nil {
-					logger.Errorf("Could not initialise worker %d: %w", i, err)
-					continue
-				}
-
-				err = w.Init(ctx)
-				if err != nil {
-					logger.Errorf("Could not initialise worker %d: %w", i, err)
-					continue
-				}
-
-				// start will only return if an error occurs
-				if err = w.Start(ctx); err != nil {
-					logger.Errorf("error from worker: %v", err)
-				}
-
-				time.Sleep(1 * time.Second)
+			if err := w.Start(ctx); err != nil {
+				return fmt.Errorf("error from worker: %v", err)
 			}
+
+			return nil
 		})
 	}
 
