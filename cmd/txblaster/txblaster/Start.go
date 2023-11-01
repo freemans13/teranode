@@ -51,14 +51,12 @@ var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
 var totalTransactions atomic.Uint64
 var startTime time.Time
 
-func Init() {
+func Start() {
 	gocore.SetInfo(progname, version, commit)
 
 	var logLevelStr, _ = gocore.Config().Get("logLevel", "INFO")
 	logger = gocore.Log("txblast", gocore.NewLogLevelFromString(logLevelStr))
-}
 
-func Start() {
 	_ = os.Chdir("../../")
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
