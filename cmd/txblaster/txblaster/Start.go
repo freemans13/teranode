@@ -230,8 +230,6 @@ func Start() {
 		}()
 	}
 
-	logLevelStr, _ := gocore.Config().Get("logLevel", "INFO")
-
 	startTime = time.Now()
 
 	for i := 0; i < *workers; i++ {
