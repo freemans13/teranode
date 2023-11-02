@@ -277,7 +277,7 @@ LOOP:
 
 		block, err := c.blobServerClient.GetBlock(ctx, blockHeader.Hash())
 		if err != nil {
-			return errors.Join(fmt.Errorf("failed to get block [%s] [%v]", blockHeader.String(), err))
+			return errors.Join(fmt.Errorf("failed to get block [%s]", blockHeader.String()), err)
 		}
 
 		err = c.storeBlock(ctx, block)
@@ -535,8 +535,21 @@ func (c *Coinbase) RequestFunds(ctx context.Context, address string) (*bt.Tx, er
 		return nil, fmt.Errorf("error creating initial transaction: %v", err)
 	}
 
-	if err = tx.PayToAddress(address, utxo.Satoshis); err != nil {
-		return nil, fmt.Errorf("error paying to address: %v", err)
+	// Split the utxo into 1,000 outputs satoshis
+	sats := utxo.Satoshis / 1000
+	remainder := utxo.Satoshis % 1000
+
+	for i := 0; i < 1000; i++ {
+		if i == 0 && remainder > 0 {
+			if err = tx.PayToAddress(address, sats+remainder); err != nil {
+				return nil, fmt.Errorf("error paying to address: %v", err)
+			}
+			continue
+		}
+
+		if err = tx.PayToAddress(address, sats); err != nil {
+			return nil, fmt.Errorf("error paying to address: %v", err)
+		}
 	}
 
 	unlockerGetter := unlocker.Getter{PrivateKey: c.privateKey}

@@ -5,7 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 	"net/url"
-	"strconv"
+	"strings"
 
 	"github.com/bitcoin-sv/ubsv/stores/txmeta"
 	"github.com/bitcoin-sv/ubsv/util"
@@ -24,39 +24,48 @@ type Redis struct {
 	mode string
 }
 
-func New(u *url.URL, password ...string) (*Redis, error) {
-
-	ro := &redis.Options{
+func NewRedisClient(u *url.URL, password ...string) (*Redis, error) {
+	o := &redis.Options{
 		Addr: u.Host,
 	}
 
-	if u.Path != "" {
-		db, err := strconv.Atoi(u.Path[1:])
-		if err != nil {
-			return nil, fmt.Errorf("path must be an integer: %v", err)
-		}
-
-		ro.DB = db
-	}
-
-	if u.User != nil && u.User.Username() != "" {
-		ro.Username = u.User.Username()
-	}
-
 	p, ok := u.User.Password()
-	if ok {
-		ro.Password = p
+	if ok && p != "" {
+		o.Password = p
 	}
 
 	// If optional password is set, override...
 	if len(password) > 0 && password[0] != "" {
-		ro.Password = password[0]
+		o.Password = password[0]
 	}
 
+	rdb := redis.NewClient(o)
+
+	return &Redis{
+		url:  u,
+		mode: "client",
+		rdb:  rdb,
+	}, nil
+}
+
+func NewRedisCluster(u *url.URL, password ...string) (*Redis, error) {
+	hosts := strings.Split(u.Host, ",")
+
+	addrs := make([]string, 0)
+	addrs = append(addrs, hosts...)
+
 	o := &redis.ClusterOptions{
-		NewClient: func(opt *redis.Options) *redis.Client {
-			return redis.NewClient(ro)
-		},
+		Addrs: addrs,
+	}
+
+	p, ok := u.User.Password()
+	if ok && p != "" {
+		o.Password = p
+	}
+
+	// If optional password is set, override...
+	if len(password) > 0 && password[0] != "" {
+		o.Password = password[0]
 	}
 
 	rdb := redis.NewClusterClient(o)
@@ -64,6 +73,37 @@ func New(u *url.URL, password ...string) (*Redis, error) {
 	return &Redis{
 		url:  u,
 		mode: "cluster",
+		rdb:  rdb,
+	}, nil
+}
+
+func NewRedisRing(u *url.URL, password ...string) (*Redis, error) {
+	hosts := strings.Split(u.Host, ",")
+
+	addrs := make(map[string]string)
+	for i, host := range hosts {
+		addrs[fmt.Sprintf("shard%d", i)] = host
+	}
+
+	o := &redis.RingOptions{
+		Addrs: addrs,
+	}
+
+	p, ok := u.User.Password()
+	if ok && p != "" {
+		o.Password = p
+	}
+
+	// If optional password is set, override...
+	if len(password) > 0 && password[0] != "" {
+		o.Password = password[0]
+	}
+
+	rdb := redis.NewRing(o)
+
+	return &Redis{
+		url:  u,
+		mode: "ring",
 		rdb:  rdb,
 	}, nil
 }
