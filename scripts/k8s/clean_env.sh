@@ -36,15 +36,25 @@ clusters=("arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground"
 offset=0
 
 for cluster in "${clusters[@]}"; do
+  kubectl config use-context $cluster
   for i in {1..3}; do
-    kubectl config use-context $cluster
-    index=$((offset + i))  # Calculate the index
-    (kubectl port-forward -n "redis-miner${index}" "redis-store-${index}-redis-cluster-0" 6379:6379) &
-    pid=$!
-    sleep 2
-    redis-cli -h localhost -a TfocK5PCg7 -c -n "${clusters[index]}" FLUSHALL
-    kill -9 $pid
     offset=$((offset + 1))
+    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-0 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
+    echo "Cleaning $cluster redis cluster share-0: $result"
+    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-1 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
+    echo "Cleaning $cluster redis cluster share-1: $result"
+    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-2 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
+    echo "Cleaning $cluster redis cluster share-2: $result"
+    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-3 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
+    echo "Cleaning $cluster redis cluster share-3: $result"
+    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-4 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
+    echo "Cleaning $cluster redis cluster share-4: $result"
+    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-5 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
+    echo "Cleaning $cluster redis cluster share-5: $result"
+    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-6 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
+    echo "Cleaning $cluster redis cluster share-6: $result"
+    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-7 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
+    echo "Cleaning $cluster redis cluster share-7: $result"
   done
 done
 # endregion
