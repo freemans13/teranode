@@ -253,13 +253,13 @@ func Start() {
 					&startTime,
 				)
 				if err != nil {
-					logger.Errorf("Could not initialise worker %d: %w", i, err)
+					logger.Errorf("Could not initialise worker %d: %v", i, err)
 					continue
 				}
 
 				err = w.Init(ctx)
 				if err != nil {
-					logger.Errorf("Could not initialise worker %d: %w", i, err)
+					logger.Errorf("Could not initialise worker %d: %v", i, err)
 					continue
 				}
 
