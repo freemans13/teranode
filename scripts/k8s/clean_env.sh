@@ -29,6 +29,26 @@ psql postgresql://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amaz
 psql postgresql://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/m1 -c "truncate table state CASCADE; truncate table blocks CASCADE; truncate table coinbase_utxos CASCADE;"
 psql postgresql://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase -c "truncate table state CASCADE; truncate table blocks CASCADE; truncate table coinbase_utxos CASCADE;"
 
+# region clean redis
+clusters=("arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground"
+          "arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground"
+          "arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground")
+offset=0
+
+for cluster in "${clusters[@]}"; do
+  for i in {1..3}; do
+    kubectl config use-context $cluster
+    index=$((offset + i))  # Calculate the index
+    (kubectl port-forward -n "redis-miner${index}" "redis-store-${index}-redis-cluster-0" 6379:6379) &
+    pid=$!
+    sleep 2
+    redis-cli -h localhost -a TfocK5PCg7 -c -n "${clusters[index]}" FLUSHALL
+    kill -9 $pid
+    offset=$((offset + 1))
+  done
+done
+# endregion
+
 # todo make key dynamic based on user
 ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem  ubuntu@aero.ubsv-store0.eu-north-1.ubsv.dev -f "aql -c \"TRUNCATE ubsv-store;"\"
 
