@@ -12,11 +12,10 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "blobserver_httpAddress": "http://localhost:8090",
-        "blockAssemblyDisabled" : "true",
+        "blobserver_httpAddress": "http://localhost:8090"
       },
       "args": [
-        "-miner=1"
+        "-p2p=0"
       ]
     },
     {
