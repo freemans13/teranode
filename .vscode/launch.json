@@ -12,7 +12,8 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "blobserver_httpAddress": "http://localhost:8090"
+        "blobserver_httpAddress": "http://localhost:8090",
+        "blockAssemblyDisabled" : "true",
       },
       "args": [
         "-miner=1"
