@@ -15,3 +15,4 @@ resources:
   - tx-blaster-configmap.yaml
   - p2p-ingress.yaml
   - p2p-ws-ingress.yaml
+  - tx-blaster-service.yaml
