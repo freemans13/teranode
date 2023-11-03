@@ -39,22 +39,14 @@ for cluster in "${clusters[@]}"; do
   kubectl config use-context $cluster
   for i in {1..3}; do
     offset=$((offset + 1))
-    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-0 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
-    echo "Cleaning $cluster redis cluster share-0: $result"
-    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-1 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
-    echo "Cleaning $cluster redis cluster share-1: $result"
-    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-2 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
-    echo "Cleaning $cluster redis cluster share-2: $result"
-    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-3 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
-    echo "Cleaning $cluster redis cluster share-3: $result"
-    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-4 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
-    echo "Cleaning $cluster redis cluster share-4: $result"
-    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-5 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
-    echo "Cleaning $cluster redis cluster share-5: $result"
-    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-6 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
-    echo "Cleaning $cluster redis cluster share-6: $result"
-    result=$(kubectl exec -it -n redis-miner$offset redis-store-$offset-redis-cluster-7 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL)&
-    echo "Cleaning $cluster redis cluster share-7: $result"
+    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-0 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
+    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-1 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
+    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-2 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
+    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-3 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
+    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-4 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
+    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-5 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
+    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-6 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
+    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-7 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
   done
 done
 # endregion
