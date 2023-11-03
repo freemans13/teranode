@@ -17,7 +17,6 @@
     "blockassembler",
     "blockassembly",
     "blockstore",
-    "blocktx",
     "blockvalidation",
     "bscript",
     "Bulma",
