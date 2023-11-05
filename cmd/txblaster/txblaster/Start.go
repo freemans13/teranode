@@ -22,6 +22,7 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/bitcoin-sv/ubsv/cmd/txblaster/worker"
 	_ "github.com/bitcoin-sv/ubsv/k8sresolver"
+	"github.com/bitcoin-sv/ubsv/services/coinbase"
 	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
 	"github.com/libsv/go-p2p/wire"
@@ -29,8 +30,6 @@ import (
 	"github.com/ordishs/gocore"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sercand/kuberesolver/v5"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
 	"google.golang.org/grpc/resolver"
 )
 
@@ -76,7 +75,7 @@ func Start() {
 	logger.Infof("STATS\n%s\nVERSION\n-------\n%s (%s)\n\n", stats, version, commit)
 
 	workers := flag.Int("workers", runtime.NumCPU(), "how many workers to use for blasting")
-	rateLimit := flag.Int("limit", -1, "rate limit tx/s")
+	rateLimit := flag.Float64("limit", -1, "rate limit tx/s per worker")
 	printFlag := flag.Int("print", 0, "print out progress every x transactions")
 	kafka := flag.String("kafka", "", "Kafka server URL - if applicable")
 	ipv6Address := flag.String("ipv6Address", "", "IPv6 multicast address - if applicable")
@@ -92,7 +91,19 @@ func Start() {
 		http.Handle(prometheusEndpoint, promhttp.Handler())
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
+	txDistributor, err := distributor.NewDistributor(logger,
+		distributor.WithBackoffDuration(200*time.Millisecond),
+		distributor.WithRetryAttempts(3),
+		distributor.WithFailureTolerance(0),
+	)
+	if err != nil {
+		log.Fatalf("error creating tx distributor: %v", err)
+	}
+
+	coinbaseClient, err := coinbase.NewClient(ctx)
+	if err != nil {
+		log.Fatalf("error creating coinbase tracker client: %v", err)
+	}
 
 	if kafka != nil && *kafka != "" {
 		logger.Infof("Connecting to kafka at %s", *kafka)
@@ -196,24 +207,13 @@ func Start() {
 		kuberesolver.RegisterInClusterWithSchema("k8s")
 	}
 
-	propagationServers := distributor.GetPropagationGRPCAddresses()
+	propagationServers := txDistributor.GetPropagationGRPCAddresses()
 	if len(propagationServers) == 0 {
 		panic("No suitable propagation server connection found")
 	}
 
 	logger.Infof("Using %d propagation servers: %+v", len(propagationServers), propagationServers)
-
-	var rateLimiter *rate.Limiter
-
-	if *rateLimit > 0 {
-
-		rateLimitDuration := time.Duration(*workers) * time.Second / time.Duration(*rateLimit)
-		rateLimiter = rate.NewLimiter(rate.Every(rateLimitDuration), 1)
-
-		logger.Infof("Starting %d workers with rate limit of %d tx/s (%s)", *workers, *rateLimit, rateLimitDuration)
-	} else {
-		logger.Infof("Starting %d workers", *workers)
-	}
+	logger.Infof("Starting %d workers", *workers)
 
 	var logIdsFile chan string
 	if *logIds {
@@ -233,44 +233,53 @@ func Start() {
 	startTime = time.Now()
 
 	for i := 0; i < *workers; i++ {
-		i := i
-
-		g.Go(func() error {
+		go func(workerId int) {
 			for {
-				logger.Infof("starting worker %d", i)
-				workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					if *rateLimit > 0 {
+						logger.Infof("starting worker %d with rate limit: %0.2f/s", workerId, *rateLimit)
+					} else {
+						logger.Infof("starting worker %d", workerId)
+					}
+					workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", workerId), gocore.NewLogLevelFromString(logLevelStr))
 
-				w, err := worker.NewWorker(
-					workerLogger,
-					rateLimiter,
-					kafkaProducer,
-					kafkaTopic,
-					ipv6MulticastConn,
-					ipv6MulticastChan,
-					printProgress,
-					logIdsFile,
-					&totalTransactions,
-					&startTime,
-				)
-				if err != nil {
-					logger.Errorf("Could not initialise worker %d: %v", i, err)
-					continue
+					w, err := worker.NewWorker(
+						workerLogger,
+						*rateLimit,
+						coinbaseClient,
+						txDistributor,
+						kafkaProducer,
+						kafkaTopic,
+						ipv6MulticastConn,
+						ipv6MulticastChan,
+						printProgress,
+						logIdsFile,
+						&totalTransactions,
+						&startTime,
+					)
+					if err != nil {
+						logger.Errorf("Could not initialise worker %d: %v", workerId, err)
+						continue
+					}
+
+					err = w.Init(ctx)
+					if err != nil {
+						logger.Errorf("Could not initialise worker %d: %v", workerId, err)
+						continue
+					}
+
+					// start will only return if an error occurs
+					if err = w.Start(ctx); err != nil {
+						logger.Errorf("error from worker: %v", err)
+					}
+
+					time.Sleep(1 * time.Second)
 				}
-
-				err = w.Init(ctx)
-				if err != nil {
-					logger.Errorf("Could not initialise worker %d: %v", i, err)
-					continue
-				}
-
-				// start will only return if an error occurs
-				if err = w.Start(ctx); err != nil {
-					logger.Errorf("error from worker: %v", err)
-				}
-
-				time.Sleep(1 * time.Second)
 			}
-		})
+		}(i)
 	}
 
 	// start http health check server
@@ -279,7 +288,5 @@ func Start() {
 		_, _ = w.Write([]byte("OK"))
 	}))
 
-	if err := g.Wait(); err != nil {
-		logger.Errorf("error occurred in tx blaster: %v", err)
-	}
+	<-ctx.Done()
 }
