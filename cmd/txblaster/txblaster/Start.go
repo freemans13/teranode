@@ -233,53 +233,8 @@ func Start() {
 	startTime = time.Now()
 
 	for i := 0; i < *workers; i++ {
-		go func(workerId int) {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					if *rateLimit > 0 {
-						logger.Infof("starting worker %d with rate limit: %0.2f/s", workerId, *rateLimit)
-					} else {
-						logger.Infof("starting worker %d", workerId)
-					}
-					workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", workerId), gocore.NewLogLevelFromString(logLevelStr))
-
-					w, err := worker.NewWorker(
-						workerLogger,
-						*rateLimit,
-						coinbaseClient,
-						txDistributor,
-						kafkaProducer,
-						kafkaTopic,
-						ipv6MulticastConn,
-						ipv6MulticastChan,
-						printProgress,
-						logIdsFile,
-						&totalTransactions,
-						&startTime,
-					)
-					if err != nil {
-						logger.Errorf("Could not initialise worker %d: %v", workerId, err)
-						continue
-					}
-
-					err = w.Init(ctx)
-					if err != nil {
-						logger.Errorf("Could not initialise worker %d: %v", workerId, err)
-						continue
-					}
-
-					// start will only return if an error occurs
-					if err = w.Start(ctx); err != nil {
-						logger.Errorf("error from worker: %v", err)
-					}
-
-					time.Sleep(1 * time.Second)
-				}
-			}
-		}(i)
+		workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
+		go startWorker(ctx, workerLogger, i, *rateLimit, coinbaseClient, txDistributor, logIdsFile)
 	}
 
 	// start http health check server
@@ -289,4 +244,56 @@ func Start() {
 	}))
 
 	<-ctx.Done()
+}
+
+func startWorker(ctx context.Context, logger utils.Logger, workerId int, rateLimit float64,
+	coinbaseClient *coinbase.Client, txDistributor *distributor.Distributor, logIdsFile chan string) {
+
+	var w *worker.Worker
+	var err error
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if rateLimit > 0 {
+				logger.Infof("starting worker %d with rate limit: %0.2f/s", workerId, rateLimit)
+			} else {
+				logger.Infof("starting worker %d", workerId)
+			}
+
+			w, err = worker.NewWorker(
+				logger,
+				rateLimit,
+				coinbaseClient,
+				txDistributor,
+				kafkaProducer,
+				kafkaTopic,
+				ipv6MulticastConn,
+				ipv6MulticastChan,
+				printProgress,
+				logIdsFile,
+				&totalTransactions,
+				&startTime,
+			)
+			if err != nil {
+				logger.Errorf("Could not initialise worker %d: %v", workerId, err)
+				continue
+			}
+
+			err = w.Init(ctx)
+			if err != nil {
+				logger.Errorf("Could not initialise worker %d: %v", workerId, err)
+				continue
+			}
+
+			// start will only return if an error occurs
+			if err = w.Start(ctx); err != nil {
+				logger.Errorf("error from worker: %v", err)
+			}
+
+			time.Sleep(1 * time.Second)
+		}
+	}
 }
