@@ -22,7 +22,6 @@ psql postgres://miner7:miner7@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaw
 psql postgres://miner8:miner8@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase8 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 psql postgres://miner9:miner9@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase9 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 
-
 psql postgresql://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/m1 -c " drop table if exists state ; drop table if exists blocks;"
 psql postgresql://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase -c "drop table if exists coinbase_utxos; drop table if exists state; drop table if exists  blocks;"
 # truncate
@@ -31,28 +30,29 @@ psql postgresql://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amaz
 
 # region clean redis
 clusters=("arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground"
-          "arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground"
-          "arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground")
+  "arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground"
+  "arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground")
 offset=0
 
 for cluster in "${clusters[@]}"; do
   kubectl config use-context $cluster
   for i in {1..3}; do
     offset=$((offset + 1))
-    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-0 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
-    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-1 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
-    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-2 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
-    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-3 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
-    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-4 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
-    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-5 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
-    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-6 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
-    kubectl exec -it -n redis-miner7 redis-store-7-redis-cluster-7 -c redis-store-7-redis-cluster -- redis-cli FLUSHALL
+    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-0 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
+    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-1 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
+    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-2 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
+    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-3 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
+    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-4 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
+    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-5 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
+    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-6 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
+    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-7 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL }
+    wait
   done
 done
 # endregion
 
 # todo make key dynamic based on user
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem  ubuntu@aero.ubsv-store0.eu-north-1.ubsv.dev -f "aql -c \"TRUNCATE ubsv-store;"\"
+ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem ubuntu@aero.ubsv-store0.eu-north-1.ubsv.dev -f "aql -c \"TRUNCATE ubsv-store;"\"
 
 # scale back up everything
 bash scale_up.sh

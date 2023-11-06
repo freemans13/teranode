@@ -66,6 +66,9 @@ spec:
             limits:
               memory: 50Gi
               cpu: "28"
+          volumeMounts:
+            - mountPath: /data/subtreestore-ttl/
+              name: subtree-store-ttl
           readinessProbe:
             # run grpcurl command
             exec:
@@ -90,3 +93,7 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+      volumes:
+        - name: subtree-store-ttl
+          persistentVolumeClaim:
+            claimName: subtree-store-ttl
