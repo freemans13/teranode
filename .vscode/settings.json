@@ -28,6 +28,7 @@
     "chainintegrity",
     "chaintip",
     "Cmdable",
+    "cntxt",
     "coinb",
     "cpuminer",
     "curr",
