@@ -17,4 +17,3 @@ resources:
   - p2p-ws-ingress.yaml
   - tx-blaster-service.yaml
   - profiler-http-ingress.yaml
-  - pvc.yaml
