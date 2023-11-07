@@ -95,5 +95,14 @@ spec:
             timeoutSeconds: 3
       volumes:
         - name: subtree-store-ttl
-          persistentVolumeClaim:
-            claimName: subtree-store-ttl
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  type: subtreestore-ttl
+              spec:
+                accessModes: [ "ReadWriteOnce" ]
+                storageClassName: "io2-xfs"
+                resources:
+                  requests:
+                    storage: 1000Gi
