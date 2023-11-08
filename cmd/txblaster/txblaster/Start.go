@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -94,7 +95,14 @@ func Start() {
 	if gocore.Config().GetBool("use_open_tracing", true) {
 		logger.Infof("Starting open tracing")
 		serviceName, _ := gocore.Config().Get("SERVICE_NAME", "tx-blaster")
-		_, closer, err := util.InitGlobalTracer(serviceName)
+		samplingRateStr, _ := gocore.Config().Get("tracing_SampleRate", "0.01")
+		samplingRate, err := strconv.ParseFloat(samplingRateStr, 64)
+		if err != nil {
+			logger.Errorf("error parsing sampling rate: %v", err)
+			samplingRate = 0.01
+		}
+
+		_, closer, err := util.InitGlobalTracer(serviceName, samplingRate)
 		if err != nil {
 			panic(err)
 		}
