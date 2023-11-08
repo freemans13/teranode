@@ -13,6 +13,14 @@ commonLabels:
 configMapGenerator:
   - behavior: merge
     literals:
+      - JAEGER_AGENT_HOST=jaeger-eu-west-1-agent.jaeger.svc.cluster.local
+    name: config-miner
+  - behavior: merge
+    literals:
+      - JAEGER_AGENT_HOST=jaeger-eu-west-1-agent.jaeger.svc.cluster.local
+    name: tx-blaster-config
+  - behavior: merge
+    literals:
       - SETTINGS_CONTEXT=allinone.miner.3
     name: config-miner
   - behavior: merge
