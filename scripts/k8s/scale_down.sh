@@ -28,7 +28,6 @@ kubectl scale deployment -n miner6 tx-blaster6 --replicas 0
 kubectl scale deployment -n miner4 miner4 --replicas 0
 kubectl scale deployment -n miner5 miner5 --replicas 0
 kubectl scale deployment -n miner6 miner6 --replicas 0
-
 kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground
 kubectl scale deployment -n miner7 tx-blaster7 --replicas 0
 kubectl scale deployment -n miner8 tx-blaster8 --replicas 0
