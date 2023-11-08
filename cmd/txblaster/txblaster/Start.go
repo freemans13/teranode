@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -89,6 +90,24 @@ func Start() {
 	if ok && prometheusEndpoint != "" {
 		logger.Infof("Starting prometheus endpoint on %s", prometheusEndpoint)
 		http.Handle(prometheusEndpoint, promhttp.Handler())
+	}
+
+	if gocore.Config().GetBool("use_open_tracing", true) {
+		logger.Infof("Starting open tracing")
+		serviceName, _ := gocore.Config().Get("SERVICE_NAME", "tx-blaster")
+		samplingRateStr, _ := gocore.Config().Get("tracing_SampleRate", "0.01")
+		samplingRate, err := strconv.ParseFloat(samplingRateStr, 64)
+		if err != nil {
+			logger.Errorf("error parsing sampling rate: %v", err)
+			samplingRate = 0.01
+		}
+
+		_, closer, err := util.InitGlobalTracer(serviceName, samplingRate)
+		if err != nil {
+			panic(err)
+		}
+
+		defer closer.Close()
 	}
 
 	txDistributor, err := distributor.NewDistributor(logger,
@@ -186,17 +205,6 @@ func Start() {
 			logger.Fatalf("%v", http.ListenAndServe(profilerAddr, nil))
 		}
 	}()
-
-	if gocore.Config().GetBool("use_open_tracing", true) {
-		logger.Infof("Starting open tracing")
-		// closeTracer := tracing.InitOtelTracer()
-		_, closer, err := util.InitGlobalTracer("tx-blaster")
-		if err != nil {
-			panic(err)
-		}
-
-		defer closer.Close()
-	}
 
 	grpcResolver, _ := gocore.Config().Get("grpc_resolver")
 	if grpcResolver == "k8s" {
