@@ -102,7 +102,7 @@ spec:
                   type: subtreestore-ttl
               spec:
                 accessModes: [ "ReadWriteOnce" ]
-                storageClassName: "io2-xfs"
+                storageClassName: "io2-xfs-low-iops"
                 resources:
                   requests:
                     storage: 1000Gi
