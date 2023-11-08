@@ -91,6 +91,17 @@ func Start() {
 		http.Handle(prometheusEndpoint, promhttp.Handler())
 	}
 
+	if gocore.Config().GetBool("use_open_tracing", true) {
+		logger.Infof("Starting open tracing")
+		serviceName, _ := gocore.Config().Get("SERVICE_NAME", "tx-blaster")
+		_, closer, err := util.InitGlobalTracer(serviceName)
+		if err != nil {
+			panic(err)
+		}
+
+		defer closer.Close()
+	}
+
 	txDistributor, err := distributor.NewDistributor(logger,
 		distributor.WithBackoffDuration(200*time.Millisecond),
 		distributor.WithRetryAttempts(3),
@@ -186,17 +197,6 @@ func Start() {
 			logger.Fatalf("%v", http.ListenAndServe(profilerAddr, nil))
 		}
 	}()
-
-	if gocore.Config().GetBool("use_open_tracing", true) {
-		logger.Infof("Starting open tracing")
-		// closeTracer := tracing.InitOtelTracer()
-		_, closer, err := util.InitGlobalTracer("tx-blaster")
-		if err != nil {
-			panic(err)
-		}
-
-		defer closer.Close()
-	}
 
 	grpcResolver, _ := gocore.Config().Get("grpc_resolver")
 	if grpcResolver == "k8s" {
