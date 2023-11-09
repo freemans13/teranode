@@ -40,6 +40,10 @@ spec:
       port: 8090
       targetPort: 8090
       protocol: TCP
+    - name: faucet-http
+      port: 8097
+      targetPort: 8097
+      protocol: TCP
     - name: blob-grpc
       port: 8091
       targetPort: 8091

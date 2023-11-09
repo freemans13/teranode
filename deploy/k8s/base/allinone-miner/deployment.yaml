@@ -53,6 +53,8 @@ spec:
               protocol: TCP
             - containerPort: 8091
               protocol: TCP
+            - containerPort: 8097
+              protocol: TCP
             - containerPort: 9091
               protocol: TCP
             - containerPort: 9905
