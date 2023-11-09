@@ -76,6 +76,7 @@
     "modernc",
     "nolint",
     "nullstore",
+    "oneofs",
     "opentracing",
     "ordishs",
     "otel",
