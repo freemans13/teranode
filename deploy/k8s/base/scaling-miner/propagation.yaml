@@ -31,7 +31,7 @@ spec:
           image: REPO:IMAGE:TAG
           args: [ "-propagation=1" ]
           # command: "You can override the entrypoint with a command."
-          #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
           #          command: [ "./ubsv.run" ]
           envFrom:
             - configMapRef:
