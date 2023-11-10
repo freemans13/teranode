@@ -25,15 +25,6 @@ psql postgres://miner7:miner7@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaw
 psql postgres://miner8:miner8@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase8 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 psql postgres://miner9:miner9@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase9 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 # endregion
-# region postgres m1
-psql postgresql://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/m1 -c " drop table if exists state ; drop table if exists blocks;"
-psql postgresql://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase -c "drop table if exists coinbase_utxos; drop table if exists state; drop table if exists  blocks;"
-# endregion
-# endregion
-
-# truncate
-psql postgresql://m1:m1@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/m1 -c "truncate table state CASCADE; truncate table blocks CASCADE; truncate table coinbase_utxos CASCADE;"
-psql postgresql://coinbase:coinbase@services-db.cipebxcxpkpk.eu-north-1.rds.amazonaws.com:5432/coinbase -c "truncate table state CASCADE; truncate table blocks CASCADE; truncate table coinbase_utxos CASCADE;"
 
 # region clean redis
 clusters=("arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground"
@@ -57,9 +48,6 @@ for cluster in "${clusters[@]}"; do
   done
 done
 # endregion
-
-# todo make key dynamic based on user
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem ubuntu@aero.ubsv-store0.eu-north-1.ubsv.dev -f "aql -c \"TRUNCATE ubsv-store;"\"
 
 # scale back up everything
 bash scale_up.sh
