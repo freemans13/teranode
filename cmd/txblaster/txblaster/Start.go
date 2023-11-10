@@ -243,6 +243,8 @@ func Start() {
 	for i := 0; i < *workers; i++ {
 		workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
 		go startWorker(ctx, workerLogger, i, *rateLimit, coinbaseClient, txDistributor, logIdsFile)
+		// stagger worker startup to not overload Coinbase
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// start http health check server
