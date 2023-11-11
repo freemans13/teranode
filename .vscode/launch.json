@@ -72,9 +72,9 @@
       "program": "${workspaceFolder}/cmd/aerospiketest/main.go",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "x"
+        "utxostore": "aerospike://localhost:3000/testtimeout=30s",
       },
-      "args": ["-strategy=direct", "-transactions=1000", "-workers=10", "-timeout=30s"]
+      "args": ["-strategy=direct", "-transactions=1000", "-workers=10", "-timeout=30s", "-aerospike_host=localhost:3000"]
     },
     {
       "name": "blockchain",
@@ -135,6 +135,18 @@
         "Xcoinbase_grpcAddress": "miner1.allinone.ubsv.dev:8093"
       },
       "args": ["-workers=1", "-print=1"]
+    },
+    {
+      "name": "utxostore_blaster",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "buildFlags": "-tags=aerospike",
+      "program": "${workspaceFolder}/cmd/utxostore_blaster/main.go",
+      "env": {
+        "utxostore": "aerospike://localhost:3000/test"
+      },
+      "args": ["-workers=1", "-store=aerospike"]
     },
     {
       "name": "Remote Debug",
