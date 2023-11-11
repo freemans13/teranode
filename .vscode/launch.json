@@ -19,6 +19,22 @@
       ]
     },
     {
+      "name": "UBSV - aerospike",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      "buildFlags": "-tags=aerospike",
+      "env": {
+        "blobserver_httpAddress": "http://localhost:8090",
+        "utxostore": "aerospike://localhost:3000/test?timeout=30s",
+        "txmeta_store": "aerospike://localhost:3000/test?timeout=30s"
+      },
+      "args": [
+        "-p2p=0"
+      ]
+    },
+    {
       "name": "coinbase",
       "type": "go",
       "request": "launch",
