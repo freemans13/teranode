@@ -26,7 +26,7 @@ psql postgres://miner8:miner8@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaw
 psql postgres://miner9:miner9@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase9 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 # endregion
 
-# region clean redis
+# region clean redis cluster
 clusters=("arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground"
   "arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground"
   "arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground")
