@@ -3,4 +3,3 @@ kind: Kustomization
 
 resources:
 - m1/
-- shared-scaling/
