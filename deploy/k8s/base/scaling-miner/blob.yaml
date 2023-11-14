@@ -57,6 +57,9 @@ spec:
             limits:
               memory: 2Gi
               cpu: "2"
+          volumeMounts:
+            - mountPath: /data/subtreestore-ttl/
+              name: subtree-store-ttl
           readinessProbe:
             httpGet:
               path: /health
@@ -73,3 +76,16 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+      volumes:
+        - name: subtree-store-ttl
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  type: subtreestore-ttl
+              spec:
+                accessModes: [ "ReadWriteOnce" ]
+                storageClassName: "io2-xfs-low-iops"
+                resources:
+                  requests:
+                    storage: 1000Gi
