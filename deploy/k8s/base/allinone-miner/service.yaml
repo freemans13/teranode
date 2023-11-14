@@ -32,10 +32,6 @@ spec:
       port: 8087
       targetPort: 8087
       protocol: TCP
-    - name: bootstrap-grpc
-      port: 8089
-      targetPort: 8089
-      protocol: TCP
     - name: blob-http
       port: 8090
       targetPort: 8090
@@ -50,10 +46,6 @@ spec:
     - name: coinbase-grpc
       port: 8093
       targetPort: 8093
-    - name: bootstrap-http
-      port: 8099
-      targetPort: 8099
-      protocol: TCP
     - name: profiler
       port: 9091
       targetPort: 9091
