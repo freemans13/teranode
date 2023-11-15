@@ -330,13 +330,16 @@ func Start() {
 	startTime = time.Now()
 
 	for i := 0; i < *workers; i++ {
-		txDistributor, err = distributor.NewQuicDistributor(logger,
-			distributor.WithBackoffDuration(200*time.Millisecond),
-			distributor.WithRetryAttempts(3),
-			distributor.WithFailureTolerance(0),
-		)
-		if err != nil {
-			log.Fatalf("error creating tx quic distributor: %v", err)
+		if useQuic {
+			// create a quic distributor for each worker
+			txDistributor, err = distributor.NewQuicDistributor(logger,
+				distributor.WithBackoffDuration(200*time.Millisecond),
+				distributor.WithRetryAttempts(3),
+				distributor.WithFailureTolerance(0),
+			)
+			if err != nil {
+				log.Fatalf("error creating tx quic distributor: %v", err)
+			}
 		}
 		workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
 		go startWorker(ctx, workerLogger, i, *rateLimit, coinbaseClient, txDistributor, logIdsFile)
