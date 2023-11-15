@@ -54,11 +54,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 8Gi
-              cpu: "4"
+              memory: 32Gi
+              cpu: "8"
             limits:
-              memory: 8Gi
-              cpu: "4"
+              memory: 32Gi
+              cpu: "16"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
               name: subtree-store-ttl
@@ -90,4 +90,4 @@ spec:
                 storageClassName: "io2-xfs-low-iops"
                 resources:
                   requests:
-                    storage: 1000Gi
+                    storage: 4000Gi
