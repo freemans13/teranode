@@ -128,16 +128,7 @@ func Start() {
 	useQuic := gocore.Config().GetBool("useQuic", false)
 	var txDistributor *distributor.Distributor
 	var err error
-	if useQuic {
-		txDistributor, err = distributor.NewQuicDistributor(logger,
-			distributor.WithBackoffDuration(200*time.Millisecond),
-			distributor.WithRetryAttempts(3),
-			distributor.WithFailureTolerance(0),
-		)
-		if err != nil {
-			log.Fatalf("error creating tx quic distributor: %v", err)
-		}
-	} else {
+	if !useQuic {
 		txDistributor, err = distributor.NewDistributor(logger,
 			distributor.WithBackoffDuration(200*time.Millisecond),
 			distributor.WithRetryAttempts(3),
@@ -339,6 +330,17 @@ func Start() {
 	startTime = time.Now()
 
 	for i := 0; i < *workers; i++ {
+		if useQuic {
+			// create a quic distributor for each worker
+			txDistributor, err = distributor.NewQuicDistributor(logger,
+				distributor.WithBackoffDuration(200*time.Millisecond),
+				distributor.WithRetryAttempts(3),
+				distributor.WithFailureTolerance(0),
+			)
+			if err != nil {
+				log.Fatalf("error creating tx quic distributor: %v", err)
+			}
+		}
 		workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
 		go startWorker(ctx, workerLogger, i, *rateLimit, coinbaseClient, txDistributor, logIdsFile)
 		// stagger worker startup to not overload Coinbase
@@ -493,7 +495,9 @@ func readPrivateKey() (*crypto.PrivKey, error) {
 
 // TODO: implement
 func handleRejectedTxs(ctx context.Context) {
+	logger.Debugf("Listening for rejected txs")
 	for {
+
 		m, err := subscription.Next(ctx)
 		if err != nil {
 			logger.Errorf("Error getting next rejected tx: %+v", err)

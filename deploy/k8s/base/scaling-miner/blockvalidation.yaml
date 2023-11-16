@@ -89,4 +89,4 @@ spec:
                 storageClassName: "io2-xfs-low-iops"
                 resources:
                   requests:
-                    storage: 1000Gi
+                    storage: 4000Gi
