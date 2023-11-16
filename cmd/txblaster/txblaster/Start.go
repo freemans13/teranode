@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -129,31 +128,32 @@ func Start() {
 	var txDistributor *distributor.Distributor
 	var err error
 	if !useQuic {
+		logger.Debugf("Using grpc distributor")
 		txDistributor, err = distributor.NewDistributor(logger,
 			distributor.WithBackoffDuration(200*time.Millisecond),
 			distributor.WithRetryAttempts(3),
 			distributor.WithFailureTolerance(0),
 		)
 		if err != nil {
-			log.Fatalf("error creating tx distributor: %v", err)
+			logger.Fatalf("error creating tx distributor: %v", err)
 		}
 	}
 
 	coinbaseClient, err := coinbase.NewClient(ctx)
 	if err != nil {
-		log.Fatalf("error creating coinbase tracker client: %v", err)
+		logger.Fatalf("error creating coinbase tracker client: %v", err)
 	}
 
 	if kafka != nil && *kafka != "" {
 		logger.Infof("Connecting to kafka at %s", *kafka)
 		kafkaURL, err := url.Parse(*kafka)
 		if err != nil {
-			log.Fatalf("unable to parse kafka url: %v", err)
+			logger.Fatalf("unable to parse kafka url: %v", err)
 		}
 
 		clusterAdmin, producer, err := util.ConnectToKafka(kafkaURL)
 		if err != nil {
-			log.Fatalf("unable to connect to kafka: %v", err)
+			logger.Fatalf("unable to connect to kafka: %v", err)
 		}
 
 		defer func() {
@@ -170,7 +170,7 @@ func Start() {
 		logger.Infof("Using ipv6 multicast interface %s at address %s", *ipv6Interface, *ipv6Address)
 		en0, err := net.InterfaceByName(*ipv6Interface)
 		if err != nil {
-			log.Fatalf("error resolving interface: %v", err)
+			logger.Fatalf("error resolving interface: %v", err)
 		}
 
 		addr := &net.UDPAddr{
@@ -182,7 +182,7 @@ func Start() {
 		logger.Infof("Starting IPv6 multicast on %s", addr.String())
 		ipv6MulticastConn, err = net.DialUDP("udp6", nil, addr)
 		if err != nil {
-			log.Fatalf("error dialing address: %v", err)
+			logger.Fatalf("error dialing address: %v", err)
 		}
 
 		go func() {
@@ -338,7 +338,8 @@ func Start() {
 				distributor.WithFailureTolerance(0),
 			)
 			if err != nil {
-				log.Fatalf("error creating tx quic distributor: %v", err)
+				logger.Errorf("error creating tx quic distributor for worker %d: %v", i, err)
+				continue
 			}
 		}
 		workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
