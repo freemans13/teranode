@@ -38,7 +38,6 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 )
@@ -64,6 +63,7 @@ const privateKeyFilename = "tx-blaster.private_key"
 
 var subscription *pubsub.Subscription
 var p2pHost host.Host
+var topic *pubsub.Topic
 
 func Start() {
 	gocore.SetInfo(progname, version, commit)
@@ -209,8 +209,6 @@ func Start() {
 	}
 
 	if *useInvalidTxSub {
-		targetPeers := 1
-		logger.Infof("Using invalid tx subscriptions")
 		topicPrefix, ok := gocore.Config().Get("p2p_topic_prefix")
 		if !ok {
 			panic("p2p_topic_prefix not set in config")
@@ -222,59 +220,10 @@ func Start() {
 		}
 		rejectedTxTopicName := fmt.Sprintf("%s-%s", topicPrefix, rtn)
 
-		var pk *crypto.PrivKey
-		var err error
-
-		pk, err = readPrivateKey()
-		if err != nil {
-			pk, err = generatePrivateKey()
-			if err != nil {
-				panic(err)
-			}
-		}
-
-		// create host
-		p2pHost, err = libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"), libp2p.Identity(*pk))
+		topic, err = createlibp2pTopic(ctx, rejectedTxTopicName)
 		if err != nil {
 			panic(err)
 		}
-
-		go discoverPeers(ctx, rejectedTxTopicName, p2pHost)
-
-		ps, err := pubsub.NewGossipSub(ctx, p2pHost)
-		if err != nil {
-			panic(err)
-		}
-
-		// join the topic
-		topic, err := ps.Join(rejectedTxTopicName)
-		if err != nil {
-			panic(err)
-		}
-
-		subscription, err = topic.Subscribe()
-		if err != nil {
-			panic(err)
-		}
-		// Channel to signal when the target number of peers is reached
-		doneCh := make(chan struct{})
-
-		// Setup connection notification
-		p2pHost.Network().Notify(&network.NotifyBundle{
-			ConnectedF: func(net network.Network, conn network.Conn) {
-				if len(net.Peers()) >= targetPeers {
-					doneCh <- struct{}{}
-				}
-			},
-		})
-		select {
-		case <-doneCh:
-			logger.Debugf("Connected to target number of peers")
-		case <-time.After(30 * time.Second): // Timeout if not connected to n peers within 30 seconds
-			logger.Warnf("Timeout: could not connect to target number of peers")
-		}
-
-		go handleRejectedTxs(ctx)
 	}
 
 	printProgress = uint64(*printFlag)
@@ -387,6 +336,7 @@ func startWorker(ctx context.Context, logger utils.Logger, workerId int, rateLim
 				logIdsFile,
 				&totalTransactions,
 				&startTime,
+				topic,
 			)
 			if err != nil {
 				logger.Errorf("Could not initialise worker %d: %v", workerId, err)
@@ -456,6 +406,40 @@ ConnectLoop:
 	}
 }
 
+func createlibp2pTopic(ctx context.Context, topicName string) (*pubsub.Topic, error) {
+	logger.Debugf("Starting libp2pListener. topicName=%s, workerId:%d", topicName)
+
+	var pk *crypto.PrivKey
+	var err error
+
+	pk, err = readPrivateKey()
+	if err != nil {
+		pk, err = generatePrivateKey()
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Create a new libp2p Host that listens on a random TCP port
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"), libp2p.Identity(*pk))
+	if err != nil {
+		return nil, err
+	}
+
+	go discoverPeers(ctx, topicName, h)
+	// Set up a new PubSub service using the GossipSub router
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		return nil, err
+	}
+
+	topic, err := ps.Join(topicName)
+	if err != nil {
+		return nil, err
+	}
+
+	return topic, err
+}
+
 func generatePrivateKey() (*crypto.PrivKey, error) {
 	// Generate a new key pair
 	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
@@ -492,17 +476,4 @@ func readPrivateKey() (*crypto.PrivKey, error) {
 	}
 
 	return &priv, nil
-}
-
-// TODO: implement
-func handleRejectedTxs(ctx context.Context) {
-	logger.Debugf("Listening for rejected txs")
-	for {
-
-		m, err := subscription.Next(ctx)
-		if err != nil {
-			logger.Errorf("Error getting next rejected tx: %+v", err)
-		}
-		logger.Debugf("received message %+v", m)
-	}
 }
