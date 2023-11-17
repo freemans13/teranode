@@ -61,8 +61,8 @@ var startTime time.Time
 
 const privateKeyFilename = "tx-blaster.private_key"
 
-var subscription *pubsub.Subscription
-var p2pHost host.Host
+// var subscription *pubsub.Subscription
+// var p2pHost host.Host
 var topic *pubsub.Topic
 
 func Start() {
