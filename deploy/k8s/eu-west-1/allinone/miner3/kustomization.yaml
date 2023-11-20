@@ -2,59 +2,59 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../base/allinone-miner
+  - ../../../base/allinone-miner
 
-namespace: miner9
+namespace: miner3
 
-nameSuffix: "9"
+nameSuffix: "3"
 commonLabels:
-  app: miner9
+  app: miner3
 
 configMapGenerator:
   - behavior: merge
     literals:
-      - JAEGER_AGENT_HOST=jaeger-ap-northeast-1-agent.jaeger.svc.cluster.local
+      - JAEGER_AGENT_HOST=jaeger-eu-west-1-agent.jaeger.svc.cluster.local
     name: config-miner
   - behavior: merge
     literals:
-      - JAEGER_AGENT_HOST=jaeger-ap-northeast-1-agent.jaeger.svc.cluster.local
+      - JAEGER_AGENT_HOST=jaeger-eu-west-1-agent.jaeger.svc.cluster.local
     name: tx-blaster-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=allinone.miner.9
+      - SETTINGS_CONTEXT=allinone.miner.3
     name: config-miner
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=allinone.miner.9
+      - SETTINGS_CONTEXT=allinone.miner.3
     name: tx-blaster-config
   - behavior: merge
     literals:
-      - coinbase_grpcAddress=miner9.miner9.svc.cluster.local:8093
+      - coinbase_grpcAddress=miner3.miner3.svc.cluster.local:8093
     name: tx-blaster-config
 
 patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/match
-        value: HostSNI(`miner9.allinone.ubsv.dev`)
+        value: HostSNI(`miner3.allinone.ubsv.dev`)
     target:
       kind: IngressRouteTCP
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: miner9
+        value: miner3
     target:
       kind: IngressRouteTCP
       labelSelector: service=miner
   - patch: |-
       - op: replace
         path: /subjects/0/namespace
-        value: miner9
+        value: miner3
     target:
       kind: ClusterRoleBinding
   - patch: |-
       - op: replace
         path: /spec/template/spec/serviceAccountName
-        value: sa-miner9
+        value: sa-miner3
     target:
       kind: Deployment

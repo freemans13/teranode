@@ -2,13 +2,13 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../base/allinone-miner
+  - ../../../base/allinone-miner
 
-namespace: miner3
+namespace: miner1
 
-nameSuffix: "3"
+nameSuffix: "1"
 commonLabels:
-  app: miner3
+  app: miner1
 
 configMapGenerator:
   - behavior: merge
@@ -21,40 +21,40 @@ configMapGenerator:
     name: tx-blaster-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=allinone.miner.3
+      - SETTINGS_CONTEXT=allinone.miner.1
     name: config-miner
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=allinone.miner.3
+      - SETTINGS_CONTEXT=allinone.miner.1
     name: tx-blaster-config
   - behavior: merge
     literals:
-      - coinbase_grpcAddress=miner3.miner3.svc.cluster.local:8093
+      - coinbase_grpcAddress=miner1.miner1.svc.cluster.local:8093
     name: tx-blaster-config
 
 patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/match
-        value: HostSNI(`miner3.allinone.ubsv.dev`)
+        value: HostSNI(`miner1.allinone.ubsv.dev`)
     target:
       kind: IngressRouteTCP
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: miner3
+        value: miner1
     target:
       kind: IngressRouteTCP
       labelSelector: service=miner
   - patch: |-
       - op: replace
         path: /subjects/0/namespace
-        value: miner3
+        value: miner1
     target:
       kind: ClusterRoleBinding
   - patch: |-
       - op: replace
         path: /spec/template/spec/serviceAccountName
-        value: sa-miner3
+        value: sa-miner1
     target:
       kind: Deployment

@@ -2,36 +2,36 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../base/scaling-miner
+  - ../../../base/scaling-miner
 
-namespace: m2
+namespace: m1
 
-nameSuffix: "2"
+nameSuffix: "1"
 commonLabels:
-  miner: m2
+  miner: m1
 
 configMapGenerator:
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.m2
+      - SETTINGS_CONTEXT=scaling.m1
     name: shared-config-m
 
 patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/match
-        value: HostSNI(`m2.scaling.ubsv.dev`)
+        value: HostSNI(`m1.scaling.ubsv.dev`)
     target:
       kind: IngressRouteTCP
   - patch: |-
       - op: replace
         path: /subjects/0/namespace
-        value: m2
+        value: m1
     target:
       kind: ClusterRoleBinding
   - patch: |-
       - op: replace
         path: /spec/template/spec/serviceAccountName
-        value: sa-m2
+        value: sa-m1
     target:
       kind: Deployment
