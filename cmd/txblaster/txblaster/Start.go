@@ -97,7 +97,7 @@ func Start() {
 	ipv6Interface := flag.String("ipv6Interface", "en0", "IPv6 multicast interface - if applicable")
 	profileAddress := flag.String("profile", "", "use this profile port instead of the default")
 	logIds := flag.Bool("log", false, "log tx ids")
-	useInvalidTxSub := flag.Bool("txSub", false, "use invalid tx subscription")
+	useQuic := flag.Bool("quic", false, "use quic and invalid tx subscription")
 
 	flag.Parse()
 
@@ -124,10 +124,9 @@ func Start() {
 
 		defer closer.Close()
 	}
-	useQuic := gocore.Config().GetBool("useQuic", false)
 	var txDistributor *distributor.Distributor
 	var err error
-	if !useQuic {
+	if !*useQuic {
 		logger.Debugf("Using grpc distributor")
 		txDistributor, err = distributor.NewDistributor(logger,
 			distributor.WithBackoffDuration(200*time.Millisecond),
@@ -208,7 +207,7 @@ func Start() {
 		}()
 	}
 
-	if *useInvalidTxSub {
+	if *useQuic {
 		topicPrefix, ok := gocore.Config().Get("p2p_topic_prefix")
 		if !ok {
 			panic("p2p_topic_prefix not set in config")
@@ -252,7 +251,7 @@ func Start() {
 		logger.Infof("[VALIDATOR] Using kubernetes resolver for clients")
 		kuberesolver.RegisterInClusterWithSchema("k8s")
 	}
-	if !useQuic {
+	if !*useQuic {
 		propagationServers := txDistributor.GetPropagationGRPCAddresses()
 		if len(propagationServers) == 0 {
 			panic("No suitable propagation server connection found")
@@ -279,7 +278,7 @@ func Start() {
 	startTime = time.Now()
 
 	for i := 0; i < *workers; i++ {
-		if useQuic {
+		if *useQuic {
 			// create a quic distributor for each worker
 			txDistributor, err = distributor.NewQuicDistributor(logger,
 				distributor.WithBackoffDuration(200*time.Millisecond),
