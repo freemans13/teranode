@@ -13,7 +13,7 @@
     "bestblockheader",
     "BIGSERIAL",
     "blkcC",
-    "blobserver",
+    "Asset",
     "blockassembler",
     "blockassembly",
     "blockstore",

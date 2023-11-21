@@ -8,7 +8,7 @@ spec:
   routes:
     - match: HostSNI(`m1.scaling.ubsv.dev`)
       services:
-        - name: blob-service1
+        - name: asset-service1
           port: 9905
   tls:
     passthrough: true

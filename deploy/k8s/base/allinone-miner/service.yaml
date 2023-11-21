@@ -32,7 +32,7 @@ spec:
       port: 8087
       targetPort: 8087
       protocol: TCP
-    - name: blob-http
+    - name: asset-http
       port: 8090
       targetPort: 8090
       protocol: TCP
@@ -40,7 +40,7 @@ spec:
       port: 8097
       targetPort: 8097
       protocol: TCP
-    - name: blob-grpc
+    - name: asset-grpc
       port: 8091
       targetPort: 8091
     - name: coinbase-grpc
