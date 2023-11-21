@@ -6,7 +6,7 @@ metadata:
     service: miner
 spec:
   entryPoints:
-    - asset-grpc
+    - ast-grpc
   routes:
   - match: HostSNI(`miner.allinone.ubsv.dev`)
     services:

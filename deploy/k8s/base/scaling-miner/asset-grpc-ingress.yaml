@@ -5,7 +5,7 @@ metadata:
 
 spec:
   entryPoints:
-    - asset-grpc
+    - ast-grpc
   routes:
   - match: HostSNI(`m1.scaling.ubsv.dev`)
     services:
