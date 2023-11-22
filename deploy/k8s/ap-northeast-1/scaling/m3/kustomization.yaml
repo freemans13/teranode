@@ -28,6 +28,34 @@ patches:
       kind: IngressRouteTCP
   - patch: |-
       - op: replace
+        path: /spec/routes/0/services/0/name
+        value: propagation-service3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=miner
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=p2p
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: coinbase-service3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=coinbase
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=asset
+  - patch: |-
+      - op: replace
         path: /subjects/0/namespace
         value: m3
     target:

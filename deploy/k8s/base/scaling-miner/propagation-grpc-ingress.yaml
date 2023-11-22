@@ -2,14 +2,15 @@ apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
   name: m1-ingressroute-tcp-8084
-
+  labels:
+    service: propagation
 spec:
   entryPoints:
     - prop-grpc
   routes:
   - match: HostSNI(`m1.scaling.ubsv.dev`)
     services:
-    - name: propagation-service1
+    - name: propagation-service
       port: 8084
   tls:
     passthrough: true
