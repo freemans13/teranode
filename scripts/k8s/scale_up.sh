@@ -30,8 +30,6 @@ kubectl scale deployment -n m$namespace_suffix blockassembly$namespace_suffix --
 wait m$namespace_suffix blockassembly$namespace_suffix 30
 kubectl scale deployment -n m$namespace_suffix blockvalidation$namespace_suffix --replicas 1
 wait m$namespace_suffix blockvalidation$namespace_suffix 30
-kubectl scale deployment -n m$namespace_suffix validation$namespace_suffix --replicas 1
-wait m$namespace_suffix validation$namespace_suffix 30
 kubectl scale deployment -n m$namespace_suffix propagation$namespace_suffix --replicas 1
 wait m$namespace_suffix propagation$namespace_suffix 30
 kubectl scale deployment -n m$namespace_suffix coinbase$namespace_suffix --replicas 1

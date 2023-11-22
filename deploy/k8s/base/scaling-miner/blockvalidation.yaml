@@ -32,6 +32,11 @@ spec:
                   matchLabels:
                     app: blockvalidation
                 topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: type
+          value: massive
+          operator: Equal
+          effect: NoSchedule
       containers:
         - name: blockvalidation
           image: REPO:IMAGE:TAG
