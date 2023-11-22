@@ -33,8 +33,6 @@ spec:
           env:
             - name: SERVICE_NAME
               value: miner-service
-            - name: SETTINGS_CONTEXT
-              value: scaling.m1
           image: REPO:IMAGE:TAG
           imagePullPolicy: IfNotPresent
           name: miner
