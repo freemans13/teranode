@@ -35,8 +35,6 @@ spec:
           env:
             - name: SERVICE_NAME
               value: asset-service
-            - name: subtreestore
-              value: s3:///ubsv-subtree-store?region=eu-north-1&localTTLStore=file&localTTLStorePath=/data/subtreestore-ttl
           ports:
             - containerPort: 8090
               protocol: TCP
