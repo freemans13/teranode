@@ -11,7 +11,7 @@ if [[ $(kubectl config current-context) == *"eu-west-1"* ]]; then
 elif [[ $(kubectl config current-context) == *"us-east-1"* ]]; then
   namespace_suffix=2
 elif [[ $(kubectl config current-context) == *"ap-northeast-1"* ]]; then
-  namespace_suffix=2
+  namespace_suffix=3
 else
   echo "Unknown context"
   exit 1
