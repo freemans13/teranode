@@ -56,11 +56,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 10Gi
-              cpu: "4"
+              memory: 400Gi
+              cpu: "120"
             limits:
-              memory: 10Gi
-              cpu: "4"
+              memory: 40Gi
+              cpu: "120"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
               name: subtree-store-ttl
