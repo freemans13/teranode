@@ -59,7 +59,7 @@ spec:
               memory: 400Gi
               cpu: "120"
             limits:
-              memory: 40Gi
+              memory: 400Gi
               cpu: "120"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
