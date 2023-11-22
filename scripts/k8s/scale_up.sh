@@ -6,26 +6,37 @@ wait() {
   kubectl -n "$namespace" wait --for=condition=available --timeout="${timeout}s" deployment/"$deployment_name"
 }
 
+if [[ $(kubectl config current-context) == *"eu-west-1"* ]]; then
+  namespace_suffix=1
+elif [[ $(kubectl config current-context) == *"us-east-1"* ]]; then
+  namespace_suffix=2
+elif [[ $(kubectl config current-context) == *"ap-northeast-1"* ]]; then
+  namespace_suffix=2
+else
+  echo "Unknown context"
+  exit 1
+fi
+
 # order is important here, do not change unless you know what you're doing
-kubectl scale deployment -n m1 blockchain1 --replicas 1
-wait m1 blockchain1 30
-#kubectl scale deployment -n m1 utxostore1 --replicas 1
-#wait m1 utxostore1 30
-#kubectl scale deployment -n m1 txmetastore1 --replicas 1
-#wait m1 txmetastore1 30
-kubectl scale deployment -n m1 asset1 --replicas 1
-wait m1 asset1 30
-kubectl scale deployment -n m1 blockassembly1 --replicas 1
-wait m1 blockassembly1 30
-kubectl scale deployment -n m1 blockvalidation1 --replicas 1
-wait m1 blockvalidation1 30
-kubectl scale deployment -n m1 validation1 --replicas 1
-wait m1 validation1 30
-kubectl scale deployment -n m1 propagation1 --replicas 1
-wait m1 propagation1 30
-kubectl scale deployment -n m1 coinbase1 --replicas 1
-wait m1 coinbase1 30
-kubectl scale deployment -n m1 miner1 --replicas 1
+kubectl scale deployment -n m$namespace_suffix blockchain$namespace_suffix --replicas 1
+wait m$namespace_suffix blockchain$namespace_suffix 30
+#kubectl scale deployment -n m$namespace_suffix utxostore$namespace_suffix --replicas 1
+#wait m$namespace_suffix utxostore$namespace_suffix 30
+#kubectl scale deployment -n m$namespace_suffix txmetastore$namespace_suffix --replicas 1
+#wait m$namespace_suffix txmetastore$namespace_suffix 30
+kubectl scale deployment -n m$namespace_suffix asset$namespace_suffix --replicas 1
+wait m$namespace_suffix asset$namespace_suffix 30
+kubectl scale deployment -n m$namespace_suffix blockassembly$namespace_suffix --replicas 1
+wait m$namespace_suffix blockassembly$namespace_suffix 30
+kubectl scale deployment -n m$namespace_suffix blockvalidation$namespace_suffix --replicas 1
+wait m$namespace_suffix blockvalidation$namespace_suffix 30
+kubectl scale deployment -n m$namespace_suffix validation$namespace_suffix --replicas 1
+wait m$namespace_suffix validation$namespace_suffix 30
+kubectl scale deployment -n m$namespace_suffix propagation$namespace_suffix --replicas 1
+wait m$namespace_suffix propagation$namespace_suffix 30
+kubectl scale deployment -n m$namespace_suffix coinbase$namespace_suffix --replicas 1
+wait m$namespace_suffix coinbase$namespace_suffix 30
+kubectl scale deployment -n m$namespace_suffix miner$namespace_suffix --replicas 1
 
 
 # all in one
