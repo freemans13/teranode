@@ -62,7 +62,7 @@ spec:
             - containerPort: 9906
               protocol: TCP
             - containerPort: 8384
-              protocol: TCP
+              protocol: UDP
           resources:
             requests:
               memory: 15Gi

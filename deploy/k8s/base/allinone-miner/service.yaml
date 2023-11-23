@@ -61,4 +61,4 @@ spec:
     - name: quic
       port: 8384
       targetPort: 8384
-      protocol: TCP
+      protocol: UDP
