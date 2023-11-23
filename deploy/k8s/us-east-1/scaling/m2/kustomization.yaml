@@ -15,11 +15,6 @@ configMapGenerator:
     literals:
       - SETTINGS_CONTEXT=scaling.m2
     name: shared-config-m
-  - behavior: merge
-    literals:
-      - SETTINGS_CONTEXT=scaling.m2
-    name: coinbase-config
-
 patches:
   - patch: |-
       - op: replace
