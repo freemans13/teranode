@@ -8,7 +8,7 @@ spec:
   entryPoints:
     - prop-frpc
   routes:
-  - match: HostSNI(`m1.scaling.ubsv.dev`)
+  - match: HostSNI(`m.scaling.ubsv.dev`)
     services:
     - name: propagation-service
       port: 8284
