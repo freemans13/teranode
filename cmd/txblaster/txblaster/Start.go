@@ -69,7 +69,7 @@ func Start() {
 	gocore.SetInfo(progname, version, commit)
 
 	var logLevelStr, _ = gocore.Config().Get("logLevel", "INFO")
-	logger = gocore.Log("txblast", gocore.NewLogLevelFromString(logLevelStr))
+	logger = util.NewLogger("txblast", logLevelStr)
 
 	_ = os.Chdir("../../")
 
@@ -290,7 +290,7 @@ func Start() {
 				continue
 			}
 		}
-		workerLogger := gocore.Log(fmt.Sprintf("wrk_%d", i), gocore.NewLogLevelFromString(logLevelStr))
+		workerLogger := util.NewLogger(fmt.Sprintf("wrk_%d", i), logLevelStr)
 		go startWorker(ctx, workerLogger, i, *rateLimit, coinbaseClient, txDistributor, logIdsFile)
 		// stagger worker startup to not overload Coinbase
 		time.Sleep(100 * time.Millisecond)
