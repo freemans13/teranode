@@ -5,25 +5,19 @@ bash scale_down.sh
 # region postgres all in one
 psql postgres://miner1:miner1@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/ubsv1 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
 psql postgres://miner2:miner2@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/ubsv2 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
-psql postgres://miner3:miner3@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/ubsv3 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
 psql postgres://miner4:miner4@miners-db.cwhjir53bktc.us-east-1.rds.amazonaws.com:5432/ubsv4 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
 psql postgres://miner5:miner5@miners-db.cwhjir53bktc.us-east-1.rds.amazonaws.com:5432/ubsv5 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
-psql postgres://miner6:miner6@miners-db.cwhjir53bktc.us-east-1.rds.amazonaws.com:5432/ubsv6 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
 psql postgres://miner7:miner7@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/ubsv7 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
 psql postgres://miner8:miner8@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/ubsv8 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
-psql postgres://miner9:miner9@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/ubsv9 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
 # endregion
 
 # region postgress coinbase
 psql postgres://miner1:miner1@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/coinbase1 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 psql postgres://miner2:miner2@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/coinbase2 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
-psql postgres://miner3:miner3@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/coinbase3 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 psql postgres://miner4:miner4@miners-db.cwhjir53bktc.us-east-1.rds.amazonaws.com:5432/coinbase4 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 psql postgres://miner5:miner5@miners-db.cwhjir53bktc.us-east-1.rds.amazonaws.com:5432/coinbase5 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
-psql postgres://miner6:miner6@miners-db.cwhjir53bktc.us-east-1.rds.amazonaws.com:5432/coinbase6 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 psql postgres://miner7:miner7@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase7 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 psql postgres://miner8:miner8@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase8 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
-psql postgres://miner9:miner9@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase9 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 # endregion
 
 # region clean redis cluster

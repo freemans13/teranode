@@ -35,9 +35,3 @@ wait m$namespace_suffix propagation$namespace_suffix 30
 kubectl scale deployment -n m$namespace_suffix coinbase$namespace_suffix --replicas 1
 wait m$namespace_suffix coinbase$namespace_suffix 30
 kubectl scale deployment -n m$namespace_suffix miner$namespace_suffix --replicas 1
-
-
-# all in one
-# kubectl scale deployment -n miner1 miner1 --replicas 1
-# kubectl scale deployment -n miner2 miner2 --replicas 1
-# kubectl scale deployment -n miner3 miner3 --replicas 1

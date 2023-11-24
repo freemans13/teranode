@@ -4,4 +4,3 @@ kind: Kustomization
 resources:
 - miner4/
 - miner5/
-- miner6/
