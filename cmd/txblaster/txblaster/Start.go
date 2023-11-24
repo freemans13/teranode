@@ -25,6 +25,7 @@ import (
 	_ "github.com/bitcoin-sv/ubsv/k8sresolver"
 	"github.com/bitcoin-sv/ubsv/services/coinbase"
 	"github.com/bitcoin-sv/ubsv/services/p2p"
+	"github.com/bitcoin-sv/ubsv/ulogger"
 	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
 	"github.com/libsv/go-p2p/wire"
@@ -48,7 +49,7 @@ const progname = "tx-blaster"
 var version string
 var commit string
 
-var logger utils.Logger
+var logger ulogger.Logger
 
 var printProgress uint64
 
@@ -69,7 +70,7 @@ func Start() {
 	gocore.SetInfo(progname, version, commit)
 
 	var logLevelStr, _ = gocore.Config().Get("logLevel", "INFO")
-	logger = util.NewLogger("txblast", logLevelStr)
+	logger = ulogger.New("txblast", ulogger.WithLevel(logLevelStr))
 
 	_ = os.Chdir("../../")
 
@@ -138,7 +139,7 @@ func Start() {
 		}
 	}
 
-	coinbaseClient, err := coinbase.NewClient(ctx)
+	coinbaseClient, err := coinbase.NewClient(ctx, logger)
 	if err != nil {
 		logger.Fatalf("error creating coinbase tracker client: %v", err)
 	}
@@ -290,7 +291,7 @@ func Start() {
 				continue
 			}
 		}
-		workerLogger := util.NewLogger(fmt.Sprintf("wrk_%d", i), logLevelStr)
+		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
 		go startWorker(ctx, workerLogger, i, *rateLimit, coinbaseClient, txDistributor, logIdsFile)
 		// stagger worker startup to not overload Coinbase
 		time.Sleep(100 * time.Millisecond)
@@ -305,7 +306,7 @@ func Start() {
 	<-ctx.Done()
 }
 
-func startWorker(ctx context.Context, logger utils.Logger, workerId int, rateLimit float64,
+func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64,
 	coinbaseClient *coinbase.Client, txDistributor *distributor.Distributor, logIdsFile chan string) {
 
 	var w *worker.Worker
