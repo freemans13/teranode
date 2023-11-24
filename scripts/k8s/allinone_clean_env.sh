@@ -1,8 +1,12 @@
 # scale down everything
-bash scale_down.sh
+# get relative path for current file
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+echo "Scaling down: all"
+bash $DIR/allinone_down.sh
 
 # region delete postgres
 # region postgres all in one
+echo "Flushing all postgres databases"
 psql postgres://miner1:miner1@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/ubsv1 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
 psql postgres://miner2:miner2@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/ubsv2 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
 psql postgres://miner4:miner4@miners-db.cwhjir53bktc.us-east-1.rds.amazonaws.com:5432/ubsv4 -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists utxos; drop table if exists blocks;"
@@ -20,31 +24,10 @@ psql postgres://miner7:miner7@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaw
 psql postgres://miner8:miner8@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amazonaws.com:5432/coinbase8 -c "drop table if exists state; drop table if exists coinbase_utxos; drop table if exists spendable_utxos; drop table if exists blocks;"
 # endregion
 
-# region clean redis cluster
-clusters=("arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground"
-  "arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground"
-  "arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground")
-offset=0
-
-for cluster in "${clusters[@]}"; do
-  kubectl config use-context $cluster
-  for i in {1..3}; do
-    offset=$((offset + 1))
-    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-0 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
-    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-1 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
-    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-2 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
-    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-3 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
-    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-4 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
-    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-5 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
-    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-6 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL } &
-    { kubectl exec -n redis-miner$offset redis-store-$offset-redis-cluster-7 -c redis-store-$offset-redis-cluster -- redis-cli FLUSHALL }
-    wait
-  done
-done
-# endregion
-
+echo "Aerospike cleaning skipped for now. #todo joe to fix"
+echo "Scaling back up: all"
 # scale back up everything
-bash scale_up.sh
+bash $DIR/allinone_up.sh all
 
 # scale up tx blaster
-kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1
+#kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1

@@ -1,6 +1,9 @@
 # scale down everything
-bash scale_down.sh
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+echo "Scaling down: all"
+bash $DIR/scale_down.sh all
 
+echo "Flushing all postgres databases"
 # region postgres m1
 psql postgres://m1:m1@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/m1 -c "drop table if exists state ; drop table if exists blocks;"
 psql postgres://coinbase:coinbase@miners-db.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/coinbase -c "drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists state; drop table if exists  blocks;"
@@ -11,11 +14,10 @@ psql postgres://coinbase:coinbase@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amaz
 # endregion
 
 # todo make key dynamic based on user
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem ubuntu@aero.ubsv-store-asia0.ap-northeast-1.ubsv.dev -f "aql -c \"TRUNCATE ubsv-store;"\"
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem ubuntu@aero.ubsv-store-eu0.eu-west-1.ubsv.dev -f "aql -c \"TRUNCATE ubsv-store;"\"
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem ubuntu@aero.ubsv-store-us0.us-east-1.ubsv.dev -f "aql -c \"TRUNCATE ubsv-store;"\"
+echo "Aerospike cleaning skipped for now. #todo joe to fix"
+echo "Scaling back up: all"
 # scale back up everything
-bash scale_up.sh
+bash $DIR/scale_up.sh all
 
 # scale up tx blaster
 kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1
