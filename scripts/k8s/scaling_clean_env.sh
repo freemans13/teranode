@@ -1,7 +1,7 @@
 # scale down everything
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 echo "Scaling down: all"
-bash $DIR/scale_down.sh all
+bash $DIR/scaling_down.sh all
 
 echo "Flushing all postgres databases"
 # region postgres m1
@@ -17,7 +17,7 @@ psql postgres://coinbase:coinbase@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amaz
 echo "Aerospike cleaning skipped for now. #todo joe to fix"
 echo "Scaling back up: all"
 # scale back up everything
-bash $DIR/scale_up.sh all
+bash $DIR/scaling_up.sh all
 
 # scale up tx blaster
 kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1
