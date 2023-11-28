@@ -1,19 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: asset
+  name: p2p
+
   labels:
-    app: asset
+    app: p2p
     project: service
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: asset
+      app: p2p
   template:
     metadata:
       labels:
-        app: asset
+        app: p2p
     spec:
       serviceAccountName: sa-m
       affinity:
@@ -23,39 +24,39 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: asset
+                    app: p2p
                 topologyKey: "kubernetes.io/hostname"
       containers:
-        - name: asset
+        - name: p2p
           image: REPO:IMAGE:TAG
-          args: [ "-asset=1" ]
+          args: [ "-p2p=1" ]
+          # command: "You can override the entrypoint with a command."
+#          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          #          command: [ "./ubsv.run" ]
           envFrom:
             - configMapRef:
                 name: shared-config-m
           env:
             - name: SERVICE_NAME
-              value: asset-service
+              value: p2p-service
           ports:
-            - containerPort: 8090
-              protocol: TCP
-            - containerPort: 8099
-              protocol: TCP
-            - containerPort: 8091
-              protocol: TCP
-            - containerPort: 9091
-              protocol: TCP
             - containerPort: 4040
+              protocol: TCP
+            - containerPort: 9905
+              protocol: TCP
+            - containerPort: 9906
+              protocol: TCP
+            - containerPort: 9907
+              protocol: TCP
+            - containerPort: 9901
               protocol: TCP
           resources:
             requests:
-              memory: 55Gi
-              cpu: "8"
+              memory: 2Gi
+              cpu: "1"
             limits:
-              memory: 55Gi
-              cpu: "16"
-          volumeMounts:
-            - mountPath: /data/subtreestore-ttl/
-              name: subtree-store-ttl
+              memory: 2Gi
+              cpu: "1"
           readinessProbe:
             httpGet:
               path: /health
@@ -72,16 +73,3 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
-      volumes:
-        - name: subtree-store-ttl
-          ephemeral:
-            volumeClaimTemplate:
-              metadata:
-                labels:
-                  type: subtreestore-ttl
-              spec:
-                accessModes: [ "ReadWriteOnce" ]
-                storageClassName: "io2-xfs-low-iops"
-                resources:
-                  requests:
-                    storage: 4000Gi

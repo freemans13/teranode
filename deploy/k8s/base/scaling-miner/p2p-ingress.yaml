@@ -10,7 +10,7 @@ spec:
   routes:
     - match: HostSNI(`m1.scaling.ubsv.dev`)
       services:
-        - name: asset-service
+        - name: p2p-service
           port: 9905
   tls:
     passthrough: true

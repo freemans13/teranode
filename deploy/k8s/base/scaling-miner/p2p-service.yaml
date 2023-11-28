@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: asset-service
+  name: p2p-service
 
   labels:
-    app: asset
+    app: p2p
   annotations:
     prometheus.io/port: "9091"
     prometheus.io/scrape: "true"
@@ -14,21 +14,25 @@ spec:
   ipFamilies:
   - IPv4
   selector:
-    app: asset
+    app: p2p
   ports:
-    - name: asset-grpc
-      port: 8091
-      targetPort: 8091
-      protocol: TCP
-    - name: asset-http
-      port: 8090
-      targetPort: 8090
-      protocol: TCP
     - name: profiler
       port: 9091
       targetPort: 9091
       protocol: TCP
-    - name: debugger
-      port: 4040
+    - name: delve
+      port: 4041
       targetPort: 4040
+      protocol: TCP
+    - name: p2p
+      port: 9905
+      targetPort: 9905
+      protocol: TCP
+    - name: p2p-http
+      port: 9906
+      targetPort: 9906
+      protocol: TCP
+    - name: p2p-grpc
+      port: 9907
+      targetPort: 9907
       protocol: TCP
