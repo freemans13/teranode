@@ -20,6 +20,10 @@ spec:
       port: 8088
       targetPort: 8088
       protocol: TCP
+    - name: tcp
+      port: 8288
+      targetPort: 8288
+      protocol: TCP
     - name: profiler
       port: 9091
       targetPort: 9091

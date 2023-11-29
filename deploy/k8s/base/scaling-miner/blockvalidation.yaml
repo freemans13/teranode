@@ -50,6 +50,8 @@ spec:
           ports:
             - containerPort: 8088
               protocol: TCP
+            - containerPort: 8288
+              protocol: TCP
             - containerPort: 9091
               protocol: TCP
             - containerPort: 4040
