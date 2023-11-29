@@ -1,0 +1,19 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: status-ws-ingress-9907
+  labels:
+    service: status
+spec:
+  entryPoints:
+    - status-ws
+  routes:
+    - match: HostSNI(`m1.scaling.ubsv.dev`)
+#      middlewares:
+#        - name: wss-headers
+#          namespace: traefik
+      services:
+        - name: status-service
+          port: 9907
+  tls:
+    passthrough: true

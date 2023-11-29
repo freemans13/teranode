@@ -63,6 +63,10 @@ spec:
               protocol: TCP
             - containerPort: 9907
               protocol: TCP
+            - containerPort: 9908
+              protocol: TCP
+            - containerPort: 9909
+              protocol: TCP
             - containerPort: 8384
               protocol: UDP
           resources:

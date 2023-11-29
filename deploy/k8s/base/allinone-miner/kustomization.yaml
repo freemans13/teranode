@@ -16,4 +16,7 @@ resources:
   - p2p-ingress.yaml
   - p2p-ws-ingress.yaml
   - p2p-grpc-ingress.yaml
+  - status-ingress.yaml
+  - status-ws-ingress.yaml
+  - status-grpc-ingress.yaml
   - tx-blaster-service.yaml

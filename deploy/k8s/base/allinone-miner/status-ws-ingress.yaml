@@ -1,0 +1,16 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: status-ws-ingress-9908
+  labels:
+    service: miner
+spec:
+  entryPoints:
+    - status-ws
+  routes:
+    - match: HostSNI(`miner.allinone.ubsv.dev`)
+      services:
+        - name: miner
+          port: 9908
+  tls:
+    passthrough: true

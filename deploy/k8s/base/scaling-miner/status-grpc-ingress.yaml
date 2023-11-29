@@ -1,0 +1,16 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: status-ingress-tcp-9909
+  labels:
+    service: status
+spec:
+  entryPoints:
+    - status-grpc
+  routes:
+  - match: HostSNI(`m.scaling.ubsv.dev`)
+    services:
+    - name: status-service
+      port: 9909
+  tls:
+    passthrough: true
