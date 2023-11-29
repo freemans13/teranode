@@ -99,6 +99,7 @@ func Start() {
 	profileAddress := flag.String("profile", "", "use this profile port instead of the default")
 	logIds := flag.Bool("log", false, "log tx ids")
 	useQuic := flag.Bool("quic", false, "use quic and invalid tx subscription")
+	iterations := flag.Int("iterations", -1, "number of iterations to run (default is indefinite)")
 
 	flag.Parse()
 
@@ -292,7 +293,7 @@ func Start() {
 			}
 		}
 		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
-		go startWorker(ctx, workerLogger, i, *rateLimit, coinbaseClient, txDistributor, logIdsFile)
+		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributor, logIdsFile)
 		// stagger worker startup to not overload Coinbase
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -306,17 +307,24 @@ func Start() {
 	<-ctx.Done()
 }
 
-func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64,
+func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64, iterations int,
 	coinbaseClient *coinbase.Client, txDistributor *distributor.Distributor, logIdsFile chan string) {
 
 	var w *worker.Worker
 	var err error
 
-	for {
+	// Check if the iterations flag was set to a positive value
+	runIndefinitely := iterations < 0
+
+	for i := 0; ; i++ {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			if !runIndefinitely && i >= iterations {
+				logger.Infof("worker %d finished", workerId)
+				os.Exit(0)
+			}
 			if rateLimit > 0 {
 				logger.Infof("starting worker %d with rate limit: %0.2f/s", workerId, rateLimit)
 			} else {
@@ -326,6 +334,7 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 			w, err = worker.NewWorker(
 				logger,
 				rateLimit,
+				iterations,
 				coinbaseClient,
 				txDistributor,
 				kafkaProducer,
