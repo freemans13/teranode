@@ -28,9 +28,13 @@ scale_up() {
   wait m$namespace_suffix blockvalidation$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix propagation$namespace_suffix --replicas 1
   wait m$namespace_suffix propagation$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix coinbase$namespace_suffix --replicas 1
-  wait m$namespace_suffix coinbase$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix miner$namespace_suffix --replicas 1
+  kubectl scale deployment -n m$namespace_suffix p2p$namespace_suffix --replicas 1
+  wait m$namespace_suffix p2p$namespace_suffix 30
+  echo "Not scaling coinbase and miner as you need to be careful of order when booting the blockchain"
+  # todo think of better way to bring up the nodes
+#  kubectl scale deployment -n m$namespace_suffix coinbase$namespace_suffix --replicas 1
+#  wait m$namespace_suffix coinbase$namespace_suffix 30
+#  kubectl scale deployment -n m$namespace_suffix miner$namespace_suffix --replicas 1
 }
 
 if [ "$1" == "all" ]; then
