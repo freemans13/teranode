@@ -14,9 +14,6 @@
       "env": {
         "asset_httpAddress": "http://localhost:8090"
       },
-      "args": [
-        "-p2p=0"
-      ]
     },
     {
       "name": "UBSV - aerospike",
