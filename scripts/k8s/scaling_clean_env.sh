@@ -16,11 +16,11 @@ psql postgres://coinbase:coinbase@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amaz
 # todo make key dynamic based on user
 echo "Aerospike cleaning skipped for now"
 IP=$(aws ec2 describe-instances --filters  'Name=tag:Name,Values=ubsv-store-eu-aerospike-node-1' --query "Reservations[*].Instances[*].PublicIpAddress" --output text --region eu-west-1)
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
+ssh ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
 IP=$(aws ec2 describe-instances --filters  'Name=tag:Name,Values=ubsv-store-us-aerospike-node-1' --query "Reservations[*].Instances[*].PublicIpAddress" --output text --region us-east-1)
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
+ssh ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
 IP=$(aws ec2 describe-instances --filters  'Name=tag:Name,Values=ubsv-store-asia-aerospike-node-1' --query "Reservations[*].Instances[*].PublicIpAddress" --output text --region ap-northeast-1)
-ssh -i ~/.ssh/joe-ssh-aws-ubsv.pem ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
+ssh ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
 
 echo "Scaling back up: all"
 # scale back up everything
