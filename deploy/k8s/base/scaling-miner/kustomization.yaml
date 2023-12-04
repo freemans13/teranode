@@ -44,5 +44,4 @@ resources:
   - status.yaml
   - status-service.yaml
   - status-ingress.yaml
-  - status-ws-ingress.yaml
   - status-grpc-ingress.yaml
