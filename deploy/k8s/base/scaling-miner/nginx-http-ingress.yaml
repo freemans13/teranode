@@ -12,5 +12,3 @@ spec:
     services:
     - name: nginx-service
       port: 80
-  tls:
-    passthrough: true
