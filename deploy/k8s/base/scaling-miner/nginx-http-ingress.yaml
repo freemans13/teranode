@@ -6,9 +6,9 @@ metadata:
     service: nginx
 spec:
   entryPoints:
-    - web
+    - nginx
   routes:
   - match: HostSNI(`m1.scaling.ubsv.dev`)
     services:
     - name: nginx-service
-      port: 80
+      port: 5555
