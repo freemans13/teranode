@@ -1,0 +1,16 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: ingressroute-http
+  labels:
+    service: nginx
+spec:
+  entryPoints:
+    - web
+  routes:
+  - match: HostSNI(`m1.scaling.ubsv.dev`)
+    services:
+    - name: nginx-service
+      port: 80
+  tls:
+    passthrough: true
