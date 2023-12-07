@@ -3,14 +3,14 @@ kind: IngressRouteTCP
 metadata:
   name: status-ingress-tcp-9909
   labels:
-    service: status
+    service: miner
 spec:
   entryPoints:
     - status-grpc
   routes:
-  - match: HostSNI(`m.scaling.ubsv.dev`)
+  - match: HostSNI(`miner.allinone.ubsv.dev`)
     services:
-    - name: status-service
+    - name: miner
       port: 9909
   tls:
     passthrough: true
