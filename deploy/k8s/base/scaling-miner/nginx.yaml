@@ -6,7 +6,7 @@ metadata:
     app: nginx
     project: service
 spec:
-  replicas: 0
+  replicas: 1
   selector:
     matchLabels:
       app: nginx
@@ -59,6 +59,6 @@ spec:
                 storageClassName: "io2-xfs-low-iops"
                 resources:
                   requests:
-                    storage: 100Mi
+                    storage: 1Gi
 
       
