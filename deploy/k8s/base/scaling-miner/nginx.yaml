@@ -23,11 +23,14 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 16Gi
-              cpu: "4"
+              memory: 4Gi
+              cpu: "2"
             limits:
-              memory: 16Gi
-              cpu: "4"
+              memory: 4Gi
+              cpu: "2"
+            volumeMounts:
+            - mountPath: /usr/share/nginx/html/
+              name: nginx-html
           readinessProbe:
             httpGet:
               path: /
@@ -44,4 +47,18 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+      volumes:
+        - name: nginx-html
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  type: subtreestore-ttl
+              spec:
+                accessModes: [ "ReadWriteOnce" ]
+                storageClassName: "io2-xfs-low-iops"
+                resources:
+                  requests:
+                    storage: 100Mi
+
       
