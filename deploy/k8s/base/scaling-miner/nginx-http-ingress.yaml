@@ -8,7 +8,7 @@ spec:
   entryPoints:
     - nginx
   routes:
-  - match: HostSNI(`m1.scaling.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: nginx-service
       port: 5555

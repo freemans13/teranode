@@ -6,7 +6,6 @@ metadata:
   labels:
     app: nginx
 spec:
-  clusterIP: None
   ipFamilyPolicy: SingleStack
   ipFamilies:
   - IPv4
