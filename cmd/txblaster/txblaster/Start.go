@@ -115,7 +115,7 @@ func Start() {
 
 			for {
 				// Define the URL to query block height
-				url := "http://127.0.0.1:8090/lastblocks?n=1"
+				url := "http://127.0.0.1:18090/lastblocks?n=1"
 
 				// Send an HTTP GET request to the URL
 				resp, err := http.Get(url)
