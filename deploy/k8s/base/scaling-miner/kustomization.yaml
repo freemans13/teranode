@@ -21,6 +21,7 @@ resources:
   - miner-deployment.yaml
   - nginx-http-ingress.yaml
   - nginx-service.yaml
+  - nginx-volume.yaml
   - nginx.yaml
   - p2p-grpc-ingress.yaml
   - p2p-ingress.yaml
