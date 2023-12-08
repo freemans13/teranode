@@ -3,14 +3,14 @@ kind: IngressRouteTCP
 metadata:
   name: p2p-ingress-tcp-9907
   labels:
-    service: p2p
+    service: miner
 spec:
   entryPoints:
     - p2p-grpc
   routes:
-  - match: HostSNI(`m.scaling.ubsv.dev`)
+  - match: HostSNI(`miner.allinone.ubsv.dev`)
     services:
-    - name: p2p-service
+    - name: miner
       port: 9907
   tls:
     passthrough: true

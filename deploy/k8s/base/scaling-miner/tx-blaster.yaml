@@ -36,7 +36,7 @@ spec:
           image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-workers=100"]
+          args: [ "-workers=400"]
           envFrom:
             - configMapRef:
                 name: shared-config-m
@@ -56,10 +56,10 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 2Gi
+              memory: 512Mi
               cpu: "4"
             limits:
-              memory: 2Gi
+              memory: 512Mi
               cpu: "4"
           readinessProbe:
             httpGet:

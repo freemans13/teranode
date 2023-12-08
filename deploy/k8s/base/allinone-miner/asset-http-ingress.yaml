@@ -12,6 +12,5 @@ spec:
     services:
     - name: miner
       port: 8090
-      terminationDelay: 400
   tls:
     passthrough: true

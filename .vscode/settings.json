@@ -16,6 +16,7 @@
     "blkcC",
     "blockassembler",
     "blockassembly",
+    "blockchainstatus",
     "blockstore",
     "blockvalidation",
     "bscript",

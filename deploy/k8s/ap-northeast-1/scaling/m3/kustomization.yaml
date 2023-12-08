@@ -38,6 +38,13 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
+        value: status-service3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=status
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
         value: coinbase-service3
     target:
       kind: IngressRouteTCP
