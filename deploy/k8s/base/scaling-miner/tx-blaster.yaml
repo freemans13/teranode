@@ -31,12 +31,17 @@ spec:
                   matchLabels:
                     app: tx-blaster
                 topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: role
+          value: tx-blaster
+          operator: Equal
+          effect: NoSchedule
       containers:
         - name: tx-blaster
           image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-workers=1600"]
+          args: [ "-workers=1600" ]
           envFrom:
             - configMapRef:
                 name: shared-config-m
