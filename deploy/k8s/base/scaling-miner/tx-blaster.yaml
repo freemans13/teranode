@@ -36,7 +36,7 @@ spec:
           image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-workers=800"]
+          args: [ "-workers=1600"]
           envFrom:
             - configMapRef:
                 name: shared-config-m
@@ -56,16 +56,16 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 512Mi
+              memory: 2048Mi
               cpu: "4"
             limits:
-              memory: 512Mi
+              memory: 2048Mi
               cpu: "4"
           readinessProbe:
             httpGet:
               path: /health
               port: 9092
-            initialDelaySeconds: 120
+            initialDelaySeconds: 240
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
@@ -73,7 +73,7 @@ spec:
             httpGet:
               path: /health
               port: 9092
-            initialDelaySeconds: 120
+            initialDelaySeconds: 240
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
