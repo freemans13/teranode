@@ -8,16 +8,22 @@ if [ "$1" == "help" ]; then
   exit 0
 fi
 
+second_argument="$2"
 scale_down() {
-  # order is important here, do not change unless you know what you're doing
-  kubectl scale deployment -n miner$namespace_suffix tx-blaster$namespace_suffix --replicas 0
-  kubectl scale deployment -n miner$namespace_suffix miner$namespace_suffix --replicas 0
-  kubectl scale deployment -n miner$namespace_suffix coinbase$namespace_suffix --replicas 0
-  kubectl scale deployment -n miner$namespace_suffix propagation$namespace_suffix --replicas 0
-  kubectl scale deployment -n miner$namespace_suffix blockvalidation$namespace_suffix --replicas 0
-  kubectl scale deployment -n miner$namespace_suffix blockassembly$namespace_suffix --replicas 0
-  kubectl scale deployment -n miner$namespace_suffix asset$namespace_suffix --replicas 0
-  kubectl scale deployment -n miner$namespace_suffix blockchain$namespace_suffix --replicas 0
+  if [ "$second_argument" == "unsafe" ]; then
+    # no order is preserved, use this when destroying the env
+    kubectl scale deployment -n m$namespace_suffix --all --replicas 0
+  else
+    # order is important here, do not change unless you know what you're doing
+    kubectl scale deployment -n miner$namespace_suffix tx-blaster$namespace_suffix --replicas 0
+    kubectl scale deployment -n miner$namespace_suffix miner$namespace_suffix --replicas 0
+    kubectl scale deployment -n miner$namespace_suffix coinbase$namespace_suffix --replicas 0
+    kubectl scale deployment -n miner$namespace_suffix propagation$namespace_suffix --replicas 0
+    kubectl scale deployment -n miner$namespace_suffix blockvalidation$namespace_suffix --replicas 0
+    kubectl scale deployment -n miner$namespace_suffix blockassembly$namespace_suffix --replicas 0
+    kubectl scale deployment -n miner$namespace_suffix asset$namespace_suffix --replicas 0
+    kubectl scale deployment -n miner$namespace_suffix blockchain$namespace_suffix --replicas 0
+  fi
 }
 
 if [ "$1" == "all" ]; then

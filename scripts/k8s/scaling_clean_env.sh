@@ -1,7 +1,7 @@
 # scale down everything
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 echo "Scaling down: all"
-bash $DIR/scaling_down.sh all
+bash $DIR/scaling_down.sh all unsafe
 
 echo "Flushing all postgres databases"
 # region postgres m1
@@ -14,13 +14,18 @@ psql postgres://coinbase:coinbase@miners-db.cfhjsqgwu9jw.ap-northeast-1.rds.amaz
 # endregion
 
 # todo make key dynamic based on user
-echo "Aerospike cleaning skipped for now"
-IP=$(aws ec2 describe-instances --filters  'Name=tag:Name,Values=ubsv-store-eu-aerospike-node-1' --query "Reservations[*].Instances[*].PublicIpAddress" --output text --region eu-west-1)
-ssh ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
-IP=$(aws ec2 describe-instances --filters  'Name=tag:Name,Values=ubsv-store-us-aerospike-node-1' --query "Reservations[*].Instances[*].PublicIpAddress" --output text --region us-east-1)
-ssh ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
-IP=$(aws ec2 describe-instances --filters  'Name=tag:Name,Values=ubsv-store-asia-aerospike-node-1' --query "Reservations[*].Instances[*].PublicIpAddress" --output text --region ap-northeast-1)
-ssh ubuntu@$IP -f "aql -c \"TRUNCATE ubsv-store;"\"
+echo "Aerospike cleaning"
+CONTEXT=$(kubectl config current-context)
+echo "Aerospike cleaning: EU"
+kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
+keti -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+echo "Aerospike cleaning: US"
+kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
+keti -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+echo "Aerospike cleaning: Asia"
+kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground
+keti -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+kubectl config use-context $CONTEXT
 
 echo "Scaling back up: all"
 # scale back up everything
