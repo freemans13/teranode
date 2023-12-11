@@ -25,10 +25,10 @@ scale_up() {
   kubectl scale deployment -n m$namespace_suffix asset$namespace_suffix --replicas 1
   wait m$namespace_suffix asset$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix blockassembly$namespace_suffix --replicas 1
-  wait m$namespace_suffix blockassembly$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix blockvalidation$namespace_suffix --replicas 1
   wait m$namespace_suffix blockvalidation$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix propagation$namespace_suffix --replicas 1
+  wait m$namespace_suffix blockassembly$namespace_suffix 30
+  kubectl scale deployment -n m$namespace_suffix blockvalidation$namespace_suffix --replicas 1
   wait m$namespace_suffix propagation$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix p2p$namespace_suffix --replicas 1
   wait m$namespace_suffix p2p$namespace_suffix 30
