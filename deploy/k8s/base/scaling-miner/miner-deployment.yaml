@@ -6,7 +6,7 @@ metadata:
   name: miner
 
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: miner
@@ -33,6 +33,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: miner-service
+            - name: mine_initial_blocks_count
+              value: "5000"
           image: REPO:IMAGE:TAG
           imagePullPolicy: IfNotPresent
           name: miner
