@@ -28,13 +28,13 @@ echo "Aerospike cleaning"
 CONTEXT=$(kubectl config current-context)
 echo "Aerospike cleaning: EU"
 kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
-keti -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
 echo "Aerospike cleaning: US"
 kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
-keti -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
 echo "Aerospike cleaning: Asia"
 kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground
-keti -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
 kubectl config use-context $CONTEXT
 
 echo "Scaling back up: all"
