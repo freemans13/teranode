@@ -2,7 +2,7 @@
 # get relative path for current file
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 echo "Scaling down: all"
-bash $DIR/allinone_down.sh all unsafe
+bash $DIR/down.sh all unsafe
 
 # region delete postgres
 # region postgres all in one
@@ -39,7 +39,7 @@ kubectl config use-context $CONTEXT
 
 echo "Scaling back up: all"
 # scale back up everything
-bash $DIR/allinone_up.sh all
+bash $DIR/up.sh all
 
 # scale up tx blaster
 #kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1
