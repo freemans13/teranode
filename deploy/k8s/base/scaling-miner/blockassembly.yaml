@@ -33,7 +33,7 @@ spec:
                     app: blockassembly
                 topologyKey: "kubernetes.io/hostname"
       tolerations:
-        - key: type
+        - key: role
           value: massive
           operator: Equal
           effect: NoSchedule
