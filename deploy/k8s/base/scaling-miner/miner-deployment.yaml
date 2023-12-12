@@ -41,6 +41,8 @@ spec:
           ports:
             - containerPort: 8089
               protocol: TCP
+            - containerPort: 8092
+              protocol: TCP
             - containerPort: 8099
               protocol: TCP
             - containerPort: 9091
