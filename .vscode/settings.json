@@ -142,6 +142,7 @@
     "txstore",
     "txsts",
     "txviewer",
+    "uaerospike",
     "ubsv",
     "ubsverrors",
     "uchar",
