@@ -42,9 +42,6 @@ spec:
       containers:
         - name: blockvalidation
           image: REPO:IMAGE:TAG
-          volumeDevices:
-            - devicePath: /mnt/disks/nvme1n1
-              name: blockvalidation
           args: [ "-blockvalidation=1" ]
           envFrom:
             - configMapRef:
