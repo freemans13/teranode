@@ -52,8 +52,6 @@ spec:
           env:
             - name: SERVICE_NAME
               value: blockvalidation-service
-            - name: logLevel
-              value: "DEBUG"
           ports:
             - containerPort: 8088
               protocol: TCP
