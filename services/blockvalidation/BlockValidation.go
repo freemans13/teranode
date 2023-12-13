@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -90,22 +91,28 @@ func (u *BlockValidation) ValidateBlock(ctx context.Context, block *model.Block,
 	u.logger.Infof("[ValidateBlock][%s] called", block.Header.Hash().String())
 
 	// validate all the subtrees in the block
+	u.logger.Infof("[ValidateBlock][%s] validating %d subtrees", block.Hash().String(), len(block.Subtrees))
 	err := u.validateBLockSubtrees(spanCtx, block, baseUrl)
 	if err != nil {
 		return err
 	}
+	u.logger.Infof("[ValidateBlock][%s] validating %d subtrees DONE", block.Hash().String(), len(block.Subtrees))
 
 	// get all 100 previous block headers on the main chain
+	u.logger.Infof("[ValidateBlock][%s] GetBlockHeaders", block.Header.Hash().String())
 	blockHeaders, _, err := u.blockchainClient.GetBlockHeaders(spanCtx, block.Header.HashPrevBlock, 100)
 	if err != nil {
 		return err
 	}
+	u.logger.Infof("[ValidateBlock][%s] GetBlockHeaders DONE", block.Header.Hash().String())
 
 	// Add the coinbase transaction to the metaTxStore
+	u.logger.Infof("[ValidateBlock][%s] storeCoinbaseTx", block.Header.Hash().String())
 	err = u.storeCoinbaseTx(spanCtx, block)
 	if err != nil {
 		return err
 	}
+	u.logger.Infof("[ValidateBlock][%s] storeCoinbaseTx DONE", block.Header.Hash().String())
 
 	// validate the block
 	// TODO do we pass in the subtreeStore here or the list of loaded subtrees?
@@ -113,17 +120,20 @@ func (u *BlockValidation) ValidateBlock(ctx context.Context, block *model.Block,
 	if ok, err := block.Valid(spanCtx, u.subtreeStore, u.txMetaStore, blockHeaders); !ok {
 		return fmt.Errorf("[ValidateBlock][%s] block is not valid: %v", block.String(), err)
 	}
+	u.logger.Infof("[ValidateBlock][%s] validating block DONE", block.Hash().String())
 
 	// if valid, store the block
 	u.logger.Infof("[ValidateBlock][%s] adding block to blockchain", block.Hash().String())
 	if err = u.blockchainClient.AddBlock(spanCtx, block, baseUrl); err != nil {
 		return fmt.Errorf("[ValidateBlock][%s] failed to store block [%w]", block.Hash().String(), err)
 	}
+	u.logger.Infof("[ValidateBlock][%s] adding block to blockchain DONE", block.Hash().String())
 
 	u.logger.Infof("[ValidateBlock][%s] storing coinbase tx: %s", block.Hash().String(), block.CoinbaseTx.TxIDChainHash().String())
 	if err = u.txStore.Set(spanCtx, block.CoinbaseTx.TxIDChainHash()[:], block.CoinbaseTx.Bytes()); err != nil {
 		u.logger.Errorf("[ValidateBlock][%s] failed to store coinbase transaction [%s]", block.Hash().String(), err)
 	}
+	u.logger.Infof("[ValidateBlock][%s] storing coinbase tx: %s DONE", block.Hash().String(), block.CoinbaseTx.TxIDChainHash().String())
 
 	// decouple the tracing context to not cancel the context when finalize the block processing in the background
 	callerSpan := opentracing.SpanFromContext(spanCtx)
@@ -181,6 +191,7 @@ func (u *BlockValidation) finalizeBlockValidation(ctx context.Context, block *mo
 	setCtx := opentracing.ContextWithSpan(context.Background(), callerSpan)
 
 	g, gCtx := errgroup.WithContext(setCtx)
+	g.SetLimit(util.Max(4, runtime.NumCPU()-8))
 
 	ids, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Header.Hash(), 1)
 	if err != nil {
@@ -213,9 +224,6 @@ func (u *BlockValidation) finalizeBlockValidation(ctx context.Context, block *mo
 	})
 
 	if err = g.Wait(); err != nil {
-		if err = u.blockchainClient.InvalidateBlock(setCtx, block.Header.Hash()); err != nil {
-			u.logger.Errorf("[ValidateBlock] failed to invalidate block: %s", err)
-		}
 		return fmt.Errorf("[ValidateBlock][%s] failed to finalize block validation [%w]", block.Hash().String(), err)
 	}
 
@@ -230,6 +238,7 @@ func (u *BlockValidation) updateSubtreesTTL(ctx context.Context, block *model.Bl
 
 	// update the subtree TTLs
 	g, gCtx := errgroup.WithContext(spanCtx)
+	g.SetLimit(util.Max(4, runtime.NumCPU()-8))
 	for _, subtreeHash := range block.Subtrees {
 		subtreeHash := subtreeHash
 		g.Go(func() error {
@@ -258,8 +267,8 @@ func (u *BlockValidation) validateBLockSubtrees(ctx context.Context, block *mode
 
 	start1 := gocore.CurrentTime()
 	g, gCtx := errgroup.WithContext(spanCtx)
+	g.SetLimit(util.Max(4, runtime.NumCPU()-8))
 
-	u.logger.Infof("[ValidateBlock][%s] validating %d subtrees", block.Hash().String(), len(block.Subtrees))
 	missingSubtrees := make([]*chainhash.Hash, len(block.Subtrees))
 	missingSubtreesMu := sync.Mutex{}
 	for idx, subtreeHash := range block.Subtrees {
@@ -516,15 +525,15 @@ func (u *BlockValidation) validateSubtree(ctx context.Context, subtreeHash *chai
 	// validate the subtree
 	txMetaSlice := make([]*txmeta.Data, len(txHashes))
 	g, gCtx := errgroup.WithContext(spanCtx)
-	g.SetLimit(1024) // max 1024 concurrent requests
+	g.SetLimit(util.Max(4, runtime.NumCPU()-8))
 
 	u.logger.Infof("[validateSubtree][%s] processing %d txs from subtree", subtreeHash.String(), len(txHashes))
 	// unlike many other lists, this needs to be a pointer list, because a lot of values could be empty = nil
 	missingTxHashes := make([]*chainhash.Hash, len(txHashes))
 	nrOfMissingTransactions := 0
 
-	// cycle through batches of 1000 txHashes at a time
-	batchSize, _ := gocore.Config().GetInt("blockvalidation_validateSubtreeBatchSize", 1014)
+	// cycle through batches of 1024 txHashes at a time
+	batchSize, _ := gocore.Config().GetInt("blockvalidation_validateSubtreeBatchSize", 1024)
 	for i := 0; i < len(txHashes); i += batchSize {
 		i := i
 		g.Go(func() error {
@@ -719,7 +728,7 @@ func (u *BlockValidation) getMissingTransactions(ctx context.Context, missingTxH
 	missingTxsMu := sync.Mutex{}
 
 	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(32)
+	g.SetLimit(util.Max(4, runtime.NumCPU()-8))
 
 	// get the transactions in batches of 500
 	batchSize, _ := gocore.Config().GetInt("blockvalidation_missingTransactionsBatchSize", 100_000)
