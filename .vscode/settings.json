@@ -148,6 +148,7 @@
     "ulogger",
     "unlocker",
     "upgrader",
+    "usql",
     "utxo",
     "utxos",
     "utxoservice",
