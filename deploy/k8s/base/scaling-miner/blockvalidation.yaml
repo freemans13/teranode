@@ -32,6 +32,8 @@ spec:
                   matchLabels:
                     app: blockvalidation
                 topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: massive
       tolerations:
         - key: role
           value: massive
@@ -40,6 +42,9 @@ spec:
       containers:
         - name: blockvalidation
           image: REPO:IMAGE:TAG
+          volumeDevices:
+            - devicePath:  /mnt/disks/nvme1n1
+              name: blockvalidation
           args: [ "-blockvalidation=1" ]
           envFrom:
             - configMapRef:
@@ -60,11 +65,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 400Gi
-              cpu: "120"
+              memory: 720Gi
+              cpu: "90"
             limits:
-              memory: 400Gi
-              cpu: "120"
+              memory: 720Gi
+              cpu: "90"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
               name: subtree-store-ttl
@@ -85,15 +90,7 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 3
       volumes:
-        - name: subtree-store-ttl
-          ephemeral:
-            volumeClaimTemplate:
-              metadata:
-                labels:
-                  type: subtreestore-ttl
-              spec:
-                accessModes: [ "ReadWriteOnce" ]
-                storageClassName: "io2-xfs-low-iops"
-                resources:
-                  requests:
-                    storage: 4000Gi
+        - hostPath:
+          path: /data/disk2
+          type: Directory
+          name: subtree-store-ttl

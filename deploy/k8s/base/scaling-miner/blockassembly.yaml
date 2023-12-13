@@ -32,6 +32,8 @@ spec:
                   matchLabels:
                     app: blockassembly
                 topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: massive
       tolerations:
         - key: role
           value: massive
@@ -56,11 +58,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 300Gi
-              cpu: "120"
+              memory: 720Gi
+              cpu: "90"
             limits:
-              memory: 300Gi
-              cpu: "120"
+              memory: 720Gi
+              cpu: "90"
           readinessProbe:
             httpGet:
               path: /health
