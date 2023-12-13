@@ -58,10 +58,10 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 990Gi
+              memory: 950Gi
               cpu: "110"
             limits:
-              memory: 990Gi
+              memory: 950Gi
               cpu: "110"
           readinessProbe:
             httpGet:
