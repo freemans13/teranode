@@ -58,11 +58,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 720Gi
-              cpu: "90"
+              memory: 990Gi
+              cpu: "110"
             limits:
-              memory: 720Gi
-              cpu: "90"
+              memory: 990Gi
+              cpu: "110"
           readinessProbe:
             httpGet:
               path: /health
