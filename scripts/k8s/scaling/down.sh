@@ -1,3 +1,8 @@
+if [ -n "$KUBECONFIG" ]; then
+  echo "KUBECONFIG is set. Please run this script with KUBECONFIG unset."
+  exit 1
+fi
+
 CONTEXT=$(kubectl config current-context)
 if [ "$1" == "help" ]; then
   echo "Usage: $0 [all|eu|m1|us|m2|asia|m3]"

@@ -1,3 +1,8 @@
+if [ -n "$KUBECONFIG" ]; then
+  echo "KUBECONFIG is set. Please run this script with KUBECONFIG unset."
+  exit 1
+fi
+
 # scale down everything
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 echo "Scaling down: all"
