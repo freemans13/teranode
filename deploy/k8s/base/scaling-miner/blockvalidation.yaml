@@ -43,7 +43,7 @@ spec:
         - name: blockvalidation
           image: REPO:IMAGE:TAG
           volumeDevices:
-            - devicePath:  /mnt/disks/nvme1n1
+            - devicePath: /mnt/disks/nvme1n1
               name: blockvalidation
           args: [ "-blockvalidation=1" ]
           envFrom:
@@ -91,6 +91,6 @@ spec:
             timeoutSeconds: 3
       volumes:
         - hostPath:
-          path: /data/disk2
-          type: Directory
+            path: /data/disk2
+            type: Directory
           name: subtree-store-ttl
