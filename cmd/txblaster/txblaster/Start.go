@@ -278,6 +278,12 @@ func Start() {
 
 	startTime = time.Now()
 
+	// start http health check server
+	http.Handle("/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+
 	for i := 0; i < *workers; i++ {
 		if *useQuic {
 			// create a quic distributor for each worker
@@ -296,12 +302,6 @@ func Start() {
 		// stagger worker startup to not overload Coinbase
 		time.Sleep(100 * time.Millisecond)
 	}
-
-	// start http health check server
-	http.Handle("/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
-	}))
 
 	<-ctx.Done()
 }
