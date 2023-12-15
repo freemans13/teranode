@@ -63,6 +63,9 @@ spec:
             limits:
               memory: 950Gi
               cpu: "110"
+          volumeMounts:
+            - mountPath: /data/subtreestore-ttl/
+              name: subtree-store-ttl
           readinessProbe:
             httpGet:
               path: /health
@@ -79,3 +82,8 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+      volumes:
+        - hostPath:
+            path: /data/disk1
+            type: Directory
+          name: subtree-store-ttl
