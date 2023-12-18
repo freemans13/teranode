@@ -24,13 +24,13 @@ CONTEXT=$(kubectl config current-context)
 echo "Postgres cleaning: EU"
 kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
 kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=m1 psql -U m1 -d m1 -c "drop table if exists state ; drop table if exists blocks;"
-kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state ; drop table if exists blocks;"
+kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;"
 
 
 echo "Postgres cleaning: US"
 kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
 kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=m2 psql -U m2 -d m2 -c "drop table if exists state ; drop table if exists blocks;"
-kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state ; drop table if exists blocks;"
+kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;"
 
 # echo "Postgres cleaning: Asia"
 # kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
