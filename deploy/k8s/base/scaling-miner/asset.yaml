@@ -54,7 +54,7 @@ spec:
               memory: 55Gi
               cpu: "16"
           volumeMounts:
-            - mountPath: /data/subtreestore-ttl/
+            - mountPath: /data/
               name: subtree-store-ttl
           readinessProbe:
             httpGet:
