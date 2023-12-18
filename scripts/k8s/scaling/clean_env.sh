@@ -60,6 +60,7 @@ echo "Scaling back up: all"
 # bash $DIR/up.sh all
 bash $DIR/up.sh m1
 bash $DIR/up.sh m2
+# bash $DIR/up.sh m3
 
 # scale up tx blaster
 #kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1
