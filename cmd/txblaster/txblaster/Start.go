@@ -216,7 +216,7 @@ func Start() {
 
 		rtn, ok := gocore.Config().Get("p2p_rejected_tx_topic")
 		if !ok {
-			panic("p2p_mining_on_topic not set in config")
+			panic("p2p_rejected_tx_topic not set in config")
 		}
 		rejectedTxTopicName := fmt.Sprintf("%s-%s", topicPrefix, rtn)
 
