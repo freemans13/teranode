@@ -105,17 +105,20 @@ func Start() {
 
 	flag.Parse()
 
-	const MIN_BLOCK_HEIGHT_FOR_E2E = 2001
 	if *e2e {
+		MIN_BLOCK_HEIGHT_FOR_E2E, _ := gocore.Config().GetInt("min_block_height_for_e2e", 200)
+
 		// Create a channel to signal when the block height condition is met
 		blockHeightCh := make(chan struct{})
 
-		// Start a goroutine to check the block height continuously
+		// Start a blocking goroutine to check the block height continuously
 		go func() {
 
 			for {
 				// Define the URL to query block height
-				url := "http://127.0.0.1:18090/lastblocks?n=1"
+				asset_httpAddress, _ := gocore.Config().Get("asset_httpAddress")
+				path := "/lastblocks?n=1"
+				url := asset_httpAddress + path
 
 				// Send an HTTP GET request to the URL
 				resp, err := http.Get(url)
@@ -143,9 +146,9 @@ func Start() {
 				if len(blocks) > 0 {
 					height := blocks[0].Height
 					logger.Infof("Height: %d\n", height)
-					// Check if the block height is greater than 1000
-					if height > MIN_BLOCK_HEIGHT_FOR_E2E {
-						logger.Infof("Block height is now %d (greater than 1000), signaling to exit.", height)
+					// Check if the block height is greater than min_height
+					if min_height := MIN_BLOCK_HEIGHT_FOR_E2E; height > min_height {
+						logger.Infof("Block height is now %d (greater than %d), signaling to exit.", height, min_height)
 						// Signal to exit the goroutine
 						blockHeightCh <- struct{}{}
 						return
@@ -156,7 +159,7 @@ func Start() {
 				}
 
 				//add a sleep here to control the frequency of block height checks
-				time.Sleep(time.Second * 30) // Adjust sleep duration as needed
+				time.Sleep(time.Second * 5) // Adjust sleep duration as needed
 			}
 		}()
 
