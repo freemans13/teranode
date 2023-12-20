@@ -18,25 +18,19 @@ wait() {
 
 # order is important here, do not change unless you know what you're doing
 scale_up() {
-  kubectl scale deployment -n m$namespace_suffix blockchain$namespace_suffix --replicas 1
-  wait m$namespace_suffix blockchain$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix status$namespace_suffix --replicas 1
-  wait m$namespace_suffix status$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix asset$namespace_suffix --replicas 1
-  wait m$namespace_suffix asset$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix blockassembly$namespace_suffix --replicas 1
-  wait m$namespace_suffix blockassembly$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix blockvalidation$namespace_suffix --replicas 1
-  wait m$namespace_suffix blockvalidation$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix propagation$namespace_suffix --replicas 1
-  wait m$namespace_suffix propagation$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix p2p$namespace_suffix --replicas 1
-  wait m$namespace_suffix p2p$namespace_suffix 30
-  echo "Not scaling coinbase and miner as you need to be careful of order when booting the blockchain"
-  # todo think of better way to bring up the nodes
-#  kubectl scale deployment -n m$namespace_suffix coinbase$namespace_suffix --replicas 1
-#  wait m$namespace_suffix coinbase$namespace_suffix 30
-#  kubectl scale deployment -n m$namespace_suffix miner$namespace_suffix --replicas 1
+  kubectl scale deployment -n miner$namespace_suffix blockchain$namespace_suffix --replicas 1
+  wait miner$namespace_suffix blockchain$namespace_suffix 30
+  kubectl scale deployment -n miner$namespace_suffix asset$namespace_suffix --replicas 1
+  wait miner$namespace_suffix asset$namespace_suffix 30
+  kubectl scale deployment -n miner$namespace_suffix blockvalidation$namespace_suffix --replicas 1
+  wait miner$namespace_suffix blockvalidation$namespace_suffix 30
+  kubectl scale deployment -n miner$namespace_suffix blockassembly$namespace_suffix --replicas 1
+  wait miner$namespace_suffix blockassembly$namespace_suffix 30
+  kubectl scale deployment -n miner$namespace_suffix propagation$namespace_suffix --replicas 1
+  wait miner$namespace_suffix propagation$namespace_suffix 30
+  kubectl scale deployment -n miner$namespace_suffix coinbase$namespace_suffix --replicas 1
+  wait miner$namespace_suffix coinbase$namespace_suffix 30
+  kubectl scale deployment -n miner$namespace_suffix miner$namespace_suffix --replicas 1
 }
 
 if [ "$1" == "all" ]; then

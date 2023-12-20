@@ -31,12 +31,17 @@ spec:
                   matchLabels:
                     app: tx-blaster
                 topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: role
+          value: tx-blaster
+          operator: Equal
+          effect: NoSchedule
       containers:
         - name: tx-blaster
           image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
-          args: [ "-workers=400"]
+          args: ["-workers=900"]
           envFrom:
             - configMapRef:
                 name: shared-config-m
@@ -56,11 +61,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 512Mi
-              cpu: "4"
+              memory: 1Gi
+              cpu: "5"
             limits:
-              memory: 512Mi
-              cpu: "4"
+              memory: 1Gi
+              cpu: "5"
           readinessProbe:
             httpGet:
               path: /health

@@ -281,7 +281,7 @@ func Start() {
 
 		rtn, ok := gocore.Config().Get("p2p_rejected_tx_topic")
 		if !ok {
-			panic("p2p_mining_on_topic not set in config")
+			panic("p2p_rejected_tx_topic not set in config")
 		}
 		rejectedTxTopicName := fmt.Sprintf("%s-%s", topicPrefix, rtn)
 
@@ -343,6 +343,12 @@ func Start() {
 
 	startTime = time.Now()
 
+	// start http health check server
+	http.Handle("/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+
 	// var wg sync.WaitGroup
 	runIndefinitely := *iterations < 0
 	completed := make(chan struct{}, *workers)
@@ -372,12 +378,6 @@ func Start() {
 		// stagger worker startup to not overload Coinbase
 		time.Sleep(100 * time.Millisecond)
 	}
-
-	// start http health check server
-	http.Handle("/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
-	}))
 
 	<-ctx.Done()
 }

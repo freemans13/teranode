@@ -6,7 +6,7 @@ metadata:
     app: nginx
     project: service
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: nginx
@@ -15,6 +15,11 @@ spec:
       labels:
         app: nginx
     spec:
+      tolerations:
+       - effect: NoSchedule
+         key: role
+         operator: Equal
+         value: tx-blaster
       containers:
       - name: nginx
         image: nginx:latest
@@ -23,40 +28,17 @@ spec:
           protocol: TCP
         resources:
           requests:
-            memory: "4Gi"
+            memory: "2Gi"
             cpu: "2"
           limits:
-            memory: "4Gi"
+            memory: "2Gi"
             cpu: "2"
         volumeMounts:
         - mountPath: /usr/share/nginx/html/
           name: nginx-html
-        readinessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 1
-          periodSeconds: 10
-          failureThreshold: 5
-          timeoutSeconds: 3
-        livenessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 1
-          periodSeconds: 10
-          failureThreshold: 5
-          timeoutSeconds: 3
       volumes:
       - name: nginx-html
-        ephemeral:
-          volumeClaimTemplate:
-            metadata:
-              labels:
-                type: subtreestore-ttl
-            spec:
-              accessModes: ["ReadWriteOnce"]
-              storageClassName: "io2-xfs-low-iops"
-              resources:
-                requests:
-                  storage: "50Mi"
+        persistentVolumeClaim:
+          claimName: nginx-html
+          readOnly: false
+   

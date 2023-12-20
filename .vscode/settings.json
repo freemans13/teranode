@@ -37,11 +37,6 @@
     "Debugf",
     "defaultvalidator",
     "dialing",
-    "DRPC",
-    "drpcconn",
-    "drpcerr",
-    "drpcmux",
-    "drpcserver",
     "emptypb",
     "errgroup",
     "extranonce",
@@ -54,6 +49,7 @@
     "halvings",
     "ifnull",
     "Infof",
+    "initialise",
     "InvVect",
     "jellydator",
     "keyset",
@@ -142,12 +138,14 @@
     "txstore",
     "txsts",
     "txviewer",
+    "uaerospike",
     "ubsv",
     "ubsverrors",
     "uchar",
     "ulogger",
     "unlocker",
     "upgrader",
+    "usql",
     "utxo",
     "utxos",
     "utxoservice",
@@ -169,7 +167,7 @@
   "[go]": {
     "editor.formatOnSave": true,
     "editor.codeActionsOnSave": {
-      "source.organizeImports": true
+      "source.organizeImports": "explicit"
     }
   },
   "go.lintTool": "golangci-lint",

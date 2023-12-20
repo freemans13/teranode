@@ -28,10 +28,6 @@ spec:
       port: 8284
       targetPort: 8284
       protocol: TCP
-    - name: drpc
-      port: 8184
-      targetPort: 8184
-      protocol: TCP
     - name: quic
       port: 8384
       targetPort: 8384

@@ -27,7 +27,6 @@ resources:
   - p2p-service.yaml
   - p2p-ws-ingress.yaml
   - p2p.yaml
-  - propagation-drpc-ingress.yaml
   - propagation-frpc-ingress.yaml
   - propagation-grpc-ingress.yaml
   - propagation-quic-ingress.yaml

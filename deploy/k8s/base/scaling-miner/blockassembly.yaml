@@ -32,8 +32,10 @@ spec:
                   matchLabels:
                     app: blockassembly
                 topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: massive
       tolerations:
-        - key: type
+        - key: role
           value: massive
           operator: Equal
           effect: NoSchedule
@@ -56,11 +58,20 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 300Gi
-              cpu: "120"
+              memory: 950Gi
+              cpu: "110"
             limits:
-              memory: 300Gi
-              cpu: "120"
+              memory: 950Gi
+              cpu: "110"
+          volumeMounts:
+            - mountPath: /data/subtreestore-ttl-1/
+              name: subtree-store-ttl-1
+            - mountPath: /data/subtreestore-ttl-2/
+              name: subtree-store-ttl-2
+            - mountPath: /data/subtreestore-ttl-3/
+              name: subtree-store-ttl-3
+            - mountPath: /data/subtreestore-ttl-4/
+              name: subtree-store-ttl-4
           readinessProbe:
             httpGet:
               path: /health
@@ -77,3 +88,20 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+      volumes:
+        - hostPath:
+            path: /data/disk1
+            type: Directory
+          name: subtree-store-ttl-1
+        - hostPath:
+            path: /data/disk2
+            type: Directory
+          name: subtree-store-ttl-2
+        - hostPath:
+            path: /data/disk3
+            type: Directory
+          name: subtree-store-ttl-3
+        - hostPath:
+            path: /data/disk4
+            type: Directory
+          name: subtree-store-ttl-4
