@@ -46,6 +46,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: shared-config-m
+            - configMapRef:
+                name: blockassembly-config-m
           env:
             - name: SERVICE_NAME
               value: blockassembly-service
@@ -89,19 +91,23 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 3
       volumes:
-        - hostPath:
-            path: /data/disk1
-            type: Directory
+        - storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
+          resources:
+            requests:
+              storage: 1000Gi
           name: subtree-store-ttl-1
-        - hostPath:
-            path: /data/disk2
-            type: Directory
+        - storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
+          resources:
+            requests:
+              storage: 1000Gi
           name: subtree-store-ttl-2
-        - hostPath:
-            path: /data/disk3
-            type: Directory
+        - storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
+          resources:
+            requests:
+              storage: 1000Gi
           name: subtree-store-ttl-3
-        - hostPath:
-            path: /data/disk4
-            type: Directory
+        - storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
+          resources:
+            requests:
+              storage: 1000Gi
           name: subtree-store-ttl-4

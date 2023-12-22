@@ -2,16 +2,19 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
+  - asset-configmap.yaml
   - asset-grpc-ingress.yaml
   - asset-http-ingress.yaml
   - asset-service.yaml
   - asset.yaml
   - blockassembly-blaster-service.yaml
   - blockassembly-blaster.yaml
+  - blockassembly-configmap.yaml
   - blockassembly-service.yaml
   - blockassembly.yaml
   - blockchain-service.yaml
   - blockchain.yaml
+  - blockvalidation-configmap.yaml
   - blockvalidation-service.yaml
   - blockvalidation.yaml
   - cluster-role-binding.yaml

@@ -15,6 +15,18 @@ configMapGenerator:
     literals:
       - SETTINGS_CONTEXT=scaling.m3
     name: shared-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.asset
+    name: asset-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.blockvalidation
+    name: blockvalidation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.blockassembly
+    name: blockassembly-config-m
 patches:
   - patch: |-
       - op: replace
