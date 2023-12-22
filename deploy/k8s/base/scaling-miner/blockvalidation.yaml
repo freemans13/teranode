@@ -7,7 +7,7 @@ metadata:
     app: blockvalidation
     project: service
 spec:
-  replicas: 0
+  replicas: 1
   selector:
     matchLabels:
       app: blockvalidation
@@ -32,6 +32,13 @@ spec:
                   matchLabels:
                     app: blockvalidation
                 topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: massive
+      tolerations:
+        - key: role
+          value: massive
+          operator: Equal
+          effect: NoSchedule
       containers:
         - name: blockvalidation
           image: REPO:IMAGE:TAG
@@ -42,10 +49,10 @@ spec:
           env:
             - name: SERVICE_NAME
               value: blockvalidation-service
-            - name: subtreestore
-              value: s3:///ubsv-subtree-store?region=eu-north-1&localTTLStore=file&localTTLStorePath=/data/subtreestore-ttl
           ports:
             - containerPort: 8088
+              protocol: TCP
+            - containerPort: 8288
               protocol: TCP
             - containerPort: 9091
               protocol: TCP
@@ -53,19 +60,25 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 10Gi
-              cpu: "4"
+              memory: 950Gi
+              cpu: "110"
             limits:
-              memory: 10Gi
-              cpu: "4"
+              memory: 950Gi
+              cpu: "110"
           volumeMounts:
-            - mountPath: /data/subtreestore-ttl/
-              name: subtree-store-ttl
+            - mountPath: /data/subtreestore-ttl-1/
+              name: subtree-store-ttl-1
+            - mountPath: /data/subtreestore-ttl-2/
+              name: subtree-store-ttl-2
+            - mountPath: /data/subtreestore-ttl-3/
+              name: subtree-store-ttl-3
+            - mountPath: /data/subtreestore-ttl-4/
+              name: subtree-store-ttl-4
           readinessProbe:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
@@ -73,20 +86,24 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
       volumes:
-        - name: subtree-store-ttl
-          ephemeral:
-            volumeClaimTemplate:
-              metadata:
-                labels:
-                  type: subtreestore-ttl
-              spec:
-                accessModes: [ "ReadWriteOnce" ]
-                storageClassName: "io2-xfs-low-iops"
-                resources:
-                  requests:
-                    storage: 1000Gi
+        - hostPath:
+            path: /data/disk1
+            type: Directory
+          name: subtree-store-ttl-1
+        - hostPath:
+            path: /data/disk2
+            type: Directory
+          name: subtree-store-ttl-2
+        - hostPath:
+            path: /data/disk3
+            type: Directory
+          name: subtree-store-ttl-3
+        - hostPath:
+            path: /data/disk4
+            type: Directory
+          name: subtree-store-ttl-4

@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+    project: service
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      tolerations:
+       - effect: NoSchedule
+         key: role
+         operator: Equal
+         value: tx-blaster
+      containers:
+      - name: nginx
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+          protocol: TCP
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "2"
+          limits:
+            memory: "2Gi"
+            cpu: "2"
+        volumeMounts:
+        - mountPath: /usr/share/nginx/html/
+          name: nginx-html
+      volumes:
+      - name: nginx-html
+        persistentVolumeClaim:
+          claimName: nginx-html
+          readOnly: false
+   

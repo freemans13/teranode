@@ -50,22 +50,20 @@ spec:
               protocol: TCP
             - containerPort: 8284
               protocol: TCP
-            - containerPort: 9905
-              protocol: TCP
-            - containerPort: 9906
-              protocol: TCP
+            - containerPort: 8384
+              protocol: UDP
           resources:
             requests:
-              memory: 2Gi
+              memory: 4Gi
               cpu: "8"
             limits:
-              memory: 2Gi
+              memory: 4Gi
               cpu: "8"
           readinessProbe:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
@@ -73,7 +71,7 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3

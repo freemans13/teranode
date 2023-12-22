@@ -61,7 +61,7 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
@@ -69,7 +69,7 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3

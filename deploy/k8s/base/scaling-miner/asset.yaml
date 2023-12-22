@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: asset
+  labels:
+    app: asset
+    project: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: asset
+  template:
+    metadata:
+      labels:
+        app: asset
+    spec:
+      serviceAccountName: sa-m
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: asset
+                topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: asset
+          image: REPO:IMAGE:TAG
+          args: [ "-asset=1" ]
+          envFrom:
+            - configMapRef:
+                name: shared-config-m
+          env:
+            - name: SERVICE_NAME
+              value: asset-service
+          ports:
+            - containerPort: 8090
+              protocol: TCP
+            - containerPort: 8099
+              protocol: TCP
+            - containerPort: 8091
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 55Gi
+              cpu: "16"
+            limits:
+              memory: 55Gi
+              cpu: "16"
+          volumeMounts:
+            - mountPath: /data/
+              name: subtree-store-ttl
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+      volumes:
+        - name: subtree-store-ttl
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  type: subtreestore-ttl
+              spec:
+                accessModes: [ "ReadWriteOnce" ]
+                storageClassName: "io2-xfs-low-iops"
+                resources:
+                  requests:
+                    storage: 4000Gi

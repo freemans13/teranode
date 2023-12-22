@@ -6,13 +6,16 @@ resources:
   - cluster-role-binding.yaml
   - service-account.yaml
   - configmap.yaml
-  - blob-grpc-ingress.yaml
+  - asset-grpc-ingress.yaml
   - deployment.yaml
   - propagation-grpc-ingress.yaml
-  - blob-http-ingress.yaml
+  - asset-http-ingress.yaml
   - coinbase-grpc-ingress.yaml
   - tx-blaster-deployment.yaml
   - tx-blaster-configmap.yaml
   - p2p-ingress.yaml
   - p2p-ws-ingress.yaml
+  - p2p-grpc-ingress.yaml
+  - status-ingress.yaml
+  - status-grpc-ingress.yaml
   - tx-blaster-service.yaml

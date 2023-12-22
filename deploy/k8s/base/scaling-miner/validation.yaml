@@ -7,7 +7,7 @@ metadata:
     app: validation
     project: service
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: validation
@@ -58,7 +58,7 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
@@ -66,7 +66,7 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3

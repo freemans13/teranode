@@ -7,7 +7,7 @@ metadata:
     app: coinbase
     project: service
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: coinbase
@@ -42,7 +42,7 @@ spec:
           args: [ "-coinbase=1" ]
           envFrom:
             - configMapRef:
-                name: coinbase-config
+                name: shared-config-m
           env:
             - name: SERVICE_NAME
               value: coinbase-service
@@ -64,7 +64,7 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
@@ -72,7 +72,7 @@ spec:
             httpGet:
               path: /health
               port: 9091
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3

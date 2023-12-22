@@ -1,0 +1,13 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteUDP
+metadata:
+  name: ingressroute-upd-8384
+  labels:
+    service: propagation
+spec:
+  entryPoints:
+    - quic
+  routes:
+  - services:
+    - name: propagation-service
+      port: 8384

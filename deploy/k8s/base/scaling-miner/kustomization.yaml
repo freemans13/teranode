@@ -2,39 +2,48 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - blob.yaml
-  - blockvalidation.yaml
-  - propagation-service.yaml
-  - utxostore-service.yaml
-  - txmetastore-service.yaml
-  - utxo-config-map.yaml
-  - blockvalidation-service.yaml
-  - miner-deployment.yaml
+  - asset-grpc-ingress.yaml
+  - asset-http-ingress.yaml
+  - asset-service.yaml
+  - asset.yaml
   - blockassembly-blaster-service.yaml
-  - tx-blaster-service.yaml
-  - validation-service.yaml
-  - propagation.yaml
-  - utxostore.yaml
-  - txmetastore.yaml
-  - blockassembly.yaml
-  - validation.yaml
-  - blob-service.yaml
-  - blockchain-service.yaml
-  - blob-http-ingress.yaml
-  - blob-grpc-ingress.yaml
   - blockassembly-blaster.yaml
-  - tx-blaster.yaml
-  - propagation-grpc-ingress.yaml
-  - blockchain.yaml
   - blockassembly-service.yaml
-  - shared-config-map.yaml
-  - service-account.yaml
+  - blockassembly.yaml
+  - blockchain-service.yaml
+  - blockchain.yaml
+  - blockvalidation-service.yaml
+  - blockvalidation.yaml
   - cluster-role-binding.yaml
-  - coinbase-service.yaml
   - coinbase-deployment.yaml
-  - coinbase-configmap.yaml
   - coinbase-grpc-ingress.yaml
-  - propagation-drpc-ingress.yaml
-  - propagation-frpc-ingress.yaml
+  - coinbase-service.yaml
+  - miner-deployment.yaml
+  - nginx-http-ingress.yaml
+  - nginx-service.yaml
+  - nginx.yaml
+  - p2p-grpc-ingress.yaml
   - p2p-ingress.yaml
+  - p2p-service.yaml
   - p2p-ws-ingress.yaml
+  - p2p.yaml
+  - propagation-frpc-ingress.yaml
+  - propagation-grpc-ingress.yaml
+  - propagation-quic-ingress.yaml
+  - propagation-service.yaml
+  - propagation.yaml
+  - service-account.yaml
+  - shared-config-map.yaml
+  - status-grpc-ingress.yaml
+  - status-ingress.yaml
+  - status-service.yaml
+  - status.yaml
+  - tx-blaster-service.yaml
+  - tx-blaster.yaml
+  - txmetastore-service.yaml
+  - txmetastore.yaml
+  - utxo-config-map.yaml
+  - utxostore-service.yaml
+  - utxostore.yaml
+  - validation-service.yaml
+  - validation.yaml

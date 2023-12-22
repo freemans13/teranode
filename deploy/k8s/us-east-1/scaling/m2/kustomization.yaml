@@ -1,0 +1,70 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../base/scaling-miner
+
+namespace: m2
+
+nameSuffix: "2"
+commonLabels:
+  miner: m2
+
+configMapGenerator:
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m2
+    name: shared-config-m
+patches:
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/match
+        value: HostSNI(`m2.scaling.ubsv.dev`)
+    target:
+      kind: IngressRouteTCP
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: propagation-service2
+    target:
+      labelSelector: service=propagation
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: p2p-service2
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=p2p
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: status-service2
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=status
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: coinbase-service2
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=coinbase
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service2
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=asset
+  - patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: m2
+    target:
+      kind: ClusterRoleBinding
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: sa-m2
+    target:
+      kind: Deployment

@@ -12,11 +12,8 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "blobserver_httpAddress": "http://localhost:8090"
+        "asset_httpAddress": "http://localhost:8090"
       },
-      "args": [
-        "-p2p=0"
-      ]
     },
     {
       "name": "UBSV - aerospike",
@@ -26,7 +23,7 @@
       "program": "${workspaceFolder}/.",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "blobserver_httpAddress": "http://localhost:8090",
+        "asset_httpAddress": "http://localhost:8090",
         "utxostore": "aerospike://localhost:3000/test?timeout=30s",
         "txmeta_store": "aerospike://localhost:3000/test?timeout=30s"
       },
@@ -50,7 +47,7 @@
         "-blockchain=0",
         "-utxostore=0",
         "-txmetastore=0",
-        "-blobserver=0",
+        "-Asset=0",
         "-coinbase=1",
         "-miner=0",
         "-blockvalidation=0",

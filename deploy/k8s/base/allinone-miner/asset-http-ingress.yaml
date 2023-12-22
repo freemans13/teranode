@@ -1,0 +1,16 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: tcp-443-https-asset-miner
+  labels:
+    service: miner
+spec:
+  entryPoints:
+    - websecure
+  routes:
+  - match: HostSNI(`miner.allinone.ubsv.dev`)
+    services:
+    - name: miner
+      port: 8090
+  tls:
+    passthrough: true
