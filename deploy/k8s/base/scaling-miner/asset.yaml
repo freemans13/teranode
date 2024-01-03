@@ -76,7 +76,5 @@ spec:
             timeoutSeconds: 3
       volumes:
         - name: subtree-store-ttl
-          storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
-          resources:
-            requests:
-              storage: 4000Gi
+          persistentVolumeClaim:
+            claimName: asset-pvc

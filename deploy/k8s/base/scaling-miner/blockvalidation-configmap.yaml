@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: asset-config-m
+  name: blockvalidation-config-m
 data:
   SETTINGS_CONTEXT:  "scaling.m"
 #  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
