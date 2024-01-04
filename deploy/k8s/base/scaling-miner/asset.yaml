@@ -17,6 +17,13 @@ spec:
       labels:
         app: asset
     spec:
+      nodeSelector:
+        role: asset
+      tolerations:
+        - key: role
+          value: asset
+          operator: Equal
+          effect: NoSchedule
       serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
