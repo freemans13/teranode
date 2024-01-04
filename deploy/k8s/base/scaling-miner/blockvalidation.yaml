@@ -13,10 +13,6 @@ spec:
       app: blockvalidation
   strategy:
     type: Recreate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
-
   template:
     metadata:
       labels:
