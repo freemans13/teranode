@@ -328,7 +328,7 @@ func Start() {
 	}
 	var logIdsFile chan string
 	if *logIds {
-		logFile, err := os.OpenFile("data/txblaster.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		logFile, err := os.OpenFile("/app/data/txblaster.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			panic(err)
 		}
