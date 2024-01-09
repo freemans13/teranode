@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - websecure
   routes:
-  - match: HostSNI(`m1.scaling.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: asset-service
       port: 8090
-  tls:
-    passthrough: true

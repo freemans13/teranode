@@ -8,10 +8,7 @@ spec:
   entryPoints:
     - ast-grpc
   routes:
-  - match: HostSNI(`m1.scaling.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: asset-service
       port: 8091
-  tls:
-    # use m1-cert
-    passthrough: true

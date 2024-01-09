@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - prop-grpc
   routes:
-    - match: HostSNI(`miner.allinone.ubsv.dev`)
+    - match: HostSNI(`*`)
       services:
         - name: miner
           port: 8084
-  tls:
-    passthrough: true

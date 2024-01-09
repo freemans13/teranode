@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - p2p-grpc
   routes:
-  - match: HostSNI(`miner.allinone.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: miner
       port: 9907
-  tls:
-    passthrough: true

@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - prop-grpc
   routes:
-  - match: HostSNI(`m.scaling.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: propagation-service
       port: 8084
-  tls:
-    passthrough: true

@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - status-grpc
   routes:
-  - match: HostSNI(`m.scaling.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: status-service
       port: 9909
-  tls:
-    passthrough: true

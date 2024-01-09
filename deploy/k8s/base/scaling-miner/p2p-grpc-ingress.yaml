@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - p2p-grpc
   routes:
-  - match: HostSNI(`m.scaling.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: p2p-service
       port: 9907
-  tls:
-    passthrough: true
