@@ -6,7 +6,7 @@ metadata:
     service: asset
 spec:
   entryPoints:
-    - asset
+    - web
   routes:
   - match: HostSNI(`*`)
     services:
