@@ -1,0 +1,17 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: p2p-wss-ingress-9906
+  labels:
+    service: p2p
+spec:
+  entryPoints:
+    - websecure # Service port expecting HTTPS
+  routes:
+  - match: Host(`m.scaling.ubsv.dev`)
+    kind: Rule
+    services:
+    - name: p2p-service
+      port: 9906  # Service port expecting HTTP
+  tls:
+    secretName: wildcard-tls-custom

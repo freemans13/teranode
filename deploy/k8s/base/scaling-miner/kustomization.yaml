@@ -30,6 +30,7 @@ resources:
   - p2p-ingress.yaml
   - p2p-service.yaml
   - p2p-ws-ingress.yaml
+  - p2p-wss-ingress.yaml
   - p2p.yaml
   - propagation-frpc-ingress.yaml
   - propagation-grpc-ingress.yaml
