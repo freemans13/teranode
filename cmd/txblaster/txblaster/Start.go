@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -99,8 +100,72 @@ func Start() {
 	profileAddress := flag.String("profile", "", "use this profile port instead of the default")
 	logIds := flag.Bool("log", false, "log tx ids")
 	useQuic := flag.Bool("quic", false, "use quic and invalid tx subscription")
+	iterations := flag.Int("iterations", -1, "number of iterations to run (default is indefinite)")
+	e2e := flag.Bool("e2e", false, "run in e2e mode")
 
 	flag.Parse()
+
+	if *e2e {
+		MIN_BLOCK_HEIGHT_FOR_E2E, _ := gocore.Config().GetInt("min_block_height_for_e2e", 200)
+
+		// Create a channel to signal when the block height condition is met
+		blockHeightCh := make(chan struct{})
+
+		// Start a blocking goroutine to check the block height continuously
+		go func() {
+
+			for {
+				// Define the URL to query block height
+				asset_httpAddress, _ := gocore.Config().Get("asset_httpAddress")
+				path := "/lastblocks?n=1"
+				url := asset_httpAddress + path
+
+				// Send an HTTP GET request to the URL
+				resp, err := http.Get(url)
+				if err != nil {
+					panic("Error: " + err.Error())
+				}
+				defer resp.Body.Close()
+
+				// Check the response status code
+				if resp.StatusCode != http.StatusOK {
+					panic(fmt.Sprintf("Error: Unexpected status code %d", resp.StatusCode))
+				}
+
+				// Decode the JSON response
+				var blocks []struct {
+					Height int `json:"height"`
+				}
+
+				decoder := json.NewDecoder(resp.Body)
+				if err := decoder.Decode(&blocks); err != nil {
+					panic("Error: " + err.Error())
+				}
+
+				// Extract the height value from the first block (assuming there's only one block in the response)
+				if len(blocks) > 0 {
+					height := blocks[0].Height
+					logger.Infof("Height: %d\n", height)
+					// Check if the block height is greater than min_height
+					if min_height := MIN_BLOCK_HEIGHT_FOR_E2E; height > min_height {
+						logger.Infof("Block height is now %d (greater than %d), signaling to exit.", height, min_height)
+						// Signal to exit the goroutine
+						blockHeightCh <- struct{}{}
+						return
+					}
+					logger.Infof("Block height is %d, waiting for it to exceed %d...", height, MIN_BLOCK_HEIGHT_FOR_E2E)
+				} else {
+					logger.Infof("No blocks found in the response")
+				}
+
+				//add a sleep here to control the frequency of block height checks
+				time.Sleep(time.Second * 5) // Adjust sleep duration as needed
+			}
+		}()
+
+		// Block the main program until the block height condition is met
+		<-blockHeightCh
+	}
 
 	prometheusEndpoint, ok := gocore.Config().Get("prometheusEndpoint")
 	if ok && prometheusEndpoint != "" {
@@ -265,7 +330,7 @@ func Start() {
 	}
 	var logIdsFile chan string
 	if *logIds {
-		logFile, err := os.OpenFile("data/txblaster.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		logFile, err := os.OpenFile("/app/data/txblaster.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			panic(err)
 		}
@@ -286,6 +351,10 @@ func Start() {
 		_, _ = w.Write([]byte("OK"))
 	}))
 
+	// var wg sync.WaitGroup
+	runIndefinitely := *iterations < 0
+	completed := make(chan struct{}, *workers)
+
 	for i := 0; i < *workers; i++ {
 		if *useQuic {
 			// create a quic distributor for each worker
@@ -300,7 +369,14 @@ func Start() {
 			}
 		}
 		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
-		go startWorker(ctx, workerLogger, i, *rateLimit, coinbaseClient, txDistributor, logIdsFile)
+		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributor, logIdsFile, completed)
+
+		if !runIndefinitely {
+			for i := 0; i < *workers; i++ {
+				<-completed
+			}
+			os.Exit(0)
+		}
 		// stagger worker startup to not overload Coinbase
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -308,11 +384,14 @@ func Start() {
 	<-ctx.Done()
 }
 
-func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64,
-	coinbaseClient *coinbase.Client, txDistributor *distributor.Distributor, logIdsFile chan string) {
+func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64, iterations int,
+	coinbaseClient *coinbase.Client, txDistributor *distributor.Distributor, logIdsFile chan string, completed chan struct{}) {
 
 	var w *worker.Worker
 	var err error
+
+	// Check if the iterations flag was set to a positive value
+	runIndefinitely := iterations < 0
 
 	for {
 		select {
@@ -328,6 +407,7 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 			w, err = worker.NewWorker(
 				logger,
 				rateLimit,
+				iterations,
 				coinbaseClient,
 				txDistributor,
 				kafkaProducer,
@@ -357,6 +437,10 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 			}
 
 			time.Sleep(1 * time.Second)
+			if !runIndefinitely {
+				logger.Infof("worker %d finished", workerId)
+				completed <- struct{}{}
+			}
 		}
 	}
 }
