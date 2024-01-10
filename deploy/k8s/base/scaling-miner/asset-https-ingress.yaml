@@ -6,13 +6,11 @@ metadata:
     service: asset
 spec:
   entryPoints:
-    - websecure  # Ensure this corresponds to HTTPS (port 443) in Traefik
+    - websecure # Service port expecting HTTPS
   routes:
-  - match: HostSNI(`m1.scaling.ubsv.dev`)  # Replace with your actual domain
+  - match: HostSNI(`m.scaling.ubsv.dev`)
     services:
     - name: asset-service
-      port: 8090
+      port: 8090  # Service port expecting HTTP
   tls:
-    certResolver: le  # The certificate resolver configured for Let's Encrypt in Traefik
-    domains:
-    - main: m1.scaling.ubsv.dev  # Replace with your actual domain
+    certResolver: le  # Let's Encrypt resolver for SSL
