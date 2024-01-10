@@ -64,6 +64,16 @@ patches:
       labelSelector: service=asset
   - patch: |-
       - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service2
+      - op: replace
+        path: /spec/routes/0/match
+        value: Host(`m2.scaling.ubsv.dev`)
+    target:
+      kind: IngressRoute
+      labelSelector: service=asset
+  - patch: |-
+      - op: replace
         path: /subjects/0/namespace
         value: m2
     target:

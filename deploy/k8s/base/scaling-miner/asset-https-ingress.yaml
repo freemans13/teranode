@@ -1,5 +1,5 @@
 apiVersion: traefik.containo.us/v1alpha1
-kind: IngressRouteTCP
+kind: IngressRoute
 metadata:
   name: https-443-asset
   labels:
@@ -8,9 +8,10 @@ spec:
   entryPoints:
     - websecure # Service port expecting HTTPS
   routes:
-  - match: HostSNI(`m.scaling.ubsv.dev`)
+  - match: Host(`m.scaling.ubsv.dev`)
+    kind: Rule
     services:
     - name: asset-service
       port: 8090  # Service port expecting HTTP
   tls:
-    certResolver: le  # Let's Encrypt resolver for SSL
+    secretName: wildcard-tls-custom

@@ -5,6 +5,7 @@ resources:
   - asset-configmap.yaml
   - asset-grpc-ingress.yaml
   - asset-http-ingress.yaml
+  - asset-https-ingress.yaml
   - asset-service.yaml
   - asset.yaml
   - blockassembly-blaster-service.yaml
