@@ -1,0 +1,18 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: https-443-asset
+  labels:
+    service: asset
+spec:
+  entryPoints:
+    - websecure  # Ensure this corresponds to HTTPS (port 443) in Traefik
+  routes:
+  - match: HostSNI(`m1.scaling.ubsv.dev`)  # Replace with your actual domain
+    services:
+    - name: asset-service
+      port: 8090
+  tls:
+    certResolver: le  # The certificate resolver configured for Let's Encrypt in Traefik
+    domains:
+    - main: m1.scaling.ubsv.dev  # Replace with your actual domain
