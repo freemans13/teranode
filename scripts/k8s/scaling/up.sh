@@ -27,11 +27,13 @@ scale_up() {
   wait m$namespace_suffix blockchain$namespace_suffix 30
   # kubectl scale deployment -n m$namespace_suffix status$namespace_suffix --replicas 1
   # wait m$namespace_suffix status$namespace_suffix 30
+  # asset/blockvalidation/blockassembly need to be scaled up together as they depend on each other :(
   kubectl scale deployment -n m$namespace_suffix asset$namespace_suffix --replicas 1
-  wait m$namespace_suffix asset$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix blockvalidation$namespace_suffix --replicas 1
-  wait m$namespace_suffix blockvalidation$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix blockassembly$namespace_suffix --replicas 1
+  # wait for all 3 to be ready
+  wait m$namespace_suffix asset$namespace_suffix 30
+  wait m$namespace_suffix blockvalidation$namespace_suffix 30
   wait m$namespace_suffix blockassembly$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix propagation$namespace_suffix --replicas 1
   wait m$namespace_suffix propagation$namespace_suffix 30
