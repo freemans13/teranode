@@ -35,12 +35,6 @@ configMapGenerator:
 patches:
   - patch: |-
       - op: replace
-        path: /spec/routes/0/match
-        value: HostSNI(`miner8.allinone.ubsv.dev`)
-    target:
-      kind: IngressRouteTCP
-  - patch: |-
-      - op: replace
         path: /spec/routes/0/services/0/name
         value: miner8
     target:

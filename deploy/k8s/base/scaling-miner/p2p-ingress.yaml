@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - p2p
   routes:
-    - match: HostSNI(`m1.scaling.ubsv.dev`)
+    - match: HostSNI(`*`)
       services:
         - name: p2p-service
           port: 9905
-  tls:
-    passthrough: true

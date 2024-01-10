@@ -30,12 +30,6 @@ configMapGenerator:
 patches:
   - patch: |-
       - op: replace
-        path: /spec/routes/0/match
-        value: HostSNI(`m3.scaling.ubsv.dev`)
-    target:
-      kind: IngressRouteTCP
-  - patch: |-
-      - op: replace
         path: /spec/routes/0/services/0/name
         value: propagation-service3
     target:

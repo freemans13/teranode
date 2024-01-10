@@ -8,11 +8,8 @@ spec:
   entryPoints:
     - ast-grpc
   routes:
-  - match: HostSNI(`miner.allinone.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: miner
       port: 8091
-  tls:
-    # use miner-cert
-#    secretName: miner-tls
-    passthrough: true
+  

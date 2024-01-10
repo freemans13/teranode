@@ -8,9 +8,8 @@ spec:
   entryPoints:
     - p2p-ws
   routes:
-    - match: HostSNI(`miner.allinone.ubsv.dev`)
+    - match: HostSNI(`*`)
       services:
         - name: miner
           port: 9906
-  tls:
-    passthrough: true
+  

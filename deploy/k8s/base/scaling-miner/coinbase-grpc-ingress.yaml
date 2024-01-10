@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - coin-grpc
   routes:
-    - match: HostSNI(`coinbase.allinone.ubsv.dev`)
+    - match: HostSNI(`*`)
       services:
         - name: coinbase-service
           port: 8093
-  tls:
-    passthrough: true

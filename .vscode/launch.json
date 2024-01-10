@@ -162,6 +162,13 @@
       "args": ["-workers=1", "-store=aerospike"]
     },
     {
+      "name": "binserve",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/poc/binserve/main.go",
+    },
+    {
       "name": "Remote Debug",
       "type": "go",
       "request": "attach",

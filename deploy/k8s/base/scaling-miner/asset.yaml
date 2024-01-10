@@ -10,11 +10,20 @@ spec:
   selector:
     matchLabels:
       app: asset
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
         app: asset
     spec:
+      nodeSelector:
+        role: asset
+      tolerations:
+        - key: role
+          value: asset
+          operator: Equal
+          effect: NoSchedule
       serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
@@ -50,14 +59,20 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 55Gi
-              cpu: "16"
+              memory: 75Gi
+              cpu: "25"
             limits:
-              memory: 55Gi
-              cpu: "16"
+              memory: 75Gi
+              cpu: "25"
           volumeMounts:
-            - mountPath: /data/
-              name: subtree-store-ttl
+            - mountPath: /data/subtreestore-ttl-1/
+              name: subtree-store-ttl-1
+            - mountPath: /data/subtreestore-ttl-2/
+              name: subtree-store-ttl-2
+            - mountPath: /data/subtreestore-ttl-3/
+              name: subtree-store-ttl-3
+            - mountPath: /data/subtreestore-ttl-4/
+              name: subtree-store-ttl-4
           readinessProbe:
             httpGet:
               path: /health
@@ -75,8 +90,15 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 3
       volumes:
-        - name: subtree-store-ttl
-          storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
-          resources:
-            requests:
-              storage: 4000Gi
+        - name: subtree-store-ttl-1
+          persistentVolumeClaim:
+            claimName: asset-pvc-1
+        - name: subtree-store-ttl-2
+          persistentVolumeClaim:
+            claimName: asset-pvc-2
+        - name: subtree-store-ttl-3
+          persistentVolumeClaim:
+            claimName: asset-pvc-3
+        - name: subtree-store-ttl-4
+          persistentVolumeClaim:
+            claimName: asset-pvc-4

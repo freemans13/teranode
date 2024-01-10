@@ -8,9 +8,7 @@ spec:
   entryPoints:
     - status
   routes:
-    - match: HostSNI(`miner.allinone.ubsv.dev`)
+    - match: HostSNI(`*`)
       services:
         - name: miner
           port: 9908
-  tls:
-    passthrough: true

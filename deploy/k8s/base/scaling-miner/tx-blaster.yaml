@@ -31,6 +31,8 @@ spec:
                   matchLabels:
                     app: tx-blaster
                 topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: tx-blaster
       tolerations:
         - key: role
           value: tx-blaster

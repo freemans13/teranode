@@ -1,16 +1,14 @@
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
-  name: ingressroute-https
+  name: tcp-80-http-asset
   labels:
     service: asset
 spec:
   entryPoints:
-    - websecure
+    - web
   routes:
-  - match: HostSNI(`m1.scaling.ubsv.dev`)
+  - match: HostSNI(`*`)
     services:
     - name: asset-service
       port: 8090
-  tls:
-    passthrough: true

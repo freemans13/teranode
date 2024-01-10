@@ -12,11 +12,7 @@ spec:
     matchLabels:
       app: blockvalidation
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
-
+    type: Recreate
   template:
     metadata:
       labels:
@@ -62,11 +58,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 950Gi
-              cpu: "110"
+              memory: 1400Gi
+              cpu: "186"
             limits:
-              memory: 950Gi
-              cpu: "110"
+              memory: 1400Gi
+              cpu: "186"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl-1/
               name: subtree-store-ttl-1
@@ -93,23 +89,15 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 3
       volumes:
-        - storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
-          resources:
-            requests:
-              storage: 1000Gi
-          name: subtree-store-ttl-1
-        - storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
-          resources:
-            requests:
-              storage: 1000Gi
-          name: subtree-store-ttl-2
-        - storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
-          resources:
-            requests:
-              storage: 1000Gi
-          name: subtree-store-ttl-3
-        - storageClassName: "io2-xfs" # Change storage class to "ebs-sc"
-          resources:
-            requests:
-              storage: 1000Gi
-          name: subtree-store-ttl-4
+        - name: subtree-store-ttl-1
+          persistentVolumeClaim:
+            claimName: blockvalidation-pvc-1
+        - name: subtree-store-ttl-2
+          persistentVolumeClaim:
+            claimName: blockvalidation-pvc-2
+        - name: subtree-store-ttl-3
+          persistentVolumeClaim:
+            claimName: blockvalidation-pvc-3
+        - name: subtree-store-ttl-4
+          persistentVolumeClaim:
+            claimName: blockvalidation-pvc-4
