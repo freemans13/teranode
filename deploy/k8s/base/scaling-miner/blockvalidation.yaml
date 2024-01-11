@@ -29,10 +29,10 @@ spec:
                     app: blockvalidation
                 topologyKey: "kubernetes.io/hostname"
       nodeSelector:
-        role: massive
+        role: blockvalidation
       tolerations:
         - key: role
-          value: massive
+          value: blockvalidation
           operator: Equal
           effect: NoSchedule
       containers:

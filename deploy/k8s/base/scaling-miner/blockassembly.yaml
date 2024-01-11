@@ -29,10 +29,10 @@ spec:
                     app: blockassembly
                 topologyKey: "kubernetes.io/hostname"
       nodeSelector:
-        role: massive
+        role: blockassembly
       tolerations:
         - key: role
-          value: massive
+          value: blockassembly
           operator: Equal
           effect: NoSchedule
       containers:
