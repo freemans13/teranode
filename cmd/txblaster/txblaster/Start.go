@@ -190,15 +190,21 @@ func Start() {
 
 		defer closer.Close()
 	}
-	var txDistributor *distributor.Distributor
+
+	var txDistributors []*distributor.Distributor
+	nrTxDistributors, _ := gocore.Config().GetInt("txblaster_distributors", 16)
+
 	var err error
 	if !*useQuic {
-		logger.Debugf("Using grpc distributor")
-		txDistributor, err = distributor.NewDistributor(logger,
-			distributor.WithBackoffDuration(200*time.Millisecond),
-			distributor.WithRetryAttempts(3),
-			distributor.WithFailureTolerance(0),
-		)
+		logger.Debugf("Using %d grpc distributors", nrTxDistributors)
+		txDistributors = make([]*distributor.Distributor, nrTxDistributors)
+		for i := 0; i < nrTxDistributors; i++ {
+			txDistributors[i], err = distributor.NewDistributor(logger,
+				distributor.WithBackoffDuration(200*time.Millisecond),
+				distributor.WithRetryAttempts(3),
+				distributor.WithFailureTolerance(0),
+			)
+		}
 		if err != nil {
 			logger.Fatalf("error creating tx distributor: %v", err)
 		}
@@ -320,7 +326,8 @@ func Start() {
 		kuberesolver.RegisterInClusterWithSchema("k8s")
 	}
 	if !*useQuic {
-		propagationServers := txDistributor.GetPropagationGRPCAddresses()
+		// we can get the propagation servers from the first distributor, they are all the same
+		propagationServers := txDistributors[0].GetPropagationGRPCAddresses()
 		if len(propagationServers) == 0 {
 			panic("No suitable propagation server connection found")
 		}
@@ -357,8 +364,9 @@ func Start() {
 
 	for i := 0; i < *workers; i++ {
 		if *useQuic {
-			// create a quic distributor for each worker
-			txDistributor, err = distributor.NewQuicDistributor(logger,
+			// create a separate quic distributor for each worker
+			txDistributors = make([]*distributor.Distributor, 1)
+			txDistributors[0], err = distributor.NewQuicDistributor(logger,
 				distributor.WithBackoffDuration(200*time.Millisecond),
 				distributor.WithRetryAttempts(3),
 				distributor.WithFailureTolerance(0),
@@ -369,7 +377,7 @@ func Start() {
 			}
 		}
 		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
-		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributor, logIdsFile, completed)
+		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completed)
 
 		if !runIndefinitely {
 			for i := 0; i < *workers; i++ {
@@ -385,7 +393,7 @@ func Start() {
 }
 
 func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64, iterations int,
-	coinbaseClient *coinbase.Client, txDistributor *distributor.Distributor, logIdsFile chan string, completed chan struct{}) {
+	coinbaseClient *coinbase.Client, txDistributors []*distributor.Distributor, logIdsFile chan string, completed chan struct{}) {
 
 	var w *worker.Worker
 	var err error
@@ -409,7 +417,7 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 				rateLimit,
 				iterations,
 				coinbaseClient,
-				txDistributor,
+				txDistributors,
 				kafkaProducer,
 				kafkaTopic,
 				ipv6MulticastConn,
