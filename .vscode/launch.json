@@ -23,11 +23,23 @@
       "program": "${workspaceFolder}/.",
       "buildFlags": "-tags=aerospike",
       "env": {
+        "SETTINGS_CONTEXT": "scaling.m1",
         "asset_httpAddress": "http://localhost:8090",
-        "utxostore": "aerospike://localhost:3000/test?timeout=30s",
-        "txmeta_store": "aerospike://localhost:3000/test?timeout=30s"
+        // "utxostore": "aerospike://localhost:3000/test?timeout=30s",
+        // "txmeta_store": "aerospike://localhost:3000/test?timeout=30s"
       },
       "args": [
+        "-blockchain=0",
+        "-utxostore=0",
+        "-txmetastore=0",
+        "-Asset=0",
+        "-coinbase=0",
+        "-miner=0",
+        "-blockvalidation=0",
+        "-blockassembly=0",
+        "-validator=0",
+        "-propagation=1",
+        "-bootstrap=0",
         "-p2p=0"
       ]
     },
