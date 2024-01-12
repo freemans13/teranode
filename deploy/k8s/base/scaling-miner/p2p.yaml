@@ -46,8 +46,6 @@ spec:
               protocol: TCP
             - containerPort: 9906
               protocol: TCP
-            - containerPort: 9907
-              protocol: TCP
             - containerPort: 9901
               protocol: TCP
           resources:
