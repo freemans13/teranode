@@ -362,6 +362,9 @@ func Start() {
 	runIndefinitely := *iterations < 0
 	completed := make(chan struct{}, *workers)
 
+	staggerWorkersTimeMs, _ := gocore.Config().GetInt("tx_blaster_staggerWorkersTimeMs", 25)
+	staggerWorkersTime := time.Duration(staggerWorkersTimeMs) * time.Millisecond
+
 	for i := 0; i < *workers; i++ {
 		if *useQuic {
 			// create a separate quic distributor for each worker
@@ -386,7 +389,7 @@ func Start() {
 			os.Exit(0)
 		}
 		// stagger worker startup to not overload Coinbase
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(staggerWorkersTime)
 	}
 
 	<-ctx.Done()
