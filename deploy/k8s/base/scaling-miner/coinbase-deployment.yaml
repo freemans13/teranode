@@ -46,6 +46,16 @@ spec:
           env:
             - name: SERVICE_NAME
               value: coinbase-service
+            - name: slack_channel
+              valueFrom:
+                secretKeyRef:
+                  name: ubsv-secrets
+                  key: slack_channel
+            - name: slack_token
+              valueFrom:
+                secretKeyRef:
+                  name: ubsv-secrets
+                  key: slack_token
           ports:
             - containerPort: 8093
               protocol: TCP
