@@ -81,6 +81,8 @@
     "opentracing",
     "ordishs",
     "otel",
+    "otelgrpc",
+    "otgrpc",
     "P2PAPIClient",
     "P2PAPIServer",
     "Pipeliner",

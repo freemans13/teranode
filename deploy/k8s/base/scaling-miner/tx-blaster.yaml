@@ -43,7 +43,7 @@ spec:
           image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
-          args: ["-workers=900"]
+          args: ["-workers=4500"]
           envFrom:
             - configMapRef:
                 name: shared-config-m
@@ -63,11 +63,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1Gi
-              cpu: "5"
+              memory: 32Gi
+              cpu: "27"
             limits:
-              memory: 1Gi
-              cpu: "5"
+              memory: 32Gi
+              cpu: "27"
           readinessProbe:
             httpGet:
               path: /health

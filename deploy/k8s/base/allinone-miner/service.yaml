@@ -58,10 +58,6 @@ spec:
       port: 9906
       targetPort: 9906
       protocol: TCP
-    - name: p2p-grpc
-      port: 9907
-      targetPort: 9907
-      protocol: TCP
     - name: status-http
       port: 9908
       targetPort: 9908

@@ -26,6 +26,13 @@ spec:
                   matchLabels:
                     app: propagation
                 topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: role
+          value: propagation
+          operator: Equal
+          effect: NoSchedule
+      nodeSelector:
+        role: propagation
       containers:
         - name: propagation
           image: REPO:IMAGE:TAG
@@ -54,11 +61,11 @@ spec:
               protocol: UDP
           resources:
             requests:
-              memory: 4Gi
-              cpu: "8"
+              memory: 32Gi
+              cpu: "27"
             limits:
-              memory: 4Gi
-              cpu: "8"
+              memory: 32Gi
+              cpu: "27"
           readinessProbe:
             httpGet:
               path: /health

@@ -74,6 +74,16 @@ patches:
       labelSelector: service=asset
   - patch: |-
       - op: replace
+        path: /spec/routes/0/services/0/name
+        value: p2p-service1
+      - op: replace
+        path: /spec/routes/0/match
+        value: Host(`m1.scaling.ubsv.dev`)
+    target:
+      kind: IngressRoute
+      labelSelector: service=p2p
+  - patch: |-
+      - op: replace
         path: /subjects/0/namespace
         value: m1
     target:

@@ -30,6 +30,7 @@ import (
 	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
 	"github.com/libsv/go-p2p/wire"
+	"github.com/multiformats/go-multiaddr"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -37,9 +38,13 @@ import (
 	"google.golang.org/grpc/resolver"
 
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/pnet"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 )
@@ -60,6 +65,11 @@ var ipv6MulticastConn *net.UDPConn
 var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
 var totalTransactions atomic.Uint64
 var startTime time.Time
+
+var usePrivateDht bool = false
+var dhtProtocolIdStr string
+
+var sharedKey string
 
 const privateKeyFilename = "tx-blaster.private_key"
 
@@ -104,6 +114,17 @@ func Start() {
 	e2e := flag.Bool("e2e", false, "run in e2e mode")
 
 	flag.Parse()
+
+	var ok bool
+	dhtProtocolIdStr, ok = gocore.Config().Get("p2p_dht_protocol_id")
+	if !ok {
+		panic(fmt.Errorf("error getting p2p_dht_protocol_id"))
+	}
+	sharedKey, ok = gocore.Config().Get("p2p_shared_key")
+	if !ok {
+		panic(fmt.Errorf("error getting p2p_shared_key"))
+	}
+	usePrivateDht = gocore.Config().GetBool("p2p_dht_use_private", false)
 
 	if *e2e {
 		MIN_BLOCK_HEIGHT_FOR_E2E, _ := gocore.Config().GetInt("min_block_height_for_e2e", 200)
@@ -190,15 +211,21 @@ func Start() {
 
 		defer closer.Close()
 	}
-	var txDistributor *distributor.Distributor
+
+	var txDistributors []*distributor.Distributor
+	nrTxDistributors, _ := gocore.Config().GetInt("txblaster_distributors", 16)
+
 	var err error
 	if !*useQuic {
-		logger.Debugf("Using grpc distributor")
-		txDistributor, err = distributor.NewDistributor(logger,
-			distributor.WithBackoffDuration(200*time.Millisecond),
-			distributor.WithRetryAttempts(3),
-			distributor.WithFailureTolerance(0),
-		)
+		logger.Debugf("Using %d grpc distributors", nrTxDistributors)
+		txDistributors = make([]*distributor.Distributor, nrTxDistributors)
+		for i := 0; i < nrTxDistributors; i++ {
+			txDistributors[i], err = distributor.NewDistributor(logger,
+				distributor.WithBackoffDuration(200*time.Millisecond),
+				distributor.WithRetryAttempts(3),
+				distributor.WithFailureTolerance(0),
+			)
+		}
 		if err != nil {
 			logger.Fatalf("error creating tx distributor: %v", err)
 		}
@@ -320,7 +347,8 @@ func Start() {
 		kuberesolver.RegisterInClusterWithSchema("k8s")
 	}
 	if !*useQuic {
-		propagationServers := txDistributor.GetPropagationGRPCAddresses()
+		// we can get the propagation servers from the first distributor, they are all the same
+		propagationServers := txDistributors[0].GetPropagationGRPCAddresses()
 		if len(propagationServers) == 0 {
 			panic("No suitable propagation server connection found")
 		}
@@ -355,10 +383,14 @@ func Start() {
 	runIndefinitely := *iterations < 0
 	completed := make(chan struct{}, *workers)
 
+	staggerWorkersTimeMs, _ := gocore.Config().GetInt("tx_blaster_staggerWorkersTimeMs", 25)
+	staggerWorkersTime := time.Duration(staggerWorkersTimeMs) * time.Millisecond
+
 	for i := 0; i < *workers; i++ {
 		if *useQuic {
-			// create a quic distributor for each worker
-			txDistributor, err = distributor.NewQuicDistributor(logger,
+			// create a separate quic distributor for each worker
+			txDistributors = make([]*distributor.Distributor, 1)
+			txDistributors[0], err = distributor.NewQuicDistributor(logger,
 				distributor.WithBackoffDuration(200*time.Millisecond),
 				distributor.WithRetryAttempts(3),
 				distributor.WithFailureTolerance(0),
@@ -369,7 +401,7 @@ func Start() {
 			}
 		}
 		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
-		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributor, logIdsFile, completed)
+		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completed)
 
 		if !runIndefinitely {
 			for i := 0; i < *workers; i++ {
@@ -378,14 +410,14 @@ func Start() {
 			os.Exit(0)
 		}
 		// stagger worker startup to not overload Coinbase
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(staggerWorkersTime)
 	}
 
 	<-ctx.Done()
 }
 
 func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64, iterations int,
-	coinbaseClient *coinbase.Client, txDistributor *distributor.Distributor, logIdsFile chan string, completed chan struct{}) {
+	coinbaseClient *coinbase.Client, txDistributors []*distributor.Distributor, logIdsFile chan string, completed chan struct{}) {
 
 	var w *worker.Worker
 	var err error
@@ -409,7 +441,7 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 				rateLimit,
 				iterations,
 				coinbaseClient,
-				txDistributor,
+				txDistributors,
 				kafkaProducer,
 				kafkaTopic,
 				ipv6MulticastConn,
@@ -446,7 +478,49 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 }
 
 func discoverPeers(ctx context.Context, topicName string, h host.Host) {
-	kademliaDHT := p2p.InitDHT(ctx, h)
+	var kademliaDHT *dht.IpfsDHT
+	var err error
+	if usePrivateDht {
+		bootstrapAddresses, _ := gocore.Config().GetMulti("p2p_bootstrapAddresses", "|")
+		if len(bootstrapAddresses) == 0 {
+			panic(fmt.Errorf("bootstrapAddresses not set in config"))
+		}
+		for _, ba := range bootstrapAddresses {
+			bootstrapAddr, err := multiaddr.NewMultiaddr(ba)
+			if err != nil {
+				panic(err)
+			}
+
+			peerInfo, err := peer.AddrInfoFromP2pAddr(bootstrapAddr)
+			if err != nil {
+				panic(err)
+			}
+
+			// Connect to the bootstrap node.
+			err = h.Connect(ctx, *peerInfo)
+			if err != nil {
+				panic(err)
+			}
+		}
+		dhtProtocolID := protocol.ID(dhtProtocolIdStr)
+		var options []dht.Option
+		options = append(options, dht.ProtocolPrefix(dhtProtocolID))
+		options = append(options, dht.Mode(dht.ModeAuto))
+
+		// initialise the DHT
+		kademliaDHT, err = dht.New(ctx, h, options...)
+		if err != nil {
+			panic(err)
+		}
+
+		err = kademliaDHT.Bootstrap(ctx)
+		if err != nil {
+			panic(err)
+		}
+
+	} else {
+		kademliaDHT = p2p.InitDHT(ctx, h)
+	}
 	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
 
 	dutil.Advertise(ctx, routingDiscovery, topicName)
@@ -505,10 +579,39 @@ func createlibp2pTopic(ctx context.Context, topicName string) (*pubsub.Topic, er
 			return nil, err
 		}
 	}
-	// Create a new libp2p Host that listens on a random TCP port
-	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"), libp2p.Identity(*pk))
-	if err != nil {
-		return nil, err
+	var h host.Host
+	if usePrivateDht {
+
+		p2pIp, ok := gocore.Config().Get("p2p_ip")
+		if !ok {
+			panic("p2p_ip not set in config")
+		}
+		p2pPort, ok := gocore.Config().GetInt("p2p_port")
+		if !ok {
+			panic("p2p_port not set in config")
+		}
+		s := ""
+		s += fmt.Sprintln("/key/swarm/psk/1.0.0/")
+		s += fmt.Sprintln("/base16/")
+		s += sharedKey
+		psk, err := pnet.DecodeV1PSK(bytes.NewBuffer([]byte(s)))
+		if err != nil {
+			panic(err)
+		}
+		h, err = libp2p.New(
+			libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/%s/tcp/%d", p2pIp, p2pPort)),
+			libp2p.Identity(*pk),
+			libp2p.PrivateNetwork(psk),
+		)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		// Create a new libp2p Host that listens on a random TCP port
+		h, err = libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"), libp2p.Identity(*pk))
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	go discoverPeers(ctx, topicName, h)

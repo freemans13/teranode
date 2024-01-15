@@ -29,10 +29,10 @@ spec:
                     app: blockassembly
                 topologyKey: "kubernetes.io/hostname"
       nodeSelector:
-        role: massive
+        role: blockassembly
       tolerations:
         - key: role
-          value: massive
+          value: blockassembly
           operator: Equal
           effect: NoSchedule
       containers:
@@ -56,11 +56,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1400Gi
-              cpu: "186"
+              memory: 1200Gi
+              cpu: "182"
             limits:
-              memory: 1400Gi
-              cpu: "186"
+              memory: 1200Gi
+              cpu: "182"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl-1/
               name: subtree-store-ttl-1
