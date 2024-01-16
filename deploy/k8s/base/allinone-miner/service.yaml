@@ -58,14 +58,6 @@ spec:
       port: 9906
       targetPort: 9906
       protocol: TCP
-    - name: status-http
-      port: 9908
-      targetPort: 9908
-      protocol: TCP
-    - name: status-grpc
-      port: 9909
-      targetPort: 9909
-      protocol: TCP
     - name: quic
       port: 8384
       targetPort: 8384
