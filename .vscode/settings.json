@@ -140,8 +140,6 @@
     "txmetacache",
     "txmetastore",
     "txns",
-    "txstatus",
-    "txstatusstore",
     "txstore",
     "txsts",
     "txviewer",

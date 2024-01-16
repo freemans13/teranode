@@ -53,8 +53,6 @@ spec:
               protocol: TCP
             - containerPort: 8084
               protocol: TCP
-            - containerPort: 8184
-              protocol: TCP
             - containerPort: 8284
               protocol: TCP
             - containerPort: 8384

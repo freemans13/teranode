@@ -24,10 +24,6 @@ spec:
       port: 8084
       targetPort: 8084
       protocol: TCP
-    - name: frpc
-      port: 8284
-      targetPort: 8284
-      protocol: TCP
     - name: quic
       port: 8384
       targetPort: 8384
