@@ -59,7 +59,6 @@ spec:
               cpu: "8"
             limits:
               memory: 8Gi
-              cpu: "8"
           readinessProbe:
             httpGet:
               path: /health
