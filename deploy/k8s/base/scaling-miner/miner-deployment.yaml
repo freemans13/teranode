@@ -49,7 +49,6 @@ spec:
               protocol: TCP
           resources:
             limits:
-              cpu: 2
               memory: 2Gi
             requests:
               cpu: 2
