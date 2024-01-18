@@ -62,7 +62,6 @@ spec:
               cpu: "182"
             limits:
               memory: 1200Gi
-              cpu: "182"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl-1/
               name: subtree-store-ttl-1
