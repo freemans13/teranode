@@ -27,6 +27,10 @@ configMapGenerator:
     literals:
       - SETTINGS_CONTEXT=scaling.m2.blockassembly
     name: blockassembly-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m2.propagation
+    name: propagation-config-m
 patches:
   - patch: |-
       - op: replace
