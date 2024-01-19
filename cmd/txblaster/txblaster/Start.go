@@ -167,9 +167,9 @@ func Start() {
 				if len(blocks) > 0 {
 					height := blocks[0].Height
 					logger.Infof("Height: %d\n", height)
-					// Check if the block height is greater than min_height
-					if min_height := MIN_BLOCK_HEIGHT_FOR_E2E; height > min_height {
-						logger.Infof("Block height is now %d (greater than %d), signaling to exit.", height, min_height)
+					// Check if the block height is greater than minHeight
+					if minHeight := MIN_BLOCK_HEIGHT_FOR_E2E; height > minHeight {
+						logger.Infof("Block height is now %d (greater than %d), signaling to exit.", height, minHeight)
 						// Signal to exit the goroutine
 						blockHeightCh <- struct{}{}
 						return
@@ -381,7 +381,7 @@ func Start() {
 
 	// var wg sync.WaitGroup
 	runIndefinitely := *iterations < 0
-	completed := make(chan struct{}, *workers)
+	completedCh := make(chan struct{}, *workers)
 
 	staggerWorkersTimeMs, _ := gocore.Config().GetInt("tx_blaster_staggerWorkersTimeMs", 25)
 	staggerWorkersTime := time.Duration(staggerWorkersTimeMs) * time.Millisecond
@@ -401,11 +401,11 @@ func Start() {
 			}
 		}
 		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
-		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completed)
+		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completedCh)
 
 		if !runIndefinitely {
 			for i := 0; i < *workers; i++ {
-				<-completed
+				<-completedCh
 			}
 			os.Exit(0)
 		}
@@ -459,7 +459,8 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 
 			err = w.Init(ctx)
 			if err != nil {
-				logger.Errorf("Could not initialise worker %d: %v", workerId, err)
+				logger.Errorf("Could not initialise worker %d: %v. Sleeping for 5 seconds", workerId, err)
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
