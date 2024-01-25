@@ -43,7 +43,7 @@ spec:
           image: REPO:IMAGE:TAG
           command:
             - ./utxostoreblaster.run
-          args: ["-workers=4500", "-store=aerospike"]
+          args: ["-workers=1000", "-store=aerospike"]
           envFrom:
             - configMapRef:
                 name: shared-config-m
