@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: utxo-blaster
+
+  labels:
+    app: utxo-blaster
+    project: service
+spec:
+  replicas: 0
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: utxo-blaster
+  template:
+    metadata:
+      labels:
+        app: utxo-blaster
+    spec:
+      serviceAccountName: sa-m
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: utxo-blaster
+                topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: utxo-blaster
+      tolerations:
+        - key: role
+          value: utxo-blaster
+          operator: Equal
+          effect: NoSchedule
+      containers:
+        - name: utxo-blaster
+          image: REPO:IMAGE:TAG
+          command:
+            - ./utxostoreblaster.run
+          args: ["-workers=4500", "-store=aerospike"]
+          envFrom:
+            - configMapRef:
+                name: shared-config-m
+          env:
+            - name: SERVICE_NAME
+              value: utxo-blaster-service
+            - name: utxostore
+              value: "aerospike://editor:password1234@aerocluster.aerospike.svc.cluster.local:3000/ubsv-store?WarmUp=512&ConnectionQueueSize=512&LimitConnectionsToQueueSize=false&MinConnectionsPerNode=512&expiration=900"
+          ports:
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 32Gi
+              cpu: "27"
+            limits:
+              memory: 32Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9092
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3

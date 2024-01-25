@@ -37,6 +37,8 @@ resources:
   - shared-config-map.yaml
   - tx-blaster-service.yaml
   - tx-blaster.yaml
+  - utxo-blaster-service.yaml
+  - utxo-blaster.yaml
   - txmetastore-service.yaml
   - txmetastore.yaml
   - utxo-config-map.yaml
