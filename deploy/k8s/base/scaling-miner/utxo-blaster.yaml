@@ -32,10 +32,10 @@ spec:
                     app: utxo-blaster
                 topologyKey: "kubernetes.io/hostname"
       nodeSelector:
-        role: tx-blaster
+        role: propagation
       tolerations:
         - key: role
-          value: tx-blaster
+          value: propagation
           operator: Equal
           effect: NoSchedule
       containers:
