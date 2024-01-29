@@ -64,13 +64,15 @@ spec:
             limits:
               memory: 200Gi
           volumeMounts:
-            - mountPath: /data/subtreestore-ttl-1/
+            - name: lustre-storage
+              mountPath: /data/subtreestore
+            - mountPath: /data/subtreestore-ttl-1
               name: subtree-store-ttl-1
-            - mountPath: /data/subtreestore-ttl-2/
+            - mountPath: /data/subtreestore-ttl-2
               name: subtree-store-ttl-2
-            - mountPath: /data/subtreestore-ttl-3/
+            - mountPath: /data/subtreestore-ttl-3
               name: subtree-store-ttl-3
-            - mountPath: /data/subtreestore-ttl-4/
+            - mountPath: /data/subtreestore-ttl-4
               name: subtree-store-ttl-4
           readinessProbe:
             httpGet:
@@ -89,6 +91,9 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 3
       volumes:
+        - name: lustre-storage
+          persistentVolumeClaim:
+            claimName: lustre-pvc
         - name: subtree-store-ttl-1
           persistentVolumeClaim:
             claimName: asset-pvc-1

@@ -28,6 +28,7 @@ resources:
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml
   - p2p.yaml
+  - propagation-config-map.yaml
   - propagation-grpc-ingress.yaml
   - propagation-quic-ingress.yaml
   - propagation-service.yaml
@@ -36,6 +37,8 @@ resources:
   - shared-config-map.yaml
   - tx-blaster-service.yaml
   - tx-blaster.yaml
+  - utxo-blaster-service.yaml
+  - utxo-blaster.yaml
   - txmetastore-service.yaml
   - txmetastore.yaml
   - utxo-config-map.yaml

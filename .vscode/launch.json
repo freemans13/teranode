@@ -171,7 +171,7 @@
       "env": {
         "utxostore": "aerospike://localhost:3000/test"
       },
-      "args": ["-workers=1", "-store=aerospike"]
+      "args": ["-workers=10", "-store=aerospike"]
     },
     {
       "name": "binserve",
