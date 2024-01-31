@@ -133,6 +133,7 @@
     "TIMESTAMPTZ",
     "tmsql",
     "ttlcache",
+    "TTLs",
     "txblast",
     "txblaster",
     "txcount",
