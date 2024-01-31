@@ -169,9 +169,10 @@
       "buildFlags": "-tags=aerospike",
       "program": "${workspaceFolder}/cmd/utxostore_blaster/main.go",
       "env": {
-        "utxostore": "aerospike://localhost:3000/test"
+        "utxostore": "aerospike://localhost:3000/test",
+        "utxoblaster_utxostore_redis" : "redis://13.51.121.65:6379,13.51.205.122:6379"
       },
-      "args": ["-workers=10", "-store=aerospike"]
+      "args": ["-workers=10", "-store=redis-ring"]
     },
     {
       "name": "binserve",
