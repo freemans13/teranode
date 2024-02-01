@@ -98,6 +98,7 @@
     "protogen",
     "protojson",
     "pubkey",
+    "quic",
     "regtest",
     "resp",
     "respend",
