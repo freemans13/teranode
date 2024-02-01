@@ -40,6 +40,15 @@ spec:
           envFrom:
             - configMapRef:
                 name: config-miner
+          env: 
+            - name: "blockchain_store"
+              value: "postgres://postgres:postgres@localhost:5432/blockchain"
+            - name: "coinbase_store"
+              value: "postgres://postgres:postgres@localhost:5432/coinbase"
+            - name: "txmeta_store"
+              value: "postgres://postgres:postgres@localhost:5432/txmeta"
+            - name: "utxostore"
+              value: "postgres://postgres:postgres@localhost:5432/utxostore"
           ports:
             - containerPort: 4040
               protocol: TCP
@@ -97,16 +106,34 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+        - name: postgres-sidecar
+          image: postgres:latest
+          env:
+          - name: POSTGRES_PASSWORD
+            value: postgres
+          volumeMounts:
+          - name: postgres-storage
+            mountPath: /var/lib/postgresql/data
+          - name: init-script
+            mountPath: /docker-entrypoint-initdb.d
+            # SubPath ensures only your script is mounted, not the entire ConfigMap directory
+            subPath: create-db.sql
       volumes:
-        - name: subtree-store-ttl
-          ephemeral:
-            volumeClaimTemplate:
-              metadata:
-                labels:
-                  type: subtreestore-ttl
-              spec:
-                accessModes: [ "ReadWriteOnce" ]
-                storageClassName: "io2-xfs-low-iops"
-                resources:
-                  requests:
-                    storage: 1000Gi
+      - name: subtree-store-ttl
+        ephemeral:
+          volumeClaimTemplate:
+            metadata:
+              labels:
+                type: subtreestore-ttl
+            spec:
+              accessModes: [ "ReadWriteOnce" ]
+              storageClassName: "io2-xfs-low-iops"
+              resources:
+                requests:
+                  storage: 1000Gi
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+      - name: init-script
+        configMap:
+          name: postgres-init-scripts
