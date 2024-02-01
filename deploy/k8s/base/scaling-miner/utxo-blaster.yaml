@@ -50,8 +50,6 @@ spec:
           env:
             - name: SERVICE_NAME
               value: utxo-blaster-service
-            - name: utxostore
-              value: "aerospike://editor:password1234@aerocluster.aerospike.svc.cluster.local:3000/ubsv-store?WarmUp=512&ConnectionQueueSize=512&LimitConnectionsToQueueSize=false&MinConnectionsPerNode=512&expiration=900"
           ports:
             - containerPort: 9091
               protocol: TCP

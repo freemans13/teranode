@@ -21,12 +21,16 @@ configMapGenerator:
     name: asset-config-m
   - behavior: merge
     literals:
+      - SETTINGS_CONTEXT=scaling.m1.blockassembly
+    name: blockassembly-config-m
+  - behavior: merge
+    literals:
       - SETTINGS_CONTEXT=scaling.m1.blockvalidation
     name: blockvalidation-config-m
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.m1.blockassembly
-    name: blockassembly-config-m
+      - SETTINGS_CONTEXT=scaling.m1.coinbase
+    name: coinbase-config-m
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1.propagation

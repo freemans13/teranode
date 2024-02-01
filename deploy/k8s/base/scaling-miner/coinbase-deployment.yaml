@@ -39,10 +39,12 @@ spec:
       containers:
         - name: coinbase
           image: REPO:IMAGE:TAG
-          args: [ "-coinbase=1" ]
+          args: ["-coinbase=1"]
           envFrom:
             - configMapRef:
                 name: shared-config-m
+            - configMapRef:
+                name: coinbase-config-m
           env:
             - name: SERVICE_NAME
               value: coinbase-service
