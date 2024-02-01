@@ -42,6 +42,16 @@ patches:
       labelSelector: service=miner
   - patch: |-
       - op: replace
+        path: /spec/routes/0/services/0/name
+        value: miner-service1
+      - op: replace
+        path: /spec/routes/0/match
+        value: Host(`miner1.allinone.ubsv.dev`)
+    target:
+      kind: IngressRoute
+      labelSelector: service=miner
+  - patch: |-
+      - op: replace
         path: /subjects/0/namespace
         value: miner1
     target:

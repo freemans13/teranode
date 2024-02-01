@@ -35,7 +35,7 @@ spec:
       containers:
         - name: miner
           image: REPO:IMAGE:TAG
-          #          command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
+                # command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
           args: [ ]
           envFrom:
             - configMapRef:

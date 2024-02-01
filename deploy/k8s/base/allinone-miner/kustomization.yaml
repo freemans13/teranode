@@ -2,17 +2,24 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - service.yaml
-  - cluster-role-binding.yaml
-  - service-account.yaml
-  - configmap.yaml
-  - asset-grpc-ingress.yaml
-  - deployment.yaml
-  - propagation-grpc-ingress.yaml
-  - asset-http-ingress.yaml
-  - coinbase-grpc-ingress.yaml
-  - tx-blaster-deployment.yaml
-  - tx-blaster-configmap.yaml
-  - p2p-ingress.yaml
-  - p2p-ws-ingress.yaml
-  - tx-blaster-service.yaml
+- service.yaml
+- cluster-role-binding.yaml
+- service-account.yaml
+- configmap.yaml
+- asset-grpc-ingress.yaml
+- deployment.yaml
+- propagation-grpc-ingress.yaml
+- asset-http-ingress.yaml
+- asset-https-ingress.yaml
+- coinbase-grpc-ingress.yaml
+- tx-blaster-deployment.yaml
+- tx-blaster-configmap.yaml
+- p2p-ingress.yaml
+- p2p-ws-ingress.yaml
+- p2p-wss-ingress.yaml
+- tx-blaster-service.yaml
+- postgres.yaml
+images:
+- name: REPO:IMAGE:TAG
+  newName: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv
+  newTag: b552fef8d8f80b7358efddd1611f8436eb75c91c
