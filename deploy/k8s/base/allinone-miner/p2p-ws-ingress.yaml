@@ -5,6 +5,7 @@ metadata:
   labels:
     service: miner
 spec:
+  ingressClassName: traefik-allinone
   entryPoints:
     - p2p-ws
   routes:
