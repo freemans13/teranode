@@ -20,7 +20,3 @@ resources:
 - p2p-wss-ingress.yaml
 - tx-blaster-service.yaml
 - postgres-pvc.yaml
-images:
-- name: REPO:IMAGE:TAG
-  newName: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv
-  newTag: b552fef8d8f80b7358efddd1611f8436eb75c91c
