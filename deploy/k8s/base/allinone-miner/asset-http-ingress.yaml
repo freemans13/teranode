@@ -1,15 +1,14 @@
 apiVersion: traefik.containo.us/v1alpha1
-kind: IngressRouteTCP
+kind: IngressRoute
 metadata:
   name: tcp-80-http-asset-miner
   labels:
     service: miner
 spec:
-  ingressClassName: traefik-allinone
   entryPoints:
     - miner
   routes:
-  - match: HostSNI(`*`)
+  - match: HostSNI(`miner.allinone.ubsv.dev`)
     services:
     - name: miner
       port: 8090
