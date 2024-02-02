@@ -1,15 +1,16 @@
 apiVersion: traefik.containo.us/v1alpha1
-kind: IngressRoute
+kind: IngressRouteTCP
 metadata:
   name: tcp-80-http-asset-miner
   labels:
     service: miner
+  annotations:
+    kubernetes.io/ingress.class: "traefik-allinone"
 spec:
   entryPoints:
     - miner
   routes:
-  - match: Host(`miner.allinone.ubsv.dev`)
-    kind: Rule
+  - match: HostSNI(`*`)
     services:
     - name: miner
       port: 8090
