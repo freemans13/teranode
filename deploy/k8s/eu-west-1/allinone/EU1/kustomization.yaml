@@ -4,11 +4,11 @@ kind: Kustomization
 resources:
   - ../../../base/allinone-miner
 
-namespace: miner1
+namespace: minerEU1
 
-nameSuffix: "1"
+nameSuffix: "EU1"
 commonLabels:
-  app: miner1
+  app: minerEU1
 
 configMapGenerator:
   - behavior: merge
@@ -21,44 +21,47 @@ configMapGenerator:
     name: tx-blaster-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=allinone.miner.1
+      - SETTINGS_CONTEXT=allinone.miner.EU.1
     name: config-miner
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=allinone.miner.1
-    name: tx-blaster-config
-  - behavior: merge
-    literals:
-      - coinbase_grpcAddress=miner1.miner1.svc.cluster.local:8093
+      - SETTINGS_CONTEXT=allinone.miner.EU.1
     name: tx-blaster-config
 
 patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: miner1
+        value: minerEU1
     target:
       kind: IngressRouteTCP
       labelSelector: service=miner
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: miner-service1
+        value: minerEU1
       - op: replace
         path: /spec/routes/0/match
-        value: Host(`miner1.allinone.ubsv.dev`)
+        value: Host(`minerEU1.allinone.ubsv.dev`)
     target:
       kind: IngressRoute
       labelSelector: service=miner
   - patch: |-
       - op: replace
         path: /subjects/0/namespace
-        value: miner1
+        value: minerEU1
     target:
       kind: ClusterRoleBinding
   - patch: |-
       - op: replace
         path: /spec/template/spec/serviceAccountName
-        value: sa-miner1
+        value: sa-minerEU1
     target:
       kind: Deployment
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/1/persistentVolumeClaim/claimName
+        value: postgres-pvcEU1
+    target:
+      kind: Deployment
+      labelSelector: service=miner

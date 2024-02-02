@@ -1,0 +1,17 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: https-443-miner
+  labels:
+    service: miner
+spec:
+  entryPoints:
+    - websecure # Service port expecting HTTPS
+  routes:
+  - match: Host(`miner.allinone.ubsv.dev`)
+    kind: Rule
+    services:
+    - name: miner
+      port: 8090  # Service port expecting HTTP
+  tls:
+    secretName: wildcard-tls-custom

@@ -6,6 +6,7 @@ resources:
 - cluster-role-binding.yaml
 - service-account.yaml
 - configmap.yaml
+- postgres_configmap.yaml
 - asset-grpc-ingress.yaml
 - deployment.yaml
 - propagation-grpc-ingress.yaml
@@ -18,7 +19,7 @@ resources:
 - p2p-ws-ingress.yaml
 - p2p-wss-ingress.yaml
 - tx-blaster-service.yaml
-- postgres.yaml
+- postgres-pvc.yaml
 images:
 - name: REPO:IMAGE:TAG
   newName: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv

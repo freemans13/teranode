@@ -40,7 +40,7 @@ spec:
           envFrom:
             - configMapRef:
                 name: config-miner
-          env: 
+          env:
             - name: "blockchain_store"
               value: "postgres://postgres:postgres@localhost:5432/blockchain"
             - name: "coinbase_store"
@@ -82,40 +82,42 @@ spec:
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
               name: subtree-store-ttl
-          readinessProbe:
-            # run grpcurl command
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
-                - grpcurl -insecure localhost:8093 coinbase_api.CoinbaseAPI.Health && grpcurl -insecure localhost:8084 propagation_api.PropagationAPI.Health && grpcurl -insecure localhost:8081 validator_api.ValidatorAPI.Health && grpcurl -insecure localhost:8087 blockchain_api.BlockchainAPI.Health && grpcurl -insecure localhost:8091 asset_api.AssetAPI.Health && grpcurl -insecure localhost:8085 blockassembly_api.BlockAssemblyAPI.Health && grpcurl -insecure localhost:8088 blockvalidation_api.BlockValidationAPI.Health
-            initialDelaySeconds: 1
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 3
-          livenessProbe:
-            # run grpcurl command
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
-                - grpcurl -insecure localhost:8093 coinbase_api.CoinbaseAPI.Health && grpcurl -insecure localhost:8084 propagation_api.PropagationAPI.Health && grpcurl -insecure localhost:8081 validator_api.ValidatorAPI.Health && grpcurl -insecure localhost:8087 blockchain_api.BlockchainAPI.Health && grpcurl -insecure localhost:8091 asset_api.AssetAPI.Health && grpcurl -insecure localhost:8085 blockassembly_api.BlockAssemblyAPI.Health && grpcurl -insecure localhost:8088 blockvalidation_api.BlockValidationAPI.Health
-            initialDelaySeconds: 1
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 3
+          # readinessProbe:
+          #   # run grpcurl command
+          #   exec:
+          #     command:
+          #       - /bin/sh
+          #       - -c
+          #       # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
+          #       - grpcurl -insecure localhost:8093 coinbase_api.CoinbaseAPI.Health && grpcurl -insecure localhost:8084 propagation_api.PropagationAPI.Health && grpcurl -insecure localhost:8081 validator_api.ValidatorAPI.Health && grpcurl -insecure localhost:8087 blockchain_api.BlockchainAPI.Health && grpcurl -insecure localhost:8091 asset_api.AssetAPI.Health && grpcurl -insecure localhost:8085 blockassembly_api.BlockAssemblyAPI.Health && grpcurl -insecure localhost:8088 blockvalidation_api.BlockValidationAPI.Health
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 3
+          # livenessProbe:
+          #   # run grpcurl command
+          #   exec:
+          #     command:
+          #       - /bin/sh
+          #       - -c
+          #       # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
+          #       - grpcurl -insecure localhost:8093 coinbase_api.CoinbaseAPI.Health && grpcurl -insecure localhost:8084 propagation_api.PropagationAPI.Health && grpcurl -insecure localhost:8081 validator_api.ValidatorAPI.Health && grpcurl -insecure localhost:8087 blockchain_api.BlockchainAPI.Health && grpcurl -insecure localhost:8091 asset_api.AssetAPI.Health && grpcurl -insecure localhost:8085 blockassembly_api.BlockAssemblyAPI.Health && grpcurl -insecure localhost:8088 blockvalidation_api.BlockValidationAPI.Health
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 3
         - name: postgres-sidecar
           image: postgres:latest
           env:
           - name: POSTGRES_PASSWORD
             value: postgres
+          - name: PGDATA
+            value: /data/subtreestore-ttl/postgres
           volumeMounts:
           - name: postgres-storage
             mountPath: /var/lib/postgresql/data
           - name: init-script
-            mountPath: /docker-entrypoint-initdb.d
+            mountPath: /docker-entrypoint-initdb.d/create-db.sql
             # SubPath ensures only your script is mounted, not the entire ConfigMap directory
             subPath: create-db.sql
       volumes:
