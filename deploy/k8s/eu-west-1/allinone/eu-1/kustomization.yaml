@@ -4,11 +4,11 @@ kind: Kustomization
 resources:
   - ../../../base/allinone-miner
 
-namespace: minerEU1
+namespace: miner-eu-1
 
-nameSuffix: "EU1"
+nameSuffix: "-eu-1"
 commonLabels:
-  app: minerEU1
+  app: miner-eu-1
 
 configMapGenerator:
   - behavior: merge
@@ -32,36 +32,36 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: minerEU1
+        value: miner-eu-1
     target:
       kind: IngressRouteTCP
       labelSelector: service=miner
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: minerEU1
+        value: miner-eu-1
       - op: replace
         path: /spec/routes/0/match
-        value: Host(`minerEU1.allinone.ubsv.dev`)
+        value: Host(`miner-eu-1.allinone.ubsv.dev`)
     target:
       kind: IngressRoute
       labelSelector: service=miner
   - patch: |-
       - op: replace
         path: /subjects/0/namespace
-        value: minerEU1
+        value: miner-eu-1
     target:
       kind: ClusterRoleBinding
   - patch: |-
       - op: replace
         path: /spec/template/spec/serviceAccountName
-        value: sa-minerEU1
+        value: sa-miner-eu-1
     target:
       kind: Deployment
   - patch: |-
       - op: replace
         path: /spec/template/spec/volumes/1/persistentVolumeClaim/claimName
-        value: postgres-pvcEU1
+        value: postgres-pvc-eu-1
     target:
       kind: Deployment
       labelSelector: service=miner
