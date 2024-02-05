@@ -106,13 +106,13 @@ spec:
           #   periodSeconds: 10
           #   failureThreshold: 5
           #   timeoutSeconds: 3
-        - name: postgres-sidecar
+        - name: postgres
           image: postgres:latest
           env:
           - name: POSTGRES_PASSWORD
             value: postgres
           - name: PGDATA
-            value: /data/subtreestore-ttl/postgres
+            value: /var/lib/postgresql/data
           volumeMounts:
           - name: postgres-storage
             mountPath: /var/lib/postgresql/data

@@ -45,8 +45,6 @@ spec:
               value: tx-blaster-service
 
           ports:
-            - containerPort: 8086
-              protocol: TCP
             - containerPort: 9091
               protocol: TCP
             - containerPort: 9092

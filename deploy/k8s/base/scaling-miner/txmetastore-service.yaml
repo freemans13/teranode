@@ -16,10 +16,6 @@
 #  selector:
 #    app: txmetastore
 #  ports:
-#    - name: grpc
-#      port: 8086
-#      targetPort: 8086
-#      protocol: TCP
 #    - name: profiler
 #      port: 9091
 #      targetPort: 9091

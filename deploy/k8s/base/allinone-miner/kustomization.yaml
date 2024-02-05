@@ -1,21 +1,21 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - service.yaml
-  - cluster-role-binding.yaml
-  - service-account.yaml
-  - configmap.yaml
-  - postgres_configmap.yaml
   - asset-grpc-ingress.yaml
-  - deployment.yaml
-  - propagation-grpc-ingress.yaml
   - asset-http-ingress.yaml
   - asset-https-ingress.yaml
+  - cluster-role-binding.yaml
   - coinbase-grpc-ingress.yaml
-  - tx-blaster-deployment.yaml
-  - tx-blaster-configmap.yaml
+  - miner-configmap.yaml
+  - miner-service.yaml
+  - miner.yaml
   - p2p-ingress.yaml
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml
-  - tx-blaster-service.yaml
+  - postgres_configmap.yaml
   - postgres-pvc.yaml
+  - propagation-grpc-ingress.yaml
+  - service-account.yaml
+  - tx-blaster-configmap.yaml
+  - tx-blaster-service.yaml
+  - tx-blaster.yaml
