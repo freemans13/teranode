@@ -82,30 +82,30 @@ spec:
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
               name: subtree-store-ttl
-          # readinessProbe:
-          #   # run grpcurl command
-          #   exec:
-          #     command:
-          #       - /bin/sh
-          #       - -c
-          #       # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
-          #       - grpcurl -insecure localhost:8093 coinbase_api.CoinbaseAPI.Health && grpcurl -insecure localhost:8084 propagation_api.PropagationAPI.Health && grpcurl -insecure localhost:8081 validator_api.ValidatorAPI.Health && grpcurl -insecure localhost:8087 blockchain_api.BlockchainAPI.Health && grpcurl -insecure localhost:8091 asset_api.AssetAPI.Health && grpcurl -insecure localhost:8085 blockassembly_api.BlockAssemblyAPI.Health && grpcurl -insecure localhost:8088 blockvalidation_api.BlockValidationAPI.Health
-          #   initialDelaySeconds: 1
-          #   periodSeconds: 10
-          #   failureThreshold: 5
-          #   timeoutSeconds: 3
-          # livenessProbe:
-          #   # run grpcurl command
-          #   exec:
-          #     command:
-          #       - /bin/sh
-          #       - -c
-          #       # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
-          #       - grpcurl -insecure localhost:8093 coinbase_api.CoinbaseAPI.Health && grpcurl -insecure localhost:8084 propagation_api.PropagationAPI.Health && grpcurl -insecure localhost:8081 validator_api.ValidatorAPI.Health && grpcurl -insecure localhost:8087 blockchain_api.BlockchainAPI.Health && grpcurl -insecure localhost:8091 asset_api.AssetAPI.Health && grpcurl -insecure localhost:8085 blockassembly_api.BlockAssemblyAPI.Health && grpcurl -insecure localhost:8088 blockvalidation_api.BlockValidationAPI.Health
-          #   initialDelaySeconds: 1
-          #   periodSeconds: 10
-          #   failureThreshold: 5
-          #   timeoutSeconds: 3
+          readinessProbe:
+            # run grpcurl command
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
+                - grpcurl -plaintext localhost:8093 coinbase_api.CoinbaseAPI.HealthGRPC && grpcurl -plaintext localhost:8084 propagation_api.PropagationAPI.HealthGRPC && grpcurl -plaintext localhost:8087 blockchain_api.BlockchainAPI.HealthGRPC && grpcurl -plaintext localhost:8091 asset_api.AssetAPI.HealthGRPC && grpcurl -plaintext localhost:8085 blockassembly_api.BlockAssemblyAPI.HealthGRPC && grpcurl -plaintext localhost:8088 blockvalidation_api.BlockValidationAPI.HealthGRPC
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            # run grpcurl command
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
+                - grpcurl -plaintext localhost:8093 coinbase_api.CoinbaseAPI.HealthGRPC && grpcurl -plaintext localhost:8084 propagation_api.PropagationAPI.HealthGRPC && grpcurl -plaintext localhost:8087 blockchain_api.BlockchainAPI.HealthGRPC && grpcurl -plaintext localhost:8091 asset_api.AssetAPI.HealthGRPC && grpcurl -plaintext localhost:8085 blockassembly_api.BlockAssemblyAPI.HealthGRPC && grpcurl -plaintext localhost:8088 blockvalidation_api.BlockValidationAPI.HealthGRPC
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
         - name: postgres
           image: postgres:latest
           env:
