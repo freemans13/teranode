@@ -14,6 +14,7 @@ resources:
   - p2p-wss-ingress.yaml
   - postgres_configmap.yaml
   - postgres-pvc.yaml
+  - subtree-pvc.yaml
   - propagation-grpc-ingress.yaml
   - service-account.yaml
   - tx-blaster-configmap.yaml
