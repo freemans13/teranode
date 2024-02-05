@@ -330,9 +330,11 @@ func Start() {
 			profilerAddr, startProfiler = gocore.Config().Get("tx_blaster_profilerAddr", ":9191")
 		}
 
-		gocore.StartStatsServer(profilerAddr)
-
 		if startProfiler {
+			gocore.RegisterStatsHandlers()
+			prefix, _ := gocore.Config().Get("stats_prefix")
+			logger.Infof("StatsServer listening on http://%s/%s/stats", profilerAddr, prefix)
+
 			logger.Infof("Starting profile on http://%s/debug/pprof", profilerAddr)
 			logger.Fatalf("%v", http.ListenAndServe(profilerAddr, nil))
 		}
