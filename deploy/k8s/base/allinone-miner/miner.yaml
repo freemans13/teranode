@@ -42,13 +42,13 @@ spec:
                 name: config-miner
           env:
             - name: "blockchain_store"
-              value: "postgres://postgres:postgres@localhost:5432/blockchain"
+              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/blockchain"
             - name: "coinbase_store"
-              value: "postgres://postgres:postgres@localhost:5432/coinbase"
+              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/coinbase"
             - name: "txmeta_store"
-              value: "postgres://postgres:postgres@localhost:5432/txmeta"
+              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/txmeta"
             - name: "utxostore"
-              value: "postgres://postgres:postgres@localhost:5432/utxostore"
+              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/utxostore"
           ports:
             - containerPort: 4040
               protocol: TCP
@@ -74,11 +74,11 @@ spec:
               protocol: UDP
           resources:
             requests:
-              memory: 15Gi
-              cpu: "8"
+              memory: 4Gi
+              cpu: "1"
             limits:
-              memory: 15Gi
-              cpu: "8"
+              memory: 4Gi
+              cpu: "1"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
               name: subtree-store-ttl
