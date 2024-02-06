@@ -35,12 +35,12 @@ spec:
       containers:
         - name: miner
           image: REPO:IMAGE:TAG
-          #          command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
-          args: [ ]
+          # command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
+          args: [ "-wait_for_postgres=1" ]
           envFrom:
             - configMapRef:
                 name: config-miner
-          env: 
+          env:
             - name: "blockchain_store"
               value: "postgres://postgres:postgres@localhost:5432/blockchain"
             - name: "coinbase_store"
@@ -89,7 +89,7 @@ spec:
                 - /bin/sh
                 - -c
                 # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
-                - grpcurl -insecure localhost:8093 coinbase_api.CoinbaseAPI.Health && grpcurl -insecure localhost:8084 propagation_api.PropagationAPI.Health && grpcurl -insecure localhost:8081 validator_api.ValidatorAPI.Health && grpcurl -insecure localhost:8087 blockchain_api.BlockchainAPI.Health && grpcurl -insecure localhost:8091 asset_api.AssetAPI.Health && grpcurl -insecure localhost:8085 blockassembly_api.BlockAssemblyAPI.Health && grpcurl -insecure localhost:8088 blockvalidation_api.BlockValidationAPI.Health
+                - grpcurl -plaintext localhost:8093 coinbase_api.CoinbaseAPI.HealthGRPC && grpcurl -plaintext localhost:8084 propagation_api.PropagationAPI.HealthGRPC && grpcurl -plaintext localhost:8087 blockchain_api.BlockchainAPI.HealthGRPC && grpcurl -plaintext localhost:8091 asset_api.AssetAPI.HealthGRPC && grpcurl -plaintext localhost:8085 blockassembly_api.BlockAssemblyAPI.HealthGRPC && grpcurl -plaintext localhost:8088 blockvalidation_api.BlockValidationAPI.HealthGRPC
             initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
@@ -101,36 +101,30 @@ spec:
                 - /bin/sh
                 - -c
                 # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
-                - grpcurl -insecure localhost:8093 coinbase_api.CoinbaseAPI.Health && grpcurl -insecure localhost:8084 propagation_api.PropagationAPI.Health && grpcurl -insecure localhost:8081 validator_api.ValidatorAPI.Health && grpcurl -insecure localhost:8087 blockchain_api.BlockchainAPI.Health && grpcurl -insecure localhost:8091 asset_api.AssetAPI.Health && grpcurl -insecure localhost:8085 blockassembly_api.BlockAssemblyAPI.Health && grpcurl -insecure localhost:8088 blockvalidation_api.BlockValidationAPI.Health
+                - grpcurl -plaintext localhost:8093 coinbase_api.CoinbaseAPI.HealthGRPC && grpcurl -plaintext localhost:8084 propagation_api.PropagationAPI.HealthGRPC && grpcurl -plaintext localhost:8087 blockchain_api.BlockchainAPI.HealthGRPC && grpcurl -plaintext localhost:8091 asset_api.AssetAPI.HealthGRPC && grpcurl -plaintext localhost:8085 blockassembly_api.BlockAssemblyAPI.HealthGRPC && grpcurl -plaintext localhost:8088 blockvalidation_api.BlockValidationAPI.HealthGRPC
             initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
-        - name: postgres-sidecar
+        - name: postgres
           image: postgres:latest
+          args: ["-c", "max_connections=1000"]
           env:
           - name: POSTGRES_PASSWORD
             value: postgres
+          - name: PGDATA
+            value: /var/lib/postgresql/data/pgdata
           volumeMounts:
           - name: postgres-storage
             mountPath: /var/lib/postgresql/data
           - name: init-script
-            mountPath: /docker-entrypoint-initdb.d
+            mountPath: /docker-entrypoint-initdb.d/create-db.sql
             # SubPath ensures only your script is mounted, not the entire ConfigMap directory
             subPath: create-db.sql
       volumes:
       - name: subtree-store-ttl
-        ephemeral:
-          volumeClaimTemplate:
-            metadata:
-              labels:
-                type: subtreestore-ttl
-            spec:
-              accessModes: [ "ReadWriteOnce" ]
-              storageClassName: "io2-xfs-low-iops"
-              resources:
-                requests:
-                  storage: 1000Gi
+        persistentVolumeClaim:
+          claimName: subtree-pvc
       - name: postgres-storage
         persistentVolumeClaim:
           claimName: postgres-pvc

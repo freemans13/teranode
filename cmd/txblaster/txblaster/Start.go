@@ -330,9 +330,11 @@ func Start() {
 			profilerAddr, startProfiler = gocore.Config().Get("tx_blaster_profilerAddr", ":9191")
 		}
 
-		gocore.StartStatsServer(profilerAddr)
-
 		if startProfiler {
+			gocore.RegisterStatsHandlers()
+			prefix, _ := gocore.Config().Get("stats_prefix")
+			logger.Infof("StatsServer listening on http://%s/%s/stats", profilerAddr, prefix)
+
 			logger.Infof("Starting profile on http://%s/debug/pprof", profilerAddr)
 			logger.Fatalf("%v", http.ListenAndServe(profilerAddr, nil))
 		}
@@ -430,12 +432,6 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 		case <-ctx.Done():
 			return
 		default:
-			if rateLimit > 0 {
-				logger.Infof("starting worker %d with rate limit: %0.2f/s", workerId, rateLimit)
-			} else {
-				logger.Infof("starting worker %d", workerId)
-			}
-
 			w, err = worker.NewWorker(
 				logger,
 				rateLimit,
@@ -462,6 +458,12 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 				logger.Errorf("Could not initialise worker %d: %v. Sleeping for 5 seconds", workerId, err)
 				time.Sleep(5 * time.Second)
 				continue
+			}
+
+			if rateLimit > 0 {
+				logger.Infof("starting worker %d with rate limit: %0.2f/s", workerId, rateLimit)
+			} else {
+				logger.Infof("starting worker %d", workerId)
 			}
 
 			// start will only return if an error occurs

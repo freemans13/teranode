@@ -50,14 +50,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: tx-blaster-service
-            - name: tx_blaster_profilerAddr
-              value: 0.0.0.0:9092
           ports:
-            - containerPort: 8086
-              protocol: TCP
             - containerPort: 9091
-              protocol: TCP
-            - containerPort: 9092
               protocol: TCP
             - containerPort: 4040
               protocol: TCP
