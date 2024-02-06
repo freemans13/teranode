@@ -63,8 +63,8 @@ patches:
     kind: Deployment
 - patch: |-
     - op: replace
-      path: /spec/template/spec/volumes/1/persistentVolumeClaim/claimName
+      path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
       value: postgres-pvc-eu-1
   target:
     kind: Deployment
-    labelSelector: service=miner
+    labelSelector: service=postgres

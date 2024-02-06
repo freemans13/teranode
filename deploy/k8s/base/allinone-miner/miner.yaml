@@ -106,28 +106,7 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
-        - name: postgres
-          image: postgres:latest
-          args: ["-c", "max_connections=1000"]
-          env:
-          - name: POSTGRES_PASSWORD
-            value: postgres
-          - name: PGDATA
-            value: /var/lib/postgresql/data/pgdata
-          volumeMounts:
-          - name: postgres-storage
-            mountPath: /var/lib/postgresql/data
-          - name: init-script
-            mountPath: /docker-entrypoint-initdb.d/create-db.sql
-            # SubPath ensures only your script is mounted, not the entire ConfigMap directory
-            subPath: create-db.sql
       volumes:
       - name: subtree-store-ttl
         persistentVolumeClaim:
           claimName: subtree-pvc
-      - name: postgres-storage
-        persistentVolumeClaim:
-          claimName: postgres-pvc
-      - name: init-script
-        configMap:
-          name: postgres-init-scripts

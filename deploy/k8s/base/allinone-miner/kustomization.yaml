@@ -12,6 +12,8 @@ resources:
   - p2p-ingress.yaml
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml
+  - postgres.yaml
+  - postgres-service.yaml
   - postgres_configmap.yaml
   - postgres-pvc.yaml
   - subtree-pvc.yaml
