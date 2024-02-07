@@ -4,8 +4,6 @@ metadata:
   name: p2p-ws-ingress-9906
   labels:
     service: miner
-  # annotations:
-  #   kubernetes.io/ingress.class: "traefik-allinone"
 spec:
   entryPoints:
     - p2p-ws

@@ -9,9 +9,6 @@ spec:
     - p2p-ws
   routes:
     - match: HostSNI(`*`)
-#      middlewares:
-#        - name: wss-headers
-#          namespace: traefik
       services:
         - name: p2p-service
           port: 9906
