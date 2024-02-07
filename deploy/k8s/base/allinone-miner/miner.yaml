@@ -4,13 +4,13 @@ metadata:
   name: miner
   namespace: miner
   labels:
-    service: miner
+    app: miner
     project: miner
 spec:
   replicas: 1
   selector:
     matchLabels:
-      service: miner
+      app: miner
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -19,7 +19,7 @@ spec:
   template:
     metadata:
       labels:
-        service: miner
+        app: miner
     spec:
       serviceAccountName: miner-sa
       # affinity to attempt as much as possible not to schedule same instance types on the same k8s host/node
@@ -30,7 +30,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    service: miner
+                    app: miner
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: miner

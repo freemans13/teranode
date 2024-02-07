@@ -7,11 +7,6 @@ resources:
 namespace: miner-lo-1
 
 nameSuffix: -lo-1
-labels:
-- includeSelectors: true
-  pairs:
-    app: miner-lo-1
-
 
 configMapGenerator:
 - behavior: merge

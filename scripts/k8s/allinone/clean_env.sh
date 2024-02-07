@@ -1,24 +1,12 @@
-TXBLASTER_EXISTS=$(kubectl get deployment -l service=tx-blaster --output 'jsonpath={.items}')
-if [[ ! -z $TXBLASTER_EXIST ]]; then
-  TXBLASTER=$(kubectl get deployment -l service=tx-blaster --output 'jsonpath={.items[0].metadata.name}')
-  kubectl scale deployment $TXBLASTER --replicas 0
-fi
+TXBLASTER=$(kkubectl get deployment -l app=tx-blaster --output 'jsonpath={.items[0].metadata.name}')
+kubectl scale deployment $TXBLASTER --replicas 0
 
-MINER_EXISTS=$(kubectl get deployment -l service=miner --output 'jsonpath={.items}')
-if [[ ! -z $MINER_EXIST ]]; then
-  MINER=$(kubectl get deployment -l service=miner --output 'jsonpath={.items[0].metadata.name}')
-  kubectl scale deployment $MINER --replicas 0
-fi
+MINER=$(kubectl get deployment -l app=miner --output 'jsonpath={.items[0].metadata.name}')
+kubectl scale deployment $MINER --replicas 0
 
 kubectl exec -it $(kubectl get pod -l service=postgres -o name) -- psql -h localhost -U postgres -d blockchain -c "drop table if exists state; drop table if exists blocks;"
 kubectl exec -it $(kubectl get pod -l service=postgres -o name) -- psql -h localhost -U postgres -d coinbase -c "drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists state; drop table if exists blocks;"
 kubectl exec -it $(kubectl get pod -l service=postgres -o name) -- psql -h localhost -U postgres -d txmeta -c "drop table if exists txmeta;"
 kubectl exec -it $(kubectl get pod -l service=postgres -o name) -- psql -h localhost -U postgres -d utxostore -c "drop table if exists utxos;"
 
-if [[ ! -z $MINER ]]; then
-  kubectl scale deployment $MINER --replicas 1
-fi
-
-if [[ ! -z $TXBLASTER ]]; then
-  kubectl scale deployment $TXBLASTER --replicas 1
-fi
+kubectl scale deployment $MINER --replicas 1
