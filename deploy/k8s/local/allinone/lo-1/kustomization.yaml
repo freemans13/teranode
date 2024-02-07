@@ -75,3 +75,9 @@ patches:
   target:
     kind: Deployment
     labelSelector: service=miner
+- patch: |-
+    - op: replace
+      path: /spec/storageClassName
+      value: hostpath
+  target:
+    kind: PersistentVolumeClaim

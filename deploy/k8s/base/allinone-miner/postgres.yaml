@@ -35,7 +35,7 @@ spec:
       containers:
         - name: postgres
           image: postgres:latest
-          args: ["-c", "max_connections=1000"]
+          args: ["-c", "max_connections=1000", "-c", "listen_addresses=*"]
           env:
           - name: POSTGRES_PASSWORD
             value: postgres
@@ -46,11 +46,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1Gi
-              cpu: "1"
+              memory: 8Gi
+              cpu: "2"
             limits:
-              memory: 1Gi
-              cpu: "1"
+              memory: 8Gi
+              cpu: "2"
           volumeMounts:
           - name: postgres-storage
             mountPath: /var/lib/postgresql/data
