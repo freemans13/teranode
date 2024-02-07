@@ -8,7 +8,7 @@ metadata:
   #   kubernetes.io/ingress.class: "traefik-allinone"
 spec:
   entryPoints:
-    - miner
+    - web
   routes:
   - match: HostSNI(`*`)
     services:
