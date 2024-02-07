@@ -4,7 +4,7 @@ metadata:
   name: miner
   namespace: miner
   labels:
-    service: miner
+    app: miner
   annotations:
     prometheus.io/port: "9091"
     prometheus.io/scrape: "true"
@@ -14,7 +14,7 @@ spec:
   ipFamilies:
     - IPv4
   selector:
-    service: miner
+    app: miner
   ports:
     - name: delve
       port: 4040
