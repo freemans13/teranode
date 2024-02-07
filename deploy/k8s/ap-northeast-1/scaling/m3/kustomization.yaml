@@ -7,8 +7,10 @@ resources:
 namespace: m3
 
 nameSuffix: "3"
-commonLabels:
-  miner: m3
+labels:
+- includeSelectors: true
+  pairs:
+    app: m3
 
 configMapGenerator:
   - behavior: merge

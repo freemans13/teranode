@@ -7,8 +7,10 @@ resources:
 namespace: m1
 
 nameSuffix: "1"
-commonLabels:
-  miner: m1
+labels:
+- includeSelectors: true
+  pairs:
+    app: m1
 
 configMapGenerator:
   - behavior: merge
