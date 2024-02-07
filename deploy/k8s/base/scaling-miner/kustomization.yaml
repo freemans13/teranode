@@ -19,7 +19,7 @@ resources:
   - blockvalidation-service.yaml
   - blockvalidation.yaml
   - cluster-role-binding.yaml
-  - coinbase-configmap.yaml
+  - coinbase-config-map.yaml
   - coinbase-deployment.yaml
   - coinbase-grpc-ingress.yaml
   - coinbase-service.yaml
