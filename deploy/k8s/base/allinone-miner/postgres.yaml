@@ -46,10 +46,10 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 8Gi
+              memory: 4Gi
               cpu: "2"
             limits:
-              memory: 8Gi
+              memory: 4Gi
               cpu: "2"
           volumeMounts:
           - name: postgres-storage
