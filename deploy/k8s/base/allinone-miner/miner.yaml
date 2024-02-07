@@ -43,6 +43,15 @@ spec:
           env:
             - name: "postgres_check_address"
               value: "postgres-lo-1.miner-lo-1.svc.cluster.local:5432"
+            - name: "blockchain_store"
+              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/blockchain"
+            - name: "coinbase_store"
+              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/coinbase"
+            - name: "txmeta_store"
+              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/txmeta"
+            - name: "utxostore"
+              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/utxostore"
+
           ports:
             - containerPort: 4040
               protocol: TCP
@@ -76,30 +85,30 @@ spec:
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
               name: subtree-store-ttl
-          # readinessProbe:
-          #   # run grpcurl command
-          #   exec:
-          #     command:
-          #       - /bin/sh
-          #       - -c
-          #       # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
-          #       - grpcurl -plaintext localhost:8093 coinbase_api.CoinbaseAPI.HealthGRPC && grpcurl -plaintext localhost:8084 propagation_api.PropagationAPI.HealthGRPC && grpcurl -plaintext localhost:8087 blockchain_api.BlockchainAPI.HealthGRPC && grpcurl -plaintext localhost:8091 asset_api.AssetAPI.HealthGRPC && grpcurl -plaintext localhost:8085 blockassembly_api.BlockAssemblyAPI.HealthGRPC && grpcurl -plaintext localhost:8088 blockvalidation_api.BlockValidationAPI.HealthGRPC
-          #   initialDelaySeconds: 1
-          #   periodSeconds: 10
-          #   failureThreshold: 5
-          #   timeoutSeconds: 3
-          # livenessProbe:
-          #   # run grpcurl command
-          #   exec:
-          #     command:
-          #       - /bin/sh
-          #       - -c
-          #       # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
-          #       - grpcurl -plaintext localhost:8093 coinbase_api.CoinbaseAPI.HealthGRPC && grpcurl -plaintext localhost:8084 propagation_api.PropagationAPI.HealthGRPC && grpcurl -plaintext localhost:8087 blockchain_api.BlockchainAPI.HealthGRPC && grpcurl -plaintext localhost:8091 asset_api.AssetAPI.HealthGRPC && grpcurl -plaintext localhost:8085 blockassembly_api.BlockAssemblyAPI.HealthGRPC && grpcurl -plaintext localhost:8088 blockvalidation_api.BlockValidationAPI.HealthGRPC
-          #   initialDelaySeconds: 1
-          #   periodSeconds: 10
-          #   failureThreshold: 5
-          #   timeoutSeconds: 3
+          readinessProbe:
+            # run grpcurl command
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
+                - grpcurl -plaintext localhost:8093 coinbase_api.CoinbaseAPI.HealthGRPC && grpcurl -plaintext localhost:8084 propagation_api.PropagationAPI.HealthGRPC && grpcurl -plaintext localhost:8087 blockchain_api.BlockchainAPI.HealthGRPC && grpcurl -plaintext localhost:8091 asset_api.AssetAPI.HealthGRPC && grpcurl -plaintext localhost:8085 blockassembly_api.BlockAssemblyAPI.HealthGRPC && grpcurl -plaintext localhost:8088 blockvalidation_api.BlockValidationAPI.HealthGRPC
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            # run grpcurl command
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                # this hacky but siggi and joe agreed to do it that way because all in one configuration is just for testing
+                - grpcurl -plaintext localhost:8093 coinbase_api.CoinbaseAPI.HealthGRPC && grpcurl -plaintext localhost:8084 propagation_api.PropagationAPI.HealthGRPC && grpcurl -plaintext localhost:8087 blockchain_api.BlockchainAPI.HealthGRPC && grpcurl -plaintext localhost:8091 asset_api.AssetAPI.HealthGRPC && grpcurl -plaintext localhost:8085 blockassembly_api.BlockAssemblyAPI.HealthGRPC && grpcurl -plaintext localhost:8088 blockvalidation_api.BlockValidationAPI.HealthGRPC
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
       volumes:
       - name: subtree-store-ttl
         persistentVolumeClaim:

@@ -10,7 +10,7 @@ spec:
   entryPoints:
     - p2p
   routes:
-    - match: Host(`*`)
+    - match: HostSNI(`*`)
       services:
         - name: miner
           port: 9905
