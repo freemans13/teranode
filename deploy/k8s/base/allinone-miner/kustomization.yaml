@@ -18,7 +18,7 @@ resources:
   - asset-http-ingress.yaml
   - asset-https-ingress.yaml
   - coinbase-grpc-ingress.yaml
-  - p2p-ingress.yaml
+  - p2p-grpc-ingress.yaml
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml
   - propagation-grpc-ingress.yaml
