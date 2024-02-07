@@ -58,6 +58,10 @@ spec:
       port: 9906
       targetPort: 9906
       protocol: TCP
+    - name: miner-http
+      port: 8092
+      targetPort: 8092
+      protocol: TCP
     - name: quic
       port: 8384
       targetPort: 8384
