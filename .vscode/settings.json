@@ -137,6 +137,7 @@
     "timestamppb",
     "TIMESTAMPTZ",
     "tmsql",
+    "Traefik",
     "ttlcache",
     "TTLs",
     "txblast",
