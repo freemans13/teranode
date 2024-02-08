@@ -7,10 +7,6 @@ resources:
 namespace: m3
 
 nameSuffix: "3"
-labels:
-- includeSelectors: true
-  pairs:
-    app: m3
 
 configMapGenerator:
   - behavior: merge

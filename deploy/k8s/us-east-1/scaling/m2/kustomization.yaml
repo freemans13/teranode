@@ -7,10 +7,6 @@ resources:
 namespace: m2
 
 nameSuffix: "2"
-labels:
-- includeSelectors: true
-  pairs:
-    app: m2
 
 
 configMapGenerator:
