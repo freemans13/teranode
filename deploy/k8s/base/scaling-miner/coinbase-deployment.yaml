@@ -48,6 +48,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: coinbase-service
+            - name: logLevel
+              value: DEBUG
             - name: slack_channel
               valueFrom:
                 secretKeyRef:

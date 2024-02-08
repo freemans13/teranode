@@ -71,7 +71,7 @@ var dhtProtocolIdStr string
 
 var sharedKey string
 
-const privateKeyFilename = "tx-blaster.private_key"
+var privateKeyFilename = fmt.Sprintf("tx-blaster.%s.p2p.private_key", gocore.Config().GetContext())
 
 // var subscription *pubsub.Subscription
 // var p2pHost host.Host
@@ -554,7 +554,7 @@ ConnectLoop:
 						//  we fail to connect to a lot of peers. Just ignore it for now.
 						// s.logger.Debugf("Failed connecting to ", peer.ID.Pretty(), ", error:", err)
 					} else {
-						logger.Debugf("Connected to:", p.ID.String())
+						logger.Debugf("Connected to:", p.String())
 						anyConnected = true
 					}
 				}
