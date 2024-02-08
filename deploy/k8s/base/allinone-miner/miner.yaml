@@ -40,18 +40,6 @@ spec:
           envFrom:
             - configMapRef:
                 name: config-miner
-          env:
-            - name: "postgres_check_address"
-              value: "postgres-lo-1.miner-lo-1.svc.cluster.local:5432"
-            - name: "blockchain_store"
-              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/blockchain"
-            - name: "coinbase_store"
-              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/coinbase"
-            - name: "txmeta_store"
-              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/txmeta"
-            - name: "utxostore"
-              value: "postgres://postgres:postgres@postgres-lo-1.miner-lo-1.svc.cluster.local:5432/utxostore"
-
           ports:
             - containerPort: 4040
               protocol: TCP
