@@ -36,8 +36,9 @@ spec:
           operator: Equal
           effect: NoSchedule
       containers:
-        - name: blockvalidation
+        - name: blockvalidation          
           image: REPO:IMAGE:TAG
+          imagePullPolicy: Always
           args: [ "-blockvalidation=1" ]
           envFrom:
             - configMapRef:
