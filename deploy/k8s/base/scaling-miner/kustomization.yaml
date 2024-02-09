@@ -24,7 +24,7 @@ resources:
   - coinbase-grpc-ingress.yaml
   - coinbase-service.yaml
   - miner-deployment.yaml
-  - p2p-ingress.yaml
+  - p2p-grpc-ingress.yaml
   - p2p-service.yaml
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml
