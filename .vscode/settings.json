@@ -83,6 +83,7 @@
     "nullstore",
     "oneofs",
     "opentracing",
+    "optimise",
     "ordishs",
     "otel",
     "otelgrpc",

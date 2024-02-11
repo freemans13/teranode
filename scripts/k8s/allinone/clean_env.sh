@@ -1,4 +1,4 @@
-TXBLASTER=$(kkubectl get deployment -l app=tx-blaster --output 'jsonpath={.items[0].metadata.name}')
+TXBLASTER=$(kubectl get deployment -l app=tx-blaster --output 'jsonpath={.items[0].metadata.name}')
 kubectl scale deployment $TXBLASTER --replicas 0
 
 MINER=$(kubectl get deployment -l app=miner --output 'jsonpath={.items[0].metadata.name}')

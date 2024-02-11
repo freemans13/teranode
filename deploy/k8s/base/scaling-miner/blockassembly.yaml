@@ -38,6 +38,7 @@ spec:
       containers:
         - name: blockassembly
           image: REPO:IMAGE:TAG
+          imagePullPolicy: Always
           args: [ "-blockassembly=1" ]
           envFrom:
             - configMapRef:

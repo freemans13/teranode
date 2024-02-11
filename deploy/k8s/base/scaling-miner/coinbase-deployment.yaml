@@ -39,6 +39,7 @@ spec:
       containers:
         - name: coinbase
           image: REPO:IMAGE:TAG
+          imagePullPolicy: Always
           args: ["-coinbase=1"]
           envFrom:
             - configMapRef:
