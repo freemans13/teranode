@@ -29,9 +29,10 @@ spec:
       containers:
         - name: p2p
           image: REPO:IMAGE:TAG
-          args: [ "-p2p=1" ]
+          imagePullPolicy: Always
+          args: ["-p2p=1"]
           # command: "You can override the entrypoint with a command."
-#          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
           #          command: [ "./ubsv.run" ]
           envFrom:
             - configMapRef:
@@ -39,6 +40,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: p2p-service
+            - name: logLevel
+              value: DEBUG
           ports:
             - containerPort: 4040
               protocol: TCP

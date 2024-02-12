@@ -1,14 +1,15 @@
 apiVersion: traefik.containo.us/v1alpha1
-kind: IngressRouteTCP
+kind: IngressRoute
 metadata:
   name: http-80-asset
   labels:
     service: asset
 spec:
   entryPoints:
-    - web  # Ensure this corresponds to HTTP (port 80) in Traefik
+    - web # Ensure this corresponds to HTTP (port 80) in Traefik
   routes:
-  - match: HostSNI(`*`)
+  - match: Host(`m.scaling.ubsv.dev`)
+    kind: Rule
     services:
     - name: asset-service
       port: 8090

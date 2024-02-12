@@ -1,6 +1,5 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
 resources:
   - asset-configmap.yaml
   - asset-grpc-ingress.yaml
@@ -19,12 +18,12 @@ resources:
   - blockvalidation-service.yaml
   - blockvalidation.yaml
   - cluster-role-binding.yaml
-  - coinbase-configmap.yaml
+  - coinbase-config-map.yaml
   - coinbase-deployment.yaml
   - coinbase-grpc-ingress.yaml
   - coinbase-service.yaml
   - miner-deployment.yaml
-  - p2p-ingress.yaml
+  - p2p-grpc-ingress.yaml
   - p2p-service.yaml
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml

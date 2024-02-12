@@ -3,7 +3,6 @@ package txblaster
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,28 +24,18 @@ import (
 	"github.com/bitcoin-sv/ubsv/cmd/txblaster/worker"
 	_ "github.com/bitcoin-sv/ubsv/k8sresolver"
 	"github.com/bitcoin-sv/ubsv/services/coinbase"
-	"github.com/bitcoin-sv/ubsv/services/p2p"
 	"github.com/bitcoin-sv/ubsv/ulogger"
 	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
+	"github.com/bitcoin-sv/ubsv/util/p2p"
 	"github.com/libsv/go-p2p/wire"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sercand/kuberesolver/v5"
 	"google.golang.org/grpc/resolver"
 
-	"github.com/libp2p/go-libp2p"
-	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/pnet"
-	"github.com/libp2p/go-libp2p/core/protocol"
-	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 )
 
 const progname = "tx-blaster"
@@ -65,16 +54,7 @@ var ipv6MulticastConn *net.UDPConn
 var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
 var totalTransactions atomic.Uint64
 var startTime time.Time
-
-var usePrivateDht bool = false
-var dhtProtocolIdStr string
-
 var sharedKey string
-
-const privateKeyFilename = "tx-blaster.private_key"
-
-// var subscription *pubsub.Subscription
-// var p2pHost host.Host
 var topic *pubsub.Topic
 
 func Start() {
@@ -116,15 +96,20 @@ func Start() {
 	flag.Parse()
 
 	var ok bool
-	dhtProtocolIdStr, ok = gocore.Config().Get("p2p_dht_protocol_id")
+	p2pIP, ok := gocore.Config().Get("p2p_ip")
 	if !ok {
-		panic(fmt.Errorf("error getting p2p_dht_protocol_id"))
+		panic(fmt.Errorf("error getting p2p_ip"))
+	}
+	p2pPort, ok := gocore.Config().GetInt("p2p_port")
+	if !ok {
+		panic(fmt.Errorf("error getting p2p_port"))
 	}
 	sharedKey, ok = gocore.Config().Get("p2p_shared_key")
 	if !ok {
 		panic(fmt.Errorf("error getting p2p_shared_key"))
 	}
-	usePrivateDht = gocore.Config().GetBool("p2p_dht_use_private", false)
+	usePrivateDHT := gocore.Config().GetBool("p2p_dht_use_private", false)
+	optimiseRetries := gocore.Config().GetBool("p2p_optimise_retries", false)
 
 	if *e2e {
 		MIN_BLOCK_HEIGHT_FOR_E2E, _ := gocore.Config().GetInt("min_block_height_for_e2e", 200)
@@ -312,10 +297,23 @@ func Start() {
 		}
 		rejectedTxTopicName := fmt.Sprintf("%s-%s", topicPrefix, rtn)
 
-		topic, err = createlibp2pTopic(ctx, rejectedTxTopicName)
-		if err != nil {
+		config := p2p.P2PConfig{
+			ProcessName:     "tx-blaster",
+			IP:              p2pIP,
+			Port:            p2pPort,
+			SharedKey:       sharedKey,
+			UsePrivateDHT:   usePrivateDHT,
+			OptimiseRetries: optimiseRetries,
+			Advertise:       true,
+		}
+
+		p2pNode := p2p.NewP2PNode(logger, config)
+
+		if err := p2pNode.Start(ctx, rejectedTxTopicName); err != nil {
 			panic(err)
 		}
+
+		topic = p2pNode.GetTopic(rejectedTxTopicName)
 	}
 
 	printProgress = uint64(*printFlag)
@@ -478,194 +476,4 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 			}
 		}
 	}
-}
-
-func discoverPeers(ctx context.Context, topicName string, h host.Host) {
-	var kademliaDHT *dht.IpfsDHT
-	var err error
-	if usePrivateDht {
-		bootstrapAddresses, _ := gocore.Config().GetMulti("p2p_bootstrapAddresses", "|")
-		if len(bootstrapAddresses) == 0 {
-			panic(fmt.Errorf("bootstrapAddresses not set in config"))
-		}
-		for _, ba := range bootstrapAddresses {
-			bootstrapAddr, err := multiaddr.NewMultiaddr(ba)
-			if err != nil {
-				panic(err)
-			}
-
-			peerInfo, err := peer.AddrInfoFromP2pAddr(bootstrapAddr)
-			if err != nil {
-				panic(err)
-			}
-
-			// Connect to the bootstrap node.
-			err = h.Connect(ctx, *peerInfo)
-			if err != nil {
-				panic(err)
-			}
-		}
-		dhtProtocolID := protocol.ID(dhtProtocolIdStr)
-		var options []dht.Option
-		options = append(options, dht.ProtocolPrefix(dhtProtocolID))
-		options = append(options, dht.Mode(dht.ModeAuto))
-
-		// initialise the DHT
-		kademliaDHT, err = dht.New(ctx, h, options...)
-		if err != nil {
-			panic(err)
-		}
-
-		err = kademliaDHT.Bootstrap(ctx)
-		if err != nil {
-			panic(err)
-		}
-
-	} else {
-		kademliaDHT = p2p.InitDHT(ctx, h)
-	}
-	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
-
-	dutil.Advertise(ctx, routingDiscovery, topicName)
-
-	// Look for others who have announced and attempt to connect to them
-	anyConnected := false
-ConnectLoop:
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Infof("P2P service shutting down")
-			return
-		default:
-			if !anyConnected {
-				logger.Debugf("Searching for peers for topic %s..\n", topicName)
-				time.Sleep(1 * time.Second)
-				peerChan, err := routingDiscovery.FindPeers(ctx, topicName)
-				if err != nil {
-					panic(err)
-				}
-
-				for p := range peerChan {
-					if p.ID == h.ID() {
-						continue // No self connection
-					}
-					err = h.Connect(ctx, p)
-					if err != nil {
-						//  we fail to connect to a lot of peers. Just ignore it for now.
-						// s.logger.Debugf("Failed connecting to ", peer.ID.Pretty(), ", error:", err)
-					} else {
-						logger.Debugf("Connected to:", p.ID.String())
-						anyConnected = true
-					}
-				}
-
-			} else {
-				logger.Debugf("Peer discovery complete")
-				logger.Debugf("connected to %d peers\n", len(h.Network().Peers()))
-				logger.Debugf("peerstore has %d peers\n", len(h.Peerstore().Peers()))
-				break ConnectLoop
-			}
-		}
-	}
-}
-
-func createlibp2pTopic(ctx context.Context, topicName string) (*pubsub.Topic, error) {
-	logger.Debugf("Starting libp2pListener. topicName=%s, workerId:%d", topicName)
-
-	var pk *crypto.PrivKey
-	var err error
-
-	pk, err = readPrivateKey()
-	if err != nil {
-		pk, err = generatePrivateKey()
-		if err != nil {
-			return nil, err
-		}
-	}
-	var h host.Host
-	if usePrivateDht {
-
-		p2pIp, ok := gocore.Config().Get("p2p_ip")
-		if !ok {
-			panic("p2p_ip not set in config")
-		}
-		p2pPort, ok := gocore.Config().GetInt("p2p_port")
-		if !ok {
-			panic("p2p_port not set in config")
-		}
-		s := ""
-		s += fmt.Sprintln("/key/swarm/psk/1.0.0/")
-		s += fmt.Sprintln("/base16/")
-		s += sharedKey
-		psk, err := pnet.DecodeV1PSK(bytes.NewBuffer([]byte(s)))
-		if err != nil {
-			panic(err)
-		}
-		h, err = libp2p.New(
-			libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/%s/tcp/%d", p2pIp, p2pPort)),
-			libp2p.Identity(*pk),
-			libp2p.PrivateNetwork(psk),
-		)
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		// Create a new libp2p Host that listens on a random TCP port
-		h, err = libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"), libp2p.Identity(*pk))
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	go discoverPeers(ctx, topicName, h)
-	// Set up a new PubSub service using the GossipSub router
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		return nil, err
-	}
-
-	topic, err := ps.Join(topicName)
-	if err != nil {
-		return nil, err
-	}
-
-	return topic, err
-}
-
-func generatePrivateKey() (*crypto.PrivKey, error) {
-	// Generate a new key pair
-	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-
-	// Convert private key to bytes
-	privBytes, err := crypto.MarshalPrivateKey(priv)
-	if err != nil {
-		return nil, err
-	}
-
-	// Save private key to a file
-	err = os.WriteFile(privateKeyFilename, privBytes, 0644)
-	if err != nil {
-		return nil, err
-	}
-
-	return &priv, nil
-}
-
-func readPrivateKey() (*crypto.PrivKey, error) {
-	// Read private key from a file
-	privBytes, err := os.ReadFile(privateKeyFilename)
-	if err != nil {
-		return nil, err
-	}
-
-	// Unmarshal the private key bytes into a key
-	priv, err := crypto.UnmarshalPrivateKey(privBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	return &priv, nil
 }

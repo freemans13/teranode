@@ -41,6 +41,7 @@ spec:
       containers:
         - name: tx-blaster
           image: REPO:IMAGE:TAG
+          imagePullPolicy: Always
           command:
             - ./blaster.run
           args: ["-workers=4500"]

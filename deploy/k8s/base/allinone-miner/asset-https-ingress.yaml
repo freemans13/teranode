@@ -1,7 +1,7 @@
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRoute
 metadata:
-  name: https-443-miner
+  name: https-443-asset
   labels:
     service: miner
 spec:

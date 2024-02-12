@@ -37,6 +37,7 @@ spec:
       containers:
         - name: asset
           image: REPO:IMAGE:TAG
+          imagePullPolicy: Always
           args: [ "-asset=1" ]
           envFrom:
             - configMapRef:

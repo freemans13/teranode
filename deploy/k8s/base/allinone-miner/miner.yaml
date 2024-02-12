@@ -4,13 +4,13 @@ metadata:
   name: miner
   namespace: miner
   labels:
-    service: miner
+    app: miner
     project: miner
 spec:
   replicas: 1
   selector:
     matchLabels:
-      service: miner
+      app: miner
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -19,7 +19,7 @@ spec:
   template:
     metadata:
       labels:
-        service: miner
+        app: miner
     spec:
       serviceAccountName: miner-sa
       # affinity to attempt as much as possible not to schedule same instance types on the same k8s host/node
@@ -30,31 +30,25 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    service: miner
+                    app: miner
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: miner
           image: REPO:IMAGE:TAG
+          imagePullPolicy: Always
           # command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
           args: [ "-wait_for_postgres=1" ]
           envFrom:
             - configMapRef:
                 name: config-miner
-          env:
-            - name: "blockchain_store"
-              value: "postgres://postgres:postgres@localhost:5432/blockchain"
-            - name: "coinbase_store"
-              value: "postgres://postgres:postgres@localhost:5432/coinbase"
-            - name: "txmeta_store"
-              value: "postgres://postgres:postgres@localhost:5432/txmeta"
-            - name: "utxostore"
-              value: "postgres://postgres:postgres@localhost:5432/utxostore"
           ports:
             - containerPort: 4040
               protocol: TCP
             - containerPort: 8084
               protocol: TCP
             - containerPort: 8087
+              protocol: TCP
+            - containerPort: 8092
               protocol: TCP
             - containerPort: 8093
               protocol: TCP
@@ -74,11 +68,11 @@ spec:
               protocol: UDP
           resources:
             requests:
-              memory: 15Gi
-              cpu: "8"
+              memory: 8Gi
+              cpu: "2"
             limits:
-              memory: 15Gi
-              cpu: "8"
+              memory: 8Gi
+              cpu: "2"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
               name: subtree-store-ttl
@@ -106,28 +100,7 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
-        - name: postgres
-          image: postgres:latest
-          args: ["-c", "max_connections=1000"]
-          env:
-          - name: POSTGRES_PASSWORD
-            value: postgres
-          - name: PGDATA
-            value: /var/lib/postgresql/data/pgdata
-          volumeMounts:
-          - name: postgres-storage
-            mountPath: /var/lib/postgresql/data
-          - name: init-script
-            mountPath: /docker-entrypoint-initdb.d/create-db.sql
-            # SubPath ensures only your script is mounted, not the entire ConfigMap directory
-            subPath: create-db.sql
       volumes:
       - name: subtree-store-ttl
         persistentVolumeClaim:
           claimName: subtree-pvc
-      - name: postgres-storage
-        persistentVolumeClaim:
-          claimName: postgres-pvc
-      - name: init-script
-        configMap:
-          name: postgres-init-scripts

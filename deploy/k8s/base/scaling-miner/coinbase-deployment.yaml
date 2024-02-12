@@ -39,6 +39,7 @@ spec:
       containers:
         - name: coinbase
           image: REPO:IMAGE:TAG
+          imagePullPolicy: Always
           args: ["-coinbase=1"]
           envFrom:
             - configMapRef:
@@ -48,6 +49,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: coinbase-service
+            - name: logLevel
+              value: INFO
             - name: slack_channel
               valueFrom:
                 secretKeyRef:

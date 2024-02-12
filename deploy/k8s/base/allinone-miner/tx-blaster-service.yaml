@@ -9,6 +9,7 @@ metadata:
     prometheus.io/port: "9092"
     prometheus.io/scrape: "true"
 spec:
+  clusterIP: None
   ipFamilyPolicy: SingleStack
   ipFamilies:
   - IPv4

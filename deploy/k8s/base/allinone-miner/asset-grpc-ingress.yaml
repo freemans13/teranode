@@ -4,8 +4,6 @@ metadata:
   name: tcp-8091-asset-miner
   labels:
     service: miner
-  annotations:
-    kubernetes.io/ingress.class: "traefik-allinone"
 spec:
   entryPoints:
     - ast-grpc
