@@ -50,7 +50,7 @@ spec:
             - name: SERVICE_NAME
               value: coinbase-service
             - name: logLevel
-              value: DEBUG
+              value: INFO
             - name: slack_channel
               valueFrom:
                 secretKeyRef:
