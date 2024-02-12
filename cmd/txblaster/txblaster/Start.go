@@ -304,6 +304,7 @@ func Start() {
 			SharedKey:       sharedKey,
 			UsePrivateDHT:   usePrivateDHT,
 			OptimiseRetries: optimiseRetries,
+			Advertise:       true,
 		}
 
 		p2pNode := p2p.NewP2PNode(logger, config)
