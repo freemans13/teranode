@@ -27,6 +27,9 @@ configMapGenerator:
   name: tx-blaster-config
 
 patches:
+- path: add-imagepullsecrets-patch.yaml
+  target:
+    kind: Deployment
 - patch: |-
     - op: replace
       path: /spec/routes/0/services/0/name
