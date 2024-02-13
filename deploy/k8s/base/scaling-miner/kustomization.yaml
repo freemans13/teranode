@@ -46,3 +46,5 @@ resources:
   - utxostore.yaml
   - validation-service.yaml
   - validation.yaml
+  - faucet.yaml
+  - faucet-service.yaml
