@@ -16,8 +16,8 @@ spec:
     app: faucet
   ports:
     - name: tcp
-      port: 8093
-      targetPort: 8093
+      port: 8097
+      targetPort: 8097
       protocol: TCP
     - name: profiler
       port: 9091
