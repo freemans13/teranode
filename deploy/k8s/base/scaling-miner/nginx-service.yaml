@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+spec:
+  type: LoadBalancer  # Use NodePort or ClusterIP if you're not on a cloud provider that supports LoadBalancers
+  selector:
+    app: nginx-reverse-proxy
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+    # - protocol: TCP
+    #   port: 443
+    #   targetPort: 443

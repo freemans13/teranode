@@ -14,6 +14,13 @@
       "env": {
         "asset_httpAddress": "http://localhost:8090"
       },
+      "args": [
+        "-faucet=1",
+        "-blockchain=1",
+        "-asset=1",
+        "-coinbase=1",
+        "-all=0"
+      ]
     },
     {
       "name": "UBSV - aerospike",

@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-reverse-proxy
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: nginx-reverse-proxy
+  template:
+    metadata:
+      labels:
+        app: nginx-reverse-proxy
+    spec:
+      containers:
+      - name: nginx-reverse-proxy
+        image: nginx:latest  # Use an appropriate version
+        ports:
+        - containerPort: 80
+        # - containerPort: 443
+        volumeMounts:
+        - name: nginx-config-volume
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        # - name: ssl-certs
+        #   mountPath: /etc/nginx/ssl
+      volumes:
+      - name: nginx-config-volume
+        configMap:
+          name: nginx-config
+      # - name: ssl-certs
+      #   secret:
+      #     secretName: your-ssl-secret  # Ensure this secret exists and contains your SSL cert and key
