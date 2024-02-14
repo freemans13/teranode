@@ -31,6 +31,8 @@ scale_up() {
   kubectl scale deployment -n m$namespace_suffix asset$namespace_suffix --replicas 1
   kubectl scale deployment -n m$namespace_suffix blockvalidation$namespace_suffix --replicas 1
   kubectl scale deployment -n m$namespace_suffix blockassembly$namespace_suffix --replicas 1
+  kubectl scale deployment -n m$namespace_suffix faucet$namespace_suffix --replicas 1
+  kubectl scale deployment -n m$namespace_suffix nginx-reverse-proxy --replicas 1
   # wait for all 3 to be ready
   wait m$namespace_suffix asset$namespace_suffix 30
   wait m$namespace_suffix blockvalidation$namespace_suffix 30
