@@ -48,7 +48,7 @@ var logger ulogger.Logger
 
 var printProgress uint64
 
-var kafkaProducer sarama.SyncProducer
+var kafkaProducer sarama.AsyncProducer
 var kafkaTopic string
 var ipv6MulticastConn *net.UDPConn
 var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
