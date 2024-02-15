@@ -29,7 +29,6 @@ spec:
       containers:
         - name: validation
           image: REPO:IMAGE:TAG
-          imagePullPolicy: Always
           args: [ "-validator=1" ]
           envFrom:
             - configMapRef:

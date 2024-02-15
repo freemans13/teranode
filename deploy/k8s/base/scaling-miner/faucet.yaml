@@ -39,7 +39,6 @@ spec:
       containers:
         - name: faucet
           image: REPO:IMAGE:TAG
-          imagePullPolicy: Always
           args: ["-faucet=1"]
           envFrom:
             - configMapRef:

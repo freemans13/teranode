@@ -35,7 +35,6 @@ spec:
       containers:
         - name: miner
           image: REPO:IMAGE:TAG
-          imagePullPolicy: Always
           # command: [ "./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--" ]
           args: [ "-wait_for_postgres=1" ]
           envFrom:

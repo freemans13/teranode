@@ -41,7 +41,6 @@ spec:
       containers:
         - name: utxo-blaster
           image: REPO:IMAGE:TAG
-          imagePullPolicy: Always
           command:
             - ./utxostoreblaster.run
           args: ["-workers=1000", "-store=aerospike"]
