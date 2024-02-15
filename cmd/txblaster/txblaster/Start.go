@@ -297,14 +297,19 @@ func Start() {
 		}
 		rejectedTxTopicName := fmt.Sprintf("%s-%s", topicPrefix, rtn)
 
+		privateKey, _ := gocore.Config().Get("tx_blaster_p2p_private_key")
+		staticPeers, _ := gocore.Config().GetMulti("tx_blaster_p2p_static_peers", "|", []string{})
+
 		config := p2p.P2PConfig{
 			ProcessName:     "tx-blaster",
 			IP:              p2pIP,
 			Port:            p2pPort,
+			PrivateKey:      privateKey,
 			SharedKey:       sharedKey,
 			UsePrivateDHT:   usePrivateDHT,
 			OptimiseRetries: optimiseRetries,
 			Advertise:       true,
+			StaticPeers:     staticPeers,
 		}
 
 		p2pNode := p2p.NewP2PNode(logger, config)
