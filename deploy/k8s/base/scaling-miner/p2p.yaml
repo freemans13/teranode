@@ -40,7 +40,7 @@ spec:
             - name: SERVICE_NAME
               value: p2p-service
             - name: logLevel
-              value: DEBUG
+              value: INFO
           ports:
             - containerPort: 4040
               protocol: TCP
