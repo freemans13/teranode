@@ -20,7 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Shopify/sarama"
 	"github.com/bitcoin-sv/ubsv/cmd/txblaster/worker"
 	_ "github.com/bitcoin-sv/ubsv/k8sresolver"
 	"github.com/bitcoin-sv/ubsv/services/coinbase"
@@ -48,7 +47,7 @@ var logger ulogger.Logger
 
 var printProgress uint64
 
-var kafkaProducer sarama.AsyncProducer
+var kafkaProducer util.KafkaProducerI
 var kafkaTopic string
 var ipv6MulticastConn *net.UDPConn
 var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
@@ -235,7 +234,9 @@ func Start() {
 
 		defer func() {
 			_ = clusterAdmin.Close()
-			_ = producer.Close()
+			if err = producer.Close(); err != nil {
+				logger.Errorf("error closing kafka producer: %v", err)
+			}
 		}()
 
 		kafkaProducer = producer
