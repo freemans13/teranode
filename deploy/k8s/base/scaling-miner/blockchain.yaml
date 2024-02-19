@@ -34,7 +34,6 @@ spec:
       containers:
         - name: blockchain
           image: REPO:IMAGE:TAG
-          imagePullPolicy: Always
           args: [ "-blockchain=1" ]
           envFrom:
             - configMapRef:

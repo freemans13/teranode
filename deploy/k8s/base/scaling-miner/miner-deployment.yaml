@@ -34,7 +34,6 @@ spec:
             - name: SERVICE_NAME
               value: miner-service
           image: REPO:IMAGE:TAG
-          imagePullPolicy: Always
           name: miner
           ports:
             - containerPort: 8089

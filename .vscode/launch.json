@@ -14,6 +14,13 @@
       "env": {
         "asset_httpAddress": "http://localhost:8090"
       },
+      "args": [
+        "-faucet=1",
+        "-blockchain=1",
+        "-asset=1",
+        "-coinbase=1",
+        "-all=0"
+      ]
     },
     {
       "name": "UBSV - aerospike",
@@ -23,7 +30,7 @@
       "program": "${workspaceFolder}/.",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "scaling.m1",
+        "SETTINGS_CONTEXT": "dev",
         "asset_httpAddress": "http://localhost:8090",
         // "utxostore": "aerospike://localhost:3000/test?timeout=30s",
         // "txmeta_store": "aerospike://localhost:3000/test?timeout=30s"

@@ -20,7 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Shopify/sarama"
 	"github.com/bitcoin-sv/ubsv/cmd/txblaster/worker"
 	_ "github.com/bitcoin-sv/ubsv/k8sresolver"
 	"github.com/bitcoin-sv/ubsv/services/coinbase"
@@ -48,7 +47,7 @@ var logger ulogger.Logger
 
 var printProgress uint64
 
-var kafkaProducer sarama.SyncProducer
+var kafkaProducer util.KafkaProducerI
 var kafkaTopic string
 var ipv6MulticastConn *net.UDPConn
 var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
@@ -235,7 +234,9 @@ func Start() {
 
 		defer func() {
 			_ = clusterAdmin.Close()
-			_ = producer.Close()
+			if err = producer.Close(); err != nil {
+				logger.Errorf("error closing kafka producer: %v", err)
+			}
 		}()
 
 		kafkaProducer = producer
@@ -297,14 +298,19 @@ func Start() {
 		}
 		rejectedTxTopicName := fmt.Sprintf("%s-%s", topicPrefix, rtn)
 
+		privateKey, _ := gocore.Config().Get("tx_blaster_p2p_private_key")
+		staticPeers, _ := gocore.Config().GetMulti("tx_blaster_p2p_static_peers", "|", []string{})
+
 		config := p2p.P2PConfig{
 			ProcessName:     "tx-blaster",
 			IP:              p2pIP,
 			Port:            p2pPort,
+			PrivateKey:      privateKey,
 			SharedKey:       sharedKey,
 			UsePrivateDHT:   usePrivateDHT,
 			OptimiseRetries: optimiseRetries,
 			Advertise:       true,
+			StaticPeers:     staticPeers,
 		}
 
 		p2pNode := p2p.NewP2PNode(logger, config)

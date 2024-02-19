@@ -33,7 +33,7 @@ kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=m2 psql -U 
 kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;"
 
 # echo "Postgres cleaning: Asia"
-# kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
+# kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground
 # kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=m3 psql -U m3 -d m3 -c "drop table if exists state ; drop table if exists blocks;"
 # kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state ; drop table if exists blocks;"
 

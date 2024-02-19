@@ -36,7 +36,6 @@ spec:
       containers:
         - name: propagation
           image: REPO:IMAGE:TAG
-          imagePullPolicy: Always
           args: ["-propagation=1"]
           # command: "You can override the entrypoint with a command."
           #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
@@ -64,6 +63,9 @@ spec:
               cpu: "50"
             limits:
               memory: 100Gi
+          volumeMounts:
+            - name: lustre-storage
+              mountPath: /data/txstore
           readinessProbe:
             httpGet:
               path: /health
@@ -80,3 +82,7 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+      volumes:
+        - name: lustre-storage
+          persistentVolumeClaim:
+            claimName: propagation-luster-pvc

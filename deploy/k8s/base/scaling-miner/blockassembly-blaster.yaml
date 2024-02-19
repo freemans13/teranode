@@ -34,7 +34,6 @@
 #      containers:
 #        - name: blockassembly-blaster
 #          image: REPO:IMAGE:TAG
-#          imagePullPolicy: Always
 #          command:
 #            - ./blockassemblyblaster.run
 #          args: [ "-workers=200", "-broadcast=frpc", "-batch_size=10" ]
