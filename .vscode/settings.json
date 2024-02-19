@@ -186,5 +186,8 @@
     }
   },
   "go.lintTool": "golangci-lint",
-  "go.lintFlags": ["--fast"]
+  "go.lintFlags": [
+    "--fast"
+  ],
+  "cSpell.language": "en,en-US,en-GB,lorem"
 }
