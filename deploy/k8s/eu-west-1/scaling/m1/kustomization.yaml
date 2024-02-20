@@ -34,6 +34,10 @@ configMapGenerator:
     literals:
       - SETTINGS_CONTEXT=scaling.m1.propagation
     name: propagation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m1.subtreeassembly
+    name: subtreeassembly-config-m
 patches:
   - patch: |-
       - op: replace

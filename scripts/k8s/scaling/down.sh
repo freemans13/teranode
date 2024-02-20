@@ -43,7 +43,7 @@ if [ "$1" == "all" ]; then
   namespace_suffix=2
   scale_down
 
-  kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground
+  kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground
   namespace_suffix=3
   scale_down
 else
@@ -54,7 +54,7 @@ else
     kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
     namespace_suffix=2
   elif [[ "$1" == "asia" || "$1" == "m3" ]]; then
-    kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground
+    kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground
     namespace_suffix=3
   else
     echo "Auto detecting environment"
@@ -62,7 +62,7 @@ else
       namespace_suffix=1
     elif [[ $(kubectl config current-context) == *"us-east-1"* ]]; then
       namespace_suffix=2
-    elif [[ $(kubectl config current-context) == *"ap-northeast-1"* ]]; then
+    elif [[ $(kubectl config current-context) == *"ap-south-1"* ]]; then
       namespace_suffix=3
     else
       echo "Unknown context, cannot scale down. Change namespace and try again"

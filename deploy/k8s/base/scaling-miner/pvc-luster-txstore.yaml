@@ -6,7 +6,8 @@ spec:
   accessModes:
     - ReadWriteMany
   storageClassName: ""
+  volumeName: propagation-luster-pv
   resources:
     requests:
       storage: 2400Gi
-  volumeName: propagation-luster-pv
+

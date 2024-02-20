@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: propagation-luster-pv
+  name: subtree-lustre-pv
 spec:
   capacity:
     storage: 2400Gi
@@ -13,7 +13,7 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   csi:
     driver: fsx.csi.aws.com
-    volumeHandle: fs-0d78849895b00d529
+    volumeHandle: fs-006930142645b417e
     volumeAttributes:
-      dnsname: fs-0d78849895b00d529.fsx.eu-west-1.amazonaws.com
-      mountname: meetpbev
+      dnsname: fs-006930142645b417e.fsx.eu-west-1.amazonaws.com
+      mountname: isxdjbev

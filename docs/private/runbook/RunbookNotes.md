@@ -5,12 +5,12 @@ AWS Secret Access Key [None]: AAnPcnunISxXlac8UnHH9G3fgZWHUCq/3/JjlR0E
 Default region name [None]: eu-north-1
 Default output format [None]:
 
-19:00  torrejonv ~  $ aws eks update-kubeconfig --name aws-ubsv-playground --region ap-northeast-1
-Added new context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground to /Users/torrejonv/.kube/config
+19:00  torrejonv ~  $ aws eks update-kubeconfig --name aws-ubsv-playground --region ap-south-1
+Added new context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground to /Users/torrejonv/.kube/config
 
 aws eks update-kubeconfig --name aws-ubsv-playground --region  eu-west-1
 aws eks update-kubeconfig --name aws-ubsv-playground --region  us-east-1
-aws eks update-kubeconfig --name aws-ubsv-playground --region  ap-northeast-1
+aws eks update-kubeconfig --name aws-ubsv-playground --region  ap-south-1
 
 this stuff is now under your
 ~/.kube  $ vi config
@@ -132,7 +132,7 @@ alias m2='kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/
 
 
 
-alias m3='kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground; kcn m3'
+alias m3='kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground; kcn m3'
 
 
 -----
@@ -203,7 +203,7 @@ mount
 
 k get pv ### shows persistent storage
         --> CLAIM label--> m1/lustre-pv
-k describe pvc fsx-pv
+k describe pvc subtree-lustre-pv
 
 asset.yaml --> lustre is in there.
 

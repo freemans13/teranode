@@ -11,11 +11,11 @@ nameSuffix: -ap-1
 configMapGenerator:
 - behavior: merge
   literals:
-  - JAEGER_AGENT_HOST=jaeger-ap-northeast-1-agent.jaeger.svc.cluster.local
+  - JAEGER_AGENT_HOST=jaeger-ap-south-1-agent.jaeger.svc.cluster.local
   name: config-miner
 - behavior: merge
   literals:
-  - JAEGER_AGENT_HOST=jaeger-ap-northeast-1-agent.jaeger.svc.cluster.local
+  - JAEGER_AGENT_HOST=jaeger-ap-south-1-agent.jaeger.svc.cluster.local
   name: tx-blaster-config
 - behavior: merge
   literals:

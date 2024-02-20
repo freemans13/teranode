@@ -1,22 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: blockassembly
+  name: subtreeassembly
 
   labels:
-    app: blockassembly
+    app: subtreeassembly
     project: service
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: blockassembly
-  strategy:
-    type: Recreate
+      app: subtreeassembly
   template:
     metadata:
       labels:
-        app: blockassembly
+        app: subtreeassembly
     spec:
       serviceAccountName: sa-m
       affinity:
@@ -26,44 +24,42 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: blockassembly
+                    app: subtreeassembly
                 topologyKey: "kubernetes.io/hostname"
       nodeSelector:
-        role: blockassembly
+        role: subtreeassembly
       tolerations:
         - key: role
-          value: blockassembly
+          value: subtreeassembly
           operator: Equal
           effect: NoSchedule
       containers:
-        - name: blockassembly
+        - name: subtreeassembly
           image: REPO:IMAGE:TAG
-          args: [ "-blockassembly=1" ]
+          args: ["-subtreeassembly=1"]
+          # command: "You can override the entrypoint with a command."
+          #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          #          command: [ "./ubsv.run" ]
           envFrom:
             - configMapRef:
                 name: shared-config-m
             - configMapRef:
-                name: blockassembly-config-m
+                name: subtreeassembly-config-m
           env:
             - name: SERVICE_NAME
-              value: blockassembly-service
+              value: subtreeassembly-service
           ports:
-            - containerPort: 8055
-              protocol: TCP
-            - containerPort: 9091
-              protocol: TCP
             - containerPort: 4040
               protocol: TCP
           resources:
             requests:
-              memory: 475Gi
-              cpu: "105"
+              memory: 512Gi
+              cpu: "50"
             limits:
-              memory: 475Gi
+              memory: 512Gi
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
-
           readinessProbe:
             httpGet:
               path: /health
@@ -84,4 +80,3 @@ spec:
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
-
