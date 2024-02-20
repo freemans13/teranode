@@ -6,6 +6,7 @@ spec:
   type: LoadBalancer  # Use NodePort or ClusterIP if you're not on a cloud provider that supports LoadBalancers
   selector:
     app: nginx-reverse-proxy
+  loadBalancerClass: service.k8s.aws/nlb
   ports:
     - protocol: TCP
       port: 80
