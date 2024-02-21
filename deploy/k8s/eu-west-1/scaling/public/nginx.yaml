@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nginx-reverse-proxy
+  name: nginx
 spec:
   replicas: 1
   strategy:
@@ -11,14 +11,14 @@ spec:
       maxUnavailable: 0
   selector:
     matchLabels:
-      app: nginx-reverse-proxy
+      app: nginx
   template:
     metadata:
       labels:
-        app: nginx-reverse-proxy
+        app: nginx
     spec:
       containers:
-      - name: nginx-reverse-proxy
+      - name: nginx
         image: nginx:latest  # Use an appropriate version
         ports:
         - containerPort: 80
