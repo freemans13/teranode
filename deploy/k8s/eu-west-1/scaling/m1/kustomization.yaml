@@ -3,11 +3,15 @@ kind: Kustomization
 
 resources:
   - ../../../base/scaling-miner
+  - nginx-config-map.yaml
+  - nginx-service.yaml
+  - nginx.yaml
+  - cloudflare-config-map.yaml
+  - cloudflare.yaml
 
 namespace: m1
 
 nameSuffix: "1"
-
 
 configMapGenerator:
   - behavior: merge
@@ -34,6 +38,10 @@ configMapGenerator:
     literals:
       - SETTINGS_CONTEXT=scaling.m1.propagation
     name: propagation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m1.subtreeassembly
+    name: subtreeassembly-config-m
 patches:
   - patch: |-
       - op: replace

@@ -35,6 +35,8 @@ resources:
   - propagation.yaml
   - service-account.yaml
   - shared-config-map.yaml
+  - subtreeassembly-config-map.yaml
+  - subtreeassembly.yaml
   - tx-blaster-service.yaml
   - tx-blaster.yaml
   - utxo-blaster-service.yaml

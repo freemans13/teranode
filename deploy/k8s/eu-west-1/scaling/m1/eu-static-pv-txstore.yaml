@@ -10,7 +10,7 @@ spec:
     - ReadWriteMany
   mountOptions:
     - flock
-  persistentVolumeReclaimPolicy: Recycle
+  persistentVolumeReclaimPolicy: Retain
   csi:
     driver: fsx.csi.aws.com
     volumeHandle: fs-0d78849895b00d529

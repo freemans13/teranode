@@ -43,7 +43,7 @@ spec:
           image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
-          args: ["-workers=4500"]
+          args: ["-workers=5600"]
           envFrom:
             - configMapRef:
                 name: shared-config-m

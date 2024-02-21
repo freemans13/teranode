@@ -65,14 +65,7 @@ spec:
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
-            - mountPath: /data/subtreestore-ttl-1/
-              name: subtree-store-ttl-1
-            - mountPath: /data/subtreestore-ttl-2/
-              name: subtree-store-ttl-2
-            - mountPath: /data/subtreestore-ttl-3/
-              name: subtree-store-ttl-3
-            - mountPath: /data/subtreestore-ttl-4/
-              name: subtree-store-ttl-4
+
           readinessProbe:
             httpGet:
               path: /health
@@ -93,15 +86,3 @@ spec:
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
-        - name: subtree-store-ttl-1
-          persistentVolumeClaim:
-            claimName: blockvalidation-pvc-1
-        - name: subtree-store-ttl-2
-          persistentVolumeClaim:
-            claimName: blockvalidation-pvc-2
-        - name: subtree-store-ttl-3
-          persistentVolumeClaim:
-            claimName: blockvalidation-pvc-3
-        - name: subtree-store-ttl-4
-          persistentVolumeClaim:
-            claimName: blockvalidation-pvc-4
