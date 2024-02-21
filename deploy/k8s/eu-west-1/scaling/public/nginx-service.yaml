@@ -3,14 +3,13 @@ kind: Service
 metadata:
   name: nginx-service
 spec:
-  type: LoadBalancer  # Use NodePort or ClusterIP if you're not on a cloud provider that supports LoadBalancers
+  clusterIP: None
+  ipFamilyPolicy: SingleStack
+  ipFamilies:
+  - IPv4
   selector:
     app: nginx
-  loadBalancerClass: service.k8s.aws/nlb
   ports:
     - protocol: TCP
       port: 80
       targetPort: 80
-    # - protocol: TCP
-    #   port: 443
-    #   targetPort: 443
