@@ -36,15 +36,15 @@ echo "Do not truncate a namespace that's too large, it will take hours"
 
 echo "Aerospike cleaning: EU"
 kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike $(kgp -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
 
 echo "Aerospike cleaning: US"
 kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike $(kgp -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
 
 # echo "Aerospike cleaning: Asia"
 kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike $(kgp -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
 
 kubectl config use-context $CONTEXT
 
