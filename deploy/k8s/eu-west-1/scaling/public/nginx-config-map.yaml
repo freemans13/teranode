@@ -18,9 +18,9 @@ data:
         # that's is used in the configuration file.
         resolver kube-dns.kube-system.svc.cluster.local valid=5s;
 
-        location /p2p-ws {
-          set $p2p p2p-service1.m1.svc.cluster.local:9906;
-          proxy_pass http://$p2p;
+        location /connection/websocket {
+          set $asset asset-service1.m1.svc.cluster.local:8090;
+          proxy_pass http://$asset;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
           proxy_set_header Connection "upgrade";
