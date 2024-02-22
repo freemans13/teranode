@@ -1,6 +1,15 @@
+#!/bin/bash
+
 if [ -n "$KUBECONFIG" ]; then
   echo "KUBECONFIG is set. Please run this script with KUBECONFIG unset."
   exit 1
+fi
+
+# Check if kubectl is installed
+if ! command -v kubectl &> /dev/null
+then
+    echo "kubectl could not be found, please install it to continue (brew install kubectl)."
+    exit 1
 fi
 
 # scale down everything
@@ -10,6 +19,7 @@ bash $DIR/down.sh all unsafe
 
 
 CONTEXT=$(kubectl config current-context)
+NAMESPACE=$(kubectl config view --minify --output 'jsonpath={..namespace}')
 
 # Local databases
 echo "Postgres cleaning: EU"
@@ -47,6 +57,7 @@ kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-
 kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
 
 kubectl config use-context $CONTEXT
+kubectl config set-context --current --namespace=$NAMESPACE
 
 echo "Scaling back up: all"
 # scale back up everything
