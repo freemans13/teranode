@@ -31,18 +31,20 @@ kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase ps
 
 # todo make key dynamic based on user
 echo "Aerospike cleaning"
+echo "Warning: If aerospike is too large, it might be faster to delete and restart the instances. Talk to the devops team."
+echo "Do not truncate a namespace that's too large, it will take hours"
 
 echo "Aerospike cleaning: EU"
 kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
 
 echo "Aerospike cleaning: US"
 kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
 
 # echo "Aerospike cleaning: Asia"
 kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike aerocluster-0-0 -c aerospike-server -- asinfo -U admin -P admin123 -v "truncate-namespace:namespace=ubsv-store;"
+kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
 
 kubectl config use-context $CONTEXT
 

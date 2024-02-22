@@ -5,18 +5,18 @@ metadata:
 data:
   config.yaml: |
     # Name of the tunnel you want to run
-    tunnel: simon
+    tunnel: ubsv
     credentials-file: /etc/cloudflared/creds/credentials.json
 
     # Serves the metrics server under /metrics and the readiness server under /ready
     metrics: 0.0.0.0:2000
 
-    # Autoupdates applied in a k8s pod will be lost when the pod is removed or restarted, so
-    # autoupdate doesn't make sense in Kubernetes. However, outside of Kubernetes, we strongly
-    # recommend using autoupdate.
+    # Auto updates applied in a k8s pod will be lost when the pod is removed or restarted, so
+    # auto update doesn't make sense in Kubernetes. However, outside of Kubernetes, we strongly
+    # recommend using auto update.
     no-autoupdate: true
     
     ingress:
-      - hostname: simon.ubsv.dev
-        service: http://nginx-service.m1.svc.cluster.local:80
+      - hostname: teranode.bsvblockchain.org
+        service: http://nginx-service.public.svc.cluster.local:80
       - service: http_status:404
