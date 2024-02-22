@@ -30,7 +30,7 @@ data:
           proxy_set_header X-Forwarded-Proto $scheme;
         }
 
-        location ~ ^/(health|gocore) {
+        location ~ ^/(health|gocore|alive) {
             return 403;
         }
 
