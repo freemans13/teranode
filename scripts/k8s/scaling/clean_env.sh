@@ -12,59 +12,68 @@ then
     exit 1
 fi
 
+function clean() {
+  local region=$1
+  local namespace=$2
+
+  echo "Aerospike cleaning: $region"
+  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
+  # echo "Clearing Lustre: $region"
+  # kubectl scale deployment -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get deployment --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep blockchain | tail -c+17) --replicas 1
+  # kubectl scale deployment -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get deployment --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep asset | tail -c+17) --replicas 1
+  # kubectl exec -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep asset | tail -c+5) -- find /data/subtreestore -type f -delete
+}
+
+function truncate() {
+  local region=$1
+  local namespace=$2
+
+  echo "Postgres cleaning: $region $namespace"
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state ; drop table if exists blocks;" >/dev/null
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;" > /dev/null
+}
+
 # scale down everything
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 echo "Scaling down: all"
 bash $DIR/down.sh all unsafe
-
-
-CONTEXT=$(kubectl config current-context)
-NAMESPACE=$(kubectl config view --minify --output 'jsonpath={..namespace}')
-
-# Local databases
-echo "Postgres cleaning: EU"
-kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=m1 psql -U m1 -d m1 -c "drop table if exists state ; drop table if exists blocks;"
-kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;"
-
-
-echo "Postgres cleaning: US"
-kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=m2 psql -U m2 -d m2 -c "drop table if exists state ; drop table if exists blocks;"
-kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;"
-
-# echo "Postgres cleaning: Asia"
-kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=m3 psql -U m3 -d m3 -c "drop table if exists state ; drop table if exists blocks;"
-kubectl exec -it -n postgres postgres-postgresql-0 -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;"
-
 
 # todo make key dynamic based on user
 echo "Aerospike cleaning"
 echo "Warning: If aerospike is too large, it might be faster to delete and restart the instances. Talk to the devops team."
 echo "Do not truncate a namespace that's too large, it will take hours"
 
-echo "Aerospike cleaning: EU"
-kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
+# Array to hold PIDs of background processes
+bg_pids=()
 
-echo "Aerospike cleaning: US"
-kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
+clean "eu-west-1" "m1" &
+bg_pids+=($!)
+clean "us-east-1" "m2" &
+bg_pids+=($!)
+clean "ap-south-1" "m3" &
+bg_pids+=($!)
 
-# echo "Aerospike cleaning: Asia"
-kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground
-kubectl exec -it -n aerospike $(kubectl get pod -n aerospike -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
+# Local databases
+truncate "eu-west-1" "m1" &
+bg_pids+=($!)
+truncate "us-east-1" "m2" &
+bg_pids+=($!)
+truncate "ap-south-1" "m3" &
+bg_pids+=($!)
 
-kubectl config use-context $CONTEXT
-kubectl config set-context --current --namespace=$NAMESPACE
+
+# Wait for all background processes to complete
+for pid in "${bg_pids[@]}"; do
+  wait "$pid" || echo "Process $pid exited with status $?"
+done
+
 
 echo "Scaling back up: all"
 # scale back up everything
-# bash $DIR/up.sh all
-bash $DIR/up.sh m1
-bash $DIR/up.sh m2
-bash $DIR/up.sh m3
+bash $DIR/up.sh all
+# bash $DIR/up.sh m1
+# bash $DIR/up.sh m2
+# bash $DIR/up.sh m3
 
 # scale up tx blaster
 #kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1
