@@ -12,6 +12,13 @@ then
     exit 1
 fi
 
+# Check if kubectl is installed
+if ! command -v aws &> /dev/null
+then
+    echo "aws cli could not be found, please install it to continue (brew install awscli)."
+    exit 1
+fi
+
 function clean() {
   local region=$1
   local namespace=$2
