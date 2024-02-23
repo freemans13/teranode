@@ -12,7 +12,7 @@ then
     exit 1
 fi
 
-# Check if kubectl is installed
+# Check if aws is installed
 if ! command -v aws &> /dev/null
 then
     echo "aws cli could not be found, please install it to continue (brew install awscli)."
