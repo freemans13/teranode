@@ -19,6 +19,21 @@ then
     exit 1
 fi
 
+# Array to hold PIDs of background processes
+declare -g -a bg_pids
+
+# Function to handle SIGINT
+function kill_background_processes() {
+  echo "Caught SIGINT, stopping background processes..."
+  for pid in "${bg_pids[@]}"; do
+    kill -SIGINT "$pid" 2>/dev/null
+  done
+  exit 1
+}
+
+# Setup trap for SIGINT
+trap 'kill_background_processes' SIGINT
+
 function clean() {
   local region=$1
   local namespace=$2
@@ -65,9 +80,6 @@ bash $DIR/down.sh all unsafe
 echo "Aerospike cleaning"
 echo "Warning: If aerospike is too large, it might be faster to delete and restart the instances. Talk to the devops team."
 echo "Do not truncate a namespace that's too large, it will take hours"
-
-# Array to hold PIDs of background processes
-bg_pids=()
 
 clean "eu-west-1" "m1" &
 bg_pids+=($!)
