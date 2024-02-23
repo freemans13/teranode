@@ -9,30 +9,18 @@ data:
     }
 
     http {
-      # Rate limiting configuration
-      limit_req_zone $binary_remote_addr zone=mylimit:10m rate=5r/s;
-
-      proxy_cache_path  /var/cache/nginx/cache levels=1:2 keys_zone=STATIC:10m inactive=2h max_size=5g;
-
       # Server configuration
       server {
         listen 80 default_server;
-        # listen [::]:80 default_server;
-        # listen 443 ssl default_server;
-        # listen [::]:443 ssl default_server;
-
-        # # SSL configuration
-        # ssl_certificate /etc/nginx/ssl/tls.crt;
-        # ssl_certificate_key /etc/nginx/ssl/tls.key;
-        # ssl_protocols TLSv1.2 TLSv1.3;
-        # ssl_ciphers HIGH:!aNULL:!MD5;
-
+        
+        # Specifying a resolver is a workaround for a bug in nginx
+        # where it will not start if it cannot resolve any hostname
+        # that's is used in the configuration file.
         resolver kube-dns.kube-system.svc.cluster.local valid=5s;
-  
-        location /faucet {
-          set $faucet faucet-service1.m1.svc.cluster.local:8097;
-          # limit_req zone=mylimit burst=10 nodelay;
-          proxy_pass http://$faucet;
+
+        location /connection/websocket {
+          set $asset asset-service1.m1.svc.cluster.local:8090;
+          proxy_pass http://$asset;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
           proxy_set_header Connection "upgrade";
@@ -40,29 +28,14 @@ data:
           proxy_set_header X-Real-IP $remote_addr;
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_set_header X-Forwarded-Proto $scheme;
-
-          proxy_buffering        on;
-          proxy_cache            STATIC;
-          proxy_cache_valid      200  2h;
-          proxy_cache_use_stale  error timeout invalid_header updating http_500 http_502 http_503 http_504;
         }
 
-        location /p2p-ws {
-          set $p2p p2p-service1.m1.svc.cluster.local:9906;
-          # limit_req zone=mylimit burst=10 nodelay;
-          proxy_pass http://$p2p;
-          proxy_http_version 1.1;
-          proxy_set_header Upgrade $http_upgrade;
-          proxy_set_header Connection "upgrade";
-          proxy_set_header Host $host;
-          proxy_set_header X-Real-IP $remote_addr;
-          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-          proxy_set_header X-Forwarded-Proto $scheme;
+        location ~ ^/(health|gocore|alive) {
+            return 403;
         }
 
         location / {
           set $asset asset-service1.m1.svc.cluster.local:8090;
-          limit_req zone=mylimit burst=100 nodelay;
           proxy_pass http://$asset;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
@@ -72,12 +45,24 @@ data:
           proxy_set_header X-Real-IP $remote_addr;
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_set_header X-Forwarded-Proto $scheme;
-
-          proxy_buffering        on;
-          proxy_cache            STATIC;
-          proxy_cache_valid      200  2h;
-          proxy_cache_use_stale  error timeout invalid_header updating http_500 http_502 http_503 http_504;
+          proxy_buffering  on;
         }
       }
     }
 
+  status.conf: |
+    server {
+      listen 81;
+
+      location /nginx_status {
+        stub_status;
+        access_log /dev/stdout;
+        allow 127.0.0.1;
+        allow 10.0.0.0/8;
+        deny all;
+      }
+
+      location / {
+        return 404;
+      }
+    }
