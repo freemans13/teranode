@@ -24,9 +24,25 @@ function clean() {
   # kubectl exec -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep asset | tail -c+5) -- find /data/subtreestore -type f -delete
 }
 
+function backup() {
+  local region=$1
+  local namespace=$2
+  local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ) # Generate timestamp in UTC with -u option
+  local datePart=$(echo $timestamp | cut -d'T' -f1) # Extract the date part (yyyy-mm-dd)
+  local filename="${timestamp}-${region}-${namespace}.dump"
+  local s3Path="s3://ubsv-blockchain-backups/${datePart}/${filename}" # Include datePart in the path
+
+  echo "Postgres backup: $region $namespace > $s3Path"
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace pg_dump -U $namespace $namespace > $filename
+  aws s3 cp $filename $s3Path
+  rm $filename
+}
+
 function truncate() {
   local region=$1
   local namespace=$2
+
+  backup $region $namespace
 
   echo "Postgres cleaning: $region $namespace"
   kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state ; drop table if exists blocks;" >/dev/null
