@@ -48,21 +48,5 @@ data:
           proxy_buffering  on;
         }
       }
-    }
-
-  status.conf: |
-    server {
-      listen 81;
-
-      location /nginx_status {
-        stub_status;
-        access_log /dev/stdout;
-        allow 127.0.0.1;
-        allow 10.0.0.0/8;
-        deny all;
-      }
-
-      location / {
-        return 404;
-      }
+      include conf.d/status.conf;
     }
