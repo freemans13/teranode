@@ -33,6 +33,9 @@ scale_down() {
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground asset$namespace_suffix --replicas 0
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground status$namespace_suffix --replicas 0
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockchain$namespace_suffix --replicas 0
+
+    kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground faucet$namespace_suffix --replicas 0
+    kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground nginx-reverse-proxy --replicas 0
   fi
 }
 
@@ -43,7 +46,7 @@ if [ "$1" == "all" ]; then
   echo "Scaling down all regions"
   scale_down "eu-west-1" "1" &
   bg_pids+=($!)
-  scale_down "eu-west-1" "2" &
+  scale_down "es-east-1" "2" &
   bg_pids+=($!)
   scale_down "ap-south-1" "3" &
   bg_pids+=($!)
