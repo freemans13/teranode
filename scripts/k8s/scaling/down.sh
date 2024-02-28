@@ -46,7 +46,7 @@ if [ "$1" == "all" ]; then
   echo "Scaling down all regions"
   scale_down "eu-west-1" "1" &
   bg_pids+=($!)
-  scale_down "es-east-1" "2" &
+  scale_down "us-east-1" "2" &
   bg_pids+=($!)
   scale_down "ap-south-1" "3" &
   bg_pids+=($!)
