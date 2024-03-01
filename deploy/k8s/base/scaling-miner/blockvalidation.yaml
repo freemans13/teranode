@@ -66,22 +66,22 @@ spec:
             - name: lustre-storage
               mountPath: /data/subtreestore
 
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 9091
-            initialDelaySeconds: 1
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 9091
-            initialDelaySeconds: 1
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 10
+          # readinessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: 9091
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 10
+          # livenessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: 9091
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 10
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
