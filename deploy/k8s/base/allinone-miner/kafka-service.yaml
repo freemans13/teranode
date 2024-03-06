@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+spec:
+  type: NodePort  # For demo/experimentation; for production, consider LoadBalancer or Ingress
+  ports:
+  - port: 9092
+    targetPort: 9092
+    nodePort: 30092  # Optional: only needed if you want to access from outside the cluster
+  selector:
+    app: kafka
