@@ -20,3 +20,7 @@ spec:
       port: 9092
       targetPort: 9092
       protocol: TCP
+    - name: kafka-external
+      port: 9094
+      targetPort: 9094
+      protocol: TCP
