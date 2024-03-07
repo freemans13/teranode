@@ -33,19 +33,29 @@ patches:
 - patch: |-
     - op: replace
       path: /spec/routes/0/services/0/name
-      value: miner-lo-1
+      value: kafka-service-lo-1
   target:
     kind: IngressRouteTCP
+    labelSelector: service=kafka
+- patch: |-
+    - op: replace
+      path: /spec/routes/0/services/0/name
+      value: miner-service-lo-1
+    - op: replace
+      path: /spec/routes/0/match
+      value: Host(`localhost`)
+  target:
+    kind: IngressRoute
     labelSelector: service=miner
 - patch: |-
     - op: replace
       path: /spec/routes/0/services/0/name
-      value: miner-lo-1
+      value: miner-service-lo-1
     - op: replace
       path: /spec/routes/0/match
-      value: Host(`miner-lo-1.allinone.ubsv.dev`)
+      value: Host(`localhost`)
   target:
-    kind: IngressRoute
+    kind: IngressRouteTCP
     labelSelector: service=miner
 - patch: |-
     - op: replace
