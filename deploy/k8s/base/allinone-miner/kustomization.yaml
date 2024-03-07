@@ -22,3 +22,7 @@ resources:
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml
   - propagation-grpc-ingress.yaml
+  - kafka-pvc.yaml
+  - kafka.yaml
+  - kafka-service.yaml
+  - kafka-ingress.yaml

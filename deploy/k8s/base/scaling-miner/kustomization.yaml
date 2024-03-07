@@ -17,6 +17,8 @@ resources:
   - blockvalidation-config-map.yaml
   - blockvalidation-service.yaml
   - blockvalidation.yaml
+  - subtreevalidation-service.yaml
+  - subtreevalidation.yaml
   - cluster-role-binding.yaml
   - coinbase-config-map.yaml
   - coinbase-deployment.yaml

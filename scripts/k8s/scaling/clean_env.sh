@@ -1,5 +1,7 @@
 #!/bin/bash
 
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
 if [ -n "$KUBECONFIG" ]; then
   echo "KUBECONFIG is set. Please run this script with KUBECONFIG unset."
   exit 1
@@ -71,8 +73,16 @@ function truncate() {
   kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;" > /dev/null
 }
 
+function clear_kafka() {
+  local namespace=$1
+
+  # Make the kafkatool if necessary...
+  make -C $DIR/../../../cmd/kafkatool
+
+  SETTINGS_CONTEXT=scaling.${NAMESPACE} $DIR/../../../kafkatool
+}
+
 # scale down everything
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 echo "Scaling down: all"
 bash $DIR/down.sh all unsafe
 
@@ -96,6 +106,13 @@ bg_pids+=($!)
 truncate "ap-south-1" "m3" &
 bg_pids+=($!)
 
+# Kafka
+clear_kafka "m1" &
+bg_pids+=($!)
+clear_kafka "m2" &
+bg_pids+=($!)
+clear_kafka "m3" &
+bg_pids+=($!)
 
 # Wait for all background processes to complete
 for pid in "${bg_pids[@]}"; do
