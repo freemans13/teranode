@@ -12,7 +12,7 @@ data:
       # Server configuration
       server {
         listen 80 default_server;
-        
+    
         # Specifying a resolver is a workaround for a bug in nginx
         # where it will not start if it cannot resolve any hostname
         # that's is used in the configuration file.

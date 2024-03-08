@@ -6,7 +6,7 @@ spec:
   clusterIP: None
   ipFamilyPolicy: SingleStack
   ipFamilies:
-  - IPv4
+    - IPv4
   selector:
     app: nginx
   ports:

@@ -17,13 +17,14 @@ resources:
   - blockvalidation-config-map.yaml
   - blockvalidation-service.yaml
   - blockvalidation.yaml
-  - subtreevalidation-service.yaml
-  - subtreevalidation.yaml
+  - certificate.yaml
   - cluster-role-binding.yaml
   - coinbase-config-map.yaml
   - coinbase-deployment.yaml
   - coinbase-grpc-ingress.yaml
   - coinbase-service.yaml
+  - faucet-service.yaml
+  - faucet.yaml
   - miner-deployment.yaml
   - p2p-grpc-ingress.yaml
   - p2p-service.yaml
@@ -39,16 +40,16 @@ resources:
   - shared-config-map.yaml
   - subtreeassembly-config-map.yaml
   - subtreeassembly.yaml
+  - subtreevalidation-service.yaml
+  - subtreevalidation.yaml
   - tx-blaster-service.yaml
   - tx-blaster.yaml
-  - utxo-blaster-service.yaml
-  - utxo-blaster.yaml
   - txmetastore-service.yaml
   - txmetastore.yaml
+  - utxo-blaster-service.yaml
+  - utxo-blaster.yaml
   - utxo-config-map.yaml
   - utxostore-service.yaml
   - utxostore.yaml
   - validation-service.yaml
   - validation.yaml
-  - faucet.yaml
-  - faucet-service.yaml

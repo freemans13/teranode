@@ -8,10 +8,10 @@ spec:
   entryPoints:
     - p2p-wss # Service port expecting WSS
   routes:
-  - match: Host(`m.scaling.ubsv.dev`)
-    kind: Rule
-    services:
-    - name: p2p-service
-      port: 9906  # Service port expecting WS
+    - match: Host(`m.scaling.ubsv.dev`)
+      kind: Rule
+      services:
+        - name: p2p-service
+          port: 9906  # Service port expecting WS
   tls:
-    secretName: wildcard-tls-custom
+    secretName: scaling-tls

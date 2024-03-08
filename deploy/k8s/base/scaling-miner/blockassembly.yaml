@@ -38,7 +38,7 @@ spec:
       containers:
         - name: blockassembly
           image: REPO:IMAGE:TAG
-          args: ["-blockassembly=1"]
+          args: [ "-blockassembly=1" ]
           envFrom:
             - configMapRef:
                 name: shared-config-m
@@ -60,9 +60,6 @@ spec:
               cpu: "105"
             limits:
               memory: 475Gi
-          volumeMounts:
-            - name: lustre-storage
-              mountPath: /data/subtreestore
 
           readinessProbe:
             httpGet:
@@ -80,7 +77,21 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 10
+          volumeMounts:
+            - name: lustre-storage
+              mountPath: /data/subtreestore
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

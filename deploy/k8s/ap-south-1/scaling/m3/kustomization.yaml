@@ -36,6 +36,13 @@ configMapGenerator:
 patches:
   - patch: |-
       - op: replace
+        path: /spec/dnsNames
+        value: 
+         - m3.scaling.ubsv.dev
+    target:
+      kind: Certificate
+  - patch: |-
+      - op: replace
         path: /spec/routes/0/services/0/name
         value: propagation-service3
     target:

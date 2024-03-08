@@ -8,6 +8,6 @@ spec:
   entryPoints:
     - quic
   routes:
-  - services:
-    - name: propagation-service
-      port: 8384
+    - services:
+        - name: propagation-service
+          port: 8384

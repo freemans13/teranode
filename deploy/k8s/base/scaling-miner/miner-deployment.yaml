@@ -24,6 +24,7 @@ spec:
                     app: miner
                 topologyKey: kubernetes.io/hostname
               weight: 100
+      serviceAccountName: sa-m
       containers:
         - args:
             - -miner=1
@@ -52,4 +53,16 @@ spec:
             requests:
               cpu: 2
               memory: 2Gi
-      serviceAccountName: sa-m
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

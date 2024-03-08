@@ -35,12 +35,12 @@ spec:
       containers:
         - name: postgres
           image: postgres:latest
-          args: ["-c", "max_connections=1000", "-c", "listen_addresses=*"]
+          args: [ "-c", "max_connections=1000", "-c", "listen_addresses=*" ]
           env:
-          - name: POSTGRES_PASSWORD
-            value: postgres
-          - name: PGDATA
-            value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_PASSWORD
+              value: postgres
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
           ports:
             - containerPort: 5432
               protocol: TCP
@@ -52,12 +52,12 @@ spec:
               memory: 4Gi
               cpu: "2"
           volumeMounts:
-          - name: postgres-storage
-            mountPath: /var/lib/postgresql/data
-          - name: init-script
-            mountPath: /docker-entrypoint-initdb.d/create-db.sql
-            # SubPath ensures only your script is mounted, not the entire ConfigMap directory
-            subPath: create-db.sql
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d/create-db.sql
+              # SubPath ensures only your script is mounted, not the entire ConfigMap directory
+              subPath: create-db.sql
           readinessProbe:
             exec:
               command:
@@ -93,9 +93,9 @@ spec:
             failureThreshold: 5
             successThreshold: 1
       volumes:
-      - name: postgres-storage
-        persistentVolumeClaim:
-          claimName: postgres-pvc
-      - name: init-script
-        configMap:
-          name: postgres-init-scripts
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+        - name: init-script
+          configMap:
+            name: postgres-init-scripts
