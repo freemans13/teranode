@@ -18,29 +18,29 @@ spec:
         app: nginx
     spec:
       containers:
-      - name: nginx
-        image: nginx:latest  # Use an appropriate version
-        ports:
-        - containerPort: 80
-        - containerPort: 81
-        # - containerPort: 443
-        volumeMounts:
-        - name: nginx-config-volume
-          mountPath: /etc/nginx/nginx.conf
-          subPath: nginx.conf
-        - name: nginx-status-volume
-          mountPath: /etc/nginx/conf.d/status.conf
-          subPath: status.conf
-          readOnly: true
-        # - name: ssl-certs
-        #   mountPath: /etc/nginx/ssl
+        - name: nginx
+          image: nginx:latest  # Use an appropriate version
+          ports:
+            - containerPort: 80
+            - containerPort: 81
+          # - containerPort: 443
+          volumeMounts:
+            - name: nginx-config-volume
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: nginx-status-volume
+              mountPath: /etc/nginx/conf.d/status.conf
+              subPath: status.conf
+              readOnly: true
+          # - name: ssl-certs
+          #   mountPath: /etc/nginx/ssl
       volumes:
-      - name: nginx-config-volume
-        configMap:
-          name: nginx-config
-      - name: nginx-status-volume
-        configMap:
-          name: nginx-status
+        - name: nginx-config-volume
+          configMap:
+            name: nginx-config
+        - name: nginx-status-volume
+          configMap:
+            name: nginx-status
       # - name: ssl-certs
       #   secret:
       #     secretName: your-ssl-secret  # Ensure this secret exists and contains your SSL cert and key

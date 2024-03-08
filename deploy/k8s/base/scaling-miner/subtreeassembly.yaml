@@ -36,7 +36,7 @@ spec:
       containers:
         - name: subtreeassembly
           image: REPO:IMAGE:TAG
-          args: ["-subtreeassembly=1"]
+          args: [ "-subtreeassembly=1" ]
           # command: "You can override the entrypoint with a command."
           #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
           #          command: [ "./ubsv.run" ]
@@ -57,9 +57,6 @@ spec:
               cpu: "50"
             limits:
               memory: 512Gi
-          volumeMounts:
-            - name: lustre-storage
-              mountPath: /data/subtreestore
           readinessProbe:
             httpGet:
               path: /health
@@ -76,7 +73,21 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+          volumeMounts:
+            - name: lustre-storage
+              mountPath: /data/subtreestore
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

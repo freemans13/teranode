@@ -38,7 +38,7 @@ spec:
       containers:
         - name: blockvalidation
           image: REPO:IMAGE:TAG
-          args: ["-blockvalidation=1"]
+          args: [ "-blockvalidation=1" ]
           envFrom:
             - configMapRef:
                 name: shared-config-m
@@ -65,7 +65,9 @@ spec:
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
-
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
           # readinessProbe:
           #   httpGet:
           #     path: /health
@@ -86,3 +88,11 @@ spec:
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

@@ -8,7 +8,7 @@ spec:
   entryPoints:
     - prop-grpc
   routes:
-  - match: HostSNI(`*`)
-    services:
-    - name: propagation-service
-      port: 8084
+    - match: HostSNI(`*`)
+      services:
+        - name: propagation-service
+          port: 8084

@@ -8,8 +8,8 @@ spec:
   entryPoints:
     - ast-grpc
   routes:
-  - match: HostSNI(`*`)
-    services:
-    - name: miner
-      port: 8091
+    - match: HostSNI(`*`)
+      services:
+        - name: miner
+          port: 8091
   

@@ -39,7 +39,7 @@ spec:
       containers:
         - name: faucet
           image: REPO:IMAGE:TAG
-          args: ["-faucet=1"]
+          args: [ "-faucet=1" ]
           envFrom:
             - configMapRef:
                 name: shared-config-m
@@ -75,3 +75,16 @@ spec:
           #   periodSeconds: 10
           #   failureThreshold: 5
           #   timeoutSeconds: 3
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key
