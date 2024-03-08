@@ -43,6 +43,7 @@
     "exister",
     "expiringmap",
     "extranonce",
+    "failfast",
     "fastcache",
     "faucet",
     "foldermanager",
