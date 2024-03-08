@@ -29,10 +29,10 @@ spec:
                     app: subtreevalidation
                 topologyKey: "kubernetes.io/hostname"
       nodeSelector:
-        role: subtreevalidation
+        role: blockvalidation
       tolerations:
         - key: role
-          value: subtreevalidation
+          value: blockvalidation
           operator: Equal
           effect: NoSchedule
       containers:

@@ -33,12 +33,14 @@ scale_up() {
   # wait_for_scale $region m$namespace_suffix status$namespace_suffix 30
   # asset/blockvalidation/blockassembly need to be scaled up together as they depend on each other :(
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground asset$namespace_suffix --replicas 1
+  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground subtreevalidation$namespace_suffix --replicas 1
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockvalidation$namespace_suffix --replicas 1
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockassembly$namespace_suffix --replicas 1
 kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground faucet$namespace_suffix --replicas 1
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground nginx-reverse-proxy --replicas 1
   # wait for all 3 to be ready
   wait_for_scale $region m$namespace_suffix asset$namespace_suffix 30
+  wait_for_scale $region m$namespace_suffix subtreevalidation$namespace_suffix 30
   wait_for_scale $region m$namespace_suffix blockvalidation$namespace_suffix 30
   wait_for_scale $region m$namespace_suffix blockassembly$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground propagation$namespace_suffix --replicas 1
