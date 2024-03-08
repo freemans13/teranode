@@ -28,7 +28,7 @@ configMapGenerator:
     name: blockvalidation-config-m
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.m1.subtreevalidation
+      - SETTINGS_CONTEXT=scaling.m2.subtreevalidation
     name: subtreevalidation-config-m
   - behavior: merge
     literals:
