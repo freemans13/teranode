@@ -39,8 +39,8 @@ configMapGenerator:
     name: propagation-config-m
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.m1.subtreeassembly
-    name: subtreeassembly-config-m
+      - SETTINGS_CONTEXT=scaling.m1.blockpersister
+    name: blockpersister-config-m
 patches:
   - patch: |-
       - op: replace

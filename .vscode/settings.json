@@ -18,6 +18,7 @@
     "blockassembler",
     "blockassembly",
     "blockchainstatus",
+    "blockpersister",
     "blockstore",
     "blockvalidation",
     "bscript",
