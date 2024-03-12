@@ -28,6 +28,10 @@ configMapGenerator:
     name: blockvalidation-config-m
   - behavior: merge
     literals:
+      - SETTINGS_CONTEXT=scaling.m2.subtreevalidation
+    name: subtreevalidation-config-m
+  - behavior: merge
+    literals:
       - SETTINGS_CONTEXT=scaling.m2.coinbase
     name: coinbase-config-m
   - behavior: merge

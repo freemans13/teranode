@@ -79,7 +79,8 @@ function clear_kafka() {
   # Make the kafkatool if necessary...
   make -C $DIR/../../../cmd/kafkatool
 
-  SETTINGS_CONTEXT=scaling.${NAMESPACE} $DIR/../../../kafkatool
+  echo "SETTINGS_CONTEXT=scaling.${namespace} $DIR/../../../cmd/kafkatool/kafkatool"
+  # SETTINGS_CONTEXT=scaling.${namespace} $DIR/../../../cmd/kafkatool/kafkatool
 }
 
 # scale down everything

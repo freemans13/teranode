@@ -40,6 +40,7 @@ resources:
   - shared-config-map.yaml
   - subtreeassembly-config-map.yaml
   - subtreeassembly.yaml
+  - subtreevalidation-config-map.yaml
   - subtreevalidation-service.yaml
   - subtreevalidation.yaml
   - tx-blaster-service.yaml
