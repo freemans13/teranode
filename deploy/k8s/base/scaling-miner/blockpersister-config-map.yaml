@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: subtreeassembly-config-m
+  name: blockpersister-config-m
 data:
   SETTINGS_CONTEXT: "scaling.m"
 #  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
