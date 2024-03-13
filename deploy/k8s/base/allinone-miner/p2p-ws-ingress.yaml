@@ -1,5 +1,5 @@
 apiVersion: traefik.containo.us/v1alpha1
-kind: IngressRouteTCP
+kind: IngressRoute
 metadata:
   name: p2p-ws-ingress-9906
   labels:
@@ -8,7 +8,8 @@ spec:
   entryPoints:
     - p2p-ws
   routes:
-    - match: HostSNI(`*`)
+    - match: HostSNI(`miner.allinone.ubsv.dev`)
+      kind: Rule
       services:
         - name: miner
           port: 9906

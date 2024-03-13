@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: miner-service
+  namespace: miner
+  labels:
+    app: miner
+  annotations:
+    prometheus.io/port: "9091"
+    prometheus.io/scrape: "true"
+spec:
+  clusterIP: None
+  ipFamilyPolicy: SingleStack
+  ipFamilies:
+    - IPv4
+  selector:
+    app: miner
+  ports:
+    - name: delve
+      port: 4040
+      targetPort: 4040
+      protocol: TCP
+    - name: seeder
+      port: 8083
+      targetPort: 8083
+      protocol: TCP
+    - name: propagation
+      port: 8084
+      targetPort: 8084
+      protocol: TCP
+    - name: blockchain
+      port: 8087
+      targetPort: 8087
+      protocol: TCP
+    - name: asset-http
+      port: 8090
+      targetPort: 8090
+      protocol: TCP
+    - name: faucet-http
+      port: 8097
+      targetPort: 8097
+      protocol: TCP
+    - name: asset-grpc
+      port: 8091
+      targetPort: 8091
+    - name: coinbase-grpc
+      port: 8093
+      targetPort: 8093
+    - name: profiler
+      port: 9091
+      targetPort: 9091
+      protocol: TCP
+    - name: p2p
+      port: 9905
+      targetPort: 9905
+      protocol: TCP
+    - name: p2p-http
+      port: 9906
+      targetPort: 9906
+      protocol: TCP
+    - name: miner-http
+      port: 8092
+      targetPort: 8092
+      protocol: TCP
+    - name: quic
+      port: 8384
+      targetPort: 8384
+      protocol: UDP

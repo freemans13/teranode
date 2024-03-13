@@ -1,0 +1,17 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: p2p-wss-ingress-9906
+  labels:
+    service: miner
+spec:
+  entryPoints:
+    - p2p-wss # Service port expecting WSS
+  routes:
+    - match: Host(`miner1.allinone.ubsv.dev`)
+      kind: Rule
+      services:
+        - name: miner
+          port: 9906  # Service port expecting WS
+  tls:
+    secretName: scaling-tls

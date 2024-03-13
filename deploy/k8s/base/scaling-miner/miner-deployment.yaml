@@ -24,6 +24,7 @@ spec:
                     app: miner
                 topologyKey: kubernetes.io/hostname
               weight: 100
+      serviceAccountName: sa-m
       containers:
         - args:
             - -miner=1
@@ -34,7 +35,6 @@ spec:
             - name: SERVICE_NAME
               value: miner-service
           image: REPO:IMAGE:TAG
-          imagePullPolicy: IfNotPresent
           name: miner
           ports:
             - containerPort: 8089
@@ -49,9 +49,20 @@ spec:
               protocol: TCP
           resources:
             limits:
-              cpu: 2
               memory: 2Gi
             requests:
               cpu: 2
               memory: 2Gi
-      serviceAccountName: sa-m
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

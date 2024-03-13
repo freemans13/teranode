@@ -7,8 +7,6 @@ resources:
 namespace: m1
 
 nameSuffix: "1"
-commonLabels:
-  miner: m1
 
 configMapGenerator:
   - behavior: merge
@@ -21,13 +19,36 @@ configMapGenerator:
     name: asset-config-m
   - behavior: merge
     literals:
+      - SETTINGS_CONTEXT=scaling.m1.blockassembly
+    name: blockassembly-config-m
+  - behavior: merge
+    literals:
       - SETTINGS_CONTEXT=scaling.m1.blockvalidation
     name: blockvalidation-config-m
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.m1.blockassembly
-    name: blockassembly-config-m
+      - SETTINGS_CONTEXT=scaling.m1.subtreevalidation
+    name: subtreevalidation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m1.coinbase
+    name: coinbase-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m1.propagation
+    name: propagation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m1.blockpersister
+    name: blockpersister-config-m
 patches:
+  - patch: |-
+      - op: replace
+        path: /spec/dnsNames
+        value:
+         - m1.scaling.ubsv.dev
+    target:
+      kind: Certificate
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name

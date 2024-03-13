@@ -58,46 +58,41 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1200Gi
-              cpu: "182"
+              memory: 1456Gi
+              cpu: "125"
             limits:
-              memory: 1200Gi
-              cpu: "182"
+              memory: 1456Gi
           volumeMounts:
-            - mountPath: /data/subtreestore-ttl-1/
-              name: subtree-store-ttl-1
-            - mountPath: /data/subtreestore-ttl-2/
-              name: subtree-store-ttl-2
-            - mountPath: /data/subtreestore-ttl-3/
-              name: subtree-store-ttl-3
-            - mountPath: /data/subtreestore-ttl-4/
-              name: subtree-store-ttl-4
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 9091
-            initialDelaySeconds: 1
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 3
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 9091
-            initialDelaySeconds: 1
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 3
+            - name: lustre-storage
+              mountPath: /data/subtreestore
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+          # readinessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: 9091
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 10
+          # livenessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: 9091
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 10
       volumes:
-        - name: subtree-store-ttl-1
+        - name: lustre-storage
           persistentVolumeClaim:
-            claimName: blockvalidation-pvc-1
-        - name: subtree-store-ttl-2
-          persistentVolumeClaim:
-            claimName: blockvalidation-pvc-2
-        - name: subtree-store-ttl-3
-          persistentVolumeClaim:
-            claimName: blockvalidation-pvc-3
-        - name: subtree-store-ttl-4
-          persistentVolumeClaim:
-            claimName: blockvalidation-pvc-4
+            claimName: lustre-pvc
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

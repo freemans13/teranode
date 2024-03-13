@@ -41,8 +41,6 @@ spec:
               protocol: TCP
             - containerPort: 8181
               protocol: TCP
-            - containerPort: 8281
-              protocol: TCP
             - containerPort: 9091
               protocol: TCP
             - containerPort: 4040
@@ -53,7 +51,6 @@ spec:
               cpu: "8"
             limits:
               memory: 2Gi
-              cpu: "8"
           readinessProbe:
             httpGet:
               path: /health
@@ -70,3 +67,16 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

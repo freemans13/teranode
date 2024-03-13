@@ -1,8 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
 resources:
-  - asset-configmap.yaml
+  - asset-config-map.yaml
   - asset-grpc-ingress.yaml
   - asset-http-ingress.yaml
   - asset-https-ingress.yaml
@@ -10,34 +9,46 @@ resources:
   - asset.yaml
   - blockassembly-blaster-service.yaml
   - blockassembly-blaster.yaml
-  - blockassembly-configmap.yaml
+  - blockassembly-config-map.yaml
   - blockassembly-service.yaml
   - blockassembly.yaml
   - blockchain-service.yaml
   - blockchain.yaml
-  - blockvalidation-configmap.yaml
+  - blockvalidation-config-map.yaml
   - blockvalidation-service.yaml
   - blockvalidation.yaml
+  - certificate.yaml
   - cluster-role-binding.yaml
+  - coinbase-config-map.yaml
   - coinbase-deployment.yaml
   - coinbase-grpc-ingress.yaml
   - coinbase-service.yaml
+  - faucet-service.yaml
+  - faucet.yaml
   - miner-deployment.yaml
-  - p2p-ingress.yaml
+  - p2p-grpc-ingress.yaml
   - p2p-service.yaml
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml
   - p2p.yaml
+  - propagation-config-map.yaml
   - propagation-grpc-ingress.yaml
   - propagation-quic-ingress.yaml
   - propagation-service.yaml
   - propagation.yaml
   - service-account.yaml
   - shared-config-map.yaml
+  - blockpersister-config-map.yaml
+  - blockpersister.yaml
+  - subtreevalidation-config-map.yaml
+  - subtreevalidation-service.yaml
+  - subtreevalidation.yaml
   - tx-blaster-service.yaml
   - tx-blaster.yaml
   - txmetastore-service.yaml
   - txmetastore.yaml
+  - utxo-blaster-service.yaml
+  - utxo-blaster.yaml
   - utxo-config-map.yaml
   - utxostore-service.yaml
   - utxostore.yaml

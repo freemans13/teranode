@@ -63,16 +63,6 @@ spec:
               cpu: "100"
             limits:
               memory: 200Gi
-              cpu: "100"
-          volumeMounts:
-            - mountPath: /data/subtreestore-ttl-1/
-              name: subtree-store-ttl-1
-            - mountPath: /data/subtreestore-ttl-2/
-              name: subtree-store-ttl-2
-            - mountPath: /data/subtreestore-ttl-3/
-              name: subtree-store-ttl-3
-            - mountPath: /data/subtreestore-ttl-4/
-              name: subtree-store-ttl-4
           readinessProbe:
             httpGet:
               path: /health
@@ -89,16 +79,21 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+          volumeMounts:
+            - name: lustre-storage
+              mountPath: /data/subtreestore
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
       volumes:
-        - name: subtree-store-ttl-1
+        - name: lustre-storage
           persistentVolumeClaim:
-            claimName: asset-pvc-1
-        - name: subtree-store-ttl-2
-          persistentVolumeClaim:
-            claimName: asset-pvc-2
-        - name: subtree-store-ttl-3
-          persistentVolumeClaim:
-            claimName: asset-pvc-3
-        - name: subtree-store-ttl-4
-          persistentVolumeClaim:
-            claimName: asset-pvc-4
+            claimName: lustre-pvc
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

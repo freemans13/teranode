@@ -1,0 +1,9 @@
+# create config map for asset service
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: asset-config-m
+data:
+  SETTINGS_CONTEXT: "scaling.m"
+#  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
+#  JAEGER_AGENT_PORT: "6831"

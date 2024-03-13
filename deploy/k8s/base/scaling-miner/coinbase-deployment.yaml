@@ -43,9 +43,13 @@ spec:
           envFrom:
             - configMapRef:
                 name: shared-config-m
+            - configMapRef:
+                name: coinbase-config-m
           env:
             - name: SERVICE_NAME
               value: coinbase-service
+            - name: logLevel
+              value: INFO
             - name: slack_channel
               valueFrom:
                 secretKeyRef:
@@ -69,7 +73,6 @@ spec:
               cpu: "2"
             limits:
               memory: 5Gi
-              cpu: "2"
           readinessProbe:
             httpGet:
               path: /health
@@ -86,3 +89,19 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
             timeoutSeconds: 3
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: ubsv-secrets
+          secret:
+            secretName: ubsv-secrets
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

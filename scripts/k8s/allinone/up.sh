@@ -22,6 +22,8 @@ scale_up() {
   wait miner$namespace_suffix blockchain$namespace_suffix 30
   kubectl scale deployment -n miner$namespace_suffix asset$namespace_suffix --replicas 1
   wait miner$namespace_suffix asset$namespace_suffix 30
+  kubectl scale deployment -n miner$namespace_suffix subtreevalidation$namespace_suffix --replicas 1
+  wait miner$namespace_suffix subtreevalidation$namespace_suffix 30
   kubectl scale deployment -n miner$namespace_suffix blockvalidation$namespace_suffix --replicas 1
   wait miner$namespace_suffix blockvalidation$namespace_suffix 30
   kubectl scale deployment -n miner$namespace_suffix blockassembly$namespace_suffix --replicas 1
@@ -42,7 +44,7 @@ if [ "$1" == "all" ]; then
   namespace_suffix=2
   scale_up
 
-  kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground
+  kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground
   namespace_suffix=3
   scale_up
 else
@@ -53,7 +55,7 @@ else
     kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground
     namespace_suffix=2
   elif [[ "$1" == "asia" || "$1" == "m3" ]]; then
-    kubectl config use-context arn:aws:eks:ap-northeast-1:434394763103:cluster/aws-ubsv-playground
+    kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground
     namespace_suffix=3
   else
     echo "Auto detecting environment"
@@ -61,7 +63,7 @@ else
       namespace_suffix=1
     elif [[ $(kubectl config current-context) == *"us-east-1"* ]]; then
       namespace_suffix=2
-    elif [[ $(kubectl config current-context) == *"ap-northeast-1"* ]]; then
+    elif [[ $(kubectl config current-context) == *"ap-south-1"* ]]; then
       namespace_suffix=3
     else
       echo "Unknown context, cannot scale down. Change namespace and try again"

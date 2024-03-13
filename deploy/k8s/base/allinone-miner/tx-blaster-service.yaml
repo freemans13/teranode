@@ -9,16 +9,13 @@ metadata:
     prometheus.io/port: "9092"
     prometheus.io/scrape: "true"
 spec:
+  clusterIP: None
   ipFamilyPolicy: SingleStack
   ipFamilies:
-  - IPv4
+    - IPv4
   selector:
     app: tx-blaster
   ports:
-    - name: tcp
-      port: 8086
-      targetPort: 8086
-      protocol: TCP
     - name: profiler
       port: 9091
       targetPort: 9091

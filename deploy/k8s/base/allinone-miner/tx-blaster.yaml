@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tx-blaster
+  namespace: allinone-miner
+  labels:
+    app: tx-blaster
+    project: service
+spec:
+  replicas: 0
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: tx-blaster
+  template:
+    metadata:
+      labels:
+        app: tx-blaster
+    spec:
+      serviceAccountName: miner-sa
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: tx-blaster
+                topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: tx-blaster
+          image: REPO:IMAGE:TAG
+          command:
+            - ./blaster.run
+          args: [ "-workers=80" ]
+          envFrom:
+            - configMapRef:
+                name: tx-blaster-config
+          env:
+            - name: SERVICE_NAME
+              value: tx-blaster-service
+
+          ports:
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 9092
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "8"
+            limits:
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9092
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9092
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3

@@ -8,10 +8,10 @@ spec:
   entryPoints:
     - websecure # Service port expecting HTTPS
   routes:
-  - match: Host(`m.scaling.ubsv.dev`)
-    kind: Rule
-    services:
-    - name: asset-service
-      port: 8090  # Service port expecting HTTP
+    - match: Host(`m.scaling.ubsv.dev`)
+      kind: Rule
+      services:
+        - name: asset-service
+          port: 8090  # Service port expecting HTTP
   tls:
-    secretName: wildcard-tls-custom
+    secretName: scaling-tls

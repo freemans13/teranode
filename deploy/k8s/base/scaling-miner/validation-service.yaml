@@ -12,17 +12,13 @@ spec:
   clusterIP: None
   ipFamilyPolicy: SingleStack
   ipFamilies:
-  - IPv4
+    - IPv4
   selector:
     app: validation
   ports:
     - name: tcp
       port: 8081
       targetPort: 8081
-      protocol: TCP
-    - name: frpc
-      port: 8281
-      targetPort: 8281
       protocol: TCP
     - name: validation
       port: 8088

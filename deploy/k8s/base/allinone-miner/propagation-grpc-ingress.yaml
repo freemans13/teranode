@@ -1,7 +1,7 @@
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRouteTCP
 metadata:
-  name: tcp-8084-propagation-miner
+  name: ingressroute-tcp-8084
   labels:
     service: miner
 spec:

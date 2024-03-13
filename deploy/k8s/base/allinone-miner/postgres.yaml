@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: miner
+  labels:
+    service: postgres
+    project: miner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service: postgres
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        service: postgres
+    spec:
+      serviceAccountName: miner-sa
+      # affinity to attempt as much as possible not to schedule same instance types on the same k8s host/node
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    service: postgres
+                topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: postgres
+          image: postgres:latest
+          args: [ "-c", "max_connections=1000", "-c", "listen_addresses=*" ]
+          env:
+            - name: POSTGRES_PASSWORD
+              value: postgres
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+              protocol: TCP
+          resources:
+            requests:
+              memory: 4Gi
+              cpu: "2"
+            limits:
+              memory: 4Gi
+              cpu: "2"
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d/create-db.sql
+              # SubPath ensures only your script is mounted, not the entire ConfigMap directory
+              subPath: create-db.sql
+          readinessProbe:
+            exec:
+              command:
+                - psql
+                - -h
+                - localhost
+                - -p
+                - "5432"
+                - -U
+                - postgres
+                - -c
+                - "SELECT 1"
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            timeoutSeconds: 5
+            failureThreshold: 2
+            successThreshold: 1
+          livenessProbe:
+            exec:
+              command:
+                - psql
+                - -h
+                - localhost
+                - -p
+                - "5432"
+                - -U
+                - postgres
+                - -c
+                - "SELECT 1"
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 5
+            successThreshold: 1
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+        - name: init-script
+          configMap:
+            name: postgres-init-scripts

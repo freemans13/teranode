@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: faucet
+  labels:
+    app: faucet
+    project: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: faucet
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app: faucet
+    spec:
+      serviceAccountName: sa-m
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: faucet
+                topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: service
+          value: faucet
+          operator: Equal
+          effect: NoSchedule
+      containers:
+        - name: faucet
+          image: REPO:IMAGE:TAG
+          args: [ "-faucet=1" ]
+          envFrom:
+            - configMapRef:
+                name: shared-config-m
+          env:
+            - name: SERVICE_NAME
+              value: faucet-service
+          ports:
+            - containerPort: 8097
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 5Gi
+              cpu: "2"
+            limits:
+              memory: 5Gi
+          # readinessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: 9091
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 3
+          # livenessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: 9091
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 3
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

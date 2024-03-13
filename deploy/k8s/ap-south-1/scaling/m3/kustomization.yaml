@@ -1,0 +1,106 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../base/scaling-miner
+
+namespace: m3
+
+nameSuffix: "3"
+
+configMapGenerator:
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3
+    name: shared-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.asset
+    name: asset-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.blockassembly
+    name: blockassembly-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.blockvalidation
+    name: blockvalidation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.subtreevalidation
+    name: subtreevalidation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.coinbase
+    name: coinbase-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.propagation
+    name: propagation-config-m
+patches:
+  - patch: |-
+      - op: replace
+        path: /spec/dnsNames
+        value: 
+         - m3.scaling.ubsv.dev
+    target:
+      kind: Certificate
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: propagation-service3
+    target:
+      labelSelector: service=propagation
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: p2p-service3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=p2p
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: coinbase-service3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=coinbase
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=asset
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service3
+      - op: replace
+        path: /spec/routes/0/match
+        value: Host(`m3.scaling.ubsv.dev`)
+    target:
+      kind: IngressRoute
+      labelSelector: service=asset
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: p2p-service3
+      - op: replace
+        path: /spec/routes/0/match
+        value: Host(`m3.scaling.ubsv.dev`)
+    target:
+      kind: IngressRoute
+      labelSelector: service=p2p
+  - patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: m3
+    target:
+      kind: ClusterRoleBinding
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: sa-m3
+    target:
+      kind: Deployment
