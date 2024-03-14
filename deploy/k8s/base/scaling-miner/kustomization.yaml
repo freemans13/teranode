@@ -39,6 +39,7 @@ resources:
   - service-account.yaml
   - shared-config-map.yaml
   - blockpersister-config-map.yaml
+  - blockpersister-pvc.yaml
   - blockpersister.yaml
   - subtreevalidation-config-map.yaml
   - subtreevalidation-service.yaml

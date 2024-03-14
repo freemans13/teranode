@@ -31,7 +31,7 @@ spec:
           image: REPO:IMAGE:TAG
           args: [ "-blockpersister=1" ]
           # command: "You can override the entrypoint with a command."
-          #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
           #          command: [ "./ubsv.run" ]
           envFrom:
             - configMapRef:
@@ -70,7 +70,12 @@ spec:
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
+            - name: blockpersister-storage
+              mountPath: /data/workdir
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
+        - name: blockpersister-storage
+          persistentVolumeClaim:
+            claimName: blockpersister-pvc
