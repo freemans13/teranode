@@ -175,6 +175,7 @@
     "utxoservice",
     "utxostore",
     "Uxto",
+    "validateblock",
     "verifysignature",
     "Vout",
     "Warnf",
