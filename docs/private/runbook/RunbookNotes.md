@@ -1,12 +1,12 @@
 
-19:00  torrejonv ~  $ aws configure
-AWS Access Key ID [None]: AKIAWKI7SB5PTXR6DV4J
-AWS Secret Access Key [None]: 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
+ ~  $ aws configure
+AWS Access Key ID [None]: ...
+AWS Secret Access Key [None]: ....
 Default region name [None]: eu-north-1
 Default output format [None]:
 
-19:00  torrejonv ~  $ aws eks update-kubeconfig --name aws-ubsv-playground --region ap-south-1
-Added new context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground to /Users/torrejonv/.kube/config
+ ~  $ aws eks update-kubeconfig --name aws-ubsv-playground --region ap-south-1
+Added new context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground to $HOME/.kube/config
 
 aws eks update-kubeconfig --name aws-ubsv-playground --region  eu-west-1
 aws eks update-kubeconfig --name aws-ubsv-playground --region  us-east-1
@@ -14,7 +14,7 @@ aws eks update-kubeconfig --name aws-ubsv-playground --region  ap-south-1
 
 this stuff is now under your
 ~/.kube  $ vi config
-15:42  torrejonv ~/.kube  $
+ ~/.kube  $
 
 brew install kubectl
 
@@ -93,7 +93,7 @@ In the regional k8s folder, we have further kustomization.yaml that further cust
 
 Questions:
 
-Do services need to be started in any specific order? YES -- see /Users/torrejonv/workspace/ubsv/scripts/k8s/scaling/up.sh
+Do services need to be started in any specific order? YES -- see ubsv/scripts/k8s/scaling/up.sh
 
 * Blockchain server
 * asset
