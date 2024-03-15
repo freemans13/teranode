@@ -37,6 +37,10 @@ configMapGenerator:
     literals:
       - SETTINGS_CONTEXT=scaling.m3.propagation
     name: propagation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m3.blockpersister
+    name: blockpersister-config-m
 patches:
   - patch: |-
       - op: replace
