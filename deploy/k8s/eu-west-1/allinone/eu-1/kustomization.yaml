@@ -25,8 +25,64 @@ configMapGenerator:
     literals:
       - SETTINGS_CONTEXT=allinone.miner.EU.1
     name: tx-blaster-config
-
 patches:
+  - patch: |-
+      - op: replace
+        path: /spec/template/metadata/annotations/ad.datadoghq.com/blockassembly.checks
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://blockassembly-service1.m1.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: service=blockassembly
+  - patch: |-
+      - op: replace
+        path: /spec/template/metadata/annotations/ad.datadoghq.com/propagation.checks
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://propagation-service1.m1.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["propagation_processed_transactions","validator_transactions_validate_micros_bucket","validator_transactions_store_utxos_micros_bucket","validator_transactions_spend_utxos_micros_bucket"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: service=propagation
+  - patch: |-
+      - op: replace
+        path: /spec/template/metadata/annotations/ad.datadoghq.com/tx-blaster.checks
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://tx-blaster-service1.m1.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["tx_blaster_processed_transactions",]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: service=tx-blaster
   - patch: |-
       - op: replace
         path: /spec/dnsNames
