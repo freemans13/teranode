@@ -44,7 +44,7 @@ configMapGenerator:
 patches:
   - patch: |-
       - op: replace
-        path: /spec/template/metadata/annotations/ad.datadoghq.com/blockassembly.checks
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1blockassembly.checks"
         value: |
           {
               "openmetrics": {
@@ -60,10 +60,10 @@ patches:
           }
     target:
       kind: Deployment
-      labelSelector: service=blockassembly
+      labelSelector: app=blockassembly
   - patch: |-
       - op: replace
-        path: /spec/template/metadata/annotations/ad.datadoghq.com/propagation.checks
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1propagation.checks"
         value: |
           {
               "openmetrics": {
@@ -79,10 +79,10 @@ patches:
           }
     target:
       kind: Deployment
-      labelSelector: service=propagation
+      labelSelector: app=propagation
   - patch: |-
       - op: replace
-        path: /spec/template/metadata/annotations/ad.datadoghq.com/tx-blaster.checks
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1tx-blaster.checks"
         value: |
           {
               "openmetrics": {
@@ -98,7 +98,7 @@ patches:
           }
     target:
       kind: Deployment
-      labelSelector: service=tx-blaster
+      labelSelector: app=tx-blaster
 
   - patch: |-
       - op: replace
