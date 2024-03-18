@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: scaling-cert
+spec:
+  dnsNames:
+    - 'm.scaling.ubsv.dev' # to be parametrized using kustomize
+  duration: 2880h0m0s # longest duration allowed by cert-manager
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-prod
+  renewBefore: 360h0m0s
+  secretName: scaling-tls

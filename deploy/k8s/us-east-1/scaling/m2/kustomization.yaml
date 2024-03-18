@@ -28,13 +28,86 @@ configMapGenerator:
     name: blockvalidation-config-m
   - behavior: merge
     literals:
+      - SETTINGS_CONTEXT=scaling.m2.subtreevalidation
+    name: subtreevalidation-config-m
+  - behavior: merge
+    literals:
       - SETTINGS_CONTEXT=scaling.m2.coinbase
     name: coinbase-config-m
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m2.propagation
     name: propagation-config-m
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=scaling.m2.blockpersister
+    name: blockpersister-config-m
 patches:
+  - patch: |-
+      - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1blockassembly.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://blockassembly-service2.m2.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket","blockassembly_best_block_height","blockassembly_current_block_height"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=blockassembly
+  - patch: |-
+      - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1propagation.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://propagation-service2.m2.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["propagation_processed_transactions","validator_transactions_validate_micros_bucket","validator_transactions_store_utxos_micros_bucket","validator_transactions_spend_utxos_micros_bucket"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=propagation
+  - patch: |-
+      - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1tx-blaster.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://tx-blaster-service2.m2.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          - "metrics": ["tx_blaster_processed_transactions",]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=tx-blaster
+
+  - patch: |-
+      - op: replace
+        path: /spec/dnsNames
+        value: 
+         - m2.scaling.ubsv.dev
+    target:
+      kind: Certificate
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name

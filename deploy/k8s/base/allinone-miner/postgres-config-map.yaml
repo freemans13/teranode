@@ -5,7 +5,11 @@ metadata:
   namespace: miner
 data:
   create-db.sql: |
-    CREATE DATABASE coinbase;
-    CREATE DATABASE blockchain;
-    CREATE DATABASE txmeta;
-    CREATE DATABASE utxostore;
+    CREATE
+    DATABASE coinbase;
+    CREATE
+    DATABASE blockchain;
+    CREATE
+    DATABASE txmeta;
+    CREATE
+    DATABASE utxostore;

@@ -6,10 +6,15 @@ spec:
   clusterIP: None
   ipFamilyPolicy: SingleStack
   ipFamilies:
-  - IPv4
+    - IPv4
   selector:
     app: nginx
   ports:
     - protocol: TCP
       port: 80
       targetPort: 80
+      name: nginx-80
+    - protocol: TCP
+      port: 81
+      targetPort: 81
+      name: nginx-81

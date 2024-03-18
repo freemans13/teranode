@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: miner
+  name: miner-service
   namespace: miner
   labels:
     app: miner

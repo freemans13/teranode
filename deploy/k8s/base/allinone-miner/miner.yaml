@@ -67,10 +67,10 @@ spec:
               protocol: UDP
           resources:
             requests:
-              memory: 8Gi
+              memory: 2Gi
               cpu: "2"
             limits:
-              memory: 8Gi
+              memory: 2Gi
               cpu: "2"
           volumeMounts:
             - mountPath: /data/subtreestore-ttl/
@@ -100,6 +100,6 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 3
       volumes:
-      - name: subtree-store-ttl
-        persistentVolumeClaim:
-          claimName: subtree-pvc
+        - name: subtree-store-ttl
+          persistentVolumeClaim:
+            claimName: subtree-pvc

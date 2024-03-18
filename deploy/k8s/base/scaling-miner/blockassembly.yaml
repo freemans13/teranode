@@ -15,6 +15,8 @@ spec:
     type: Recreate
   template:
     metadata:
+      annotations:
+        ad.datadoghq.com/blockassembly.checks: ""
       labels:
         app: blockassembly
     spec:
@@ -56,14 +58,10 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 475Gi
-              cpu: "105"
+              memory: 1456Gi
+              cpu: "125"
             limits:
-              memory: 475Gi
-          volumeMounts:
-            - name: lustre-storage
-              mountPath: /data/subtreestore
-
+              memory: 1456Gi
           readinessProbe:
             httpGet:
               path: /health
@@ -71,7 +69,7 @@ spec:
             initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
-            timeoutSeconds: 3
+            timeoutSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
@@ -79,9 +77,22 @@ spec:
             initialDelaySeconds: 1
             periodSeconds: 10
             failureThreshold: 5
-            timeoutSeconds: 3
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: lustre-storage
+              mountPath: /data/subtreestore
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
-
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

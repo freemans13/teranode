@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -459,7 +460,13 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 
 			err = w.Init(ctx)
 			if err != nil {
-				logger.Errorf("Could not initialise worker %d: %v. Sleeping for 5 seconds", workerId, err)
+				if strings.Contains(err.Error(), "no rows in result set") {
+					logger.Warnf("No funds available for worker %d. Sleeping for 5 seconds", workerId)
+				} else if strings.Contains(err.Error(), "connection refused") {
+					logger.Warnf("Propagation service not available for worker %d : %v. Sleeping for 5 seconds", workerId, err)
+				} else {
+					logger.Errorf("Could not initialise worker %d: %v. Sleeping for 5 seconds", workerId, err)
+				}
 				time.Sleep(5 * time.Second)
 				continue
 			}
