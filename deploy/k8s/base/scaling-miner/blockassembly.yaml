@@ -15,6 +15,20 @@ spec:
     type: Recreate
   template:
     metadata:
+      annotations:
+        ad.datadoghq.com/blockassembly.checks: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://blockassembly-service1.m1.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["propagation_processed_transactions","blockassembly_subtrees","blockassembly_transactions","tx_blaster_processed_transactions","blockassembly_add_tx_duration_seconds_bucket","validator_transactions_validate_micros_bucket","validator_transactions_store_utxos_micros_bucket","validator_transactions_spend_utxos_micros_bucket"]
+                      }
+                  ]
+              }
+          }
       labels:
         app: blockassembly
     spec:

@@ -462,6 +462,8 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 			if err != nil {
 				if strings.Contains(err.Error(), "no rows in result set") {
 					logger.Warnf("No funds available for worker %d. Sleeping for 5 seconds", workerId)
+				} else if strings.Contains(err.Error(), "connection refused") {
+					logger.Warnf("Propagation service not available for worker %d : %v. Sleeping for 5 seconds", workerId, err)
 				} else {
 					logger.Errorf("Could not initialise worker %d: %v. Sleeping for 5 seconds", workerId, err)
 				}
