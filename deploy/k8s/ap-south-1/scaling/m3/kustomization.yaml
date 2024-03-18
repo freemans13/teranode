@@ -53,7 +53,7 @@ patches:
                       {
                           "openmetrics_endpoint": "http://blockassembly-service3.m3.svc.cluster.local:9091/metrics",
                           "namespace": "prom",
-                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket"]
+                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket","blockassembly_best_block_height","blockassembly_current_block_height"]
                       }
                   ]
               }
