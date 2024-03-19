@@ -16,7 +16,7 @@ spec:
   template:
     metadata:
       annotations:
-        ad.datadoghq.com/tx-blaster.checks: ""
+        ad.datadoghq.com/subtreevalidation.checks: ""
       labels:
         app: subtreevalidation
     spec:
