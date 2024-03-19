@@ -44,7 +44,7 @@ configMapGenerator:
 patches:
   - patch: |-
       - op: replace
-        path: /spec/template/metadata/annotations/ad.datadoghq.com/blockassembly.checks
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1blockassembly.checks"
         value: |
           {
               "openmetrics": {
@@ -53,17 +53,17 @@ patches:
                       {
                           "openmetrics_endpoint": "http://blockassembly-service3.m3.svc.cluster.local:9091/metrics",
                           "namespace": "prom",
-                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket"]
+                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket","blockassembly_best_block_height","blockassembly_current_block_height"]
                       }
                   ]
               }
           }
     target:
       kind: Deployment
-      labelSelector: service=blockassembly
+      labelSelector: app=blockassembly
   - patch: |-
       - op: replace
-        path: /spec/template/metadata/annotations/ad.datadoghq.com/propagation.checks
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1propagation.checks"
         value: |
           {
               "openmetrics": {
@@ -79,10 +79,10 @@ patches:
           }
     target:
       kind: Deployment
-      labelSelector: service=propagation
+      labelSelector: app=propagation
   - patch: |-
       - op: replace
-        path: /spec/template/metadata/annotations/ad.datadoghq.com/tx-blaster.checks
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1tx-blaster.checks"
         value: |
           {
               "openmetrics": {
@@ -98,7 +98,7 @@ patches:
           }
     target:
       kind: Deployment
-      labelSelector: service=tx-blaster
+      labelSelector: app=tx-blaster
 
   - patch: |-
       - op: replace
