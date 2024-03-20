@@ -202,7 +202,7 @@
   ],
   "cSpell.language": "en,en-US,en-GB,lorem",
   "sonarlint.connectedMode.project": {
-      "connectionId": "UbsvSonarQube",
-      "projectKey": "ubsv"
-    }
+    "connectionId": "UbsvSonarQube",
+    "projectKey": "ubsv"
+  }
 }
