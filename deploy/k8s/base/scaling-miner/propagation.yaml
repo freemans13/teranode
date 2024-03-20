@@ -82,15 +82,10 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 3
           volumeMounts:
-            - name: lustre-storage
-              mountPath: /data/txstore
             - name: scaling-tls
               mountPath: /app/certs
               readOnly: true
       volumes:
-        - name: lustre-storage
-          persistentVolumeClaim:
-            claimName: propagation-luster-pvc
         - name: scaling-tls
           secret:
             secretName: scaling-tls
