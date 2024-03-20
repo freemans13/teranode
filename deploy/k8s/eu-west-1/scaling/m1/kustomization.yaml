@@ -44,6 +44,25 @@ configMapGenerator:
 patches:
   - patch: |-
       - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1subtreevalidation.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://subtreevalidation-service1.m1.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["subtreevalidation_validate_subtree"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=subtreevalidation
+  - patch: |-
+      - op: replace
         path: "/spec/template/metadata/annotations/ad.datadoghq.com~1blockassembly.checks"
         value: |
           {
@@ -53,7 +72,7 @@ patches:
                       {
                           "openmetrics_endpoint": "http://blockassembly-service1.m1.svc.cluster.local:9091/metrics",
                           "namespace": "prom",
-                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket","blockassembly_best_block_height","blockassembly_current_block_height"]
+                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket","blockassembly_best_block_height","blockassembly_current_block_height","blockassembly_add_tx_duration_seconds_count"]
                       }
                   ]
               }
