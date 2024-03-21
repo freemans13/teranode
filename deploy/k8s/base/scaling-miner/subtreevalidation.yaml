@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: subtreevalidation
+  name:  subtreevalidation
 
   labels:
     app: subtreevalidation
@@ -31,10 +31,10 @@ spec:
                     app: subtreevalidation
                 topologyKey: "kubernetes.io/hostname"
       nodeSelector:
-        role: blockvalidation
+        role: subtreevalidation
       tolerations:
         - key: role
-          value: blockvalidation
+          value: subtreevalidation
           operator: Equal
           effect: NoSchedule
       containers:

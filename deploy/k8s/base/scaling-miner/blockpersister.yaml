@@ -26,6 +26,13 @@ spec:
                   matchLabels:
                     app: blockpersister
                 topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: blockpersister
+      tolerations:
+        - key: role
+          value: blockpersister
+          operator: Equal
+          effect: NoSchedule
       containers:
         - name: blockpersister
           image: REPO:IMAGE:TAG
@@ -72,12 +79,11 @@ spec:
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
-            - name: blockpersister-storage
-              mountPath: /data/blockpersister
       volumes:
+        - name: host-root
+          hostPath:
+            path: /root
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
-        - name: blockpersister-storage
-          persistentVolumeClaim:
-            claimName: blockpersister-pvc
+
