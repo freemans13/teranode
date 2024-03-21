@@ -26,32 +26,33 @@ wait_for_scale() {
 scale_up() {
   local region=$1
   local namespace_suffix=$2
-  
+
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockchain$namespace_suffix --replicas 1
   wait_for_scale $region m$namespace_suffix blockchain$namespace_suffix 30
   # kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground status$namespace_suffix --replicas 1
   # wait_for_scale $region m$namespace_suffix status$namespace_suffix 30
   # asset/blockvalidation/blockassembly need to be scaled up together as they depend on each other :(
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground asset$namespace_suffix --replicas 1
-  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground subtreevalidation$namespace_suffix --replicas 1
+  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground subtreevalidation$namespace_suffix --replicas 2
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockvalidation$namespace_suffix --replicas 1
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockassembly$namespace_suffix --replicas 1
-kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground faucet$namespace_suffix --replicas 1
+  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockpersister$namespace_suffix --replicas 1
+  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground faucet$namespace_suffix --replicas 1
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground nginx-reverse-proxy --replicas 1
   # wait for all 3 to be ready
   wait_for_scale $region m$namespace_suffix asset$namespace_suffix 30
   wait_for_scale $region m$namespace_suffix subtreevalidation$namespace_suffix 30
   wait_for_scale $region m$namespace_suffix blockvalidation$namespace_suffix 30
   wait_for_scale $region m$namespace_suffix blockassembly$namespace_suffix 30
-  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground propagation$namespace_suffix --replicas 16
-wait_for_scale $region m$namespace_suffix propagation$namespace_suffix 30
+  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground propagation$namespace_suffix --replicas 30
+  wait_for_scale $region m$namespace_suffix propagation$namespace_suffix 30
   kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground p2p$namespace_suffix --replicas 1
-wait_for_scale $region m$namespace_suffix p2p$namespace_suffix 30
+  wait_for_scale $region m$namespace_suffix p2p$namespace_suffix 30
   echo "Not scaling coinbase and miner as you need to be careful of order when booting the blockchain"
-    # todo think of better way to bring up the nodes
-#  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground coinbase$namespace_suffix --replicas 1
-#  wait_for_scale $region m$namespace_suffix coinbase$namespace_suffix 30
-#  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground miner$namespace_suffix --replicas 1
+  # todo think of better way to bring up the nodes
+  #  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground coinbase$namespace_suffix --replicas 1
+  #  wait_for_scale $region m$namespace_suffix coinbase$namespace_suffix 30
+  #  kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground miner$namespace_suffix --replicas 1
 }
 
 # Array to hold PIDs of background processes
@@ -91,4 +92,3 @@ fi
 for pid in "${bg_pids[@]}"; do
   wait "$pid" || echo "Process $pid exited with status $?"
 done
-
