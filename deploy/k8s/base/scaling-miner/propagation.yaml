@@ -61,10 +61,10 @@ spec:
               protocol: UDP
           resources:
             requests:
-              memory: 100Gi
-              cpu: "50"
+              memory: 40Gi
+              cpu: "28"
             limits:
-              memory: 100Gi
+              memory: 58Gi
           readinessProbe:
             httpGet:
               path: /health
