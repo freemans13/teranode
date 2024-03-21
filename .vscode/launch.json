@@ -12,7 +12,8 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "asset_httpAddress": "http://localhost:8090"
+        "asset_httpAddress": "http://localhost:8090",
+        "startLegacy": "true",
       },
       "args": [
         // "-faucet=1",
