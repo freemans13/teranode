@@ -13,14 +13,16 @@
       // "buildFlags": "-tags=aerospike",
       "env": {
         "asset_httpAddress": "http://localhost:8090",
+        "startMiner": "false",
         "startLegacy": "true",
+        "mine_initial_blocks": "false",
       },
       "args": [
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
         // "-coinbase=1",
-        "-all=1"
+        // "-all=1"
       ]
     },
     {
