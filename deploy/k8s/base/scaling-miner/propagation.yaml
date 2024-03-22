@@ -21,13 +21,11 @@ spec:
       serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app: propagation
-                topologyKey: "kubernetes.io/hostname"
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: propagation
+              topologyKey: "kubernetes.io/hostname"
       tolerations:
         - key: role
           value: propagation

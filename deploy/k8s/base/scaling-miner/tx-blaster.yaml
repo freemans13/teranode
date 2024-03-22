@@ -26,13 +26,11 @@ spec:
       serviceAccountName: sa-m
       affinity:
         podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app: tx-blaster
-                topologyKey: "kubernetes.io/hostname"
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: tx-blaster
+              topologyKey: "kubernetes.io/hostname"
       nodeSelector:
         role: tx-blaster
       tolerations:
