@@ -7,7 +7,7 @@ metadata:
     app: subtreevalidation
     project: service
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: subtreevalidation
@@ -58,10 +58,10 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 1456Gi
-              cpu: "125"
+              memory: 200Gi
+              cpu: "25"
             limits:
-              memory: 1456Gi
+              memory: 240Gi
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
