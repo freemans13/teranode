@@ -56,11 +56,11 @@ spec:
             - containerPort: 4040
               protocol: TCP
           resources:
-            requests:
-              memory: 32Gi
-              cpu: "27"
             limits:
-              memory: 32Gi
+              memory: 10Gi
+            requests:
+              cpu: "12"
+              memory: 10Gi
           readinessProbe:
             httpGet:
               path: /health
