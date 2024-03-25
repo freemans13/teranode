@@ -61,7 +61,7 @@ spec:
               memory: 350Gi
               cpu: "40"
             limits:
-              memory: 760Gi
+              memory: 1012Gi
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
