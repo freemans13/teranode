@@ -432,6 +432,7 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 	// Check if the iterations flag was set to a positive value
 	runIndefinitely := iterations < 0
 
+	retries := 1
 	for {
 		select {
 		case <-ctx.Done():
@@ -482,11 +483,15 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 				logger.Errorf("error from worker: %v", err)
 			}
 
-			time.Sleep(1 * time.Second)
+			waitTime := time.Duration(retries) * time.Second
+			logger.Infof("worker %d failed, retrying in %s", workerId, waitTime)
+
+			time.Sleep(waitTime)
 			if !runIndefinitely {
 				logger.Infof("worker %d finished", workerId)
 				completed <- struct{}{}
 			}
+			retries++
 		}
 	}
 }
