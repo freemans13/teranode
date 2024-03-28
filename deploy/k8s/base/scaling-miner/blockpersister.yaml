@@ -78,11 +78,12 @@ spec:
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
+            - name: blockpersister-storage
+              mountPath: /data/blockpersister
       volumes:
-        - name: host-root
-          hostPath:
-            path: /root
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: lustre-pvc
-
+        - name: blockpersister-storage
+          persistentVolumeClaim:
+            claimName: blockpersister-pvc
