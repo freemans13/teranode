@@ -19,7 +19,6 @@ import (
 	"github.com/bitcoin-sv/ubsv/services/validator"
 	"github.com/bitcoin-sv/ubsv/stores/blob"
 	txmeta_store "github.com/bitcoin-sv/ubsv/stores/txmeta"
-	"github.com/bitcoin-sv/ubsv/stores/txmetacache"
 	utxostore "github.com/bitcoin-sv/ubsv/stores/utxo"
 	"github.com/bitcoin-sv/ubsv/ulogger"
 	"github.com/bitcoin-sv/ubsv/util"
@@ -33,17 +32,17 @@ import (
 	"google.golang.org/grpc"
 )
 
-var stats = gocore.NewStat("blockvalidation")
-
 type processBlockFound struct {
-	hash    *chainhash.Hash
-	baseURL string
-	errCh   chan error
+	hash        *chainhash.Hash
+	blockHeight uint32
+	baseURL     string
+	errCh       chan error
 }
 
 type processBlockCatchup struct {
-	block   *model.Block
-	baseURL string
+	block       *model.Block
+	blockHeight uint32
+	baseURL     string
 }
 
 // Server type carries the logger within it
@@ -66,12 +65,7 @@ type Server struct {
 	// we are getting all message many times from the different miners and this prevents going to the stores multiple times
 	processSubtreeNotify *ttlcache.Cache[chainhash.Hash, bool]
 	// bloom filter stats for all blocks processed
-	bloomFilterStats *model.BloomStats
-}
-
-func Enabled() bool {
-	_, found := gocore.Config().Get("blockvalidation_grpcListenAddress")
-	return found
+	stats *gocore.Stat
 }
 
 // New will return a server instance with the logger stored within it
@@ -86,7 +80,7 @@ func New(logger ulogger.Logger, utxoStore utxostore.Interface, subtreeStore blob
 	subtreeGroup := errgroup.Group{}
 	subtreeGroup.SetLimit(subtreeGroupConcurrency)
 
-	blockFoundChBuffer, _ := gocore.Config().GetInt("blockvalidation_blockFoundCh_buffer_size", 200)
+	blockFoundChBuffer, _ := gocore.Config().GetInt("blockvalidation_blockFoundCh_buffer_size", 1000) // during testing often mine 1000 blocks to begin with
 	catchupChBuffer, _ := gocore.Config().GetInt("blockvalidation_catchupCh_buffer_size", 10)
 
 	bVal := &Server{
@@ -94,20 +88,13 @@ func New(logger ulogger.Logger, utxoStore utxostore.Interface, subtreeStore blob
 		logger:               logger,
 		subtreeStore:         subtreeStore,
 		txStore:              txStore,
+		txMetaStore:          txMetaStore,
 		validatorClient:      validatorClient,
 		blockFoundCh:         make(chan processBlockFound, blockFoundChBuffer),
 		catchupCh:            make(chan processBlockCatchup, catchupChBuffer),
 		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
 		SetTxMetaQ:           util.NewLockFreeQ[[][]byte](),
-		bloomFilterStats:     model.NewBloomStats(),
-	}
-
-	// create a caching tx meta store
-	if gocore.Config().GetBool("blockvalidation_txMetaCacheEnabled", true) {
-		logger.Infof("Using cached version of tx meta store")
-		bVal.txMetaStore = txmetacache.NewTxMetaCache(context.Background(), ulogger.TestLogger{}, txMetaStore)
-	} else {
-		bVal.txMetaStore = txMetaStore
+		stats:                gocore.NewStat("blockvalidation"),
 	}
 
 	return bVal
@@ -138,11 +125,9 @@ func (u *Server) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	u.blockValidation = NewBlockValidation(u.logger, u.blockchainClient, u.subtreeStore, u.txStore, u.txMetaStore, u.validatorClient, subtreeValidationClient, time.Duration(expiration)*time.Second)
+	u.blockValidation = NewBlockValidation(ctx, u.logger, u.blockchainClient, u.subtreeStore, u.txStore, u.txMetaStore, u.validatorClient, subtreeValidationClient, time.Duration(expiration)*time.Second)
 
 	go u.processSubtreeNotify.Start()
-
-	go u.bloomFilterStats.BloomFilterStatsProcessor(ctx)
 
 	go func() {
 		for {
@@ -185,7 +170,7 @@ func (u *Server) Init(ctx context.Context) (err error) {
 	// process blocks found from channel
 	go func() {
 		for {
-			_, _, ctx1 := util.NewStatFromContext(ctx, "catchupCh", stats, false)
+			_, _, ctx1 := util.NewStatFromContext(ctx, "catchupCh", u.stats, false)
 			select {
 			case <-ctx.Done():
 				u.logger.Infof("[Init] closing block found channel")
@@ -201,10 +186,10 @@ func (u *Server) Init(ctx context.Context) (err error) {
 				}
 			case b := <-u.blockFoundCh:
 				{
-					_, _, ctx1 := util.NewStatFromContext(ctx, "blockFoundCh", stats, false)
+					_, _, ctx1 := util.NewStatFromContext(ctx, "blockFoundCh", u.stats, false)
 					// TODO optimize this for the valid chain, not processing everything ???
 					u.logger.Infof("[Init] processing block found on channel [%s]", b.hash.String())
-					if err := u.processBlockFound(ctx1, b.hash, b.baseURL); err != nil {
+					if err := u.processBlockFound(ctx1, b.hash, b.baseURL, b.blockHeight); err != nil {
 						u.logger.Errorf("[Init] failed to process block [%s] [%v]", b.hash.String(), err)
 					}
 
@@ -266,7 +251,7 @@ func (u *Server) Start(ctx context.Context) error {
 								u.logger.Errorf("[BlockValidation] failed getting block from blockchain service")
 							}
 
-							u.logger.Infof("[BlockValidation][%s] processing block into blockpersister kafka producer", block.Hash().String())
+							u.logger.Debugf("[BlockValidation][%s] processing block into blockpersister kafka producer", block.Hash().String())
 
 							for _, subtreeHash := range block.Subtrees {
 								subtreeBytes := subtreeHash.CloneBytes()
@@ -280,6 +265,20 @@ func (u *Server) Start(ctx context.Context) error {
 				}
 			}()
 		}
+	}
+
+	kafkaBlocksValidateConfigURL, err, ok := gocore.Config().GetURL("kafka_blocksValidateConfig")
+	if err == nil && ok {
+		u.logger.Infof("[BlockValidation] starting block validation Kafka client on address: %s, with %d workers", kafkaBlocksValidateConfigURL.String(), 1)
+
+		util.StartKafkaListener(ctx, u.logger, kafkaBlocksValidateConfigURL, 1, "BlockValidation", "blockvalidation", func(_ context.Context, blockHashBytes []byte, _ []byte) error {
+			blockHash, err := chainhash.NewHash(blockHashBytes)
+			if err != nil {
+				u.logger.Errorf("[BlockValidation] failed to parse block hash from kafka: %v", err)
+				return nil
+			}
+			return u.blockValidation.validateBlock(ctx, blockHash)
+		})
 	}
 
 	// this will block
@@ -390,7 +389,7 @@ func (u *Server) Stop(_ context.Context) error {
 }
 
 func (u *Server) HealthGRPC(_ context.Context, _ *blockvalidation_api.EmptyMessage) (*blockvalidation_api.HealthResponse, error) {
-	start, stat, _ := util.NewStatFromContext(context.Background(), "Health", stats)
+	start, stat, _ := util.NewStatFromContext(context.Background(), "Health", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -404,7 +403,7 @@ func (u *Server) HealthGRPC(_ context.Context, _ *blockvalidation_api.EmptyMessa
 }
 
 func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockFoundRequest) (*blockvalidation_api.EmptyMessage, error) {
-	start, stat, ctx := util.NewStatFromContext(ctx, "BlockFound", stats)
+	start, stat, ctx := util.NewStatFromContext(ctx, "BlockFound", u.stats)
 	defer func() {
 		stat.AddTime(start)
 		prometheusBlockValidationBlockFoundDuration.Observe(float64(time.Since(start).Microseconds()) / 1_000_000)
@@ -439,9 +438,10 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 	go func() {
 		u.logger.Infof("[BlockFound][%s] add on channel", hash.String())
 		u.blockFoundCh <- processBlockFound{
-			hash:    hash,
-			baseURL: req.GetBaseUrl(),
-			errCh:   errCh,
+			hash:        hash,
+			blockHeight: req.BlockHeight,
+			baseURL:     req.GetBaseUrl(),
+			errCh:       errCh,
 		}
 		prometheusBlockValidationBlockFoundCh.Set(float64(len(u.blockFoundCh)))
 	}()
@@ -456,10 +456,10 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 	return &blockvalidation_api.EmptyMessage{}, nil
 }
 
-func (u *Server) processBlockFound(cntxt context.Context, hash *chainhash.Hash, baseUrl string) error {
+func (u *Server) processBlockFound(cntxt context.Context, hash *chainhash.Hash, baseUrl string, blockHeight uint32) error {
 	span, spanCtx := opentracing.StartSpanFromContext(cntxt, "BlockValidationServer:processBlockFound")
 	span.LogKV("hash", hash.String())
-	start, stat, ctx := util.NewStatFromContext(spanCtx, "processBlockFound", stats)
+	start, stat, ctx := util.NewStatFromContext(spanCtx, "processBlockFound", u.stats)
 	defer func() {
 		span.Finish()
 		stat.AddTime(start)
@@ -488,7 +488,8 @@ func (u *Server) processBlockFound(cntxt context.Context, hash *chainhash.Hash, 
 		u.blockValidation.blockBloomFiltersBeingCreated.Exists(*block.Header.HashPrevBlock)
 
 	if blockBeingFinalized {
-		u.logger.Infof("[processBlockFound][%s] parent block is being validated (hash: %s), waiting for it to finish", hash.String(), block.Header.HashPrevBlock.String())
+		u.logger.Infof("[processBlockFound][%s] parent block is being validated (hash: %s), waiting for it to finish: %v - %v", hash.String(), block.Header.HashPrevBlock.String(), u.blockValidation.blockHashesCurrentlyValidated.Exists(*block.Header.HashPrevBlock), u.blockValidation.blockBloomFiltersBeingCreated.Exists(*block.Header.HashPrevBlock))
+		retries := 0
 		for {
 			blockBeingFinalized = u.blockValidation.blockHashesCurrentlyValidated.Exists(*block.Header.HashPrevBlock) ||
 				u.blockValidation.blockBloomFiltersBeingCreated.Exists(*block.Header.HashPrevBlock)
@@ -496,7 +497,13 @@ func (u *Server) processBlockFound(cntxt context.Context, hash *chainhash.Hash, 
 			if !blockBeingFinalized {
 				break
 			}
+
+			if (retries % 10) == 0 {
+				u.logger.Infof("[processBlockFound][%s] parent block is still (%d) being validated (hash: %s), waiting for it to finish: %v - %v", hash.String(), retries, block.Header.HashPrevBlock.String(), u.blockValidation.blockHashesCurrentlyValidated.Exists(*block.Header.HashPrevBlock), u.blockValidation.blockBloomFiltersBeingCreated.Exists(*block.Header.HashPrevBlock))
+			}
+
 			time.Sleep(1 * time.Second)
+			retries++
 		}
 		u.logger.Infof("[processBlockFound][%s] parent block is done being validated", hash.String())
 	}
@@ -512,8 +519,9 @@ func (u *Server) processBlockFound(cntxt context.Context, hash *chainhash.Hash, 
 		go func() {
 			u.logger.Infof("[processBlockFound][%s] processBlockFound add to catchup channel", hash.String())
 			u.catchupCh <- processBlockCatchup{
-				block:   block,
-				baseURL: baseUrl,
+				block:       block,
+				blockHeight: blockHeight,
+				baseURL:     baseUrl,
 			}
 			prometheusBlockValidationCatchupCh.Set(float64(len(u.catchupCh)))
 		}()
@@ -523,7 +531,7 @@ func (u *Server) processBlockFound(cntxt context.Context, hash *chainhash.Hash, 
 
 	// validate the block
 	u.logger.Infof("[processBlockFound][%s] validate block", hash.String())
-	err = u.blockValidation.ValidateBlock(ctx, block, baseUrl, u.bloomFilterStats)
+	err = u.blockValidation.ValidateBlock(ctx, block, baseUrl, u.blockValidation.bloomFilterStats)
 	if err != nil {
 		u.logger.Errorf("failed block validation BlockFound [%s] [%v]", block.String(), err)
 	}
@@ -532,7 +540,7 @@ func (u *Server) processBlockFound(cntxt context.Context, hash *chainhash.Hash, 
 }
 
 func (u *Server) getBlock(ctx context.Context, hash *chainhash.Hash, baseUrl string) (*model.Block, error) {
-	start, stat, ctx := util.NewStatFromContext(ctx, "getBlock", stats)
+	start, stat, ctx := util.NewStatFromContext(ctx, "getBlock", u.stats)
 	span, spanCtx := opentracing.StartSpanFromContext(ctx, "BlockValidationServer:getBlock")
 	defer func() {
 		span.Finish()
@@ -557,7 +565,7 @@ func (u *Server) getBlock(ctx context.Context, hash *chainhash.Hash, baseUrl str
 }
 
 func (u *Server) getBlockHeaders(ctx context.Context, hash *chainhash.Hash, baseUrl string) ([]*model.BlockHeader, error) {
-	start, stat, ctx := util.NewStatFromContext(ctx, "getBlockHeaders", stats)
+	start, stat, ctx := util.NewStatFromContext(ctx, "getBlockHeaders", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -582,7 +590,7 @@ func (u *Server) getBlockHeaders(ctx context.Context, hash *chainhash.Hash, base
 }
 
 func (u *Server) catchup(ctx context.Context, fromBlock *model.Block, baseURL string) error {
-	start, stat, ctx := util.NewStatFromContext(ctx, "catchup", stats)
+	start, stat, ctx := util.NewStatFromContext(ctx, "catchup", u.stats)
 	span, spanCtx := opentracing.StartSpanFromContext(ctx, "BlockValidationServer:catchup")
 	defer func() {
 		stat.AddTime(start)
@@ -626,7 +634,8 @@ LOOP:
 				u.blockValidation.blockBloomFiltersBeingCreated.Exists(*blockHeader.HashPrevBlock)
 
 			if blockBeingFinalized {
-				u.logger.Infof("[catchup][%s] parent block is being validated (hash: %s), waiting for it to finish", fromBlock.Hash().String(), blockHeader.HashPrevBlock.String())
+				u.logger.Infof("[catchup][%s] parent block is being validated (hash: %s), waiting for it to finish: %v - %v", fromBlock.Hash().String(), blockHeader.HashPrevBlock.String(), u.blockValidation.blockHashesCurrentlyValidated.Exists(*blockHeader.HashPrevBlock), u.blockValidation.blockBloomFiltersBeingCreated.Exists(*blockHeader.HashPrevBlock))
+				retries := 0
 				for {
 					blockBeingFinalized = u.blockValidation.blockHashesCurrentlyValidated.Exists(*blockHeader.HashPrevBlock) ||
 						u.blockValidation.blockBloomFiltersBeingCreated.Exists(*blockHeader.HashPrevBlock)
@@ -634,7 +643,13 @@ LOOP:
 					if !blockBeingFinalized {
 						break
 					}
+
+					if (retries % 10) == 0 {
+						u.logger.Infof("[catchup][%s] parent block is still (%d) being validated (hash: %s), waiting for it to finish: %v - %v", fromBlock.Hash().String(), retries, blockHeader.HashPrevBlock.String(), u.blockValidation.blockHashesCurrentlyValidated.Exists(*blockHeader.HashPrevBlock), u.blockValidation.blockBloomFiltersBeingCreated.Exists(*blockHeader.HashPrevBlock))
+					}
+
 					time.Sleep(1 * time.Second)
+					retries++
 				}
 				u.logger.Infof("[catchup][%s] parent block is done being validated", fromBlock.Hash().String())
 			}
@@ -692,7 +707,7 @@ LOOP:
 	// validate the blocks while getting them from the other node
 	// this will block until all blocks are validated
 	for block := range validateBlocksChan {
-		if err := u.blockValidation.ValidateBlock(spanCtx, block, baseURL, u.bloomFilterStats); err != nil {
+		if err := u.blockValidation.ValidateBlock(spanCtx, block, baseURL, u.blockValidation.bloomFilterStats); err != nil {
 			return errors.Join(fmt.Errorf("[catchup][%s] failed block validation BlockFound [%s]", fromBlock.Hash().String(), block.String()), err)
 		}
 	}
@@ -717,7 +732,7 @@ func (u *Server) SubtreeFound(_ context.Context, req *blockvalidation_api.Subtre
 }
 
 func (u *Server) Get(ctx context.Context, request *blockvalidation_api.GetSubtreeRequest) (*blockvalidation_api.GetSubtreeResponse, error) {
-	start, stat, ctx := util.NewStatFromContext(ctx, "Get", stats)
+	start, stat, ctx := util.NewStatFromContext(ctx, "Get", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -733,7 +748,7 @@ func (u *Server) Get(ctx context.Context, request *blockvalidation_api.GetSubtre
 }
 
 func (u *Server) Exists(ctx context.Context, request *blockvalidation_api.ExistsSubtreeRequest) (*blockvalidation_api.ExistsSubtreeResponse, error) {
-	start, stat, ctx := util.NewStatFromContext(ctx, "Exists", stats)
+	start, stat, ctx := util.NewStatFromContext(ctx, "Exists", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -750,7 +765,7 @@ func (u *Server) Exists(ctx context.Context, request *blockvalidation_api.Exists
 }
 
 func (u *Server) SetTxMeta(ctx context.Context, request *blockvalidation_api.SetTxMetaRequest) (*blockvalidation_api.SetTxMetaResponse, error) {
-	start, stat, _ := util.NewStatFromContext(ctx, "SetTxMeta", stats)
+	start, stat, _ := util.NewStatFromContext(ctx, "SetTxMeta", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -769,7 +784,7 @@ func (u *Server) SetTxMeta(ctx context.Context, request *blockvalidation_api.Set
 }
 
 func (u *Server) DelTxMeta(ctx context.Context, request *blockvalidation_api.DelTxMetaRequest) (*blockvalidation_api.DelTxMetaResponse, error) {
-	start, stat, ctx := util.NewStatFromContext(ctx, "SetTxMeta", stats)
+	start, stat, ctx := util.NewStatFromContext(ctx, "SetTxMeta", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -790,7 +805,7 @@ func (u *Server) DelTxMeta(ctx context.Context, request *blockvalidation_api.Del
 }
 
 func (u *Server) SetMinedMulti(ctx context.Context, request *blockvalidation_api.SetMinedMultiRequest) (*blockvalidation_api.SetMinedMultiResponse, error) {
-	start, stat, ctx := util.NewStatFromContext(ctx, "SetMinedMulti", stats)
+	start, stat, ctx := util.NewStatFromContext(ctx, "SetMinedMulti", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()

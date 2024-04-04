@@ -49,26 +49,22 @@ type BlockAssembly struct {
 	blockAssembler *BlockAssembler
 	logger         ulogger.Logger
 
-	blockchainClient      blockchain.ClientI
-	txStore               blob.Store
-	utxoStore             utxostore.Interface
-	txMetaStore           txmeta_store.Store
-	subtreeStore          blob.Store
-	subtreeTTL            time.Duration
-	jobStore              *ttlcache.Cache[chainhash.Hash, *subtreeprocessor.Job] // has built in locking
-	blockSubmissionChan   chan *BlockSubmissionRequest
-	blockAssemblyDisabled bool
+	blockchainClient        blockchain.ClientI
+	txStore                 blob.Store
+	utxoStore               utxostore.Interface
+	txMetaStore             txmeta_store.Store
+	subtreeStore            blob.Store
+	subtreeTTL              time.Duration
+	jobStore                *ttlcache.Cache[chainhash.Hash, *subtreeprocessor.Job] // has built in locking
+	blockSubmissionChan     chan *BlockSubmissionRequest
+	blockAssemblyDisabled   bool
+	blockValidKafkaProducer util.KafkaProducerI
 }
 
 type subtreeRetrySend struct {
 	subtreeHash  chainhash.Hash
 	subtreeBytes []byte
 	retries      int
-}
-
-func Enabled() bool {
-	_, found := gocore.Config().Get("blockassembly_grpcListenAddress")
-	return found
 }
 
 // New will return a server instance with the logger stored within it
@@ -128,6 +124,14 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 
 	// init the block assembler for this server
 	ba.blockAssembler = NewBlockAssembler(ctx, ba.logger, ba.utxoStore, ba.subtreeStore, ba.blockchainClient, newSubtreeChan)
+
+	kafkaBlocksValidateConfig, err, ok := gocore.Config().GetURL("kafka_blocksValidateConfig")
+	if err == nil && ok {
+		_, ba.blockValidKafkaProducer, err = util.ConnectToKafka(kafkaBlocksValidateConfig)
+		if err != nil {
+			return fmt.Errorf("[BlockAssembly:Init] unable to connect to kafka for block validation: %v", err)
+		}
+	}
 
 	// start the new subtree retry processor in the background
 	go func() {
@@ -286,58 +290,12 @@ func (ba *BlockAssembly) Start(ctx context.Context) (err error) {
 		go ba.startKafkaListener(ctx, kafkaURL)
 	}
 
-	// Experimental fRPC server - to test throughput at scale
-	frpcAddress, ok := gocore.Config().Get("blockassembly_frpcListenAddress")
-	if ok {
-		err = ba.frpcServer(ctx, frpcAddress)
-		if err != nil {
-			ba.logger.Errorf("failed to start fRPC server: %v", err)
-		}
-	}
-
 	// this will block
 	if err = util.StartGRPCServer(ctx, ba.logger, "blockassembly", func(server *grpc.Server) {
 		blockassembly_api.RegisterBlockAssemblyAPIServer(server, ba)
 	}); err != nil {
 		return err
 	}
-
-	return nil
-}
-
-func (ba *BlockAssembly) frpcServer(ctx context.Context, frpcAddress string) error {
-	ba.logger.Infof("Starting fRPC server on %s", frpcAddress)
-
-	frpcBa := &fRPC_BlockAssembly{
-		ba: ba,
-	}
-
-	s, err := blockassembly_api.NewServer(frpcBa, nil, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create fRPC server: %v", err)
-	}
-
-	concurrency, ok := gocore.Config().GetInt("blockassembly_frpcConcurrency")
-	if ok {
-		ba.logger.Infof("Setting fRPC server concurrency to %d", concurrency)
-		s.SetConcurrency(uint64(concurrency))
-	}
-
-	// run the server
-	go func() {
-		err := s.Start(frpcAddress)
-		if err != nil {
-			ba.logger.Errorf("failed to serve frpc: %v", err)
-		}
-	}()
-
-	go func() {
-		<-ctx.Done()
-		err := s.Shutdown()
-		if err != nil {
-			ba.logger.Errorf("failed to shutdown frpc server: %v", err)
-		}
-	}()
 
 	return nil
 }
@@ -382,17 +340,10 @@ func (ba *BlockAssembly) startKafkaListener(ctx context.Context, kafkaURL *url.U
 			return
 		}
 
-		utxoHashesBytes := make([][]byte, len(data.UtxoHashes))
-		for i, hash := range data.UtxoHashes {
-			utxoHashesBytes[i] = hash.CloneBytes()
-		}
-
 		if _, err = ba.AddTx(ctx, &blockassembly_api.AddTxRequest{
-			Txid:     data.TxIDChainHash.CloneBytes(),
-			Fee:      data.Fee,
-			Size:     data.Size,
-			Locktime: data.LockTime,
-			Utxos:    utxoHashesBytes,
+			Txid: data.TxIDChainHash.CloneBytes(),
+			Fee:  data.Fee,
+			Size: data.Size,
 		}); err != nil {
 			ba.logger.Errorf("[BlockAssembly] failed to add tx to block assembly: %s", err)
 		}
@@ -424,7 +375,7 @@ func (ba *BlockAssembly) HealthGRPC(_ context.Context, _ *blockassembly_api.Empt
 
 var txsProcessed = atomic.Uint64{}
 
-func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTxRequest) (resp *blockassembly_api.AddTxResponse, err error) {
+func (ba *BlockAssembly) AddTx(_ context.Context, req *blockassembly_api.AddTxRequest) (resp *blockassembly_api.AddTxResponse, err error) {
 	startTime := time.Now()
 	defer func() {
 		if txsProcessed.Load()%1000 == 0 {
@@ -477,7 +428,7 @@ func (ba *BlockAssembly) RemoveTx(_ context.Context, req *blockassembly_api.Remo
 	return &blockassembly_api.EmptyMessage{}, nil
 }
 
-func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_api.AddTxBatchRequest) (*blockassembly_api.AddTxBatchResponse, error) {
+func (ba *BlockAssembly) AddTxBatch(_ context.Context, batch *blockassembly_api.AddTxBatchRequest) (*blockassembly_api.AddTxBatchResponse, error) {
 	// start := gocore.CurrentTime()
 	// defer func() {
 	// 	addTxBatchGrpc.AddTime(start)
@@ -497,7 +448,6 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 	}
 
 	var batchError error = nil
-	txIdErrors := make([][]byte, 0, len(requests))
 	for _, req := range requests {
 		startTxTime := time.Now()
 		// create the subtree node
@@ -513,8 +463,7 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 	}
 
 	return &blockassembly_api.AddTxBatchResponse{
-		Ok:         true,
-		TxIdErrors: txIdErrors,
+		Ok: true,
 	}, batchError
 }
 
@@ -770,6 +719,14 @@ func (ba *BlockAssembly) submitMiningSolution(cntxt context.Context, req *BlockS
 	if err = ba.blockchainClient.AddBlock(ctx, block, ""); err != nil {
 		return nil, fmt.Errorf("[BlockAssembly][%s][%s] failed to add block: %w", jobID, block.Hash().String(), err)
 	}
+
+	// send the block for validation in the blockvalidation server, this makes sure we also mark the block as
+	// invalid if there is something wrong with it
+	// TODO this does not work properly, since the subtreeMeta is not stored with the subtree from our own blocks
+	//      this needs to be changed before re-activating this one
+	//if err = ba.blockValidKafkaProducer.Send(block.Hash().CloneBytes(), block.Hash().CloneBytes()); err != nil {
+	//	ba.logger.Errorf("[BlockAssembly][%s][%s] failed to send block for validation: %s", jobID, block.Hash().String(), err)
+	//}
 
 	// decouple the tracing context to not cancel the context when the subtree TTL is being saved in the background
 	callerSpan := opentracing.SpanFromContext(ctx)

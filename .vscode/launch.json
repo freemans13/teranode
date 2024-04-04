@@ -13,11 +13,32 @@
       // "buildFlags": "-tags=aerospike",
       "env": {
         "asset_httpAddress": "http://localhost:8090",
-        "startMiner": "false",
         "startLegacy": "true",
-        "mine_initial_blocks": "false",
       },
       "args": [
+        // "-faucet=1",
+        // "-blockchain=1",
+        // "-asset=1",
+        // "-coinbase=1",
+        // "-all=1"
+      ]
+    },{
+      "name": "Legacy",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      // "buildFlags": "-tags=aerospike",
+      "env": {
+        "asset_httpAddress": "http://localhost:8090",
+        "startLegacy": "true",
+      },
+      "args": [
+        "-all=0",
+        "-blockchain=1",
+        "-legacy=1",
+        "-blockvalidation=1",
+        "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",

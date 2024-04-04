@@ -32,13 +32,11 @@ import (
 var (
 	prometheusWorkers               prometheus.Gauge
 	prometheusProcessedTransactions prometheus.Counter
-	prometheusTransactionsRetry     prometheus.Counter
 	prometheusInvalidTransactions   prometheus.Counter
 	prometheusInternalErrors        prometheus.Counter
 	prometheusTransactionDuration   prometheus.Histogram
 	prometheusTransactionSize       prometheus.Histogram
 	prometheusWorkerErrors          *prometheus.CounterVec
-	// prometheusTransactionErrors     *prometheus.CounterVec
 )
 
 // ContextKey type
@@ -71,12 +69,6 @@ func _initPrometheusMetrics() {
 		prometheus.CounterOpts{
 			Name: "tx_blaster_processed_transactions",
 			Help: "Number of transactions processed by the tx blaster",
-		},
-	)
-	prometheusTransactionsRetry = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "tx_blaster_retry_transactions",
-			Help: "Number of transactions retried by the tx blaster",
 		},
 	)
 	prometheusInvalidTransactions = promauto.NewCounter(
@@ -113,16 +105,6 @@ func _initPrometheusMetrics() {
 			"error",    // error returned
 		},
 	)
-	// prometheusTransactionErrors = promauto.NewCounterVec(
-	// 	prometheus.CounterOpts{
-	// 		Name: "tx_blaster_errors",
-	// 		Help: "Number of tx blaster errors",
-	// 	},
-	// 	[]string{
-	// 		"function", //function raising the error
-	// 		"error",    // error returned
-	// 	},
-	// )
 }
 
 type Ipv6MulticastMsg struct {
@@ -322,30 +304,9 @@ func (w *Worker) Start(ctx context.Context) (err error) {
 			return ctx.Err()
 
 		case utxo = <-w.utxoChan:
-
-			// Even though the sendTransactionFromUtxo function retries, we still want to retry
-			// this transaction a few times before giving up in case a subtree has been processed
-			// or a propagation error has been fixed.
-			for outerRetry := 0; outerRetry < 3; outerRetry++ {
-				tx, err = w.sendTransactionFromUtxo(ctx, utxo)
-				if err == nil {
-					break
-				}
-
-				w.logger.Errorf("error sending transaction: %v", err)
-
-				if errors.Is(err, propagation.ErrBadRequest) {
-					// There is no point retrying a bad transaction
-					return err
-				}
-
-				prometheusTransactionsRetry.Inc()
-				time.Sleep(5 * time.Second)
-			}
-
+			tx, err = w.sendTransactionFromUtxo(ctx, utxo)
 			if err != nil {
-				// Even after retries, the transaction failed
-				return err
+				return fmt.Errorf("error sending transaction from utxo %s:%d: %v", utxo.TxIDHash.String(), utxo.Vout, err)
 			}
 
 			counterLoad = counter.Add(1)
@@ -364,14 +325,12 @@ func (w *Worker) Start(ctx context.Context) (err error) {
 			prometheusTransactionDuration.Observe(float64(time.Since(start).Microseconds()))
 			w.totalTransactions.Add(1)
 
-			btUtxo := &bt.UTXO{
+			w.utxoChan <- &bt.UTXO{
 				TxIDHash:      tx.TxIDChainHash(),
 				Vout:          0,
 				LockingScript: tx.Outputs[0].LockingScript,
 				Satoshis:      tx.Outputs[0].Satoshis,
 			}
-
-			w.utxoChan <- btUtxo
 
 			if w.rateLimiter != nil {
 				_ = w.rateLimiter.Wait(ctx)
@@ -390,18 +349,18 @@ func (w *Worker) sendTransactionFromUtxo(ctx context.Context, utxo *bt.UTXO) (tx
 	err = tx.FromUTXOs(utxo)
 	if err != nil {
 		prometheusInvalidTransactions.Inc()
-		return tx, fmt.Errorf("error adding utxo to tx: %v", err)
+		return nil, fmt.Errorf("error adding utxo to tx: %v", err)
 	}
 
 	err = tx.AddP2PKHOutputFromAddress(w.address.AddressString, utxo.Satoshis)
 	if err != nil {
 		prometheusInvalidTransactions.Inc()
-		return tx, fmt.Errorf("error adding output to tx: %v", err)
+		return nil, fmt.Errorf("error adding output to tx: %v", err)
 	}
 
 	if err = tx.FillAllInputs(ctx, w.unlocker); err != nil {
 		prometheusInvalidTransactions.Inc()
-		return tx, fmt.Errorf("error filling tx inputs: %v", err)
+		return nil, fmt.Errorf("error filling tx inputs: %v", err)
 	}
 
 	w.sentTxCache.Add(tx.TxIDChainHash().String())
@@ -431,7 +390,7 @@ func (w *Worker) sendTransactionFromUtxo(ctx context.Context, utxo *bt.UTXO) (tx
 			}
 		}
 
-		return tx, fmt.Errorf("error sending transaction #%d: %v", counter.Load(), err)
+		return nil, fmt.Errorf("error sending transaction #%d: %v", counter.Load(), err)
 	}
 
 	return tx, nil

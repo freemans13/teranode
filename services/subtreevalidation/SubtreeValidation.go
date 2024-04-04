@@ -91,6 +91,19 @@ func (u *Server) SetTxMetaCacheMulti(ctx context.Context, keys [][]byte, values 
 	return nil
 }
 
+func (u *Server) DelTxMetaCache(ctx context.Context, hash *chainhash.Hash) error {
+	if cache, ok := u.txMetaStore.(*txmetacache.TxMetaCache); ok {
+		span, _ := opentracing.StartSpanFromContext(ctx, "BlockValidation:DelTxMetaCache")
+		defer func() {
+			span.Finish()
+		}()
+
+		return cache.Delete(ctx, hash)
+	}
+
+	return nil
+}
+
 func (u *Server) DelTxMetaCacheMulti(ctx context.Context, hash *chainhash.Hash) error {
 	if cache, ok := u.txMetaStore.(*txmetacache.TxMetaCache); ok {
 		span, _ := opentracing.StartSpanFromContext(ctx, "BlockValidation:DelTxMetaCacheMulti")
@@ -213,7 +226,7 @@ func (u *Server) readTxFromReader(body io.ReadCloser) (tx *bt.Tx, err error) {
 // 	return tx, nil
 // }
 
-func (u *Server) blessMissingTransaction(ctx context.Context, tx *bt.Tx) (txMeta *txmeta.Data, err error) {
+func (u *Server) blessMissingTransaction(ctx context.Context, tx *bt.Tx, blockHeight uint32) (txMeta *txmeta.Data, err error) {
 	startTotal, stat, ctx := util.StartStatFromContext(ctx, "getMissingTransaction")
 	defer func() {
 		stat.AddTime(startTotal)
@@ -233,7 +246,7 @@ func (u *Server) blessMissingTransaction(ctx context.Context, tx *bt.Tx) (txMeta
 	// validate the transaction in the validation service
 	// this should spend utxos, create the tx meta and create new utxos
 	// todo return tx meta data
-	err = u.validatorClient.Validate(ctx, tx)
+	err = u.validatorClient.Validate(ctx, tx, blockHeight)
 	if err != nil {
 		// TODO what to do here? This could be a double spend and the transaction needs to be marked as conflicting
 		return nil, fmt.Errorf("[blessMissingTransaction][%s] failed to validate transaction [%s]", tx.TxID(), err.Error())
@@ -260,7 +273,7 @@ type ValidateSubtree struct {
 	AllowFailFast bool
 }
 
-func (u *Server) validateSubtreeInternal(ctx context.Context, v ValidateSubtree) error {
+func (u *Server) validateSubtreeInternal(ctx context.Context, v ValidateSubtree, blockHeight uint32) error {
 	startTotal, stat, ctx := util.StartStatFromContext(ctx, "validateSubtreeBlobInternal")
 	span, spanCtx := opentracing.StartSpanFromContext(ctx, "BlockValidation:validateSubtree")
 	span.LogKV("subtree", v.SubtreeHash.String())
@@ -291,9 +304,19 @@ func (u *Server) validateSubtreeInternal(ctx context.Context, v ValidateSubtree)
 
 		// The function was called by BlockFound, and we had not already blessed the subtree, so we load the subtree from the store to get the hashes
 		// get subtree from network over http using the baseUrl
-		txHashes, err = u.getSubtreeTxHashes(spanCtx, stat, &v.SubtreeHash, v.BaseUrl)
-		if err != nil {
-			return errors.Join(fmt.Errorf("[validateSubtreeInternal][%s] failed to get subtree from network", v.SubtreeHash.String()), err)
+		for retries := 0; retries < 3; retries++ {
+			txHashes, err = u.getSubtreeTxHashes(spanCtx, stat, &v.SubtreeHash, v.BaseUrl)
+			if err != nil {
+				if retries < 2 {
+					backoff := time.Duration(2^retries) * time.Second
+					u.logger.Warnf("[validateSubtreeInternal][%s] failed to get subtree from network (try %d), will retry in %s", v.SubtreeHash.String(), retries, backoff.String())
+					time.Sleep(backoff)
+				} else {
+					return errors.Join(fmt.Errorf("[validateSubtreeInternal][%s] failed to get subtree from network", v.SubtreeHash.String()), err)
+				}
+			} else {
+				break
+			}
 		}
 	}
 
@@ -378,7 +401,7 @@ func (u *Server) validateSubtreeInternal(ctx context.Context, v ValidateSubtree)
 
 			u.logger.Infof("[validateSubtreeInternal][%s] [attempt #%d] processing %d missing tx for subtree instance", v.SubtreeHash.String(), attempt, len(missingTxHashesCompacted))
 
-			err = u.processMissingTransactions(ctx5, &v.SubtreeHash, missingTxHashesCompacted, v.BaseUrl, txMetaSlice)
+			err = u.processMissingTransactions(ctx5, &v.SubtreeHash, missingTxHashesCompacted, v.BaseUrl, txMetaSlice, blockHeight)
 			if err != nil {
 				return err
 			}
@@ -494,7 +517,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 	buffer := make([]byte, chainhash.HashSize)
 	bufferedReader := bufio.NewReaderSize(body, 1024*1024*4) // 4MB buffer
 
-	u.logger.Infof("[getSubtreeTxHashes][%s] processing subtree response into tx hashes", subtreeHash.String())
+	u.logger.Debugf("[getSubtreeTxHashes][%s] processing subtree response into tx hashes", subtreeHash.String())
 	for {
 		n, err := io.ReadFull(bufferedReader, buffer)
 		if n > 0 {
@@ -512,21 +535,15 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 		}
 	}
 
-	// // the subtree bytes we got from our competing miner only contain the transaction hashes
-	// // it's basically just a list of 32 byte transaction hashes
-	// txHashes := make([]chainhash.Hash, len(subtreeBytes)/chainhash.HashSize)
-	// for i := 0; i < len(subtreeBytes); i += chainhash.HashSize {
-	// 	txHashes[i/chainhash.HashSize] = chainhash.Hash(subtreeBytes[i : i+chainhash.HashSize])
-	// }
 	stat.NewStat("3. createTxHashes").AddTime(start)
 
-	u.logger.Infof("[getSubtreeTxHashes][%s] done with subtree response", subtreeHash.String())
+	u.logger.Debugf("[getSubtreeTxHashes][%s] done with subtree response", subtreeHash.String())
 
 	return txHashes, nil
 }
 
 func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash *chainhash.Hash,
-	missingTxHashes []txmeta.MissingTxHash, baseUrl string, txMetaSlice []*txmeta.Data) error {
+	missingTxHashes []txmeta.MissingTxHash, baseUrl string, txMetaSlice []*txmeta.Data, blockHeight uint32) error {
 
 	span, spanCtx := opentracing.StartSpanFromContext(ctx, "BlockValidation:processMissingTransactions")
 	defer func() {
@@ -551,7 +568,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash *ch
 			return fmt.Errorf("[validateSubtree][%s] missing transaction is nil", subtreeHash.String())
 		}
 
-		txMeta, err = u.blessMissingTransaction(spanCtx, mTx.tx)
+		txMeta, err = u.blessMissingTransaction(spanCtx, mTx.tx, blockHeight)
 		if err != nil {
 			return fmt.Errorf("[validateSubtree][%s] failed to bless missing transaction: %s: %w", subtreeHash.String(), mTx.tx.TxIDChainHash().String(), err)
 		}

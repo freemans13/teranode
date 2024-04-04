@@ -216,24 +216,23 @@ func (r *Redis) Store(ctx context.Context, tx *bt.Tx, lockTime ...uint32) error 
 
 	var nrStored = atomic.Uint64{}
 	for i, output := range tx.Outputs {
-		if output.Satoshis > 0 { // only do outputs with value
-			i := i
-			output := output
-			g.Go(func() error {
-				hash, err := util.UTXOHashFromOutput(txIDHash, output, uint32(i))
-				if err != nil {
-					return err
-				}
+		i := i
+		output := output
 
-				if err = r.storeUtxo(gCtx, hash, value); err != nil {
-					return err
-				}
+		g.Go(func() error {
+			hash, err := util.UTXOHashFromOutput(txIDHash, output, uint32(i))
+			if err != nil {
+				return err
+			}
 
-				nrStored.Add(1)
+			if err = r.storeUtxo(gCtx, hash, value); err != nil {
+				return err
+			}
 
-				return nil
-			})
-		}
+			nrStored.Add(1)
+
+			return nil
+		})
 	}
 
 	if err := g.Wait(); err != nil {
@@ -310,6 +309,10 @@ func (r *Redis) Spend(ctx context.Context, spends []*utxostore.Spend) (err error
 		case <-ctx.Done():
 			return fmt.Errorf("timeout spending %d of %d utxos", i, len(spends))
 		default:
+			if spend == nil {
+				continue
+			}
+
 			if err = spendUtxo(ctx, r.rdb, spend, r.getBlockHeight(), r.spentUtxoTtl); err != nil {
 				// revert the spent utxos
 				_ = r.UnSpend(ctx, spentSpends)

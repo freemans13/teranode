@@ -60,6 +60,7 @@ type Coinbase struct {
 	waitForPeers bool
 	g            *errgroup.Group
 	gCtx         context.Context
+	stats        *gocore.Stat
 }
 
 // NewCoinbase builds on top of the blockchain store to provide a coinbase tracker
@@ -132,6 +133,7 @@ func NewCoinbase(logger ulogger.Logger, store blockchain.Store) (*Coinbase, erro
 		waitForPeers: waitForPeers,
 		g:            g,
 		gCtx:         gCtx,
+		stats:        gocore.NewStat("coinbase"),
 	}
 
 	threshold, found := gocore.Config().GetInt("coinbase_notification_threshold")
@@ -323,7 +325,7 @@ func (c *Coinbase) createTables(ctx context.Context) error {
 }
 
 func (c *Coinbase) catchup(cntxt context.Context, fromBlock *model.Block, baseURL string) error {
-	start, stat, ctx := util.NewStatFromContext(cntxt, "catchup", stats)
+	start, stat, ctx := util.NewStatFromContext(cntxt, "catchup", c.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -590,12 +592,7 @@ func (c *Coinbase) createSpendingUtxos(ctx context.Context, timestamp time.Time)
 		// we don't have a method to revert anything that goes wrong anyway
 		c.g.Go(func() error {
 			c.logger.Infof("createSpendingUtxos coinbase: %s: utxo %d", utxo.TxIDHash, utxo.Vout)
-			delay, err, _ := gocore.Config().GetDuration("coinbase_store_createSpendingUtxos_delay", 0*time.Second)
-			if err != nil {
-				panic(fmt.Sprintf("could not parse coinbase_store_createSpendingUtxos_delay: %v", err))
-			}
-			time.Sleep(delay)
-			if err := c.splitUtxo(c.gCtx, utxo); err != nil {
+			if err = c.splitUtxo(c.gCtx, utxo); err != nil {
 				return fmt.Errorf("could not split utxo: %w", err)
 			}
 			return nil
@@ -610,9 +607,6 @@ func (c *Coinbase) splitUtxo(cntxt context.Context, utxo *bt.UTXO) error {
 	defer func() {
 		stat.AddTime(start)
 	}()
-
-	//ctx, cancelTimeout := context.WithTimeout(ctx, c.dbTimeout)
-	//defer cancelTimeout()
 
 	tx := bt.NewTx()
 

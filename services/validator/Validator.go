@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"runtime"
 	"time"
 
 	"github.com/TAAL-GmbH/arc/api"
@@ -30,8 +29,6 @@ const (
 	MaxSatoshis                        = 21_000_000_00_000_000
 	coinbaseTxID                       = "0000000000000000000000000000000000000000000000000000000000000000"
 	MaxTxSigopsCountPolicyAfterGenesis = ^uint32(0) // UINT32_MAX
-
-	GenesisActivationHeight = 620538
 )
 
 var (
@@ -48,6 +45,7 @@ type Validator struct {
 	blockAssemblyDisabled  bool
 	blockassemblyKafkaChan chan []byte
 	txMetaKafkaChan        chan []byte
+	stats                  *gocore.Stat
 }
 
 func New(ctx context.Context, logger ulogger.Logger, store utxostore.Interface, txMetaStore txmeta.Store) (Interface, error) {
@@ -61,6 +59,7 @@ func New(ctx context.Context, logger ulogger.Logger, store utxostore.Interface, 
 		blockAssembler: ba,
 		txMetaStore:    txMetaStore,
 		saveInParallel: true,
+		stats:          gocore.NewStat("validator"),
 	}
 
 	v.blockAssemblyDisabled = gocore.Config().GetBool("blockassembly_disabled", false)
@@ -107,7 +106,7 @@ func New(ctx context.Context, logger ulogger.Logger, store utxostore.Interface, 
 }
 
 func (v *Validator) Health(cntxt context.Context) (int, string, error) {
-	start, stat, _ := util.NewStatFromContext(cntxt, "Health", stats)
+	start, stat, _ := util.NewStatFromContext(cntxt, "Health", v.stats)
 	defer stat.AddTime(start)
 
 	return 0, "LocalValidator", nil
@@ -118,8 +117,8 @@ func (v *Validator) GetBlockHeight() (height uint32, err error) {
 }
 
 // TODO try to break this
-func (v *Validator) Validate(cntxt context.Context, tx *bt.Tx) (err error) {
-	start, stat, ctx := util.NewStatFromContext(cntxt, "Validate", stats)
+func (v *Validator) Validate(cntxt context.Context, tx *bt.Tx, blockHeight uint32) (err error) {
+	start, stat, ctx := util.NewStatFromContext(cntxt, "Validate", v.stats)
 	defer func() {
 		stat.AddTime(start)
 		prometheusTransactionValidateTotal.Observe(float64(time.Since(start).Microseconds()) / 1_000_000)
@@ -131,35 +130,28 @@ func (v *Validator) Validate(cntxt context.Context, tx *bt.Tx) (err error) {
 	defer func(reservedUtxos *[]*utxostore.Spend) {
 		traceSpan.Finish()
 
-		if r := recover(); r != nil {
-			buf := make([]byte, 1024)
-			runtime.Stack(buf, false)
-
-			if len(*reservedUtxos) > 0 {
-				// TODO is this correct in the recover? should we be reversing the utxos?
-				spanCtx := tracing.Start(ctx, "Validator:Validate:Recover")
-				if reverseErr := v.reverseSpends(spanCtx, *reservedUtxos); reverseErr != nil {
-					v.logger.Errorf("[Validate][%s] error reversing utxos: %v", tx.TxID(), reverseErr)
-				}
-			}
-
-			v.logger.Errorf("[Validate][%s] Validate recover [stack=%s]: %v", tx.TxID(), string(buf), r)
-		}
+		//if r := recover(); r != nil {
+		//	buf := make([]byte, 1024)
+		//	runtime.Stack(buf, false)
+		//
+		//	//if reservedUtxos != nil && len(*reservedUtxos) > 0 {
+		//	//	// TODO is this correct in the recover? should we be reversing the utxos?
+		//	//	spanCtx := tracing.Start(ctx, "Validator:Validate:Recover")
+		//	//	if reverseErr := v.reverseSpends(spanCtx, *reservedUtxos); reverseErr != nil {
+		//	//		v.logger.Errorf("[Validate][%s] error reversing utxos: %v", tx.TxID(), reverseErr)
+		//	//	}
+		//	//}
+		//
+		//	v.logger.Errorf("[Validate][%s] Validate recover [stack=%s]: %v", tx.TxID(), string(buf), r)
+		//}
 	}(&spentUtxos)
 
 	if tx.IsCoinbase() {
 		return errors.Join(ErrBadRequest, fmt.Errorf("[Validate][%s] coinbase transactions are not supported", tx.TxIDChainHash().String()))
 	}
 
-	if err = v.validateTransaction(traceSpan, tx); err != nil {
+	if err = v.validateTransaction(traceSpan, tx, blockHeight); err != nil {
 		return errors.Join(ErrBadRequest, fmt.Errorf("[Validate][%s] error validating transaction: %v", tx.TxID(), err))
-	}
-
-	// this will reverse the spends if there is an error
-	// TODO make this stricter, checking whether this utxo was already spent by the same tx and return early if so
-	//      do not allow any utxo be spent more than once
-	if spentUtxos, err = v.spendUtxos(traceSpan, tx); err != nil {
-		return errors.Join(ErrInternal, fmt.Errorf("[Validate][%s] error spending utxos: %v", tx.TxID(), err))
 	}
 
 	// decouple the tracing context to not cancel the context when finalize the block assembly
@@ -179,6 +171,13 @@ func (v *Validator) Validate(cntxt context.Context, tx *bt.Tx) (err error) {
 		Child                                                  -> spent -> tx meta -> stored -> block assembly
 	*/
 
+	// this will reverse the spends if there is an error
+	// TODO make this stricter, checking whether this utxo was already spent by the same tx and return early if so
+	//      do not allow any utxo be spent more than once
+	if spentUtxos, err = v.spendUtxos(setSpan, tx); err != nil {
+		return errors.Join(ErrInternal, fmt.Errorf("[Validate][%s] error spending utxos: %v", tx.TxID(), err))
+	}
+
 	txMetaData, err := v.registerTxInMetaStore(setSpan, tx, spentUtxos)
 	if err != nil {
 		if errors.Is(err, txmeta.NewErrTxmetaAlreadyExists(tx.TxIDChainHash())) {
@@ -187,6 +186,7 @@ func (v *Validator) Validate(cntxt context.Context, tx *bt.Tx) (err error) {
 			return nil
 		}
 
+		v.logger.Errorf("[Validate][%s] error registering tx in metaStore: %v", tx.TxIDChainHash().String(), err)
 		if reverseErr := v.reverseSpends(setSpan, spentUtxos); reverseErr != nil {
 			err = errors.Join(err, fmt.Errorf("error reversing utxo spends: %v", reverseErr))
 		}
@@ -201,16 +201,14 @@ func (v *Validator) Validate(cntxt context.Context, tx *bt.Tx) (err error) {
 
 		// first we send the tx to the block assembler
 		if err = v.sendToBlockAssembler(setSpan, &blockassembly.Data{
-			TxIDChainHash:  tx.TxIDChainHash(),
-			Fee:            txMetaData.Fee,
-			Size:           uint64(tx.Size()),
-			LockTime:       tx.LockTime,
-			ParentTxHashes: parentTxHashes,
+			TxIDChainHash: tx.TxIDChainHash(),
+			Fee:           txMetaData.Fee,
+			Size:          uint64(tx.Size()),
 		}, spentUtxos); err != nil {
 			err = errors.Join(ErrInternal, fmt.Errorf("error sending tx to block assembler: %v", err))
 
-			if metaErr := v.txMetaStore.Delete(setSpan.Ctx, tx.TxIDChainHash()); metaErr != nil {
-				err = errors.Join(err, fmt.Errorf("error deleting tx %s from tx meta utxoStore: %v", tx.TxIDChainHash().String(), metaErr))
+			if reverseErr := v.reverseTxMetaStore(setSpan, tx.TxIDChainHash()); err != nil {
+				err = errors.Join(err, fmt.Errorf("error reversing tx meta utxoStore: %v", reverseErr))
 			}
 
 			if reverseErr := v.reverseSpends(setSpan, spentUtxos); reverseErr != nil {
@@ -226,6 +224,8 @@ func (v *Validator) Validate(cntxt context.Context, tx *bt.Tx) (err error) {
 	// then we store the new utxos from the tx
 	err = v.storeUtxos(setSpan.Ctx, tx)
 	if err != nil {
+		v.logger.Errorf("[Validate][%s] error storing tx in utxo utxoStore: %v", tx.TxIDChainHash().String(), err)
+
 		// TODO We need to make sure that these actions are actually completed
 		//      Push into a queue to be processed later?
 
@@ -249,8 +249,24 @@ func (v *Validator) Validate(cntxt context.Context, tx *bt.Tx) (err error) {
 }
 
 func (v *Validator) reverseTxMetaStore(setSpan tracing.Span, txID *chainhash.Hash) (err error) {
-	if metaErr := v.txMetaStore.Delete(setSpan.Ctx, txID); metaErr != nil {
-		err = errors.Join(err, fmt.Errorf("error deleting tx %s from tx meta utxoStore: %v", txID.String(), metaErr))
+	for retries := 0; retries < 3; retries++ {
+		if metaErr := v.txMetaStore.Delete(setSpan.Ctx, txID); metaErr != nil {
+			if retries < 2 {
+				backoff := time.Duration(2^retries) * time.Second
+				v.logger.Errorf("error deleting tx %s from tx meta utxoStore, retrying in %s: %v", txID.String(), backoff.String(), metaErr)
+				time.Sleep(backoff)
+			} else {
+				err = fmt.Errorf("error deleting tx %s from tx meta utxoStore: %v", txID.String(), metaErr)
+			}
+		} else {
+			break
+		}
+	}
+
+	if v.txMetaKafkaChan != nil {
+		startKafka := time.Now()
+		v.txMetaKafkaChan <- append(txID.CloneBytes(), []byte("delete")...)
+		prometheusValidatorSendToBlockValidationKafka.Observe(float64(time.Since(startKafka).Microseconds()) / 1_000_000)
 	}
 
 	return err
@@ -330,8 +346,14 @@ func (v *Validator) spendUtxos(traceSpan tracing.Span, tx *bt.Tx) ([]*utxostore.
 
 	// check the utxos
 	txIDChainHash := tx.TxIDChainHash()
+
 	spends := make([]*utxostore.Spend, len(tx.Inputs))
+
 	for idx, input := range tx.Inputs {
+		if input.PreviousTxSatoshis == 0 {
+			continue // There are some old transactions (e.g. d5a13dcb1ad24dbffab91c3c2ffe7aea38d5e84b444c0014eb6c7c31fe8e23fc) that have 0 satoshis
+		}
+
 		hash, err = util.UTXOHashFromInput(input)
 		if err != nil {
 			utxoSpan.RecordError(err)
@@ -357,9 +379,11 @@ func (v *Validator) spendUtxos(traceSpan tracing.Span, tx *bt.Tx) ([]*utxostore.
 		if ok {
 			// remove the spending tx from the block assembly and freeze it
 			// TODO implement freezing in utxo store
-			err = v.blockAssembler.RemoveTx(ctx, spentErr.SpendingTxID)
-			if err != nil {
-				v.logger.Errorf("validator: UTXO Store remove tx failed: %v", err)
+			if spentErr.SpendingTxID != nil {
+				err = v.blockAssembler.RemoveTx(ctx, spentErr.SpendingTxID)
+				if err != nil {
+					v.logger.Errorf("validator: UTXO Store remove tx failed: %v", err)
+				}
 			}
 		}
 
@@ -379,24 +403,10 @@ func (v *Validator) sendToBlockAssembler(traceSpan tracing.Span, bData *blockass
 	if v.blockassemblyKafkaChan != nil {
 		start := time.Now()
 		v.blockassemblyKafkaChan <- bData.Bytes()
-		// TODO: Don't need to reverse spends here. That should be taken care of on another topic
 		prometheusValidatorSendToBlockAssemblyKafka.Observe(float64(time.Since(start).Microseconds()) / 1_000_000)
 	} else {
-		utxoHashes := make([]*chainhash.Hash, len(bData.UtxoHashes))
-		for i, h := range bData.UtxoHashes {
-			utxoHashes[i] = &h
-		}
-
-		parentTxHashes := make([]*chainhash.Hash, len(bData.ParentTxHashes))
-		for i, h := range bData.ParentTxHashes {
-			parentTxHashes[i] = &h
-		}
-
-		if _, err := v.blockAssembler.Store(ctx, bData.TxIDChainHash, bData.Fee, bData.Size, bData.LockTime, utxoHashes, parentTxHashes); err != nil {
+		if _, err := v.blockAssembler.Store(ctx, bData.TxIDChainHash, bData.Fee, bData.Size); err != nil {
 			e := fmt.Errorf("error calling blockAssembler Store(): %v", err)
-			if reverseErr := v.reverseSpends(traceSpan, reservedUtxos); reverseErr != nil {
-				e = errors.Join(e, fmt.Errorf("error reversing utxos: %v", reverseErr))
-			}
 			traceSpan.RecordError(e)
 			return e
 		}
@@ -409,24 +419,28 @@ func (v *Validator) reverseSpends(traceSpan tracing.Span, spentUtxos []*utxostor
 	start, stat, ctx := util.StartStatFromContext(traceSpan.Ctx, "reverseSpends")
 	defer stat.AddTime(start)
 
-	reverseUtxoSpan := tracing.Start(ctx, "Validator:Validate:ReverseUtxos")
+	reverseUtxoSpan := tracing.Start(ctx, "Validator:Validate:reverseSpends")
 	defer reverseUtxoSpan.Finish()
 
-	// decouple the tracing context to not cancel the context when the tx is being saved in the background
-	callerSpan := opentracing.SpanFromContext(reverseUtxoSpan.Ctx)
-	setCtx := opentracing.ContextWithSpan(context.Background(), callerSpan)
-	_, _, ctx = util.StartStatFromContext(setCtx, "reverseSpends")
-
-	if errReset := v.utxoStore.UnSpend(ctx, spentUtxos); errReset != nil {
-		// TODO on error add to a queue to be processed later
-		reverseUtxoSpan.RecordError(errReset)
-		return fmt.Errorf("error resetting utxos %v", errReset)
+	for retries := 0; retries < 3; retries++ {
+		if errReset := v.utxoStore.UnSpend(ctx, spentUtxos); errReset != nil {
+			if retries < 2 {
+				backoff := time.Duration(2^retries) * time.Second
+				v.logger.Errorf("error resetting utxos, retrying in %s: %v", backoff.String(), errReset)
+				time.Sleep(backoff)
+			} else {
+				reverseUtxoSpan.RecordError(errReset)
+				return fmt.Errorf("error resetting utxos %v", errReset)
+			}
+		} else {
+			break
+		}
 	}
 
 	return nil
 }
 
-func (v *Validator) validateTransaction(traceSpan tracing.Span, tx *bt.Tx) error {
+func (v *Validator) validateTransaction(traceSpan tracing.Span, tx *bt.Tx, blockHeight uint32) error {
 	start, stat, ctx := util.StartStatFromContext(traceSpan.Ctx, "validateTransaction")
 	defer func() {
 		stat.AddTime(start)
@@ -438,6 +452,7 @@ func (v *Validator) validateTransaction(traceSpan tracing.Span, tx *bt.Tx) error
 		basicSpan.Finish()
 	}()
 
+	// TODO read policy from config
 	policy := &bitcoin.Settings{}
 	//
 	// Each node will verify every transaction against a long checklist of criteria:
@@ -448,7 +463,7 @@ func (v *Validator) validateTransaction(traceSpan tracing.Span, tx *bt.Tx) error
 
 	// 0) Check whether we have a complete transaction in extended format, with all input information
 	//    we cannot check the satoshi input, OP_RETURN is allowed 0 satoshis
-	if !tx.IsExtended() {
+	if !util.IsExtended(tx, blockHeight) {
 		return fmt.Errorf("transaction is not in extended format")
 	}
 
@@ -470,7 +485,7 @@ func (v *Validator) validateTransaction(traceSpan tracing.Span, tx *bt.Tx) error
 
 	// 4) Each output value, as well as the total, must be within the allowed range of values (less than 21m coins,
 	//    more than the dust threshold if 1 unless it's OP_RETURN, which is allowed to be 0)
-	if err := v.checkOutputs(tx); err != nil {
+	if err := v.checkOutputs(tx, blockHeight); err != nil {
 		return err
 	}
 
@@ -487,9 +502,12 @@ func (v *Validator) validateTransaction(traceSpan tracing.Span, tx *bt.Tx) error
 		return err
 	}
 
-	// 9) The unlocking script (scriptSig) can only push numbers on the stack
-	if err := v.pushDataCheck(tx); err != nil {
-		return err
+	// SAO - https://bitcoin.stackexchange.com/questions/83805/did-the-introduction-of-verifyscript-cause-a-backwards-incompatible-change-to-co
+	if blockHeight != 163685 {
+		// 9) The unlocking script (scriptSig) can only push numbers on the stack
+		if err := v.pushDataCheck(tx); err != nil {
+			return err
+		}
 	}
 
 	// 10) Reject if the sum of input values is less than sum of output values
@@ -499,7 +517,7 @@ func (v *Validator) validateTransaction(traceSpan tracing.Span, tx *bt.Tx) error
 	}
 
 	// 12) The unlocking scripts for each input must validate against the corresponding output locking scripts
-	if err := v.checkScripts(tx); err != nil {
+	if err := v.checkScripts(tx, blockHeight); err != nil {
 		return err
 	}
 
@@ -520,16 +538,11 @@ func (v *Validator) checkTxSize(txSize int, policy *bitcoin.Settings) error {
 	return nil
 }
 
-func (v *Validator) checkOutputs(tx *bt.Tx) error {
+func (v *Validator) checkOutputs(tx *bt.Tx, blockHeight uint32) error {
 	total := uint64(0)
 
-	// TODO: improve this?
 	minOutput := uint64(0)
-	height, err := v.utxoStore.GetBlockHeight()
-	if err != nil {
-		return err
-	}
-	if height >= GenesisActivationHeight {
+	if blockHeight >= util.GenesisActivationHeight {
 		minOutput = bt.DustLimit
 	}
 
@@ -634,19 +647,27 @@ func (v *Validator) pushDataCheck(tx *bt.Tx) error {
 	return nil
 }
 
-func (v *Validator) checkScripts(tx *bt.Tx) error {
+func (v *Validator) checkScripts(tx *bt.Tx, blockHeight uint32) error {
 	for i, in := range tx.Inputs {
 		prevOutput := &bt.Output{
 			Satoshis:      in.PreviousTxSatoshis,
 			LockingScript: in.PreviousTxScript,
 		}
 
-		if err := interpreter.NewEngine().Execute(
-			interpreter.WithTx(tx, i, prevOutput),
-			interpreter.WithForkID(),
-			interpreter.WithAfterGenesis(),
-			// interpreter.WithDebugger(&LogDebugger{}),
-		); err != nil {
+		opts := make([]interpreter.ExecutionOptionFunc, 0, 3)
+		opts = append(opts, interpreter.WithTx(tx, i, prevOutput))
+
+		if blockHeight >= util.ForkIDActivationHeight {
+			opts = append(opts, interpreter.WithForkID())
+		}
+
+		if blockHeight >= util.GenesisActivationHeight {
+			opts = append(opts, interpreter.WithAfterGenesis())
+		}
+
+		// opts = append(opts, interpreter.WithDebugger(&LogDebugger{}),
+
+		if err := interpreter.NewEngine().Execute(opts...); err != nil {
 			return fmt.Errorf("script execution failed: %w", err)
 		}
 	}

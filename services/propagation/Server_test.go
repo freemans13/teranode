@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/libsv/go-bt/v2/chainhash"
 	"testing"
+
+	"github.com/libsv/go-bt/v2/chainhash"
 
 	"github.com/bitcoin-sv/ubsv/services/validator"
 	"github.com/bitcoin-sv/ubsv/stores/txmeta/memory"
 	utxostore "github.com/bitcoin-sv/ubsv/stores/utxo"
 	"github.com/bitcoin-sv/ubsv/ulogger"
+	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/libsv/go-bt/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,7 +46,7 @@ func TestValidatorErrors(t *testing.T) {
 
 	v, err := validator.New(context.Background(), ulogger.TestLogger{}, ns, memory.New(ulogger.TestLogger{}))
 	require.NoError(t, err)
-	err = v.Validate(context.Background(), tx)
+	err = v.Validate(context.Background(), tx, util.GenesisActivationHeight)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, validator.ErrBadRequest))
 }

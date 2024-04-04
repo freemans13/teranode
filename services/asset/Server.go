@@ -45,12 +45,6 @@ type Server struct {
 	centrifugeServer *centrifuge_impl.Centrifuge
 }
 
-func Enabled() bool {
-	_, grpcOk := gocore.Config().Get("asset_grpcListenAddress")
-	_, httpOk := gocore.Config().Get("asset_httpListenAddress")
-	return grpcOk || httpOk
-}
-
 // NewServer will return a server instance with the logger stored within it
 func NewServer(logger ulogger.Logger, utxoStore utxo.Interface, txStore blob.Store, txMetaStore txmeta.Store, subtreeStore blob.Store) *Server {
 	s := &Server{
@@ -225,7 +219,7 @@ func (v *Server) Start(ctx context.Context) error {
 						}
 
 						validationClient := blockvalidation.NewClient(ctx, v.logger)
-						if err = validationClient.BlockFound(ctx, blockHeader.Hash(), p.AssetHttpAddress, false); err != nil {
+						if err = validationClient.BlockFound(ctx, blockHeader.Hash(), p.AssetHttpAddress, util.GenesisActivationHeight, false); err != nil {
 							v.logger.Errorf("[Asset] error validating block from %s: %s", p.AssetHttpAddress, err)
 						}
 					}

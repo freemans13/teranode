@@ -148,7 +148,7 @@ func New(logger ulogger.Logger, storeUrl *url.URL) (*Store, error) {
 }
 
 func (s *Store) SetBlockHeight(blockHeight uint32) error {
-	s.logger.Warnf("setting block height to %d", blockHeight)
+	s.logger.Debugf("setting block height to %d", blockHeight)
 	s.blockHeight.Store(blockHeight)
 	return nil
 }
@@ -244,6 +244,12 @@ func (s *Store) Store(cntxt context.Context, tx *bt.Tx, lockTime ...uint32) erro
 		// Execute the batch transaction
 		_, err = stmt.ExecContext(ctx)
 		if err != nil {
+			if err, ok := err.(*pq.Error); ok {
+				if err.Code == "23505" {
+					// duplicate key value violates unique constraint "ux_utxos_hash"
+					return errors.Join(utxostore.ErrAlreadyExists, err)
+				}
+			}
 			return err
 		}
 
@@ -408,6 +414,10 @@ func (s *Store) Spend(cntxt context.Context, spends []*utxostore.Spend) (err err
 
 	var result sql.Result
 	for _, spend := range spends {
+		if spend == nil {
+			continue
+		}
+
 		q := `
 			UPDATE utxos
 			SET tx_id = $1
@@ -434,7 +444,7 @@ func (s *Store) Spend(cntxt context.Context, spends []*utxostore.Spend) (err err
 				if utxo.SpendingTxID.IsEqual(spend.SpendingTxID) {
 					return nil
 				} else {
-					return utxostore.NewErrSpent(utxo.SpendingTxID)
+					return utxostore.NewErrSpent(spend.TxID, spend.Vout, spend.Hash, utxo.SpendingTxID)
 				}
 			} else if !util.ValidLockTime(utxo.LockTime, s.blockHeight.Load()) {
 				return utxostore.NewErrLockTime(utxo.LockTime, s.blockHeight.Load())

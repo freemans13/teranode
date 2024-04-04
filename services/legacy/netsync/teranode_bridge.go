@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/bitcoin-sv/ubsv/model"
@@ -17,6 +20,8 @@ import (
 	legacy_blockchain "github.com/bitcoin-sv/ubsv/services/legacy/blockchain"
 	"github.com/bitcoin-sv/ubsv/services/legacy/bsvutil"
 	"github.com/bitcoin-sv/ubsv/services/legacy/wire"
+	"github.com/bitcoin-sv/ubsv/stores/utxo"
+	utxofactory "github.com/bitcoin-sv/ubsv/stores/utxo/_factory"
 	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/labstack/echo/v4"
 	"github.com/libsv/go-bt/v2"
@@ -39,6 +44,7 @@ type wrapper struct {
 type TeranodeBridge struct {
 	blockValidationClient *blockvalidation.Client
 	blockchainClient      blockchain.ClientI
+	utxoStore             utxo.Interface
 	txCache               *expiringmap.ExpiringMap[chainhash.Hash, *wrapper]
 	subtreeCache          *expiringmap.ExpiringMap[chainhash.Hash, *wrapper]
 	blockCache            *expiringmap.ExpiringMap[chainhash.Hash, *wrapper]
@@ -67,14 +73,28 @@ func NewTeranodeBridge(chain *legacy_blockchain.BlockChain) (*TeranodeBridge, er
 		return nil, fmt.Errorf("error creating blockchain client: %w", err)
 	}
 
+	utxoStoreURL, err, found := gocore.Config().GetURL("utxostore")
+	if err != nil {
+		return nil, fmt.Errorf("could not read utxostore: %w", err)
+	}
+	if !found {
+		return nil, fmt.Errorf("could not find utxostore: %w", err)
+	}
+
+	utxoStore, err := utxofactory.NewStore(context.TODO(), log, utxoStoreURL, "teranode_bridge")
+	if err != nil {
+		panic(err)
+	}
+
 	tb := &TeranodeBridge{
-		txCache:               expiringmap.New[chainhash.Hash, *wrapper](2 * time.Minute),
-		subtreeCache:          expiringmap.New[chainhash.Hash, *wrapper](2 * time.Minute),
-		blockCache:            expiringmap.New[chainhash.Hash, *wrapper](2 * time.Minute),
+		txCache:               expiringmap.New[chainhash.Hash, *wrapper](30 * time.Minute),
+		subtreeCache:          expiringmap.New[chainhash.Hash, *wrapper](30 * time.Minute),
+		blockCache:            expiringmap.New[chainhash.Hash, *wrapper](30 * time.Minute),
 		blockValidationClient: blockvalidation.NewClient(context.TODO(), log),
 		blockchainClient:      blockchainClient,
 		baseUrl:               baseUrl.String(),
 		chain:                 chain,
+		utxoStore:             utxoStore,
 	}
 
 	e := echo.New()
@@ -112,24 +132,32 @@ func NewTeranodeBridge(chain *legacy_blockchain.BlockChain) (*TeranodeBridge, er
 	}
 
 	// Start syncing from the last block we have in Teranode + 1
-	// teranodeHeight++
+	teranodeHeight++
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
 	for teranodeHeight <= best.Height {
-		block, err := chain.BlockByHeight(teranodeHeight)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to get block by hash %s: %w", best.Hash, err)
-		} else {
-			if err := tb.HandleBlock(block); err != nil {
-				return nil, fmt.Errorf("Failed to handle block %s: %s", block.Hash(), err)
-			}
+		select {
+		case <-sigs:
+			break
+		default:
+			block, err := chain.BlockByHeight(teranodeHeight)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to get block by hash %s: %w", best.Hash, err)
+			} else {
+				if err := tb.HandleBlock(block); err != nil {
+					return nil, fmt.Errorf("Failed to handle block %s: %s", block.Hash(), err)
+				}
 
-			if err := tb.HandleBlockConnected(block); err != nil {
-				return nil, fmt.Errorf("Failed to handle block connected %s: %s", block.Hash(), err)
+				if err := tb.HandleBlockConnected(block); err != nil {
+					return nil, fmt.Errorf("Failed to handle block connected %s: %s", block.Hash(), err)
+				}
 			}
+			log.Infof("Teranode bridge synced with legacy block %d", teranodeHeight)
+
+			teranodeHeight++
 		}
-		log.Infof("Teranode bridge synced with legacy block %d", teranodeHeight)
-
-		teranodeHeight++
 	}
 
 	log.Infof("Teranode bridge synced with legacy")
@@ -138,19 +166,8 @@ func NewTeranodeBridge(chain *legacy_blockchain.BlockChain) (*TeranodeBridge, er
 }
 
 func (tb *TeranodeBridge) HandleBlock(block *bsvutil.Block) error {
-	log.Warnf("HandleBlock received for %s", block.Hash())
 
-	for i := 0; i < 10; i++ {
-		if block.Height() <= tb.height.Load()+1 {
-			break
-		}
-		log.Infof("HandleBlock waiting #%d for teranode to reach height %d, currently %d", i, block.Height(), tb.height.Load())
-		time.Sleep(1 * time.Second)
-	}
-
-	if block.Height() > tb.height.Load()+1 {
-		return fmt.Errorf("received block %s (height %d) is beyond teranode height %d - no more processing, not allowing legacy to get too far ahead of teranode", block.Hash(), block.Height(), tb.height.Load())
-	}
+	log.Debugf("HandleBlock received for %s", block.Hash())
 
 	var size int64
 
@@ -193,12 +210,21 @@ func (tb *TeranodeBridge) HandleBlock(block *bsvutil.Block) error {
 			}
 
 			if currentHeight != int32(blockHeight-1) {
-				log.Warnf("HandleBlock received for %s, expected height %d, got %d - IGNORING...", block.Hash(), tb.height.Load()+1, blockHeight)
+				log.Infof("HandleBlock received for %s, expected height %d, got %d - IGNORING...", block.Hash(), tb.height.Load()+1, blockHeight)
 				return nil
 			}
 		}
 
-		if !tx.IsCoinbase() {
+		if tx.IsCoinbase() {
+			if err := tb.utxoStore.Store(context.TODO(), tx, tx.LockTime); err != nil {
+				if errors.Is(err, utxo.ErrAlreadyExists) {
+					log.Debugf("Coinbase tx %s already exists in utxo store", txHash)
+				} else {
+					return fmt.Errorf("Failed to store coinbase tx %s: %w", txHash, err)
+				}
+			}
+
+		} else {
 			if err := subtree.AddNode(txHash, 0, txSize); err != nil {
 				return fmt.Errorf("Failed to add node (%s) to subtree: %w", txHash, err)
 			}
@@ -242,7 +268,7 @@ func (tb *TeranodeBridge) HandleBlock(block *bsvutil.Block) error {
 
 			}
 
-			if !tx.IsExtended() {
+			if !util.IsExtended(tx, uint32(currentHeight)) {
 				return fmt.Errorf("tx %s is not extended", txHash)
 			}
 		}
@@ -317,14 +343,14 @@ func (tb *TeranodeBridge) HandleBlockConnected(block *bsvutil.Block) error {
 	currentHeight := tb.height.Load()
 	if currentHeight > 0 {
 		if block.Height() != tb.height.Load()+1 {
-			log.Warnf("HandleBlockConnected received for %s, expected height %d, got %d - IGNORING...", block.Hash(), tb.height.Load()+1, block.Height())
+			log.Infof("HandleBlockConnected received for %s, expected height %d, got %d - IGNORING...", block.Hash(), tb.height.Load()+1, block.Height())
 			return nil
 		}
 	}
 
-	log.Warnf("HandleBlockConnected received for %s", block.Hash())
+	log.Warnf("HandleBlockConnected received for %s (%d)", block.Hash(), block.Height())
 
-	if err := tb.blockValidationClient.BlockFound(context.TODO(), block.Hash(), tb.baseUrl, true); err != nil {
+	if err := tb.blockValidationClient.BlockFound(context.TODO(), block.Hash(), tb.baseUrl, uint32(block.Height()), true); err != nil {
 		return fmt.Errorf("error broadcasting block from %s: %w", tb.baseUrl, err)
 	}
 
@@ -345,7 +371,9 @@ func (tb *TeranodeBridge) BlockHandler(c echo.Context) error {
 	}
 
 	w.readCount++
-	log.Warnf("block %s read %d times", hash, w.readCount)
+	if w.readCount > 1 {
+		log.Warnf("block %s read %d times", hash, w.readCount)
+	}
 
 	return c.Blob(http.StatusOK, "application/octet-stream", w.bytes)
 }
@@ -362,7 +390,9 @@ func (tb *TeranodeBridge) SubtreeHandler(c echo.Context) error {
 	}
 
 	w.readCount++
-	log.Warnf("subtree %s read %d times", hash, w.readCount)
+	if w.readCount > 1 {
+		log.Warnf("subtree %s read %d times", hash, w.readCount)
+	}
 
 	return c.Blob(http.StatusOK, "application/octet-stream", w.bytes)
 }
@@ -379,12 +409,17 @@ func (tb *TeranodeBridge) TxHandler(c echo.Context) error {
 	}
 
 	w.readCount++
-	log.Warnf("tx %s read %d times", hash, w.readCount)
+	if w.readCount > 1 {
+		log.Warnf("tx %s read %d times", hash, w.readCount)
+	}
 
 	return c.Blob(http.StatusOK, "application/octet-stream", w.bytes)
 }
 
 func (tb *TeranodeBridge) TempHeaderHandler(c echo.Context) error {
+	// TODO: SAO - remove
+	panic("TernodeBridge has started catchup.")
+
 	hash, err := chainhash.NewHashFromStr(c.Param("hash"))
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, "invalid hash")
@@ -422,7 +457,7 @@ func (tb *TeranodeBridge) TxBatchHandler() func(c echo.Context) error {
 				}
 			}
 
-			log.Infof("ReadTXID *********** %s", hash)
+			// log.Infof("ReadTXID *********** %s", hash)
 
 			if hash.IsEqual(model.CoinbasePlaceholderHash) {
 				continue
@@ -436,7 +471,9 @@ func (tb *TeranodeBridge) TxBatchHandler() func(c echo.Context) error {
 			}
 
 			w.readCount++
-			log.Warnf("txs %s read %d times SIMON", hash, w.readCount)
+			if w.readCount > 1 {
+				log.Warnf("txs %s read %d times", hash, w.readCount)
+			}
 
 			responseBytes = append(responseBytes, w.bytes...)
 

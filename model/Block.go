@@ -526,6 +526,8 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 		sIdx := sIdx
 		subtree := subtree
 		g.Go(func() error {
+			checkParentTxHashes := make([]chainhash.Hash, 0, len(subtree.Nodes))
+
 			var parentTxHashes []chainhash.Hash
 			bloomStats.mu.Lock()
 			bloomStats.QueryCounter += uint64(len(subtree.Nodes))
@@ -584,9 +586,12 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 
 						// there is a chance that the bloom filter has a false positive, but the txMetaStore has pruned
 						// the transaction. This will cause the block to be incorrectly invalidated, but this is the safe
-						// option for now. TODO is there a better way to handle this?
+						// option for now.
 						txMeta, err := txMetaStore.Get(gCtx, &subtreeNode.Hash)
 						if err != nil {
+							if errors.Is(err, txmetastore.NewErrTxmetaNotFound(&subtreeNode.Hash)) {
+								continue
+							}
 							return fmt.Errorf("error getting transaction %s from txMetaStore: %v", subtreeNode.Hash.String(), err)
 						}
 
@@ -613,18 +618,29 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 						// in a previous block here above. No need to check again
 						continue
 					}
+					checkParentTxHashes = append(checkParentTxHashes, parentTxHash)
+				}
+			}
 
+			logger.Infof("Block:validOrderAndBlessed: checking %d parent transactio0ns", len(checkParentTxHashes))
+
+			// check all the parent transactions in parallel, this allows us to batch read from the txMetaStore
+			parentG := errgroup.Group{}
+			parentG.SetLimit(1024 * 32)
+			for _, parentTxHash := range checkParentTxHashes {
+				parentTxHash := parentTxHash
+				parentG.Go(func() error {
 					// check whether the parent transaction has already been mined in a block on our chain
 					// we need to get back to the txMetaStore for this, to make sure we have the latest data
 					// two options: 1- parent is currently under validation, 2- parent is from forked chain.
 					// for the first situation we don't start validating the current block until the parent is validated.
-					parentTxMeta, err := txMetaStore.Get(gCtx, &parentTxHash)
+					parentTxMeta, err := txMetaStore.GetMeta(gCtx, &parentTxHash)
 					if err != nil && !errors.Is(err, txmetastore.NewErrTxmetaNotFound(&parentTxHash)) {
-						return fmt.Errorf("error getting parent transaction %s of %s from txMetaStore: %v", parentTxHash.String(), subtreeNode.Hash.String(), err)
+						return fmt.Errorf("error getting parent transaction %s from txMetaStore: %v", parentTxHash.String(), err)
 					}
 					// parent tx meta was not found, must be old, ignore
 					if parentTxMeta == nil {
-						continue
+						return nil
 					}
 
 					// check whether the parent is on our current chain (of 100 blocks), it should be, because the tx meta is still in the store
@@ -643,9 +659,15 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 						sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 						logger.Errorf("parent error currentBlockHeaderIDsMap: %v", ids)
 						logger.Errorf("parent error parentTxMeta: %v", parentTxMeta)
-						return fmt.Errorf("parent transaction %s of %s is not valid on our current chain, found %d times", parentTxHash.String(), subtreeNode.Hash.String(), len(foundInPreviousBlocks))
+						return fmt.Errorf("parent transaction %s is not valid on our current chain, found %d times", parentTxHash.String(), len(foundInPreviousBlocks))
 					}
-				}
+
+					return nil
+				})
+			}
+
+			if err := parentG.Wait(); err != nil {
+				return err
 			}
 
 			return nil
@@ -709,58 +731,71 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 		i := i
 		if b.SubtreeSlices[i] == nil {
 			subtreeHash := subtreeHash
+
 			g.Go(func() error {
 				// retry to get the subtree from the store 3 times, there are instances when we get an EOF error,
 				// probably when being moved to permanent storage in another service
 				retries := 0
 				subtree := &util.Subtree{}
 				for { // retry for loop
-					subtreeReader, err := subtreeStore.GetIoReader(gCtx, subtreeHash[:])
-					if err != nil {
-						if retries < 3 {
-							retries++
-							logger.Warnf("failed to get subtree %s, retrying %d", subtreeHash.String(), retries)
-							continue
-						}
-						return errors.Join(fmt.Errorf("failed to get subtree %s", subtreeHash.String()), err)
-					}
+					select {
+					case <-gCtx.Done():
+						return gCtx.Err()
+					default:
 
-					err = subtree.DeserializeFromReader(subtreeReader)
-					if err != nil {
+						subtreeReader, err := subtreeStore.GetIoReader(gCtx, subtreeHash[:])
+						if err != nil {
+							if retries < 3 {
+								retries++
+								backoff := time.Duration(2^retries) * time.Second
+								logger.Warnf("failed to get subtree %s, retrying %d in %s", subtreeHash.String(), retries, backoff.String())
+								time.Sleep(backoff)
+								continue
+							}
+							return errors.Join(fmt.Errorf("failed to get subtree %s", subtreeHash.String()), err)
+						}
+
+						err = subtree.DeserializeFromReader(subtreeReader)
+						if err != nil {
+							_ = subtreeReader.Close()
+							if retries < 3 {
+								retries++
+								backoff := time.Duration(2^retries) * time.Second
+								logger.Warnf("failed to deserialize subtree %s, retrying %d in %s", subtreeHash.String(), retries, backoff)
+								time.Sleep(backoff)
+								continue
+							}
+							return errors.Join(fmt.Errorf("failed to deserialize subtree %s", subtreeHash.String()), err)
+						}
+
+						b.SubtreeSlices[i] = subtree
+
+						sizeInBytes.Add(subtree.SizeInBytes)
+						txCount.Add(uint64(subtree.Length()))
+
 						_ = subtreeReader.Close()
-						if retries < 3 {
-							retries++
-							logger.Warnf("failed to deserialize subtree %s, retrying %d", subtreeHash.String(), retries)
-							continue
-						}
-						return errors.Join(fmt.Errorf("failed to deserialize subtree %s", subtreeHash.String()), err)
+						break
+
 					}
 
-					b.SubtreeSlices[i] = subtree
+					// get subtree meta
+					subtreeMetaReader, err := subtreeStore.GetIoReader(gCtx, subtreeHash[:], options.WithFileExtension("meta"))
+					if err != nil {
+						// this is just an optimization, we can always get the data from the txmeta store
+						// logger.Warnf("failed to get subtree meta %s: %w", subtreeHash.String(), err)
+						return nil
+					}
+					defer func() {
+						_ = subtreeMetaReader.Close()
+					}()
 
-					sizeInBytes.Add(subtree.SizeInBytes)
-					txCount.Add(uint64(subtree.Length()))
+					b.SubtreeMetaSlices[i], err = util.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
+					if err != nil {
+						logger.Warnf("failed to deserialize subtree meta %s: %w", subtreeHash.String(), err)
+					}
 
-					_ = subtreeReader.Close()
-					break
-				}
-
-				// get subtree meta
-				subtreeMetaReader, err := subtreeStore.GetIoReader(gCtx, subtreeHash[:], options.WithFileExtension("meta"))
-				if err != nil {
-					logger.Warnf("failed to get subtree meta %s: %w", subtreeHash.String(), err)
 					return nil
 				}
-				defer func() {
-					_ = subtreeMetaReader.Close()
-				}()
-
-				b.SubtreeMetaSlices[i], err = util.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
-				if err != nil {
-					logger.Warnf("failed to deserialize subtree meta %s: %w", subtreeHash.String(), err)
-				}
-
-				return nil
 			})
 		}
 	}

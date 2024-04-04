@@ -10,9 +10,9 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/aerospike/aerospike-client-go/v6"
-	asl "github.com/aerospike/aerospike-client-go/v6/logger"
-	"github.com/aerospike/aerospike-client-go/v6/types"
+	"github.com/aerospike/aerospike-client-go/v7"
+	asl "github.com/aerospike/aerospike-client-go/v7/logger"
+	"github.com/aerospike/aerospike-client-go/v7/types"
 	utxostore "github.com/bitcoin-sv/ubsv/stores/utxo"
 	"github.com/bitcoin-sv/ubsv/ulogger"
 	"github.com/bitcoin-sv/ubsv/util"
@@ -348,6 +348,10 @@ func (s *Store) Spend(ctx context.Context, spends []*utxostore.Spend) (err error
 			return fmt.Errorf("context cancelled spending %d of %d utxos", i, len(spends))
 
 		default:
+			if spend == nil {
+				continue
+			}
+
 			err = s.spendUtxo(policy, spend)
 			if err != nil {
 				// error encountered, reverse all spends and return error
@@ -439,7 +443,7 @@ func (s *Store) spendUtxo(policy *aerospike.WritePolicy, spend *utxostore.Spend)
 						}
 
 						s.logger.Debugf("utxo %s was spent by %s", spend.TxID.String(), spendingTxHash)
-						return utxostore.NewErrSpent(spendingTxHash)
+						return utxostore.NewErrSpent(spend.TxID, spend.Vout, spend.Hash, spendingTxHash)
 					}
 				}
 			}

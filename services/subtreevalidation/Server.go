@@ -26,8 +26,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-var stats = gocore.NewStat("subtreevalidation")
-
 // Server type carries the logger within it
 type Server struct {
 	subtreevalidation_api.UnimplementedSubtreeValidationAPIServer
@@ -39,14 +37,11 @@ type Server struct {
 	validatorClient          validator.Interface
 	subtreeCount             atomic.Int32
 	maxMerkleItemsPerSubtree int
-}
-
-func Enabled() bool {
-	_, found := gocore.Config().Get("subtreevalidation_grpcListenAddress")
-	return found
+	stats                    *gocore.Stat
 }
 
 func New(
+	ctx context.Context,
 	logger ulogger.Logger,
 	subtreeStore blob.Store,
 	txStore blob.Store,
@@ -67,12 +62,13 @@ func New(
 		validatorClient:          validatorClient,
 		subtreeCount:             atomic.Int32{},
 		maxMerkleItemsPerSubtree: maxMerkleItemsPerSubtree,
+		stats:                    gocore.NewStat("subtreevalidation"),
 	}
 
 	// create a caching tx meta store
 	if gocore.Config().GetBool("subtreevalidation_txMetaCacheEnabled", true) {
 		logger.Infof("Using cached version of tx meta store")
-		u.txMetaStore = txmetacache.NewTxMetaCache(context.Background(), ulogger.TestLogger{}, txMetaStore)
+		u.txMetaStore = txmetacache.NewTxMetaCache(ctx, ulogger.TestLogger{}, txMetaStore)
 	} else {
 		u.txMetaStore = txMetaStore
 	}
@@ -177,7 +173,7 @@ func (u *Server) Stop(_ context.Context) error {
 }
 
 func (u *Server) HealthGRPC(_ context.Context, _ *subtreevalidation_api.EmptyMessage) (*subtreevalidation_api.HealthResponse, error) {
-	start, stat, _ := util.NewStatFromContext(context.Background(), "Health", stats)
+	start, stat, _ := util.NewStatFromContext(context.Background(), "Health", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -191,7 +187,7 @@ func (u *Server) HealthGRPC(_ context.Context, _ *subtreevalidation_api.EmptyMes
 }
 
 func (u *Server) CheckSubtree(ctx context.Context, request *subtreevalidation_api.CheckSubtreeRequest) (*subtreevalidation_api.CheckSubtreeResponse, error) {
-	start, stat, ctx, cancel := util.NewStatFromContextWithCancel(ctx, "CheckSubtree", stats)
+	start, stat, ctx, cancel := util.NewStatFromContextWithCancel(ctx, "CheckSubtree", u.stats)
 	defer func() {
 		stat.AddTime(start)
 	}()
@@ -232,7 +228,7 @@ func (u *Server) CheckSubtree(ctx context.Context, request *subtreevalidation_ap
 			}
 
 			// Call the validateSubtreeInternal method
-			if err = u.validateSubtreeInternal(ctx, v); err != nil {
+			if err = u.validateSubtreeInternal(ctx, v, request.BlockHeight); err != nil {
 				return nil, fmt.Errorf("Failed to validate subtree %s: %w", hash.String(), err)
 			}
 
@@ -244,12 +240,13 @@ func (u *Server) CheckSubtree(ctx context.Context, request *subtreevalidation_ap
 			// Wait for a bit before retrying.
 			select {
 			case <-ctx.Done():
-				return nil, fmt.Errorf("Context cancelled")
-			case <-time.After(500 * time.Millisecond):
+				return nil, fmt.Errorf("context cancelled")
+			case <-time.After(1 * time.Second):
 				retryCount++
 
-				if retryCount > 10 {
-					return nil, fmt.Errorf("Failed to get lock for subtree %s after 10 retries", hash.String())
+				// will retry for 20 seconds
+				if retryCount > 20 {
+					return nil, fmt.Errorf("failed to get lock for subtree %s after 10 retries", hash.String())
 				}
 
 				// Automatically retries the loop.

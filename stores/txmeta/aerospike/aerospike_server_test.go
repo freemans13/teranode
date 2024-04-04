@@ -5,11 +5,12 @@ package aerospike
 import (
 	"context"
 	"fmt"
+	"github.com/ordishs/gocore"
 	"net/url"
 	"testing"
 	"time"
 
-	"github.com/aerospike/aerospike-client-go/v6"
+	"github.com/aerospike/aerospike-client-go/v7"
 	"github.com/bitcoin-sv/ubsv/stores/txmeta"
 	"github.com/bitcoin-sv/ubsv/ulogger"
 	"github.com/bitcoin-sv/ubsv/util"
@@ -34,7 +35,27 @@ var (
 	key4 *aerospike.Key
 )
 
+func TestAerospikeKey(t *testing.T) {
+	hash, err := chainhash.NewHashFromStr("5062d8fdda67c5098589c8dc47854c0755a9629d9c63ca4581a3f4aa0195effc")
+	require.NoError(t, err)
+
+	_, err = aerospike.NewKey(aerospikeNamespace, "txmeta", hash[:])
+	require.NoError(t, err)
+}
+
 func TestAerospike(t *testing.T) {
+	gocore.Config().Set("txmeta_store_storeBatcherEnabled", "false")
+	gocore.Config().Set("txmeta_store_getBatcherEnabled", "false")
+	runAerospikeTest(t)
+}
+
+func TestAerospikeWithBatching(t *testing.T) {
+	gocore.Config().Set("txmeta_store_storeBatcherEnabled", "true")
+	gocore.Config().Set("txmeta_store_getBatcherEnabled", "true")
+	runAerospikeTest(t)
+}
+
+func runAerospikeTest(t *testing.T) {
 	aeroURL, err := url.Parse(fmt.Sprintf("aerospike://%s:%d/%s", aerospikeHost, aerospikePort, aerospikeNamespace))
 	require.NoError(t, err)
 

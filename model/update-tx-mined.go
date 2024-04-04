@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/bitcoin-sv/ubsv/ulogger"
@@ -10,6 +11,7 @@ import (
 	"github.com/libsv/go-bt/v2/chainhash"
 	"github.com/opentracing/opentracing-go"
 	"github.com/ordishs/gocore"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -21,14 +23,97 @@ type txMinedStatus interface {
 	SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, blockID uint32) error
 }
 
-func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, txMetaStore txMinedStatus, subtrees []*util.Subtree, blockID uint32) error {
+type txMinedMessage struct {
+	ctx         context.Context
+	logger      ulogger.Logger
+	txMetaStore txMinedStatus
+	subtrees    []*util.Subtree
+	blockHash   *chainhash.Hash
+	blockID     uint32
+	done        chan error
+}
+
+var (
+	txMinedChan = make(chan *txMinedMessage, 1024)
+	txMinedOnce sync.Once
+
+	// prometheus metrics
+	prometheusUpdateTxMinedCh       prometheus.Counter
+	prometheusUpdateTxMinedQueue    prometheus.Gauge
+	prometheusUpdateTxMinedDuration prometheus.Histogram
+)
+
+func initWorker() {
+	prometheusUpdateTxMinedCh = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "model",
+		Name:      "update_tx_mined_ch",
+		Help:      "Number of tx mined messages sent to the worker",
+	})
+	prometheusUpdateTxMinedQueue = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "model",
+		Name:      "update_tx_mined_queue",
+		Help:      "Number of tx mined messages in the queue",
+	})
+	prometheusUpdateTxMinedDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "model",
+		Name:      "update_tx_mined_duration",
+		Help:      "Duration of updating tx mined status",
+		Buckets:   util.MetricsBucketsSeconds,
+	})
+
+	go func() {
+		for msg := range txMinedChan {
+			if err := updateTxMinedStatus(msg.ctx, msg.logger, msg.txMetaStore, msg.subtrees, msg.blockHash, msg.blockID); err != nil {
+				msg.done <- err
+			} else {
+				msg.done <- nil
+			}
+
+			prometheusUpdateTxMinedQueue.Set(float64(len(txMinedChan)))
+		}
+	}()
+}
+
+func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, txMetaStore txMinedStatus, subtrees []*util.Subtree,
+	blockHash *chainhash.Hash, blockID uint32) error {
+
+	// start the worker, if not already started
+	txMinedOnce.Do(initWorker)
+
+	startTime := time.Now()
+	defer func() {
+		prometheusUpdateTxMinedDuration.Observe(float64(time.Since(startTime).Microseconds()) / 1_000_000)
+	}()
+
+	done := make(chan error)
+
+	txMinedChan <- &txMinedMessage{
+		ctx:         ctx,
+		logger:      logger,
+		txMetaStore: txMetaStore,
+		subtrees:    subtrees,
+		blockHash:   blockHash,
+		blockID:     blockID,
+		done:        done,
+	}
+
+	prometheusUpdateTxMinedCh.Inc()
+
+	return <-done
+}
+
+func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, txMetaStore txMinedStatus, subtrees []*util.Subtree,
+	blockHash *chainhash.Hash, blockID uint32) error {
+
 	span, spanCtx := opentracing.StartSpanFromContext(ctx, "UpdateTxMinedStatus")
 	defer func() {
 		span.Finish()
 	}()
 
-	updateTxMinedStatus := gocore.Config().GetBool("txmeta_store_updateTxMinedStatus", true)
-	if !updateTxMinedStatus {
+	logger.Infof("[UpdateTxMinedStatus][%s] blockID %d for %d subtrees", blockHash.String(), blockID, len(subtrees))
+
+	updateTxMinedStatusEnabled := gocore.Config().GetBool("txmeta_store_updateTxMinedStatus", true)
+	if !updateTxMinedStatusEnabled {
 		return nil
 	}
 
@@ -54,16 +139,15 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, txMetaStore
 
 				hashes = append(hashes, &node.Hash)
 				if idx > 0 && idx%maxMinedBatchSize == 0 {
-					logger.Infof("[UpdateTxMinedStatus] SetMinedMulti for %d hashes, batch %d, for subtree %s in block %d", len(hashes), idx/maxMinedBatchSize, subtree.RootHash().String(), blockID)
-					retryCount := 0
-					for {
+					logger.Debugf("[UpdateTxMinedStatus][%s] SetMinedMulti for %d hashes, batch %d, for subtree %s in block %d", blockHash.String(), len(hashes), idx/maxMinedBatchSize, subtree.RootHash().String(), blockID)
+					for retries := 0; retries < 3; retries++ {
 						if err := txMetaStore.SetMinedMulti(gCtx, hashes, blockID); err != nil {
-							retryCount++
-							if retryCount >= 3 {
-								return fmt.Errorf("[UpdateTxMinedStatus] error setting mined tx: %v", err)
+							if retries >= 2 {
+								return fmt.Errorf("[UpdateTxMinedStatus][%s] error setting mined tx: %v", blockHash.String(), err)
 							} else {
-								logger.Warnf("[UpdateTxMinedStatus] error setting mined tx, retrying: %v", err)
-								time.Sleep(100 * time.Duration(retryCount) * time.Millisecond)
+								backoff := time.Duration(2^retries) * time.Second
+								logger.Warnf("[UpdateTxMinedStatus][%s] error setting mined tx, retrying in %s: %v", blockHash.String(), backoff.String(), err)
+								time.Sleep(backoff)
 							}
 						} else {
 							break
@@ -75,9 +159,9 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, txMetaStore
 			}
 
 			if len(hashes) > 0 {
-				logger.Infof("[UpdateTxMinedStatus] SetMinedMulti for %d hashes, remainder batch, for subtree %s in block %d", len(hashes), subtree.RootHash().String(), blockID)
+				logger.Debugf("[UpdateTxMinedStatus][%s] SetMinedMulti for %d hashes, remainder batch, for subtree %s in block %d", blockHash.String(), len(hashes), subtree.RootHash().String(), blockID)
 				if err := txMetaStore.SetMinedMulti(gCtx, hashes, blockID); err != nil {
-					return fmt.Errorf("[UpdateTxMinedStatus] error setting mined tx: %v", err)
+					return fmt.Errorf("[UpdateTxMinedStatus][%s] error setting mined tx: %v", blockHash.String(), err)
 				}
 			}
 
@@ -86,10 +170,10 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, txMetaStore
 	}
 
 	if err := g.Wait(); err != nil {
-		return fmt.Errorf("[UpdateTxMinedStatus] error updating tx mined status: %w", err)
+		return fmt.Errorf("[UpdateTxMinedStatus][%s] error updating tx mined status: %w", blockHash.String(), err)
 	}
 
-	logger.Infof("[UpdateTxMinedStatus] end: block %d", blockID)
+	logger.Infof("[UpdateTxMinedStatus][%s] blockID %d DONE", blockHash.String(), blockID)
 
 	return nil
 }

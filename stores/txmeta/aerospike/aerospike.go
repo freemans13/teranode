@@ -6,14 +6,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	batcher "github.com/bitcoin-sv/ubsv/util/batcher_temp"
 	"math"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"time"
 
-	"github.com/aerospike/aerospike-client-go/v6"
-	asl "github.com/aerospike/aerospike-client-go/v6/logger"
-	"github.com/aerospike/aerospike-client-go/v6/types"
+	"github.com/aerospike/aerospike-client-go/v7"
+	"github.com/aerospike/aerospike-client-go/v7/types"
 	"github.com/bitcoin-sv/ubsv/model"
 	"github.com/bitcoin-sv/ubsv/stores/txmeta"
 	"github.com/bitcoin-sv/ubsv/ulogger"
@@ -22,86 +23,38 @@ import (
 	"github.com/libsv/go-bt/v2"
 	"github.com/libsv/go-bt/v2/chainhash"
 	"github.com/ordishs/gocore"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-var (
-	prometheusTxMetaGet            prometheus.Counter
-	prometheusTxMetaSet            prometheus.Counter
-	prometheusTxMetaSetMined       prometheus.Counter
-	prometheusTxMetaSetMinedBatch  prometheus.Counter
-	prometheusTxMetaSetMinedBatchN prometheus.Counter
-	prometheusTxMetaGetMulti       prometheus.Counter
-	prometheusTxMetaGetMultiN      prometheus.Counter
-	prometheusTxMetaDelete         prometheus.Counter
-)
+type batchStoreItem struct {
+	tx     *bt.Tx
+	txMeta *txmeta.Data
+	done   chan error
+}
 
-func init() {
-	prometheusTxMetaGet = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "aerospike_txmeta_get",
-			Help: "Number of txmeta get calls done to aerospike",
-		},
-	)
-	prometheusTxMetaSet = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "aerospike_txmeta_set",
-			Help: "Number of txmeta set calls done to aerospike",
-		},
-	)
-	prometheusTxMetaSetMined = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "aerospike_txmeta_set_mined",
-			Help: "Number of txmeta set_mined calls done to aerospike",
-		},
-	)
-	prometheusTxMetaSetMinedBatch = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "aerospike_txmeta_set_mined_batch",
-			Help: "Number of txmeta set_mined_batch calls done to aerospike",
-		},
-	)
-	prometheusTxMetaSetMinedBatchN = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "aerospike_txmeta_set_mined_batch_n",
-			Help: "Number of txmeta set_mined_batch txs done to aerospike",
-		},
-	)
-	prometheusTxMetaGetMulti = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "aerospike_txmeta_get_multi",
-			Help: "Number of txmeta get_multi calls done to aerospike",
-		},
-	)
-	prometheusTxMetaGetMultiN = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "aerospike_txmeta_get_multi_n",
-			Help: "Number of txmeta get_multi txs done to aerospike",
-		},
-	)
-	prometheusTxMetaDelete = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "aerospike_txmeta_delete",
-			Help: "Number of txmeta delete calls done to aerospike",
-		},
-	)
+type batchGetItemData struct {
+	Data *txmeta.Data
+	Err  error
+}
 
-	if gocore.Config().GetBool("aerospike_debug", true) {
-		asl.Logger.SetLevel(asl.DEBUG)
-	}
-
+type batchGetItem struct {
+	hash   chainhash.Hash
+	fields []string
+	done   chan batchGetItemData
 }
 
 type Store struct {
-	client     *uaerospike.Client
-	namespace  string
-	expiration uint32
-	logger     ulogger.Logger
+	client       *uaerospike.Client
+	namespace    string
+	setName      string
+	expiration   uint32
+	logger       ulogger.Logger
+	batchId      atomic.Uint64
+	storeBatcher *batcher.Batcher2[batchStoreItem]
+	getBatcher   *batcher.Batcher2[batchGetItem]
 }
 
 func New(logger ulogger.Logger, u *url.URL) (*Store, error) {
-	logger = logger.New("aero_store")
+	initPrometheusMetrics()
 
 	namespace := u.Path[1:]
 
@@ -120,26 +73,183 @@ func New(logger ulogger.Logger, u *url.URL) (*Store, error) {
 		expiration = uint32(expiration64)
 	}
 
-	return &Store{
+	setName := u.Query().Get("set")
+	if setName == "" {
+		setName = "txmeta"
+	}
+
+	s := &Store{
 		client:     client,
 		namespace:  namespace,
+		setName:    setName,
 		expiration: expiration,
 		logger:     logger,
-	}, nil
+	}
+
+	storeBatcherEnabled := gocore.Config().GetBool("txmeta_store_storeBatcherEnabled", true)
+	if storeBatcherEnabled {
+		batchSize, _ := gocore.Config().GetInt("txmeta_store_storeBatcherSize", 256)
+		batchDuration, _ := gocore.Config().GetInt("txmeta_store_storeBatcherDurationMillis", 10)
+		duration := time.Duration(batchDuration) * time.Millisecond
+		s.storeBatcher = batcher.New[batchStoreItem](batchSize, duration, s.sendStoreBatch, true)
+	}
+
+	getBatcherEnabled := gocore.Config().GetBool("txmeta_store_getBatcherEnabled", true)
+	if getBatcherEnabled {
+		batchSize, _ := gocore.Config().GetInt("txmeta_store_getBatcherSize", 1024)
+		batchDuration, _ := gocore.Config().GetInt("txmeta_store_getBatcherDurationMillis", 10)
+		duration := time.Duration(batchDuration) * time.Millisecond
+		s.getBatcher = batcher.New[batchGetItem](batchSize, duration, s.sendGetBatch, true)
+	}
+
+	return s, nil
+}
+
+func (s *Store) sendStoreBatch(batch []*batchStoreItem) {
+	batchPolicy := util.GetAerospikeBatchPolicy()
+
+	batchWritePolicy := util.GetAerospikeBatchWritePolicy(0, 0)
+	batchWritePolicy.RecordExistsAction = aerospike.CREATE_ONLY
+
+	batchRecords := make([]aerospike.BatchRecordIfc, len(batch))
+
+	s.logger.Debugf("[STORE_BATCH] sending batch of %d txMetas", len(batch))
+
+	var hash *chainhash.Hash
+	var key *aerospike.Key
+	var err error
+	for idx, bItem := range batch {
+		hash = bItem.tx.TxIDChainHash()
+		key, err = aerospike.NewKey(s.namespace, s.setName, hash[:])
+		if err != nil {
+			bItem.done <- err
+			continue
+		}
+
+		parentTxHashesInterface := make([]byte, 0, 32*len(bItem.txMeta.ParentTxHashes))
+		for _, v := range bItem.txMeta.ParentTxHashes {
+			parentTxHashesInterface = append(parentTxHashesInterface, v[:]...)
+		}
+
+		putOps := []*aerospike.Operation{
+			aerospike.PutOp(aerospike.NewBin("tx", bItem.tx.ExtendedBytes())),
+			aerospike.PutOp(aerospike.NewBin("fee", int(bItem.txMeta.Fee))),
+			aerospike.PutOp(aerospike.NewBin("sizeInBytes", int(bItem.txMeta.SizeInBytes))),
+			aerospike.PutOp(aerospike.NewBin("parentTxHashes", parentTxHashesInterface)),
+			aerospike.PutOp(aerospike.NewBin("firstSeen", time.Now().Unix())),
+			aerospike.PutOp(aerospike.NewBin("lockTime", int(bItem.tx.LockTime))),
+		}
+
+		record := aerospike.NewBatchWrite(batchWritePolicy, key, putOps...)
+		batchRecords[idx] = record
+	}
+
+	batchId := s.batchId.Add(1)
+
+	err = s.client.BatchOperate(batchPolicy, batchRecords)
+	if err != nil {
+		s.logger.Warnf("[STORE_BATCH][%s] Failed to batch store aerospike txMeta in batchId %d: %v\n", len(batch), batchId, err)
+		// don't return, check each record in the batch for errors and process accordingly
+	}
+
+	// batchOperate may have no errors, but some of the records may have failed
+	for idx, batchRecord := range batchRecords {
+		err = batchRecord.BatchRec().Err
+		if err != nil {
+			var aErr *aerospike.AerospikeError
+			if errors.As(err, &aErr) && aErr != nil && aErr.ResultCode == types.KEY_EXISTS_ERROR {
+				s.logger.Warnf("[STORE_BATCH][%s:%d] txMeta already exists in batch %d, skipping", batch[idx].tx.TxIDChainHash().String(), idx, batchId)
+				batch[idx].done <- txmeta.NewErrTxmetaAlreadyExists(hash)
+				continue
+			}
+
+			batch[idx].done <- fmt.Errorf("[STORE_BATCH][%s:%d] error in aerospike store batch record for txMeta (will retry): %d - %w", batch[idx].tx.TxIDChainHash().String(), idx, batchId, err)
+		} else {
+			batch[idx].done <- nil
+		}
+	}
+}
+
+func (s *Store) sendGetBatch(batch []*batchGetItem) {
+	items := make([]*txmeta.MissingTxHash, 0, len(batch))
+	for idx, item := range batch {
+		items = append(items, &txmeta.MissingTxHash{
+			Hash:   item.hash,
+			Idx:    idx,
+			Fields: item.fields,
+		})
+	}
+
+	err := s.MetaBatchDecorate(context.Background(), items)
+	if err != nil {
+		// mark all items as errored
+		for _, bItem := range batch {
+			bItem.done <- batchGetItemData{
+				Err: err,
+			}
+		}
+		return
+	}
+
+	for _, item := range items {
+		// send the data back to the original caller
+		batch[item.Idx].done <- batchGetItemData{
+			Data: item.Data,
+			Err:  item.Err,
+		}
+	}
 }
 
 func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash) (*txmeta.Data, error) {
-	return s.get(ctx, hash, []string{"fee", "sizeInBytes", "parentTxHashes", "blockIDs"})
+	startTime := time.Now()
+	defer func() {
+		prometheusTxMetaGetDuration.Observe(float64(time.Since(startTime).Microseconds()) / 1_000_000)
+	}()
+	fields := []string{"fee", "sizeInBytes", "parentTxHashes", "blockIDs"}
+
+	if s.getBatcher != nil {
+		done := make(chan batchGetItemData)
+		s.getBatcher.Put(&batchGetItem{hash: *hash, fields: fields, done: done})
+
+		data := <-done
+		if data.Err != nil {
+			prometheusTxMetaGetErr.Inc()
+		} else {
+			prometheusTxMetaGet.Inc()
+		}
+		return data.Data, data.Err
+	}
+
+	return s.get(ctx, hash, fields)
 }
 
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash) (*txmeta.Data, error) {
-	return s.get(ctx, hash, []string{"tx", "fee", "sizeInBytes", "parentTxHashes", "blockIDs"})
+	startTime := time.Now()
+	defer func() {
+		prometheusTxMetaGetDuration.Observe(float64(time.Since(startTime).Microseconds()) / 1_000_000)
+	}()
+	fields := []string{"tx", "fee", "sizeInBytes", "parentTxHashes", "blockIDs"}
+
+	if s.getBatcher != nil {
+		done := make(chan batchGetItemData)
+		s.getBatcher.Put(&batchGetItem{hash: *hash, fields: fields, done: done})
+
+		data := <-done
+		if data.Err != nil {
+			prometheusTxMetaGetErr.Inc()
+		} else {
+			prometheusTxMetaGet.Inc()
+		}
+		return data.Data, data.Err
+	}
+
+	return s.get(ctx, hash, fields)
 }
 
 func (s *Store) get(_ context.Context, hash *chainhash.Hash, bins []string) (*txmeta.Data, error) {
 	prometheusTxMetaGet.Inc()
 
-	key, aeroErr := aerospike.NewKey(s.namespace, "txmeta", hash[:])
+	key, aeroErr := aerospike.NewKey(s.namespace, s.setName, hash[:])
 	if aeroErr != nil {
 		return nil, aeroErr
 	}
@@ -150,6 +260,7 @@ func (s *Store) get(_ context.Context, hash *chainhash.Hash, bins []string) (*tx
 	start := time.Now()
 	value, aeroErr = s.client.Get(readPolicy, key, bins...)
 	if aeroErr != nil {
+		prometheusTxMetaGetErr.Inc()
 		if errors.Is(aeroErr, aerospike.ErrKeyNotFound) {
 			return nil, txmeta.NewErrTxmetaNotFound(hash)
 		}
@@ -209,25 +320,26 @@ func (s *Store) get(_ context.Context, hash *chainhash.Hash, bins []string) (*tx
 	return status, nil
 }
 
-func (s *Store) MetaBatchDecorate(ctx context.Context, items []*txmeta.MissingTxHash, fields ...string) error {
+func (s *Store) MetaBatchDecorate(_ context.Context, items []*txmeta.MissingTxHash, fields ...string) error {
 	batchPolicy := util.GetAerospikeBatchPolicy()
-
-	//policy := util.GetAerospikeBatchReadPolicy()
+	policy := util.GetAerospikeBatchReadPolicy()
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(items))
 
 	for idx, item := range items {
-		key, err := aerospike.NewKey(s.namespace, "txmeta", item.Hash[:])
+		key, err := aerospike.NewKey(s.namespace, s.setName, item.Hash[:])
 		if err != nil {
 			return err
 		}
 
 		bins := []string{"tx", "fee", "sizeInBytes", "parentTxHashes", "blockIDs"}
-		if len(fields) > 0 {
+		if len(item.Fields) > 0 {
+			bins = item.Fields
+		} else if len(fields) > 0 {
 			bins = fields
 		}
 
-		record := aerospike.NewBatchRead(key, bins)
+		record := aerospike.NewBatchRead(policy, key, bins)
 		// Add to batch
 		batchRecords[idx] = record
 	}
@@ -242,7 +354,11 @@ func (s *Store) MetaBatchDecorate(ctx context.Context, items []*txmeta.MissingTx
 		if err != nil {
 			items[idx].Data = nil
 			if !model.CoinbasePlaceholderHash.Equal(items[idx].Hash) {
-				s.logger.Errorf("batchRecord SetMinedMulti: %s - %v", items[idx].Hash.String(), err)
+				if errors.Is(err, aerospike.ErrKeyNotFound) {
+					items[idx].Err = txmeta.NewErrTxmetaNotFound(&items[idx].Hash)
+				} else {
+					items[idx].Err = err
+				}
 			}
 		} else {
 			bins := batchRecord.BatchRec().Record.Bins
@@ -313,7 +429,20 @@ func (s *Store) Create(_ context.Context, tx *bt.Tx) (*txmeta.Data, error) {
 		return nil, err
 	}
 
-	key, err := aerospike.NewKey(s.namespace, "txmeta", hash[:])
+	if s.storeBatcher != nil {
+		done := make(chan error)
+		s.storeBatcher.Put(&batchStoreItem{tx: tx, txMeta: txMeta, done: done})
+
+		err = <-done
+		if err != nil {
+			return nil, err
+		}
+
+		prometheusTxMetaSet.Inc()
+		return txMeta, nil
+	}
+
+	key, err := aerospike.NewKey(s.namespace, s.setName, hash[:])
 	if err != nil {
 		e = err
 		return nil, err
@@ -380,7 +509,7 @@ func (s *Store) SetMined(_ context.Context, hash *chainhash.Hash, blockID uint32
 		}
 	}()
 
-	key, err := aerospike.NewKey(s.namespace, "txmeta", hash[:])
+	key, err := aerospike.NewKey(s.namespace, s.setName, hash[:])
 	if err != nil {
 		e = err
 		return err
@@ -409,9 +538,9 @@ func (s *Store) SetMinedMulti(_ context.Context, hashes []*chainhash.Hash, block
 	batchRecords := make([]aerospike.BatchRecordIfc, len(hashes))
 
 	for idx, hash := range hashes {
-		key, err := aerospike.NewKey(s.namespace, "txmeta", hash[:])
+		key, err := aerospike.NewKey(s.namespace, s.setName, hash[:])
 		if err != nil {
-			return err
+			return fmt.Errorf("aerospike NewKey error: %w", err)
 		}
 		op := aerospike.ListAppendOp("blockIDs", blockID)
 		record := aerospike.NewBatchWrite(policy, key, op)
@@ -421,24 +550,33 @@ func (s *Store) SetMinedMulti(_ context.Context, hashes []*chainhash.Hash, block
 
 	err := s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
-		return err
+		return fmt.Errorf("aerospike BatchOperate error: %w", err)
 	}
 
 	prometheusTxMetaSetMinedBatch.Inc()
 
 	okUpdates := 0
+	errs := make([]error, 0, len(hashes))
 	for idx, batchRecord := range batchRecords {
 		err = batchRecord.BatchRec().Err
 		if err != nil {
-			// TODO what to do here?
-			hash := hashes[idx]
-			s.logger.Errorf("batchRecord SetMinedMulti: %s - %v", hash.String(), err)
+			var aErr *aerospike.AerospikeError
+			if errors.As(err, &aErr) && aErr != nil && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
+				// the tx Meta does not exist anymore, so we do not have to set the mined status
+				continue
+			}
+			errs = append(errs, fmt.Errorf("%s - %v", hashes[idx].String(), err))
 		} else {
 			okUpdates++
 		}
 	}
 
 	prometheusTxMetaSetMinedBatchN.Add(float64(okUpdates))
+
+	if len(errs) > 0 {
+		prometheusTxMetaSetMinedBatchErrN.Add(float64(len(errs)))
+		return fmt.Errorf("aerospike batchRecord errors: %v", errs)
+	}
 
 	return nil
 }
@@ -455,7 +593,7 @@ func (s *Store) Delete(_ context.Context, hash *chainhash.Hash) error {
 
 	policy := util.GetAerospikeWritePolicy(0, math.MaxUint32)
 
-	key, err := aerospike.NewKey(s.namespace, "txmeta", hash[:])
+	key, err := aerospike.NewKey(s.namespace, s.setName, hash[:])
 	if err != nil {
 		e = err
 		return err
