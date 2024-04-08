@@ -32,6 +32,7 @@
       "env": {
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
+        "blockassembly_disabled": "true",
       },
       "args": [
         "-all=0",
