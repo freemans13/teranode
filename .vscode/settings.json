@@ -158,6 +158,7 @@
     "txid",
     "txmeta",
     "txmetacache",
+    "txmetafactory",
     "txmetas",
     "txmetastore",
     "txns",
