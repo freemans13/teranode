@@ -58,10 +58,10 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 350Gi
-              cpu: "40"
+              memory: 1000Gi
+              cpu: "100"
             limits:
-              memory: 1012Gi
+              memory: 1500Gi
           volumeMounts:
             - name: lustre-storage
               mountPath: /data/subtreestore
