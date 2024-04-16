@@ -408,7 +408,7 @@ func Start() {
 			}
 		}
 		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
-		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completedCh)
+		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completedCh, *useQuic)
 
 		if !runIndefinitely {
 			for i := 0; i < *workers; i++ {
@@ -424,7 +424,7 @@ func Start() {
 }
 
 func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64, iterations int,
-	coinbaseClient *coinbase.Client, txDistributors []*distributor.Distributor, logIdsFile chan string, completed chan struct{}) {
+	coinbaseClient *coinbase.Client, txDistributors []*distributor.Distributor, logIdsFile chan string, completed chan struct{}, useQuic bool) {
 
 	var w *worker.Worker
 	var err error
@@ -453,6 +453,7 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 				&totalTransactions,
 				&startTime,
 				topic,
+				useQuic,
 			)
 			if err != nil {
 				logger.Errorf("Could not initialise worker %d: %v", workerId, err)
