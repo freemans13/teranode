@@ -57,6 +57,7 @@
     "getsentry",
     "gocore",
     "halvings",
+    "hashable",
     "ifnull",
     "Infof",
     "initialise",
