@@ -16,6 +16,7 @@
         "startLegacy": "true",
       },
       "args": [
+        "-legacy=0"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
@@ -205,6 +206,15 @@
         "utxoblaster_utxostore_redis" : "redis://13.51.121.65:6379,13.51.205.122:6379"
       },
       "args": ["-workers=10", "-store=redis-ring"]
+    },
+    {
+      "name": "utxotool",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "buildFlags": "-tags=aerospike",
+      "program": "${workspaceFolder}/cmd/utxotool/main.go",
+      "args": ["../../data/blockpersister/00d07e632c0db3fc18f43c47238db5162d4e8589c4fbc25dc2d84b4ca5a6d63a_0.utxodiff"]
     },
     {
       "name": "binserve",

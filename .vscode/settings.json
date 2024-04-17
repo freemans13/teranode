@@ -177,6 +177,7 @@
     "upgrader",
     "usql",
     "utxo",
+    "utxodiff",
     "utxos",
     "utxoservice",
     "utxostore",
