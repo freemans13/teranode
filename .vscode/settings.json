@@ -180,6 +180,7 @@
     "utxodiff",
     "utxos",
     "utxoservice",
+    "utxoset",
     "utxostore",
     "Uxto",
     "validateblock",
