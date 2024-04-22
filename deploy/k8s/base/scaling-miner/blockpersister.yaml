@@ -80,6 +80,8 @@ spec:
               mountPath: /data/subtreestore
             - name: blockpersister-storage
               mountPath: /data/blockpersister
+            - name: blockpersister-lustre
+              mountPath: /data/blockstore
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
@@ -87,3 +89,6 @@ spec:
         - name: blockpersister-storage
           persistentVolumeClaim:
             claimName: blockpersister-pvc
+        - name: blockpersister-lustre
+          persistentVolumeClaim:
+            claimName: blockpersister-lustre-pvc
