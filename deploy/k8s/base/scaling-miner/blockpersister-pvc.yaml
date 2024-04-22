@@ -3,9 +3,10 @@ kind: PersistentVolumeClaim
 metadata:
   name: blockpersister-pvc
 spec:
+  storageClassName: ssd-gp3
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1500Gi
-      storageClass: ssd-gp3
+      storage: "1500Gi"
+
