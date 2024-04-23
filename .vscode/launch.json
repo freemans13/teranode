@@ -214,7 +214,8 @@
       "mode": "auto",
       "buildFlags": "-tags=aerospike",
       "program": "${workspaceFolder}/cmd/filereader/main.go",
-      "args": ["../../data/blockpersister/00d07e632c0db3fc18f43c47238db5162d4e8589c4fbc25dc2d84b4ca5a6d63a_0.utxodiff"]
+      // "args": ["../../data/blockpersister/00d07e632c0db3fc18f43c47238db5162d4e8589c4fbc25dc2d84b4ca5a6d63a_0.utxodiff"]
+      "args": ["-verify"]
     },
     {
       "name": "binserve",
