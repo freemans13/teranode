@@ -64,6 +64,25 @@ patches:
       labelSelector: app=subtreevalidation
   - patch: |-
       - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1blockvalidation.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://blockvalidation-service2.m2.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["blockvalidation_block_found_ch","blockvalidation_validate_block_duration_seconds_bucket"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=blockvalidation
+  - patch: |-
+      - op: replace
         path: "/spec/template/metadata/annotations/ad.datadoghq.com~1blockassembly.checks"
         value: |
           {
@@ -123,7 +142,7 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/dnsNames
-        value: 
+        value:
          - m2.scaling.ubsv.dev
     target:
       kind: Certificate
