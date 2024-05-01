@@ -13,35 +13,35 @@ configMapGenerator:
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=allinone.a1
-    name: shared-config-m
+    name: shared-config-a1
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=allinone.a1.asset
-    name: asset-config-m
+    name: asset-config-a1
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=allinone.a1.blockassembly
-    name: blockassembly-config-m
+    name: blockassembly-config-a1
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=allinone.a1.blockvalidation
-    name: blockvalidation-config-m
+    name: blockvalidation-config-a1
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=allinone.a1.subtreevalidation
-    name: subtreevalidation-config-m
+    name: subtreevalidation-config-a1
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=allinone.a1.coinbase
-    name: coinbase-config-m
+    name: coinbase-config-a1
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=allinone.a1.propagation
-    name: propagation-config-m
+    name: propagation-config-a1
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=allinone.a1.blockpersister
-    name: blockpersister-config-m
+    name: blockpersister-config-a1
 patches:
   - patch: |-
       - op: replace
@@ -149,34 +149,34 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: propagation-service2
+        value: propagation-service1
     target:
       labelSelector: service=propagation
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: p2p-service2
+        value: p2p-service1
     target:
       kind: IngressRouteTCP
       labelSelector: service=p2p
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: coinbase-service2
+        value: coinbase-service1
     target:
       kind: IngressRouteTCP
       labelSelector: service=coinbase
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: asset-service2
+        value: asset-service1
     target:
       kind: IngressRouteTCP
       labelSelector: service=asset
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: asset-service2
+        value: asset-service1
       - op: replace
         path: /spec/routes/0/match
         value: Host(`a1.allinone.ubsv.dev`)
