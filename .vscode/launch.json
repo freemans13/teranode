@@ -37,10 +37,10 @@
       },
       "args": [
         "-all=0",
-        "-blockchain=1",
+        // "-blockchain=1",
         "-legacy=1",
-        "-blockvalidation=1",
-        "-subtreevalidation=1"
+        // "-blockvalidation=1",
+        // "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
