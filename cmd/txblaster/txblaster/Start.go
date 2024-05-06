@@ -200,15 +200,22 @@ func Start() {
 	var txDistributors []*distributor.Distributor
 	nrTxDistributors, _ := gocore.Config().GetInt("txblaster_distributors", 16)
 
+	// with 3 retry attempts and 400ms backoff duration, the total time to wait is 2.8s
+	// the first backoff is 400ms, the second is 800ms, the third is 1600ms
+	// this should be plenty for the propagation service to recover
+	backoffDuration, _, _ := gocore.Config().GetDuration("txblaster_backoffDuration", 400*time.Millisecond)
+	retryAttempts, _ := gocore.Config().GetInt("txblaster_retryAttempts", 3)
+	failureTolerance, _ := gocore.Config().GetInt("txblaster_failureTolerance", 0)
+
 	var err error
 	if !*useQuic {
 		logger.Debugf("Using %d grpc distributors", nrTxDistributors)
 		txDistributors = make([]*distributor.Distributor, nrTxDistributors)
 		for i := 0; i < nrTxDistributors; i++ {
 			txDistributors[i], err = distributor.NewDistributor(logger,
-				distributor.WithBackoffDuration(200*time.Millisecond),
-				distributor.WithRetryAttempts(3),
-				distributor.WithFailureTolerance(0),
+				distributor.WithBackoffDuration(backoffDuration),
+				distributor.WithRetryAttempts(int32(retryAttempts)),
+				distributor.WithFailureTolerance(failureTolerance),
 			)
 		}
 		if err != nil {
