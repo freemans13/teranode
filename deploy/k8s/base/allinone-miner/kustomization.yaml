@@ -10,6 +10,8 @@ resources:
   - postgres-config-map.yaml
   - postgres-pvc.yaml
   - subtree-pvc.yaml
+  - subtree-pvc-lustre.yaml
+  - blockpersister-pvc-lustre.yaml
   - service-account.yaml
   - tx-blaster-config-map.yaml
   - tx-blaster-service.yaml
