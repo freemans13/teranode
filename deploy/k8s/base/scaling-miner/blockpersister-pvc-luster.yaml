@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: blockpersister-lustre-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: blockpersister-lustre-pv
+  resources:
+    requests:
+      storage: 2400Gi

@@ -16,6 +16,7 @@
         "startLegacy": "true",
       },
       "args": [
+        "-legacy=0"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
@@ -32,13 +33,14 @@
       "env": {
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
+        "blockassembly_disabled": "true",
       },
       "args": [
         "-all=0",
-        "-blockchain=1",
+        // "-blockchain=1",
         "-legacy=1",
-        "-blockvalidation=1",
-        "-subtreevalidation=1"
+        // "-blockvalidation=1",
+        // "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
@@ -204,6 +206,19 @@
         "utxoblaster_utxostore_redis" : "redis://13.51.121.65:6379,13.51.205.122:6379"
       },
       "args": ["-workers=10", "-store=redis-ring"]
+    },
+    {
+      "name": "filereader",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "buildFlags": "-tags=aerospike",
+      "program": "${workspaceFolder}/cmd/filereader/main.go",
+      // "args": ["../../data/blockpersister/00d07e632c0db3fc18f43c47238db5162d4e8589c4fbc25dc2d84b4ca5a6d63a_0.utxodiff"]
+      "args": ["003981438894b73b4ec829a9c4a895c064a1aad82e03966b3a88172060f25546.block"],
+      "env": {
+        "blockstore" :"s3:///eu-ubsv-block-store?region=eu-west-1",
+      }
     },
     {
       "name": "binserve",

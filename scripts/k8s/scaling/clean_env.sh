@@ -41,9 +41,8 @@ function clean() {
   local namespace=$2
 
   echo "Aerospike cleaning: $region"
-  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=ubsv-store;"
-  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=utxo-store;"
   kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=txmeta-store;"
+  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=utxo-store;"
   # echo "Clearing Lustre: $region"
   # kubectl scale deployment -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get deployment --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep blockchain | tail -c+17) --replicas 1
   # kubectl scale deployment -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get deployment --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep asset | tail -c+17) --replicas 1
