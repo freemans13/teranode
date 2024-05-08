@@ -1,30 +1,38 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - cluster-role-binding.yaml
-  - miner-config-map.yaml
-  - miner-service.yaml
-  - miner.yaml
-  - postgres.yaml
-  - postgres-service.yaml
-  - postgres-config-map.yaml
-  - postgres-pvc.yaml
-  - subtree-pvc.yaml
-  - subtree-pvc-lustre.yaml
-  - blockpersister-pvc-lustre.yaml
-  - service-account.yaml
-  - tx-blaster-config-map.yaml
-  - tx-blaster-service.yaml
-  - tx-blaster.yaml
   - asset-grpc-ingress.yaml
   - asset-http-ingress.yaml
   - asset-https-ingress.yaml
+  - blockassembly-config-map.yaml
+  - blockpersister-pvc-lustre.yaml
+  - cluster-role-binding.yaml
   - coinbase-grpc-ingress.yaml
+  - kafka.yaml
+  - kafka-ingress.yaml
+  - kafka-pvc.yaml
+  - kafka-service.yaml
+  - miner.yaml
+  - miner-config-map.yaml
+  - miner-service.yaml
   - p2p-grpc-ingress.yaml
   - p2p-ws-ingress.yaml
   - p2p-wss-ingress.yaml
+  - postgres.yaml
+  - postgres-config-map.yaml
+  - postgres-pvc.yaml
+  - postgres-service.yaml
   - propagation-grpc-ingress.yaml
-  - kafka-pvc.yaml
-  - kafka.yaml
-  - kafka-service.yaml
-  - kafka-ingress.yaml
+  - service-account.yaml
+  - shared-config-map.yaml
+  - subtree-pvc.yaml
+  - subtree-pvc-lustre.yaml
+  - tx-blaster.yaml
+  - tx-blaster-config-map.yaml
+  - tx-blaster-service.yaml
+  - asset-config-map.yaml
+  - coinbase-config-map.yaml
+  - propagation-config-map.yaml
+  - subtreevalidation-config-map.yaml
+  - blockpersister-config-map.yaml
+  - blockvalidation-config-map.yaml

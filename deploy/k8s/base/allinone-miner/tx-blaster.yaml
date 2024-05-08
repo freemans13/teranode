@@ -18,6 +18,8 @@ spec:
       app: tx-blaster
   template:
     metadata:
+      annotations:
+        ad.datadoghq.com/blockassembly.checks: ""
       labels:
         app: tx-blaster
     spec:
