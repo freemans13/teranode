@@ -18,6 +18,8 @@ spec:
       maxUnavailable: 0
   template:
     metadata:
+      annotations:
+        ad.datadoghq.com/blockassembly.checks: ""
       labels:
         app: miner
     spec:
