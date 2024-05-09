@@ -202,6 +202,6 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/template/spec/serviceAccountName
-        value: sa-miner
+        value: sa-a1
     target:
       kind: Deployment
