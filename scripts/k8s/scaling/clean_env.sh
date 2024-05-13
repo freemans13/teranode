@@ -99,6 +99,12 @@ clean "us-east-1" "m2" &
 bg_pids+=($!)
 clean "ap-south-1" "m3" &
 bg_pids+=($!)
+clean "ca-central-1" "m4" &
+bg_pids+=($!)
+clean "us-west-2" "m5" &
+bg_pids+=($!)
+clean "eu-central-1" "m6" &
+bg_pids+=($!)
 
 # Local databases
 truncate "eu-west-1" "m1" &
@@ -107,6 +113,12 @@ truncate "us-east-1" "m2" &
 bg_pids+=($!)
 truncate "ap-south-1" "m3" &
 bg_pids+=($!)
+truncate "ca-central-1" "m4" &
+bg_pids+=($!)
+truncate "us-west-2" "m5" &
+bg_pids+=($!)
+truncate "eu-central-1" "m6" &
+bg_pids+=($!)
 
 # Kafka
 clear_kafka "m1" &
@@ -114,6 +126,12 @@ bg_pids+=($!)
 clear_kafka "m2" &
 bg_pids+=($!)
 clear_kafka "m3" &
+bg_pids+=($!)
+clear_kafka "m4" &
+bg_pids+=($!)
+clear_kafka "m5" &
+bg_pids+=($!)
+clear_kafka "m6" &
 bg_pids+=($!)
 
 # Wait for all background processes to complete
