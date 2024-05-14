@@ -205,3 +205,12 @@ patches:
         value: sa-m6
     target:
       kind: Deployment
+
+  - target:
+      version: v1
+      kind: ServiceAccount
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/eks.amazonaws.com~1role-arn
+        value: arn:aws:iam::1234:role/eks-s3-access-role-usw
+  
