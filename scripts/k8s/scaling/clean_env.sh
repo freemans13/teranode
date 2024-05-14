@@ -99,11 +99,11 @@ clean "us-east-1" "m2" &
 bg_pids+=($!)
 clean "ap-south-1" "m3" &
 bg_pids+=($!)
-clean "ca-central-1" "m4" &
+clean "ap-northeast-2" "m4" &
 bg_pids+=($!)
-clean "us-west-2" "m5" &
+clean "ca-central-1" "m5" &
 bg_pids+=($!)
-clean "eu-central-1" "m6" &
+clean "us-west-2" "m6" &
 bg_pids+=($!)
 
 # Local databases
@@ -113,12 +113,13 @@ truncate "us-east-1" "m2" &
 bg_pids+=($!)
 truncate "ap-south-1" "m3" &
 bg_pids+=($!)
-truncate "ca-central-1" "m4" &
+truncate "ap-northeast-2" "m4" &
 bg_pids+=($!)
-truncate "us-west-2" "m5" &
+truncate "ca-central-1" "m5" &
 bg_pids+=($!)
-truncate "eu-central-1" "m6" &
+truncate "us-west-2" "m6" &
 bg_pids+=($!)
+
 
 # Kafka
 clear_kafka "m1" &

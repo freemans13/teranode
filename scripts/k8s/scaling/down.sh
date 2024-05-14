@@ -51,11 +51,11 @@ if [ "$1" == "all" ]; then
   bg_pids+=($!)
   scale_down "ap-south-1" "3" &
   bg_pids+=($!)
-  scale_down "ca-central-1" "4" &
+  scale_down "ap-northeast-2" "4" &
   bg_pids+=($!)
-  scale_down "us-west-2" "5" &
+  scale_down "ca-central-1" "5" &
   bg_pids+=($!)
-  scale_down "eu-central-1" "6" &
+  scale_down "us-west-2" "6" &
   bg_pids+=($!)
 else
   if [[ "$1" == "eu" || "$1" == "m1" ]]; then
@@ -68,13 +68,13 @@ else
     scale_down "ap-south-1" "3" &
     bg_pids+=($!)
   elif [[ "$1" == "m4" ]]; then
-    scale_down "ca-central-1" "4" &
+    scale_down "ap-northeast-2" "4" &
     bg_pids+=($!)
   elif [[ "$1" == "m5" ]]; then
-    scale_down "us-west-2" "5" &
+    scale_down "ca-central-1" "5" &
     bg_pids+=($!)
   elif [[ "$1" == "m6" ]]; then
-    scale_down "eu-central-1" "6" &
+    scale_down "us-west-1" "6" &
     bg_pids+=($!)
   else
     echo "Auto detecting environment"
@@ -85,11 +85,11 @@ else
     elif [[ $(kubectl config current-context) == *"ap-south-1"* ]]; then
       scale_down "ap-south-1" "3"
     elif [[ $(kubectl config current-context) == *"ca-central-1"* ]]; then
-      scale_down "ca-central-1" "4"
+      scale_down "ap-northeast-2" "4"
     elif [[ $(kubectl config current-context) == *"us-west-2"* ]]; then
-      scale_down "us-west-2" "5"
+      scale_down "ca-central-1" "5"
     elif [[ $(kubectl config current-context) == *"eu-central-1"* ]]; then
-      scale_down "eu-central-1" "6"
+      scale_down "us-west-2" "6"
     else
       echo "Unknown context, cannot scale down. Change namespace and try again"
       exit 1
