@@ -23,26 +23,28 @@
         // "-coinbase=1",
         // "-all=1"
       ]
-    },{
-        "name": "UBSV - docker.ci.ubsv3",
-        "type": "go",
-        "request": "launch",
-        "mode": "auto",
-        "program": "${workspaceFolder}/.",
-        // "buildFlags": "-tags=aerospike",
-        "env": {
-          "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug",
-        },
-        "args": [
-          "-legacy=0"
-          // "-faucet=1",
-          // "-blockchain=1",
-          // "-asset=1",
-          // "-coinbase=1",
-          // "-all=1"
-        ]
-      },{
-        "name": "Legacy",
+    },
+    {
+      "name": "UBSV - docker.ci.ubsv3",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      // "buildFlags": "-tags=aerospike",
+      "env": {
+        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug"
+      },
+      "args": [
+        "-legacy=0"
+        // "-faucet=1",
+        // "-blockchain=1",
+        // "-asset=1",
+        // "-coinbase=1",
+        // "-all=1"
+      ]
+    },
+    {
+      "name": "Legacy",
       "type": "go",
       "request": "launch",
       "mode": "auto",
@@ -52,6 +54,8 @@
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
         "blockassembly_disabled": "true",
+        "legacy_verifyOnly": "false",
+        "profilerAddr": ":6060",
       },
       "args": [
         "-all=0",
@@ -65,7 +69,8 @@
         // "-coinbase=1",
         // "-all=1"
       ]
-    },,{
+    },
+    {
       "name": "Rpc",
       "type": "go",
       "request": "launch",
@@ -144,7 +149,9 @@
       "program": "${workspaceFolder}/cmd/propagation_blaster/main.go",
       "buildFlags": "-tags=native",
       "env": {},
-      "args": ["-broadcast=grpc"]
+      "args": [
+        "-broadcast=grpc"
+      ]
     },
     {
       "name": "blockassembly_blaster",
@@ -153,7 +160,9 @@
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/blockassembly_blaster/main.go",
       "env": {},
-      "args": ["-broadcast=frpc"]
+      "args": [
+        "-broadcast=frpc"
+      ]
     },
     {
       "name": "aerospiketest",
@@ -165,7 +174,13 @@
       "env": {
         "utxostore": "aerospike://localhost:3000/testtimeout=30s",
       },
-      "args": ["-strategy=direct", "-transactions=1000", "-workers=10", "-timeout=30s", "-aerospike_host=localhost:3000"]
+      "args": [
+        "-strategy=direct",
+        "-transactions=1000",
+        "-workers=10",
+        "-timeout=30s",
+        "-aerospike_host=localhost:3000"
+      ]
     },
     {
       "name": "blockchain",
@@ -177,7 +192,9 @@
       "env": {
         "SETTINGS_CONTEXT": "x"
       },
-      "args": ["-blockchain=1"]
+      "args": [
+        "-blockchain=1"
+      ]
     },
     {
       "name": "bootstrap",
@@ -190,7 +207,9 @@
         "SETTINGS_CONTEXT": "x",
         "bootstrap_httpListenAddress": "localhost:8099"
       },
-      "args": ["-bootstrap=1"]
+      "args": [
+        "-bootstrap=1"
+      ]
     },
     {
       "name": "tx-blaster",
@@ -198,7 +217,10 @@
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/txblaster/main.go",
-      "args": ["-workers=1", "-print=1"]
+      "args": [
+        "-workers=1",
+        "-print=1"
+      ]
     },
     {
       "name": "s3-blaster",
@@ -210,7 +232,9 @@
         "logLevel": "DEBUG",
         "SETTINGS_CONTEXT": "dev.stu"
       },
-      "args": ["-workers=1"]
+      "args": [
+        "-workers=1"
+      ]
     },
     {
       "name": "tx-blaster-miner7",
@@ -225,7 +249,10 @@
         "Xpropagation_grpcAddresses": "miner1.allinone.ubsv.dev:8084",
         "Xcoinbase_grpcAddress": "miner1.allinone.ubsv.dev:8093"
       },
-      "args": ["-workers=1", "-print=1"]
+      "args": [
+        "-workers=1",
+        "-print=1"
+      ]
     },
     {
       "name": "utxostore_blaster",
@@ -236,9 +263,12 @@
       "program": "${workspaceFolder}/cmd/utxostore_blaster/main.go",
       "env": {
         "utxostore": "aerospike://localhost:3000/test",
-        "utxoblaster_utxostore_redis" : "redis://13.51.121.65:6379,13.51.205.122:6379"
+        "utxoblaster_utxostore_redis": "redis://13.51.121.65:6379,13.51.205.122:6379"
       },
-      "args": ["-workers=10", "-store=redis-ring"]
+      "args": [
+        "-workers=10",
+        "-store=redis-ring"
+      ]
     },
     {
       "name": "filereader",
@@ -248,9 +278,11 @@
       "buildFlags": "-tags=aerospike",
       "program": "${workspaceFolder}/cmd/filereader/main.go",
       // "args": ["../../data/blockpersister/00d07e632c0db3fc18f43c47238db5162d4e8589c4fbc25dc2d84b4ca5a6d63a_0.utxodiff"]
-      "args": ["003981438894b73b4ec829a9c4a895c064a1aad82e03966b3a88172060f25546.block"],
+      "args": [
+        "003981438894b73b4ec829a9c4a895c064a1aad82e03966b3a88172060f25546.block"
+      ],
       "env": {
-        "blockstore" :"s3:///eu-ubsv-block-store?region=eu-west-1",
+        "blockstore": "s3:///eu-ubsv-block-store?region=eu-west-1",
       }
     },
     {
