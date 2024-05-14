@@ -14,9 +14,11 @@
       "env": {
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
+        "blockassembly_disabled": "true",
+        "legacy_verifyOnly": "false",
       },
       "args": [
-        "-legacy=0"
+        // "-legacy=0"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
