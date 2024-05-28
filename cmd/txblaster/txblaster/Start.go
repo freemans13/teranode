@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"os/signal"
@@ -123,11 +122,21 @@ func Start() {
 			for {
 				// Define the URL to query block height
 				asset_httpAddress, _ := gocore.Config().Get("asset_httpAddress")
-				path := "/lastblocks?n=1"
-				url := asset_httpAddress + path
+
+				parsedURL, err := url.ParseRequestURI(asset_httpAddress)
+				if err != nil {
+					panic(fmt.Errorf("Invalid URL: %v", err))
+				}
+
+				fullURL := parsedURL.ResolveReference(&url.URL{Path: "/lastblocks?n=1"})
+
+				// Set up HTTP client with timeouts
+				client := &http.Client{
+					Timeout: time.Second * 10,
+				}
 
 				// Send an HTTP GET request to the URL
-				resp, err := http.Get(url)
+				resp, err := client.Get(fullURL.String())
 				if err != nil {
 					panic("Error: " + err.Error())
 				}
@@ -342,13 +351,21 @@ func Start() {
 			profilerAddr, startProfiler = gocore.Config().Get("tx_blaster_profilerAddr", ":9191")
 		}
 
+		server := &http.Server{
+			Addr:         profilerAddr,
+			Handler:      nil,
+			ReadTimeout:  60 * time.Second,
+			WriteTimeout: 60 * time.Second,
+			IdleTimeout:  120 * time.Second,
+		}
+
 		if startProfiler {
 			gocore.RegisterStatsHandlers()
 			prefix, _ := gocore.Config().Get("stats_prefix")
 			logger.Infof("StatsServer listening on http://%s/%s/stats", profilerAddr, prefix)
 
 			logger.Infof("Starting profile on http://%s/debug/pprof", profilerAddr)
-			logger.Fatalf("%v", http.ListenAndServe(profilerAddr, nil))
+			logger.Fatalf("%v", server.ListenAndServe())
 		}
 	}()
 

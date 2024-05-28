@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: subtree-lustre-pv
+spec:
+  capacity:
+    storage: 2400Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - flock
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-0bd949934d6632631
+    volumeAttributes:
+      dnsname: fs-0bd949934d6632631.fsx.ca-central-1.amazonaws.com
+      mountname: i4r6nbmv

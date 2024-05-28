@@ -56,6 +56,7 @@
     "fsrv",
     "getsentry",
     "gocore",
+    "gosec",
     "halvings",
     "hashable",
     "ifnull",

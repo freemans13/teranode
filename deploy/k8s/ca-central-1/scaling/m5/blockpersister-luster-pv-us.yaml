@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: blockpersister-lustre-pv
+spec:
+  capacity:
+    storage: 2400Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - flock
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-077b110d0d16229cb
+    volumeAttributes:
+      dnsname: fs-077b110d0d16229cb.fsx.ca-central-1.amazonaws.com
+      mountname: iyr6nbmv
