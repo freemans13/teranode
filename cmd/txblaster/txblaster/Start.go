@@ -221,7 +221,7 @@ func Start() {
 		logger.Debugf("Using %d grpc distributors", nrTxDistributors)
 		txDistributors = make([]*distributor.Distributor, nrTxDistributors)
 		for i := 0; i < nrTxDistributors; i++ {
-			txDistributors[i], err = distributor.NewDistributor(logger,
+			txDistributors[i], err = distributor.NewDistributor(ctx, logger,
 				distributor.WithBackoffDuration(backoffDuration),
 				distributor.WithRetryAttempts(int32(retryAttempts)),
 				distributor.WithFailureTolerance(failureTolerance),

@@ -4,7 +4,7 @@ if [ -n "$KUBECONFIG" ]; then
 fi
 
 if [ "$1" == "help" ]; then
-  echo "Usage: $0 [all|eu|m1|us|m2|asia|m3]"
+  echo "Usage: $0 [all|eu|m1|us|m2|asia|m3|m4|m5|m6]"
   echo "all: scale down all regions"
   echo "eu or m1: scale down eu region"
   echo "us or m2: scale down us region"
@@ -31,12 +31,14 @@ scale_down() {
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockvalidation$namespace_suffix --replicas 0
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground subtreevalidation$namespace_suffix --replicas 0
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockassembly$namespace_suffix --replicas 0
+    kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockpersister$namespace_suffix --replicas 0
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground asset$namespace_suffix --replicas 0
-    kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground status$namespace_suffix --replicas 0
+    # kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground status$namespace_suffix --replicas 0
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockchain$namespace_suffix --replicas 0
+    kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground blockpersister$namespace_suffix --replicas 0
 
     kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground faucet$namespace_suffix --replicas 0
-    kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground nginx-reverse-proxy --replicas 0
+    # kubectl scale deployment -n m$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground nginx-reverse-proxy --replicas 0
   fi
 }
 
@@ -51,6 +53,12 @@ if [ "$1" == "all" ]; then
   bg_pids+=($!)
   scale_down "ap-south-1" "3" &
   bg_pids+=($!)
+  scale_down "ap-northeast-2" "4" &
+  bg_pids+=($!)
+  scale_down "ca-central-1" "5" &
+  bg_pids+=($!)
+  scale_down "us-west-2" "6" &
+  bg_pids+=($!)
 else
   if [[ "$1" == "eu" || "$1" == "m1" ]]; then
     scale_down "eu-west-1" "1" &
@@ -61,6 +69,15 @@ else
   elif [[ "$1" == "asia" || "$1" == "m3" ]]; then
     scale_down "ap-south-1" "3" &
     bg_pids+=($!)
+  elif [[ "$1" == "m4" ]]; then
+    scale_down "ap-northeast-2" "4" &
+    bg_pids+=($!)
+  elif [[ "$1" == "m5" ]]; then
+    scale_down "ca-central-1" "5" &
+    bg_pids+=($!)
+  elif [[ "$1" == "m6" ]]; then
+    scale_down "us-west-2" "6" &
+    bg_pids+=($!)
   else
     echo "Auto detecting environment"
     if [[ $(kubectl config current-context) == *"eu-west-1"* ]]; then
@@ -69,6 +86,12 @@ else
       scale_down "us-east-1" "2"
     elif [[ $(kubectl config current-context) == *"ap-south-1"* ]]; then
       scale_down "ap-south-1" "3"
+    elif [[ $(kubectl config current-context) == *"ca-central-1"* ]]; then
+      scale_down "ap-northeast-2" "4"
+    elif [[ $(kubectl config current-context) == *"us-west-2"* ]]; then
+      scale_down "ca-central-1" "5"
+    elif [[ $(kubectl config current-context) == *"eu-central-1"* ]]; then
+      scale_down "us-west-2" "6"
     else
       echo "Unknown context, cannot scale down. Change namespace and try again"
       exit 1
