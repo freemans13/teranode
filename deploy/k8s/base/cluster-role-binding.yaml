@@ -4,11 +4,7 @@ metadata:
   name: scaling-ubsv-service-role-binding
 subjects:
   - kind: ServiceAccount
-<<<<<<< Updated upstream:deploy/k8s/base/allinone-miner/cluster-role-binding.yaml
     name: miner-service-account
-=======
-    name: sa-t
->>>>>>> Stashed changes:deploy/k8s/base/cluster-role-binding.yaml
 roleRef:
   kind: ClusterRole
   name: edit

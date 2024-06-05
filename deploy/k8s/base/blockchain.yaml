@@ -1,12 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-<<<<<<< Updated upstream:deploy/k8s/base/allinone-miner/tx-blaster.yaml
-  name: tx-blaster
-=======
   name: blockchain
-
->>>>>>> Stashed changes:deploy/k8s/base/blockchain.yaml
   labels:
     app: blockchain
     project: service
