@@ -198,7 +198,6 @@
         "SETTINGS_CONTEXT": "dev",
         "asset_httpAddress": "http://localhost:8090",
         // "utxostore": "aerospike://localhost:3000/test?timeout=30s",
-        // "txmeta_store": "aerospike://localhost:3000/test?timeout=30s"
       },
       "args": [
         "-blockchain=0",
