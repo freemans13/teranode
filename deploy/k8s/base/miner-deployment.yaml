@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: miner
+  name: miner
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: miner
+  template:
+    metadata:
+      labels:
+        app: miner
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: miner
+                topologyKey: kubernetes.io/hostname
+              weight: 100
+      serviceAccountName: sa-t
+      containers:
+        - args:
+            - -miner=1
+          envFrom:
+            - configMapRef:
+                name: shared-config
+          env:
+            - name: SERVICE_NAME
+              value: miner-service
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
+          name: miner
+          ports:
+            - containerPort: 8089
+              protocol: TCP
+            - containerPort: 8092
+              protocol: TCP
+            - containerPort: 8099
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            limits:
+              memory: 2Gi
+            requests:
+              cpu: 2
+              memory: 2Gi
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

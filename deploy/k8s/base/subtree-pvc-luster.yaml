@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+<<<<<<< Updated upstream:deploy/k8s/base/allinone-miner/subtree-pvc.yaml
+  name: subtree-pvc
+=======
+  name: lustre-pvc
+>>>>>>> Stashed changes:deploy/k8s/base/subtree-pvc-luster.yaml
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: subtree-lustre-pv
+  resources:
+    requests:
+      storage: 1200Gi

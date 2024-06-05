@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: utxo-blaster
+
+  labels:
+    app: utxo-blaster
+    project: service
+spec:
+  replicas: 0
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: utxo-blaster
+  template:
+    metadata:
+      labels:
+        app: utxo-blaster
+    spec:
+      serviceAccountName: sa-t
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: utxo-blaster
+                topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: propagation
+      tolerations:
+        - key: role
+          value: propagation
+          operator: Equal
+          effect: NoSchedule
+      containers:
+        - name: utxo-blaster
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
+          command:
+            - ./utxostoreblaster.run
+          args: [ "-workers=1000", "-store=aerospike" ]
+          envFrom:
+            - configMapRef:
+                name: shared-config
+          env:
+            - name: SERVICE_NAME
+              value: utxo-blaster-service
+          ports:
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 32Gi
+              cpu: "27"
+            limits:
+              memory: 32Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

@@ -1,0 +1,86 @@
+#apiVersion: apps/v1
+#kind: Deployment
+#metadata:
+#  name: blockassembly-blaster
+#
+#  labels:
+#    app: blockassembly-blaster
+#    project: service
+#spec:
+#  replicas: 0
+#  strategy:
+#    type: RollingUpdate
+#    rollingUpdate:
+#      maxSurge: 1
+#      maxUnavailable: 0
+#  selector:
+#    matchLabels:
+#      app: blockassembly-blaster
+#  template:
+#    metadata:
+#      labels:
+#        app: blockassembly-blaster
+#    spec:
+#      serviceAccountName: sa-t
+#      affinity:
+#        podAntiAffinity:
+#          preferredDuringSchedulingIgnoredDuringExecution:
+#            - weight: 100
+#              podAffinityTerm:
+#                labelSelector:
+#                  matchLabels:
+#                    app: blockassembly-blaster
+#                topologyKey: "kubernetes.io/hostname"
+#      containers:
+#        - name: blockassembly-blaster
+#          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
+#          command:
+#            - ./blockassemblyblaster.run
+#          args: [ "-workers=200", "-broadcast=frpc", "-batch_size=10" ]
+#          env:
+#            - name: SERVICE_NAME
+#              value: blockassembly-blaster-service
+#            - name: SETTINGS_CONTEXT
+#              value: scaling.m1
+#            - name: GRPC_GO_LOG_VERBOSITY
+#              value: info
+#            - name: GRPC_GO_LOG_SEVERITY
+#              value: info
+#          ports:
+#            - containerPort: 8085
+#              protocol: TCP
+#            - containerPort: 8185
+#              protocol: TCP
+#            - containerPort: 8285
+#              protocol: TCP
+#            - containerPort: 9091
+#              protocol: TCP
+#            - containerPort: 9092
+#              protocol: TCP
+#            - containerPort: 4040
+#              protocol: TCP
+#            - containerPort: 6060
+#              protocol: TCP
+#          resources:
+#            requests:
+#              memory: 128Mi
+#              cpu: "6"
+#            limits:
+#              memory: 128Mi
+#              cpu: "6"
+#          readinessProbe:
+#            httpGet:
+#              path: /health
+#              port: 9091
+#            initialDelaySeconds: 1
+#            periodSeconds: 10
+#            failureThreshold: 5
+#            timeoutSeconds: 3
+#          livenessProbe:
+#            httpGet:
+#              path: /health
+#              port: 9091
+#            initialDelaySeconds: 1
+#            periodSeconds: 10
+#            failureThreshold: 5
+#            timeoutSeconds: 3

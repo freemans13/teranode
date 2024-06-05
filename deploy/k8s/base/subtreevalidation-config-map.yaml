@@ -1,0 +1,15 @@
+# create config map for asset service
+apiVersion: v1
+kind: ConfigMap
+metadata:
+<<<<<<< Updated upstream:deploy/k8s/base/allinone-miner/subtreevalidation-config-map.yaml
+  name: subtreevalidation-config-a
+data:
+  SETTINGS_CONTEXT: "scaling.a"
+=======
+  name: subtreevalidation-config
+data:
+  SETTINGS_CONTEXT: "scaling.m"
+>>>>>>> Stashed changes:deploy/k8s/base/subtreevalidation-config-map.yaml
+#  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
+#  JAEGER_AGENT_PORT: "6831"

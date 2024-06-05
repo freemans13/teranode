@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coinbase
+  namespace: coinbase-service
+  labels:
+    app: coinbase
+    project: service
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: coinbase
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app: coinbase
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: coinbase
+                topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: service
+          value: coinbase
+          operator: Equal
+          effect: NoSchedule
+      containers:
+        - name: coinbase
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
+          args: [ "-coinbase=1" ]
+          envFrom:
+            - configMapRef:
+                name: shared-config
+            - configMapRef:
+                name: coinbase-config
+          env:
+            - name: SERVICE_NAME
+              value: coinbase-service
+            - name: logLevel
+              value: INFO
+            - name: slack_channel
+              valueFrom:
+                secretKeyRef:
+                  name: ubsv-secrets
+                  key: slack_channel
+            - name: slack_token
+              valueFrom:
+                secretKeyRef:
+                  name: ubsv-secrets
+                  key: slack_token
+          ports:
+            - containerPort: 8093
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 20Gi
+              cpu: "10"
+            limits:
+              memory: 28Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+      volumes:
+        - name: ubsv-secrets
+          secret:
+            secretName: ubsv-secrets
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

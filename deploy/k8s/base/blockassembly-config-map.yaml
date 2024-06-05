@@ -1,0 +1,15 @@
+# create config map for asset service
+apiVersion: v1
+kind: ConfigMap
+metadata:
+<<<<<<< Updated upstream:deploy/k8s/base/allinone-miner/blockassembly-config-map.yaml
+  name: blockassembly-config-a
+data:
+  SETTINGS_CONTEXT: "scaling.a"
+=======
+  name: blockassembly-config
+data:
+  SETTINGS_CONTEXT: "scaling.m"
+>>>>>>> Stashed changes:deploy/k8s/base/blockassembly-config-map.yaml
+#  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
+#  JAEGER_AGENT_PORT: "6831"

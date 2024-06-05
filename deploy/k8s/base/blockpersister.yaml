@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockpersister
+
+  labels:
+    app: blockpersister
+    project: service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: blockpersister
+  template:
+    metadata:
+      labels:
+        app: blockpersister
+    spec:
+      serviceAccountName: sa-t
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: blockpersister
+                topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: blockpersister
+      tolerations:
+        - key: role
+          value: blockpersister
+          operator: Equal
+          effect: NoSchedule
+      containers:
+        - name: blockpersister
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
+          args: [ "-blockpersister=1" ]
+          # command: "You can override the entrypoint with a command."
+          # command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]
+          #          command: [ "./ubsv.run" ]
+          envFrom:
+            - configMapRef:
+                name: shared-config
+            - configMapRef:
+                name: blockpersister-config
+          env:
+            - name: SERVICE_NAME
+              value: blockpersister-service
+            - name: blockPersister_groupLimit
+              value: "100"
+          ports:
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 80Gi
+              cpu: "25"
+            limits:
+              memory: 80Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: lustre-storage
+              mountPath: /data/subtreestore
+            - name: blockpersister-lustre
+              mountPath: /data/blockstore
+      volumes:
+        - name: lustre-storage
+          persistentVolumeClaim:
+            claimName: lustre-pvc
+        - name: blockpersister-lustre
+          persistentVolumeClaim:
+            claimName: blockpersister-lustre-pvc

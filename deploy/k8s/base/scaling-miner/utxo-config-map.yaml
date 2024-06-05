@@ -1,8 +1,0 @@
-#apiVersion: v1
-#kind: ConfigMap
-#metadata:
-#  name: utxo-config-m
-#data:
-#  SETTINGS_CONTEXT:  "scaling.m1.memory"
-#  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
-#  JAEGER_AGENT_PORT: "6831"

@@ -2,45 +2,45 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../../base/scaling-miner
+  - ../../../base/
 
 namespace: m1
 
-nameSuffix: "1"
+nameSuffix: "-m1"
 
 configMapGenerator:
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1
-    name: shared-config-m
+    name: shared-config
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1.asset
-    name: asset-config-m
+    name: asset-config
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1.blockassembly
-    name: blockassembly-config-m
+    name: blockassembly-config
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1.blockvalidation
-    name: blockvalidation-config-m
+    name: blockvalidation-config
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1.subtreevalidation
-    name: subtreevalidation-config-m
+    name: subtreevalidation-config
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1.coinbase
-    name: coinbase-config-m
+    name: coinbase-config
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1.propagation
-    name: propagation-config-m
+    name: propagation-config
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=scaling.m1.blockpersister
-    name: blockpersister-config-m
+    name: blockpersister-config
 patches:
   - patch: |-
       - op: replace
@@ -51,7 +51,7 @@ patches:
                   "init_config": {},
                   "instances": [
                       {
-                          "openmetrics_endpoint": "http://subtreevalidation-service1.m1.svc.cluster.local:9091/metrics",
+                          "openmetrics_endpoint": "http://subtreevalidation-service-m1.m1.svc.cluster.local:9091/metrics",
                           "namespace": "prom",
                           "metrics": ["subtreevalidation_validate_subtree"]
                       }
@@ -70,7 +70,7 @@ patches:
                   "init_config": {},
                   "instances": [
                       {
-                          "openmetrics_endpoint": "http://blockvalidation-service1.m1.svc.cluster.local:9091/metrics",
+                          "openmetrics_endpoint": "http://blockvalidation-service-m1.m1.svc.cluster.local:9091/metrics",
                           "namespace": "prom",
                           "metrics": ["blockvalidation_block_found_ch","blockvalidation_validate_block_duration_seconds_bucket"]
                       }
@@ -89,7 +89,7 @@ patches:
                   "init_config": {},
                   "instances": [
                       {
-                          "openmetrics_endpoint": "http://blockassembly-service1.m1.svc.cluster.local:9091/metrics",
+                          "openmetrics_endpoint": "http://blockassembly-service-m1.m1.svc.cluster.local:9091/metrics",
                           "namespace": "prom",
                           "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket","blockassembly_best_block_height","blockassembly_current_block_height","blockassembly_add_tx_duration_seconds_count"]
                       }
@@ -108,7 +108,7 @@ patches:
                   "init_config": {},
                   "instances": [
                       {
-                          "openmetrics_endpoint": "http://propagation-service1.m1.svc.cluster.local:9091/metrics",
+                          "openmetrics_endpoint": "http://propagation-service-m1.m1.svc.cluster.local:9091/metrics",
                           "namespace": "prom",
                           "metrics": ["propagation_processed_transactions","validator_transactions_validate_micros_bucket","validator_transactions_store_utxos_micros_bucket","validator_transactions_spend_utxos_micros_bucket"]
                       }
@@ -127,7 +127,7 @@ patches:
                   "init_config": {},
                   "instances": [
                       {
-                          "openmetrics_endpoint": "http://tx-blaster-service1.m1.svc.cluster.local:9091/metrics",
+                          "openmetrics_endpoint": "http://tx-blaster-service-m1.m1.svc.cluster.local:9091/metrics",
                           "namespace": "prom",
                           "metrics": ["tx_blaster_processed_transactions",]
                       }
@@ -147,34 +147,34 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: propagation-service1
+        value: propagation-service-m1
     target:
       labelSelector: service=propagation
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: p2p-service1
+        value: p2p-service-m1
     target:
       kind: IngressRouteTCP
       labelSelector: service=p2p
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: coinbase-service1
+        value: coinbase-service-m1
     target:
       kind: IngressRouteTCP
       labelSelector: service=coinbase
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: asset-service1
+        value: asset-service-m1
     target:
       kind: IngressRouteTCP
       labelSelector: service=asset
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: asset-service1
+        value: asset-service-m1
       - op: replace
         path: /spec/routes/0/match
         value: Host(`m1.scaling.ubsv.dev`)
@@ -184,7 +184,7 @@ patches:
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: p2p-service1
+        value: p2p-service-m1
       - op: replace
         path: /spec/routes/0/match
         value: Host(`m1.scaling.ubsv.dev`)
