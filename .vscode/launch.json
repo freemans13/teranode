@@ -36,6 +36,28 @@
       // "buildFlags": "-tags=aerospike",
       "env": {
         "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug"
+        // "blockassembly_disabled": "true",
+        "legacy_verifyOnly": "false",
+      },
+      "args": [
+        "-miner=0"
+        // "-legacy=0"
+        // "-faucet=1",
+        // "-blockchain=1",
+        // "-asset=1",
+        // "-coinbase=1",
+        // "-all=1"
+      ]
+    },
+    {
+      "name": "UBSV - docker.ci.ubsv3",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      // "buildFlags": "-tags=aerospike",
+      "env": {
+        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug"
       },
       "args": [
         "-legacy=0"
@@ -102,13 +124,14 @@
       "args": [
         // "-all=0",
         // "-blockchain=1",
-        // "-legacy=1",
+        "-legacy=0",
         // "-blockvalidation=1",
         // "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
         // "-coinbase=1",
+          "-blockpersister=0"
         // "-all=1"
       ]
     },{
@@ -124,13 +147,14 @@
       "args": [
         // "-all=0",
         // "-blockchain=1",
-        // "-legacy=1",
+        "-legacy=0",
         // "-blockvalidation=1",
         // "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
         // "-coinbase=1",
+        "-blockpersister=0"
         // "-all=1"
       ]
     },{
@@ -146,32 +170,17 @@
       "args": [
         // "-all=0",
         // "-blockchain=1",
-        // "-legacy=1",
+        "-legacy=0",
         // "-blockvalidation=1",
         // "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
         // "-coinbase=1",
+        "-blockpersister=0"
         // "-all=1"
       ]
     },{
-      "name": "Rpc",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/.",
-      // "buildFlags": "-tags=aerospike",
-      "env": {
-        "blockassembly_disabled": "true",
-      },
-      "args": [
-        "-all=0",
-        "-rpc=1",
-        "-blockchain=1",
-      ]
-    },
-    {
       "name": "Rpc",
       "type": "go",
       "request": "launch",
