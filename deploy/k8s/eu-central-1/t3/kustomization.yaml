@@ -12,35 +12,35 @@ nameSuffix: "-t3"
 configMapGenerator:
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.t3
+      - SETTINGS_CONTEXT=testing.t3
     name: shared-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.t3.asset
+      - SETTINGS_CONTEXT=testing.t3.asset
     name: asset-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.t3.blockassembly
+      - SETTINGS_CONTEXT=testing.t3.blockassembly
     name: blockassembly-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.t3.blockvalidation
+      - SETTINGS_CONTEXT=testing.t3.blockvalidation
     name: blockvalidation-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.t3.subtreevalidation
+      - SETTINGS_CONTEXT=testing.t3.subtreevalidation
     name: subtreevalidation-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.t3.coinbase
+      - SETTINGS_CONTEXT=testing.t3.coinbase
     name: coinbase-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.t3.propagation
+      - SETTINGS_CONTEXT=testing.t3.propagation
     name: propagation-config
   - behavior: merge
     literals:
-      - SETTINGS_CONTEXT=scaling.t3.blockpersister
+      - SETTINGS_CONTEXT=testing.t3.blockpersister
     name: blockpersister-config
 patches:
   - patch: |-
@@ -143,7 +143,7 @@ patches:
       - op: replace
         path: /spec/dnsNames
         value:
-         - t3.scaling.ubsv.dev
+         - t3.testing.ubsv.dev
     target:
       kind: Certificate
   - patch: |-
@@ -179,7 +179,7 @@ patches:
         value: asset-service-t3
       - op: replace
         path: /spec/routes/0/match
-        value: Host(`t3.scaling.ubsv.dev`)
+        value: Host(`t3.testing.ubsv.dev`)
     target:
       kind: IngressRoute
       labelSelector: service=asset
@@ -189,7 +189,7 @@ patches:
         value: p2p-service-t3
       - op: replace
         path: /spec/routes/0/match
-        value: Host(`t3.scaling.ubsv.dev`)
+        value: Host(`t3.testing.ubsv.dev`)
     target:
       kind: IngressRoute
       labelSelector: service=p2p
