@@ -35,7 +35,7 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug"
+        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug",
         // "blockassembly_disabled": "true",
         "legacy_verifyOnly": "false",
       },
@@ -395,6 +395,20 @@
       }
     },
     {
+      "name": "s3inventoryintegrity",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/s3inventoryintegrity/main.go",
+      "args": [
+        "-d=postgres://poc2:poc2@localhost:5432/poc2",
+        "-f=/Users/freemans/Downloads/0c7171e2-6742-493a-9ede-95a57b19c81c.csv",
+      ],
+      "env": {
+        "SETTINGS_CONTEXT": "docker.host.ubsv1"
+      },
+  },
+    {
       "name": "binserve",
       "type": "go",
       "request": "launch",
@@ -408,6 +422,20 @@
       "mode": "remote",
       "port": 4040,
       "host": "127.0.0.1"
-    }
+      },
+      {
+        "name": "blockpersister intergrity",
+        "type": "go",
+        "request": "launch",
+        "mode": "auto",
+        "program": "${workspaceFolder}/cmd/blockpersisterintegrity/main.go",
+        "env": {
+          "SETTINGS_CONTEXT": "docker.host.ubsv1"
+        },
+         "args": [
+          // "-workers=1",
+          // "-print=1"
+        ]
+      }
   ]
 }
