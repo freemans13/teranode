@@ -211,7 +211,7 @@ patches:
     patch: |-
       - op: replace
         path: /metadata/annotations/eks.amazonaws.com~1role-arn
-        value: arn:aws:iam::434394763103:role/eks-s3-access-role-ane
+        value: arn:aws:iam::434394763103:role/eks-s3-access-role-euc
 
   # remove resource from all deployments
   # todo fix this when we find the correct sizing
