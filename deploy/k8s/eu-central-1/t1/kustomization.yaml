@@ -228,3 +228,4 @@ patches:
         value: 1
     target:
       kind: Deployment
+
