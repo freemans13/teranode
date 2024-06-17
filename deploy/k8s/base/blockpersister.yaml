@@ -7,7 +7,7 @@ metadata:
     app: blockpersister
     project: service
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: blockpersister
@@ -83,7 +83,7 @@ spec:
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
-            claimName: lustre-pvc
+            claimName: subtree-pvc
         - name: blockpersister-lustre
           persistentVolumeClaim:
             claimName: blockpersister-lustre-pvc

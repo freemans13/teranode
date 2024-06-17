@@ -39,6 +39,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: shared-config
+            - configMapRef:
+                name: blockchain-config
           env:
             - name: SERVICE_NAME
               value: blockchain-service

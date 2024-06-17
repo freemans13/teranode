@@ -32,6 +32,10 @@ configMapGenerator:
     name: subtreevalidation-config
   - behavior: merge
     literals:
+      - SETTINGS_CONTEXT=testing.t3.blockchain
+    name: blockchain-config
+  - behavior: merge
+    literals:
       - SETTINGS_CONTEXT=testing.t3.coinbase
     name: coinbase-config
   - behavior: merge
@@ -197,6 +201,9 @@ patches:
       - op: replace
         path: /subjects/0/namespace
         value: t3
+      - op: replace
+        path: /subjects/0/name
+        value: sa-t3
     target:
       kind: ClusterRoleBinding
   - patch: |-
@@ -213,3 +220,10 @@ patches:
         path: /metadata/annotations/eks.amazonaws.com~1role-arn
         value: arn:aws:iam::434394763103:role/eks-s3-access-role-euc
 
+  # remove resource from all deployments
+  # todo fix this when we find the correct sizing
+  - patch: |-
+      - op: remove
+        path: /spec/template/spec/containers/0/resources
+    target:
+      kind: Deployment

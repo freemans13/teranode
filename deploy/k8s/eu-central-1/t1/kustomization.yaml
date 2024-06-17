@@ -32,6 +32,10 @@ configMapGenerator:
     name: subtreevalidation-config
   - behavior: merge
     literals:
+      - SETTINGS_CONTEXT=testing.t1.blockchain
+    name: blockchain-config
+  - behavior: merge
+    literals:
       - SETTINGS_CONTEXT=testing.t1.coinbase
     name: coinbase-config
   - behavior: merge
@@ -197,6 +201,9 @@ patches:
       - op: replace
         path: /subjects/0/namespace
         value: t1
+      - op: replace
+        path: /subjects/0/name
+        value: sa-t1
     target:
       kind: ClusterRoleBinding
   - patch: |-

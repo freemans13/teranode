@@ -6,7 +6,7 @@ metadata:
     app: asset
     project: service
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: asset
@@ -88,7 +88,7 @@ spec:
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
-            claimName: lustre-pvc
+            claimName: subtree-pvc
         - name: scaling-tls
           secret:
             secretName: scaling-tls

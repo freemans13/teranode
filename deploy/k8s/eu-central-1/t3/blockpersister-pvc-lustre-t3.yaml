@@ -6,7 +6,7 @@ spec:
   accessModes:
     - ReadWriteMany
   storageClassName: ""
-  volumeName: blockpersister-lustre-pv
+  volumeName: blockpersister-lustre-pv-3
   resources:
     requests:
       storage: 1200Gi

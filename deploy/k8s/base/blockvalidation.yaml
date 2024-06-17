@@ -89,7 +89,7 @@ spec:
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
-            claimName: lustre-pvc
+            claimName: subtree-pvc
         - name: scaling-tls
           secret:
             secretName: scaling-tls

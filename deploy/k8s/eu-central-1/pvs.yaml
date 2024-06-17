@@ -1,0 +1,124 @@
+# this is a bit tricky to manage. Kubernetes does not support multiple pvc per pv, you need a 1-1 relationship.
+# when mounting a pvc to a pod, you specify the directory. the idea is to make them mount on the same file system
+# but different directories. The PVCs are not shared across namespace, so we need two per namespace (subtree+block) and
+# therefore one pv for each. The only way to make it work is to have static provisioning of pv and pvc. This is not
+#  ideal, but it is the only way to make it work.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: subtree-lustre-pv-1
+spec:
+  capacity:
+    storage: 1200Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - flock
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-0bd4eeef9930ec9be
+    volumeAttributes:
+      dnsname: fs-0bd4eeef9930ec9be.fsx.eu-central-1.amazonaws.com
+      mountname: prdchbev
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: subtree-lustre-pv-2
+spec:
+  capacity:
+    storage: 1200Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - flock
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-0bd4eeef9930ec9be
+    volumeAttributes:
+      dnsname: fs-0bd4eeef9930ec9be.fsx.eu-central-1.amazonaws.com
+      mountname: prdchbev
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: subtree-lustre-pv-3
+spec:
+  capacity:
+    storage: 1200Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - flock
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-0bd4eeef9930ec9be
+    volumeAttributes:
+      dnsname: fs-0bd4eeef9930ec9be.fsx.eu-central-1.amazonaws.com
+      mountname: prdchbev
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: blockpersister-lustre-pv-1
+spec:
+  capacity:
+    storage: 1200Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - flock
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-0bd4eeef9930ec9be
+    volumeAttributes:
+      dnsname: fs-0bd4eeef9930ec9be.fsx.eu-central-1.amazonaws.com
+      mountname: prdchbev
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: blockpersister-lustre-pv-2
+spec:
+  capacity:
+    storage: 1200Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - flock
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-0bd4eeef9930ec9be
+    volumeAttributes:
+      dnsname: fs-0bd4eeef9930ec9be.fsx.eu-central-1.amazonaws.com
+      mountname: prdchbev
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: blockpersister-lustre-pv-3
+spec:
+  capacity:
+    storage: 1200Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - flock
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-0bd4eeef9930ec9be
+    volumeAttributes:
+      dnsname: fs-0bd4eeef9930ec9be.fsx.eu-central-1.amazonaws.com
+      mountname: prdchbev
