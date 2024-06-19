@@ -430,11 +430,11 @@
         "mode": "auto",
         "program": "${workspaceFolder}/cmd/blockpersisterintegrity/main.go",
         "env": {
-          "SETTINGS_CONTEXT": "docker.host.ubsv1"
+          "SETTINGS_CONTEXT": "docker.host.ubsv1",
         },
          "args": [
-          // "-workers=1",
-          // "-print=1"
+          "-d=postgres://poc2:poc2@localhost:5432/poc2",
+          "-s3=s3://s3.eu-west-1.amazonaws.com/ubsv-m1-block-store?region=eu-west-1",
         ]
       }
   ]
