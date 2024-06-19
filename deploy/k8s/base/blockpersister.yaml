@@ -26,13 +26,6 @@ spec:
                   matchLabels:
                     app: blockpersister
                 topologyKey: "kubernetes.io/hostname"
-      nodeSelector:
-        role: blockpersister
-      tolerations:
-        - key: role
-          value: blockpersister
-          operator: Equal
-          effect: NoSchedule
       containers:
         - name: blockpersister
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
