@@ -227,3 +227,81 @@ patches:
         path: /spec/template/spec/containers/0/resources
     target:
       kind: Deployment
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t2
+    target:
+      kind: Deployment
+      labelSelector: app=blockpersister
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t2
+    target:
+      kind: Deployment
+      labelSelector: app=asset
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t2
+    target:
+      kind: Deployment
+      labelSelector: app=blockassembly
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t2
+    target:
+      kind: Deployment
+      labelSelector: app=blockvalidation
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t2
+    target:
+      kind: Deployment
+      labelSelector: app=subtreevalidation
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts/0/mountPath
+        value: /data/t2/subtreestore
+    target:
+      kind: Deployment
+      labelSelector: app=asset
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts/0/mountPath
+        value: /data/t2/subtreestore
+    target:
+      kind: Deployment
+      labelSelector: app=blockassembly
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts/0/mountPath
+        value: /data/t2/subtreestore
+    target:
+      kind: Deployment
+      labelSelector: app=blockpersister
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts/1/mountPath
+        value: /data/t2/blockstore
+    target:
+      kind: Deployment
+      labelSelector: app=blockpersister
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts/0/mountPath
+        value: /data/t2/subtreestore
+    target:
+      kind: Deployment
+      labelSelector: app=blockvalidation
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts/0/mountPath
+        value: /data/t2/subtreestore
+    target:
+      kind: Deployment
+      labelSelector: app=subtreevalidation
+
