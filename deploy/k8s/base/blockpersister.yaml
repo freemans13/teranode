@@ -26,6 +26,13 @@ spec:
                   matchLabels:
                     app: blockpersister
                 topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: blockpersister
+      tolerations:
+        - key: role
+          value: blockpersister
+          operator: Equal
+          effect: NoSchedule
       containers:
         - name: blockpersister
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
@@ -48,10 +55,10 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: 80Gi
-              cpu: "25"
+              memory: 4Gi
+              cpu: "2"
             limits:
-              memory: 80Gi
+              memory: 4Gi
           readinessProbe:
             httpGet:
               path: /health
@@ -70,13 +77,15 @@ spec:
             timeoutSeconds: 3
           volumeMounts:
             - name: lustre-storage
-              mountPath: /data/subtreestore
-            - name: blockpersister-lustre
-              mountPath: /data/blockstore
+              mountPath: /data/t1/subtreestore
+              subPath: subtreestore_dir
+            - name: lustre-storage
+              mountPath: /data/t1/blockstore
+              subPath: blockstore_dir
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
-            claimName: subtree-pvc
-        - name: blockpersister-lustre
-          persistentVolumeClaim:
-            claimName: blockpersister-lustre-pvc
+            claimName: subtree-pvc-t2
+        # - name: blockpersister-lustre
+        #   persistentVolumeClaim:
+        #     claimName: blockpersister-lustre-pvc-t2

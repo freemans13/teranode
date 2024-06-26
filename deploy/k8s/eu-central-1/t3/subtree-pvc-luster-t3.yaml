@@ -1,12 +1,12 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: blockpersister-lustre-pvc
+  name: subtree-pvc-t3
 spec:
   accessModes:
     - ReadWriteMany
-  storageClassName: ""
-  volumeName: blockpersister-lustre-pv-2
+  storageClassName: fsx-sc
+  volumeName: subtree-lustre-pv-t3
   resources:
     requests:
       storage: 1200Gi
