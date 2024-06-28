@@ -408,7 +408,23 @@
         "SETTINGS_CONTEXT": "docker.host.ubsv1"
       },
   },
-    {
+  {
+    "name": "txblockidcheck",
+    "type": "go",
+    "request": "launch",
+    "mode": "auto",
+    "program": "${workspaceFolder}/cmd/txblockidcheck/main.go",
+    "args": [
+      "-utxostore=postgres://miner2:miner2@localhost:15432/ubsv2",
+      "-blockchainstore=postgres://miner2:miner2@localhost:15432/ubsv2",
+      "-subtreestore=file:///data/ubsv2/subtreestore",
+      "-txhash=5f9f8103bc643c14b88a52757108510dc71a3cdc4b469da26e64d9c0fe717f46",
+    ],
+    "env": {
+      "SETTINGS_CONTEXT": "docker.host.ubsv1"
+    },
+  },
+  {
       "name": "binserve",
       "type": "go",
       "request": "launch",
@@ -422,20 +438,30 @@
       "mode": "remote",
       "port": 4040,
       "host": "127.0.0.1"
+    },
+    {
+      "name": "blockpersister intergrity",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/blockpersisterintegrity/main.go",
+      "env": {
+        "SETTINGS_CONTEXT": "docker.host.ubsv1",
       },
-      {
-        "name": "blockpersister intergrity",
-        "type": "go",
-        "request": "launch",
-        "mode": "auto",
-        "program": "${workspaceFolder}/cmd/blockpersisterintegrity/main.go",
-        "env": {
-          "SETTINGS_CONTEXT": "docker.host.ubsv1",
-        },
-         "args": [
-          "-d=postgres://poc2:poc2@localhost:5432/poc2",
-          "-s3=s3://s3.eu-west-1.amazonaws.com/ubsv-m1-block-store?region=eu-west-1",
-        ]
-      }
+       "args": [
+        "-d=postgres://poc2:poc2@localhost:5432/poc2",
+        "-s3=s3://s3.eu-west-1.amazonaws.com/ubsv-m1-block-store?region=eu-west-1",
+      ]
+    },
+    {
+      "name": "chainintergrity",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/chainintegrity/main.go",
+      "env": {
+        "SETTINGS_CONTEXT": "docker.host.ubsv2",
+      },
+    }
   ]
 }
