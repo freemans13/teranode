@@ -36,6 +36,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: asset
+          imagePullPolicy: Always
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
           args: [ "-asset=1" ]
           envFrom:
