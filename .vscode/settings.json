@@ -176,6 +176,7 @@
     "uchar",
     "ulogger",
     "unlocker",
+    "unspend",
     "upgrader",
     "usql",
     "utxo",
