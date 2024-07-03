@@ -8,17 +8,15 @@ if [ -n "$KUBECONFIG" ]; then
 fi
 
 # Check if kubectl is installed
-if ! command -v kubectl &> /dev/null
-then
-    echo "kubectl could not be found, please install it to continue (brew install kubectl)."
-    exit 1
+if ! command -v kubectl &>/dev/null; then
+  echo "kubectl could not be found, please install it to continue (brew install kubectl)."
+  exit 1
 fi
 
 # Check if aws is installed
-if ! command -v aws &> /dev/null
-then
-    echo "aws cli could not be found, please install it to continue (brew install awscli)."
-    exit 1
+if ! command -v aws &>/dev/null; then
+  echo "aws cli could not be found, please install it to continue (brew install awscli)."
+  exit 1
 fi
 
 # Array to hold PIDs of background processes
@@ -41,8 +39,12 @@ function clean() {
   local namespace=$2
 
   echo "Aerospike cleaning: $region"
-  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=txmeta-store;"
-  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name| tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=utxo-store;"
+  echo "Aerospike cleaning"
+  echo "Warning: If aerospike is too large, it might be faster to delete and restart the instances. Talk to the devops team."
+  echo "Do not truncate a namespace that's too large, it will take hours"
+
+  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=txmeta-store;"
+  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | tail -c+5) -- asinfo -h aerospike-0.ubsv.internal -v "truncate-namespace:namespace=utxo-store;"
   # echo "Clearing Lustre: $region"
   # kubectl scale deployment -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get deployment --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep blockchain | tail -c+17) --replicas 1
   # kubectl scale deployment -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get deployment --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep asset | tail -c+17) --replicas 1
@@ -52,13 +54,13 @@ function clean() {
 function backup() {
   local region=$1
   local namespace=$2
-  local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ) # Generate timestamp in UTC with -u option
+  local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)    # Generate timestamp in UTC with -u option
   local datePart=$(echo $timestamp | cut -d'T' -f1) # Extract the date part (yyyy-mm-dd)
   local filename="${timestamp}-${region}-${namespace}.dump"
   local s3Path="s3://ubsv-blockchain-backups/${datePart}/${filename}" # Include datePart in the path
 
   echo "Postgres backup: $region $namespace > $s3Path"
-  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace pg_dump -U $namespace $namespace > $filename
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace pg_dump -U $namespace $namespace >$filename
   aws s3 cp $filename $s3Path
   rm $filename
 }
@@ -71,7 +73,7 @@ function truncate() {
 
   echo "Postgres cleaning: $region $namespace"
   kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state ; drop table if exists blocks;" >/dev/null
-  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;" > /dev/null
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=coinbase psql -U coinbase -d coinbase -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;" >/dev/null
 }
 
 function clear_kafka() {
@@ -89,10 +91,6 @@ echo "Scaling down: all"
 bash $DIR/down.sh all unsafe
 
 # todo make key dynamic based on user
-echo "Aerospike cleaning"
-echo "Warning: If aerospike is too large, it might be faster to delete and restart the instances. Talk to the devops team."
-echo "Do not truncate a namespace that's too large, it will take hours"
-
 clean "eu-west-1" "m1" &
 bg_pids+=($!)
 clean "us-east-1" "m2" &
@@ -120,7 +118,6 @@ bg_pids+=($!)
 truncate "us-west-2" "m6" &
 bg_pids+=($!)
 
-
 # Kafka
 clear_kafka "m1" &
 bg_pids+=($!)
@@ -139,7 +136,6 @@ bg_pids+=($!)
 for pid in "${bg_pids[@]}"; do
   wait "$pid" || echo "Process $pid exited with status $?"
 done
-
 
 echo "Scaling back up: all"
 # scale back up everything
