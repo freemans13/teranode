@@ -85,7 +85,7 @@ spec:
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
-            claimName: subtree-pvc-t2
+            claimName: subtree-pvc
         # - name: blockpersister-lustre
         #   persistentVolumeClaim:
         #     claimName: blockpersister-lustre-pvc-t2

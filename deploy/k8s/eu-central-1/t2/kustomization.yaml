@@ -187,10 +187,21 @@ patches:
     target:
       kind: IngressRoute
       labelSelector: service=asset
+    # add image pull policy to always
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+    target:
+      kind: Deployment
+# edit p2p ingress to asset server
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
-        value: p2p-service-t2
+        value: asset-service-t1
+      - op: replace
+        path: /spec/routes/0/services/0/port
+        value: 8090
       - op: replace
         path: /spec/routes/0/match
         value: Host(`t2.testing.ubsv.dev`)
