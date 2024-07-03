@@ -415,14 +415,11 @@
     "mode": "auto",
     "program": "${workspaceFolder}/cmd/txblockidcheck/main.go",
     "args": [
-      "-utxostore=postgres://miner2:miner2@localhost:15432/ubsv2",
-      "-blockchainstore=postgres://miner2:miner2@localhost:15432/ubsv2",
-      "-subtreestore=file:///data/ubsv2/subtreestore",
-      "-txhash=5f9f8103bc643c14b88a52757108510dc71a3cdc4b469da26e64d9c0fe717f46",
+      "-utxostore=${input:utxoStore}",
+      "-blockchainstore=${input:blockchainStore}",
+      "-subtreestore=${input:subtreeStore}",
+      "-txhash=${input:txHash}"
     ],
-    "env": {
-      "SETTINGS_CONTEXT": "docker.host.ubsv1"
-    },
   },
   {
       "name": "binserve",
@@ -463,5 +460,44 @@
         "SETTINGS_CONTEXT": "docker.host.ubsv2",
       },
     }
-  ]
+  ],
+  "inputs": [
+    {
+      "id": "utxoStore",
+      "type": "promptString",
+      "description": "Enter the UTXO store URL",
+      "default": "postgres://miner2:miner2@localhost:15432/ubsv2"
+    },
+    {
+      "id": "blockchainStore",
+      "type": "promptString",
+      "description": "Enter the blockchain store URL",
+      "default": "postgres://miner2:miner2@localhost:15432/ubsv2"
+    },
+    {
+      "id": "subtreeStore",
+      "type": "promptString",
+      "description": "Enter the subtree store URL",
+      "default": "file:///data/ubsv2/subtreestore"
+    },
+    {
+      "id": "txHash",
+      "type": "promptString",
+      "description": "Enter the transaction hash"
+    }
+  ],
+  "commands": {
+    "txblockidcheck.getLastUtxoStore": {
+      "command": "cat .last_utxoStore"
+    },
+    "txblockidcheck.getLastBlockchainStore": {
+      "command": "cat .last_blockchainStore"
+    },
+    "txblockidcheck.getLastSubtreeStore": {
+      "command": "cat .last_subtreeStore"
+    },
+    "txblockidcheck.getLastTxHash": {
+      "command": "cat .last_txHash"
+    }
+  }
 }
