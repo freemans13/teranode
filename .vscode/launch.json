@@ -466,7 +466,8 @@
       "id": "utxoStore",
       "type": "promptString",
       "description": "Enter the UTXO store URL",
-      "default": "postgres://miner2:miner2@localhost:15432/ubsv2"
+      // "default": "postgres://miner2:miner2@localhost:15432/ubsv2"
+      "default": "aerospike://localhost:3200/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8"
     },
     {
       "id": "blockchainStore",
@@ -483,7 +484,8 @@
     {
       "id": "txHash",
       "type": "promptString",
-      "description": "Enter the transaction hash"
+      "description": "Enter the transaction hash",
+      "default": "bf8f820d97a657d218b6b86fe8390f59b6505cc881f9c733ead9734461599216"
     }
   ],
   "commands": {
