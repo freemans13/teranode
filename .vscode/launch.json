@@ -35,6 +35,28 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
+        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug",
+        // "blockassembly_disabled": "true",
+        "legacy_verifyOnly": "false",
+      },
+      "args": [
+        "-miner=0"
+        // "-legacy=0"
+        // "-faucet=1",
+        // "-blockchain=1",
+        // "-asset=1",
+        // "-coinbase=1",
+        // "-all=1"
+      ]
+    },
+    {
+      "name": "UBSV - docker.ci.ubsv3",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      // "buildFlags": "-tags=aerospike",
+      "env": {
         "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug"
       },
       "args": [
@@ -102,13 +124,14 @@
       "args": [
         // "-all=0",
         // "-blockchain=1",
-        // "-legacy=1",
+        "-legacy=0",
         // "-blockvalidation=1",
         // "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
         // "-coinbase=1",
+          "-blockpersister=0"
         // "-all=1"
       ]
     },{
@@ -124,13 +147,14 @@
       "args": [
         // "-all=0",
         // "-blockchain=1",
-        // "-legacy=1",
+        "-legacy=0",
         // "-blockvalidation=1",
         // "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
         // "-coinbase=1",
+        "-blockpersister=0"
         // "-all=1"
       ]
     },{
@@ -146,32 +170,17 @@
       "args": [
         // "-all=0",
         // "-blockchain=1",
-        // "-legacy=1",
+        "-legacy=0",
         // "-blockvalidation=1",
         // "-subtreevalidation=1"
         // "-faucet=1",
         // "-blockchain=1",
         // "-asset=1",
         // "-coinbase=1",
+        "-blockpersister=0"
         // "-all=1"
       ]
     },{
-      "name": "Rpc",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/.",
-      // "buildFlags": "-tags=aerospike",
-      "env": {
-        "blockassembly_disabled": "true",
-      },
-      "args": [
-        "-all=0",
-        "-rpc=1",
-        "-blockchain=1",
-      ]
-    },
-    {
       "name": "Rpc",
       "type": "go",
       "request": "launch",
@@ -198,7 +207,6 @@
         "SETTINGS_CONTEXT": "dev",
         "asset_httpAddress": "http://localhost:8090",
         // "utxostore": "aerospike://localhost:3000/test?timeout=30s",
-        // "txmeta_store": "aerospike://localhost:3000/test?timeout=30s"
       },
       "args": [
         "-blockchain=0",
@@ -387,6 +395,33 @@
       }
     },
     {
+      "name": "s3inventoryintegrity",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/s3inventoryintegrity/main.go",
+      "args": [
+        "-d=postgres://poc2:poc2@localhost:5432/poc2",
+        "-f=/Users/freemans/Downloads/0c7171e2-6742-493a-9ede-95a57b19c81c.csv",
+      ],
+      "env": {
+        "SETTINGS_CONTEXT": "docker.host.ubsv1"
+      },
+  },
+  {
+    "name": "txblockidcheck",
+    "type": "go",
+    "request": "launch",
+    "mode": "auto",
+    "program": "${workspaceFolder}/cmd/txblockidcheck/main.go",
+    "args": [
+      "-utxostore=${input:utxoStore}",
+      "-blockchainstore=${input:blockchainStore}",
+      "-subtreestore=${input:subtreeStore}",
+      "-txhash=${input:txHash}"
+    ],
+  },
+  {
       "name": "binserve",
       "type": "go",
       "request": "launch",
@@ -400,6 +435,71 @@
       "mode": "remote",
       "port": 4040,
       "host": "127.0.0.1"
+    },
+    {
+      "name": "blockpersister intergrity",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/blockpersisterintegrity/main.go",
+      "env": {
+        "SETTINGS_CONTEXT": "docker.host.ubsv1",
+      },
+       "args": [
+        "-d=postgres://poc2:poc2@localhost:5432/poc2",
+        "-s3=s3://s3.eu-west-1.amazonaws.com/ubsv-m1-block-store?region=eu-west-1",
+      ]
+    },
+    {
+      "name": "chainintergrity",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/chainintegrity/main.go",
+      "env": {
+        "SETTINGS_CONTEXT": "docker.host.ubsv2",
+      },
     }
-  ]
+  ],
+  "inputs": [
+    {
+      "id": "utxoStore",
+      "type": "promptString",
+      "description": "Enter the UTXO store URL",
+      // "default": "postgres://miner2:miner2@localhost:15432/ubsv2"
+      "default": "aerospike://localhost:3200/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8"
+    },
+    {
+      "id": "blockchainStore",
+      "type": "promptString",
+      "description": "Enter the blockchain store URL",
+      "default": "postgres://miner2:miner2@localhost:15432/ubsv2"
+    },
+    {
+      "id": "subtreeStore",
+      "type": "promptString",
+      "description": "Enter the subtree store URL",
+      "default": "file:///data/ubsv2/subtreestore"
+    },
+    {
+      "id": "txHash",
+      "type": "promptString",
+      "description": "Enter the transaction hash",
+      "default": "bf8f820d97a657d218b6b86fe8390f59b6505cc881f9c733ead9734461599216"
+    }
+  ],
+  "commands": {
+    "txblockidcheck.getLastUtxoStore": {
+      "command": "cat .last_utxoStore"
+    },
+    "txblockidcheck.getLastBlockchainStore": {
+      "command": "cat .last_blockchainStore"
+    },
+    "txblockidcheck.getLastSubtreeStore": {
+      "command": "cat .last_subtreeStore"
+    },
+    "txblockidcheck.getLastTxHash": {
+      "command": "cat .last_txHash"
+    }
+  }
 }
