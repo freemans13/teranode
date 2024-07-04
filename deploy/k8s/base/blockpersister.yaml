@@ -77,11 +77,11 @@ spec:
             timeoutSeconds: 3
           volumeMounts:
             - name: lustre-storage
-              mountPath: /data/t1/subtreestore
-              subPath: subtreestore_dir
+              mountPath: /data/t1/
+              subPath: subtreestore
             - name: lustre-storage
-              mountPath: /data/t1/blockstore
-              subPath: blockstore_dir
+              mountPath: /data/t1/
+              subPath: blockstore
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
