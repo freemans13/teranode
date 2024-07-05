@@ -13,6 +13,8 @@ configMapGenerator:
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=testing.t1
+      - JAEGER_AGENT_HOST=jaeger-agent.jaeger.svc.cluster.local
+      - JAEGER_AGENT_PORT=6831
     name: shared-config
   - behavior: merge
     literals:
@@ -341,4 +343,3 @@ patches:
     target:
       kind: Deployment
       labelSelector: app=subtreevalidation
-
