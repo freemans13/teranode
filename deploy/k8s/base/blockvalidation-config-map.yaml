@@ -4,5 +4,6 @@ kind: ConfigMap
 metadata:
   name: blockvalidation-config
 data:
+  JAEGER_SERVICE_NAME: blockvalidation-service
 #  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
 #  JAEGER_AGENT_PORT: "6831"

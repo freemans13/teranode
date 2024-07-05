@@ -3,5 +3,6 @@ kind: ConfigMap
 metadata:
   name: coinbase-config
 data:
+  JAEGER_SERVICE_NAME: coinbase-service
 #  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
 #  JAEGER_AGENT_PORT: "6831"
