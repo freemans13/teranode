@@ -33,7 +33,7 @@
 #          effect: NoSchedule
 #      containers:
 #        - name: txmetastore
-#          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
+#          image: REPO:IMAGE:TAG
 #          args: [ "-txmetastore=1" ]
 #          # command: "You can override the entrypoint with a command."
 #          #          command: ["./dlv", "--listen=:4040", "--continue", "--accept-multiclient", "--headless=true", "--api-version=2", "exec", "./ubsv.run", "--"]

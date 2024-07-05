@@ -38,7 +38,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: faucet
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
+          image: REPO:IMAGE:TAG
           args: [ "-faucet=1" ]
           envFrom:
             - configMapRef:

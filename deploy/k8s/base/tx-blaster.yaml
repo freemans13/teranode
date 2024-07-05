@@ -40,7 +40,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: tx-blaster
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-arm64
+          image: REPO:IMAGE:TAG
           command:
             - ./blaster.run
           args: [ "-workers=10000" ]

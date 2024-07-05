@@ -39,7 +39,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: blockvalidation
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:latest-amd64
+          image: REPO:IMAGE:TAG
           args: [ "-blockvalidation=1" ]
           envFrom:
             - configMapRef:
