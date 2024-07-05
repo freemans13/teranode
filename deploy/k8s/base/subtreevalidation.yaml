@@ -64,7 +64,7 @@ spec:
               memory: 370Gi
           volumeMounts:
             - name: lustre-storage
-              mountPath: /data/subtreestore
+              mountPath: /data/
             - name: scaling-tls
               mountPath: /app/certs
               readOnly: true

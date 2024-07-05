@@ -77,15 +77,8 @@ spec:
             timeoutSeconds: 3
           volumeMounts:
             - name: lustre-storage
-              mountPath: /data/t1/
-              subPath: subtreestore
-            - name: lustre-storage
-              mountPath: /data/t1/
-              subPath: blockstore
+              mountPath: /data/
       volumes:
         - name: lustre-storage
           persistentVolumeClaim:
             claimName: subtree-pvc
-        # - name: blockpersister-lustre
-        #   persistentVolumeClaim:
-        #     claimName: blockpersister-lustre-pvc-t2

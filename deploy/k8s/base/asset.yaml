@@ -82,7 +82,7 @@ spec:
             timeoutSeconds: 3
           volumeMounts:
             - name: lustre-storage
-              mountPath: /data/subtreestore
+              mountPath: /data/
             - name: scaling-tls
               mountPath: /app/certs
               readOnly: true
