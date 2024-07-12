@@ -1,4 +1,5 @@
 #!/bin/bash
+set -ex
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
@@ -20,7 +21,7 @@ if ! command -v aws &>/dev/null; then
 fi
 
 # Array to hold PIDs of background processes
-declare -g -a bg_pids
+bg_pids=()
 
 # Function to handle SIGINT
 function kill_background_processes() {
@@ -70,7 +71,7 @@ function truncate() {
   local namespace=$2
   # get the last part of the namespace
   local ns_suffix=$(echo $namespace | tail -c+2)
-  backup $region $namespace
+#  backup $region $namespace
 
   echo "Postgres cleaning: $region $namespace"
   kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state ; drop table if exists blocks;" >/dev/null
