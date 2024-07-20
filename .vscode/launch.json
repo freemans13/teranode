@@ -14,11 +14,13 @@
       "env": {
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
+        "startAsset": "true",
         // "blockassembly_disabled": "true",
         "legacy_verifyOnly": "false",
       },
       "args": [
-        "-miner=0"
+        "-miner=0",
+        "-asset=1"
         // "-legacy=0"
         // "-faucet=1",
         // "-blockchain=1",
