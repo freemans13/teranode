@@ -1,0 +1,14 @@
+# dynamic provisioning for Lustre FSx for Lustre.
+# take a look at pvs.yaml for understanding better why this is done this way. All others are statically provisioned
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: t1
+  name: subtree-pvc-t1
+spec:
+  storageClassName: fsx-sc
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1200Gi

@@ -1,0 +1,278 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../base/
+
+namespace: t3
+
+nameSuffix: "-t3"
+
+
+configMapGenerator:
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3
+      - JAEGER_AGENT_HOST=jaeger-agent.jaeger.svc.cluster.local
+      - JAEGER_AGENT_PORT=6831
+    name: shared-config
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3.asset
+    name: asset-config
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3.blockassembly
+    name: blockassembly-config
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3.blockvalidation
+    name: blockvalidation-config
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3.subtreevalidation
+    name: subtreevalidation-config
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3.blockchain
+    name: blockchain-config
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3.coinbase
+    name: coinbase-config
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3.propagation
+    name: propagation-config
+  - behavior: merge
+    literals:
+      - SETTINGS_CONTEXT=testing.t3.blockpersister
+    name: blockpersister-config
+patches:
+  - patch: |-
+      - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1subtreevalidation.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://subtreevalidation-service-t3.t3.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["subtreevalidation_validate_subtree"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=subtreevalidation
+  - patch: |-
+      - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1blockvalidation.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://blockvalidation-service-t3.t3.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["blockvalidation_block_found_ch","blockvalidation_validate_block_duration_seconds_bucket"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=blockvalidation
+  - patch: |-
+      - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1blockassembly.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://blockassembly-service-t3.t3.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["blockassembly_subtrees","blockassembly_transactions","blockassembly_add_tx_duration_seconds_bucket","blockassembly_best_block_height","blockassembly_current_block_height","blockassembly_add_tx_duration_seconds_count"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=blockassembly
+  - patch: |-
+      - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1propagation.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://propagation-service-t3.t3.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          "metrics": ["propagation_processed_transactions","validator_transactions_validate_micros_bucket","validator_transactions_store_utxos_micros_bucket","validator_transactions_spend_utxos_micros_bucket"]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=propagation
+  - patch: |-
+      - op: replace
+        path: "/spec/template/metadata/annotations/ad.datadoghq.com~1tx-blaster.checks"
+        value: |
+          {
+              "openmetrics": {
+                  "init_config": {},
+                  "instances": [
+                      {
+                          "openmetrics_endpoint": "http://tx-blaster-service-t3.t3.svc.cluster.local:9091/metrics",
+                          "namespace": "prom",
+                          - "metrics": ["tx_blaster_processed_transactions",]
+                      }
+                  ]
+              }
+          }
+    target:
+      kind: Deployment
+      labelSelector: app=tx-blaster
+
+  - patch: |-
+      - op: replace
+        path: /spec/dnsNames
+        value:
+         - t3.testing.ubsv.dev
+    target:
+      kind: Certificate
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: propagation-service-t3
+    target:
+      labelSelector: service=propagation
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: p2p-service-t3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=p2p
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: coinbase-service-t3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=coinbase
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service-t3
+    target:
+      kind: IngressRouteTCP
+      labelSelector: service=asset
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service-t3
+      - op: replace
+        path: /spec/routes/0/match
+        value: Host(`t3.testing.ubsv.dev`)
+    target:
+      kind: IngressRoute
+      labelSelector: service=asset
+# edit p2p ingress to asset server
+  - patch: |-
+      - op: replace
+        path: /spec/routes/0/services/0/name
+        value: asset-service-t1
+      - op: replace
+        path: /spec/routes/0/services/0/port
+        value: 8090
+      - op: replace
+        path: /spec/routes/0/match
+        value: Host(`t3.testing.ubsv.dev`)
+    target:
+      kind: IngressRoute
+      labelSelector: service=p2p
+  - patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: t3
+      - op: replace
+        path: /subjects/0/name
+        value: sa-t3
+    target:
+      kind: ClusterRoleBinding
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: sa-t3
+    target:
+      kind: Deployment
+  - target:
+      version: v1
+      kind: ServiceAccount
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/eks.amazonaws.com~1role-arn
+        value: arn:aws:iam::434394763103:role/eks-s3-access-role-euc
+
+  # remove resource from all deployments
+  # todo fix this when we find the correct sizing
+  - patch: |-
+      - op: remove
+        path: /spec/template/spec/containers/0/resources
+    target:
+      kind: Deployment
+  # add image pull policy to always
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+    target:
+      kind: Deployment
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t3
+    target:
+      kind: Deployment
+      labelSelector: app=blockpersister
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t3
+    target:
+      kind: Deployment
+      labelSelector: app=asset
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t3
+    target:
+      kind: Deployment
+      labelSelector: app=blockassembly
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t3
+    target:
+      kind: Deployment
+      labelSelector: app=blockvalidation
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: subtree-pvc-t3
+    target:
+      kind: Deployment
+      labelSelector: app=subtreevalidation
+

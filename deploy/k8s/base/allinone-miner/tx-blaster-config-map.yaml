@@ -1,9 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: tx-blaster-config
-data:
-  SETTINGS_CONTEXT: "allinone.miner" # replaced in kustomize to dynamically get the value
-  JAEGER_AGENT_HOST: jaeger-cluster-agent.jaeger.svc.cluster.local
-  JAEGER_AGENT_PORT: "6831"
-  coinbase_grpcAddress: "" # replaced in kustomize to dynamically get the value

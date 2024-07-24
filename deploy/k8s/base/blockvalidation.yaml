@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockvalidation
+
+  labels:
+    app: blockvalidation
+    project: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blockvalidation
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/blockvalidation.checks: ""
+      labels:
+        app: blockvalidation
+    spec:
+      serviceAccountName: sa-t
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: blockvalidation
+                topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        role: blockvalidation
+      tolerations:
+        - key: role
+          value: blockvalidation
+          operator: Equal
+          effect: NoSchedule
+      containers:
+        - name: blockvalidation
+          image: REPO:IMAGE:TAG
+          args: [ "-blockvalidation=1" ]
+          envFrom:
+            - configMapRef:
+                name: shared-config
+            - configMapRef:
+                name: blockvalidation-config
+          env:
+            - name: SERVICE_NAME
+              value: blockvalidation-service
+          ports:
+            - containerPort: 8088
+              protocol: TCP
+            - containerPort: 8288
+              protocol: TCP
+            - containerPort: 9091
+              protocol: TCP
+            - containerPort: 4040
+              protocol: TCP
+          resources:
+            requests:
+              memory: 1000Gi
+              cpu: "100"
+            limits:
+              memory: 1500Gi
+          volumeMounts:
+            - name: lustre-storage
+              mountPath: /data/
+            - name: scaling-tls
+              mountPath: /app/certs
+              readOnly: true
+          # readinessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: 9091
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 10
+          # livenessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: 9091
+          #   initialDelaySeconds: 1
+          #   periodSeconds: 10
+          #   failureThreshold: 5
+          #   timeoutSeconds: 10
+      volumes:
+        - name: lustre-storage
+          persistentVolumeClaim:
+            claimName: subtree-pvc
+        - name: scaling-tls
+          secret:
+            secretName: scaling-tls
+            items:
+              - key: tls.crt
+                path: ubsv.crt
+              - key: tls.key
+                path: ubsv.key

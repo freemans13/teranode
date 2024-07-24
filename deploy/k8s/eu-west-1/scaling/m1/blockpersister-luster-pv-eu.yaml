@@ -4,7 +4,7 @@ metadata:
   name: blockpersister-lustre-pv
 spec:
   capacity:
-    storage: 2400Gi
+    storage: 1200Gi
   volumeMode: Filesystem
   accessModes:
     - ReadWriteMany

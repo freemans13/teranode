@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: subtree-pvc-t2
+spec:
+  storageClassName: fsx-sc
+  accessModes:
+    - ReadWriteMany
+  volumeName: subtree-lustre-pv-t2
+  resources:
+    requests:
+      storage: 1200Gi
