@@ -97,15 +97,15 @@ func Start() {
 	var ok bool
 	p2pIP, ok := gocore.Config().Get("p2p_ip")
 	if !ok {
-		panic(errors.New(errors.ERR_CONFIGURATION, "error getting p2p_ip"))
+		panic(errors.NewConfigurationError("error getting p2p_ip"))
 	}
 	p2pPort, ok := gocore.Config().GetInt("p2p_port")
 	if !ok {
-		panic(errors.New(errors.ERR_CONFIGURATION, "error getting p2p_port"))
+		panic(errors.NewConfigurationError("error getting p2p_port"))
 	}
 	sharedKey, ok = gocore.Config().Get("p2p_shared_key")
 	if !ok {
-		panic(errors.New(errors.ERR_CONFIGURATION, "error getting p2p_shared_key"))
+		panic(errors.NewConfigurationError("error getting p2p_shared_key"))
 	}
 	usePrivateDHT := gocore.Config().GetBool("p2p_dht_use_private", false)
 	optimiseRetries := gocore.Config().GetBool("p2p_optimise_retries", false)
@@ -125,7 +125,7 @@ func Start() {
 
 				parsedURL, err := url.ParseRequestURI(asset_httpAddress)
 				if err != nil {
-					panic(errors.New(errors.ERR_CONFIGURATION, "Invalid URL", err))
+					panic(errors.NewConfigurationError("Invalid URL", err))
 				}
 
 				fullURL := parsedURL.ResolveReference(&url.URL{Path: "/lastblocks?n=1"})
