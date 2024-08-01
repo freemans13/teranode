@@ -13,6 +13,8 @@ configMapGenerator:
   - behavior: merge
     literals:
       - SETTINGS_CONTEXT=testing.t1
+      - JAEGER_AGENT_HOST=jaeger-agent.jaeger.svc.cluster.local
+      - JAEGER_AGENT_PORT=6831
     name: shared-config
   - behavior: merge
     literals:
@@ -187,7 +189,14 @@ patches:
     target:
       kind: IngressRoute
       labelSelector: service=asset
-  # edit p2p ingress to asset server
+# add image pull policy to always
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+    target:
+      kind: Deployment
+# edit p2p ingress to asset server
   - patch: |-
       - op: replace
         path: /spec/routes/0/services/0/name
@@ -225,12 +234,13 @@ patches:
         value: arn:aws:iam::434394763103:role/eks-s3-access-role-euc
 
   # remove resource from all deployments
-  # todo fix this when we find the correct sizing
-  - patch: |-
-      - op: remove
-        path: /spec/template/spec/containers/0/resources
-    target:
-      kind: Deployment
+  # disabled for resource limit configuration below
+  # - patch: |-
+  #     - op: remove
+  #       path: /spec/template/spec/containers/0/resources
+  #   target:
+  #     kind: Deployment
+
   # set all replicas to 1
   # todo fix this when we find the correct sizing
   - patch: |-
@@ -239,13 +249,7 @@ patches:
         value: 1
     target:
       kind: Deployment
-    # add image pull policy to always
-  - patch: |-
-      - op: replace
-        path: /spec/template/spec/containers/0/imagePullPolicy
-        value: Always
-    target:
-      kind: Deployment
+
   - patch: |-
       - op: replace
         path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
@@ -282,3 +286,160 @@ patches:
       kind: Deployment
       labelSelector: app=subtreevalidation
 
+  # Set resource limits
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 6Gi
+            cpu: 4
+          limits:
+            memory: 8700Mi
+    target:
+      kind: Deployment
+      labelSelector: app=asset
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 12Gi
+            cpu: 2
+          limits:
+            memory: 17Gi
+    target:
+      kind: Deployment
+      labelSelector: app=blockassembly
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 12Gi
+            cpu: 2
+          limits:
+            memory: 17Gi
+    target:
+      kind: Deployment
+      labelSelector: app=blockvalidation
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 3600Mi
+            cpu: 2
+          limits:
+              memory: 4200Mi
+    target:
+      kind: Deployment
+      labelSelector: app=blockpersister
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 1500Mi
+            cpu: 1
+          limits:
+            memory: 2130Mi
+    target:
+      kind: Deployment
+      labelSelector: app=propagation
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 12Gi
+            cpu: 2
+          limits:
+            memory: 17Gi
+    target:
+      kind: Deployment
+      labelSelector: app=subtreevalidation
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 1300Mi
+            cpu: 1
+          limits:
+            memory: 1600Mi
+    target:
+      kind: Deployment
+      labelSelector: app=blockchain
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 1300Mi
+            cpu: 1
+          limits:
+            memory: 1600Mi
+    target:
+      kind: Deployment
+      labelSelector: app=faucet
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 1300Mi
+            cpu: 1
+          limits:
+            memory: 1600Mi
+    target:
+      kind: Deployment
+      labelSelector: app=p2p
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 1300Mi
+            cpu: 1
+          limits:
+            memory: 1600Mi
+    target:
+      kind: Deployment
+      labelSelector: app=miner
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 1300Mi
+            cpu: 1
+          limits:
+            memory: 1600Mi
+    target:
+      kind: Deployment
+      labelSelector: app=coinbase
+
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            memory: 3500Mi
+            cpu: 2
+          limits:
+            memory: 4200Mi
+    target:
+      kind: Deployment
+      labelSelector: app=tx-blaster
