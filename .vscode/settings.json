@@ -180,6 +180,7 @@
     "upgrader",
     "usql",
     "utxo",
+    "utxopersister",
     "utxos",
     "utxoservice",
     "utxostore",
