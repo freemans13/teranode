@@ -24,6 +24,7 @@ import (
 	_ "github.com/bitcoin-sv/ubsv/k8sresolver"
 	"github.com/bitcoin-sv/ubsv/services/coinbase"
 	"github.com/bitcoin-sv/ubsv/services/legacy/wire"
+	"github.com/bitcoin-sv/ubsv/tracing"
 	"github.com/bitcoin-sv/ubsv/ulogger"
 	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
@@ -198,7 +199,7 @@ func Start() {
 			samplingRate = 0.01
 		}
 
-		_, closer, err := util.InitGlobalTracer(serviceName, samplingRate)
+		_, closer, err := tracing.InitGlobalTracer(serviceName, samplingRate)
 		if err != nil {
 			panic(err)
 		}
