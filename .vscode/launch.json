@@ -56,7 +56,7 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug",
+        "SETTINGS_CONTEXT": "docker.ci.ubsv1.debug",
         // "blockassembly_disabled": "true",
         "legacy_verifyOnly": "false",
       },
@@ -71,14 +71,14 @@
       ]
     },
     {
-      "name": "UBSV - docker.ci.ubsv3",
+      "name": "UBSV - docker.ci.ubsv2",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug"
+        "SETTINGS_CONTEXT": "docker.ci.ubsv2.debug"
       },
       "args": [
         "-legacy=0"
