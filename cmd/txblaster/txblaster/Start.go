@@ -199,7 +199,7 @@ func Start() {
 			samplingRate = 0.01
 		}
 
-		_, closer, err := tracing.InitGlobalTracer(serviceName, samplingRate)
+		closer, err := tracing.InitOpenTracer(serviceName, samplingRate)
 		if err != nil {
 			panic(err)
 		}
