@@ -92,6 +92,7 @@
     "modernc",
     "multiclient",
     "nolint",
+    "nosec",
     "nullstore",
     "oneofs",
     "opentracing",
