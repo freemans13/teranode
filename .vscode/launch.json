@@ -15,6 +15,7 @@
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
         "startAsset": "true",
+        "profilerAddr": ":6060",
         // "blockassembly_disabled": "true",
         "legacy_verifyOnly": "false",
       },
