@@ -17,7 +17,6 @@
         "startAsset": "true",
         "profilerAddr": ":6060",
         // "blockassembly_disabled": "true",
-        "legacy_verifyOnly": "false",
       },
       "args": [
         "-miner=0",
@@ -60,7 +59,6 @@
       "env": {
         "SETTINGS_CONTEXT": "docker.ci.ubsv1.debug",
         // "blockassembly_disabled": "true",
-        "legacy_verifyOnly": "false",
       },
       "args": [
         "-miner=0"
@@ -119,7 +117,6 @@
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
         "blockassembly_disabled": "true",
-        "legacy_verifyOnly": "false",
         "profilerAddr": ":6060",
       },
       "args": [
