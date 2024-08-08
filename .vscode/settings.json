@@ -51,6 +51,7 @@
     "failfast",
     "fastcache",
     "faucet",
+    "filestorer",
     "foldermanager",
     "foundationdb",
     "frpc",

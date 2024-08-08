@@ -42,6 +42,7 @@
         "asset_httpAddress": "http://localhost:8090",
         "profilerAddr": ":9092",
         "kafka_blocksFinalConfig": "",
+        "profilerAddr": ":6060"
       },
       "args": [
         "-all=0",
