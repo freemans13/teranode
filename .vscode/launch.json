@@ -50,6 +50,16 @@
       ]
     },
     {
+      "name": "UTXOPersisterDirect",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/utxopersister/main.go",
+      "cwd": "${workspaceFolder}/.",
+      "env": {},
+      "args": []
+    },
+    {
       "name": "UBSV - docker.ci.ubsv3",
       "type": "go",
       "request": "launch",
