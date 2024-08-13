@@ -331,7 +331,10 @@ func Start() {
 			StaticPeers:     staticPeers,
 		}
 
-		p2pNode := p2p.NewP2PNode(logger, config)
+		p2pNode, err := p2p.NewP2PNode(logger, config)
+		if err != nil {
+			panic(err)
+		}
 
 		if err := p2pNode.Start(ctx, rejectedTxTopicName); err != nil {
 			panic(err)
