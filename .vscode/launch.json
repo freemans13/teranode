@@ -15,8 +15,8 @@
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
         "startAsset": "true",
+        "profilerAddr": ":6060",
         // "blockassembly_disabled": "true",
-        "legacy_verifyOnly": "false",
       },
       "args": [
         "-miner=0",
@@ -32,6 +32,24 @@
       ]
     },
     {
+      "name": "UTXOPersister",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      "env": {
+        "asset_httpAddress": "http://localhost:8090",
+        "profilerAddr": ":9092",
+        "kafka_blocksFinalConfig": "",
+        "profilerAddr": ":6060"
+      },
+      "args": [
+        "-all=0",
+        "-blockchain=1",
+        "-utxopersister=1",
+      ]
+    },
+    {
       "name": "UBSV - docker.ci.ubsv3",
       "type": "go",
       "request": "launch",
@@ -39,9 +57,8 @@
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug",
+        "SETTINGS_CONTEXT": "docker.ci.ubsv1.debug",
         // "blockassembly_disabled": "true",
-        "legacy_verifyOnly": "false",
       },
       "args": [
         "-miner=0"
@@ -54,14 +71,14 @@
       ]
     },
     {
-      "name": "UBSV - docker.ci.ubsv3",
+      "name": "UBSV - docker.ci.ubsv2",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug"
+        "SETTINGS_CONTEXT": "docker.ci.ubsv2.debug"
       },
       "args": [
         "-legacy=0"
@@ -100,7 +117,6 @@
         "asset_httpAddress": "http://localhost:8090",
         "startLegacy": "true",
         "blockassembly_disabled": "true",
-        "legacy_verifyOnly": "false",
         "profilerAddr": ":6060",
       },
       "args": [
