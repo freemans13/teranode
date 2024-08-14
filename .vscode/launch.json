@@ -39,7 +39,6 @@
       "program": "${workspaceFolder}/.",
       "env": {
         "asset_httpAddress": "http://localhost:8090",
-        "profilerAddr": ":9092",
         "kafka_blocksFinalConfig": "",
         "profilerAddr": ":6060"
       },
@@ -489,6 +488,17 @@
       "env": {
         "SETTINGS_CONTEXT": "docker.host.ubsv2",
       },
+    },
+    {
+      "name": "aerospike_reader",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/aerospike_reader/main.go",
+      "env": {
+        "utxostore": "aerospike://10.90.0.96:3000/utxo-store?set=utxo&WarmUp=1&externalStore=s3:///teranode-gateway-test-eu-central-1?region=eu-central-1&subDirectory=sv-node/external",
+      },
+      "args": [ "1bd4f08ffbeefbb67d82a340dd35259a97c5626368f8a6efa056571b293fae52" ]
     }
   ],
   "inputs": [
