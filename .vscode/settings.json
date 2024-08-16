@@ -215,5 +215,6 @@
   "sonarlint.connectedMode.project": {
     "connectionId": "UbsvSonarQube",
     "projectKey": "ubsv"
-  }
+  },
+  "makefile.configureOnOpen": false
 }
