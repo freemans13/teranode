@@ -417,11 +417,11 @@
       "program": "${workspaceFolder}/cmd/filereader/main.go",
       // "args": ["../../data/blockpersister/00d07e632c0db3fc18f43c47238db5162d4e8589c4fbc25dc2d84b4ca5a6d63a_0.utxodiff"]
       "args": [
-        "003981438894b73b4ec829a9c4a895c064a1aad82e03966b3a88172060f25546.block"
+        "../../data/blockstore/00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048.utxo-deletions"
       ],
-      "env": {
-        "blockstore": "s3:///eu-ubsv-block-store?region=eu-west-1",
-      }
+      // "env": {
+        // "blockstore": "s3:///eu-ubsv-block-store?region=eu-west-1",
+      // }
     },
     {
       "name": "s3inventoryintegrity",
