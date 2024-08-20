@@ -142,7 +142,6 @@ spec:
         requests:
           storage: 5Gi
       storageClass: "fsx-sc"
-      storageVolume: "shared-storage-2"
   validator:
     enabled: false
     spec: {}
