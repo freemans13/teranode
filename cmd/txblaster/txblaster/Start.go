@@ -29,13 +29,12 @@ import (
 	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
 	"github.com/bitcoin-sv/ubsv/util/p2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sercand/kuberesolver/v5"
 	"google.golang.org/grpc/resolver"
-
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
 const progname = "tx-blaster"
