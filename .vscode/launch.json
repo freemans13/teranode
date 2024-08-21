@@ -435,7 +435,8 @@
       },
       "args": [
         "-in",
-        "../../data/blockstore/00000000a23332a5740d8676baabcbffe490fd8849b6d30f7399b83aedd733f6.utxo-set"
+        "/Users/ordishs/t.utxo-set"
+        // "../../data/blockstore/00000000a23332a5740d8676baabcbffe490fd8849b6d30f7399b83aedd733f6.utxo-set"
       ],
       // "env": {
         // "blockstore": "s3:///eu-ubsv-block-store?region=eu-west-1",

@@ -178,6 +178,7 @@
     "uchar",
     "ulogger",
     "unlocker",
+    "Unpad",
     "unspend",
     "upgrader",
     "usql",
