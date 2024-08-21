@@ -1,6 +1,7 @@
 apiVersion: teranode.bsvblockchain.org/v1alpha1
 kind: Cluster
 metadata:
+  namespace: t1
   labels:
     app.kubernetes.io/name: cluster
     app.kubernetes.io/instance: cluster-sample
