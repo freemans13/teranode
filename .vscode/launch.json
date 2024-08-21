@@ -424,6 +424,24 @@
       // }
     },
     {
+      "name": "seeder",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "buildFlags": "-tags=aerospike",
+      "program": "${workspaceFolder}/cmd/seeder/main.go",
+      "env": {
+        "utxostore": "aerospike://localhost:3000/test?set=utxo&externalStore=file:///external",
+      },
+      "args": [
+        "-in",
+        "../../data/blockstore/00000000a23332a5740d8676baabcbffe490fd8849b6d30f7399b83aedd733f6.utxo-set"
+      ],
+      // "env": {
+        // "blockstore": "s3:///eu-ubsv-block-store?region=eu-west-1",
+      // }
+    },
+    {
       "name": "s3inventoryintegrity",
       "type": "go",
       "request": "launch",
