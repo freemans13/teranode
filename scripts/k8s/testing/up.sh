@@ -36,7 +36,7 @@ if [ "$1" == "all" ]; then
 else
   if [[ "$1" == "t1" ]]; then
     scale_up "eu-central-1" "1"
-  elif [[ "$1" == "t" ]]; then
+  elif [[ "$1" == "t2" ]]; then
     scale_up "eu-central-1" "2"
   elif [[ "$1" == "t3" ]]; then
     scale_up "eu-central-1" "3"
