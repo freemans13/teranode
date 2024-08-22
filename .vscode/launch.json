@@ -432,7 +432,8 @@
       "program": "${workspaceFolder}/cmd/seeder/main.go",
       "env": {
         // "utxostore": "aerospike://localhost:3000/test?set=utxo&externalStore=file:///external",
-        "utxostore": "postgres://ubsv:ubsv@localhost:5432/ubsv?expiration=300"
+        "utxostore": "postgres://ubsv:ubsv@localhost:5432/ubsv?expiration=300",
+        "workerCount": "1",
       },
       "args": [
         "-in",
