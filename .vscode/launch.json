@@ -445,6 +445,14 @@
       // }
     },
     {
+      "name": "headers",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "buildFlags": "-tags=aerospike",
+      "program": "${workspaceFolder}/cmd/headers/main.go",
+    },
+    {
       "name": "s3inventoryintegrity",
       "type": "go",
       "request": "launch",
