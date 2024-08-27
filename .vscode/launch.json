@@ -453,6 +453,20 @@
       "program": "${workspaceFolder}/cmd/headers/main.go",
     },
     {
+      "name": "bitcoin2utxoset",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "buildFlags": "-tags=aerospike",
+      "program": "${workspaceFolder}/cmd/bitcoin2utxoset/main.go",
+      "args": [
+        "-bitcoinDir",
+        "/Users/ordishs/BTC.copy",
+        "-outputDir",
+        "/Users/ordishs/BTC"
+      ]
+    },
+    {
       "name": "s3inventoryintegrity",
       "type": "go",
       "request": "launch",
