@@ -81,6 +81,15 @@ spec:
           memory: 1Gi
         limits:
           memory: 2Gi
+  legacy:
+    enabled: false
+    spec:
+      resources:
+        requests:
+          cpu: 1
+          memory: 1Gi
+        limits:
+          memory: 2Gi
   miner:
     enabled: true
     spec:
