@@ -59,7 +59,7 @@ spec:
       serviceAccountName: tx-blaster
       containers:
         - name: tx-blaster
-          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:4c34891d26af9a23bf980f97c4c201b90b4e3c34
+          image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:f41429d7879002eef353a3e496437f6336d99c5d
           command:
             - ./blaster.run
           args: [ "-workers=10" ]
