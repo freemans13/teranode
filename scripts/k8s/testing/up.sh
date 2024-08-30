@@ -20,7 +20,24 @@ scale_up() {
   local region=$1
   local namespace_suffix=$2
   two_layers_up=$(dirname "$(realpath "$0")")/../../..
-  kubectl apply -f $two_layers_up/deploy/operator/t${namespace_suffix}_teranode_v1alpha1_node.yaml -n t$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground
+
+  # Create a temporary directory
+  TMP_DIR=$(mktemp -d)
+
+  # Copy all *_teranode_v1alpha1_node.yaml files to the temporary directory
+  cp ${two_layers_up}/deploy/operator/t${namespace_suffix}_teranode_v1alpha1_node.yaml ${TMP_DIR}
+
+  # Fetch the image name
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  image_name=$(cat "${SCRIPT_DIR}/image_name.tmp")
+
+  # Use sed to append after the 'spec:' line
+  sed -i.bak '/^spec:$/a\'$'\n''  image: "'"$image_name"'"'$'\n'  "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
+
+  echo "YAML file in $TMP_DIR has been updated with image: $image_name"
+
+  # Use the modified YAML files
+  kubectl apply -f ${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml -n t$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground
 }
 
 # Array to hold PIDs of background processes
