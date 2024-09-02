@@ -172,7 +172,7 @@
       "buildFlags": "-tags=aerospike",
       "env": {
         "SETTINGS_CONTEXT": "docker.host.ubsv1",
-        "utxostore": "aerospike://localhost:3100/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8&set=utxo&externalStore=file//./data/ubsv1/external"
+        "utxostore": "aerospike://localhost:3100/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8&set=utxo&externalStore=file://./data/ubsv1/external"
       },
       "args": [
         // "-all=0",
@@ -219,7 +219,7 @@
       "buildFlags": "-tags=aerospike",
       "env": {
         "SETTINGS_CONTEXT": "docker.host.ubsv2",
-        "utxostore": "aerospike://localhost:3200/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8&set=utxo&externalStore=file//./data/ubsv2/external"
+        "utxostore": "aerospike://localhost:3200/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8&set=utxo&externalStore=file://./data/ubsv2/external"
       },
       "args": [
         // "-all=0",
