@@ -172,7 +172,8 @@
       "buildFlags": "-tags=aerospike",
       "env": {
         "SETTINGS_CONTEXT": "docker.host.ubsv1",
-        "utxostore": "aerospike://localhost:3100/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8&set=utxo&externalStore=file://./data/ubsv1/external"
+        // "utxostore": "aerospike://localhost:3100/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8&set=utxo&externalStore=lustre:///?subDirectory=sv-node/external%26localDir=/data/ubsv1/external%26localPersist=s3"
+        "utxostore": "aerospike://localhost:3100/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8&set=utxo&externalStore=lustre:///?subDirectory=sv-node/external%26localDir=./data/ubsv1/external%26localPersist=s3"
       },
       "args": [
         // "-all=0",
@@ -281,7 +282,22 @@
         "-blockpersister=0"
         // "-all=1"
       ]
-    },{
+    },
+      {
+        "name": "tx-blaster docker.host.ubsv1",
+        "type": "go",
+        "request": "launch",
+        "mode": "auto",
+        "program": "${workspaceFolder}/cmd/txblaster/main.go",
+        "env": {
+          "SETTINGS_CONTEXT": "docker.host.ubsv1",
+        },
+          "args": [
+          "-workers=1",
+          "-print=1"
+        ]
+      },
+{  
       "name": "Rpc",
       "type": "go",
       "request": "launch",
