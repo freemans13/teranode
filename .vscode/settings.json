@@ -43,6 +43,7 @@
     "curr",
     "dbmode",
     "Debugf",
+    "deduplicator",
     "defaultvalidator",
     "dialing",
     "emptypb",
