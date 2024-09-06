@@ -519,13 +519,16 @@
       "buildFlags": "-tags=aerospike",
       "program": "${workspaceFolder}/cmd/seeder/main.go",
       "env": {
-        // "utxostore": "aerospike://localhost:3000/test?set=utxo&externalStore=file:///external",
-        "utxostore": "postgres://ubsv:ubsv@localhost:5432/ubsv?expiration=300",
+        "utxostore": "aerospike://localhost:3000/test?set=utxo&externalStore=file://./external",
+        // "utxostore": "postgres://ubsv:ubsv@localhost:5432/ubsv?expiration=300",
         "workerCount": "1",
       },
       "args": [
-        "-in",
-        "/Users/ordishs/t.utxo-set"
+        "-inputDir",
+        "/Users/ordishs",
+        "-hash",
+        "t",
+        "-skipHeaders"
         // "../../data/blockstore/00000000a23332a5740d8676baabcbffe490fd8849b6d30f7399b83aedd733f6.utxo-set"
       ],
       // "env": {
@@ -627,9 +630,10 @@
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/aerospike_reader/main.go",
       "env": {
-        "utxostore": "aerospike://10.90.0.96:3000/utxo-store?set=utxo&WarmUp=1&externalStore=s3:///teranode-gateway-test-eu-central-1?region=eu-central-1&subDirectory=sv-node/external",
+        // "utxostore": "aerospike://editor:password1234@10.1.26.237:3000/utxo-store?set=utxo&WarmUp=1&externalStore=s3:///teranode-gateway-test-eu-central-1?region=eu-central-1&subDirectory=sv-node/external",
+        "utxostore": "aerospike://localhost:3000/test?set=utxo&externalStore=file:///Users/ordishs/external"
       },
-      "args": [ "1bd4f08ffbeefbb67d82a340dd35259a97c5626368f8a6efa056571b293fae52" ]
+      "args": [ "3e4b1785cc97c0aaeb778943fd1cac0ecf300f31966fb71261584c780f000000" ]
     }
   ],
   "inputs": [
