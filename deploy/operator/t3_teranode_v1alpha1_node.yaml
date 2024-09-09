@@ -81,6 +81,15 @@ spec:
           memory: 1Gi
         limits:
           memory: 2Gi
+  legacy:
+    enabled: false
+    spec:
+      resources:
+        requests:
+          cpu: 1
+          memory: 1Gi
+        limits:
+          memory: 2Gi
   miner:
     enabled: true
     spec:
@@ -144,8 +153,14 @@ spec:
           storage: 5Gi
       storageClass: "fsx-sc"
   validator:
-    enabled: false
-    spec: {}
+    enabled: true
+    spec:
+      resources:
+        requests:
+          cpu: 1
+          memory: 1Gi
+        limits:
+          memory: 2Gi
   coinbase:
     enabled: true
     spec:

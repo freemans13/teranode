@@ -17,6 +17,9 @@ scale_down() {
   local region=$1
   local namespace_suffix=$2
 
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  kubectl get cluster cluster-sample -n t${namespace_suffix} -o json | jq -r .spec.image > "${SCRIPT_DIR}/image_name.tmp"
+
   kubectl delete clusters.teranode.bsvblockchain.org -n t$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground --all
 
 }
