@@ -38,15 +38,13 @@
       "type": "go",
       "request": "launch",
       "mode": "auto",
-      "program": "${workspaceFolder}/.",
+      "program": "${workspaceFolder}/cmd/utxopersister/main.go",
+      "cwd": "${workspaceFolder}/.",
       "env": {
-        "asset_httpAddress": "http://localhost:8090",
-        "kafka_blocksFinalConfig": "",
-        "profilerAddr": ":6060"
+        "network": "mainnet"
       },
       "args": [
         "-all=0",
-        "-blockchain=1",
         "-utxopersister=1",
       ]
     },
