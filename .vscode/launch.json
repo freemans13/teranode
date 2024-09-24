@@ -41,7 +41,8 @@
       "program": "${workspaceFolder}/cmd/utxopersister/main.go",
       "cwd": "${workspaceFolder}/.",
       "env": {
-        "network": "mainnet"
+        "network": "mainnet",
+        "profilerAddr": ":9094"
       },
       "args": [
         "-all=0",
