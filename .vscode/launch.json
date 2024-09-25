@@ -13,7 +13,7 @@
       // "buildFlags": "-tags=aerospike",
       "env": {
         "asset_httpAddress": "http://localhost:8090",
-        "startLegacy": "true",
+        // "startLegacy": "true",
         "startAsset": "true",
         "profilerAddr": ":6060",
         // "blockassembly_disabled": "true",
@@ -22,6 +22,7 @@
         "-all=0",
         "-blockchain=1",
         "-asset=1",
+        "-blockpersister=1",
         // "-p2p=0",
         // "-asset=1",
         // "-legacy=1"

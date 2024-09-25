@@ -201,6 +201,7 @@
     "upgrader",
     "usql",
     "utxo",
+    "utxofactory",
     "utxop",
     "utxopersister",
     "utxos",
