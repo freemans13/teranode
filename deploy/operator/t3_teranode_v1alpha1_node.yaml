@@ -13,6 +13,12 @@ spec:
   asset:
     enabled: true
     spec:
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
       grpcIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: ast-grpc
@@ -29,32 +35,24 @@ spec:
           traefik.ingress.kubernetes.io/router.entrypoints: websecure
         className: traefik-internal
         host: t3.testing.ubsv.dev
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
-      serviceAnnotations:
-        traefik.ingress.kubernetes.io/service.serversscheme: h2c
   blockAssembly:
     enabled: true
     spec:
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 2
+            memory: 1Gi
   blockPersister:
     enabled: true
     spec:
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
       storageClass: fsx-sc
       storageResources:
         requests:
@@ -62,66 +60,67 @@ spec:
   blockValidator:
     enabled: true
     spec:
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
   blockchain:
     enabled: true
     spec:
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
   bootstrap:
     enabled: false
     spec: {}
   coinbase:
     enabled: true
     spec:
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
   configMapName: shared-config
+  image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:v2.2.102
   legacy:
-    enabled: false
+    enabled: true
     spec:
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 2
+            memory: 1Gi
   miner:
     enabled: true
     spec:
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
   peer:
     enabled: true
     spec:
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
       grpcIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: peer-grpc
         className: traefik-internal
         host: t3.testing.ubsv.dev
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
       wsIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: p2p-ws
@@ -135,38 +134,45 @@ spec:
   propagation:
     enabled: true
     spec:
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
       grpcIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: prop-grpc
         className: traefik-internal
         host: t3.testing.ubsv.dev
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
       serviceAnnotations:
         traefik.ingress.kubernetes.io/service.serversscheme: h2c
   subtreeValidator:
     enabled: true
     spec:
-      resources:
-        limits:
-          memory: 6Gi
-        requests:
-          cpu: 1
-          memory: 2Gi
+      deploymentOverrides:
+        resources:
+          requests:
+            cpu: 1
+            memory: 2Gi
       storageClass: fsx-sc
       storageResources:
         requests:
           storage: 5Gi
+  utxoPersister:
+    enabled: false
+    spec:
+      deploymentOverrides:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 2
+            memory: 1Gi
   validator:
     enabled: true
     spec:
-      resources:
-        limits:
-          memory: 2Gi
-        requests:
-          cpu: 1
-          memory: 1Gi
+      deploymentOverrides:
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
