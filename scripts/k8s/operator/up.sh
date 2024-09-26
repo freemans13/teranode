@@ -37,8 +37,6 @@ scale_up() {
   cp ${two_layers_up}/deploy/operator/t${namespace_suffix}_teranode_v1alpha1_node.yaml ${TMP_DIR}
 
   # Fetch the image name
-  # check if file image_name.tmp exists
-  if
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   image_name=$(cat "${SCRIPT_DIR}/image_name.tmp")
   rm "${SCRIPT_DIR}/image_name.tmp"
