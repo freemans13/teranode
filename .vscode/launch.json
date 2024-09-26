@@ -5,6 +5,30 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Debug TxValidator_test",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${workspaceFolder}/services/validator", // Replace with your test file path
+      "cwd": "${workspaceFolder}",
+      "buildFlags": "-tags=bdk",
+      "env": {"LD_LIBRARY_PATH":"${env:BDK_INSTALL_ROOT}/bin:${env:LD_LIBRARY_PATH}"
+        //For go run on MacOS,"CGO_LDFLAGS":"-L${env:BDK_INSTALL_ROOT}/lib -L${env:BDK_INSTALL_ROOT}/bin -Wl,-rpath,${env:BDK_INSTALL_ROOT}/bin ${env:CGO_LDFLAGS}"
+        ,"CGO_LDFLAGS":"-L${env:BDK_INSTALL_ROOT}/lib -L${env:BDK_INSTALL_ROOT}/bin ${env:CGO_LDFLAGS}"
+        ,"CGO_CFLAGS":"-I${env:BDK_INSTALL_ROOT}/include/core -I${env:BDK_INSTALL_ROOT}/include ${env:CGO_CFLAGS}"
+        ,"GOBDK_SCRIPTCONFIG_MAXOPSPERSCRIPTPOLICY":"1"
+        ,"GOBDK_SCRIPTCONFIG_MAXSCRIPTNUMLENGTHPOLICY":"2"
+        ,"GOBDK_SCRIPTCONFIG_MAXSCRIPTSIZEPOLICY":"3"
+        ,"GOBDK_SCRIPTCONFIG_MAXPUBKEYSPERMULTISIG":"4"
+        ,"GOBDK_SCRIPTCONFIG_MAXSTACKMEMORYUSAGECONSENSUS":"5"
+        ,"GOBDK_SCRIPTCONFIG_MAXSTACKMEMORYUSAGEPOLICY":"6"
+      },
+      "args": [
+        "-test.run", "TestValidateTxda47bd83967d81f3cf6520f4ff81b3b6c4797bfe7ac2b5969aedbf01a840cda6"
+      ],
+      "showLog": true
+    },
+    {
       "name": "UBSV",
       "type": "go",
       "request": "launch",
