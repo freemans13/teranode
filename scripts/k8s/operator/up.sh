@@ -39,7 +39,6 @@ scale_up() {
   # Fetch the image name
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   image_name=$(cat "${SCRIPT_DIR}/image_name.tmp")
-  rm "${SCRIPT_DIR}/image_name.tmp"
 
   # Use sed to append after the 'spec:' line
   sed -i.bak '/^spec:$/a\'$'\n''  image: "'"$image_name"'"'$'\n' "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
