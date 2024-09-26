@@ -90,7 +90,7 @@ spec:
   configMapName: shared-config
   image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:v2.2.102
   legacy:
-    enabled: true
+    enabled: false
     spec:
       deploymentOverrides:
         replicas: 1
