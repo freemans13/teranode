@@ -41,6 +41,9 @@ scale_up() {
   image_name=$(cat "${SCRIPT_DIR}/image_name.tmp")
 
   # Use sed to append after the 'spec:' line
+  # Remove existing image line if present
+  sed -i.bak '/^  image:/d' "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
+  # Add new image line after spec:
   sed -i.bak '/^spec:$/a\'$'\n''  image: "'"$image_name"'"'$'\n' "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
 
   echo "YAML file in $TMP_DIR has been updated with image: $image_name"
