@@ -89,7 +89,7 @@ spec:
             memory: 1Gi
   configMapName: shared-config
   legacy:
-    enabled: true
+    enabled: false
     spec:
       deploymentOverrides:
         replicas: 1
