@@ -88,7 +88,6 @@ spec:
             cpu: 1
             memory: 1Gi
   configMapName: shared-config
-  image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:v2.2.102
   legacy:
     enabled: true
     spec:
