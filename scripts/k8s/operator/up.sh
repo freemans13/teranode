@@ -6,12 +6,21 @@ if [ -n "$KUBECONFIG" ]; then
   exit 1
 fi
 
+readme() {
+  echo "Usage: $0 [all_test|t1|t2|t3|all_main|main1|main2]"
+  echo "Testing Environments:"
+  echo "\t all_test: scale up all regions in testing environment"
+  echo "\t t1: scale up eu region"
+  echo "\t t2: scale up us region"
+  echo "\t t3: scale up asia region"
+
+  echo "Main Environments:"
+  echo "\t all_main: scale up all regions in mainnet environment"
+  echo "\t main1: scale up mainnet 1 environment in eu west 1"
+  echo "\t main2: scale up mainnet 2 environment in eu west 1"
+}
 if [ "$1" == "help" ]; then
-  echo "Usage: $0 [all|t1|t2|t3]"
-  echo "all: scale up all regions"
-  echo "t1: scale up eu region"
-  echo "t2: scale up us region"
-  echo "t3: scale up asia region"
+  readme
   exit 0
 fi
 
@@ -32,7 +41,10 @@ scale_up() {
   image_name=$(cat "${SCRIPT_DIR}/image_name.tmp")
 
   # Use sed to append after the 'spec:' line
-  sed -i.bak '/^spec:$/a\'$'\n''  image: "'"$image_name"'"'$'\n'  "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
+  # Remove existing image line if present
+  sed -i.bak '/^  image:/d' "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
+  # Add new image line after spec:
+  sed -i.bak '/^spec:$/a\'$'\n''  image: "'"$image_name"'"'$'\n' "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
 
   echo "YAML file in $TMP_DIR has been updated with image: $image_name"
 
@@ -43,23 +55,31 @@ scale_up() {
 # Array to hold PIDs of background processes
 bg_pids=()
 
-if [ "$1" == "all" ]; then
+if [ "$1" == "all_test" ]; then
   scale_up "eu-central-1" "1" &
   bg_pids+=($!)
   scale_up "eu-central-1" "2" &
   bg_pids+=($!)
   scale_up "eu-central-1" "3" &
   bg_pids+=($!)
+elif [ "$1" == "all_main" ]; then
+  scale_up "eu-west-1" "1" &
+  bg_pids+=($!)
+  scale_up "eu-west-1" "2" &
+  bg_pids+=($!)
+elif [[ "$1" == "main1" ]]; then
+  scale_up "eu-west-1" "1" &
+elif [[ "$1" == "main2" ]]; then
+  scale_up "eu-west-1" "2" &
+elif [[ "$1" == "t1" ]]; then
+  scale_up "eu-central-1" "1"
+elif [[ "$1" == "t2" ]]; then
+  scale_up "eu-central-1" "2"
+elif [[ "$1" == "t3" ]]; then
+  scale_up "eu-central-1" "3"
 else
-  if [[ "$1" == "t1" ]]; then
-    scale_up "eu-central-1" "1"
-  elif [[ "$1" == "t2" ]]; then
-    scale_up "eu-central-1" "2"
-  elif [[ "$1" == "t3" ]]; then
-    scale_up "eu-central-1" "3"
-  else
-    echo "T1, T2, T3 are sharing the same environment. Please specify one of them."
-  fi
+  echo "You're not specifying the correct environment. Refer to help function for more information.\n"
+  readme
 fi
 
 # Wait for all background processes to complete

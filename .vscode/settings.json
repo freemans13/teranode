@@ -32,6 +32,7 @@
     "Bulma",
     "bval",
     "BYTEA",
+    "bytesize",
     "CFLAGS",
     "chaincfg",
     "chainhash",

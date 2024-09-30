@@ -1,5 +1,5 @@
 #!/bin/bash
-set -ex
+set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
@@ -39,26 +39,19 @@ function clean() {
   local region=$1
   local namespace=$2
 
-  echo "Aerospike cleaning: $region"
-  echo "Aerospike cleaning"
+  echo "Aerospike cleaning: $region $namespace"
   echo "Warning: If aerospike is too large, it might be faster to delete and restart the instances. Talk to the devops team."
-  echo "Do not truncate a namespace that's too large, it will take hours"
-
   kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.ubsv.internal -v "truncate-namespace:namespace=txmeta-store;"
   kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.ubsv.internal -v "truncate-namespace:namespace=utxo-store;"
-  # echo "Clearing Lustre: $region"
-  # kubectl scale deployment -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get deployment --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep blockchain | tail -c+17) --replicas 1
-  # kubectl scale deployment -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get deployment --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep asset | tail -c+17) --replicas 1
-  # kubectl exec -n $namespace --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | grep asset | tail -c+5) -- find /data/subtreestore -type f -delete
 }
 
 function backup() {
   local region=$1
   local namespace=$2
-  local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)    # Generate timestamp in UTC with -u option
-  local datePart=$(echo $timestamp | cut -d'T' -f1) # Extract the date part (yyyy-mm-dd)
+  local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local datePart=$(echo $timestamp | cut -d'T' -f1)
   local filename="${timestamp}-${region}-${namespace}.dump"
-  local s3Path="s3://ubsv-blockchain-backups/${datePart}/${filename}" # Include datePart in the path
+  local s3Path="s3://ubsv-blockchain-backups/${datePart}/${filename}"
 
   echo "Postgres backup: $region $namespace > $s3Path"
   kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace pg_dump -U $namespace $namespace >/tmp/$filename
@@ -69,9 +62,7 @@ function backup() {
 function truncate() {
   local region=$1
   local namespace=$2
-  # get the last part of the namespace
   local ns_suffix=$(echo $namespace | tail -c+2)
-#  backup $region $namespace
 
   echo "Postgres cleaning: $region $namespace"
   kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state ; drop table if exists blocks;" >/dev/null
@@ -80,41 +71,87 @@ function truncate() {
 
 function clear_kafka() {
   local namespace=$1
-
-  # Make the kafkatool if necessary...
   make -C $DIR/../../../cmd/kafkatool
-
   echo "SETTINGS_CONTEXT=testing.${namespace} $DIR/../../../cmd/kafkatool/kafkatool"
-  # SETTINGS_CONTEXT=scaling.${namespace} $DIR/../../../cmd/kafkatool/kafkatool
 }
 
+function clean_env() {
+  local region=$1
+  local namespace=$2
+  clean $region $namespace &
+  bg_pids+=($!)
 
-# scale down everything
-echo "Scaling down: all"
-bash $DIR/down.sh all unsafe
+  truncate $region $namespace &
+  bg_pids+=($!)
 
-for i in 1 2 3; do
-    clean "eu-central-1" "t$i" &
-    bg_pids+=($!)
+  clear_kafka $namespace &
+  bg_pids+=($!)
+}
 
-    # Local databases
-    truncate "eu-central-1" "t$i" &
-    bg_pids+=($!)
+function clean_test_envs() {
+  echo "Scaling down: all test environments"
+  bash $DIR/down.sh all_test unsafe
 
-    # Kafka
-    clear_kafka "t$i" &
-    bg_pids+=($!)
-
+  for i in 1 2 3; do
+    clean_env "eu-central-1" "t$i"
   done
 
-# Wait for all background processes to complete
-for pid in "${bg_pids[@]}"; do
-  wait "$pid" || echo "Process $pid exited with status $?"
-done
+  for pid in "${bg_pids[@]}"; do
+    wait "$pid" || echo "Process $pid exited with status $?"
+  done
 
-echo "Scaling back up: all"
-# scale back up everything
-bash $DIR/up.sh all
+  echo "Scaling back up: all test environments"
+  bash $DIR/up.sh all_test
+}
 
-# scale up tx blaster
-#kubectl scale deployment -n tx-blaster-service tx-blaster --replicas 1
+function clean_main_envs() {
+  echo "Scaling down: all mainnet environments"
+  bash $DIR/down.sh all_main unsafe
+
+  for i in 1 2; do
+    clean_env "eu-west-1" "main$i"
+  done
+
+  for pid in "${bg_pids[@]}"; do
+    wait "$pid" || echo "Process $pid exited with status $?"
+  done
+
+  echo "Scaling back up: all mainnet environments"
+  bash $DIR/up.sh all_main
+}
+
+function clean_individual_env() {
+  local env_type=$1
+  local env_number=$2
+
+  if [[ $env_type == "t" ]]; then
+    echo "Cleaning test environment t${env_number}"
+    clean_env "eu-central-1" "t${env_number}"
+    bash $DIR/up.sh "t${env_number}"
+  elif [[ $env_type == "main" ]]; then
+    echo "Cleaning mainnet environment main${env_number}"
+    clean_env "eu-west-1" "main${env_number}"
+    bash $DIR/up.sh "main${env_number}"
+  else
+    echo "Invalid environment specified. Use t1, t2, t3, main1, or main2."
+    exit 1
+  fi
+
+  for pid in "${bg_pids[@]}"; do
+    wait "$pid" || echo "Process $pid exited with status $?"
+  done
+}
+
+# Parse input arguments and call appropriate functions
+if [ "$1" == "all_test" ]; then
+  clean_test_envs
+elif [ "$1" == "all_main" ]; then
+  clean_main_envs
+elif [[ "$1" =~ ^t[1-3]$ ]]; then
+  clean_individual_env "t" "${1:1}"
+elif [[ "$1" =~ ^main[1-2]$ ]]; then
+  clean_individual_env "main" "${1:4}"
+else
+  echo "Invalid argument. Usage: $0 [all_test|all_main|t1|t2|t3|main1|main2]"
+  exit 1
+fi
