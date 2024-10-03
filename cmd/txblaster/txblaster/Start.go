@@ -26,8 +26,8 @@ import (
 	"github.com/bitcoin-sv/ubsv/services/legacy/wire"
 	"github.com/bitcoin-sv/ubsv/tracing"
 	"github.com/bitcoin-sv/ubsv/ulogger"
-	"github.com/bitcoin-sv/ubsv/util"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
+	"github.com/bitcoin-sv/ubsv/util/kafka"
 	"github.com/bitcoin-sv/ubsv/util/p2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/ordishs/go-utils"
@@ -47,7 +47,7 @@ var logger ulogger.Logger
 
 var printProgress uint64
 
-var kafkaProducer util.KafkaProducerI
+var kafkaProducer kafka.KafkaProducerI
 var kafkaTopic string
 var ipv6MulticastConn *net.UDPConn
 var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
@@ -83,7 +83,7 @@ func Start() {
 	workers := flag.Int("workers", runtime.NumCPU(), "how many workers to use for blasting")
 	rateLimit := flag.Float64("limit", -1, "rate limit tx/s per worker")
 	printFlag := flag.Int("print", 0, "print out progress every x transactions")
-	kafka := flag.String("kafka", "", "Kafka server URL - if applicable")
+	kafkaURL := flag.String("kafka", "", "Kafka server URL - if applicable")
 	ipv6Address := flag.String("ipv6Address", "", "IPv6 multicast address - if applicable")
 	ipv6Interface := flag.String("ipv6Interface", "en0", "IPv6 multicast interface - if applicable")
 	profileAddress := flag.String("profile", "", "use this profile port instead of the default")
@@ -237,14 +237,14 @@ func Start() {
 		logger.Fatalf("error creating coinbase tracker client: %v", err)
 	}
 
-	if kafka != nil && *kafka != "" {
-		logger.Infof("Connecting to kafka at %s", *kafka)
-		kafkaURL, err := url.Parse(*kafka)
+	if kafkaURL != nil && *kafkaURL != "" {
+		logger.Infof("Connecting to kafka at %s", *kafkaURL)
+		kafkaURL, err := url.Parse(*kafkaURL)
 		if err != nil {
 			logger.Fatalf("unable to parse kafka url: %v", err)
 		}
 
-		clusterAdmin, producer, err := util.ConnectToKafka(kafkaURL)
+		clusterAdmin, producer, err := kafka.ConnectToKafka(kafkaURL)
 		if err != nil {
 			logger.Fatalf("unable to connect to kafka: %v", err)
 		}
