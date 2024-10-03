@@ -244,7 +244,7 @@ func Start() {
 			logger.Fatalf("unable to parse kafka url: %v", err)
 		}
 
-		clusterAdmin, producer, err := kafka.ConnectToKafka(kafkaURL)
+		clusterAdmin, producer, err := kafka.NewKafkaProducer(kafkaURL)
 		if err != nil {
 			logger.Fatalf("unable to connect to kafka: %v", err)
 		}
