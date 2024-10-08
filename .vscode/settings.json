@@ -137,6 +137,7 @@
     "regtest",
     "resp",
     "respend",
+    "Rollup",
     "s3inventoryintegrity",
     "safemap",
     "sarama",
