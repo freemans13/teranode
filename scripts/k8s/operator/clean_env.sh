@@ -65,7 +65,7 @@ function truncate() {
   local ns_suffix=$(echo $namespace | tail -c+2)
 
   echo "Postgres cleaning: $region $namespace"
-  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state ; drop table if exists blocks;" >/dev/null
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists blocks;" >/dev/null
   kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=coinbase${ns_suffix} psql -U coinbase${ns_suffix} -d coinbase${ns_suffix} -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;" >/dev/null
 }
 
