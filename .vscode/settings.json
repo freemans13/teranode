@@ -223,7 +223,7 @@
   ],
   "cmake.configureOnOpen": false,
   "editor.codeActionsOnSave": {},
-  "go.buildTags": "aerospike,native",
+  "go.buildTags": "aerospike,native,functional",
   "go.languageServerFlags": [],
   "go.useLanguageServer": true,
   "[go]": {
