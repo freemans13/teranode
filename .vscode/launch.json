@@ -618,12 +618,60 @@
       "program": "${workspaceFolder}/poc/binserve/main.go",
     },
     {
-      "name": "Remote Debug",
+      "name": "Remote Debug (localhost:4040)",
       "type": "go",
       "request": "attach",
       "mode": "remote",
       "port": 4040,
       "host": "127.0.0.1"
+    },
+    {
+      "name": "Remote Debug (blockchain:4040)",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "port": 4040,
+      "host": "blockchain"
+    },
+    {
+      "name": "Remote Debug (asset:4040)",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "port": 4040,
+      "host": "asset"
+    },
+    {
+      "name": "Remote Debug (block-validation:4040)",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "port": 4040,
+      "host": "block-validation"
+    },
+    {
+      "name": "Remote Debug (legacy:4040)",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "port": 4040,
+      "host": "legacy"
+    },
+    {
+      "name": "Remote Debug (block-assembly:4040)",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "port": 4040,
+      "host": "block-assembly"
+    },
+    {
+      "name": "Remote Debug (subtree-validator:4040)",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "port": 4040,
+      "host": "subtree-validator"
     },
     {
       "name": "blockpersister intergrity",
