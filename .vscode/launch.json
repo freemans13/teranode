@@ -77,7 +77,10 @@
       "cwd": "${workspaceFolder}/.",
       "env": {
         "network": "mainnet",
-        "profilerAddr": ":9094"
+        "profilerAddr": ":9094",
+        "blockstore": "file://./data/blockstore_test",
+        "blockchain_grpcAddress": "localhost:8087",
+        "direct": "false"
       },
       "args": [
         "-all=0",
@@ -554,22 +557,13 @@
       "mode": "auto",
       "buildFlags": "-tags=aerospike",
       "program": "${workspaceFolder}/cmd/seeder/main.go",
-      "env": {
-        "utxostore": "aerospike://localhost:3000/test?set=utxo&externalStore=file://./external",
-        // "utxostore": "postgres://ubsv:ubsv@localhost:5432/ubsv?expiration=300",
-        "workerCount": "1",
-      },
+      "cwd": "${workspaceFolder}",
       "args": [
         "-inputDir",
-        "/Users/ordishs",
+        "./test/seed",
         "-hash",
-        "t",
-        "-skipHeaders"
-        // "../../data/blockstore/00000000a23332a5740d8676baabcbffe490fd8849b6d30f7399b83aedd733f6.utxo-set"
-      ],
-      // "env": {
-        // "blockstore": "s3:///eu-ubsv-block-store?region=eu-west-1",
-      // }
+        "6d0e693024653c9dde15b731f09bf31aa3174302890ec751500250c2a4ea0984",
+      ]
     },
     {
       "name": "headers",
