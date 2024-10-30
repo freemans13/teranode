@@ -1,0 +1,16 @@
+apiVersion: v1
+data:
+  SETTINGS_CONTEXT: operator.mainnet.euw1-3
+  asset_centrifuge_disable: "true"
+  blockchain_store: postgres://mainnet-3:mainnet-3@main-net.czklemh7vdzk.eu-west-1.rds.amazonaws.com:5432/mainnet-3?sslmode=require
+  legacy_connect_peers: 13.213.100.250:8333|18.199.12.185:8333|44.213.141.106:8333
+  txMetaCacheMaxMB: "512"
+  useLocalValidator: "false"
+  utxostore: aerospike://editor:password1234@aero-0-teranode-main-net-3-eu-west-1-prod.ubsv.internal:3000,aero-1-teranode-main-net-3-eu-west-1-prod.ubsv.internal:3000,aero-2-teranode-main-net-3-eu-west-1-prod.ubsv.internal:3000/utxo-store?set=utxo&WarmUp=0&ConnectionQueueSize=256&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8&expiration=14400&externalStore=file:///data/mainnet-3/external%3FhashPrefix=2
+  utxostore_useExternalTxCache: "false"
+  utxostore_utxoBatchSize: "512"
+  validator_scriptVerificationLibrary: GoBDK
+kind: ConfigMap
+metadata:
+  name: shared-config
+  namespace: mainnet-3
