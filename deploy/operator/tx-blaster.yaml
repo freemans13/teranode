@@ -10,13 +10,13 @@ apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: tx-blaster
 subjects:
-- kind: ServiceAccount
-  name: tx-blaster
-  namespace: tx-blasters
+  - kind: ServiceAccount
+    name: tx-blaster
+    namespace: tx-blasters
 roleRef:
-    kind: ClusterRole
-    name: view
-    apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: v1
 data:
@@ -61,8 +61,17 @@ spec:
         - name: tx-blaster
           image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/ubsv:f41429d7879002eef353a3e496437f6336d99c5d
           command:
-            - ./blaster.run
-          args: [ "-workers=10" ]
+            - "./dlv"
+            - "--listen=:4040"
+            - "--continue"
+            - "--accept-multiclient"
+            - "--headless=true"
+            - "--api-version=2"
+            - "exec"
+            - "./ubsv.run"
+            - "--"
+          args:
+            - "-legacy=1"
           envFrom:
             - configMapRef:
                 name: tx-blaster-config
