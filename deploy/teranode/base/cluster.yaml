@@ -1,116 +1,93 @@
 apiVersion: teranode.bsvblockchain.org/v1alpha1
 kind: Cluster
 metadata:
-  labels:
-    app.kubernetes.io/created-by: teranode-operator
-    app.kubernetes.io/instance: cluster
-    app.kubernetes.io/managed-by: kustomize
-    app.kubernetes.io/name: cluster
-    app.kubernetes.io/part-of: teranode-operator
-    k8slens-edit-resource-version: v1alpha1
-  name: mainnet-1
-  namespace: mainnet-1
+  name: teranode
 spec:
   asset:
-    enabled: true
+    enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: "0.6"
-            memory: 500Mi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
       grpcIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: ast-grpc
         className: traefik-internal
-        host: euw1-teranode-main-net-1-prod.ubsv.dev
+        host: domain
       httpIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: web
         className: traefik-internal
-        host: euw1-teranode-main-net-1-prod.ubsv.dev
+        host: domain
       httpsIngress:
         annotations:
           cert-manager.io/cluster-issuer: letsencrypt-prod
           traefik.ingress.kubernetes.io/router.entrypoints: websecure
         className: traefik-internal
-        host: euw1-teranode-main-net-1-prod.ubsv.dev
+        host: domain
   blockAssembly:
-    enabled: true
+    enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: "0.5"
-            memory: 4Gi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
   blockPersister:
     enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: "0.5"
-            memory: 4Gi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
       storageClass: fsx-lustre
       storageResources:
         requests:
           storage: 5Gi
   blockValidator:
-    enabled: true
+    enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: 2
-            memory: 8Gi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
   blockchain:
-    enabled: true
+    enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: "0.5"
-            memory: 500Mi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
   bootstrap:
     enabled: false
     spec: {}
@@ -119,122 +96,104 @@ spec:
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: 1
-            memory: 1Gi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
   configMapName: shared-config
-  image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode-public:v0.5.4
+  image: image:latest
   legacy:
-    enabled: true
+    enabled: false
     spec:
       deploymentOverrides:
         configMapName: legacy-config
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: 8
-            memory: 4Gi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
   miner:
     enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: 1
-            memory: 1Gi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
   peer:
     enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: "0.5"
-            memory: 500Mi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
       grpcIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: peer-grpc
         className: traefik-internal
-        host: euw1-teranode-main-net-1-prod.ubsv.dev
+        host: domain
       wsIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: p2p-ws
         className: traefik-internal
-        host: euw1-teranode-main-net-1-prod.ubsv.dev
+        host: domain
       wssIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: p2p-wss
         className: traefik-internal
-        host: euw1-teranode-main-net-1-prod.ubsv.dev
+        host: domain
   propagation:
     enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: "0.5"
-            memory: 500Mi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
       grpcIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: prop-grpc
         className: traefik-internal
-        host: euw1-teranode-main-net-1-prod.ubsv.dev
+        host: domain
       serviceAnnotations:
         traefik.ingress.kubernetes.io/service.serversscheme: h2c
   subtreeValidator:
-    enabled: true
+    enabled: false
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: 1
-            memory: 8Gi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
       storageClass: fsx-lustre
       storageResources:
         requests:
@@ -244,17 +203,14 @@ spec:
     spec:
       deploymentOverrides:
         nodeSelector:
-          role: mainnet-1
+          role: node-selector
         replicas: 1
-        resources:
-          requests:
-            cpu: 1
-            memory: 8Gi
+        resources: {}
         tolerations:
         - effect: NoSchedule
           key: role
           operator: Equal
-          value: mainnet-1
+          value: node-selector
   validator:
     enabled: false
     spec: {}
