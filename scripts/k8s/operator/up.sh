@@ -34,22 +34,17 @@ scale_up() {
   TMP_DIR=$(mktemp -d)
 
   # Copy all *_teranode_v1alpha1_node.yaml files to the temporary directory
-  cp ${two_layers_up}/deploy/operator/t${namespace_suffix}_teranode_v1alpha1_node.yaml ${TMP_DIR}
+  cp -R ${two_layers_up}/deploy/teranode/deployments/prod-teranet-${namespace_suffix} ${TMP_DIR}
 
   # Fetch the image name
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   image_name=$(cat "${SCRIPT_DIR}/image_name.tmp")
 
-  # Use sed to append after the 'spec:' line
-  # Remove existing image line if present
-  sed -i.bak '/^  image:/d' "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
-  # Add new image line after spec:
-  sed -i.bak '/^spec:$/a\'$'\n''  image: "'"$image_name"'"'$'\n' "${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml"
-
-  echo "YAML file in $TMP_DIR has been updated with image: $image_name"
-
-  # Use the modified YAML files
-  kubectl apply -f ${TMP_DIR}/t${namespace_suffix}_teranode_v1alpha1_node.yaml -n t$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground
+  local overlay_dir="$(dirname "$(realpath "$0")")/../../../deploy/teranode/deployments/prod-teranet-${namespace_suffix}"
+   # Use the overlay with an inline image override, avoiding file changes
+  kustomize build "${overlay_dir}" | \
+    sed "s|image: .*|image: ${image_name}|" | \
+    kubectl apply --context arn:aws:eks:${region}:434394763103:cluster/aws-ubsv-playground -f -
 }
 
 # Array to hold PIDs of background processes
