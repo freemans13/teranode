@@ -285,6 +285,10 @@ func (b *BlockAssembler) UpdateBestBlock(ctx context.Context) {
 		return
 	}
 
+	b.logger.Infof("[BlockAssembler][%s] new best block header: %d", bestBlockchainBlockHeader.Hash(), meta.Height)
+
+	defer b.logger.Infof("[BlockAssembler][%s] new best block header: %d DONE", bestBlockchainBlockHeader.Hash(), meta.Height)
+
 	prometheusBlockAssemblyBestBlockHeight.Set(float64(meta.Height))
 
 	switch {
@@ -294,6 +298,7 @@ func (b *BlockAssembler) UpdateBestBlock(ctx context.Context) {
 	case !bestBlockchainBlockHeader.HashPrevBlock.IsEqual(b.bestBlockHeader.Load().Hash()):
 		b.logger.Infof("[BlockAssembler][%s] best block header is not the same as the previous best block header, reorging: %s", bestBlockchainBlockHeader.Hash(), b.bestBlockHeader.Load().Hash())
 		b.currentRunningState.Store("reorging")
+
 		err = b.handleReorg(ctx, bestBlockchainBlockHeader)
 		if err != nil {
 			b.logger.Errorf("[BlockAssembler][%s] error handling reorg: %v", bestBlockchainBlockHeader.Hash(), err)
@@ -332,7 +337,8 @@ func (b *BlockAssembler) UpdateBestBlock(ctx context.Context) {
 		b.logger.Errorf("[BlockAssembler][%s] error setting state: %v", bestBlockchainBlockHeader.Hash(), err)
 	}
 
-	if b.currentDifficulty, err = b.blockchainClient.GetNextWorkRequired(ctx, bestBlockchainBlockHeader.Hash()); err != nil {
+	b.currentDifficulty, err = b.blockchainClient.GetNextWorkRequired(ctx, bestBlockchainBlockHeader.Hash())
+	if err != nil {
 		b.logger.Errorf("[BlockAssembler][%s] error getting next work required: %v", bestBlockchainBlockHeader.Hash(), err)
 	}
 }
