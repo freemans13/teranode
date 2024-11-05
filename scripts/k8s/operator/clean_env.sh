@@ -41,8 +41,8 @@ function clean() {
 
   echo "Aerospike cleaning: $region $namespace"
   echo "Warning: If aerospike is too large, it might be faster to delete and restart the instances. Talk to the devops team."
-  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.ubsv.internal -v "truncate-namespace:namespace=txmeta-store;"
-  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.ubsv.internal -v "truncate-namespace:namespace=utxo-store;"
+  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.ubsv.internal -v "truncate-namespace:namespace=txmeta-store;"
+  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.ubsv.internal -v "truncate-namespace:namespace=utxo-store;"
 }
 
 function backup() {
@@ -54,7 +54,7 @@ function backup() {
   local s3Path="s3://ubsv-blockchain-backups/${datePart}/${filename}"
 
   echo "Postgres backup: $region $namespace > $s3Path"
-  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace pg_dump -U $namespace $namespace >/tmp/$filename
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/teranet -- env PGPASSWORD=$namespace pg_dump -U $namespace $namespace >/tmp/$filename
   aws s3 cp /tmp/$filename $s3Path
   rm /tmp/$filename
 }
@@ -65,8 +65,8 @@ function truncate() {
   local ns_suffix=$(echo $namespace | tail -c+2)
 
   echo "Postgres cleaning: $region $namespace"
-  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists blocks;" >/dev/null
-  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground -- env PGPASSWORD=coinbase${ns_suffix} psql -U coinbase${ns_suffix} -d coinbase${ns_suffix} -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;" >/dev/null
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/teranet -- env PGPASSWORD=$namespace psql -U $namespace -d $namespace -c "drop table if exists state; drop table if exists utxos; drop table if exists txmeta; drop table if exists blocks;" >/dev/null
+  kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/teranet -- env PGPASSWORD=coinbase${ns_suffix} psql -U coinbase${ns_suffix} -d coinbase${ns_suffix} -c "drop table if exists state; drop table if exists spendable_utxos; drop table if exists coinbase_utxos; drop table if exists blocks;" >/dev/null
 }
 
 function clear_kafka() {

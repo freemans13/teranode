@@ -127,7 +127,7 @@ scale_down() {
   local region=$1
   local namespace_suffix=$2
 
-  kubectl delete clusters.teranode.bsvblockchain.org -n t$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground --all
+  kubectl delete clusters.teranode.bsvblockchain.org -n t$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/teranet --all
 }
 ```
 
@@ -194,7 +194,7 @@ scale_up() {
   local region=$1
   local namespace_suffix=$2
   two_layers_up=$(dirname "$(realpath "$0")")/../../..
-  kubectl apply -f $two_layers_up/deploy/operator/t${namespace_suffix}_teranode_v1alpha1_node.yaml -n t$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/aws-ubsv-playground
+  kubectl apply -f $two_layers_up/deploy/operator/t${namespace_suffix}_teranode_v1alpha1_node.yaml -n t$namespace_suffix --context arn:aws:eks:$region:434394763103:cluster/teranet
 }
 ```
 

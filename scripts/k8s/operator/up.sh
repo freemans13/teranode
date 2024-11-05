@@ -44,7 +44,7 @@ scale_up() {
    # Use the overlay with an inline image override, avoiding file changes
   kustomize build "${overlay_dir}" | \
     sed "s|image: .*|image: ${image_name}|" | \
-    kubectl apply --context arn:aws:eks:${region}:434394763103:cluster/aws-ubsv-playground -f -
+    kubectl apply --context arn:aws:eks:${region}:434394763103:cluster/teranet -f -
 }
 
 # Array to hold PIDs of background processes
