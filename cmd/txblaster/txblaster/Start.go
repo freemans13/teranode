@@ -24,6 +24,7 @@ import (
 	_ "github.com/bitcoin-sv/ubsv/k8sresolver"
 	"github.com/bitcoin-sv/ubsv/services/coinbase"
 	"github.com/bitcoin-sv/ubsv/services/legacy/wire"
+	"github.com/bitcoin-sv/ubsv/settings"
 	"github.com/bitcoin-sv/ubsv/tracing"
 	"github.com/bitcoin-sv/ubsv/ulogger"
 	"github.com/bitcoin-sv/ubsv/util/distributor"
@@ -61,6 +62,7 @@ func Start() {
 
 	var logLevelStr, _ = gocore.Config().Get("logLevel", "INFO")
 	logger = ulogger.New("txblast", ulogger.WithLevel(logLevelStr))
+	tSettings := settings.NewSettings()
 
 	_ = os.Chdir("../../")
 
@@ -95,35 +97,38 @@ func Start() {
 	flag.Parse()
 
 	var ok bool
+
 	p2pIP, ok := gocore.Config().Get("p2p_ip")
 	if !ok {
 		panic(errors.NewConfigurationError("error getting p2p_ip"))
 	}
+
 	p2pPort, ok := gocore.Config().GetInt("p2p_port")
 	if !ok {
 		panic(errors.NewConfigurationError("error getting p2p_port"))
 	}
+
 	sharedKey, ok = gocore.Config().Get("p2p_shared_key")
 	if !ok {
 		panic(errors.NewConfigurationError("error getting p2p_shared_key"))
 	}
+
 	usePrivateDHT := gocore.Config().GetBool("p2p_dht_use_private", false)
 	optimiseRetries := gocore.Config().GetBool("p2p_optimise_retries", false)
 
 	if *e2e {
-		MIN_BLOCK_HEIGHT_FOR_E2E, _ := gocore.Config().GetInt("min_block_height_for_e2e", 200)
+		MIN_BLOCK_HEIGHT_FOR_E2E, _ := gocore.Config().GetInt("min_block_height_for_e2e", 200) //nolint:stylecheck
 
 		// Create a channel to signal when the block height condition is met
 		blockHeightCh := make(chan struct{})
 
 		// Start a blocking goroutine to check the block height continuously
 		go func() {
-
 			for {
 				// Define the URL to query block height
-				asset_httpAddress, _ := gocore.Config().Get("asset_httpAddress")
+				assetHTTPAddress, _ := gocore.Config().Get("asset_httpAddress")
 
-				parsedURL, err := url.ParseRequestURI(asset_httpAddress)
+				parsedURL, err := url.ParseRequestURI(assetHTTPAddress)
 				if err != nil {
 					panic(errors.NewConfigurationError("Invalid URL", err))
 				}
@@ -166,14 +171,16 @@ func Start() {
 						logger.Infof("Block height is now %d (greater than %d), signaling to exit.", height, minHeight)
 						// Signal to exit the goroutine
 						blockHeightCh <- struct{}{}
+
 						return
 					}
+
 					logger.Infof("Block height is %d, waiting for it to exceed %d...", height, MIN_BLOCK_HEIGHT_FOR_E2E)
 				} else {
 					logger.Infof("No blocks found in the response")
 				}
 
-				//add a sleep here to control the frequency of block height checks
+				// add a sleep here to control the frequency of block height checks
 				time.Sleep(time.Second * 5) // Adjust sleep duration as needed
 			}
 		}()
@@ -190,11 +197,15 @@ func Start() {
 
 	if gocore.Config().GetBool("use_open_tracing", true) {
 		logger.Infof("Starting open tracing")
+
 		serviceName, _ := gocore.Config().Get("SERVICE_NAME", "tx-blaster")
+
 		samplingRateStr, _ := gocore.Config().Get("tracing_SampleRate", "0.01")
+
 		samplingRate, err := strconv.ParseFloat(samplingRateStr, 64)
 		if err != nil {
 			logger.Errorf("error parsing sampling rate: %v", err)
+
 			samplingRate = 0.01
 		}
 
@@ -207,6 +218,7 @@ func Start() {
 	}
 
 	var txDistributors []*distributor.Distributor
+
 	nrTxDistributors, _ := gocore.Config().GetInt("txblaster_distributors", 16)
 
 	// with 3 retry attempts and 400ms backoff duration, the total time to wait is 2.8s
@@ -217,28 +229,32 @@ func Start() {
 	failureTolerance, _ := gocore.Config().GetInt("txblaster_failureTolerance", 0)
 
 	var err error
+
 	if !*useQuic {
 		logger.Debugf("Using %d grpc distributors", nrTxDistributors)
 		txDistributors = make([]*distributor.Distributor, nrTxDistributors)
+
 		for i := 0; i < nrTxDistributors; i++ {
-			txDistributors[i], err = distributor.NewDistributor(ctx, logger,
+			txDistributors[i], err = distributor.NewDistributor(ctx, logger, tSettings,
 				distributor.WithBackoffDuration(backoffDuration),
-				distributor.WithRetryAttempts(int32(retryAttempts)),
+				distributor.WithRetryAttempts(int32(retryAttempts)), //nolint:gosec
 				distributor.WithFailureTolerance(failureTolerance),
 			)
 		}
+
 		if err != nil {
 			logger.Fatalf("error creating tx distributor: %v", err)
 		}
 	}
 
-	coinbaseClient, err := coinbase.NewClient(ctx, logger)
+	coinbaseClient, err := coinbase.NewClient(ctx, logger, tSettings)
 	if err != nil {
 		logger.Fatalf("error creating coinbase tracker client: %v", err)
 	}
 
 	if kafkaURL != nil && *kafkaURL != "" {
 		logger.Infof("Connecting to kafka at %s", *kafkaURL)
+
 		kafkaURL, err := url.Parse(*kafkaURL)
 		if err != nil {
 			logger.Fatalf("unable to parse kafka url: %v", err)
@@ -251,6 +267,7 @@ func Start() {
 
 		defer func() {
 			_ = clusterAdmin.Close()
+
 			if err = producer.Close(); err != nil {
 				logger.Errorf("error closing kafka producer: %v", err)
 			}
@@ -263,6 +280,7 @@ func Start() {
 	if ipv6Address != nil && *ipv6Address != "" {
 		logger.Infof("Using %s ipv6Address", *ipv6Address)
 		logger.Infof("Using ipv6 multicast interface %s at address %s", *ipv6Interface, *ipv6Address)
+
 		en0, err := net.InterfaceByName(*ipv6Interface)
 		if err != nil {
 			logger.Fatalf("error resolving interface: %v", err)
@@ -275,6 +293,7 @@ func Start() {
 		}
 
 		logger.Infof("Starting IPv6 multicast on %s", addr.String())
+
 		ipv6MulticastConn, err = net.DialUDP("udp6", nil, addr)
 		if err != nil {
 			logger.Fatalf("error dialing address: %v", err)
@@ -286,6 +305,7 @@ func Start() {
 
 				r := bytes.NewReader(msg.TxExtendedBytes)
 				msgTx := &wire.MsgExtendedTx{}
+
 				err = msgTx.Deserialize(r)
 				if err != nil {
 					logger.Errorf("error deserializing tx %s: %v", utils.ReverseAndHexEncodeSlice(msg.IDBytes), err)
@@ -297,6 +317,7 @@ func Start() {
 						logger.Infof("[%s] Connection closed", msg.Conn.RemoteAddr())
 						continue
 					}
+
 					logger.Errorf("[%s] Failed to write message: %v", msg.Conn.RemoteAddr(), err)
 				}
 			}
@@ -313,6 +334,7 @@ func Start() {
 		if !ok {
 			panic("p2p_rejected_tx_topic not set in config")
 		}
+
 		rejectedTxTopicName := fmt.Sprintf("%s-%s", topicPrefix, rtn)
 
 		privateKey, _ := gocore.Config().Get("tx_blaster_p2p_private_key")
@@ -346,6 +368,7 @@ func Start() {
 
 	go func() {
 		var profilerAddr string
+
 		var startProfiler bool
 
 		if profileAddress != nil && *profileAddress != "" {
@@ -380,6 +403,7 @@ func Start() {
 		logger.Infof("[VALIDATOR] Using kubernetes resolver for clients")
 		kuberesolver.RegisterInClusterWithSchema("k8s")
 	}
+
 	if !*useQuic {
 		// we can get the propagation servers from the first distributor, they are all the same
 		propagationServers := txDistributors[0].GetPropagationGRPCAddresses()
@@ -390,7 +414,9 @@ func Start() {
 		logger.Infof("Using %d propagation servers: %+v", len(propagationServers), propagationServers)
 		logger.Infof("Starting %d workers", *workers)
 	}
+
 	var logIdsFile chan string
+
 	if *logIds {
 		logFile, err := os.OpenFile("/app/data/txblaster.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
@@ -424,7 +450,8 @@ func Start() {
 		if *useQuic {
 			// create a separate quic distributor for each worker
 			txDistributors = make([]*distributor.Distributor, 1)
-			txDistributors[0], err = distributor.NewQuicDistributor(logger,
+
+			txDistributors[0], err = distributor.NewQuicDistributor(logger, tSettings,
 				distributor.WithBackoffDuration(200*time.Millisecond),
 				distributor.WithRetryAttempts(3),
 				distributor.WithFailureTolerance(0),
@@ -434,14 +461,17 @@ func Start() {
 				continue
 			}
 		}
+
 		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
+
 		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completedCh, *useQuic)
 
 		if !runIndefinitely {
 			for i := 0; i < *workers; i++ {
 				<-completedCh
 			}
-			os.Exit(0)
+
+			os.Exit(0) //nolint:gocritic // exitAfterDefer: os.Exit will exit, and `defer func(){...}(...)` will not run (gocritic)
 		}
 		// stagger worker startup to not overload Coinbase
 		time.Sleep(staggerWorkersTime)
@@ -450,16 +480,18 @@ func Start() {
 	<-ctx.Done()
 }
 
+//nolint:stylecheck
 func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64, iterations int,
 	coinbaseClient *coinbase.Client, txDistributors []*distributor.Distributor, logIdsFile chan string, completed chan struct{}, useQuic bool) {
-
 	var w *worker.Worker
+
 	var err error
 
 	// Check if the iterations flag was set to a positive value
 	runIndefinitely := iterations < 0
 
 	retries := 1
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -489,14 +521,16 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 
 			err = w.Init(ctx)
 			if err != nil {
-				if strings.Contains(err.Error(), "no rows in result set") {
+				if strings.Contains(err.Error(), "no rows in result set") { //nolint:gocritic
 					logger.Warnf("No funds available for worker %d. Sleeping for 5 seconds", workerId)
 				} else if strings.Contains(err.Error(), "connection refused") {
 					logger.Warnf("Propagation service not available for worker %d : %v. Sleeping for 5 seconds", workerId, err)
 				} else {
 					logger.Errorf("Could not initialise worker %d: %v. Sleeping for 5 seconds", workerId, err)
 				}
+
 				time.Sleep(5 * time.Second)
+
 				continue
 			}
 
@@ -515,10 +549,12 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 			logger.Infof("worker %d failed, retrying in %s", workerId, waitTime)
 
 			time.Sleep(waitTime)
+
 			if !runIndefinitely {
 				logger.Infof("worker %d finished", workerId)
 				completed <- struct{}{}
 			}
+
 			retries++
 		}
 	}
