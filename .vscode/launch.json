@@ -464,7 +464,7 @@
       "program": "${workspaceFolder}/cmd/filereader/main.go",
       // "args": ["../../data/blockpersister/00d07e632c0db3fc18f43c47238db5162d4e8589c4fbc25dc2d84b4ca5a6d63a_0.utxodiff"]
       "args": [
-        "../../data/blockstore/00000000dd74d572772cafdb8c9f7a7ce14209605db76747843d811c91e61475.utxo-deletions"
+        "/Users/ordishs/dev/taal/ilumis/ubsv/6d2050d286d0b0a6436478fb83a15e33bd5aa87460cbeebca145cc65bfb33be4.subtree"
       ],
       // "env": {
         // "blockstore": "s3:///eu-ubsv-block-store?region=eu-west-1",
