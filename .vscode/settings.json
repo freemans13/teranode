@@ -39,6 +39,7 @@
     "chainintegrity",
     "chainstate",
     "chaintip",
+    "chainwork",
     "Cmdable",
     "cntxt",
     "coinb",
