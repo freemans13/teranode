@@ -40,16 +40,10 @@
         "local_test_start_from_state": "RUNNING",
       },
       "args": [
-        "-all=0",
-        "-blockchain=1",
-        "-blockassembly=1",
-        "-asset=1",
-        "-blockpersister=1",
-        "-rpc=1",
-        "-p2p=1",
-        // "-legacy=1"
-        // "-faucet=1",
-        // "-coinbase=1",
+        "-all=1",
+        "-legacy=1",
+        "-faucet=0",
+        "-coinbase=0",
       ]
     },
     {
@@ -92,7 +86,7 @@
       "args": []
     },
     {
-      "name": "UBSV - docker.ci.ubsv3",
+      "name": "UBSV - docker.ci.ubsv1",
       "type": "go",
       "request": "launch",
       "mode": "auto",
@@ -632,7 +626,20 @@
         "utxostore": "aerospike://localhost:3000/test?set=utxo&externalStore=file:///Users/ordishs/external"
       },
       "args": [ "3e4b1785cc97c0aaeb778943fd1cac0ecf300f31966fb71261584c780f000000" ]
-    }
+    },
+    {
+      "name": "Debug Current Test File",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}",
+      "buildFlags": "-tags=testtxmetacache",
+      "env": {
+        "SETTINGS_CONTEXT": "test",
+        "LONG_TESTS": "1"
+      },
+      "showLog": true
+    },
   ],
   "inputs": [
     {

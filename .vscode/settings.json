@@ -130,6 +130,7 @@
     "propagationblaster",
     "protobuf",
     "protoc",
+    "Protoconf",
     "protogen",
     "protojson",
     "pubkey",
