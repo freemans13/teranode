@@ -239,6 +239,7 @@
   "go.lintFlags": [
     "--fast"
   ],
+  "go.buildTags": "test_all",
   "cSpell.language": "en,en-US,en-GB,lorem",
   "sonarlint.connectedMode.project": {
     "connectionId": "UbsvSonarQube",
