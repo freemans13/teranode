@@ -41,8 +41,8 @@ function clean() {
 
   echo "Aerospike cleaning: $region $namespace"
   echo "Warning: If aerospike is too large, it might be faster to delete and restart the instances. Talk to the devops team."
-  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.ubsv.internal -v "truncate-namespace:namespace=txmeta-store;"
-  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.ubsv.internal -v "truncate-namespace:namespace=utxo-store;"
+  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.teranode.internal -v "truncate-namespace:namespace=txmeta-store;"
+  kubectl exec -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet $(kubectl get pod -n aerospike --context arn:aws:eks:$region:434394763103:cluster/teranet -o name | tail -c+5) -- asinfo -h ${namespace}aerospike-0.teranode.internal -v "truncate-namespace:namespace=utxo-store;"
 }
 
 function backup() {
@@ -51,7 +51,7 @@ function backup() {
   local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   local datePart=$(echo $timestamp | cut -d'T' -f1)
   local filename="${timestamp}-${region}-${namespace}.dump"
-  local s3Path="s3://ubsv-blockchain-backups/${datePart}/${filename}"
+  local s3Path="s3://teranode-blockchain-backups/${datePart}/${filename}"
 
   echo "Postgres backup: $region $namespace > $s3Path"
   kubectl exec -n postgres postgres-postgresql-0 --context arn:aws:eks:$region:434394763103:cluster/teranet -- env PGPASSWORD=$namespace pg_dump -U $namespace $namespace >/tmp/$filename

@@ -5,12 +5,12 @@ AWS Secret Access Key [None]: ....
 Default region name [None]: eu-north-1
 Default output format [None]:
 
- ~  $ aws eks update-kubeconfig --name aws-ubsv-playground --region ap-south-1
-Added new context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground to $HOME/.kube/config
+ ~  $ aws eks update-kubeconfig --name aws-teranode-playground --region ap-south-1
+Added new context arn:aws:eks:ap-south-1:434394763103:cluster/aws-teranode-playground to $HOME/.kube/config
 
-aws eks update-kubeconfig --name aws-ubsv-playground --region  eu-west-1
-aws eks update-kubeconfig --name aws-ubsv-playground --region  us-east-1
-aws eks update-kubeconfig --name aws-ubsv-playground --region  ap-south-1
+aws eks update-kubeconfig --name aws-teranode-playground --region  eu-west-1
+aws eks update-kubeconfig --name aws-teranode-playground --region  us-east-1
+aws eks update-kubeconfig --name aws-teranode-playground --region  ap-south-1
 
 this stuff is now under your
 ~/.kube  $ vi config
@@ -35,7 +35,7 @@ main.go --> os.Args(0) --> run a command.
 We deploy the compiled binary once, they all run the same image. Kubernetes rules below will define what Dockers to run
 
 (see keti blockassembly-12312321 --bash) --> ls -l --> we have all the runs there.
-The ubsv.run --> is the binary that is run in the Docker image. We just have symlinks.
+The teranode.run --> is the binary that is run in the Docker image. We just have symlinks.
 
 
 
@@ -56,14 +56,14 @@ In the utxo-blaster.yaml we have the following:
         - replicas: 0 - we want to have zero instances (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
         - role: propagation - only the pods with that role, run on those machines
         - tolerations --> ??
-        - image: REPO|IMAGE|TAG  (this will be the ubsv.run)
+        - image: REPO|IMAGE|TAG  (this will be the teranode.run)
         - command - command to run in the dockerimage, else it runs the default (entry point)
                 -- and args on top of it
         -- resources - machine requirements (otherwise do not run it)
                         (requests vs limits - sets a min and a max)
         -- readinessProbe -- is the pod ready to run?
         -- livenessProbe -- is the pod alive? In our case, we use both the same (health checks)
-           we can test this by doing curl http://m1.scaling.ubsv.dev:9091/health
+           we can test this by doing curl http://m1.scaling.teranode.dev:9091/health
         -- volumeMounts - we can mount volumes. there is a claimName, which links to the type -- like for example "claimName: luster-pvc" will go to luster-pvc.yaml which is an example of persistence storage. Here we can define sizes, and so forth.
         --
 
@@ -93,7 +93,7 @@ In the regional k8s folder, we have further kustomization.yaml that further cust
 
 Questions:
 
-Do services need to be started in any specific order? YES -- see ubsv/scripts/k8s/scaling/up.sh
+Do services need to be started in any specific order? YES -- see teranode/scripts/k8s/scaling/up.sh
 
 * Blockchain server
 * asset
@@ -105,7 +105,7 @@ Block Assembly Service - if it restarts, it loses all transactions in memory.
 
 Interesting to test the stuff Sukhendu is doing:
 docker-compose up postgres
-docker-compose-ci-distributed.yaml ubsv-1 (starts one of hte services)
+docker-compose-ci-distributed.yaml teranode-1 (starts one of hte services)
 
 
 ---
@@ -124,15 +124,15 @@ autoload -Uz compinit
 compinit
 source ~/.k8s_shortcuts.sh
 
-alias m1='kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-ubsv-playground; kcn m1'
+alias m1='kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-teranode-playground; kcn m1'
 
 
 
-alias m2='kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-ubsv-playground; kcn m2'
+alias m2='kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-teranode-playground; kcn m2'
 
 
 
-alias m3='kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-ubsv-playground; kcn m3'
+alias m3='kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-teranode-playground; kcn m3'
 
 
 -----

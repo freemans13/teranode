@@ -24,7 +24,7 @@
       "showLog": true
     },
     {
-      "name": "UBSV",
+      "name": "TERANODE",
       "type": "go",
       "request": "launch",
       "mode": "auto",
@@ -86,14 +86,14 @@
       "args": []
     },
     {
-      "name": "UBSV - docker.ci.ubsv1",
+      "name": "TERANODE - docker.ci.teranode1",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.ci.ubsv1.debug",
+        "SETTINGS_CONTEXT": "docker.ci.teranode1.debug",
         // "blockassembly_disabled": "true",
       },
       "args": [
@@ -107,14 +107,14 @@
       ]
     },
     {
-      "name": "UBSV - docker.ci.ubsv2",
+      "name": "TERANODE - docker.ci.teranode2",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.ci.ubsv2.debug"
+        "SETTINGS_CONTEXT": "docker.ci.teranode2.debug"
       },
       "args": [
         "-legacy=0"
@@ -125,14 +125,14 @@
         // "-all=1"
       ]
     },{
-      "name": "UBSV - docker.ci.ubsv3",
+      "name": "TERANODE - docker.ci.teranode3",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       // "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.ci.ubsv3.debug",
+        "SETTINGS_CONTEXT": "docker.ci.teranode3.debug",
       },
       "args": [
         "-legacy=0"
@@ -168,14 +168,14 @@
         // "-all=1"
       ]
     },{
-      "name": "UBSV docker.host.ubsv1",
+      "name": "TERANODE docker.host.teranode1",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.host.ubsv1",
+        "SETTINGS_CONTEXT": "docker.host.teranode1",
       },
       "args": [
         // "-all=0",
@@ -191,14 +191,14 @@
         // "-all=1"
       ]
     },{
-      "name": "UBSV docker.host.ubsv2",
+      "name": "TERANODE docker.host.teranode2",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.host.ubsv2",
+        "SETTINGS_CONTEXT": "docker.host.teranode2",
       },
       "args": [
         // "-all=0",
@@ -214,14 +214,14 @@
         // "-all=1"
       ]
     },{
-      "name": "UBSV docker.host.ubsv3",
+      "name": "TERANODE docker.host.teranode3",
       "type": "go",
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/.",
       "buildFlags": "-tags=aerospike",
       "env": {
-        "SETTINGS_CONTEXT": "docker.host.ubsv3",
+        "SETTINGS_CONTEXT": "docker.host.teranode3",
       },
       "args": [
         // "-all=0",
@@ -238,13 +238,13 @@
       ]
     },
       {
-        "name": "tx-blaster docker.host.ubsv1",
+        "name": "tx-blaster docker.host.teranode1",
         "type": "go",
         "request": "launch",
         "mode": "auto",
         "program": "${workspaceFolder}/cmd/txblaster/main.go",
         "env": {
-          "SETTINGS_CONTEXT": "docker.host.ubsv1",
+          "SETTINGS_CONTEXT": "docker.host.teranode1",
         },
           "args": [
           "-workers=1",
@@ -268,7 +268,7 @@
       ]
     },
     {
-      "name": "UBSV - aerospike",
+      "name": "TERANODE - aerospike",
       "type": "go",
       "request": "launch",
       "mode": "auto",
@@ -425,8 +425,8 @@
         "Xgrpc_resolver": "k8s",
         "logLevel": "DEBUG",
         "SETTINGS_CONTEXT": "allinone.miner.7",
-        "Xpropagation_grpcAddresses": "miner1.allinone.ubsv.dev:8084",
-        "Xcoinbase_grpcAddress": "miner1.allinone.ubsv.dev:8093"
+        "Xpropagation_grpcAddresses": "miner1.allinone.teranode.dev:8084",
+        "Xcoinbase_grpcAddress": "miner1.allinone.teranode.dev:8093"
       },
       "args": [
         "-workers=1",
@@ -458,10 +458,10 @@
       "program": "${workspaceFolder}/cmd/filereader/main.go",
       // "args": ["../../data/blockpersister/00d07e632c0db3fc18f43c47238db5162d4e8589c4fbc25dc2d84b4ca5a6d63a_0.utxodiff"]
       "args": [
-        "/Users/ordishs/dev/taal/ilumis/ubsv/6d2050d286d0b0a6436478fb83a15e33bd5aa87460cbeebca145cc65bfb33be4.subtree"
+        "/Users/ordishs/dev/taal/ilumis/teranode/6d2050d286d0b0a6436478fb83a15e33bd5aa87460cbeebca145cc65bfb33be4.subtree"
       ],
       // "env": {
-        // "blockstore": "s3:///eu-ubsv-block-store?region=eu-west-1",
+        // "blockstore": "s3:///eu-teranode-block-store?region=eu-west-1",
       // }
     },
     {
@@ -512,7 +512,7 @@
         "-f=/Users/freemans/Downloads/0c7171e2-6742-493a-9ede-95a57b19c81c.csv",
       ],
       "env": {
-        "SETTINGS_CONTEXT": "docker.host.ubsv1"
+        "SETTINGS_CONTEXT": "docker.host.teranode1"
       },
   },
   {
@@ -598,7 +598,7 @@
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/blockpersisterintegrity/main.go",
       "env": {
-        "SETTINGS_CONTEXT": "docker.host.ubsv1",
+        "SETTINGS_CONTEXT": "docker.host.teranode1",
       },
        "args": [
         "-d=postgres://poc2:poc2@localhost:5432/poc2",
@@ -612,7 +612,7 @@
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/chainintegrity/main.go",
       "env": {
-        "SETTINGS_CONTEXT": "docker.host.ubsv2",
+        "SETTINGS_CONTEXT": "docker.host.teranode2",
       },
     },
     {
@@ -646,20 +646,20 @@
       "id": "utxoStore",
       "type": "promptString",
       "description": "Enter the UTXO store URL",
-      // "default": "postgres://miner2:miner2@localhost:15432/ubsv2"
+      // "default": "postgres://miner2:miner2@localhost:15432/teranode2"
       "default": "aerospike://localhost:3200/test?WarmUp=32&ConnectionQueueSize=32&LimitConnectionsToQueueSize=true&MinConnectionsPerNode=8"
     },
     {
       "id": "blockchainStore",
       "type": "promptString",
       "description": "Enter the blockchain store URL",
-      "default": "postgres://miner2:miner2@localhost:15432/ubsv2"
+      "default": "postgres://miner2:miner2@localhost:15432/teranode2"
     },
     {
       "id": "subtreeStore",
       "type": "promptString",
       "description": "Enter the subtree store URL",
-      "default": "file:///data/ubsv2/subtreestore"
+      "default": "file:///data/teranode2/subtreestore"
     },
     {
       "id": "txHash",
