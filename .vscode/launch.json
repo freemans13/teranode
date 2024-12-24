@@ -425,8 +425,8 @@
         "Xgrpc_resolver": "k8s",
         "logLevel": "DEBUG",
         "SETTINGS_CONTEXT": "allinone.miner.7",
-        "Xpropagation_grpcAddresses": "miner1.allinone.teranode.dev:8084",
-        "Xcoinbase_grpcAddress": "miner1.allinone.teranode.dev:8093"
+        "Xpropagation_grpcAddresses": "miner1.allinone.ubsv.dev:8084",
+        "Xcoinbase_grpcAddress": "miner1.allinone.ubsv.dev:8093"
       },
       "args": [
         "-workers=1",

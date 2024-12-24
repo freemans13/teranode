@@ -63,7 +63,7 @@ In the utxo-blaster.yaml we have the following:
                         (requests vs limits - sets a min and a max)
         -- readinessProbe -- is the pod ready to run?
         -- livenessProbe -- is the pod alive? In our case, we use both the same (health checks)
-           we can test this by doing curl http://m1.scaling.teranode.dev:9091/health
+           we can test this by doing curl http://m1.scaling.ubsv.dev:9091/health
         -- volumeMounts - we can mount volumes. there is a claimName, which links to the type -- like for example "claimName: luster-pvc" will go to luster-pvc.yaml which is an example of persistence storage. Here we can define sizes, and so forth.
         --
 
