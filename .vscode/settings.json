@@ -224,7 +224,7 @@
   ],
   "cmake.configureOnOpen": false,
   "editor.codeActionsOnSave": {},
-  "go.buildTags": "aerospike,native,functional",
+  "go.buildTags": "aerospike,native,functional,test_all",
   "go.languageServerFlags": [],
   "go.useLanguageServer": true,
   "[go]": {
@@ -237,7 +237,6 @@
   "go.lintFlags": [
     "--fast"
   ],
-  "go.buildTags": "test_all",
   "cSpell.language": "en,en-US,en-GB,lorem",
   "sonarlint.connectedMode.project": {
     "connectionId": "UbsvSonarQube",
