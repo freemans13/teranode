@@ -209,7 +209,7 @@ func Start() {
 			samplingRate = 0.01
 		}
 
-		closer, err := tracing.InitOpenTracer(serviceName, samplingRate)
+		closer, err := tracing.InitOpenTracer(serviceName, samplingRate, tSettings)
 		if err != nil {
 			panic(err)
 		}
