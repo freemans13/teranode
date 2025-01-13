@@ -224,14 +224,17 @@
   ],
   "cmake.configureOnOpen": false,
   "editor.codeActionsOnSave": {},
-  "go.buildTags": "aerospike,native,functional,test_all",
-  "go.languageServerFlags": [],
+  "go.buildTags": "aerospike,native,functional,test_full,test_all,memory,redis,redis2,postgres,sqlite",
   "go.useLanguageServer": true,
   "[go]": {
     "editor.formatOnSave": true,
     "editor.codeActionsOnSave": {
       "source.organizeImports": "explicit"
-    }
+    },
+    "editor.snippetSuggestions": "none",
+    "editor.suggest.showConstants": false,
+    "editor.suggest.showFunctions": false,
+    "editor.suggest.showVariables": false
   },
   "go.lintTool": "golangci-lint",
   "go.lintFlags": [
@@ -242,5 +245,11 @@
     "connectionId": "UbsvSonarQube",
     "projectKey": "ubsv"
   },
-  "makefile.configureOnOpen": false
+  "makefile.configureOnOpen": false,
+  "github.copilot.enable": false,
+  "editor.suggestSelection": "first",
+  "editor.suggest.showKeywords": false,
+  "editor.suggest.showSnippets": false,
+  "editor.suggest.showWords": false,
+  "editor.suggestOnTriggerCharacters": false
 }
