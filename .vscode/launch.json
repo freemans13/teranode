@@ -5,6 +5,38 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Debug test tconfig",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${workspaceFolder}/test/utils/tconfig",
+      "cwd": "${workspaceFolder}/test/utils/tconfig",
+      "env": {
+        "SUITE_COMPOSES":"Val1FromEnvVar Val2FromEnvVar",
+        "URL_TERANODE":"RedefineEnvVar"
+      },
+      "args": [
+        "--config-file", "../example/tconfig/testabc.env"
+      ],
+      "showLog": true
+    },
+    {
+      "name": "Debug example tconfig",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/test/utils/example/tconfig",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "SUITE_COMPOSES":"Val1FromEnvVar Val2FromEnvVar",
+        "URL_TERANODE":"RedefineEnvVar"
+      },
+      "args": [
+        "--config-file", "./test/utils/example/tconfig/testabc.env"
+      ],
+      "showLog": true
+    },
+    {
       "name": "Debug TxValidator_test",
       "type": "go",
       "request": "launch",
