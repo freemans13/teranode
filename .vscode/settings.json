@@ -49,6 +49,7 @@
     "deduplicator",
     "defaultvalidator",
     "dialing",
+    "doublespendtest",
     "emptypb",
     "errgroup",
     "exister",
