@@ -8,7 +8,7 @@
       "name": "Debug test tconfig",
       "type": "go",
       "request": "launch",
-      "mode": "test",
+      "mode": "auto",
       "program": "${workspaceFolder}/test/utils/tconfig",
       "cwd": "${workspaceFolder}/test/utils/tconfig",
       "env": {
@@ -16,7 +16,7 @@
         "URL_TERANODE":"RedefineEnvVar"
       },
       "args": [
-        "--config-file", "../example/tconfig/testabc.env"
+        "--config-file", "../example/tconfig/testabc.env", "--skip-setup" , "true",
       ],
       "showLog": true
     },
@@ -32,7 +32,7 @@
         "URL_TERANODE":"RedefineEnvVar"
       },
       "args": [
-        "--config-file", "./test/utils/example/tconfig/testabc.env"
+        "--config-file", "./test/utils/example/tconfig/testabc.env", "--skip-setup",
       ],
       "showLog": true
     },
