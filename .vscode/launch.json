@@ -16,7 +16,7 @@
         "URL_TERANODE":"RedefineEnvVar"
       },
       "args": [
-        "--config-file", "../example/tconfig/testabc.env", "--skip-setup" , "true",
+        "--tconfig-file", "../example/tconfig/testabc.env", "--skip-setup" , "true",
       ],
       "showLog": true
     },
@@ -32,7 +32,7 @@
         "URL_TERANODE":"RedefineEnvVar"
       },
       "args": [
-        "--config-file", "./test/utils/example/tconfig/testabc.env", "--skip-setup",
+        "--tconfig-file", "./test/utils/example/tconfig/testabc.env", "--skip-setup",
       ],
       "showLog": true
     },
