@@ -71,6 +71,7 @@
     "gosec",
     "halvings",
     "hashable",
+    "httpmock",
     "ifnull",
     "Infof",
     "initialise",
