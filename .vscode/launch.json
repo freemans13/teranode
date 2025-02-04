@@ -5,6 +5,20 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Debug blobstore server",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/test/utils/cmd/blob/server",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "BSERVER_URL": ":8080",
+        "BSERVER_SUBDIR": "datafoo/teranode1/blockstore"
+      },
+      "args": [],
+      "showLog": true
+    },
+    {
       "name": "Debug tstore server",
       "type": "go",
       "request": "launch",
