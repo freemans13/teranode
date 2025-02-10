@@ -116,6 +116,11 @@ func Start() {
 	usePrivateDHT := gocore.Config().GetBool("p2p_dht_use_private", false)
 	optimiseRetries := gocore.Config().GetBool("p2p_optimise_retries", false)
 
+	spamRate, _ := gocore.Config().GetInt32("tx_blaster_spam_rate", 0)
+	if spamRate < 0 || spamRate > 100 {
+		spamRate = 0
+	}
+
 	if *e2e {
 		MIN_BLOCK_HEIGHT_FOR_E2E, _ := gocore.Config().GetInt("min_block_height_for_e2e", 200) //nolint:stylecheck
 
@@ -464,7 +469,7 @@ func Start() {
 
 		workerLogger := logger.New(fmt.Sprintf("wrk_%d", i))
 
-		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completedCh, *useQuic)
+		go startWorker(ctx, workerLogger, i, *rateLimit, *iterations, coinbaseClient, txDistributors, logIdsFile, completedCh, *useQuic, spamRate)
 
 		if !runIndefinitely {
 			for i := 0; i < *workers; i++ {
@@ -482,7 +487,7 @@ func Start() {
 
 //nolint:stylecheck
 func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateLimit float64, iterations int,
-	coinbaseClient *coinbase.Client, txDistributors []*distributor.Distributor, logIdsFile chan string, completed chan struct{}, useQuic bool) {
+	coinbaseClient *coinbase.Client, txDistributors []*distributor.Distributor, logIdsFile chan string, completed chan struct{}, useQuic bool, spamRate int32) {
 	var w *worker.Worker
 
 	var err error
@@ -519,7 +524,10 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 				continue
 			}
 
-			err = w.Init(ctx)
+			// NOTE: this is the only one we have for now, if we add more, we need to make this dynamic
+			malformationType := coinbase.ZeroSatoshis
+
+			err = w.Init(ctx, spamRate, malformationType)
 			if err != nil {
 				if strings.Contains(err.Error(), "no rows in result set") { //nolint:gocritic
 					logger.Warnf("No funds available for worker %d. Sleeping for 5 seconds", workerId)
