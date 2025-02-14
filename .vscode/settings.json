@@ -226,7 +226,7 @@
   ],
   "cmake.configureOnOpen": false,
   "editor.codeActionsOnSave": {},
-  "go.buildTags": "aerospike,native,functional,test_full,test_all,memory,redis,redis2,postgres,sqlite",
+  "go.buildTags": "aerospike,native,functional,test_sequentially,test_all,memory,redis,redis2,postgres,sqlite",
   "go.useLanguageServer": true,
   "[go]": {
     "editor.formatOnSave": true,
