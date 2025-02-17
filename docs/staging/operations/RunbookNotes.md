@@ -46,27 +46,6 @@ see settings with scaling.M1 suffixes.
 
 kcn m1 -- this switches me from one to another
 
---- For runthrough with simon, we used utxo-blaster.yaml
-
-We work with the utxo-blaster.yaml which exists per env or node in the examples below
-
-In the utxo-blaster.yaml we have the following:
-
-        - Name is important
-        - replicas: 0 - we want to have zero instances (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
-        - role: propagation - only the pods with that role, run on those machines
-        - tolerations --> ??
-        - image: REPO|IMAGE|TAG  (this will be the teranode.run)
-        - command - command to run in the dockerimage, else it runs the default (entry point)
-                -- and args on top of it
-        -- resources - machine requirements (otherwise do not run it)
-                        (requests vs limits - sets a min and a max)
-        -- readinessProbe -- is the pod ready to run?
-        -- livenessProbe -- is the pod alive? In our case, we use both the same (health checks)
-           we can test this by doing curl http://m1.scaling.ubsv.dev:9091/health
-        -- volumeMounts - we can mount volumes. there is a claimName, which links to the type -- like for example "claimName: luster-pvc" will go to luster-pvc.yaml which is an example of persistence storage. Here we can define sizes, and so forth.
-        --
-
 Roles can be seen as
 k get node ### all AWS machines in a given zone (node)
 k get node -L role
@@ -76,9 +55,6 @@ In the CI, we can do:
 kustomize kustomization.yaml ## runs as part of the CI build --> deploy-to-region.yaml
 - running this command - https://capture.dropbox.com/MYdvV14jbXe46Tym - it adds a images block at the end of the kustomization.yaml (during CI) - we do not want to commit this.
 - kustomize build . # populates all of the k8s yaml files and replaces the image and other stuff.
-
-We have a utxo-blaster-service.yaml which is the service that runs in the k8s cluster. It is a load balancer that points to the pods that are running the utxo-blaster.yaml
-It has a ports definition that points to the port and the target port that the pods are running.
 
 asset-grpc-ingress.yaml - it shows the ingress (the way to get to the service from the outside world)
 ast-grpc - basically means grpc over port 80
