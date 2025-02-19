@@ -5,6 +5,22 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Example test tna",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${workspaceFolder}/test/tna/tna1_test.go", // Replace with your test file path
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "LOCALSYSTEM_COMPOSES":"test/docker-compose.e2etest.yml",
+      },
+      "args": [
+        "-test.run", "^TestTNA1TestSuite$/TestBroadcastNewTxAllNodes$"
+      ],
+      "buildFlags": "-tags=test_tna",
+      "showLog": true
+    },
+    {
       "name": "Debug blobstore server",
       "type": "go",
       "request": "launch",
@@ -25,12 +41,9 @@
       "mode": "auto",
       "program": "${workspaceFolder}/test/utils/cmd/tstore",
       "cwd": "${workspaceFolder}",
-      "env": {
-        "SUITE_COMPOSES":"Val1FromEnvVar Val2FromEnvVar",
-        "URL_TERANODE":"RedefineEnvVar"
-      },
+      "env": {},
       "args": [
-        "--config-file", "./test/utils/cmd/tstore/localhost.env",
+        "--tconfig-file", "./test/utils/cmd/tstore/localhost.env",
       ],
       "showLog": true
     },
