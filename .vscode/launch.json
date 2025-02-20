@@ -491,6 +491,22 @@
       ]
     },
     {
+      "name": "docker host miner-1",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/miner/main.go",
+      "env": {
+        "logLevel": "DEBUG",
+        "SETTINGS_CONTEXT": "docker.host.teranode1"
+      },
+      "args": [
+        "-coinbase-addr=myL4TciLD59ESU9MmKH1rvfYb8QXhFHHN6",
+        "-coinbase-sig=/teranode1/",
+        "-rpcport=19292"
+      ]
+    },
+    {
       "name": "tx-blaster-miner7",
       "type": "go",
       "request": "launch",
