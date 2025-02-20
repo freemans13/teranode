@@ -357,7 +357,7 @@ func Start() {
 			StaticPeers:     staticPeers,
 		}
 
-		p2pNode, err := p2p.NewP2PNode(logger, tSettings, config)
+		p2pNode, err := p2p.NewP2PNode(logger, tSettings, config, nil)
 		if err != nil {
 			panic(err)
 		}
