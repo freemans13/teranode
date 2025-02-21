@@ -28,7 +28,6 @@ import (
 	"github.com/bitcoin-sv/teranode/tracing"
 	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bitcoin-sv/teranode/util/distributor"
-	"github.com/bitcoin-sv/teranode/util/kafka"
 	"github.com/bitcoin-sv/teranode/util/p2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/ordishs/go-utils"
@@ -43,13 +42,8 @@ const progname = "tx-blaster"
 // // Version & commit strings injected at build with -ldflags -X...
 var version string
 var commit string
-
 var logger ulogger.Logger
-
 var printProgress uint64
-
-var kafkaProducer kafka.KafkaProducerI
-var kafkaTopic string
 var ipv6MulticastConn *net.UDPConn
 var ipv6MulticastChan = make(chan worker.Ipv6MulticastMsg)
 var totalTransactions atomic.Uint64
@@ -85,7 +79,6 @@ func Start() {
 	workers := flag.Int("workers", runtime.NumCPU(), "how many workers to use for blasting")
 	rateLimit := flag.Float64("limit", -1, "rate limit tx/s per worker")
 	printFlag := flag.Int("print", 0, "print out progress every x transactions")
-	kafkaURL := flag.String("kafka", "", "Kafka server URL - if applicable")
 	ipv6Address := flag.String("ipv6Address", "", "IPv6 multicast address - if applicable")
 	ipv6Interface := flag.String("ipv6Interface", "en0", "IPv6 multicast interface - if applicable")
 	profileAddress := flag.String("profile", "", "use this profile port instead of the default")
@@ -255,31 +248,6 @@ func Start() {
 	coinbaseClient, err := coinbase.NewClient(ctx, logger, tSettings)
 	if err != nil {
 		logger.Fatalf("error creating coinbase tracker client: %v", err)
-	}
-
-	if kafkaURL != nil && *kafkaURL != "" {
-		logger.Infof("Connecting to kafka at %s", *kafkaURL)
-
-		kafkaURL, err := url.Parse(*kafkaURL)
-		if err != nil {
-			logger.Fatalf("unable to parse kafka url: %v", err)
-		}
-
-		clusterAdmin, producer, err := kafka.NewKafkaProducer(kafkaURL)
-		if err != nil {
-			logger.Fatalf("unable to connect to kafka: %v", err)
-		}
-
-		defer func() {
-			_ = clusterAdmin.Close()
-
-			if err = producer.Close(); err != nil {
-				logger.Errorf("error closing kafka producer: %v", err)
-			}
-		}()
-
-		kafkaProducer = producer
-		kafkaTopic = kafkaURL.Path[1:]
 	}
 
 	if ipv6Address != nil && *ipv6Address != "" {
@@ -508,8 +476,6 @@ func startWorker(ctx context.Context, logger ulogger.Logger, workerId int, rateL
 				iterations,
 				coinbaseClient,
 				txDistributors,
-				kafkaProducer,
-				kafkaTopic,
 				ipv6MulticastConn,
 				ipv6MulticastChan,
 				printProgress,

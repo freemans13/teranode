@@ -80,6 +80,7 @@
     "Ipfs",
     "jellydator",
     "kademlia",
+    "kafkamessage",
     "kafkatest",
     "keyset",
     "kinesiss",
