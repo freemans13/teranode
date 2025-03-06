@@ -408,17 +408,6 @@
       ]
     },
     {
-      "name": "blockassembly_blaster",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/cmd/blockassembly_blaster/main.go",
-      "env": {},
-      "args": [
-        "-broadcast=frpc"
-      ]
-    },
-    {
       "name": "aerospiketest",
       "type": "go",
       "request": "launch",

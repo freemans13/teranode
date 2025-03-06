@@ -64,7 +64,6 @@
     "filestorer",
     "foldermanager",
     "foundationdb",
-    "frpc",
     "fsrv",
     "gocognit",
     "gocore",
@@ -182,6 +181,7 @@
     "ttlcache",
     "TTLs",
     "TTLSET",
+    "TTLUNSET",
     "txblast",
     "txblaster",
     "txblockidcheck",
@@ -254,5 +254,11 @@
   "editor.suggest.showKeywords": false,
   "editor.suggest.showSnippets": false,
   "editor.suggest.showWords": false,
-  "editor.suggestOnTriggerCharacters": false
+  "editor.suggestOnTriggerCharacters": false,
+  "files.exclude": {
+    "**/.history": true
+  },
+  "search.exclude": {
+    "**/.history": true
+  }
 }
