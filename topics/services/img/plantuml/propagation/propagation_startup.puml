@@ -1,0 +1,68 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+
+participant "Propagation Server" as Server
+participant "Configuration System" as Config
+participant "UDP6 Listeners" as UDP6
+
+participant "gRPC Server" as gRPC
+participant "Kafka Producer" as Kafka
+participant "BlockchainClient" as BC
+
+activate Server
+
+Server -> Config: Get fsm_state_restore
+Config --> Server: fsmStateRestore
+
+alt if fsmStateRestore is true
+    Server -> BC: Restore()
+    BC --> Server: Restored
+    Server -> BC: WaitForFSMtoTransitionToGivenState(RUNNING)
+    BC --> Server: FSM in RUNNING state
+end
+
+Server -> Config: Get ipv6_addresses
+Config --> Server: ipv6Addresses
+Server -> UDP6: StartUDP6Listeners(ctx, ipv6Addresses)
+activate UDP6
+UDP6 --> Server: Listeners started/failed
+deactivate UDP6
+
+Server -> Config: Get kafka_validatortxsConfig
+Config --> Server: kafkaConfig
+Server -> Kafka: Setup Kafka Producer
+activate Kafka
+Kafka --> Server: Kafka Producer ready
+deactivate Kafka
+
+Server -> gRPC: StartGRPCServer(ctx, "propagation")
+activate gRPC
+gRPC --> Server: gRPC Server started/failed
+deactivate gRPC
+
+deactivate Server
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

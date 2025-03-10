@@ -1,0 +1,49 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant Client
+participant "RPC Server" as RPC
+participant "Blockchain Client" as Blockchain
+
+Client -> RPC : Request: GetBestBlockHash()
+activate RPC
+RPC -> RPC: handleGetBestBlockHash()
+
+activate RPC
+RPC -> Blockchain : GetBestBlockHeader()
+
+activate Blockchain
+Blockchain -> RPC : best block hash
+deactivate Blockchain
+
+deactivate RPC
+RPC -> Client : Response with BestBlockHash
+note right
+Response fields:
+- hash: Hex-encoded hash of the best block
+end note
+deactivate RPC
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

@@ -1,0 +1,101 @@
+@startuml overview
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+
+participant MainNet as mainnet
+participant "P2P Legacy\nOverlay Service" as legacy
+database "UTXO Store" as utxoStore
+database "Subtree Store" as subtreeStore
+database "Temporary Store\n(ConcurrentBlob)" as tempStore
+participant "Kafka\n[kafka_blocksConfig topic]" as kafkaBlock
+participant "Block Validator\n(Teranode)" as blockValidator
+participant "Kafka\n[subtrees topic]" as kafkaSubtree
+participant "Subtree Validator\n(Teranode)" as subtreeValidator
+
+mainnet -> legacy : OnBlock(peer, msg, bytes)
+activate legacy
+
+legacy -> legacy: build block from bytes
+
+legacy -> legacy: HandleBlock(block)
+activate legacy
+
+legacy -> legacy: create a new (empty) subtree
+legacy -> legacy: add a placeholder coinbase tx\n to the subtree
+
+loop each tx
+    legacy -> legacy: add Tx Hash to the Subtree
+    legacy -> legacy: Validate tx (local checks and via validator client)
+end
+
+legacy -> subtreeStore: Store Subtree data
+subtreeStore --> legacy
+
+legacy -> legacy: Build a Teranode block (block, coinbaseTx, subtree)
+
+legacy -> tempStore: Store block in ConcurrentBlob with TTL (90 min)
+tempStore --> legacy
+
+legacy -> kafkaBlock: Publish(hash, base_url)
+note right: Send block notification message \nwith hash and base_url
+
+kafkaBlock -> blockValidator: Consume message
+activate blockValidator
+
+blockValidator -> legacy: HTTP GET request for block data
+note right: Retrieves block from the temporary store
+
+legacy --> blockValidator: block data (response)
+
+blockValidator -> kafkaSubtree: Publish(hash, baseUrl)
+note right: Send subtree notification message \nwith hash and base_url
+
+kafkaSubtree -> subtreeValidator: Consume message
+activate subtreeValidator
+
+subtreeValidator -> legacy: HTTP GET request for subtree data
+note right: Retrieves subtree from the subtree store
+
+legacy --> subtreeValidator: subtree data (response)
+
+
+loop each txid
+    subtreeValidator -> legacy: HTTP GET request for transaction data
+    legacy -> tempStore: Retrieve tx if available
+    tempStore --> legacy
+    legacy --> subtreeValidator: tx data (response)
+end
+
+deactivate subtreeValidator
+
+blockValidator -> blockValidator: Add block to blockchain
+
+deactivate blockValidator
+
+deactivate legacy
+
+deactivate legacy
+
+left footer "P2P Legacy - Block Processing \n Last Modified On: %date("dd-MMM-yyyy"). © 2025 Bitcoin SV. All rights reserved."
+
+@enduml

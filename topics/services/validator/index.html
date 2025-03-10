@@ -1,0 +1,5945 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../subtreeValidation/">
+      
+      
+        <link rel="next" href="../blockPersister/">
+      
+      
+      <link rel="icon" href="../../architecture/img/bsvblockchain_blue_logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.7">
+    
+    
+      
+        <title>Validator - Teranode</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.8608ea7d.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        
+        <link rel="stylesheet" href="../../../assets/external/fonts.googleapis.com/css.49ea35f2.css">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../../overrides/custom.css">
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#tx-validator" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Teranode
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Validator
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../.." class="md-tabs__link">
+        
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../tutorials/developers/developerSetup/" class="md-tabs__link">
+          
+  
+  Tutorials
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../howto/locallyRunningServices/" class="md-tabs__link">
+          
+  
+  How-To Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../../teranodeIntro/" class="md-tabs__link">
+          
+  
+  Key Topics
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../references/projectStructure/" class="md-tabs__link">
+          
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    Teranode
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../.." class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Home
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Tutorials
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            Tutorials
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../tutorials/developers/developerSetup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../tutorials/miners/minersGettingStarted/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Miners Getting Started
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    How-To Guides
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            How-To Guides
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/locallyRunningServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Services Locally
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Debugging Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/generatingProtobuf/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Generating Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/addingNewProtobufServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Adding Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/configuringGrpcLogging/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Configuring gRPC Logging
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/runningTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/automatedTestingHowTo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Automated Testing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/makefile/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Makefile Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/bugReporting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Bug Reporting
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer's Guide to Teranode-CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11" id="__nav_3_11_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Miners
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11">
+            <span class="md-nav__icon md-icon"></span>
+            Miners
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/howToUseTheTestMiner.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Using Test Miner
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_2" id="__nav_3_11_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Installation
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_2">
+            <span class="md-nav__icon md-icon"></span>
+            Installation
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToInstallationDeprecated/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Deprecated
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_3" id="__nav_3_11_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Configuration
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_3">
+            <span class="md-nav__icon md-icon"></span>
+            Configuration
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Aerospike Tuning
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    FSM Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_4" id="__nav_3_11_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Start/Stop
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_4">
+            <span class="md-nav__icon md-icon"></span>
+            Start/Stop
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_5" id="__nav_3_11_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Updating Teranode
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_5">
+            <span class="md-nav__icon md-icon"></span>
+            Updating Teranode
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_6" id="__nav_3_11_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Security Best Practices
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_6">
+            <span class="md-nav__icon md-icon"></span>
+            Security Best Practices
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_7" id="__nav_3_11_7_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Troubleshooting
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_7">
+            <span class="md-nav__icon md-icon"></span>
+            Troubleshooting
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_8" id="__nav_3_11_8_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Additional
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_8">
+            <span class="md-nav__icon md-icon"></span>
+            Additional
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    CPU Mining Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToResetTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Reset Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToSyncTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Sync the Node
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Managing Disk Space
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToBackup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Backup (Kubernetes)
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Key Topics
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            Key Topics
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../teranodeIntro/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Introduction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-overall-system-design/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-architecture-brief/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Brief
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-microservices-overview/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Microservices Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/stateManagement/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    State Management
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/understandingDoubleSpends/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding Double Spends
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technologyStack/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Technology Stack
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../understandingTheTestingFramework/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding the Testing Framework
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../functionalRequirementTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Functional Requirement Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_10" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_10" id="__nav_4_10_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Features
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_10">
+            <span class="md-nav__icon md-icon"></span>
+            Features
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../features/two_phase_commit/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Two Phase Commit
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_11" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_4_11" id="__nav_4_11_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_11_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4_11">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alert/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../assetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockAssembly/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockchain/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../propagation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../subtreeValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#index" class="md-nav__link">
+    <span class="md-ellipsis">
+      Index
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-description" class="md-nav__link">
+    <span class="md-ellipsis">
+      1. Description
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. Description">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#11-deployment-models" class="md-nav__link">
+    <span class="md-ellipsis">
+      1.1 Deployment Models
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kafka-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Kafka Integration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#communication-patterns-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      Communication Patterns Summary
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-functionality" class="md-nav__link">
+    <span class="md-ellipsis">
+      2. Functionality
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Functionality">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-starting-the-validator-as-a-service" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1. Starting the Validator as a service
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-receiving-transaction-validation-requests" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2. Receiving Transaction Validation Requests
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-validating-the-transaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.3. Validating the Transaction
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.3. Validating the Transaction">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#231-consensus-rules-vs-policy-checks" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.3.1. Consensus Rules vs Policy Checks
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.3.1. Consensus Rules vs Policy Checks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#skip-policy-checks-feature" class="md-nav__link">
+    <span class="md-ellipsis">
+      Skip Policy Checks Feature
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#skip-policy-checks-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      Skip Policy Checks - Usage
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-script-verification" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.4. Script Verification
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-error-handling-and-transaction-rejection" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.5. Error Handling and Transaction Rejection
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#26-concurrent-processing" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.6. Concurrent Processing
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#27-post-validation-updating-stores-and-propagating-the-transaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7. Post-validation: Updating stores and propagating the transaction
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration-settings-affecting-validator-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Settings Affecting Validator Behavior
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rejected-transaction-handling" class="md-nav__link">
+    <span class="md-ellipsis">
+      Rejected Transaction Handling
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Rejected Transaction Handling">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#271-two-phase-transaction-commit-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.1. Two-Phase Transaction Commit Process
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-grpc-protobuf-definitions" class="md-nav__link">
+    <span class="md-ellipsis">
+      3. gRPC Protobuf Definitions
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-data-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      4. Data Model
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-technology" class="md-nav__link">
+    <span class="md-ellipsis">
+      5. Technology
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-directory-structure-and-main-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      6. Directory Structure and Main Files
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-how-to-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      7. How to run
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-configuration-options-settings-flags" class="md-nav__link">
+    <span class="md-ellipsis">
+      8. Configuration options (settings flags)
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. Configuration options (settings flags)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#81-configuration-categories" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.1 Configuration Categories
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#82-deployment-architecture-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.2 Deployment Architecture Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.2 Deployment Architecture Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#deployment-architecture-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Deployment Architecture Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#83-network-communication-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.3 Network &amp; Communication Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.3 Network &amp; Communication Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#network-communication-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network &amp; Communication Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#84-performance-throughput-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.4 Performance &amp; Throughput Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.4 Performance &amp; Throughput Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#performance-throughput-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Performance &amp; Throughput Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#85-kafka-integration-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.5 Kafka Integration Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.5 Kafka Integration Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#kafka-integration-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Kafka Integration Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#86-validation-rules-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.6 Validation Rules Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.6 Validation Rules Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#validation-rules-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Validation Rules Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#87-monitoring-debugging-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.7 Monitoring &amp; Debugging Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.7 Monitoring &amp; Debugging Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#monitoring-debugging-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Monitoring &amp; Debugging Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-other-resources" class="md-nav__link">
+    <span class="md-ellipsis">
+      9. Other Resources
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_12" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_12" id="__nav_4_12_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_12_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_12">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../p2p/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../legacy/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Legacy
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../rpc/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../utxoPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_13" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_13" id="__nav_4_13_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_13">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stores/blob/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stores/utxo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_14" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Data Model
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_14">
+            <span class="md-nav__icon md-icon"></span>
+            Data Model
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/block_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/block_header_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Header Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/subtree_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/transaction_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Transaction Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/utxo_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_15" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Kafka
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_15">
+            <span class="md-nav__icon md-icon"></span>
+            Kafka
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kafka/kafka/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Commands
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_16">
+            <span class="md-nav__icon md-icon"></span>
+            Commands
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/chainIntegrity.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Chain Integrity
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/propagationBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/seeder/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Seeder
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/txBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    TX Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Reference
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            Reference
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/projectStructure/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Project Structure
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2" id="__nav_5_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    API & Protobuf
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2">
+            <span class="md-nav__icon md-icon"></span>
+            API & Protobuf
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/errorHandling/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Error Handling
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/glossary/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Glossary
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/codingConventions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Coding Conventions
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/kafkaMessageFormat/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Message Format
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/networkConsensusRules/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Network Consensus Rules
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2_6" id="__nav_5_2_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Protobuf API
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_5_2_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2_6">
+            <span class="md-nav__icon md-icon"></span>
+            Protobuf API
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/alertProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_3" id="__nav_5_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_3">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/alert_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/asset_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockassembly_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockvalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockchain_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/propagation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/subtreevalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/validator_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_4" id="__nav_5_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_4">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockpersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/p2p_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/legacy_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P Legacy Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/rpc_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/utxopersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/stores/blob_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/stores/utxo_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_6" id="__nav_5_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Miscellaneous
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_6">
+            <span class="md-nav__icon md-icon"></span>
+            Miscellaneous
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Git Commit Signing Setup Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/licenseInformation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Licensing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/prometheusMetrics/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Prometheus Metrics
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/settings/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Settings
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/teranodeDaemonReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Daemon Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/testingTechnicalReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Testing Technical Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Third-Party Software Requirements
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#index" class="md-nav__link">
+    <span class="md-ellipsis">
+      Index
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-description" class="md-nav__link">
+    <span class="md-ellipsis">
+      1. Description
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. Description">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#11-deployment-models" class="md-nav__link">
+    <span class="md-ellipsis">
+      1.1 Deployment Models
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kafka-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Kafka Integration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#communication-patterns-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      Communication Patterns Summary
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-functionality" class="md-nav__link">
+    <span class="md-ellipsis">
+      2. Functionality
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Functionality">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-starting-the-validator-as-a-service" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1. Starting the Validator as a service
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-receiving-transaction-validation-requests" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2. Receiving Transaction Validation Requests
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-validating-the-transaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.3. Validating the Transaction
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.3. Validating the Transaction">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#231-consensus-rules-vs-policy-checks" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.3.1. Consensus Rules vs Policy Checks
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.3.1. Consensus Rules vs Policy Checks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#skip-policy-checks-feature" class="md-nav__link">
+    <span class="md-ellipsis">
+      Skip Policy Checks Feature
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#skip-policy-checks-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      Skip Policy Checks - Usage
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-script-verification" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.4. Script Verification
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-error-handling-and-transaction-rejection" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.5. Error Handling and Transaction Rejection
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#26-concurrent-processing" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.6. Concurrent Processing
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#27-post-validation-updating-stores-and-propagating-the-transaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7. Post-validation: Updating stores and propagating the transaction
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration-settings-affecting-validator-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Settings Affecting Validator Behavior
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rejected-transaction-handling" class="md-nav__link">
+    <span class="md-ellipsis">
+      Rejected Transaction Handling
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Rejected Transaction Handling">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#271-two-phase-transaction-commit-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.1. Two-Phase Transaction Commit Process
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-grpc-protobuf-definitions" class="md-nav__link">
+    <span class="md-ellipsis">
+      3. gRPC Protobuf Definitions
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-data-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      4. Data Model
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-technology" class="md-nav__link">
+    <span class="md-ellipsis">
+      5. Technology
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-directory-structure-and-main-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      6. Directory Structure and Main Files
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-how-to-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      7. How to run
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-configuration-options-settings-flags" class="md-nav__link">
+    <span class="md-ellipsis">
+      8. Configuration options (settings flags)
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. Configuration options (settings flags)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#81-configuration-categories" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.1 Configuration Categories
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#82-deployment-architecture-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.2 Deployment Architecture Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.2 Deployment Architecture Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#deployment-architecture-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Deployment Architecture Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#83-network-communication-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.3 Network &amp; Communication Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.3 Network &amp; Communication Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#network-communication-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network &amp; Communication Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#84-performance-throughput-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.4 Performance &amp; Throughput Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.4 Performance &amp; Throughput Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#performance-throughput-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Performance &amp; Throughput Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#85-kafka-integration-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.5 Kafka Integration Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.5 Kafka Integration Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#kafka-integration-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Kafka Integration Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#86-validation-rules-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.6 Validation Rules Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.6 Validation Rules Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#validation-rules-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Validation Rules Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#87-monitoring-debugging-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.7 Monitoring &amp; Debugging Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8.7 Monitoring &amp; Debugging Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#monitoring-debugging-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Monitoring &amp; Debugging Interactions and Dependencies
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-other-resources" class="md-nav__link">
+    <span class="md-ellipsis">
+      9. Other Resources
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<h1 id="tx-validator">🔍 TX Validator</h1>
+<h2 id="index">Index</h2>
+<ol>
+<li><a href="#1-description">Description</a></li>
+<li><a href="#2-functionality">Functionality</a><ul>
+<li><a href="#21-starting-the-validator-as-a-service">2.1. Starting the Validator as a service</a></li>
+<li><a href="#22-receiving-transaction-validation-requests">2.2. Receiving Transaction Validation Requests</a></li>
+<li><a href="#23-validating-the-transaction">2.3. Validating the Transaction</a></li>
+<li><a href="#231-consensus-rules-vs-policy-checks">2.3.1. Consensus Rules vs Policy Checks</a></li>
+<li><a href="#24-script-verification">2.4. Script Verification</a></li>
+<li><a href="#25-error-handling-and-transaction-rejection">2.5. Error Handling and Transaction Rejection</a></li>
+<li><a href="#26-concurrent-processing">2.6. Concurrent Processing</a></li>
+<li><a href="#27-post-validation-updating-stores-and-propagating-the-transaction">2.7. Post-validation: Updating stores and propagating the transaction</a></li>
+<li><a href="#271-two-phase-transaction-commit-process">2.7.1. Two-Phase Transaction Commit Process</a></li>
+</ul>
+</li>
+<li><a href="#3-grpc-protobuf-definitions">gRPC Protobuf Definitions</a></li>
+<li><a href="#4-data-model">Data Model</a></li>
+<li><a href="#5-technology">Technology</a></li>
+<li><a href="#6-directory-structure-and-main-files">Directory Structure and Main Files</a></li>
+<li><a href="#7-how-to-run">How to run</a></li>
+<li><a href="#8-configuration-options-settings-flags">Configuration options (settings flags)</a></li>
+<li><a href="#9-other-resources">Other Resources</a></li>
+</ol>
+<h2 id="1-description">1. Description</h2>
+<p>The <code>Validator</code> (also called <code>Transaction Validator</code> or <code>Tx Validator</code>) is a go component responsible for:</p>
+<ol>
+<li>Receiving new transactions from the <code>Propagation</code>service,</li>
+<li>Validating them,</li>
+<li>Persisting the data into the utxo store,</li>
+<li>
+<p>Propagating the transactions to other services based on validation results:</p>
+</li>
+<li>
+<p><strong>Block Assembly service</strong>: Direct gRPC calls for validated transactions (if the Tx is passed)</p>
+</li>
+<li><strong>Subtree Validation service</strong>: Kafka topic for transaction metadata (if the Tx is passed)</li>
+<li><strong>P2P service</strong>: Kafka topic for rejected transaction notifications (if the tx is rejected)</li>
+</ol>
+<h3 id="11-deployment-models">1.1 Deployment Models</h3>
+<p>The Validator can be deployed in two distinct ways:</p>
+<ol>
+<li>
+<p><strong>Local Validator (Recommended)</strong>:</p>
+<ul>
+<li>The Validator is instantiated directly within other services (like the Propagation, Subtree Validation, and Legacy Services)</li>
+<li>This is the recommended approach for production deployments due to better performance</li>
+<li>No additional network calls are needed between services and validator</li>
+<li>Configuration: Set <code>validator.useLocalValidator=true</code> in your settings</li>
+</ul>
+</li>
+<li>
+<p><strong>Remote Validator Service</strong>:</p>
+<ul>
+<li>The Validator runs as an independent service with a gRPC interface</li>
+<li>Other services connect to it remotely via gRPC</li>
+<li>This approach has higher latency due to additional network calls</li>
+<li>Useful for development, testing, or specialized deployment scenarios</li>
+<li>Configuration: Set <code>validator.useLocalValidator=false</code> and configure validator gRPC endpoint</li>
+</ul>
+</li>
+</ol>
+<p>The performance difference between these approaches can be significant, as the local validator approach eliminates network overhead between services.</p>
+<blockquote>
+<p><strong>Note</strong>: For detailed information about how the daemon initializes services and manages dependencies, see the <a href="../../../references/teranodeDaemonReference/#service-initialization-flow">Teranode Daemon Reference</a>.</p>
+</blockquote>
+<p><img alt="Tx_Validator_Container_Diagram.png" src="../img/Tx_Validator_Container_Diagram.png" /></p>
+<p>The Validator, as a component, is instantiated as part of any service requiring to validate transactions.
+However, the Validator can also be started as a service, allowing to interact with it via gRPC or Kafka. This setup is not recommended, given its performance overhead.</p>
+<p>The Validator receives notifications about new Txs.</p>
+<p>Also, the <code>Validator</code> will accept subscriptions from the P2P Service, where rejected tx notifications are pushed to.</p>
+<p><img alt="Tx_Validator_Component_Diagram.png" src="../img/Tx_Validator_Component_Diagram.png" /></p>
+<p>The Validator notifies the Block Assembly service of new transactions through gRPC calls via the Block Assembly client interface.</p>
+<p>A node can start multiple parallel instances of the TX Validator. This translates into multiple pods within a Kubernetes cluster. Each instance / pod will have its own gRPC server, and will be able to receive and process transactions independently. GRPC load balancing allows to distribute the load across the multiple instances.</p>
+<h3 id="kafka-integration">Kafka Integration</h3>
+<p>The Validator uses Kafka for several critical messaging paths:</p>
+<ol>
+<li>
+<p><strong>Transaction Metadata Publishing</strong>:</p>
+<ul>
+<li>Successfully validated transactions have their metadata published to a Kafka topic</li>
+<li>Metadata includes transaction ID, size, fee, input and output information</li>
+<li>The <code>txmetaKafkaProducerClient</code> handles this publishing process</li>
+<li>Target topic is configured via <code>Kafka.TxMetaConfig</code> settings</li>
+</ul>
+</li>
+<li>
+<p><strong>Rejected Transaction Notifications</strong>:</p>
+<ul>
+<li>When transactions fail validation, details are published to a rejection topic</li>
+<li>The <code>rejectedTxKafkaProducerClient</code> is responsible for these messages</li>
+<li>Includes rejection reason, transaction ID, and error classification</li>
+<li>Helps with network-wide tracking of invalid transactions</li>
+</ul>
+</li>
+<li>
+<p><strong>Transaction Validation Requests</strong>:</p>
+<ul>
+<li>The Validator can also consume validation requests via Kafka</li>
+<li>This enables asynchronous transaction processing patterns</li>
+<li>Useful for high-throughput scenarios where immediate responses aren't needed</li>
+</ul>
+</li>
+</ol>
+<p>The Kafka integration provides resilience, allowing the system to handle temporary outages or service unavailability by buffering messages.</p>
+<h3 id="communication-patterns-summary">Communication Patterns Summary</h3>
+<p>The Validator uses different communication patterns depending on the target service and use case:</p>
+<p><strong>Outbound Communications (Validator → Other Services):</strong>
+- <strong>Block Assembly</strong>: gRPC calls via <code>blockassembly.ClientI</code> interface - used for real-time transaction forwarding to mining candidates
+- <strong>Subtree Validation</strong>: Kafka producer via <code>txmetaKafkaProducerClient</code> - used for transaction metadata publishing
+- <strong>P2P Service</strong>: Kafka producer via <code>rejectedTxKafkaProducerClient</code> - used for rejected transaction notifications</p>
+<p><strong>Inbound Communications (Other Services → Validator):</strong>
+- <strong>Propagation Service</strong>: Direct method calls (local validator) or gRPC calls (remote validator)
+- <strong>Subtree Validation Service</strong>: Direct method calls (local validator) or gRPC calls (remote validator)
+- <strong>Kafka Consumers</strong>: Kafka messages via <code>consumerClient</code> - used for asynchronous validation requests
+- <strong>HTTP API</strong>: REST endpoints for external validation requests</p>
+<p>The choice between local method calls and gRPC depends on the deployment model configured via the <code>useLocalValidator</code> setting.</p>
+<h2 id="2-functionality">2. Functionality</h2>
+<h3 id="21-starting-the-validator-as-a-service">2.1. Starting the Validator as a service</h3>
+<p>Should the node require to start the validator as an independent service, the <code>services/validator/Server.go</code> will be instantiated as follows:</p>
+<p><img alt="tx_validator_init.svg" src="../img/plantuml/validator/tx_validator_init.svg" /></p>
+<ul>
+<li>
+<p><strong><code>NewServer</code> Function</strong>:</p>
+<ol>
+<li>Initialize a new <code>Server</code> instance.</li>
+<li>Create channels for new and dead subscriptions.</li>
+<li>Initialize a map for subscribers.</li>
+<li>Create a context for subscriptions and a corresponding cancellation function.</li>
+<li>Return the newly created <code>Server</code> instance.</li>
+</ol>
+</li>
+<li>
+<p><strong><code>Init</code> Function</strong>:</p>
+<ol>
+<li>Create a new validator instance within the server.</li>
+<li>Handle any errors during the creation of the validator.</li>
+<li>Return the outcome (success or error).</li>
+</ol>
+</li>
+<li>
+<p><strong><code>Start</code> Function</strong>:</p>
+<ol>
+<li>Start a goroutine to manage new and dead subscriptions.</li>
+<li>Start the gRPC server and handle any errors.</li>
+</ol>
+</li>
+</ul>
+<h3 id="22-receiving-transaction-validation-requests">2.2. Receiving Transaction Validation Requests</h3>
+<p>The Propagation and Subtree Validation modules invoke the validator process in order to have new or previously missed Txs validated. The Propagation service is responsible for processing new Txs, while the Block Validation service is responsible for identifying missed Txs while processing blocks.</p>
+<p><img alt="tx_validation_request_process.svg" src="../img/plantuml/validator/tx_validation_request_process.svg" /></p>
+<p>BlockValidation and Propagation invoke the validator process with and without batching. Batching is settings controlled, and improves the processing performance.</p>
+<ol>
+<li>
+<p><strong>Transaction Propagation</strong>:</p>
+<ul>
+<li>The Propagation module <code>ProcessTransaction()</code> function invokes <code>Validate()</code> on the Validator client.</li>
+<li>The Validator validates the transaction.</li>
+</ul>
+</li>
+<li>
+<p><strong>Subtree Validation</strong>:</p>
+<ul>
+<li>The SubtreeValidation module <code>blessMissingTransaction()</code> function invokes <code>Validate()</code> on the Validator client.</li>
+<li>The Validator validates the transaction.</li>
+</ul>
+</li>
+</ol>
+<h3 id="23-validating-the-transaction">2.3. Validating the Transaction</h3>
+<p>For every transaction received, Teranode must validate:</p>
+<ul>
+<li>All inputs against the existing UTXO-set, verifying if the input(s) can be spent,<ul>
+<li>Notice that if Teranode detects a double-spend, the transaction that was received first must be considered the valid transaction.</li>
+</ul>
+</li>
+<li>Bitcoin consensus rules,</li>
+<li>Local policies (if any),</li>
+<li>Whether the script execution returns <code>true</code>.</li>
+</ul>
+<p>Teranode will consider a transaction that passes consensus rules, local policies and script validation as fully validated and fit to be included in the next possible block.</p>
+<p>The validation process includes several stages:</p>
+<ol>
+<li>
+<p><strong>Basic Transaction Structure Validation</strong>:</p>
+<ul>
+<li>Verify inputs and outputs are present</li>
+<li>Check transaction size against policy limits</li>
+<li>Validate input and output value ranges</li>
+</ul>
+</li>
+<li>
+<p><strong>Policy Validation</strong>:</p>
+<ul>
+<li>Apply configurable policy rules that can be enabled/disabled</li>
+<li>Check transaction fees against minimum requirements</li>
+<li>Enforce limits on script operations (sigops)</li>
+</ul>
+</li>
+<li>
+<p><strong>Input Validation</strong>:</p>
+<ul>
+<li>Verify inputs exist in the UTXO set</li>
+<li>Ensure inputs are unspent (prevent double-spending)</li>
+<li>Validate input script format</li>
+</ul>
+</li>
+</ol>
+<p>New Txs are validated by the <code>ValidateTransaction()</code> function. To ensure the validity of the extended Tx, this is delegated to a BSV library: <code>github.com/TAAL-GmbH/arc/validator/default</code> (the default validator).</p>
+<p>We can see the exact steps being executed as part of the validation process below:</p>
+<div class="highlight"><pre><span></span><code><span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">tv</span><span class="w"> </span><span class="o">*</span><span class="nx">TxValidator</span><span class="p">)</span><span class="w"> </span><span class="nx">ValidateTransaction</span><span class="p">(</span><span class="nx">tx</span><span class="w"> </span><span class="o">*</span><span class="nx">bt</span><span class="p">.</span><span class="nx">Tx</span><span class="p">,</span><span class="w"> </span><span class="nx">blockHeight</span><span class="w"> </span><span class="kt">uint32</span><span class="p">,</span><span class="w"> </span><span class="nx">validationOptions</span><span class="w"> </span><span class="o">*</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w"> </span><span class="c1">//</span>
+<span class="w"> </span><span class="c1">// Each node will verify every transaction against a long checklist of criteria:</span>
+<span class="w"> </span><span class="c1">//</span>
+<span class="w"> </span><span class="nx">txSize</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">tx</span><span class="p">.</span><span class="nx">Size</span><span class="p">()</span>
+
+<span class="w"> </span><span class="c1">// 1) Neither lists of inputs nor outputs are empty</span>
+<span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">tx</span><span class="p">.</span><span class="nx">Inputs</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">tx</span><span class="p">.</span><span class="nx">Outputs</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="nx">errors</span><span class="p">.</span><span class="nx">NewTxInvalidError</span><span class="p">(</span><span class="s">&quot;transaction has no inputs or outputs&quot;</span><span class="p">)</span>
+<span class="w"> </span><span class="p">}</span>
+
+<span class="w"> </span><span class="c1">// 2) The transaction size in bytes is less than maxtxsizepolicy.</span>
+<span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">validationOptions</span><span class="p">.</span><span class="nx">SkipPolicyChecks</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">tv</span><span class="p">.</span><span class="nx">checkTxSize</span><span class="p">(</span><span class="nx">txSize</span><span class="p">);</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">   </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w"> </span><span class="p">}</span>
+
+<span class="w"> </span><span class="c1">// 3) check that each input value, as well as the sum, are in the allowed range of values (less than 21m coins)</span>
+<span class="w"> </span><span class="c1">// 5) None of the inputs have hash=0, N=–1 (coinbase transactions should not be relayed)</span>
+<span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">tv</span><span class="p">.</span><span class="nx">checkInputs</span><span class="p">(</span><span class="nx">tx</span><span class="p">,</span><span class="w"> </span><span class="nx">blockHeight</span><span class="p">);</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+<span class="w"> </span><span class="p">}</span>
+
+<span class="w"> </span><span class="c1">// 4) Each output value, as well as the total, must be within the allowed range of values (less than 21m coins,</span>
+<span class="w"> </span><span class="c1">//    more than the dust threshold if 1 unless it&#39;s OP_RETURN, which is allowed to be 0)</span>
+<span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">tv</span><span class="p">.</span><span class="nx">checkOutputs</span><span class="p">(</span><span class="nx">tx</span><span class="p">,</span><span class="w"> </span><span class="nx">blockHeight</span><span class="p">);</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+<span class="w"> </span><span class="p">}</span>
+
+<span class="w"> </span><span class="c1">// The transaction size in bytes is greater than or equal to 100 (BCH only check, not applicable to BSV)</span>
+
+<span class="w"> </span><span class="c1">// The number of signature operations (SIGOPS) contained in the transaction is less than the signature operation limit</span>
+<span class="w"> </span><span class="c1">// Note: This may be disabled for unlimited operation counts</span>
+
+<span class="w"> </span><span class="c1">// The unlocking script (scriptSig) can only push numbers on the stack</span>
+<span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nx">tv</span><span class="p">.</span><span class="nx">interpreter</span><span class="p">.</span><span class="nx">Interpreter</span><span class="p">()</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">TxInterpreterGoBDK</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">blockHeight</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">tv</span><span class="p">.</span><span class="nx">settings</span><span class="p">.</span><span class="nx">ChainCfgParams</span><span class="p">.</span><span class="nx">UahfForkHeight</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">tv</span><span class="p">.</span><span class="nx">pushDataCheck</span><span class="p">(</span><span class="nx">tx</span><span class="p">);</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">   </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w"> </span><span class="p">}</span>
+
+<span class="w"> </span><span class="c1">// 10) Reject if the sum of input values is less than sum of output values</span>
+<span class="w"> </span><span class="c1">// 11) Reject if transaction fee would be too low (minRelayTxFee) to get into an empty block.</span>
+<span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">validationOptions</span><span class="p">.</span><span class="nx">SkipPolicyChecks</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">tv</span><span class="p">.</span><span class="nx">checkFees</span><span class="p">(</span><span class="nx">tx</span><span class="p">,</span><span class="w"> </span><span class="nx">feesToBtFeeQuote</span><span class="p">(</span><span class="nx">tv</span><span class="p">.</span><span class="nx">settings</span><span class="p">.</span><span class="nx">Policy</span><span class="p">.</span><span class="nx">GetMinMiningTxFee</span><span class="p">()));</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">   </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w"> </span><span class="p">}</span>
+
+<span class="w"> </span><span class="c1">// 12) The unlocking scripts for each input must validate against the corresponding output locking scripts</span>
+<span class="w"> </span><span class="c1">// (Script verification is handled separately with multiple interpreter options)</span>
+
+<span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The above represents an implementation of the core Teranode validation rules:</p>
+<ul>
+<li>
+<p>All transactions must exist and be unspent (does not apply to Coinbase transactions).</p>
+</li>
+<li>
+<p>All transaction inputs must have been present in either a transaction in an ancestor block, or in a transaction in the same block that is located before the transaction being validated.</p>
+</li>
+<li>
+<p>All transaction inputs must not have been spent by any transaction in ancestor blocks, or by any transaction in the same block that is not located after the transaction being validated</p>
+</li>
+<li>
+<p>The length of the script (scriptSig) in the Coinbase transaction must be between 2 and (including) 100 bytes.</p>
+</li>
+<li>
+<p>The transaction must be syntactically valid:</p>
+</li>
+<li>
+<p>A transaction must have at least one input</p>
+</li>
+<li>
+<p>A transaction must have at least one output</p>
+</li>
+<li>
+<p>The amount of satoshis in all outputs must be less than or equal to the amount of satoshis in the inputs, to avoid new BSV being introduced to the network</p>
+</li>
+<li>
+<p>The amount in all outputs must be between 0 and 21,000,000 BSV (2.1 * 10^15 satoshi)</p>
+</li>
+<li>
+<p>The amount of all inputs must be between 0 and 21,000,000 BSV. The sum of the amount over all inputs must not be larger than 21,000,000 BSV.</p>
+</li>
+<li>
+<p>A transaction must be final, meaning that either of the following conditions is met:</p>
+<ul>
+<li>
+<p>The sequence number in all inputs is equal to 0xffffffff, or</p>
+</li>
+<li>
+<p>The lock time is:</p>
+</li>
+<li>
+<p>Equal to zero, or</p>
+</li>
+<li>
+<p>&lt;500000000 and smaller than block height, or &gt;=500000000 and SMALLER THAN TIMESTAMP</p>
+</li>
+<li>
+<p>Note: This means that Teranode will deem non-final transactions invalid and REJECT these transactions. It is up to the user to create proper non-final transactions to ensure that Teranode is aware of them. For clarity, if a transaction has a locktime in the future, the Tx Validator will reject it.</p>
+</li>
+<li>
+<p>No output must be Pay-to-Script-Hash (P2SH)</p>
+</li>
+<li>
+<p>A new transaction must not have any output which includes P2SH, as creation of new P2SH transactions is not allowed.</p>
+</li>
+<li>
+<p>Historical P2SH transactions (if any) must still be supported by Teranode, allowing these transactions to be spent.</p>
+</li>
+<li>
+<p>A transaction must not spend frozen UTXOs (see 3.13 – Integration with Alert System)</p>
+</li>
+<li>
+<p>A node must not be able to spend a confiscated (re-assigned) transaction until 1,000 blocks after the transaction was re-assigned (confiscation maturity). The difference between block height and height at which the transaction was re-assigned must not be less than one thousand.</p>
+</li>
+</ul>
+</li>
+</ul>
+<h4 id="231-consensus-rules-vs-policy-checks">2.3.1. Consensus Rules vs Policy Checks</h4>
+<p>In Bitcoin transaction validation, there are two distinct types of rules:</p>
+<ol>
+<li>
+<p><strong>Consensus Rules</strong>: Mandatory rules that all nodes must enforce to maintain network consensus. Transactions violating consensus rules are always rejected. These include:</p>
+<ul>
+<li>Transaction structure and formatting</li>
+<li>Double-spend prevention</li>
+<li>Input and output value constraints</li>
+<li>Script execution validity</li>
+</ul>
+</li>
+<li>
+<p><strong>Policy Rules</strong>: Node-specific preferences that determine which valid transactions to accept, relay, or mine. Policy rules can differ between nodes without breaking consensus. These include:</p>
+<ul>
+<li>Minimum transaction fees</li>
+<li>Maximum transaction size</li>
+<li>Script complexity limits</li>
+<li>Dust output thresholds</li>
+</ul>
+</li>
+</ol>
+<p>The TX Validator implements both types of rules, but provides the ability to skip policy checks when appropriate through the <code>SkipPolicyChecks</code> option.</p>
+<h5 id="skip-policy-checks-feature">Skip Policy Checks Feature</h5>
+<p>The <code>SkipPolicyChecks</code> feature allows Teranode to validate transactions while bypassing certain policy-based validations. When enabled, the validator will:</p>
+<ul>
+<li>Skip transaction size policy checks</li>
+<li>Skip minimum fee requirements</li>
+<li>Apply consensus-only script verification rules</li>
+<li>Continue enforcing all consensus rules</li>
+</ul>
+<p>This feature is particularly important when validating transactions that:</p>
+<ul>
+<li>Are part of blocks mined by other miners (which have already been validated through proof-of-work)</li>
+<li>Need to be accepted regardless of local policy preferences</li>
+<li>Have already been confirmed on the blockchain</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="c1">// Example of policy checks being conditionally applied:</span>
+<span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">validationOptions</span><span class="p">.</span><span class="nx">SkipPolicyChecks</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">tv</span><span class="p">.</span><span class="nx">checkFees</span><span class="p">(</span><span class="nx">tx</span><span class="p">,</span><span class="w"> </span><span class="nx">feesToBtFeeQuote</span><span class="p">(</span><span class="nx">tv</span><span class="p">.</span><span class="nx">settings</span><span class="p">.</span><span class="nx">Policy</span><span class="p">.</span><span class="nx">GetMinMiningTxFee</span><span class="p">()));</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>When validating transactions from blocks mined by other nodes, policy checks should be skipped because these blocks are already valid due to proof-of-work, and the transactions must be accepted to maintain consensus, even if they don't meet local policy preferences.</p>
+<h5 id="skip-policy-checks-usage">Skip Policy Checks - Usage</h5>
+<p>To use this feature:</p>
+<ul>
+<li>When directly calling the validator: Use the <code>WithSkipPolicyChecks(true)</code> option</li>
+<li>When using the gRPC API endpoint: Set the <code>skip_policy_checks</code> field to <code>true</code> in the <code>ValidateTransactionRequest</code> message</li>
+<li>In services like Subtree Validation: The option is applied automatically when validating block transactions</li>
+</ul>
+<h3 id="24-script-verification">2.4. Script Verification</h3>
+<p>The Validator supports multiple script verification implementations through a flexible interpreter architecture. Three different script interpreters are supported:</p>
+<ol>
+<li>
+<p><strong>GoBT Interpreter</strong> (<code>TxInterpreterGoBT</code>):</p>
+<ul>
+<li>Based on the Go-BT library</li>
+<li>Default interpreter for basic script validation</li>
+</ul>
+</li>
+<li>
+<p><strong>GoSDK Interpreter</strong> (<code>TxInterpreterGoSDK</code>):</p>
+<ul>
+<li>Based on the Go-SDK library</li>
+<li>Provides advanced script validation capabilities</li>
+</ul>
+</li>
+<li>
+<p><strong>GoBDK Interpreter</strong> (<code>TxInterpreterGoBDK</code>):</p>
+<ul>
+<li>Based on the Go-BDK library</li>
+<li>Optimized for performance in high-throughput scenarios</li>
+<li>Includes specialized Bitcoin script validation features</li>
+</ul>
+</li>
+</ol>
+<p>The script verification process:</p>
+<ol>
+<li>
+<p>Each transaction input's unlocking script is validated against its corresponding output's locking script</p>
+</li>
+<li>
+<p>The interpreter evaluates if the combined script executes successfully and leaves 'true' on the stack</p>
+</li>
+<li>
+<p>The script verification is context-aware, considering current block height and network parameters</p>
+</li>
+</ol>
+<p>Script verification can be configured using the <code>validator_scriptVerificationLibrary</code> setting, which defaults to "VerificatorGoBT".</p>
+<h3 id="25-error-handling-and-transaction-rejection">2.5. Error Handling and Transaction Rejection</h3>
+<p>The Validator implements a structured error handling system to categorize and report different types of validation failures:</p>
+<ol>
+<li>
+<p><strong>Error Types</strong>:</p>
+<ul>
+<li><code>TxInvalidError</code>: Generated when a transaction fails basic validation rules</li>
+<li><code>ProcessingError</code>: Occurs during transaction processing issues</li>
+<li><code>ConfigurationError</code>: Indicates validator configuration problems</li>
+<li><code>ServiceError</code>: Represents broader service-level issues</li>
+</ul>
+</li>
+<li>
+<p><strong>Rejection Flow</strong>:</p>
+<ul>
+<li>When a transaction is rejected, detailed error information is captured</li>
+<li>Rejection reasons are categorized (e.g., invalid inputs, script failure, insufficient fees)</li>
+<li>Rejected transactions are published to a dedicated Kafka topic if configured</li>
+<li>The P2P service receives notifications about rejected transactions</li>
+</ul>
+</li>
+<li>
+<p><strong>Error Propagation</strong>:</p>
+<ul>
+<li>Errors are wrapped and propagated through the system with context information</li>
+<li>GRPC error codes translate internal errors for API responses</li>
+<li>Detailed error messages assist in diagnosing validation issues</li>
+</ul>
+</li>
+</ol>
+<h3 id="26-concurrent-processing">2.6. Concurrent Processing</h3>
+<p>The Validator leverages concurrency to optimize transaction processing performance:</p>
+<ol>
+<li>
+<p><strong>Parallel UTXO Saving</strong>:</p>
+<ul>
+<li>The <code>saveInParallel</code> flag enables concurrent UTXO updates</li>
+<li>Improves throughput by processing multiple transactions simultaneously</li>
+</ul>
+</li>
+<li>
+<p><strong>Batching</strong>:</p>
+<ul>
+<li>Transactions can be validated in batches for higher throughput</li>
+<li>Batch processing is configurable and used by both Propagation and Subtree Validation services</li>
+<li>The <code>TriggerBatcher()</code> method initiates batch processing when sufficient transactions accumulate</li>
+</ul>
+</li>
+<li>
+<p><strong>Error Group Pattern</strong>:</p>
+<ul>
+<li>Uses Go's <code>errgroup</code> package for coordinated concurrent execution</li>
+<li>Maintains proper error propagation in concurrent processing flows</li>
+</ul>
+</li>
+<li>
+<p><strong>Two-Phase Commit Process</strong>:</p>
+<ul>
+<li>The <code>twoPhaseCommitTransaction</code> method ensures atomic transaction processing</li>
+<li>Prevents partial updates in case of failures during concurrent processing</li>
+</ul>
+</li>
+</ol>
+<h3 id="27-post-validation-updating-stores-and-propagating-the-transaction">2.7. Post-validation: Updating stores and propagating the transaction</h3>
+<p>Once a Tx is validated, the Validator will update the UTXO store with the new Tx data. Then, it will notify the Block Assembly service and any P2P subscribers about the new Tx.</p>
+<p><img alt="tx_validation_post_process.svg" src="../img/plantuml/validator/tx_validation_post_process.svg" /></p>
+<ul>
+<li>The Server receives a validation request and calls the <code>Validate</code> method on the Validator struct.</li>
+<li>
+<p>If the transaction is valid:</p>
+<ul>
+<li>The Validator marks the transaction's input UTXOs as spent in the UTXO Store.</li>
+<li>The Validator registers the new transaction in the UTXO Store.</li>
+<li>The Validator sends transaction metadata to the Subtree Validation Service via Kafka topic (<code>txmeta</code>).</li>
+<li>The Validator sends the transaction to the Block Assembly Service via direct gRPC calls.</li>
+<li>The Validator stores the new UTXOs generated by the transaction in the UTXO Store.</li>
+</ul>
+</li>
+<li>
+<p>If the transaction is invalid:</p>
+<ul>
+<li>The Server sends invalid transaction notifications to all P2P Service subscribers.</li>
+<li>The rejected Tx is not stored or tracked in any store, and it is simply discarded.</li>
+</ul>
+</li>
+</ul>
+<p>We can see the submission to the Subtree Validation Service here:</p>
+<p><img alt="tx_validation_subtree_validation.svg" src="../img/plantuml/validator/tx_validation_subtree_validation.svg" /></p>
+<p>We can dive deeper into the submission to the Block Assembly:</p>
+<p><img alt="tx_validation_block_assembly.svg" src="../img/plantuml/validator/tx_validation_block_assembly.svg" /></p>
+<p>The Validator notifies the Block Assembly service of new transactions through gRPC calls via the Block Assembly client interface by calling the <code>Store()</code> method on the Block Assembly client.</p>
+<h3 id="configuration-settings-affecting-validator-behavior">Configuration Settings Affecting Validator Behavior</h3>
+<p>The Validator service behavior is controlled by several key configuration parameters:</p>
+<ul>
+<li><strong><code>KafkaMaxMessageBytes</code></strong> (default: 1MB): Controls size-based routing - large transactions that exceed this threshold are routed via HTTP instead of Kafka to avoid message size limitations.</li>
+<li><strong><code>UseLocalValidator</code></strong> (default: false): Determines whether to use a local validator instance or connect to a remote validator service via gRPC.</li>
+<li><strong><code>KafkaWorkers</code></strong> (default: 0): Controls the number of concurrent Kafka message processing workers. When set to 0, Kafka consumer processing is disabled.</li>
+<li><strong><code>HTTPRateLimit</code></strong> (default: 1024): Sets the rate limit for HTTP API requests to prevent service overload.</li>
+<li><strong><code>VerboseDebug</code></strong> (default: false): Enables detailed validation logging for troubleshooting.</li>
+</ul>
+<h3 id="rejected-transaction-handling">Rejected Transaction Handling</h3>
+<p>When the Transaction Validator Service identifies an invalid transaction, it employs a Kafka-based notification system to inform other components of the system. Here's an overview of this process:</p>
+<p><img alt="tx_validation_p2p_subscribers.svg" src="../img/plantuml/validator/tx_validation_p2p_subscribers.svg" /></p>
+<ol>
+<li>
+<p><strong>Transaction Validation</strong>:</p>
+<ul>
+<li>The Validator receives a transaction for validation via a gRPC call to the <code>ValidateTransaction</code> method.</li>
+<li>The Validator performs its checks, including script verification, UTXO spending, and other validation rules.</li>
+</ul>
+</li>
+<li>
+<p><strong>Identification of Invalid Transactions</strong>:</p>
+<ul>
+<li>If the transaction fails any of the validation checks, it is deemed invalid (rejected).</li>
+</ul>
+</li>
+<li>
+<p><strong>Notification of Rejected Transactions</strong>:</p>
+<ul>
+<li>When a transaction is rejected, the Validator publishes information about the rejected transaction to a dedicated Kafka topic (<code>rejectedTx</code>).</li>
+<li>This is done using the Rejected Tx Kafka Producer, which is configured via the <code>kafka_rejectedTxConfig</code> setting.</li>
+</ul>
+</li>
+<li>
+<p><strong>Kafka Message Content</strong>:</p>
+<ul>
+<li>
+<p>The Kafka message for a rejected transaction typically includes:</p>
+<ul>
+<li>The transaction ID (hash)</li>
+<li>The reason for rejection (error message)</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Consumption of Rejected Transaction Notifications</strong>:</p>
+<ul>
+<li>Other services in the system, such as the P2P Service, can subscribe to this Kafka topic.</li>
+<li>By consuming messages from this topic, these services receive notifications about rejected transactions and can take appropriate action (e.g., banning peers that send invalid transactions).</li>
+</ul>
+</li>
+</ol>
+<h4 id="271-two-phase-transaction-commit-process">2.7.1. Two-Phase Transaction Commit Process</h4>
+<p>The Validator implements a two-phase commit process for transaction creation and addition to block assembly:</p>
+<ol>
+<li>
+<p><strong>Phase 1 - Transaction Creation with Locked Flag</strong>:</p>
+<ul>
+<li>When a transaction is created, it is initially stored in the UTXO store with an "locked" flag set to <code>true</code>.</li>
+<li>This flag prevents the transaction outputs from being spent while it's in the process of being validated and added to block assembly, protecting against potential double-spend attempts.</li>
+</ul>
+</li>
+<li>
+<p><strong>Phase 2 - Unsetting the Locked Flag</strong>:</p>
+<ul>
+<li>The locked flag is unset in two key scenarios:</li>
+</ul>
+<p>a. <strong>After Successful Addition to Block Assembly</strong>:</p>
+<div class="highlight"><pre><span></span><code>- When a transaction is successfully validated and added to the block assembly, the Validator service immediately unsets the &quot;locked&quot; flag (sets it to `false`).
+- This makes the transaction outputs available for spending in subsequent transactions, even before the transaction is mined in a block.
+</code></pre></div>
+<p>b. <strong>When Mined in a Block (Fallback Mechanism)</strong>:</p>
+<div class="highlight"><pre><span></span><code>- As a fallback mechanism, if the flag hasn&#39;t been unset already, it will be unset when the transaction is mined in a block.
+- When the transaction is mined in a block and that block is processed by the Block Validation service, the &quot;locked&quot; flag is unset (set to `false`) during the `SetMinedMulti` operation.
+</code></pre></div>
+</li>
+<li>
+<p><strong>Ignoring Locked Flag for Block Transactions</strong>:</p>
+<ul>
+<li>When processing transactions that are part of a block (as opposed to new transactions to include in an upcoming block), the validator can be configured to ignore the locked flag.</li>
+<li>This is necessary because transactions in a block have already been validated by miners and must be accepted regardless of their locked status.</li>
+<li>The validator uses the <code>WithIgnoreLocked</code> option to control this behavior during transaction validation.</li>
+</ul>
+</li>
+</ol>
+<p>This two-phase commit approach ensures that transactions are only made spendable after they've been successfully added to block assembly, reducing the risk of race conditions and double-spend attempts during the transaction processing lifecycle.</p>
+<blockquote>
+<p><strong>For a comprehensive explanation of the two-phase commit process across the entire system, see the <a href="../../features/two_phase_commit/">Two-Phase Transaction Commit Process</a> documentation.</strong></p>
+</blockquote>
+<h2 id="3-grpc-protobuf-definitions">3. gRPC Protobuf Definitions</h2>
+<p>The Validator, when run as a service, uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be found in the protobuf documentation.</p>
+<h2 id="4-data-model">4. Data Model</h2>
+<p>The Validation Service deals with the extended transaction format, as seen below:</p>
+<ul>
+<li><a href="../../datamodel/transaction_data_model/">Extended Transaction Data Model</a>: Include additional metadata to facilitate processing.</li>
+</ul>
+<h2 id="5-technology">5. Technology</h2>
+<p>The code snippet you've provided utilizes a variety of technologies and libraries, each serving a specific purpose within the context of a Bitcoin SV (BSV) blockchain-related application. Here's a breakdown of these technologies:</p>
+<ol>
+<li>
+<p><strong>Go (Golang)</strong>: The programming language used for the entire codebase.</p>
+</li>
+<li>
+<p><strong>gRPC</strong>: Google's Remote Procedure Call system, used here for server-client communication. It enables the server to expose specific methods that clients can call remotely. This is only used if the component is started as a service.</p>
+</li>
+<li>
+<p><strong>Kafka (by Apache)</strong>: A distributed streaming platform (optionally) used here for message handling. Kafka is used for distributing transaction validation data to the block assembly.</p>
+<ul>
+<li><a href="../../kafka/kafka/#validator-component">Kafka in Teranode</a>: Overview of Kafka integration with the Validator component</li>
+<li><a href="../../../references/kafkaMessageFormat/">Kafka Message Format</a>: Details on message formats used in Kafka communication</li>
+</ul>
+</li>
+<li>
+<p><strong>Sarama</strong>: A Go library for Apache Kafka.</p>
+</li>
+<li>
+<p><strong>Go-Bitcoin</strong>: A Go library that provides utilities and tools for working with Bitcoin, including transaction parsing and manipulation.</p>
+</li>
+<li>
+<p><strong>BSV Libraries</strong>: Go libraries from the bsv-blockchain organization for Bitcoin SV, used for transaction-related operations.</p>
+</li>
+<li>
+<p><strong>Other Utilities and Libraries</strong>:</p>
+<ul>
+<li><code>sync/atomic</code>, <code>strings</code>, <code>strconv</code>, <code>time</code>, <code>io</code>, <code>net/url</code>, <code>os</code>, <code>bytes</code>, and other standard Go packages for various utility functions.</li>
+<li><code>github.com/ordishs/gocore</code> and <code>github.com/ordishs/go-utils/batcher</code>: Utility libraries, used for handling core functionalities and batch processing.</li>
+<li><code>github.com/opentracing/opentracing-go</code>: Used for distributed tracing.</li>
+</ul>
+</li>
+</ol>
+<h2 id="6-directory-structure-and-main-files">6. Directory Structure and Main Files</h2>
+<div class="highlight"><pre><span></span><code>./services/validator
+├── Client.go                    # Contains client-side logic for interacting with the Validator
+├── Interface.go                 # Defines interfaces for the Validator
+├── ScriptVerificatorGoBDK.go    # Implements script verification using a Go Bitcoin Development Kit
+├── ScriptVerificatorGoBT.go     # Implements script verification using Go Bitcoin Tools
+├── ScriptVerificatorGoSDK.go    # Implements script verification using a Go Software Development Kit
+├── Server.go                    # Implements the server-side logic of the Validator
+├── TxValidator.go               # Contains specific logic for validating transactions
+├── Validator.go                 # Contains the main logic for validator functionalities
+├── data.go                      # Contains data structures or constants used in the validator service
+├── metrics.go                   # Contains code for metrics collection within the Validator
+├── options.go                   # Defines configuration options or settings for the validator service
+├── policy.go                    # Defines validation policies or rules
+└── validator_api
+    ├── validator_api.pb.go          # Auto-generated Go code from validator_api.proto
+    ├── validator_api.proto          # Protocol Buffers definition file for the validator API
+    └── validator_api_grpc.pb.go     # Auto-generated gRPC specific code from validator_api.proto
+</code></pre></div>
+<h2 id="7-how-to-run">7. How to run</h2>
+<p>To run the Validator locally, you can execute the following command:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">SETTINGS_CONTEXT</span><span class="o">=</span>dev.<span class="o">[</span>YOUR_USERNAME<span class="o">]</span><span class="w"> </span>go<span class="w"> </span>run<span class="w"> </span>-Validator<span class="o">=</span><span class="m">1</span>
+</code></pre></div>
+<p>Please refer to the <a href="../../../howto/locallyRunningServices/">Locally Running Services Documentation</a> document for more information on running the Validator locally.</p>
+<h2 id="8-configuration-options-settings-flags">8. Configuration options (settings flags)</h2>
+<p>The TX Validator service relies on a set of configuration settings that control its behavior, performance, and integration with other services. This section provides a comprehensive overview of these settings, organized by functional category, along with their impacts, dependencies, and recommended configurations for different deployment scenarios.</p>
+<h3 id="81-configuration-categories">8.1 Configuration Categories</h3>
+<p>TX Validator service settings can be organized into the following functional categories:</p>
+<ol>
+<li><strong>Deployment Architecture</strong>: Settings that determine how the validator is deployed and integrated</li>
+<li><strong>Network &amp; Communication</strong>: Settings that control network binding and API endpoints</li>
+<li><strong>Performance &amp; Throughput</strong>: Settings that affect transaction processing performance</li>
+<li><strong>Kafka Integration</strong>: Settings for message-based communication</li>
+<li><strong>Validation Rules</strong>: Settings that control transaction validation policies</li>
+<li><strong>Monitoring &amp; Debugging</strong>: Settings for observability and troubleshooting</li>
+</ol>
+<h3 id="82-deployment-architecture-settings">8.2 Deployment Architecture Settings</h3>
+<p>These settings fundamentally change how the validator operates within the system architecture.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>useLocalValidator</code></td>
+<td>bool</td>
+<td><code>false</code></td>
+<td>Controls whether validation is performed locally or via remote service</td>
+<td>Significantly affects system architecture, latency, and deployment model</td>
+</tr>
+</tbody>
+</table>
+<h4 id="deployment-architecture-interactions-and-dependencies">Deployment Architecture Interactions and Dependencies</h4>
+<p>The <code>useLocalValidator</code> setting has profound implications for system architecture:</p>
+<ul>
+<li>When <code>true</code>, the validator is instantiated directly within other services (Propagation, Subtree Validation, Legacy), eliminating network overhead but requiring these services to be compiled with the validator</li>
+<li>When <code>false</code>, the validator runs as an independent service with a gRPC interface that other services connect to remotely</li>
+</ul>
+<p>This choice creates two distinct deployment architectures:</p>
+<p><strong>Local Validator Architecture:</strong></p>
+<ul>
+<li>Services contain embedded validator instances</li>
+<li>No network calls between services and validator</li>
+<li>Lower latency and higher throughput</li>
+<li>All services must be redeployed when validator code changes</li>
+<li>Limited deployment flexibility</li>
+</ul>
+<p><strong>Remote Validator Architecture:</strong></p>
+<ul>
+<li>Validator runs as a standalone service</li>
+<li>Network calls between services and validator</li>
+<li>Higher latency but more flexible deployment</li>
+<li>Validator can be scaled independently</li>
+<li>Supports independent deployment and updates</li>
+</ul>
+<h3 id="83-network-communication-settings">8.3 Network &amp; Communication Settings</h3>
+<p>These settings control how the validator communicates over the network.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>validator_grpcAddress</code></td>
+<td>string</td>
+<td><code>"localhost:8081"</code></td>
+<td>Address for connecting to the validator gRPC service</td>
+<td>Determines how other services connect to the validator</td>
+</tr>
+<tr>
+<td><code>validator_grpcListenAddress</code></td>
+<td>string</td>
+<td><code>":8081"</code></td>
+<td>Address on which the validator gRPC server listens</td>
+<td>Controls network binding for incoming validation requests</td>
+</tr>
+<tr>
+<td><code>validator_httpListenAddress</code></td>
+<td>string</td>
+<td><code>""</code></td>
+<td>Address on which the HTTP API server listens</td>
+<td>Enables HTTP-based validation requests when set</td>
+</tr>
+<tr>
+<td><code>validator_httpAddress</code></td>
+<td>*url.URL</td>
+<td><code>nil</code></td>
+<td>URL for connecting to the validator HTTP API</td>
+<td>Determines how other services connect to the HTTP interface</td>
+</tr>
+<tr>
+<td><code>validator_httpRateLimit</code></td>
+<td>int</td>
+<td><code>1024</code></td>
+<td>Maximum number of HTTP requests per second</td>
+<td>Prevents resource exhaustion from excessive requests</td>
+</tr>
+<tr>
+<td><code>grpc_resolver</code></td>
+<td>string</td>
+<td><code>""</code></td>
+<td>Determines the gRPC resolver to use</td>
+<td>Enables service discovery in Kubernetes environments</td>
+</tr>
+</tbody>
+</table>
+<h4 id="network-communication-interactions-and-dependencies">Network &amp; Communication Interactions and Dependencies</h4>
+<p>The validator offers two API interfaces for transaction validation:</p>
+<p><strong>gRPC Interface</strong>:</p>
+<ul>
+<li>Primary interface for high-performance validation requests</li>
+<li>Used by Propagation and Subtree Validation services</li>
+<li>Always enabled when running in remote validator mode</li>
+<li>Configured through <code>validator_grpcAddress</code> and <code>validator_grpcListenAddress</code></li>
+</ul>
+<p><strong>HTTP Interface</strong>:</p>
+<ul>
+<li>Optional secondary interface for REST-based validation requests</li>
+<li>Only enabled when <code>validator_httpListenAddress</code> is set</li>
+<li>Provides a simpler interface for testing and third-party integrations</li>
+<li>Protected by rate limiting through <code>validator_httpRateLimit</code></li>
+</ul>
+<p>In Kubernetes environments, the <code>grpc_resolver</code> setting enables service discovery to locate validator instances dynamically.</p>
+<h3 id="84-performance-throughput-settings">8.4 Performance &amp; Throughput Settings</h3>
+<p>These settings control how efficiently transactions are processed.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>validator_sendBatchSize</code></td>
+<td>int</td>
+<td><code>100</code></td>
+<td>Number of transactions to accumulate before batch processing</td>
+<td>Balances throughput against latency for transaction processing</td>
+</tr>
+<tr>
+<td><code>validator_sendBatchTimeout</code></td>
+<td>int</td>
+<td><code>2</code></td>
+<td>Maximum time (seconds) to wait before processing a partial batch</td>
+<td>Ensures timely processing of transactions even when volume is low</td>
+</tr>
+<tr>
+<td><code>validator_sendBatchWorkers</code></td>
+<td>int</td>
+<td><code>10</code></td>
+<td>Number of worker goroutines for batch send operations</td>
+<td>Controls parallelism for outbound transaction processing</td>
+</tr>
+<tr>
+<td><code>validator_blockvalidation_delay</code></td>
+<td>int</td>
+<td><code>0</code></td>
+<td>Artificial delay (milliseconds) introduced before block validation</td>
+<td>Can be used for testing or throttling validation operations</td>
+</tr>
+<tr>
+<td><code>validator_blockvalidation_maxRetries</code></td>
+<td>int</td>
+<td><code>5</code></td>
+<td>Maximum number of retries for failed block validations</td>
+<td>Affects resilience against transient failures</td>
+</tr>
+<tr>
+<td><code>validator_blockvalidation_retrySleep</code></td>
+<td>string</td>
+<td><code>"2s"</code></td>
+<td>Time to wait between block validation retry attempts</td>
+<td>Controls backoff strategy for failed validations</td>
+</tr>
+</tbody>
+</table>
+<h4 id="performance-throughput-interactions-and-dependencies">Performance &amp; Throughput Interactions and Dependencies</h4>
+<p>The batch processing settings work together to optimize transaction throughput:</p>
+<ul>
+<li>Batching improves performance by amortizing overhead across multiple transactions</li>
+<li>The validator accumulates up to <code>validator_sendBatchSize</code> transactions before processing them as a batch</li>
+<li>If fewer transactions arrive, a partial batch is processed after <code>validator_sendBatchTimeout</code> seconds</li>
+<li>Multiple worker goroutines (<code>validator_sendBatchWorkers</code>) process batches in parallel</li>
+</ul>
+<p>This creates a balance between throughput (larger batches) and latency (timely processing).</p>
+<p>The block validation retry settings (<code>validator_blockvalidation_maxRetries</code> and <code>validator_blockvalidation_retrySleep</code>) control resilience by determining how aggressively the system retries failed operations.</p>
+<h3 id="85-kafka-integration-settings">8.5 Kafka Integration Settings</h3>
+<p>These settings control message-based communication via Kafka.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>validator_kafkaWorkers</code></td>
+<td>int</td>
+<td><code>0</code></td>
+<td>Number of worker goroutines for Kafka message processing</td>
+<td>Affects concurrency and throughput for Kafka-based transaction handling</td>
+</tr>
+<tr>
+<td><code>kafka_validatortxsConfig</code></td>
+<td>URL</td>
+<td><code>""</code></td>
+<td>URL for the Kafka configuration for validator transactions</td>
+<td>Configures how transactions are published to Kafka</td>
+</tr>
+<tr>
+<td><code>kafka_txmetaConfig</code></td>
+<td>URL</td>
+<td><code>""</code></td>
+<td>URL for the Kafka configuration for transaction metadata</td>
+<td>Configures how transaction metadata is published to Kafka</td>
+</tr>
+<tr>
+<td><code>kafka_rejectedTxConfig</code></td>
+<td>URL</td>
+<td><code>""</code></td>
+<td>URL for the Kafka configuration for rejected transactions</td>
+<td>Configures how rejected transaction information is published to Kafka</td>
+</tr>
+<tr>
+<td><code>validator_kafka_maxMessageBytes</code></td>
+<td>int</td>
+<td><code>1048576</code></td>
+<td>Maximum size of Kafka messages in bytes</td>
+<td>Limits the size of transactions that can be processed via Kafka</td>
+</tr>
+</tbody>
+</table>
+<h4 id="kafka-integration-interactions-and-dependencies">Kafka Integration Interactions and Dependencies</h4>
+<p>Kafka integration provides asynchronous communication between the validator and other services:</p>
+<ul>
+<li>Successful validations produce messages to <code>kafka_txmetaConfig</code> for Block Assembly</li>
+<li>Rejected transactions produce messages to <code>kafka_rejectedTxConfig</code> for P2P notification</li>
+<li><code>validator_kafka_maxMessageBytes</code> must be coordinated with Kafka broker's <code>message.max.bytes</code></li>
+<li>When <code>validator_kafkaWorkers</code> is 0, the system auto-calculates based on available CPUs</li>
+</ul>
+<p>These Kafka channels complement the synchronous gRPC and HTTP APIs, providing an event-driven architecture for transaction propagation.</p>
+<h3 id="86-validation-rules-settings">8.6 Validation Rules Settings</h3>
+<p>These settings control the rules and policies applied during transaction validation.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>maxtxsizepolicy</code></td>
+<td>int</td>
+<td>Varies</td>
+<td>Maximum allowed transaction size in bytes</td>
+<td>Restricts oversized transactions from entering the mempool</td>
+</tr>
+<tr>
+<td><code>minminingtxfee</code></td>
+<td>int64</td>
+<td>Varies</td>
+<td>Minimum fee required for transaction acceptance</td>
+<td>Sets economic barrier for transaction inclusion</td>
+</tr>
+<tr>
+<td><code>validator_scriptVerificationLibrary</code></td>
+<td>string</td>
+<td><code>"VerificatorGoBT"</code></td>
+<td>Library used for Bitcoin script verification</td>
+<td>Determines script validation implementation</td>
+</tr>
+</tbody>
+</table>
+<h4 id="validation-rules-interactions-and-dependencies">Validation Rules Interactions and Dependencies</h4>
+<p>Validation rules determine which transactions are accepted:</p>
+<ul>
+<li>The <code>maxtxsizepolicy</code> setting rejects transactions exceeding the size limit</li>
+<li>The <code>minminingtxfee</code> setting enforces minimum fee requirements</li>
+<li>The script verification library (<code>validator_scriptVerificationLibrary</code>) determines how transaction scripts are validated</li>
+</ul>
+<p>These settings directly impact consensus and policy enforcement, ensuring that only valid transactions are propagated and included in blocks.</p>
+<h3 id="87-monitoring-debugging-settings">8.7 Monitoring &amp; Debugging Settings</h3>
+<p>These settings control observability and diagnostics.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>validator_verbose_debug</code></td>
+<td>bool</td>
+<td><code>false</code></td>
+<td>Enables detailed debug logging for validator operations</td>
+<td>Provides additional diagnostic information at the cost of log verbosity</td>
+</tr>
+<tr>
+<td><code>fsm_state_restore</code></td>
+<td>bool</td>
+<td><code>false</code></td>
+<td>Controls whether the service restores from a previously saved state</td>
+<td>Affects recovery behavior after restarts or failures</td>
+</tr>
+</tbody>
+</table>
+<h4 id="monitoring-debugging-interactions-and-dependencies">Monitoring &amp; Debugging Interactions and Dependencies</h4>
+<p>These settings help with troubleshooting and observability:</p>
+<ul>
+<li><code>validator_verbose_debug</code> increases log verbosity, useful for diagnosing issues but increases log volume</li>
+<li><code>fsm_state_restore</code> enables recovering from previous state after restart, important for maintaining continuity</li>
+</ul>
+<h2 id="9-other-resources">9. Other Resources</h2>
+<p><a href="../../../references/services/validator_reference/">Validator Reference</a></p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright © 2025 BSV Blockchain Org.
+    </div>
+  
+  
+</div>
+      
+        <div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/bitcoin-sv/teranode" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.7.2 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2024 Fonticons, Inc.--><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8M97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    <script id="__config" type="application/json">{"base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.f8cc74c7.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.c8b220af.min.js"></script>
+      
+        <script src="../../../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
+      
+    
+  </body>
+</html>

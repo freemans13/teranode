@@ -1,0 +1,34 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant Validator as V
+participant P2P
+participant "Block Validation" as BV
+participant "Subtree Validation" as SV
+
+V -> P2P: Rejected Transaction \n(kafka_rejectedTxConfig)
+P2P -> BV: New Block \n(kafka_blocksConfig)
+P2P -> SV: New Subtree \n(kafka_subtreesConfig)
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+@enduml

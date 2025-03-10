@@ -1,0 +1,58 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Validator Server" as Server
+entity Validator
+entity "UTXO Store" as UTXOStore
+participant "Block Assembly" as BlockAssembly
+queue "Tx Meta Kafka Producer" as TxMetaKafka
+queue "Rejected Tx Kafka Producer" as RejectedKafka
+
+Server -> Validator: Validate(ctx, tx, blockHeight)
+activate Validator
+
+Validator -> UTXOStore: spendUtxos()
+Validator -> UTXOStore: Create() # storeTxInUtxoMap
+
+alt if Tx Meta Kafka Producer exists
+    Validator -> TxMetaKafka: Publish tx meta
+end
+
+alt if !blockAssemblyDisabled
+    Validator -> BlockAssembly: Store()
+    alt if error in block assembler store
+        Validator -> UTXOStore: Delete() # reverseTxMetaStore
+        Validator -> UTXOStore: Unspend() # reverseSpends
+        Validator --> Server: Return error
+    end
+else if validation fails
+    Validator -> RejectedKafka: Publish rejected TX
+    Validator --> Server: Return error
+end
+
+Validator --> Server: Return success
+deactivate Validator
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

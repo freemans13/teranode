@@ -1,0 +1,69 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "HTTP Client" as Client
+participant "HTTP Server\n(asset/http_impl/http.go)" as HTTPServer
+participant "UTXO Store" as UTXOStore
+participant "TxStore" as Store
+
+' GET request for a single transaction in different formats
+Client -> HTTPServer : GET /tx/:hash (BINARY_STREAM, HEX, JSON)
+activate HTTPServer
+HTTPServer -> UTXOStore : Get(ctx, hash)
+activate UTXOStore
+alt UTXOStore has data
+    UTXOStore --> HTTPServer : transactionData
+else UTXOStore does not have data
+    UTXOStore --> HTTPServer
+    HTTPServer -> Store : Get(ctx, hash)
+    activate Store
+    Store --> HTTPServer : transactionData
+    deactivate Store
+end
+HTTPServer --> Client : transactionData
+deactivate HTTPServer
+
+' POST request for multiple transactions
+Client -> HTTPServer : POST /subtree/:hash/txs (List of hashes)
+activate HTTPServer
+alt For Each Hash in List
+    loop
+        HTTPServer -> UTXOStore : Get(ctx, hash)
+        activate UTXOStore
+        alt UTXO Store has data
+            UTXOStore --> HTTPServer : transactionData
+        else UTXO Store does not have data
+            UTXOStore --> HTTPServer
+            HTTPServer -> Store : Get(ctx, hash)
+            activate Store
+            Store --> HTTPServer : transactionData
+            deactivate Store
+        end
+    end
+end
+HTTPServer --> Client : All transactionData
+deactivate HTTPServer
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

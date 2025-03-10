@@ -1,0 +1,5461 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../blockAssembly/">
+      
+      
+        <link rel="next" href="../blockchain/">
+      
+      
+      <link rel="icon" href="../../architecture/img/bsvblockchain_blue_logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.7">
+    
+    
+      
+        <title>Block Validation - Teranode</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.8608ea7d.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        
+        <link rel="stylesheet" href="../../../assets/external/fonts.googleapis.com/css.49ea35f2.css">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../../overrides/custom.css">
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#block-validation-service" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Teranode
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Block Validation
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../.." class="md-tabs__link">
+        
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../tutorials/developers/developerSetup/" class="md-tabs__link">
+          
+  
+  Tutorials
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../howto/locallyRunningServices/" class="md-tabs__link">
+          
+  
+  How-To Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../../teranodeIntro/" class="md-tabs__link">
+          
+  
+  Key Topics
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../references/projectStructure/" class="md-tabs__link">
+          
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    Teranode
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../.." class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Home
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Tutorials
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            Tutorials
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../tutorials/developers/developerSetup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../tutorials/miners/minersGettingStarted/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Miners Getting Started
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    How-To Guides
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            How-To Guides
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/locallyRunningServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Services Locally
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Debugging Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/generatingProtobuf/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Generating Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/addingNewProtobufServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Adding Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/configuringGrpcLogging/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Configuring gRPC Logging
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/runningTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/automatedTestingHowTo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Automated Testing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/makefile/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Makefile Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/bugReporting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Bug Reporting
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer's Guide to Teranode-CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11" id="__nav_3_11_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Miners
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11">
+            <span class="md-nav__icon md-icon"></span>
+            Miners
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/howToUseTheTestMiner.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Using Test Miner
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_2" id="__nav_3_11_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Installation
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_2">
+            <span class="md-nav__icon md-icon"></span>
+            Installation
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToInstallationDeprecated/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Deprecated
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_3" id="__nav_3_11_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Configuration
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_3">
+            <span class="md-nav__icon md-icon"></span>
+            Configuration
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Aerospike Tuning
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    FSM Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_4" id="__nav_3_11_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Start/Stop
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_4">
+            <span class="md-nav__icon md-icon"></span>
+            Start/Stop
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_5" id="__nav_3_11_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Updating Teranode
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_5">
+            <span class="md-nav__icon md-icon"></span>
+            Updating Teranode
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_6" id="__nav_3_11_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Security Best Practices
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_6">
+            <span class="md-nav__icon md-icon"></span>
+            Security Best Practices
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_7" id="__nav_3_11_7_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Troubleshooting
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_7">
+            <span class="md-nav__icon md-icon"></span>
+            Troubleshooting
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_8" id="__nav_3_11_8_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Additional
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_8">
+            <span class="md-nav__icon md-icon"></span>
+            Additional
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    CPU Mining Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToResetTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Reset Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToSyncTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Sync the Node
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Managing Disk Space
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToBackup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Backup (Kubernetes)
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Key Topics
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            Key Topics
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../teranodeIntro/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Introduction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-overall-system-design/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-architecture-brief/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Brief
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-microservices-overview/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Microservices Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/stateManagement/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    State Management
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/understandingDoubleSpends/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding Double Spends
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technologyStack/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Technology Stack
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../understandingTheTestingFramework/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding the Testing Framework
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../functionalRequirementTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Functional Requirement Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_10" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_10" id="__nav_4_10_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Features
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_10">
+            <span class="md-nav__icon md-icon"></span>
+            Features
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../features/two_phase_commit/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Two Phase Commit
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_11" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_4_11" id="__nav_4_11_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_11_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4_11">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alert/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../assetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockAssembly/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#index" class="md-nav__link">
+    <span class="md-ellipsis">
+      Index
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-description" class="md-nav__link">
+    <span class="md-ellipsis">
+      1. Description
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-functionality" class="md-nav__link">
+    <span class="md-ellipsis">
+      2. Functionality
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Functionality">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-receiving-blocks-for-validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1. Receiving blocks for validation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-validating-blocks" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2. Validating blocks
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.2. Validating blocks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#221-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.1. Overview
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#222-catching-up-after-a-parent-block-is-not-found" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.2. Catching up after a parent block is not found
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#223-validating-the-subtrees" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.3. Validating the Subtrees
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#224-block-data-validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.4. Block Data Validation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#225-transaction-re-presentation-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.5. Transaction Re-presentation Detection
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.2.5. Transaction Re-presentation Detection">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bloom-filter-implementation" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bloom Filter Implementation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-validorderandblessed-mechanism" class="md-nav__link">
+    <span class="md-ellipsis">
+      The validOrderAndBlessed Mechanism
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-marking-txs-as-mined" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.3. Marking Txs as mined
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-grpc-protobuf-definitions" class="md-nav__link">
+    <span class="md-ellipsis">
+      3. gRPC Protobuf Definitions
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-data-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      4. Data Model
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-technology" class="md-nav__link">
+    <span class="md-ellipsis">
+      5. Technology
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-directory-structure-and-main-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      6. Directory Structure and Main Files
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-how-to-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      7. How to run
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-configuration-options-settings-flags" class="md-nav__link">
+    <span class="md-ellipsis">
+      8. Configuration options (settings flags)
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. Configuration options (settings flags)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#network-and-communication-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network and Communication Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kafka-and-concurrency-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Kafka and Concurrency Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#performance-and-optimization" class="md-nav__link">
+    <span class="md-ellipsis">
+      Performance and Optimization
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#transaction-processing" class="md-nav__link">
+    <span class="md-ellipsis">
+      Transaction Processing
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bloom-filter-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bloom Filter Management
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#advanced-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Advanced Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#storage-and-state-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Storage and State Management
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Interactions and Dependencies
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration Interactions and Dependencies">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#optimistic-mining" class="md-nav__link">
+    <span class="md-ellipsis">
+      Optimistic Mining
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bloom-filter-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bloom Filter Operations
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#transaction-processing-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      Transaction Processing Pipeline
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#synchronization-strategy" class="md-nav__link">
+    <span class="md-ellipsis">
+      Synchronization Strategy
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-other-resources" class="md-nav__link">
+    <span class="md-ellipsis">
+      9. Other Resources
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockchain/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../propagation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../subtreeValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../validator/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_12" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_12" id="__nav_4_12_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_12_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_12">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../p2p/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../legacy/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Legacy
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../rpc/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../utxoPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_13" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_13" id="__nav_4_13_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_13">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stores/blob/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stores/utxo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_14" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Data Model
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_14">
+            <span class="md-nav__icon md-icon"></span>
+            Data Model
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/block_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/block_header_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Header Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/subtree_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/transaction_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Transaction Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/utxo_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_15" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Kafka
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_15">
+            <span class="md-nav__icon md-icon"></span>
+            Kafka
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kafka/kafka/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Commands
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_16">
+            <span class="md-nav__icon md-icon"></span>
+            Commands
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/chainIntegrity.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Chain Integrity
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/propagationBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/seeder/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Seeder
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/txBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    TX Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Reference
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            Reference
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/projectStructure/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Project Structure
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2" id="__nav_5_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    API & Protobuf
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2">
+            <span class="md-nav__icon md-icon"></span>
+            API & Protobuf
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/errorHandling/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Error Handling
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/glossary/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Glossary
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/codingConventions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Coding Conventions
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/kafkaMessageFormat/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Message Format
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/networkConsensusRules/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Network Consensus Rules
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2_6" id="__nav_5_2_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Protobuf API
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_5_2_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2_6">
+            <span class="md-nav__icon md-icon"></span>
+            Protobuf API
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/alertProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_3" id="__nav_5_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_3">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/alert_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/asset_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockassembly_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockvalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockchain_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/propagation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/subtreevalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/validator_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_4" id="__nav_5_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_4">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockpersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/p2p_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/legacy_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P Legacy Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/rpc_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/utxopersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/stores/blob_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/stores/utxo_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_6" id="__nav_5_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Miscellaneous
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_6">
+            <span class="md-nav__icon md-icon"></span>
+            Miscellaneous
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Git Commit Signing Setup Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/licenseInformation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Licensing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/prometheusMetrics/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Prometheus Metrics
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/settings/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Settings
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/teranodeDaemonReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Daemon Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/testingTechnicalReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Testing Technical Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Third-Party Software Requirements
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#index" class="md-nav__link">
+    <span class="md-ellipsis">
+      Index
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-description" class="md-nav__link">
+    <span class="md-ellipsis">
+      1. Description
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-functionality" class="md-nav__link">
+    <span class="md-ellipsis">
+      2. Functionality
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Functionality">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-receiving-blocks-for-validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1. Receiving blocks for validation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-validating-blocks" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2. Validating blocks
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.2. Validating blocks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#221-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.1. Overview
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#222-catching-up-after-a-parent-block-is-not-found" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.2. Catching up after a parent block is not found
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#223-validating-the-subtrees" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.3. Validating the Subtrees
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#224-block-data-validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.4. Block Data Validation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#225-transaction-re-presentation-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2.5. Transaction Re-presentation Detection
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.2.5. Transaction Re-presentation Detection">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bloom-filter-implementation" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bloom Filter Implementation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-validorderandblessed-mechanism" class="md-nav__link">
+    <span class="md-ellipsis">
+      The validOrderAndBlessed Mechanism
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-marking-txs-as-mined" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.3. Marking Txs as mined
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-grpc-protobuf-definitions" class="md-nav__link">
+    <span class="md-ellipsis">
+      3. gRPC Protobuf Definitions
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-data-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      4. Data Model
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-technology" class="md-nav__link">
+    <span class="md-ellipsis">
+      5. Technology
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-directory-structure-and-main-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      6. Directory Structure and Main Files
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-how-to-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      7. How to run
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-configuration-options-settings-flags" class="md-nav__link">
+    <span class="md-ellipsis">
+      8. Configuration options (settings flags)
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. Configuration options (settings flags)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#network-and-communication-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network and Communication Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kafka-and-concurrency-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Kafka and Concurrency Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#performance-and-optimization" class="md-nav__link">
+    <span class="md-ellipsis">
+      Performance and Optimization
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#transaction-processing" class="md-nav__link">
+    <span class="md-ellipsis">
+      Transaction Processing
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bloom-filter-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bloom Filter Management
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#advanced-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Advanced Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#storage-and-state-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Storage and State Management
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Interactions and Dependencies
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration Interactions and Dependencies">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#optimistic-mining" class="md-nav__link">
+    <span class="md-ellipsis">
+      Optimistic Mining
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bloom-filter-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bloom Filter Operations
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#transaction-processing-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      Transaction Processing Pipeline
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#synchronization-strategy" class="md-nav__link">
+    <span class="md-ellipsis">
+      Synchronization Strategy
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-other-resources" class="md-nav__link">
+    <span class="md-ellipsis">
+      9. Other Resources
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<h1 id="block-validation-service">🔍 Block Validation Service</h1>
+<h2 id="index">Index</h2>
+<ol>
+<li><a href="#1-description">Description</a></li>
+<li><a href="#2-functionality">Functionality</a><ul>
+<li><a href="#21-receiving-blocks-for-validation">2.1. Receiving blocks for validation</a></li>
+<li><a href="#22-validating-blocks">2.2. Validating blocks</a></li>
+<li><a href="#221-overview">2.2.1. Overview</a></li>
+<li><a href="#222-catching-up-after-a-parent-block-is-not-found">2.2.2. Catching up after a parent block is not found</a></li>
+<li><a href="#223-validating-the-subtrees">2.2.3. Validating the Subtrees</a></li>
+<li><a href="#224-block-data-validation">2.2.4. Block Data Validation</a></li>
+<li><a href="#225-transaction-re-presentation-detection">2.2.5. Transaction Re-presentation Detection</a></li>
+<li><a href="#23-marking-txs-as-mined">2.3. Marking Txs as mined</a></li>
+</ul>
+</li>
+<li><a href="#3-grpc-protobuf-definitions">gRPC Protobuf Definitions</a></li>
+<li><a href="#4-data-model">Data Model</a></li>
+<li><a href="#5-technology">Technology</a></li>
+<li><a href="#6-directory-structure-and-main-files">Directory Structure and Main Files</a></li>
+<li><a href="#7-how-to-run">How to run</a></li>
+<li><a href="#8-configuration-options-settings-flags">Configuration options (settings flags)</a><ul>
+<li><a href="#network-and-communication-settings">Network and Communication Settings</a></li>
+<li><a href="#kafka-and-concurrency-settings">Kafka and Concurrency Settings</a></li>
+<li><a href="#performance-and-optimization">Performance and Optimization</a></li>
+<li><a href="#transaction-processing">Transaction Processing</a></li>
+<li><a href="#bloom-filter-management">Bloom Filter Management</a></li>
+<li><a href="#advanced-settings">Advanced Settings</a></li>
+<li><a href="#storage-and-state-management">Storage and State Management</a></li>
+</ul>
+</li>
+<li><a href="#9-other-resources">Other Resources</a></li>
+</ol>
+<h2 id="1-description">1. Description</h2>
+<p>The Block Validator is responsible for ensuring the integrity and consistency of each block before it is added to the blockchain. It performs several key functions:</p>
+<ol>
+<li>
+<p><strong>Validation of Block Structure</strong>: Verifies that each block adheres to the defined structure and format, and that their subtrees are known and valid.</p>
+</li>
+<li>
+<p><strong>Merkle Root Verification</strong>: Confirms that the Merkle root in the block header correctly represents the subtrees in the block, ensuring data integrity.</p>
+</li>
+<li>
+<p><strong>Block Header Verification</strong>: Validates the block header, including the proof of work , timestamp, and reference to the previous block, maintaining the blockchain's unbroken chain.</p>
+</li>
+</ol>
+<p><img alt="Block_Validation_Service_Container_Diagram.png" src="../img/Block_Validation_Service_Container_Diagram.png" /></p>
+<p>The Block Validation Service:</p>
+<ul>
+<li>Receives new blocks from the Legacy Service. The Legacy Service has received them from other nodes on the network.</li>
+<li>Validates the blocks, after fetching them from the remote asset server.</li>
+<li>Updates stores, and notifies the blockchain service of the new block.</li>
+</ul>
+<p>The Legacy Service communicates with the Block Validation over the gRPC protocol.</p>
+<p><img alt="Block_Validation_Service_Component_Diagram.png" src="../img/Block_Validation_Service_Component_Diagram.png" /></p>
+<blockquote>
+<p><strong>Note</strong>: For information about how the Block Validation service is initialized during daemon startup and how it interacts with other services, see the <a href="../../../references/teranodeDaemonReference/#service-initialization-flow">Teranode Daemon Reference</a>.</p>
+</blockquote>
+<p>Finally, note that the Block Validation service benefits of the use of Lustre Fs (filesystem). Lustre is a type of parallel distributed file system, primarily used for large-scale cluster computing. This filesystem is designed to support high-performance, large-scale data storage and workloads.
+Specifically for Teranode, these volumes are meant to be temporary holding locations for short-lived file-based data that needs to be shared quickly between various services
+Teranode microservices make use of the Lustre file system in order to share subtree and tx data, eliminating the need for redundant propagation of subtrees over grpc or message queues. The services sharing Subtree data through this system can be seen here:</p>
+<p><img alt="lustre_fs.svg" src="../img/plantuml/lustre_fs.svg" /></p>
+<h2 id="2-functionality">2. Functionality</h2>
+<p>The block validator is a service that validates blocks. After validating them, it will update the relevant stores and blockchain accordingly.</p>
+<h3 id="21-receiving-blocks-for-validation">2.1. Receiving blocks for validation</h3>
+<p><img alt="block_validation_p2p_block_found.svg" src="../img/plantuml/blockvalidation/block_validation_p2p_block_found.svg" /></p>
+<ul>
+<li>The Legacy Service is responsible for receiving new blocks from the network. When a new block is found, it will notify the block validation service via the <code>BlockFound()</code> gRPC endpoint.</li>
+<li>The block validation service will then check if the block is already known. If not, it will start the validation process.</li>
+<li>The block is added to a channel for processing. The channel is used to ensure that the block validation process is asynchronous and non-blocking.</li>
+</ul>
+<h3 id="22-validating-blocks">2.2. Validating blocks</h3>
+<h4 id="221-overview">2.2.1. Overview</h4>
+<p><img alt="block_validation_p2p_block_validation.svg" src="../img/plantuml/blockvalidation/block_validation_p2p_block_validation.svg" /></p>
+<ul>
+<li>As seen in the section 2.1, a new block is queued for validation in the blockFoundCh. The block validation server will pick it up and start the validation process.</li>
+<li>The server will request the block data from the remote node (<code>DoHTTPRequest()</code>).</li>
+<li>If the parent block is not known, it will be added to the catchupCh channel for processing. We stop at this point, as we can no longer proceed. The catchup process will be explained in the next section (section 2.2.2).</li>
+<li>If the parent is known, the block will be validated.<ul>
+<li>First, the service validates all the block subtrees.<ul>
+<li>For each subtree, we check if it is known. If not, we kick off a subtree validation process (see section 2.2.3 for more details).</li>
+</ul>
+</li>
+<li>The validator retrieves the last 100 block headers, which are used to validate the block data. We can see more about this specific step in the section 2.2.4.</li>
+<li>The validator stores the coinbase Tx in the UTXO Store and the Tx Store.</li>
+<li>The validator adds the block to the Blockchain.</li>
+<li>For each Subtree in the block, the validator updates the TTL (Time To Live) to zero for the subtree. This allows the Store to clear out data the services will no longer use.</li>
+<li>For each Tx for each Subtree, we set the Tx as mined in the UTXO Store. This allows the UTXO Store to know which block(s) the Tx is in.</li>
+<li>Should an error occur during the validation process, the block will be invalidated and removed from the blockchain.</li>
+</ul>
+</li>
+</ul>
+<p>Note - there is a <code>optimisticMining</code> setting that allows to reverse the block validation and block addition to the blockchain steps.</p>
+<ul>
+<li>In the regular mode, the block is validated first, and, if valid, added to the block.</li>
+<li>If <code>optimisticMining</code> is on, the block is optimistically added to the blockchain right away, and then validated in the background next. If it was to be found invalid after validation, it would be removed from the blockchain. This mode is not recommended for production use, as it can lead to a temporary fork in the blockchain. It however can be useful for performance testing purposes.</li>
+</ul>
+<h4 id="222-catching-up-after-a-parent-block-is-not-found">2.2.2. Catching up after a parent block is not found</h4>
+<p><img alt="block_validation_p2p_block_catchup.svg" src="../img/plantuml/blockvalidation/block_validation_p2p_block_catchup.svg" /></p>
+<p>When a block parent is not found in the local blockchain, the node will start a catchup process. The catchup process will iterate through the parent blocks until it finds a known block in the blockchain.</p>
+<p>When a block is not known, it will be requested from the remote node. Once received, it will be queued for validation (effectively starting the process of validation for the parent block from the beginning, as seen in 2.3.1).</p>
+<p>Notice that, when catching up, the Block Validator will set the machine state of the node to <code>CATCHING_UP</code>. This is done to prevent the node from processing new blocks while it is still catching up. The node will only assemble or process new blocks once it has caught up with the blockchain. For more information on this, please refer to the <a href="../../architecture/stateManagement/">State Management</a>  documentation.</p>
+<h4 id="223-validating-the-subtrees">2.2.3. Validating the Subtrees</h4>
+<p>Should the validation process for a block encounter a subtree it does not know about, it can request its processing off the Subtree Validation service.</p>
+<p><img alt="block_validation_subtree_validation_request.svg" src="../img/plantuml/subtreevalidation/block_validation_subtree_validation_request.svg" /></p>
+<p>If any transaction under the subtree is also missing, the subtree validation process will kick off a recovery process for those transactions.</p>
+<h4 id="224-block-data-validation">2.2.4. Block Data Validation</h4>
+<p>As part of the overall block validation, the service will validate the block data, ensuring the format and integrity of the data, as well as confirming that coinbase tx, subtrees and transactions are valid. This is done in the <code>Valid()</code> method under the <code>Block</code> struct.</p>
+<p><img alt="block_data_validation.svg" src="../img/plantuml/blockvalidation/block_data_validation.svg" /></p>
+<p>Effectively, the following validations are performed:</p>
+<ul>
+<li>
+<p>The hash of the previous block must be known and valid. Teranode must always build a block on a previous block that it recognizes as the longest chain.</p>
+</li>
+<li>
+<p>The Proof of Work of a block must satisfy the difficulty target (Proof of Work higher than nBits in block header).</p>
+</li>
+<li>
+<p>The Merkle root of all transactions in a block must match the value of the Merkle root in the block header.</p>
+</li>
+<li>
+<p>A block must include at least one transaction, which is the Coinbase transaction.</p>
+</li>
+<li>
+<p>A block timestamp must not be too far in the past or the future.</p>
+<ul>
+<li>The block time specified in the header must be larger than the Median-Time-Past (MTP) calculated from the previous block index. MTP is calculated by taking the timestamps of the last 11 blocks and finding the median (More details in BIP113).</li>
+<li>The block time specified in the header must not be larger than the adjusted current time plus two hours (“maximum future block time”).</li>
+</ul>
+</li>
+<li>
+<p>The first transaction in a block must be Coinbase. The transaction is Coinbase if the following requirements are satisfied:</p>
+<ul>
+<li>The Coinbase transaction has exactly one input.</li>
+<li>The input is null, meaning that the input’s previous hash is 0000…0000 and the input’s previous index is 0xFFFFFFFF.</li>
+<li>The Coinbase transaction must start with the serialized block height, to ensure block and transaction uniqueness.</li>
+</ul>
+</li>
+<li>
+<p>The Coinbase transaction amount may not exceed block subsidy and all transaction fees (block reward).</p>
+</li>
+</ul>
+<h4 id="225-transaction-re-presentation-detection">2.2.5. Transaction Re-presentation Detection</h4>
+<p>The Block Validation service implements a robust mechanism for detecting re-presented transactions using bloom filters. This mechanism, implemented in the <code>validOrderAndBlessed</code> function, is critical for preventing double-spending and ensuring transaction integrity in the blockchain.</p>
+<p><img alt="bloom_filter_validation.svg" src="../img/plantuml/blockvalidation/bloom_filter_validation.svg" /></p>
+<h5 id="bloom-filter-implementation">Bloom Filter Implementation</h5>
+<p>Teranode maintains bloom filters for recent blocks to efficiently detect re-presented transactions:</p>
+<ul>
+<li><strong>Creation</strong>: Each validated block generates a bloom filter containing all of its transaction hashes</li>
+<li><strong>Storage</strong>: Bloom filters are stored in both memory (for active validation) and in the subtree store (for persistence)</li>
+<li><strong>Retention</strong>: Filters are maintained for a configurable number of recent blocks (<code>blockvalidation_bloom_filter_retention_size</code>)</li>
+<li><strong>TTL Ordering</strong>: The system enforces a strict TTL (Time-To-Live) ordering: txmetacache &lt; utxo store &lt; bloom filter<ul>
+<li>This ensures that even if a transaction is pruned from txmetacache, the bloom filter can still detect its re-presentation</li>
+<li>The longer retention period for bloom filters provides an extended window for detecting re-presented transactions</li>
+</ul>
+</li>
+</ul>
+<h5 id="the-validorderandblessed-mechanism">The validOrderAndBlessed Mechanism</h5>
+<p>The <code>validOrderAndBlessed</code> function performs several critical validations during block processing:</p>
+<ol>
+<li>
+<p><strong>Transaction Ordering Validation</strong>:</p>
+<ul>
+<li>Ensures child transactions appear after their parent transactions within the same block</li>
+<li>For each transaction, verifies that all of its parent transactions either appear earlier in the same block or exist in a previous block on the current chain</li>
+</ul>
+</li>
+<li>
+<p><strong>Re-presented Transaction Detection</strong>:</p>
+<ul>
+<li>Efficiently checks if transactions have already been mined in the current chain using bloom filters</li>
+<li>For potential matches in the bloom filter (which may include false positives), performs definitive verification against the txMetaStore</li>
+<li>Rejects blocks containing transactions that have already been mined in the current chain</li>
+</ul>
+</li>
+<li>
+<p><strong>Duplicate Input Prevention</strong>:</p>
+<ul>
+<li>Tracks all inputs being spent within the block to detect duplicate spends</li>
+<li>Ensures no two transactions in the block spend the same input</li>
+</ul>
+</li>
+<li>
+<p><strong>Orphaned Transaction Prevention</strong>:</p>
+<ul>
+<li>Verifies that parent transactions of each transaction either exist in the current block (before the child) or in a previous block on the current chain</li>
+<li>Prevents situations where transactions depend on parents that don't exist or aren't accessible</li>
+</ul>
+</li>
+</ol>
+<p>This comprehensive validation mechanism operates with high concurrency (configurable via <code>block_validOrderAndBlessedConcurrency</code>) to maintain performance while ensuring the integrity of the blockchain by preventing double-spends and transaction re-presentations.</p>
+<h3 id="23-marking-txs-as-mined">2.3. Marking Txs as mined</h3>
+<p>When a block is validated, the transactions in the block are marked as mined in the UTXO store. This process includes:</p>
+<ol>
+<li>
+<p><strong>Updating Transaction Status</strong>: The Block Validation service marks each transaction as mined by setting its block information.</p>
+</li>
+<li>
+<p><strong>Unsetting the Locked Flag</strong>: For any transaction that still has the "locked" flag set, the flag is unset during the mined transaction update process.</p>
+</li>
+<li>
+<p><strong>Storing Subtree Information</strong>: The service also stores the subtree index in the block where the transaction was located, enabling more efficient transaction lookups.</p>
+</li>
+</ol>
+<p>The Block Validation service is exclusively responsible for marking block transactions as mined and ensuring their flags are properly updated, regardless of whether the transaction was mined by the local Block Assembly service or by another node in the network.</p>
+<p>As a first step, either the <code>Block Validation</code> (after a remotely mined block is validated) or the <code>Block Assembly</code> (if a block is locally mined) marks the block subtrees as "set", by invoking the <code>Blockchain</code> <code>SetBlockSubtreesSet</code> gRPC call, as shown in the diagram below.</p>
+<p><img alt="blockchain_setblocksubtreesset.svg" src="../img/plantuml/blockchain/blockchain_setblocksubtreesset.svg" /></p>
+<p>The <code>Blockchain</code> client then notifies subscribers (in this case, the <code>BlockValidation</code> service) of a new <code>NotificationType_BlockSubtreesSet</code> event.
+The <code>BlockValidation</code> proceeds to mark all transactions within the block as "mined" in the <code>UTXOStore</code>. This allows to identify in which block a given tx was mined. See diagram below:</p>
+<p><img alt="block_validation_set_tx_mined.svg" src="../img/plantuml/blockvalidation/block_validation_set_tx_mined.svg" /></p>
+<blockquote>
+<p><strong>For a comprehensive explanation of the two-phase commit process across the entire system, including how Block Validation plays a role in the second phase, see the <a href="../../features/two_phase_commit/">Two-Phase Transaction Commit Process</a> documentation.</strong></p>
+</blockquote>
+<h2 id="3-grpc-protobuf-definitions">3. gRPC Protobuf Definitions</h2>
+<p>The Block Validation Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen <a href="../../../references/protobuf_docs/blockvalidationProto/">here</a>.</p>
+<h2 id="4-data-model">4. Data Model</h2>
+<ul>
+<li><a href="../../datamodel/block_data_model/">Block Data Model</a>: Contain lists of subtree identifiers.</li>
+<li><a href="../../datamodel/subtree_data_model/">Subtree Data Model</a>: Contain lists of transaction IDs and their Merkle root.</li>
+<li><a href="../../datamodel/transaction_data_model/">Extended Transaction Data Model</a>: Includes additional metadata to facilitate processing.</li>
+<li><a href="../../datamodel/utxo_data_model/">UTXO Data Model</a>: UTXO and UTXO Metadata data models for managing unspent transaction outputs.</li>
+</ul>
+<h2 id="5-technology">5. Technology</h2>
+<ol>
+<li>
+<p><strong>Go Programming Language (Golang)</strong>.</p>
+</li>
+<li>
+<p><strong>gRPC (Google Remote Procedure Call)</strong>:</p>
+<ul>
+<li>Used for implementing server-client communication. gRPC is a high-performance, open-source framework that supports efficient communication between services.</li>
+</ul>
+</li>
+<li>
+<p><strong>Blockchain Data Stores</strong>:</p>
+<ul>
+<li>Integration with various stores such as UTXO (Unspent Transaction Output) store, blob store, and transaction metadata store.</li>
+</ul>
+</li>
+<li>
+<p><strong>Caching Mechanisms (ttlcache)</strong>:</p>
+<ul>
+<li>Uses <code>ttlcache</code>, a Go library for in-memory caching with time-to-live settings, to avoid redundant processing and improve performance.</li>
+</ul>
+</li>
+<li>
+<p><strong>Configuration Management (gocore)</strong>:</p>
+<ul>
+<li>Uses <code>gocore</code> for configuration management, allowing dynamic configuration of service parameters.</li>
+</ul>
+</li>
+<li>
+<p><strong>Networking and Protocol Buffers</strong>:</p>
+<ul>
+<li>Handles network communications and serializes structured data using Protocol Buffers, a language-neutral, platform-neutral, extensible mechanism for serializing structured data.</li>
+</ul>
+</li>
+<li>
+<p><strong>Synchronization Primitives (sync)</strong>:</p>
+<ul>
+<li>Utilizes Go's <code>sync</code> package for synchronization primitives like mutexes, aiding in managing concurrent access to shared resources.</li>
+</ul>
+<h2 id="6-directory-structure-and-main-files">6. Directory Structure and Main Files</h2>
+</li>
+</ol>
+<div class="highlight"><pre><span></span><code>./services/blockvalidation
+│
+├── BlockValidation.go             - Contains the core logic for block validation.
+├── BlockValidation_test.go        - Unit tests for the `BlockValidation.go` functionalities.
+├── Client.go                      - Client-side logic or API for interacting with the block validation service.
+├── Interface.go                   - Defines an interface for the block validation service, outlining the methods that any implementation of the service should provide.
+├── Server.go                      - Contains the server-side implementation for the block validation service, handling incoming requests and providing validation services.
+├── Server_test.go                 - Unit tests for the `Server.go` functionalities,
+├── blockvalidation_api
+│   ├── blockvalidation_api.pb.go         - Auto-generated file from protobuf definitions, containing Go bindings for the API.
+│   ├── blockvalidation_api.proto         - Protocol Buffers definition file for the block validation API.
+│   └── blockvalidation_api_grpc.pb.go    - gRPC (Google&#39;s RPC framework) specific implementation file for the block validation API.
+├── metrics.go                     - Metrics collection and monitoring of the block validation service&#39;s performance.
+├── ttl_queue.go                   - Implements a time-to-live (TTL) queue, for managing caching within the service.
+├── txmetacache.go                 - Transaction metadata cache, used to improve performance and efficiency in transaction data access.
+└── txmetacache_test.go            - Unit tests for the `txmetacache.go` functionalities.
+</code></pre></div>
+<h2 id="7-how-to-run">7. How to run</h2>
+<p>To run the Block Validation Service locally, you can execute the following command:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">SETTINGS_CONTEXT</span><span class="o">=</span>dev.<span class="o">[</span>YOUR_USERNAME<span class="o">]</span><span class="w"> </span>go<span class="w"> </span>run<span class="w"> </span>-BlockValidation<span class="o">=</span><span class="m">1</span>
+</code></pre></div>
+<p>Please refer to the <a href="../../../howto/locallyRunningServices/">Locally Running Services Documentation</a> document for more information on running the Block Validation Service locally.</p>
+<h2 id="8-configuration-options-settings-flags">8. Configuration options (settings flags)</h2>
+<p>The Block Validation service configuration can be adjusted through environment variables or command-line flags. This section provides a comprehensive overview of all available configuration options organized by functional category.</p>
+<h3 id="network-and-communication-settings">Network and Communication Settings</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blockvalidation_grpcAddress</code></td>
+<td>string</td>
+<td>"localhost:8088"</td>
+<td>Address that other services use to connect to this service</td>
+<td>Affects how other services discover and communicate with the Block Validation service</td>
+</tr>
+<tr>
+<td><code>blockvalidation_grpcListenAddress</code></td>
+<td>string</td>
+<td>":8088"</td>
+<td>Network interface and port the service listens on for gRPC connections</td>
+<td>Controls network binding and accessibility of the service</td>
+</tr>
+</tbody>
+</table>
+<h3 id="kafka-and-concurrency-settings">Kafka and Concurrency Settings</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kafka_blocksConfig</code></td>
+<td>string</td>
+<td>(none)</td>
+<td>Kafka configuration for block messages</td>
+<td>Required for consuming blocks from Kafka</td>
+</tr>
+<tr>
+<td><code>blockvalidation_kafkaWorkers</code></td>
+<td>int</td>
+<td>0 (auto)</td>
+<td>Number of Kafka consumer workers</td>
+<td>Controls parallelism for Kafka-based block validation</td>
+</tr>
+</tbody>
+</table>
+<h3 id="performance-and-optimization">Performance and Optimization</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blockvalidation_batch_missing_transactions</code></td>
+<td>bool</td>
+<td>false</td>
+<td>When enabled, missing transactions are fetched in batches</td>
+<td>Improves network efficiency at the cost of slightly increased latency</td>
+</tr>
+<tr>
+<td><code>blockvalidation_processTxMetaUsingCache_BatchSize</code></td>
+<td>int</td>
+<td>1024</td>
+<td>Batch size for processing transaction metadata using cache</td>
+<td>Affects performance and memory usage during cache operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_processTxMetaUsingCache_Concurrency</code></td>
+<td>int</td>
+<td>32</td>
+<td>Concurrency level for processing transaction metadata using cache</td>
+<td>Controls parallel cache operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_processTxMetaUsingCache_MissingTxThreshold</code></td>
+<td>int</td>
+<td>1</td>
+<td>Threshold for switching to store-based processing when missing transactions</td>
+<td>Controls fallback behavior when cache misses occur</td>
+</tr>
+<tr>
+<td><code>blockvalidation_processTxMetaUsingStore_BatchSize</code></td>
+<td>int</td>
+<td>CPU/2 (min 4)</td>
+<td>Batch size for processing transaction metadata using store</td>
+<td>Affects performance during store operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_processTxMetaUsingStore_Concurrency</code></td>
+<td>int</td>
+<td>32</td>
+<td>Concurrency level for processing transaction metadata using store</td>
+<td>Controls parallel store operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_processTxMetaUsingStore_MissingTxThreshold</code></td>
+<td>int</td>
+<td>1</td>
+<td>Threshold for store-based processing when missing transactions</td>
+<td>Controls fallback behavior for store operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_skipCheckParentMined</code></td>
+<td>bool</td>
+<td>false</td>
+<td>Skips checking if parent block is mined during validation</td>
+<td>Performance optimization that may reduce validation accuracy</td>
+</tr>
+<tr>
+<td><code>blockvalidation_subtreeFoundChConcurrency</code></td>
+<td>int</td>
+<td>1</td>
+<td>Concurrency level for subtree found channel processing</td>
+<td>Controls parallel subtree processing</td>
+</tr>
+<tr>
+<td><code>blockvalidation_subtree_validation_abandon_threshold</code></td>
+<td>int</td>
+<td>1</td>
+<td>Threshold for abandoning subtree validation</td>
+<td>Controls when to give up on problematic subtrees</td>
+</tr>
+<tr>
+<td><code>blockvalidation_validateBlockSubtreesConcurrency</code></td>
+<td>int</td>
+<td>CPU/2 (min 4)</td>
+<td>Concurrency level for validating block subtrees</td>
+<td>Higher values improve performance but increase resource usage</td>
+</tr>
+<tr>
+<td><code>blockvalidation_validation_max_retries</code></td>
+<td>int</td>
+<td>3</td>
+<td>Maximum number of retries for validation operations</td>
+<td>Controls resilience to transient failures</td>
+</tr>
+<tr>
+<td><code>blockvalidation_validation_retry_sleep</code></td>
+<td>duration</td>
+<td>5s</td>
+<td>Sleep duration between validation retries</td>
+<td>Controls backoff timing for retry operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_isParentMined_retry_max_retry</code></td>
+<td>int</td>
+<td>20</td>
+<td>Maximum retries for checking if parent block is mined</td>
+<td>Controls persistence when checking parent block status</td>
+</tr>
+<tr>
+<td><code>blockvalidation_isParentMined_retry_backoff_multiplier</code></td>
+<td>int</td>
+<td>30</td>
+<td>Backoff multiplier for parent mined check retries</td>
+<td>Controls exponential backoff timing</td>
+</tr>
+<tr>
+<td><code>blockvalidation_subtreeGroupConcurrency</code></td>
+<td>int</td>
+<td>1</td>
+<td>Concurrency level for subtree group processing</td>
+<td>Controls parallel processing of subtree groups</td>
+</tr>
+<tr>
+<td><code>blockvalidation_blockFoundCh_buffer_size</code></td>
+<td>int</td>
+<td>1000</td>
+<td>Buffer size for block found channel</td>
+<td>Controls memory usage and throughput for block notifications</td>
+</tr>
+<tr>
+<td><code>blockvalidation_catchupCh_buffer_size</code></td>
+<td>int</td>
+<td>10</td>
+<td>Buffer size for catchup channel</td>
+<td>Controls memory usage for catchup operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_useCatchupWhenBehind</code></td>
+<td>bool</td>
+<td>false</td>
+<td>Enables catchup mechanism when node is behind</td>
+<td>Improves sync performance but increases complexity</td>
+</tr>
+<tr>
+<td><code>blockvalidation_catchupConcurrency</code></td>
+<td>int</td>
+<td>CPU/2 (min 4)</td>
+<td>Concurrency level for catchup operations</td>
+<td>Controls parallel processing during catchup</td>
+</tr>
+<tr>
+<td><code>blockvalidation_check_subtree_from_block_timeout</code></td>
+<td>duration</td>
+<td>5m</td>
+<td>Timeout for checking subtree from block</td>
+<td>Controls maximum wait time for subtree operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_check_subtree_from_block_retries</code></td>
+<td>int</td>
+<td>5</td>
+<td>Maximum retries for subtree from block checks</td>
+<td>Controls resilience for subtree operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_check_subtree_from_block_retry_backoff_duration</code></td>
+<td>duration</td>
+<td>30s</td>
+<td>Backoff duration for subtree check retries</td>
+<td>Controls timing between retry attempts</td>
+</tr>
+<tr>
+<td><code>blockvalidation_secret_mining_threshold</code></td>
+<td>uint32</td>
+<td>10</td>
+<td>Threshold for detecting secret mining attacks</td>
+<td>Security parameter for chain reorganization detection</td>
+</tr>
+<tr>
+<td><code>blockvalidation_previous_block_header_count</code></td>
+<td>uint64</td>
+<td>100</td>
+<td>Number of previous block headers to maintain</td>
+<td>Controls memory usage and validation depth</td>
+</tr>
+<tr>
+<td><code>blockvalidation_maxPreviousBlockHeadersToCheck</code></td>
+<td>uint64</td>
+<td>100</td>
+<td>Maximum previous block headers to check during validation</td>
+<td>Limits validation scope for performance</td>
+</tr>
+<tr>
+<td><code>blockvalidation_fail_fast_validation</code></td>
+<td>bool</td>
+<td>true</td>
+<td>Enables fail-fast validation mode</td>
+<td>Improves performance by stopping validation early on errors</td>
+</tr>
+<tr>
+<td><code>blockvalidation_finalizeBlockValidationConcurrency</code></td>
+<td>int</td>
+<td>8</td>
+<td>Concurrency level for finalizing block validation</td>
+<td>Controls parallel finalization operations</td>
+</tr>
+<tr>
+<td><code>blockvalidation_getMissingTransactions</code></td>
+<td>int</td>
+<td>32</td>
+<td>Concurrency level for retrieving missing transactions</td>
+<td>Controls parallel transaction retrieval</td>
+</tr>
+</tbody>
+</table>
+<h3 id="transaction-processing">Transaction Processing</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blockvalidation_localSetTxMinedConcurrency</code></td>
+<td>int</td>
+<td>8</td>
+<td>Concurrency level for marking transactions as mined</td>
+<td>Higher values improve performance but increase memory usage</td>
+</tr>
+<tr>
+<td><code>blockvalidation_missingTransactionsBatchSize</code></td>
+<td>int</td>
+<td>5000</td>
+<td>Batch size for retrieving missing transactions</td>
+<td>Larger batches improve throughput but increase memory usage</td>
+</tr>
+</tbody>
+</table>
+<h3 id="bloom-filter-management">Bloom Filter Management</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blockvalidation_bloom_filter_retention_size</code></td>
+<td>uint32</td>
+<td>GlobalBlockHeightRetention + 2</td>
+<td>Number of recent blocks to maintain bloom filters for</td>
+<td>Affects memory usage and duplicate transaction detection efficiency. Automatically set based on global retention settings</td>
+</tr>
+</tbody>
+</table>
+<h3 id="advanced-settings">Advanced Settings</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blockvalidation_optimistic_mining</code></td>
+<td>bool</td>
+<td>true</td>
+<td>When enabled, blocks are conditionally accepted before full validation</td>
+<td>Dramatically improves throughput at the cost of temporary chain inconsistency if validation fails</td>
+</tr>
+<tr>
+<td><code>blockvalidation_validation_warmup_count</code></td>
+<td>int</td>
+<td>128</td>
+<td>Number of validation operations during warmup</td>
+<td>Helps prime caches and establish performance baselines</td>
+</tr>
+<tr>
+<td><code>excessiveblocksize</code></td>
+<td>int</td>
+<td>4GB</td>
+<td>Maximum allowed block size</td>
+<td>Limits resource consumption for extremely large blocks</td>
+</tr>
+</tbody>
+</table>
+<h3 id="storage-and-state-management">Storage and State Management</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>utxostore</code></td>
+<td>URL</td>
+<td>(none)</td>
+<td>URL for the UTXO store</td>
+<td>Required for UTXO validation and updates</td>
+</tr>
+<tr>
+<td><code>fsm_state_restore</code></td>
+<td>bool</td>
+<td>false</td>
+<td>Enables FSM state restoration</td>
+<td>Affects recovery behavior after service restart</td>
+</tr>
+<tr>
+<td><code>blockvalidation_subtreeBlockHeightRetention</code></td>
+<td>uint32</td>
+<td>(global setting)</td>
+<td>How long to keep subtrees (in terms of block height)</td>
+<td>Affects storage utilization and historical data availability</td>
+</tr>
+</tbody>
+</table>
+<h2 id="configuration-interactions-and-dependencies">Configuration Interactions and Dependencies</h2>
+<p>Many configuration settings interact with each other to affect overall system behavior. Understanding these interactions is crucial for optimal tuning.</p>
+<h3 id="optimistic-mining">Optimistic Mining</h3>
+<p>The <code>blockvalidation_optimistic_mining</code> setting enables a performance optimization where blocks are conditionally accepted before full validation completes. This dramatically improves blockchain throughput but introduces a risk of temporary chain inconsistency if validation later fails.</p>
+<p>When enabled:</p>
+<ul>
+<li>The system achieves higher throughput and lower latency</li>
+<li>Validation continues asynchronously after block acceptance</li>
+<li>If validation fails, a chain reorganization may be necessary</li>
+</ul>
+<p>Related settings that affect this behavior include:</p>
+<ul>
+<li><code>blockvalidation_validation_max_retries</code> - Controls resilience during validation</li>
+<li><code>blockvalidation_validation_retry_sleep</code> - Affects backoff behavior during retries</li>
+</ul>
+<h3 id="bloom-filter-operations">Bloom Filter Operations</h3>
+<p>Bloom filters are used to efficiently detect duplicate transactions and optimize validation performance. The Block Validation Service manages bloom filters with the following operational characteristics:</p>
+<p><strong>Creation and Storage</strong>:</p>
+<ul>
+<li>Bloom filters are created for each validated block containing transaction hashes</li>
+<li>Filters are stored in the subtree store with automatic expiration based on <code>blockvalidation_bloom_filter_retention_size</code></li>
+<li>The retention size is automatically calculated as <code>GlobalBlockHeightRetention + 2</code> to ensure adequate coverage</li>
+</ul>
+<p><strong>Performance Impact</strong>:</p>
+<ul>
+<li><strong>Memory Usage</strong>: Each bloom filter consumes memory proportional to the number of transactions in the block</li>
+<li><strong>CPU Overhead</strong>: Filter creation requires hashing all transaction IDs in the block</li>
+<li><strong>Storage I/O</strong>: Filters are persisted to disk and retrieved during validation operations</li>
+</ul>
+<p><strong>Operational Considerations</strong>:</p>
+<ul>
+<li>Bloom filters reduce false positive rates for duplicate transaction detection</li>
+<li>Automatic pruning prevents unbounded storage growth</li>
+<li>Filter retrieval from subtree store may introduce latency during validation</li>
+<li>Consider increasing retention size for nodes with high transaction volumes</li>
+</ul>
+<h3 id="transaction-processing-pipeline">Transaction Processing Pipeline</h3>
+<p>The transaction processing pipeline uses a hybrid approach combining cache and store operations:</p>
+<ul>
+<li><strong>Subtree Validation Integration</strong>: Transaction metadata operations are delegated to the Subtree Validation Service, which may use caching internally via <code>subtreevalidation_txMetaCacheEnabled</code></li>
+<li><strong>Batch Processing</strong>: Transaction operations are batched using <code>blockvalidation_processTxMetaUsingStore_BatchSize</code> and <code>blockvalidation_processTxMetaUsingCache_BatchSize</code></li>
+<li><strong>Concurrency Control</strong>: Parallel processing is controlled by <code>blockvalidation_processTxMetaUsingStore_Concurrency</code> and related settings</li>
+<li><strong>Fallback Behavior</strong>: When cache operations fail, the system falls back to store-based processing based on threshold settings</li>
+</ul>
+<h3 id="synchronization-strategy">Synchronization Strategy</h3>
+<p>When a node falls behind the blockchain tip, its synchronization strategy is controlled by:</p>
+<ul>
+<li><code>blockvalidation_useCatchupWhenBehind</code> - Enables specialized catchup mode</li>
+<li><code>blockvalidation_catchupConcurrency</code> - Controls parallel processing during catchup</li>
+<li><code>blockvalidation_catchupCh_buffer_size</code> - Affects buffer capacity for catchup operations</li>
+</ul>
+<p>Optimal settings depend on hardware capabilities and network conditions.</p>
+<h2 id="9-other-resources">9. Other Resources</h2>
+<p><a href="../../../references/services/blockvalidation_reference/">Block Validation Reference</a></p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright © 2025 BSV Blockchain Org.
+    </div>
+  
+  
+</div>
+      
+        <div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/bitcoin-sv/teranode" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.7.2 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2024 Fonticons, Inc.--><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8M97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    <script id="__config" type="application/json">{"base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.f8cc74c7.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.c8b220af.min.js"></script>
+      
+        <script src="../../../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
+      
+    
+  </body>
+</html>

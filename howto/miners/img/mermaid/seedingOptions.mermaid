@@ -1,0 +1,36 @@
+graph TB
+    Start([🚀 New Teranode Instance]) --> Choice{🔄 Choose Sync Method}
+
+    Choice -->|Method 1| Method1[📡 Default Network Sync<br/>⏱️ 5-8 days<br/>🔄 P2P from BSV network]
+    Choice -->|Method 2| Method2[🏦 Legacy SV Node Seeding<br/>⏱️ ~1 hour<br/>📤 Export from bitcoind]
+    Choice -->|Method 3| Method3[⚡ Teranode Data Seeding<br/>⏱️ ~1 hour<br/>📋 Copy existing data]
+
+    %% Method 1 Flow
+    Method1 --> M1Step1[🔗 Connect to Peers]
+    M1Step1 --> M1Step2[📥 Download Blocks]
+    M1Step2 --> M1Step3[✅ Validate & Store]
+    M1Step3 --> Complete1[✅ Synchronized]
+
+    %% Method 2 Flow
+    Method2 --> M2Step1[📤 Export UTXO Set<br/>from SV Node]
+    M2Step1 --> M2Step2[🔧 Run Seeder Tool]
+    M2Step2 --> M2Step3[💾 Import to Teranode]
+    M2Step3 --> Complete2[✅ Synchronized]
+
+    %% Method 3 Flow
+    Method3 --> M3Step1[📁 Locate Source Data<br/>from existing Teranode]
+    M3Step1 --> M3Step2[📋 Transfer Data Files]
+    M3Step2 --> M3Step3[🔧 Run Seeder Tool]
+    M3Step3 --> Complete3[✅ Synchronized]
+
+    %% Styling
+    classDef methodBox fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    classDef fastMethod fill:#e8f5e8,stroke:#2e7d32,stroke-width:2px
+    classDef slowMethod fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
+    classDef stepBox fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px
+    classDef completeBox fill:#e8f5e8,stroke:#388e3c,stroke-width:2px
+
+    class Method1 slowMethod
+    class Method2,Method3 fastMethod
+    class M1Step1,M1Step2,M1Step3,M2Step1,M2Step2,M2Step3,M3Step1,M3Step2,M3Step3 stepBox
+    class Complete1,Complete2,Complete3 completeBox

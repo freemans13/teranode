@@ -1,0 +1,48 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+
+participant "Server\n (services/blockvalidation/Server.go)" as Server
+participant "Subtree Store" as SubtreeStore
+
+== Subtree Found Handling ==
+Server -> Server : SubtreeFound()
+activate Server
+Server -> SubtreeStore : Exists(spanCtx, subtreeHash[:])
+activate SubtreeStore
+SubtreeStore --> Server
+deactivate SubtreeStore
+deactivate Server
+
+== Retrieve Subtree ==
+Server -> Server : Get()
+activate Server
+Server -> SubtreeStore : Get(ctx, request.Hash)
+activate SubtreeStore
+SubtreeStore --> Server
+deactivate SubtreeStore
+deactivate Server
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

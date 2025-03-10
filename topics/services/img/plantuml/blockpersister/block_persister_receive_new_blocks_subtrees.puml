@@ -1,0 +1,56 @@
+@startuml block_persister_subtree_processing
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Block Persister Service" as BlockPersister
+participant "Blockchain Service" as Blockchain
+database "UTXO Store" as TMS
+database "Subtree Store" as SubtreeStore
+database "File Storage" as FileStorage
+
+BlockPersister -> BlockPersister: Process Block
+activate BlockPersister
+
+BlockPersister -> FileStorage: Create Block File (.block)
+
+loop for each Subtree
+    BlockPersister -> SubtreeStore: Get Subtree Data
+    SubtreeStore --> BlockPersister: Subtree Data
+
+    loop for Transaction Batches
+        BlockPersister -> TMS: Get Transaction Metadata
+        TMS --> BlockPersister: UTXO Metadata
+
+        BlockPersister -> BlockPersister: Process Transaction Batch
+    end
+
+    BlockPersister -> FileStorage: Store Subtree File (.subtree)
+end
+
+BlockPersister -> BlockPersister: Calculate UTXO Changes
+BlockPersister -> FileStorage: Store UTXO Additions (.utxo-additions)
+BlockPersister -> FileStorage: Store UTXO Deletions (.utxo-deletions)
+
+deactivate BlockPersister
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+@enduml

@@ -1,0 +1,62 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "gRPC Client" as Client
+entity "Validator Server \n(Server.go)" as ValidatorServer
+entity "Validator \n(Validator.go)" as Validator
+queue "Rejected Tx Kafka Producer" as RejectedKafka
+database "UTXO Store" as UTXOStore
+participant "Block Assembly" as BlockAssembly
+
+== Transaction Validation ==
+Client -> ValidatorServer: ValidateTransaction(ctx, req)
+activate ValidatorServer
+ValidatorServer -> Validator: Validate(ctx, tx, blockHeight)
+activate Validator
+
+Validator -> Validator: validateInternal()
+Validator -> UTXOStore: spendUtxos()
+Validator -> UTXOStore: storeTxInUtxoMap()
+
+alt if validation succeeds
+    alt if !blockAssemblyDisabled
+        Validator -> BlockAssembly: Store()
+    end
+else if validation fails
+    Validator -> RejectedKafka: Publish rejected TX
+end
+
+Validator --> ValidatorServer: Return validation result
+deactivate Validator
+
+ValidatorServer --> Client: Return ValidateTransactionResponse
+deactivate ValidatorServer
+
+note right of RejectedKafka
+  Other services can subscribe to this Kafka topic
+  to receive notifications about invalid transactions
+end note
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

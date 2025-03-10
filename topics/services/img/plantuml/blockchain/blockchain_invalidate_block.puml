@@ -1,0 +1,43 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Block Assembly" as Client
+participant "Blockchain Service" as Blockchain
+database "Store" as Store
+
+Client -> Client: submitMiningSolution(ctx, submitMiningSolutionRequest)
+
+alt Failed to submit mining solution
+    Client -> Blockchain: InvalidateBlock(request)
+    activate Blockchain
+    Blockchain -> Store: InvalidateBlock(blockHash)
+    activate Store
+    Store --> Blockchain: Result
+    deactivate Store
+    Blockchain --> Client: Response (Empty or Error)
+    deactivate Blockchain
+end
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

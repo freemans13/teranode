@@ -1,0 +1,62 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant Main
+entity "Server Instance" as Server
+control "NewServer()" as NewServer
+control "Init()" as Init
+control "Start()" as Start
+participant Validator
+participant "Blockchain Client" as BlockchainClient
+participant "Kafka Consumer" as KafkaConsumer
+
+Main -> NewServer: Initialize(logger, utxoStore, blockchainClient)
+NewServer -> Server: Create instance
+NewServer -> Server: Initialize metrics
+NewServer -> Main: Return instance
+
+Main -> Init: Initialize validator
+Init -> Validator: New(ctx, logger, utxoStore)
+alt if error in validator creation
+    Init -> Main: Return error
+else validator created successfully
+    Init -> Server: Setup Kafka consumer if configured
+    Init -> Main: Return success
+end
+
+Main -> Start: Start services
+alt if fsmStateRestore is true
+    Start -> BlockchainClient: Restore(ctx)
+    Start -> BlockchainClient: WaitForFSMtoTransitionToGivenState(RUNNING)
+end
+Start -> KafkaConsumer: Start(ctx)
+Start -> Server: Start gRPC server
+alt if error in gRPC server
+    Start -> Main: Return error
+else gRPC started successfully
+    Start -> Main: Return success
+end
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

@@ -1,0 +1,63 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Client" as Client
+participant "Blockchain Service" as Service
+database "Store" as Store
+
+== GetBlockHeader ==
+Client -> Service: GetBlockHeader(ctx, request)
+activate Service
+Service -> Service: chainhash.NewHash(request.BlockHash)
+Service -> Store: GetBlockHeader(ctx, hash)
+activate Store
+Store --> Service: blockHeader, meta, err
+deactivate Store
+Service --> Client: GetBlockHeaderResponse
+deactivate Service
+
+== GetBlockHeaders ==
+Client -> Service: GetBlockHeaders(ctx, request)
+activate Service
+Service -> Service: chainhash.NewHash(request.StartHash)
+Service -> Store: GetBlockHeaders(ctx, startHash, req.NumberOfHeaders)
+activate Store
+Store --> Service: blockHeaders, blockHeaderMetas, err
+deactivate Store
+Service --> Client: GetBlockHeadersResponse
+deactivate Service
+
+== GetBlockHeaderIDs ==
+Client -> Service: GetBlockHeaderIDs(ctx, request)
+activate Service
+Service -> Service: chainhash.NewHash(request.StartHash)
+Service -> Store: GetBlockHeaderIDs(ctx, startHash, req.NumberOfHeaders)
+activate Store
+Store --> Service: ids, err
+deactivate Store
+Service --> Client: GetBlockHeaderIDsResponse
+deactivate Service
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

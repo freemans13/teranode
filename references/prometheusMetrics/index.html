@@ -1,0 +1,5852 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../licenseInformation/">
+      
+      
+        <link rel="next" href="../settings/">
+      
+      
+      <link rel="icon" href="../../topics/architecture/img/bsvblockchain_blue_logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.7">
+    
+    
+      
+        <title>Prometheus Metrics - Teranode</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.8608ea7d.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        
+        <link rel="stylesheet" href="../../assets/external/fonts.googleapis.com/css.49ea35f2.css">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../overrides/custom.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#teranode-prometheus-metrics-reference" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../topics/architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Teranode
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Prometheus Metrics
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../tutorials/developers/developerSetup/" class="md-tabs__link">
+          
+  
+  Tutorials
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../howto/locallyRunningServices/" class="md-tabs__link">
+          
+  
+  How-To Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../topics/teranodeIntro/" class="md-tabs__link">
+          
+  
+  Key Topics
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../projectStructure/" class="md-tabs__link">
+          
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../topics/architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    Teranode
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Home
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Tutorials
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            Tutorials
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/developers/developerSetup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/miners/minersGettingStarted/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Miners Getting Started
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    How-To Guides
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            How-To Guides
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/locallyRunningServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Services Locally
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Debugging Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/generatingProtobuf/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Generating Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/addingNewProtobufServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Adding Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/configuringGrpcLogging/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Configuring gRPC Logging
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/runningTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/automatedTestingHowTo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Automated Testing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/makefile/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Makefile Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/bugReporting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Bug Reporting
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer's Guide to Teranode-CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11" id="__nav_3_11_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Miners
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11">
+            <span class="md-nav__icon md-icon"></span>
+            Miners
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/howToUseTheTestMiner.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Using Test Miner
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_2" id="__nav_3_11_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Installation
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_2">
+            <span class="md-nav__icon md-icon"></span>
+            Installation
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/kubernetes/minersHowToInstallationDeprecated/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Deprecated
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_3" id="__nav_3_11_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Configuration
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_3">
+            <span class="md-nav__icon md-icon"></span>
+            Configuration
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Aerospike Tuning
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    FSM Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_4" id="__nav_3_11_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Start/Stop
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_4">
+            <span class="md-nav__icon md-icon"></span>
+            Start/Stop
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_5" id="__nav_3_11_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Updating Teranode
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_5">
+            <span class="md-nav__icon md-icon"></span>
+            Updating Teranode
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_6" id="__nav_3_11_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Security Best Practices
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_6">
+            <span class="md-nav__icon md-icon"></span>
+            Security Best Practices
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_7" id="__nav_3_11_7_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Troubleshooting
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_7">
+            <span class="md-nav__icon md-icon"></span>
+            Troubleshooting
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_8" id="__nav_3_11_8_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Additional
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_8">
+            <span class="md-nav__icon md-icon"></span>
+            Additional
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    CPU Mining Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToResetTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Reset Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToSyncTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Sync the Node
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Managing Disk Space
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howto/miners/kubernetes/minersHowToBackup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Backup (Kubernetes)
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Key Topics
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            Key Topics
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/teranodeIntro/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Introduction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/architecture/teranode-overall-system-design/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/architecture/teranode-architecture-brief/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Brief
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/architecture/teranode-microservices-overview/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Microservices Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/architecture/stateManagement/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    State Management
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/architecture/understandingDoubleSpends/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding Double Spends
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/technologyStack/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Technology Stack
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/understandingTheTestingFramework/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding the Testing Framework
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/functionalRequirementTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Functional Requirement Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_10" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_10" id="__nav_4_10_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Features
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_10">
+            <span class="md-nav__icon md-icon"></span>
+            Features
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/features/two_phase_commit/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Two Phase Commit
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_11" id="__nav_4_11_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_11">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/alert/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/assetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/blockAssembly/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/blockValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/blockchain/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/propagation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/subtreeValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/validator/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_12" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_12" id="__nav_4_12_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_12_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_12">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/blockPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/p2p/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/legacy/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Legacy
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/rpc/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/services/utxoPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_13" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_13" id="__nav_4_13_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_13">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/stores/blob/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/stores/utxo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_14" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Data Model
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_14">
+            <span class="md-nav__icon md-icon"></span>
+            Data Model
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/datamodel/block_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/datamodel/block_header_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Header Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/datamodel/subtree_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/datamodel/transaction_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Transaction Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/datamodel/utxo_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_15" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Kafka
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_15">
+            <span class="md-nav__icon md-icon"></span>
+            Kafka
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/kafka/kafka/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Commands
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_16">
+            <span class="md-nav__icon md-icon"></span>
+            Commands
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/commands/chainIntegrity.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Chain Integrity
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/commands/propagationBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/commands/seeder/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Seeder
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../topics/commands/txBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    TX Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Reference
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            Reference
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projectStructure/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Project Structure
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2" id="__nav_5_2_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    API & Protobuf
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2">
+            <span class="md-nav__icon md-icon"></span>
+            API & Protobuf
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../errorHandling/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Error Handling
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../glossary/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Glossary
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../codingConventions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Coding Conventions
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../kafkaMessageFormat/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Message Format
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../networkConsensusRules/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Network Consensus Rules
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2_6" id="__nav_5_2_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Protobuf API
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_5_2_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2_6">
+            <span class="md-nav__icon md-icon"></span>
+            Protobuf API
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../protobuf_docs/alertProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../protobuf_docs/blockassemblyProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../protobuf_docs/blockchainProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../protobuf_docs/blockvalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../protobuf_docs/propagationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../protobuf_docs/validatorProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_3" id="__nav_5_3_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_3">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/alert_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/asset_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/blockassembly_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/blockvalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/blockchain_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/propagation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/subtreevalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/validator_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_4" id="__nav_5_4_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_4">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/blockpersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/p2p_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/legacy_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P Legacy Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/rpc_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../services/utxopersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../stores/blob_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../stores/utxo_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_6" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_5_6" id="__nav_5_6_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Miscellaneous
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_6_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_5_6">
+            <span class="md-nav__icon md-icon"></span>
+            Miscellaneous
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gitCommitSigningSetupGuide/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Git Commit Signing Setup Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../licenseInformation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Licensing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  <span class="md-ellipsis">
+    Prometheus Metrics
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  <span class="md-ellipsis">
+    Prometheus Metrics
+    
+  </span>
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#metric-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      Metric Types
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alert-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Alert Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#asset-service-http-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Asset Service HTTP Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-assembly-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Block Assembly Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Block Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#blockchain-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Blockchain Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-persister-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Block Persister Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-validation-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Block Validation Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#legacy-peer-server-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Legacy Peer Server Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#legacy-netsync-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Legacy NetSync Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#propagation-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Propagation Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rpc-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      RPC Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#subtree-validation-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Subtree Validation Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#validator-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Validator Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#txmetacache-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      TxMetaCache Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#aerospike-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Aerospike Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sql-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      SQL Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#subtree-processor-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Subtree Processor Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Settings
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../teranodeDaemonReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Daemon Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../testingTechnicalReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Testing Technical Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../thirdPartySoftwareRequirements/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Third-Party Software Requirements
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#metric-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      Metric Types
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alert-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Alert Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#asset-service-http-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Asset Service HTTP Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-assembly-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Block Assembly Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Block Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#blockchain-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Blockchain Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-persister-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Block Persister Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-validation-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Block Validation Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#legacy-peer-server-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Legacy Peer Server Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#legacy-netsync-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Legacy NetSync Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#propagation-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Propagation Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rpc-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      RPC Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#subtree-validation-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Subtree Validation Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#validator-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Validator Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#txmetacache-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      TxMetaCache Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#aerospike-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Aerospike Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sql-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      SQL Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#subtree-processor-service-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Subtree Processor Service Metrics
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<h1 id="teranode-prometheus-metrics-reference">Teranode Prometheus Metrics Reference</h1>
+<h2 id="metric-types">Metric Types</h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Counter</td>
+<td>A cumulative metric that represents an increasing counter whose value can only increase OR be reset to zero. <br/>Used for counting events or operations (e.g., number of requests, errors).</td>
+</tr>
+<tr>
+<td>CounterVec</td>
+<td>A Counter that includes additional labels/dimensions. <br/>Allows for breaking down the counter by various labels (e.g., counting errors by type, requests by status code).</td>
+</tr>
+<tr>
+<td>Gauge</td>
+<td>A metric that represents a single numerical value that can arbitrarily go up and down. <br/>Used for measured values like items in a channel or queue.</td>
+</tr>
+<tr>
+<td>Histogram</td>
+<td>Samples observations (such as duration or size) and counts them in configurable buckets. <br/>Also provides a sum of all observed values and count of observations. <br/>Used for measuring distributions of values (e.g., request durations, response sizes).</td>
+</tr>
+</tbody>
+</table>
+<h2 id="alert-service-metrics">Alert Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_alert_health</code></td>
+<td>Counter</td>
+<td>Number of calls to the Health endpoint</td>
+</tr>
+</tbody>
+</table>
+<h2 id="asset-service-http-metrics">Asset Service HTTP Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_asset_http_get_transaction</code></td>
+<td>CounterVec</td>
+<td>Number of Get transactions ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_transactions</code></td>
+<td>CounterVec</td>
+<td>Number of Get transactions ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_subtree</code></td>
+<td>CounterVec</td>
+<td>Number of Get subtree ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_block_header</code></td>
+<td>CounterVec</td>
+<td>Number of Get block header ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_best_block_header</code></td>
+<td>CounterVec</td>
+<td>Number of Get best block header ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_block</code></td>
+<td>CounterVec</td>
+<td>Number of Get block ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_block_legacy</code></td>
+<td>CounterVec</td>
+<td>Number of Get legacy block ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_subtree_data</code></td>
+<td>CounterVec</td>
+<td>Number of Get subtree data ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_last_n_blocks</code></td>
+<td>CounterVec</td>
+<td>Number of Get last N blocks ops</td>
+</tr>
+<tr>
+<td><code>teranode_asset_http_get_utxo</code></td>
+<td>CounterVec</td>
+<td>Number of Get UTXO ops</td>
+</tr>
+</tbody>
+</table>
+<h2 id="block-assembly-service-metrics">Block Assembly Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_blockassembly_health</code></td>
+<td>Counter</td>
+<td>Number of calls to the health endpoint of the blockassembly service</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_add_tx</code></td>
+<td>Histogram</td>
+<td>Histogram of AddTx in the blockassembly service</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_remove_tx</code></td>
+<td>Histogram</td>
+<td>Histogram of RemoveTx in the blockassembly service</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_get_mining_candidate_duration</code></td>
+<td>Histogram</td>
+<td>Histogram of GetMiningCandidate in the blockassembly service</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_submit_mining_solution_ch</code></td>
+<td>Gauge</td>
+<td>Number of items in the SubmitMiningSolution channel in the blockassembly service</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_submit_mining_solution</code></td>
+<td>Histogram</td>
+<td>Histogram of SubmitMiningSolution in the blockassembly service</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_update_subtrees_dah</code></td>
+<td>Histogram</td>
+<td>Histogram of updating subtrees DAH in the blockassembly service</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_block_assembler_get_mining_candidate</code></td>
+<td>Counter</td>
+<td>Number of calls to GetMiningCandidate in the block assembler</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_subtree_created</code></td>
+<td>Counter</td>
+<td>Number of subtrees created in the block assembler</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_transactions</code></td>
+<td>Gauge</td>
+<td>Number of transactions currently in the block assembler subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_queued_transactions</code></td>
+<td>Gauge</td>
+<td>Number of transactions currently queued in the block assembler subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_subtrees</code></td>
+<td>Gauge</td>
+<td>Number of subtrees currently in the block assembler subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_tx_meta_get</code></td>
+<td>Histogram</td>
+<td>Histogram of reading tx meta data from txmeta store in block assembler</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_reorg</code></td>
+<td>Counter</td>
+<td>Number of reorgs in block assembler</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_reorg_duration</code></td>
+<td>Histogram</td>
+<td>Histogram of reorg in block assembler</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_get_reorg_blocks_duration</code></td>
+<td>Histogram</td>
+<td>Histogram of GetReorgBlocks in block assembler</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_update_best_block</code></td>
+<td>Histogram</td>
+<td>Histogram of updating best block in block assembler</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_best_block_height</code></td>
+<td>Gauge</td>
+<td>Best block height in block assembly</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_current_block_height</code></td>
+<td>Gauge</td>
+<td>Current block height in block assembly</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_generate_blocks</code></td>
+<td>Histogram</td>
+<td>Histogram of generating blocks in block assembler</td>
+</tr>
+<tr>
+<td><code>teranode_blockassembly_current_state</code></td>
+<td>Gauge</td>
+<td>Current state of the block assembly process</td>
+</tr>
+</tbody>
+</table>
+<h2 id="block-service-metrics">Block Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_block_from_bytes</code></td>
+<td>Histogram</td>
+<td>Histogram of Block.FromBytes</td>
+</tr>
+<tr>
+<td><code>teranode_block_valid</code></td>
+<td>Histogram</td>
+<td>Histogram of Block.Valid</td>
+</tr>
+<tr>
+<td><code>teranode_block_check_merkle_root</code></td>
+<td>Histogram</td>
+<td>Histogram of Block.CheckMerkleRoot</td>
+</tr>
+<tr>
+<td><code>teranode_block_get_subtrees</code></td>
+<td>Histogram</td>
+<td>Histogram of Block.GetSubtrees</td>
+</tr>
+<tr>
+<td><code>teranode_block_get_and_validate_subtrees</code></td>
+<td>Histogram</td>
+<td>Histogram of Block.GetAndValidateSubtrees</td>
+</tr>
+<tr>
+<td><code>teranode_block_bloom_filter_query_counter</code></td>
+<td>Gauge</td>
+<td>Number of queries to the bloom filter</td>
+</tr>
+<tr>
+<td><code>teranode_block_bloom_filter_positive_counter</code></td>
+<td>Gauge</td>
+<td>Number of positive from the bloom filter</td>
+</tr>
+<tr>
+<td><code>teranode_block_bloom_filter_false_positive_counter</code></td>
+<td>Gauge</td>
+<td>Number of false positives from the bloom filter</td>
+</tr>
+</tbody>
+</table>
+<h2 id="blockchain-service-metrics">Blockchain Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_blockchain_health</code></td>
+<td>Counter</td>
+<td>Histogram of calls to the health endpoint of the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_add_block</code></td>
+<td>Histogram</td>
+<td>Histogram of block added to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_block</code></td>
+<td>Histogram</td>
+<td>Histogram of Get block calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_block_stats</code></td>
+<td>Histogram</td>
+<td>Histogram of Get block stats calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_block_graph_data</code></td>
+<td>Histogram</td>
+<td>Histogram of Get block graph data calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_last_n_block</code></td>
+<td>Histogram</td>
+<td>Histogram of GetLastNBlocks calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_suitable_block</code></td>
+<td>Histogram</td>
+<td>Histogram of GetSuitableBlock calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_hash_of_ancestor_block</code></td>
+<td>Histogram</td>
+<td>Histogram of GetHashOfAncestorBlock calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_next_work_required</code></td>
+<td>Histogram</td>
+<td>Histogram of GetNextWorkRequired calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_block_exists</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlockExists calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_get_best_block_header</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBestBlockHeader calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_check_block_is_in_current_chain</code></td>
+<td>Histogram</td>
+<td>Histogram of CheckBlockIsInCurrentChain calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_chain_tips</code></td>
+<td>Histogram</td>
+<td>Histogram of GetChainTips calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_get_block_header</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlockHeader calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_get_block_headers</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlockHeaders calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_get_block_headers_from_height</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlockHeadersFromHeight calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_get_block_headers_by_height</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlockHeadersByHeight calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_block_is_mined</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlockIsMined calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_subscribe</code></td>
+<td>Histogram</td>
+<td>Histogram of Subscribe calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_state</code></td>
+<td>Histogram</td>
+<td>Histogram of GetState calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_set_state</code></td>
+<td>Histogram</td>
+<td>Histogram of SetState calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_block_header_ids</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlockHeaderIDs calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_invalidate_block</code></td>
+<td>Histogram</td>
+<td>Histogram of InvalidateBlock calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_revalidate_block</code></td>
+<td>Histogram</td>
+<td>Histogram of RevalidateBlock calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_send_notification</code></td>
+<td>Histogram</td>
+<td>Histogram of SendNotification calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_set_block_mined_set</code></td>
+<td>Histogram</td>
+<td>Histogram of SetBlockMinedSet calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_blocks_mined_not_set</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlocksMinedNotSet calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_set_block_subtrees_set</code></td>
+<td>Histogram</td>
+<td>Histogram of SetBlockSubtreesSet calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_blocks_subtrees_not_set</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlocksSubtreesNotSet calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_fsm_current_state</code></td>
+<td>Gauge</td>
+<td>Current state of the blockchain FSM</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_fsm_current_state</code></td>
+<td>Histogram</td>
+<td>Histogram of GetFSMCurrentState calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_get_block_locator</code></td>
+<td>Histogram</td>
+<td>Histogram of GetBlockLocator calls to the blockchain service</td>
+</tr>
+<tr>
+<td><code>teranode_blockchain_locate_block_headers</code></td>
+<td>Histogram</td>
+<td>Histogram of LocateBlockHeaders calls to the blockchain service</td>
+</tr>
+</tbody>
+</table>
+<h2 id="block-persister-service-metrics">Block Persister Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_blockpersister_validate_subtree</code></td>
+<td>Histogram</td>
+<td>Histogram of subtree validation</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_validate_subtree_retry</code></td>
+<td>Counter</td>
+<td>Number of retries when subtrees validated</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_validate_subtree_handler</code></td>
+<td>Histogram</td>
+<td>Histogram of subtree handler</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_persist_block</code></td>
+<td>Histogram</td>
+<td>Histogram of PersistBlock in the blockpersister service</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_bless_missing_transaction</code></td>
+<td>Histogram</td>
+<td>Histogram of bless missing transaction</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_set_tx_meta_cache_kafka</code></td>
+<td>Histogram</td>
+<td>Histogram of setting tx meta cache from kafka</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_del_tx_meta_cache_kafka</code></td>
+<td>Histogram</td>
+<td>Duration of deleting tx meta cache from kafka</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_set_tx_meta_cache_kafka_errors</code></td>
+<td>Counter</td>
+<td>Number of errors setting tx meta cache from kafka</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_blocks_duration</code></td>
+<td>Histogram</td>
+<td>Duration of block processing by the block persister service</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_subtrees_duration</code></td>
+<td>Histogram</td>
+<td>Duration of subtree processing by the block persister service</td>
+</tr>
+<tr>
+<td><code>teranode_blockpersister_subtree_batch_duration</code></td>
+<td>Histogram</td>
+<td>Duration of a subtree batch processing by the block persister service</td>
+</tr>
+</tbody>
+</table>
+<h2 id="block-validation-service-metrics">Block Validation Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_blockvalidation_health</code></td>
+<td>Counter</td>
+<td>Number of health checks</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_block_found_ch</code></td>
+<td>Gauge</td>
+<td>Number of blocks found buffered in the block found channel</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_block_found</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to BlockFound method</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_catchup_ch</code></td>
+<td>Gauge</td>
+<td>Number of catchups buffered in the catchup channel</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_catchup</code></td>
+<td>Histogram</td>
+<td>Histogram of catchup events</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_process_block_found</code></td>
+<td>Histogram</td>
+<td>Histogram of process block found</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_validate_block</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to ValidateBlock method</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_revalidate_block</code></td>
+<td>Histogram</td>
+<td>Histogram of re-validate block</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_revalidate_block_err</code></td>
+<td>Histogram</td>
+<td>Number of blocks revalidated with error</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_last_validated_blocks_cache</code></td>
+<td>Gauge</td>
+<td>Number of blocks in the last validated blocks cache</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_block_exists_cache</code></td>
+<td>Gauge</td>
+<td>Number of blocks in the block exists cache</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_subtree_exists_cache</code></td>
+<td>Gauge</td>
+<td>Number of subtrees in the subtree exists cache</td>
+</tr>
+</tbody>
+</table>
+<h2 id="legacy-peer-server-metrics">Legacy Peer Server Metrics</h2>
+<p>Each metric measures "The time taken to handle a specific legacy action handler".</p>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_legacy_peer_server_OnVersion</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnVersion</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnProtoconf</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnProtoconf</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnMemPool</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnMemPool</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnTx</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnTx</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnBlock</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnBlock</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnInv</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnInv</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnHeaders</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnHeaders</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnGetData</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnGetData</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnGetBlocks</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnGetBlocks</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnGetHeaders</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnGetHeaders</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnFeeFilter</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnFeeFilter</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnGetAddr</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnGetAddr</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnAddr</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnAddr</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnReject</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnReject</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnNotFound</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnNotFound</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnRead</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnRead</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_peer_server_OnWrite</code></td>
+<td>Histogram</td>
+<td>The time taken to handle OnWrite</td>
+</tr>
+</tbody>
+</table>
+<h2 id="legacy-netsync-service-metrics">Legacy NetSync Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_legacy_netsync_block_height</code></td>
+<td>Gauge</td>
+<td>The height of the block being processed</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_handle_tx_msg</code></td>
+<td>Histogram</td>
+<td>The time taken to handle a tx message</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_handle_tx_msg_validate</code></td>
+<td>Histogram</td>
+<td>The time taken to validate a tx message</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_process_orphan_transactions</code></td>
+<td>Histogram</td>
+<td>The time taken to process orphan transactions</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_handle_block_direct</code></td>
+<td>Histogram</td>
+<td>The time taken to handle a block directly</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_process_block</code></td>
+<td>Histogram</td>
+<td>The time taken to process a block</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_prepare_subtrees</code></td>
+<td>Histogram</td>
+<td>The time taken to prepare the subtrees</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_validate_transactions_legacy_mode</code></td>
+<td>Histogram</td>
+<td>The time taken to validate transactions in legacy mode</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_pre_validate_transactions</code></td>
+<td>Histogram</td>
+<td>The time taken to pre-validate transactions</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_validate_transactions</code></td>
+<td>Histogram</td>
+<td>The time taken to validate transactions</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_extend_transactions</code></td>
+<td>Histogram</td>
+<td>The time taken to extend transactions</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_create_utxos</code></td>
+<td>Histogram</td>
+<td>The time taken to create UTXOs</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_block_tx_size</code></td>
+<td>Histogram</td>
+<td>The size of the transactions in the block being processed</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_block_tx_nr_inputs</code></td>
+<td>Histogram</td>
+<td>The number of inputs in the block being processed</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_block_tx_nr_outputs</code></td>
+<td>Histogram</td>
+<td>The number of outputs in the block being processed</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_block_tx_extend</code></td>
+<td>Histogram</td>
+<td>The time taken to extend a transaction</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_block_tx_validate</code></td>
+<td>Histogram</td>
+<td>The time taken to validate a transaction</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_orphans</code></td>
+<td>Gauge</td>
+<td>The number of orphan transactions</td>
+</tr>
+<tr>
+<td><code>teranode_legacy_netsync_orphan_time</code></td>
+<td>Histogram</td>
+<td>The time taken to process an orphan transaction</td>
+</tr>
+</tbody>
+</table>
+<h2 id="propagation-service-metrics">Propagation Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_propagation_health</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to the health endpoint of the propagation service</td>
+</tr>
+<tr>
+<td><code>teranode_propagation_transactions</code></td>
+<td>Histogram</td>
+<td>Histogram of transaction processing by the propagation service</td>
+</tr>
+<tr>
+<td><code>teranode_propagation_transactions_batch</code></td>
+<td>Histogram</td>
+<td>Histogram of transaction processing by the propagation service</td>
+</tr>
+<tr>
+<td><code>teranode_propagation_handle_single_tx</code></td>
+<td>Histogram</td>
+<td>Histogram of transaction processing by the propagation service using HTTP</td>
+</tr>
+<tr>
+<td><code>teranode_propagation_handle_multiple_tx</code></td>
+<td>Histogram</td>
+<td>Histogram of multiple transaction processing by the propagation service using HTTP</td>
+</tr>
+<tr>
+<td><code>teranode_propagation_transactions_size</code></td>
+<td>Histogram</td>
+<td>Size of transactions processed by the propagation service</td>
+</tr>
+<tr>
+<td><code>teranode_propagation_invalid_transactions</code></td>
+<td>Counter</td>
+<td>Number of transactions found invalid by the propagation service</td>
+</tr>
+</tbody>
+</table>
+<h2 id="rpc-service-metrics">RPC Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_rpc_get_block</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetBlock in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_block_by_height</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetBlockByHeight in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_block_hash</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetBlockHash in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_block_header</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetBlockHeader in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_best_block_hash</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetBestBlockHash in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_raw_transaction</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetRawTransaction in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_create_raw_transaction</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleCreateRawTransaction in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_send_raw_transaction</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleSendRawTransaction in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_generate</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGenerate in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_generate_to_address</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGenerateToAddress in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_mining_candidate</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetMiningCandidate in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_submit_mining_solution</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleSubmitMiningSolution in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_peer_info</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetpeerinfo in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_blockchain_info</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetblockchaininfo in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_info</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetinfo in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_difficulty</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetDifficulty in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_invalidate_block</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleInvalidateBlock in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_reconsider_block</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleReconsiderBlock in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_help</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleHelp in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_set_ban</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleSetBan in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_is_banned</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleIsBanned in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_get_mining_info</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleGetMiningInfo in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_list_banned</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleListBanned in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_clear_banned</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleClearBanned in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_freeze</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleFreeze in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_unfreeze</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleUnfreeze in the rpc service</td>
+</tr>
+<tr>
+<td><code>teranode_rpc_reassign</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to handleReassign in the rpc service</td>
+</tr>
+</tbody>
+</table>
+<h2 id="subtree-validation-service-metrics">Subtree Validation Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_subtreevalidation_health</code></td>
+<td>Histogram</td>
+<td>Histogram of calls to health endpoint</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_check_subtree</code></td>
+<td>Histogram</td>
+<td>Duration of calls to checkSubtree endpoint</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_validate_subtree</code></td>
+<td>Histogram</td>
+<td>Histogram of subtrees validated</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_validate_subtree_retry</code></td>
+<td>Counter</td>
+<td>Number of retries when subtrees validated</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_validate_subtree_handler</code></td>
+<td>Histogram</td>
+<td>Duration of subtree handler</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_validate_subtree_duration</code></td>
+<td>Histogram</td>
+<td>Duration of validate subtree</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_bless_missing_transaction</code></td>
+<td>Histogram</td>
+<td>Duration of bless missing transaction</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_set_tx_meta_cache_kafka</code></td>
+<td>Histogram</td>
+<td>Duration of setting tx meta cache from kafka</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_del_tx_meta_cache_kafka</code></td>
+<td>Histogram</td>
+<td>Duration of deleting tx meta cache from kafka</td>
+</tr>
+<tr>
+<td><code>teranode_subtreevalidation_set_tx_meta_cache_kafka_errors</code></td>
+<td>Counter</td>
+<td>Number of errors setting tx meta cache from kafka</td>
+</tr>
+</tbody>
+</table>
+<h2 id="validator-service-metrics">Validator Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_validator_health</code></td>
+<td>Counter</td>
+<td>Number of calls to the health endpoint</td>
+</tr>
+<tr>
+<td><code>teranode_validator_transaction</code></td>
+<td>Histogram</td>
+<td>Histogram of transaction validation by the validator service</td>
+</tr>
+<tr>
+<td><code>teranode_validator_transactions</code></td>
+<td>Histogram</td>
+<td>Histogram of batch transaction validation by the validator service</td>
+</tr>
+<tr>
+<td><code>teranode_validator_transactions_deadline</code></td>
+<td>Histogram</td>
+<td>Histogram of batch transaction validation by deadline</td>
+</tr>
+<tr>
+<td><code>teranode_validator_nblocks</code></td>
+<td>Gauge</td>
+<td>Number of blocks processed by the validator service</td>
+</tr>
+<tr>
+<td><code>teranode_validator_transactions_size</code></td>
+<td>Histogram</td>
+<td>Size of transactions being validated by the validator service</td>
+</tr>
+<tr>
+<td><code>teranode_validator_transactions_extended</code></td>
+<td>Histogram</td>
+<td>The number of transactions extended per call to the validator service</td>
+</tr>
+<tr>
+<td><code>teranode_validator_transactions_validate_scripts</code></td>
+<td>Histogram</td>
+<td>Time taken to validate scripts in transactions</td>
+</tr>
+<tr>
+<td><code>teranode_validator_transactions_input_block_heights</code></td>
+<td>Histogram</td>
+<td>Distribution of input block heights in transactions</td>
+</tr>
+<tr>
+<td><code>teranode_validator_transactions_2phase_commit</code></td>
+<td>Histogram</td>
+<td>Time taken for two-phase commit of transactions</td>
+</tr>
+<tr>
+<td><code>teranode_validator_send_to_block_assembly</code></td>
+<td>Histogram</td>
+<td>Histogram of sending transactions to block assembly</td>
+</tr>
+<tr>
+<td><code>teranode_validator_send_to_blockvalidation_kafka</code></td>
+<td>Histogram</td>
+<td>Histogram of sending transactions to block validation kafka</td>
+</tr>
+<tr>
+<td><code>teranode_validator_send_to_p2p_kafka</code></td>
+<td>Histogram</td>
+<td>Histogram of sending rejected transactions to p2p kafka</td>
+</tr>
+<tr>
+<td><code>teranode_validator_set_tx_meta</code></td>
+<td>Histogram</td>
+<td>Histogram of validator set tx meta</td>
+</tr>
+</tbody>
+</table>
+<h2 id="txmetacache-service-metrics">TxMetaCache Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_tx_meta_cache_size</code></td>
+<td>Gauge</td>
+<td>Number of items in the tx meta cache</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_insertions</code></td>
+<td>Gauge</td>
+<td>Number of insertions into the tx meta cache</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_hits</code></td>
+<td>Gauge</td>
+<td>Number of hits in the tx meta cache</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_misses</code></td>
+<td>Gauge</td>
+<td>Number of misses in the tx meta cache</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_get_origin</code></td>
+<td>Gauge</td>
+<td>Number of get origins in the tx meta cache</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_evictions</code></td>
+<td>Gauge</td>
+<td>Number of evictions in the tx meta cache</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_trims</code></td>
+<td>Gauge</td>
+<td>Number of trim operations in the tx meta cache</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_map_size</code></td>
+<td>Gauge</td>
+<td>Number of total elements in the improved cache's bucket maps</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_total_elements_added</code></td>
+<td>Gauge</td>
+<td>Number of total number of elements added to the txmetacache</td>
+</tr>
+<tr>
+<td><code>teranode_tx_meta_cache_hit_old_tx</code></td>
+<td>Gauge</td>
+<td>Number of hits on old txs in the tx meta cache</td>
+</tr>
+</tbody>
+</table>
+<h2 id="aerospike-service-metrics">Aerospike Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_aerospike_txmeta_get</code></td>
+<td>Counter</td>
+<td>Number of txmeta get calls done to aerospike</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_store</code></td>
+<td>Counter</td>
+<td>Number of Create calls done to aerospike</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_set_mined</code></td>
+<td>Counter</td>
+<td>Number of txmeta set_mined calls done to aerospike</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_errors</code></td>
+<td>CounterVec</td>
+<td>Number of txmeta map errors</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_get_multi</code></td>
+<td>Counter</td>
+<td>Number of txmeta get_multi calls done to aerospike map</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_get_multi_n</code></td>
+<td>Counter</td>
+<td>Number of txmeta get_multi txs done to aerospike map</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_set_mined_batch</code></td>
+<td>Counter</td>
+<td>Number of txmeta set_mined_batch calls done to aerospike map</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_set_mined_batch_n</code></td>
+<td>Counter</td>
+<td>Number of txmeta set_mined_batch txs done to aerospike map</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_set_mined_batch_err_n</code></td>
+<td>Counter</td>
+<td>Number of txmeta set_mined_batch txs errors to aerospike map</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_get</code></td>
+<td>Counter</td>
+<td>Number of utxo get calls done to aerospike</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_spend</code></td>
+<td>Counter</td>
+<td>Number of utxo spend calls done to aerospike</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_reset</code></td>
+<td>Counter</td>
+<td>Number of utxo reset calls done to aerospike</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_delete</code></td>
+<td>Counter</td>
+<td>Number of utxo delete calls done to aerospike</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_errors</code></td>
+<td>CounterVec</td>
+<td>Number of utxo errors</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_create_batch</code></td>
+<td>Histogram</td>
+<td>Duration of utxo create batch</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_create_batch_size</code></td>
+<td>Histogram</td>
+<td>Size of utxo create batch</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_spend_batch</code></td>
+<td>Histogram</td>
+<td>Duration of utxo spend batch</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_utxo_spend_batch_size</code></td>
+<td>Histogram</td>
+<td>Size of utxo spend batch</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_get_external</code></td>
+<td>Histogram</td>
+<td>Duration of getting an external transaction from the blob store</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_set_external</code></td>
+<td>Histogram</td>
+<td>Duration of setting an external transaction to the blob store</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_get_counter_conflicting</code></td>
+<td>Counter</td>
+<td>Counter of conflicting TxMeta GET operations using Aerospike</td>
+</tr>
+<tr>
+<td><code>teranode_aerospike_txmeta_get_conflicting</code></td>
+<td>Histogram</td>
+<td>Histogram of conflicting TxMeta GET operations using Aerospike</td>
+</tr>
+</tbody>
+</table>
+<h2 id="sql-service-metrics">SQL Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_sql_utxo_get</code></td>
+<td>Counter</td>
+<td>Number of utxo get calls done to sql</td>
+</tr>
+<tr>
+<td><code>teranode_sql_utxo_spend</code></td>
+<td>Counter</td>
+<td>Number of utxo spend calls done to sql</td>
+</tr>
+<tr>
+<td><code>teranode_sql_utxo_reset</code></td>
+<td>Counter</td>
+<td>Number of utxo reset calls done to sql</td>
+</tr>
+<tr>
+<td><code>teranode_sql_utxo_delete</code></td>
+<td>Counter</td>
+<td>Number of utxo delete calls done to sql</td>
+</tr>
+<tr>
+<td><code>teranode_sql_utxo_errors</code></td>
+<td>CounterVec</td>
+<td>Number of utxo errors</td>
+</tr>
+<tr>
+<td><code>teranode_sql_utxo_get_counter_conflicting</code></td>
+<td>Counter</td>
+<td>Counter of conflicting UTXO GET operations using SQL</td>
+</tr>
+<tr>
+<td><code>teranode_sql_utxo_get_conflicting</code></td>
+<td>Histogram</td>
+<td>Histogram of conflicting UTXO GET operations using SQL</td>
+</tr>
+</tbody>
+</table>
+<h2 id="subtree-processor-service-metrics">Subtree Processor Service Metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>teranode_subtreeprocessor_add_tx</code></td>
+<td>Counter</td>
+<td>Number of times a tx is added in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_move_forward</code></td>
+<td>Counter</td>
+<td>Number of times a block is moved up in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_move_forward_duration</code></td>
+<td>Histogram</td>
+<td>Histogram of moving up block in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_move_back</code></td>
+<td>Counter</td>
+<td>Number of times a block is moved down in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_move_back_duration</code></td>
+<td>Histogram</td>
+<td>Histogram of moving down block in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_process_coinbase_tx</code></td>
+<td>Counter</td>
+<td>Number of times a coinbase tx is processed in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_process_coinbase_tx_duration</code></td>
+<td>Histogram</td>
+<td>Duration of processing coinbase tx in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_transaction_map</code></td>
+<td>Counter</td>
+<td>Number of times a transaction map is created in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_transaction_map_duration</code></td>
+<td>Histogram</td>
+<td>Duration of creating transaction map in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_remove_tx</code></td>
+<td>Histogram</td>
+<td>Duration of removing tx in subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_reset</code></td>
+<td>Histogram</td>
+<td>Duration of resetting subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_dynamic_subtree_size</code></td>
+<td>Gauge</td>
+<td>Size of the dynamic subtree in the subtree processor</td>
+</tr>
+<tr>
+<td><code>teranode_subtreeprocessor_current_state</code></td>
+<td>Gauge</td>
+<td>Current state of the subtree processor</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright © 2025 BSV Blockchain Org.
+    </div>
+  
+  
+</div>
+      
+        <div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/bitcoin-sv/teranode" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.7.2 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2024 Fonticons, Inc.--><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8M97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    <script id="__config" type="application/json">{"base": "../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../assets/javascripts/workers/search.f8cc74c7.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.c8b220af.min.js"></script>
+      
+        <script src="../../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
+      
+    
+  </body>
+</html>

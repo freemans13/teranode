@@ -1,0 +1,81 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Mining" as Miner
+participant "Block Assembly Client" as Client
+participant "Block Assembly Server" as Server
+participant "blockSubmissionChan" as SubmissionCh
+database "JobStore" as JobStore
+entity "Block" as Block
+database "Transaction Store" as TxStore
+database "Subtree Store" as SubtreeStore
+participant "Blockchain Client" as BlockchainClient
+
+Miner -> Miner: Solve Mining Challenge
+Miner -> Client : SubmitMiningSolution(ctx, solution)
+activate Client
+
+Client -> Server : SubmitMiningSolution(ctx, solution)
+activate Server
+
+Server -> SubmissionCh : Add block submission
+SubmissionCh -> Server : submitMiningSolution(ctx, blockSubmission)
+
+Server -> JobStore : jobItem = Get(*storeId)
+JobStore --> Server : return jobItem
+
+Server -> Server : Create new block with proof of work
+Server -> Block : block.Valid(ctx, nil, nil, nil, nil, \nnil, nil, nil, nil)
+Block --> Server : Validation result
+
+Server -> TxStore : Set(context.Background(), \nblock.CoinbaseTx.TxIDChainHash().CloneBytes(), \nblock.CoinbaseTx.ExtendedBytes())
+TxStore --> Server : Coinbase Transaction stored
+
+Server -> BlockchainClient : AddBlock(ctx, block, "")
+BlockchainClient --> Server : Block added to the local Blockchain
+
+Server -> Server : UpdateBestBlock(ctx)
+
+Server -> Server : Go routine: removeSubtreesDAH(ctx, block)
+activate Server
+loop for each subtree
+    Server -> SubtreeStore : SetDAH(ctx, subtreeHashBytes, 0)
+end
+Server -> BlockchainClient : SetBlockSubtreesSet(ctx, blockHash)
+deactivate Server
+
+Server -> JobStore : DeleteAll()
+JobStore --> Server : All jobs deleted
+
+alt If Error Occurs
+    Server -> BlockchainClient : InvalidateBlock(ctx, block.Header.Hash())
+end
+
+Server --> Client : Return result
+deactivate Server
+Client --> Miner : Return result
+deactivate Client
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

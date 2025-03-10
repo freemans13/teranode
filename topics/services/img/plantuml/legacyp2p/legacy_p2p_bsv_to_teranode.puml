@@ -1,0 +1,73 @@
+@startuml overview
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+
+participant MainNet as mainnet
+participant "P2P Legacy\nOverlay Service" as legacy
+database db
+participant "Kafka\n[kafka_blocksConfig topic]" as kafkaBlock
+participant "Teranode Block Validator" as blockValidator
+participant "Kafka\n[subtrees topic]" as kafkaSubtree
+participant "Teranode Subtree Validator" as subtreeValidator
+
+legacy -> mainnet: connect
+
+mainnet -> legacy : OnInv(peer, msg)
+
+legacy -> db: have I seen this block before?
+return no
+
+legacy -> mainnet: OnGetData(peer, msg)
+
+
+mainnet -> legacy : OnBlock(peer, msg, bytes)
+
+legacy -> legacy: build subtree and block
+
+legacy -> kafkaBlock: Publish(hash, base_url)
+note right: Send block notification message \nwith hash and base_url
+
+kafkaBlock -> blockValidator: Consume message
+
+blockValidator -> legacy: http://{base_url}/block/hash
+
+legacy --> blockValidator: block
+
+blockValidator -> kafkaSubtree: Publish(hash, baseUrl)
+note right: Send subtree notification message\nwith hash and base_url
+
+kafkaSubtree -> subtreeValidator: Consume message
+
+subtreeValidator -> legacy: http://{base_url}/subtree/hash
+
+legacy --> subtreeValidator: subtree
+
+
+loop each txid
+    subtreeValidator -> legacy: http://{base_url}/tx/txid
+    legacy -> subtreeValidator: tx(response)
+end
+
+left footer "Last Modified On: %date("dd-MMM-yyyy"). © 2025 Bitcoin SV. All rights reserved."
+
+@enduml

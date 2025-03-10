@@ -1,0 +1,54 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Alert System" as AlertSystem
+participant "UTXO Store" as UTXOStore
+database "Data Store" as DataStore
+
+== Freeze UTXOs ==
+AlertSystem -> UTXOStore: FreezeUTXOs(ctx, spends)
+activate UTXOStore
+UTXOStore -> DataStore: Mark UTXOs as frozen
+DataStore --> UTXOStore: Confirmation
+UTXOStore --> AlertSystem: Confirmation
+deactivate UTXOStore
+
+== Unfreeze UTXOs ==
+AlertSystem -> UTXOStore: UnFreezeUTXOs(ctx, spends)
+activate UTXOStore
+UTXOStore -> DataStore: Remove frozen mark from UTXOs
+DataStore --> UTXOStore: Confirmation
+UTXOStore --> AlertSystem: Confirmation
+deactivate UTXOStore
+
+== Reassign UTXO ==
+AlertSystem -> UTXOStore: ReAssignUTXO(ctx, utxo, newUtxo)
+activate UTXOStore
+UTXOStore -> DataStore: Update UTXO assignment
+DataStore --> UTXOStore: Confirmation
+UTXOStore --> AlertSystem: Confirmation
+deactivate UTXOStore
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

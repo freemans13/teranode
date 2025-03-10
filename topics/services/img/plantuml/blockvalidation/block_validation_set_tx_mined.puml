@@ -1,0 +1,103 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Blockchain" as Blockchain
+participant "Block Validation Server" as BVServer
+participant "Block Validation" as BlockValidation
+participant "Model" as Model
+participant "Subtree Store" as SubtreeStore
+participant "UTXO Store" as UTXOStore
+
+Blockchain -> BVServer: SendNotification(NotificationType_BlockSubtreesSet, \nblockHashBytes)
+activate BVServer
+
+BVServer -> BVServer: Enqueue to setMinedChan
+deactivate BVServer
+
+note right of BVServer
+  Background goroutine processes setMinedChan
+end note
+
+BVServer -> BlockValidation: setTxMined(ctx, blockHash)
+activate BlockValidation
+
+note right of BlockValidation
+  Check block cache first
+end note
+
+alt Block in cache (lastValidatedBlocks)
+    BlockValidation -> BlockValidation: Use cached block
+else Block not in cache
+    BlockValidation -> Blockchain: GetBlock(ctx, blockHash)
+    activate Blockchain
+    Blockchain --> BlockValidation: Block
+    deactivate Blockchain
+end
+
+BlockValidation -> BlockValidation: Ensure all subtrees are loaded
+note right of BlockValidation
+  Using fallbackGetFunc with subtreeValidationClient
+  if subtrees aren't already loaded
+end note
+
+loop for each subtree hash in the block
+    BlockValidation -> SubtreeStore: Get(ctx, subtreeHash)
+    activate SubtreeStore
+    SubtreeStore --> BlockValidation: Subtree
+    deactivate SubtreeStore
+end
+
+BlockValidation -> Blockchain: GetBlockHeaderIDs(ctx, blockHash, 1)
+Blockchain --> BlockValidation: blockID
+
+BlockValidation -> Model: UpdateTxMinedStatus(ctx, logger, settings, utxoStore, block, blockID)
+activate Model
+note right of Model
+  Handles batch processing of transactions
+  to mark them as mined
+end note
+
+Model -> UTXOStore: SetMinedMulti(ctx, txBatchHashes, blockID)
+activate UTXOStore
+note right of UTXOStore
+  SetMinedMulti also unsets the locked flag
+  (second phase of two-phase commit)
+end note
+UTXOStore --> Model
+deactivate UTXOStore
+
+Model --> BlockValidation
+deactivate Model
+
+alt Block was cached
+    BlockValidation -> BlockValidation: Delete from lastValidatedBlocks cache
+end
+
+BlockValidation -> Blockchain: SetBlockMinedSet(ctx, blockHash)
+
+BlockValidation --> BVServer
+deactivate BlockValidation
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

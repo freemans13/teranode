@@ -1,0 +1,67 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+!define RECTANGLE class
+
+participant "P2P Network" as P2P
+participant "Kafka" as K
+participant "BlockValidation Service" as BlockValidation
+participant "Blockchain Service" as BlockchainService
+participant "FSM" as FSM
+
+
+== Block Reception and Validation ==
+P2P -> K : Publish Block\n(KafkaBlockTopicMessage)
+K -> BlockValidation : Consume Block Message
+activate BlockValidation
+BlockValidation -> BlockValidation : Validate Block
+
+== Catchup Detection ==
+BlockValidation -> BlockValidation : Detect Catchup Mode
+
+== CatchupBlocks Notification ==
+alt In Catchup Mode
+    BlockValidation -> BlockchainService : CatchupBlocks (gRPC)
+    activate BlockchainService
+
+    BlockchainService -> FSM : CatchupBlocks\n Event
+    activate FSM
+
+    FSM -> FSM : Transition to\n CatchingBlocks
+
+    FSM --> BlockchainService : State Updated
+    deactivate FSM
+
+    BlockchainService -> BlockchainService : Start Block\n Catchup Process
+    BlockchainService --> BlockValidation : CatchupBlocks Response
+    deactivate BlockchainService
+
+    BlockValidation -> BlockValidation : Handle Response
+else Not in Catchup Mode
+    BlockValidation -> BlockValidation : Continue Normal Processing
+end
+
+deactivate BlockValidation
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+@enduml

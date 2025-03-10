@@ -1,0 +1,5762 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../blockPersister/">
+      
+      
+        <link rel="next" href="../legacy/">
+      
+      
+      <link rel="icon" href="../../architecture/img/bsvblockchain_blue_logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.7">
+    
+    
+      
+        <title>P2P - Teranode</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.8608ea7d.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        
+        <link rel="stylesheet" href="../../../assets/external/fonts.googleapis.com/css.49ea35f2.css">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../../overrides/custom.css">
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#p2p-service" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Teranode
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              P2P
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../.." class="md-tabs__link">
+        
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../tutorials/developers/developerSetup/" class="md-tabs__link">
+          
+  
+  Tutorials
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../howto/locallyRunningServices/" class="md-tabs__link">
+          
+  
+  How-To Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../../teranodeIntro/" class="md-tabs__link">
+          
+  
+  Key Topics
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../references/projectStructure/" class="md-tabs__link">
+          
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    Teranode
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../.." class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Home
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Tutorials
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            Tutorials
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../tutorials/developers/developerSetup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../tutorials/miners/minersGettingStarted/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Miners Getting Started
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    How-To Guides
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            How-To Guides
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/locallyRunningServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Services Locally
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Debugging Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/generatingProtobuf/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Generating Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/addingNewProtobufServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Adding Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/configuringGrpcLogging/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Configuring gRPC Logging
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/runningTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/automatedTestingHowTo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Automated Testing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/makefile/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Makefile Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/bugReporting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Bug Reporting
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer's Guide to Teranode-CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11" id="__nav_3_11_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Miners
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11">
+            <span class="md-nav__icon md-icon"></span>
+            Miners
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/howToUseTheTestMiner.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Using Test Miner
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_2" id="__nav_3_11_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Installation
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_2">
+            <span class="md-nav__icon md-icon"></span>
+            Installation
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToInstallationDeprecated/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Deprecated
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_3" id="__nav_3_11_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Configuration
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_3">
+            <span class="md-nav__icon md-icon"></span>
+            Configuration
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Aerospike Tuning
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    FSM Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_4" id="__nav_3_11_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Start/Stop
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_4">
+            <span class="md-nav__icon md-icon"></span>
+            Start/Stop
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_5" id="__nav_3_11_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Updating Teranode
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_5">
+            <span class="md-nav__icon md-icon"></span>
+            Updating Teranode
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_6" id="__nav_3_11_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Security Best Practices
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_6">
+            <span class="md-nav__icon md-icon"></span>
+            Security Best Practices
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_7" id="__nav_3_11_7_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Troubleshooting
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_7">
+            <span class="md-nav__icon md-icon"></span>
+            Troubleshooting
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_8" id="__nav_3_11_8_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Additional
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_8">
+            <span class="md-nav__icon md-icon"></span>
+            Additional
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    CPU Mining Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToResetTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Reset Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToSyncTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Sync the Node
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Managing Disk Space
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/kubernetes/minersHowToBackup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Backup (Kubernetes)
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Key Topics
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            Key Topics
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../teranodeIntro/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Introduction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-overall-system-design/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-architecture-brief/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Brief
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/teranode-microservices-overview/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Microservices Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/stateManagement/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    State Management
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/understandingDoubleSpends/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding Double Spends
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technologyStack/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Technology Stack
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../understandingTheTestingFramework/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding the Testing Framework
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../functionalRequirementTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Functional Requirement Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_10" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_10" id="__nav_4_10_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Features
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_10">
+            <span class="md-nav__icon md-icon"></span>
+            Features
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../features/two_phase_commit/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Two Phase Commit
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_11" id="__nav_4_11_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_11">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../alert/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../assetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockAssembly/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockchain/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../propagation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../subtreeValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../validator/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_12" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_4_12" id="__nav_4_12_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_12_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4_12">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../blockPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#index" class="md-nav__link">
+    <span class="md-ellipsis">
+      Index
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-description" class="md-nav__link">
+    <span class="md-ellipsis">
+      1. Description
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-functionality" class="md-nav__link">
+    <span class="md-ellipsis">
+      2. Functionality
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Functionality">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-creating-initializing-and-starting-a-new-p2p-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1. Creating, initializing and starting a new P2P Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#211-creating-a-new-p2p-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1.1. Creating a New P2P Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#212-initializing-the-p2p-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1.2. Initializing the P2P Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#213-starting-the-p2p-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1.3. Starting the P2P Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-peer-discovery-and-connection" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2. Peer Discovery and Connection
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-best-block-messages" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.3. Best Block Messages
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-blockchain-messages" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.4. Blockchain Messages
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-tx-validator-messages" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.5. TX Validator Messages
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#26-websocket-notifications" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.6. Websocket notifications
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#27-ban-management-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7. Ban Management System
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.7. Ban Management System">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#271-ban-list-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.1. Ban List Management
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#272-ban-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.2. Ban Operations
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#273-ban-event-handling" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.3. Ban Event Handling
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#274-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.4. Configuration
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-technology" class="md-nav__link">
+    <span class="md-ellipsis">
+      3. Technology
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-data-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      4. Data Model
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-directory-structure-and-main-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      5. Directory Structure and Main Files
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-how-to-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      6. How to run
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-configuration-options-settings-flags" class="md-nav__link">
+    <span class="md-ellipsis">
+      7. Configuration options (settings flags)
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="7. Configuration options (settings flags)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#network-and-discovery-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network and Discovery Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#service-endpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      Service Endpoints
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-to-peer-topics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Peer-to-Peer Topics
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#authentication-and-security" class="md-nav__link">
+    <span class="md-ellipsis">
+      Authentication and Security
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ban-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Ban Management
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration-validation-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Validation Rules
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration Validation Rules">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#required-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Required Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#network-address-validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network Address Validation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#private-network-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      Private Network Requirements
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#key-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Key Management
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Dependencies
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Interactions and Dependencies
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration Interactions and Dependencies">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#network-binding-and-discovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network Binding and Discovery
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-discovery-and-connection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Peer Discovery and Connection
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Peer Discovery and Connection">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bootstrap-vs-static-peers" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bootstrap vs Static Peers
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#security-and-authentication" class="md-nav__link">
+    <span class="md-ellipsis">
+      Security and Authentication
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-other-resources" class="md-nav__link">
+    <span class="md-ellipsis">
+      8. Other Resources
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../legacy/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Legacy
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../rpc/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../utxoPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_13" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_13" id="__nav_4_13_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_13">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stores/blob/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stores/utxo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_14" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Data Model
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_14">
+            <span class="md-nav__icon md-icon"></span>
+            Data Model
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/block_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/block_header_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Header Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/subtree_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/transaction_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Transaction Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../datamodel/utxo_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_15" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Kafka
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_15">
+            <span class="md-nav__icon md-icon"></span>
+            Kafka
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kafka/kafka/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Commands
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_16">
+            <span class="md-nav__icon md-icon"></span>
+            Commands
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/chainIntegrity.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Chain Integrity
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/propagationBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/seeder/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Seeder
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/txBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    TX Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Reference
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            Reference
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/projectStructure/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Project Structure
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2" id="__nav_5_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    API & Protobuf
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2">
+            <span class="md-nav__icon md-icon"></span>
+            API & Protobuf
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/errorHandling/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Error Handling
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/glossary/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Glossary
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/codingConventions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Coding Conventions
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/kafkaMessageFormat/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Message Format
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/networkConsensusRules/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Network Consensus Rules
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2_6" id="__nav_5_2_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Protobuf API
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_5_2_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2_6">
+            <span class="md-nav__icon md-icon"></span>
+            Protobuf API
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/alertProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_3" id="__nav_5_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_3">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/alert_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/asset_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockassembly_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockvalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockchain_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/propagation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/subtreevalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/validator_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_4" id="__nav_5_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_4">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/blockpersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/p2p_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/legacy_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P Legacy Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/rpc_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/services/utxopersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/stores/blob_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/stores/utxo_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_6" id="__nav_5_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Miscellaneous
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_6">
+            <span class="md-nav__icon md-icon"></span>
+            Miscellaneous
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Git Commit Signing Setup Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/licenseInformation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Licensing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/prometheusMetrics/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Prometheus Metrics
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/settings/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Settings
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/teranodeDaemonReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Daemon Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/testingTechnicalReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Testing Technical Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Third-Party Software Requirements
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#index" class="md-nav__link">
+    <span class="md-ellipsis">
+      Index
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-description" class="md-nav__link">
+    <span class="md-ellipsis">
+      1. Description
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-functionality" class="md-nav__link">
+    <span class="md-ellipsis">
+      2. Functionality
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Functionality">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-creating-initializing-and-starting-a-new-p2p-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1. Creating, initializing and starting a new P2P Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#211-creating-a-new-p2p-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1.1. Creating a New P2P Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#212-initializing-the-p2p-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1.2. Initializing the P2P Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#213-starting-the-p2p-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.1.3. Starting the P2P Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-peer-discovery-and-connection" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.2. Peer Discovery and Connection
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-best-block-messages" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.3. Best Block Messages
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-blockchain-messages" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.4. Blockchain Messages
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-tx-validator-messages" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.5. TX Validator Messages
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#26-websocket-notifications" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.6. Websocket notifications
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#27-ban-management-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7. Ban Management System
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2.7. Ban Management System">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#271-ban-list-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.1. Ban List Management
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#272-ban-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.2. Ban Operations
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#273-ban-event-handling" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.3. Ban Event Handling
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#274-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.7.4. Configuration
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-technology" class="md-nav__link">
+    <span class="md-ellipsis">
+      3. Technology
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-data-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      4. Data Model
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-directory-structure-and-main-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      5. Directory Structure and Main Files
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-how-to-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      6. How to run
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-configuration-options-settings-flags" class="md-nav__link">
+    <span class="md-ellipsis">
+      7. Configuration options (settings flags)
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="7. Configuration options (settings flags)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#network-and-discovery-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network and Discovery Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#service-endpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      Service Endpoints
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-to-peer-topics" class="md-nav__link">
+    <span class="md-ellipsis">
+      Peer-to-Peer Topics
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#authentication-and-security" class="md-nav__link">
+    <span class="md-ellipsis">
+      Authentication and Security
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ban-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Ban Management
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration-validation-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Validation Rules
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration Validation Rules">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#required-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Required Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#network-address-validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network Address Validation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#private-network-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      Private Network Requirements
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#key-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Key Management
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Dependencies
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration-interactions-and-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration Interactions and Dependencies
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration Interactions and Dependencies">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#network-binding-and-discovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network Binding and Discovery
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-discovery-and-connection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Peer Discovery and Connection
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Peer Discovery and Connection">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bootstrap-vs-static-peers" class="md-nav__link">
+    <span class="md-ellipsis">
+      Bootstrap vs Static Peers
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#security-and-authentication" class="md-nav__link">
+    <span class="md-ellipsis">
+      Security and Authentication
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-other-resources" class="md-nav__link">
+    <span class="md-ellipsis">
+      8. Other Resources
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<h1 id="p2p-service">🌐 P2P Service</h1>
+<h2 id="index">Index</h2>
+<ul>
+<li><a href="#-p2p-service">🌐 P2P Service</a></li>
+<li><a href="#index">Index</a></li>
+<li><a href="#1-description">1. Description</a></li>
+<li><a href="#2-functionality">2. Functionality</a><ul>
+<li><a href="#21-creating-initializing-and-starting-a-new-p2p-server">2.1. Creating, initializing and starting a new P2P Server</a></li>
+<li><a href="#211-creating-a-new-p2p-server">2.1.1. Creating a New P2P Server</a></li>
+<li><a href="#212-initializing-the-p2p-server">2.1.2. Initializing the P2P Server</a></li>
+<li><a href="#213-starting-the-p2p-server">2.1.3. Starting the P2P Server</a></li>
+<li><a href="#22-peer-discovery-and-connection">2.2. Peer Discovery and Connection</a></li>
+<li><a href="#23-best-block-messages">2.3. Best Block Messages</a></li>
+<li><a href="#24-blockchain-messages">2.4. Blockchain Messages</a></li>
+<li><a href="#25-tx-validator-messages">2.5. TX Validator Messages</a></li>
+<li><a href="#26-websocket-notifications">2.6. Websocket notifications</a></li>
+<li><a href="#27-ban-management-system">2.7. Ban Management System</a></li>
+<li><a href="#271-ban-list-management">2.7.1. Ban List Management</a></li>
+<li><a href="#272-ban-operations">2.7.2. Ban Operations</a></li>
+<li><a href="#273-ban-event-handling">2.7.3. Ban Event Handling</a></li>
+<li><a href="#274-configuration">2.7.4. Configuration</a></li>
+</ul>
+</li>
+<li><a href="#3-technology">3. Technology</a></li>
+<li><a href="#4-data-model">4. Data Model</a></li>
+<li><a href="#5-directory-structure-and-main-files">5. Directory Structure and Main Files</a></li>
+<li><a href="#6-how-to-run">6. How to run</a></li>
+<li><a href="#7-configuration-options-settings-flags">7. Configuration options (settings flags)</a><ul>
+<li><a href="#network-and-discovery-settings">Network and Discovery Settings</a></li>
+<li><a href="#service-endpoints">Service Endpoints</a></li>
+<li><a href="#peer-to-peer-topics">Peer-to-Peer Topics</a></li>
+<li><a href="#authentication-and-security">Authentication and Security</a></li>
+<li><a href="#ban-management">Ban Management</a></li>
+</ul>
+</li>
+<li><a href="#configuration-validation-rules">Configuration Validation Rules</a><ul>
+<li><a href="#required-configuration">Required Configuration</a></li>
+<li><a href="#network-address-validation">Network Address Validation</a></li>
+<li><a href="#private-network-requirements">Private Network Requirements</a></li>
+<li><a href="#key-management">Key Management</a></li>
+</ul>
+</li>
+<li><a href="#configuration-dependencies">Configuration Dependencies</a></li>
+<li><a href="#configuration-interactions-and-dependencies">Configuration Interactions and Dependencies</a><ul>
+<li><a href="#network-binding-and-discovery">Network Binding and Discovery</a></li>
+<li><a href="#peer-discovery-and-connection">Peer Discovery and Connection</a></li>
+<li><a href="#security-and-authentication">Security and Authentication</a></li>
+</ul>
+</li>
+<li><a href="#8-other-resources">8. Other Resources</a></li>
+</ul>
+<h2 id="1-description">1. Description</h2>
+<p>The p2p package implements a peer-to-peer (P2P) server using <code>libp2p</code> (<code>github.com/libp2p/go-libp2p</code>, <code>https://libp2p.io</code>), a modular network stack that allows for direct peer-to-peer communication. The implementation follows an interface-based design pattern with <code>P2PNodeI</code> abstracting the concrete <code>P2PNode</code> implementation to allow for better testability and modularity.</p>
+<p>The p2p service allows peers to subscribe and receive blockchain notifications, effectively allowing nodes to receive notifications about new blocks and subtrees in the network.</p>
+<p>The p2p peers are part of a private network. This private network is managed by the p2p bootstrap service, which is responsible for bootstrapping the network and managing the network topology.</p>
+<ol>
+<li>
+<p><strong>Initialization and Configuration</strong>:</p>
+<ul>
+<li>The <code>Server</code> struct holds essential information for the P2P server, such as hosts, topics, subscriptions, clients for blockchain and validation, and logger for logging activities.</li>
+<li>The <code>NewServer</code> function creates a new instance of the P2P server, sets up the host with a private key, and defines various topic names for message publishing and subscribing.</li>
+<li>The <code>Init</code> function configures the server with necessary clients and settings.</li>
+</ul>
+</li>
+<li>
+<p><strong>Message Types</strong>:</p>
+<ul>
+<li>There are several message types (<code>BestBlockMessage</code>, <code>MiningOnMessage</code>, <code>BlockMessage</code>, <code>SubtreeMessage</code>, <code>RejectedTxMessage</code>) used for communicating different types of data over the network.</li>
+</ul>
+</li>
+<li>
+<p><strong>Networking and Communication</strong>:</p>
+<ul>
+<li>The server uses <code>libp2p</code> for network communication. It sets up a host with given IP and port and handles different topics for publishing and subscribing to messages.</li>
+<li>The server uses Kademlia for peer discovery, implementing both standard and private DHT (Distributed Hash Table) modes based on configuration.</li>
+<li>The server uses GossipSub for PubSub messaging, with automated topic subscription and management.</li>
+<li><code>handleBlockchainMessage</code>, <code>handleBestBlockTopic</code>, <code>handleBlockTopic</code>, <code>handleSubtreeTopic</code>, and <code>handleMiningOnTopic</code> are functions to handle incoming messages for different topics.</li>
+<li><code>sendBestBlockMessage</code> and <code>sendPeerMessage</code> are used for sending messages to peers in the network.</li>
+<li>The implementation includes error handling and retry mechanisms for peer connections to enhance network resilience.</li>
+</ul>
+</li>
+<li>
+<p><strong>Peer Discovery and Connection</strong>:</p>
+<ul>
+<li><code>discoverPeers</code> function is responsible for discovering peers in the network and attempting to establish connections with them.</li>
+<li>The system implements an intelligent retry mechanism that tracks failed connection attempts and manages reconnection policies based on error types.</li>
+<li>A dedicated mechanism for connecting to static peers runs in a separate goroutine, ensuring that mission-critical peers are always connected when available.</li>
+</ul>
+</li>
+<li>
+<p><strong>HTTP Server and WebSockets</strong>:</p>
+<ul>
+<li>An HTTP server is started using <code>echo</code>, a Go web framework, providing routes for health checks and WebSocket connections.</li>
+<li><code>HandleWebSocket</code> is used to handle incoming WebSocket connections and manage the communication with connected clients.</li>
+</ul>
+</li>
+<li>
+<p><strong>Subscription Listeners</strong>:</p>
+<ul>
+<li>The server listens for notifications from the blockchain and the tx validator services. It subscribes to these services and handles incoming notifications.</li>
+</ul>
+</li>
+<li>
+<p><strong>Publish-Subscribe Mechanism</strong>:</p>
+<ul>
+<li>The server uses the publish-subscribe model over <code>libp2p</code> pubsub for message dissemination. It joins topics and subscribes to them to receive and broadcast messages related to blockchain events.</li>
+</ul>
+</li>
+<li>
+<p><strong>Private Key Management</strong>:</p>
+<ul>
+<li>The server generates or reads a private key for secure communication (peerId and encryption) in the P2P network.</li>
+<li>The generated private key is persisted.</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>Note</strong>: For information about how the P2P service is initialized during daemon startup and how it interacts with other services, see the <a href="../../../references/teranodeDaemonReference/#service-initialization-flow">Teranode Daemon Reference</a>.</p>
+</blockquote>
+<p><img alt="P2P_System_Container_Diagram.png" src="../img/P2P_System_Container_Diagram.png" /></p>
+<p>In the diagram above:</p>
+<ul>
+<li>The node P2P service subscribes and listens to Blockchain and Tx Validator service notifications. When blocks, subtrees or rejected transactions are detected, the P2P service publishes these messages to the network.</li>
+<li>When the P2P service receives a message from the network (i.e. a Blockchain message from another node), it forwards it to the node Block Validation Service for processing.</li>
+</ul>
+<p>In more detail:</p>
+<p><img alt="P2P_System_Component_Diagram.png" src="../img/P2P_System_Component_Diagram.png" /></p>
+<h2 id="2-functionality">2. Functionality</h2>
+<h3 id="21-creating-initializing-and-starting-a-new-p2p-server">2.1. Creating, initializing and starting a new P2P Server</h3>
+<p><img alt="p2p_create_init_start.svg" src="../img/plantuml/p2p/p2p_create_init_start.svg" /></p>
+<h3 id="211-creating-a-new-p2p-server">2.1.1. Creating a New P2P Server</h3>
+<p>The startup process of the node involves the <code>main.go</code> file calling the <code>p2p.NewServer</code> function from the P2P package (<code>services/p2p/Server.go</code>). This function is tasked with creating a new P2P server instance.</p>
+<ol>
+<li>
+<p><strong>Private Key Management</strong>:</p>
+<ul>
+<li>
+<p>The server tries to read an existing private key from the blockchain store through the <code>readPrivateKey()</code> function:</p>
+</li>
+<li>
+<p><code>readPrivateKey</code> calls <code>blockchainClient.GetState(ctx, "p2p.privateKey")</code> to retrieve the serialized key data</p>
+</li>
+<li>If found, it deserializes the key using <code>crypto.UnmarshalPrivateKey()</code></li>
+<li>
+<p>If no key is specified in the configuration and no key exists in the blockchain store, it automatically generates and stores a new one using the <code>generateAndStorePrivateKey()</code> function:</p>
+</li>
+<li>
+<p><code>generateAndStorePrivateKey</code> creates a new Ed25519 key pair using <code>crypto.GenerateEd25519Key()</code></p>
+</li>
+<li>It serializes the private key with <code>crypto.MarshalPrivateKey()</code></li>
+<li>It stores the serialized key in the blockchain store using <code>blockchainClient.SetState(ctx, "p2p.privateKey", privBytes)</code></li>
+<li>The generated key is automatically persisted to ensure the node maintains the same peer ID across restarts</li>
+<li>This blockchain store persistence mechanism works through gRPC calls to the blockchain service</li>
+<li>Using the blockchain store ensures that the P2P private key (and therefore node identity) persists even if the container is destroyed, maintaining consistent peer relationships in the network</li>
+</ul>
+</li>
+</ol>
+<p><img alt="p2p_private_key_persistence.svg" src="../img/plantuml/p2p/p2p_private_key_persistence.svg" /></p>
+<ol>
+<li>
+<p><strong>Configuration Retrieval and Topic Registration</strong>:</p>
+<ul>
+<li>Retrieves required configuration settings like <code>p2p_listen_addresses</code> and <code>p2p_port</code>.</li>
+<li>It registers specific topic names derived from the configuration, such as <code>p2p_block_topic</code>, <code>p2p_subtree_topic</code>, <code>p2p_bestblock_topic</code>, <code>p2p_mining_on_topic</code>, and <code>p2p_rejected_tx_topic</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>P2P Node Initialization</strong>:</p>
+<ul>
+<li>Initializes a libp2p node (host) using the specified IP, port, and private key, which manages node communications and connections.</li>
+</ul>
+</li>
+</ol>
+<h3 id="212-initializing-the-p2p-server">2.1.2. Initializing the P2P Server</h3>
+<p>The P2P server's <code>Init</code> function is in charge of server setup:</p>
+<ol>
+<li>
+<p><strong>Blockchain Client Initialization</strong>:</p>
+<ul>
+<li>Creates a new blockchain client with <code>blockchain.NewClient(ctx, s.logger, "source")</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Asset HTTP Address Configuration</strong>:</p>
+<ul>
+<li>Retrieves the Asset HTTP Address URL from the configuration using <code>gocore.Config().GetURL("asset_httpAddress")</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Block Validation Client Initialization</strong>:</p>
+<ul>
+<li>Sets up a block validation client with <code>blockvalidation.NewClient(ctx)</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Validator Client Initialization</strong>:</p>
+<ul>
+<li>Initializes a transaction validator client with <code>validator.NewClient(ctx, s.logger)</code>.</li>
+</ul>
+</li>
+</ol>
+<h3 id="213-starting-the-p2p-server">2.1.3. Starting the P2P Server</h3>
+<p>The <code>Start</code> function is responsible for commencing the P2P service:</p>
+<ol>
+<li>
+<p><strong>HTTP Server Setup</strong>:</p>
+<ul>
+<li>Utilizes the Echo framework to set up an HTTP server.</li>
+</ul>
+</li>
+<li>
+<p><strong>HTTP Endpoints</strong>:</p>
+<ul>
+<li>Sets up a health check endpoint (<code>/health</code>) that responds with "OK".</li>
+<li>Adds a WebSocket endpoint (<code>/ws</code>) for real-time communication via <code>s.HandleWebSocket</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Start HTTP Server</strong>:</p>
+<ul>
+<li>Initiates the HTTP server using a goroutine, which is executed via <code>s.StartHttp</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>PubSub Topics Setup</strong>:</p>
+<ul>
+<li>Initializes the GossipSub system for pub-sub messaging.</li>
+<li>Subscribes to various topics defined in the configuration.</li>
+</ul>
+</li>
+<li>
+<p><strong>Peer-to-Peer Host Configuration</strong>:</p>
+<ul>
+<li>Assigns a stream handler to the P2P host to handle blockchain-related messages.</li>
+</ul>
+</li>
+<li>
+<p><strong>Topic Handlers</strong>:</p>
+<ul>
+<li>Initiates goroutines for message handling on designated topics.</li>
+</ul>
+</li>
+<li>
+<p><strong>Subscription Listeners</strong>:</p>
+<ul>
+<li>Begins subscription listeners for blockchain and validator services to manage incoming notifications about blocks and transactions.</li>
+</ul>
+</li>
+<li>
+<p><strong>Best Block Message Broadcast</strong>:</p>
+<ul>
+<li>Sends a best block message to the network to solicit the current best block hash from peers.</li>
+</ul>
+</li>
+</ol>
+<p>Once these steps are completed, the server is ready to accept peer connections, handle messages, and monitor network activity.</p>
+<h3 id="22-peer-discovery-and-connection">2.2. Peer Discovery and Connection</h3>
+<p>In the previous section, the P2P Service created a `P2PNode as part of the initialization phase. This P2PNode is responsible for joining the network. The P2PNode utilizes a libp2p host and a Distributed Hash Table (DHT) for peer discovery and connection based on shared topics. This mechanism enables the node to become part of a decentralized network, facilitating communication and resource sharing among peers.</p>
+<p><img alt="p2p_peer_discovery.svg" src="../img/plantuml/p2p/p2p_peer_discovery.svg" /></p>
+<ol>
+<li>
+<p><strong>Initialization of DHT and libp2p Host</strong>:</p>
+<ul>
+<li>The <code>P2PNode</code> struct, upon invocation of its <code>Start</code> method, initializes the DHT using either <code>initDHT</code> or <code>initPrivateDHT</code> methods depending on the configuration. This step sets up the DHT for the libp2p host (<code>s.host</code>), which allows for peer discovery and content routing within the P2P network. The DHT is bootstrapped with default or configured peers to integrate the node into the existing network.</li>
+</ul>
+</li>
+<li>
+<p><strong>Setting Up Routing Discovery</strong>:</p>
+<ul>
+<li>Once the DHT is initialized, <code>P2PNode.Start</code> sets up <code>routingDiscovery</code> with the created DHT instance. This discovery service is responsible for locating peers within the network and advertising the node's own presence.</li>
+<li>
+<p>The DHT implementation supports two modes:</p>
+</li>
+<li>
+<p>Standard mode (<code>initDHT</code>): Uses the public IPFS bootstrap nodes for initial discovery</p>
+</li>
+<li>Private mode (<code>initPrivateDHT</code>): Creates an isolated private network with custom bootstrap nodes, providing enhanced security for enterprise deployments</li>
+</ul>
+</li>
+<li>
+<p><strong>Advertising and Searching for Peers</strong>:</p>
+<ul>
+<li>The node then advertises itself for the configured topics and looks for peers associated with these topics. This is conducted through the <code>discoverPeers</code> method, which iterates over the topic names and uses the routing discovery to advertise and find peers interested in the same topics.</li>
+</ul>
+</li>
+<li>
+<p><strong>Connecting to Discovered and Static Peers</strong>:</p>
+<ul>
+<li>
+<p>The <code>discoverPeers</code> method includes sophisticated filtering and error handling mechanisms:</p>
+</li>
+<li>
+<p><code>shouldSkipPeer</code>: Determines if connection attempts should be skipped based on various criteria</p>
+</li>
+<li><code>shouldSkipBasedOnErrors</code>: Manages retry logic for previously failed connections</li>
+<li><code>shouldSkipNoGoodAddresses</code>: Special handling for peers with address resolution issues</li>
+<li>The <code>connectToStaticPeers</code> method runs in a dedicated goroutine to periodically attempt connections with a predefined list of peers (static peers), ensuring critical network infrastructure remains connected even after temporary failures.</li>
+<li>Connection errors are carefully tracked to avoid network congestion from repeated failed connection attempts.</li>
+</ul>
+</li>
+<li>
+<p><strong>Integration with P2P Network</strong>:</p>
+<ul>
+<li>The capabilities of the DHT for discovery and topic-based advertising enables the node to seamlessly integrate into the Teranode P2P network.</li>
+</ul>
+</li>
+</ol>
+<h3 id="23-best-block-messages">2.3. Best Block Messages</h3>
+<p><img alt="p2p_handle_blockchain_messages.svg" src="../img/plantuml/p2p/p2p_handle_blockchain_messages.svg" /></p>
+<ol>
+<li>
+<p><strong>Node (Peer 1) Starts</strong>:</p>
+<ul>
+<li>The server's <code>Start()</code> method is invoked. Within <code>Start()</code>, <code>s.sendBestBlockMessage(ctx)</code> is called to send the best block message.</li>
+<li>This message is published to a topic using <code>s.topics[bestBlockTopicName].Publish(ctx, msgBytes)</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Peer 2 Receives the Best Block Topic Message</strong>:</p>
+<ul>
+<li>Peer 2's server handles the best block topic through <code>s.handleBestBlockTopic(ctx)</code>.</li>
+<li>A peer message is sent using <code>s.sendPeerMessage(ctx, peer, msgBytes)</code>. A new stream to the Peer 1 LibP2P host is established with <code>s.host.NewStream(ctx, peer.ID, protocol.ID(s.bitcoinProtocolId))</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Node (Peer 1) Receives the Stream Response from Peer 2</strong>:</p>
+<ul>
+<li>The LibP2P host sends the response stream to Node (Peer 1).</li>
+<li>Node (Peer 1) handles the blockchain message using <code>s.handleBlockchainMessage(ctx, stream)</code>.</li>
+<li>The message received is logged with <code>s.logger.Debugf("Received block topic message: %s", string(buf))</code> (at the time of writing, the <code>handleBlockchainMessage</code> function simply logs block topic messages).</li>
+</ul>
+</li>
+</ol>
+<h3 id="24-blockchain-messages">2.4. Blockchain Messages</h3>
+<p>When a node creates a new subtree, or finds a new block hashing solution, it will broadcast this information to the network. This is done by publishing a message to the relevant topic. The message is then received by all peers subscribed to that topic. Listening peers can then feed relevant messages to their own Block Validation Service.</p>
+<p><img alt="p2p_blockchain_subscription.svg" src="../img/plantuml/p2p/p2p_blockchain_subscription.svg" /></p>
+<ol>
+<li>
+<p><strong>Blockchain Subscription</strong>:</p>
+<ul>
+<li>The server subscribes to the blockchain service using <code>s.blockchainClient.Subscribe(ctx, blockchain.SubscriptionType_Blockchain)</code>.</li>
+<li>The server listens for blockchain notifications (<code>Block</code>, <code>Subtree</code> or <code>MiningOn</code> notifications) using <code>s.blockchainSubscriptionListener(ctx)</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>New Block Notification</strong>:</p>
+<ul>
+<li>Node 1 listens for blockchain notifications.</li>
+<li>If a new block notification is detected, it publishes the block message to the PubSub System.</li>
+<li>The PubSub System then delivers this message to Node 2.</li>
+<li>Node 2 receives the message on the block topic, <strong>submits the block message to its own Block Validation Service</strong>, and notifies the block message on its notification channel.</li>
+<li>Note that the Block Validation Service might be configured to either receive gRPC notifications or listen to a Kafka producer. In the diagram above, the gRPC method is described. Please check the <a href="../blockValidation/">Block Validation Service</a> documentation for more details</li>
+</ul>
+</li>
+<li>
+<p><strong>New Mined Block Notification</strong>:</p>
+<ul>
+<li>Node 1 listens for blockchain notifications.</li>
+<li>If a new mined block notification is detected, it publishes the mining on message to the PubSub System.</li>
+<li>The PubSub System delivers this message to Node 2.</li>
+<li>Node 2 receives the mining message on the mining topic and notifies the "mining on" message on its notification channel.</li>
+</ul>
+</li>
+<li>
+<p><strong>New Subtree Notification</strong>:</p>
+<ul>
+<li>Node 1 listens for blockchain notifications.</li>
+<li>If a new subtree notification is detected, it publishes the subtree message to the PubSub System.</li>
+<li>The PubSub System delivers this message to Node 2.</li>
+<li>Node 2 receives the subtree message on the subtree topic, <strong>submits the subtree message to its own Subtree Validation Service</strong>, and notifies the subtree message on its notification channel.</li>
+<li>Note that the Subtree Validation Service might be configured to either receive gRPC notifications or listen to a Kafka producer. In the diagram above, the gRPC method is described. Please check the <a href="../subtreeValidation/">Subtree Validation Service</a>  documentation for more details</li>
+</ul>
+</li>
+</ol>
+<h3 id="25-tx-validator-messages">2.5. TX Validator Messages</h3>
+<p>Nodes will broadcast rejected transaction notifications to the network. This is done by publishing a message to the relevant topic. The message is then received by all peers subscribed to that topic.</p>
+<p><img alt="p2p_tx_validator_messages.svg" src="../img/plantuml/p2p/p2p_tx_validator_messages.svg" /></p>
+<ul>
+<li>The Node 1 listens for validator subscription events.</li>
+<li>When a new rejected transaction notification is detected, the Node 1 publishes this message to the PubSub System using the topic name <code>rejectedTxTopicName</code>, forwarding it to any subscribers of the <code>rejectedTxTopicName</code> topic.</li>
+</ul>
+<p>Note that the P2P service can only subscribe to these notifications if and when the TX Validator Service is available in the node. The service uses the <code>useLocalValidator</code> setting to determine whether a local validator or a validator service is in scope. If no TX validator runs in the node, the P2P will not attempt to subscribe.</p>
+<h3 id="26-websocket-notifications">2.6. Websocket notifications</h3>
+<p>All notifications collected from the Block and Validator listeners are sent over to the Websocket clients. The process can be seen below:</p>
+<p><img alt="p2p_websocket_activity_diagram.svg" src="../img/plantuml/p2p/p2p_websocket_activity_diagram.svg" /></p>
+<ul>
+<li>
+<p>WebSocket Request Handling:</p>
+</li>
+<li>
+<p>An HTTP request is upgraded to a WebSocket connection. A new client channel is associated to this Websocket client.</p>
+</li>
+<li>Data is sent over the WebSocket, using its dedicated client channel.</li>
+<li>
+<p>If there's an error in sending data, the channel is removed from the <code>clientChannels</code>.</p>
+</li>
+<li>
+<p>The server listens for various types of events in a concurrent process:</p>
+</li>
+<li>
+<p>The server tracks all active client channels (<code>clientChannels</code>).</p>
+</li>
+<li>When a new client connects, it is added to the <code>clientChannels</code>.</li>
+<li>If a client disconnects, it is removed from <code>clientChannels</code>.</li>
+<li>Periodically, we ping all connected clients. Any error would have the client removed from the list of clients.</li>
+<li>When a notification is received (from the block validation or transaction listeners described in the previous sections), it is sent to all connected clients.</li>
+</ul>
+<p>As a sequence:</p>
+<p><img alt="p2p_websocket_sequence_diagram.svg" src="../img/plantuml/p2p/p2p_websocket_sequence_diagram.svg" /></p>
+<ol>
+<li>A client requests a WebSocket connection to the server. The new client is added to the <code>newClientCh</code> queue, which then adds the client to the active client channels.</li>
+<li>The server enters a loop for WebSocket communication, where it can either receive new notifications or pings.</li>
+<li>For each new notification or ping, the server dispatches this data to all client channels.</li>
+<li>If there's a WebSocket error or the client disconnects, the client is added to the <code>deadClientCh</code> queue, which leads to its removal from the active client channels.</li>
+</ol>
+<h3 id="27-ban-management-system">2.7. Ban Management System</h3>
+<p>The P2P service includes a ban management system that allows nodes to maintain a list of banned peers and handle ban-related events across the network.</p>
+<p><img alt="p2p_ban_system.svg" src="../img/plantuml/p2p/p2p_ban_system.svg" /></p>
+<h4 id="271-ban-list-management">2.7.1. Ban List Management</h4>
+<p>The ban system consists of two main components:</p>
+<ol>
+<li><strong>BanList</strong>: A thread-safe data structure that maintains banned IP addresses and subnets</li>
+<li><strong>BanChan</strong>: A channel that broadcasts ban-related events to system components</li>
+</ol>
+<p>The ban list supports:</p>
+<ul>
+<li>Individual IP addresses</li>
+<li>Entire subnets using CIDR notation</li>
+<li>Temporary bans with expiration times</li>
+<li>Persistent storage of bans in a database</li>
+</ul>
+<h4 id="272-ban-operations">2.7.2. Ban Operations</h4>
+<p>While the banList is maintained by the P2P service, the ban operations are managed by the RPC Server. The RPC server receives request to add / remove peers, notifying the P2P service to update the ban list.</p>
+<h4 id="273-ban-event-handling">2.7.3. Ban Event Handling</h4>
+<p>When a ban event occurs:</p>
+<ol>
+<li>The ban is added to the persistent storage</li>
+<li>A ban event is broadcast through the ban channel</li>
+<li>The P2P service checks current connections against the ban</li>
+<li>Any matching connections are terminated</li>
+<li>Future connection attempts from banned IPs are rejected</li>
+</ol>
+<h4 id="274-configuration">2.7.4. Configuration</h4>
+<p>Ban-related settings in the configuration:</p>
+<ul>
+<li><code>banlist_db</code>: Database connection string for ban storage</li>
+<li><code>ban_default_duration</code>: Default duration for bans (24 hours if not specified)</li>
+<li><code>ban_max_entries</code>: Maximum number of banned entries to maintain</li>
+</ul>
+<h2 id="3-technology">3. Technology</h2>
+<ol>
+<li>
+<p><strong>Go Programming Language</strong>:</p>
+<ul>
+<li>The entire package is written in Go (Golang).</li>
+</ul>
+</li>
+<li>
+<p><strong>libp2p</strong>:</p>
+<ul>
+<li>A modular network framework that allows peers to communicate directly with each other. It's widely used in decentralized systems for handling various network protocols, peer discovery, transport, encryption, and stream multiplexing.</li>
+</ul>
+</li>
+<li>
+<p><strong>pubsub (go-libp2p-pubsub)</strong>:</p>
+<ul>
+<li>A library for publish-subscribe functionality in <code>libp2p</code>. It's used for messaging between nodes in a decentralized network, supporting various messaging patterns like broadcasting.</li>
+</ul>
+</li>
+<li>
+<p><strong>crypto (go-libp2p-core/crypto)</strong>:</p>
+<ul>
+<li>This library provides cryptographic functions for <code>libp2p</code>, including key generation, marshaling, and unmarshaling. It's crucial for maintaining secure communication channels in the P2P network.</li>
+</ul>
+</li>
+<li>
+<p><strong>Echo (labstack/echo/v4)</strong>:</p>
+<ul>
+<li>A high-performance, extensible web framework for Go.</li>
+</ul>
+</li>
+<li>
+<p><strong>WebSockets</strong>:</p>
+<ul>
+<li>A communication protocol providing full-duplex channels over a single TCP connection. Used here for real-time, two-way interaction between the server and clients.</li>
+</ul>
+</li>
+<li>
+<p><strong>JSON (JavaScript Object Notation)</strong>:</p>
+<ul>
+<li>A lightweight data-interchange format, used here for serializing and transmitting structured data over the network (like the various message types).</li>
+</ul>
+</li>
+<li>
+<p><strong>Distributed Hash Table (DHT) for Peer Discovery</strong>:</p>
+<ul>
+<li>A decentralized method of discovering peers in the network. It allows a node to efficiently find other nodes in the P2P network.</li>
+</ul>
+</li>
+<li>
+<p><strong>HTTP/HTTPS Protocols</strong>:</p>
+<ul>
+<li>Used for setting up the web server and handling requests. The server can handle both HTTP and HTTPS requests.</li>
+</ul>
+</li>
+<li>
+<p><strong>Middleware &amp; Logging (middleware, ulogger)</strong>:</p>
+<ul>
+<li>Used for handling common tasks across requests (like logging, error handling, CORS settings) in the Echo web framework.</li>
+</ul>
+</li>
+<li>
+<p><strong>gocore (ordishs/gocore)</strong>:</p>
+<ul>
+<li>A utility library for configuration management and other core functionalities.</li>
+</ul>
+</li>
+<li>
+<p><strong>Environmental Configuration</strong>:</p>
+<ul>
+<li>Configuration management using environment variables, required for setting up network parameters, topic names, etc.</li>
+</ul>
+</li>
+</ol>
+<h2 id="4-data-model">4. Data Model</h2>
+<ul>
+<li><a href="../../datamodel/block_data_model/">Block Data Model</a>: Contain lists of subtree identifiers.</li>
+<li><a href="../../datamodel/subtree_data_model/">Subtree Data Model</a>: Contain lists of transaction IDs and their Merkle root.</li>
+</ul>
+<p>Within the P2P service, notifications are sent to the Websocket clients using the following data model:</p>
+<ul>
+<li>Block notifications:</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="nx">s</span><span class="p">.</span><span class="nx">notificationCh</span><span class="w"> </span><span class="o">&lt;-</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">notificationMsg</span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Timestamp</span><span class="p">:</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">().</span><span class="nx">UTC</span><span class="p">(),</span>
+<span class="w">    </span><span class="nx">Type</span><span class="p">:</span><span class="w">      </span><span class="s">&quot;block&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">Hash</span><span class="p">:</span><span class="w">      </span><span class="nx">blockMessage</span><span class="p">.</span><span class="nx">Hash</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">BaseURL</span><span class="p">:</span><span class="w">   </span><span class="nx">blockMessage</span><span class="p">.</span><span class="nx">DataHubUrl</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">PeerId</span><span class="p">:</span><span class="w">    </span><span class="nx">blockMessage</span><span class="p">.</span><span class="nx">PeerId</span><span class="p">,</span>
+<span class="w">   </span><span class="p">}</span>
+</code></pre></div>
+<ul>
+<li>Subtree notifications:</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="nx">s</span><span class="p">.</span><span class="nx">notificationCh</span><span class="w"> </span><span class="o">&lt;-</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">notificationMsg</span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Type</span><span class="p">:</span><span class="w">    </span><span class="s">&quot;subtree&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">Hash</span><span class="p">:</span><span class="w">    </span><span class="nx">subtreeMessage</span><span class="p">.</span><span class="nx">Hash</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">BaseURL</span><span class="p">:</span><span class="w"> </span><span class="nx">subtreeMessage</span><span class="p">.</span><span class="nx">DataHubUrl</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">PeerId</span><span class="p">:</span><span class="w">  </span><span class="nx">subtreeMessage</span><span class="p">.</span><span class="nx">PeerId</span><span class="p">,</span>
+<span class="w">   </span><span class="p">}</span>
+</code></pre></div>
+<ul>
+<li>"MiningOn" notifications:</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="nx">s</span><span class="p">.</span><span class="nx">notificationCh</span><span class="w"> </span><span class="o">&lt;-</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">notificationMsg</span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Timestamp</span><span class="p">:</span><span class="w">    </span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">().</span><span class="nx">UTC</span><span class="p">(),</span>
+<span class="w">    </span><span class="nx">Type</span><span class="p">:</span><span class="w">         </span><span class="s">&quot;mining_on&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">Hash</span><span class="p">:</span><span class="w">         </span><span class="nx">miningOnMessage</span><span class="p">.</span><span class="nx">Hash</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">BaseURL</span><span class="p">:</span><span class="w">      </span><span class="nx">miningOnMessage</span><span class="p">.</span><span class="nx">DataHubUrl</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">PeerId</span><span class="p">:</span><span class="w">       </span><span class="nx">miningOnMessage</span><span class="p">.</span><span class="nx">PeerId</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">PreviousHash</span><span class="p">:</span><span class="w"> </span><span class="nx">miningOnMessage</span><span class="p">.</span><span class="nx">PreviousHash</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">Height</span><span class="p">:</span><span class="w">       </span><span class="nx">miningOnMessage</span><span class="p">.</span><span class="nx">Height</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">Miner</span><span class="p">:</span><span class="w">        </span><span class="nx">miningOnMessage</span><span class="p">.</span><span class="nx">Miner</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">SizeInBytes</span><span class="p">:</span><span class="w">  </span><span class="nx">miningOnMessage</span><span class="p">.</span><span class="nx">SizeInBytes</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">TxCount</span><span class="p">:</span><span class="w">      </span><span class="nx">miningOnMessage</span><span class="p">.</span><span class="nx">TxCount</span><span class="p">,</span>
+<span class="w">   </span><span class="p">}</span>
+</code></pre></div>
+<h2 id="5-directory-structure-and-main-files">5. Directory Structure and Main Files</h2>
+<div class="highlight"><pre><span></span><code>./services/p2p
+│
+├── HandleWebsocket.go   - Manages WebSocket connections and communications.
+├── Server.go            - Main server logic for the P2P service, including network handling and peer interactions.
+├── client.html          - A client-side HTML file for testing or interacting with the WebSocket server.
+└── dht.go               - Implements the Distributed Hash Table (DHT) functionality for the P2P network.
+</code></pre></div>
+<h2 id="6-how-to-run">6. How to run</h2>
+<p>To run the P2P Service locally, you can execute the following command:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">SETTINGS_CONTEXT</span><span class="o">=</span>dev.<span class="o">[</span>YOUR_USERNAME<span class="o">]</span><span class="w"> </span>go<span class="w"> </span>run<span class="w"> </span>-P2P<span class="o">=</span><span class="m">1</span>
+</code></pre></div>
+<p>Please refer to the <a href="../../../howto/locallyRunningServices/">Locally Running Services Documentation</a> document for more information on running the P2P Service locally.</p>
+<h2 id="7-configuration-options-settings-flags">7. Configuration options (settings flags)</h2>
+<p>The P2P service serves as the communication backbone of the Teranode network, enabling nodes to discover, connect, and exchange data with each other. This section provides a comprehensive overview of all configuration options, organized by functional category.</p>
+<h3 id="network-and-discovery-settings">Network and Discovery Settings</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>p2p_listen_addresses</code></td>
+<td>[]string</td>
+<td>[]</td>
+<td>Network addresses for the P2P service to listen on</td>
+<td>Controls which interfaces and ports the service binds to for accepting connections</td>
+</tr>
+<tr>
+<td><code>p2p_advertise_addresses</code></td>
+<td>[]string</td>
+<td>[]</td>
+<td>Addresses to advertise to other peers</td>
+<td>Affects how other peers discover and connect to this node. Supports both IP addresses and domain names with optional port specification (e.g., <code>192.168.1.1</code>, <code>example.com:9906</code>). When port is omitted, the <code>p2p_port</code> value is used.</td>
+</tr>
+<tr>
+<td><code>p2p_port</code></td>
+<td>int</td>
+<td>9906</td>
+<td>Default port for P2P communication</td>
+<td>Used as the fallback port when addresses don't specify a port</td>
+</tr>
+<tr>
+<td><code>p2p_bootstrapAddresses</code></td>
+<td>[]string</td>
+<td>[]</td>
+<td>Initial peer addresses for bootstrapping the DHT</td>
+<td>Helps new nodes join the network by providing entry points</td>
+</tr>
+<tr>
+<td><code>p2p_bootstrap_persistent</code></td>
+<td>bool</td>
+<td>false</td>
+<td>Treat bootstrap addresses as persistent connections</td>
+<td>When enabled, bootstrap servers automatically reconnect after disconnection</td>
+</tr>
+<tr>
+<td><code>p2p_static_peers</code></td>
+<td>[]string</td>
+<td>[]</td>
+<td>Peer addresses to connect to on startup</td>
+<td>Ensures connections to specific peers regardless of discovery</td>
+</tr>
+<tr>
+<td><code>p2p_dht_protocol_id</code></td>
+<td>string</td>
+<td>""</td>
+<td>Protocol identifier for DHT communications</td>
+<td>Affects how nodes discover each other in the network</td>
+</tr>
+<tr>
+<td><code>p2p_dht_use_private</code></td>
+<td>bool</td>
+<td>false</td>
+<td>Use private DHT mode</td>
+<td>Restricts DHT communication to trusted peers when enabled</td>
+</tr>
+<tr>
+<td><code>p2p_optimise_retries</code></td>
+<td>bool</td>
+<td>false</td>
+<td>Optimize retry behavior for peer connections</td>
+<td>Improves efficiency of connection attempts in certain network conditions</td>
+</tr>
+</tbody>
+</table>
+<h3 id="service-endpoints">Service Endpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>p2p_grpcAddress</code></td>
+<td>string</td>
+<td>""</td>
+<td>Address for other services to connect to this service</td>
+<td>Enables service-to-service communication</td>
+</tr>
+<tr>
+<td><code>p2p_grpcListenAddress</code></td>
+<td>string</td>
+<td>:9906</td>
+<td>Interface and port to listen on for gRPC connections</td>
+<td>Controls network binding for the gRPC server</td>
+</tr>
+<tr>
+<td><code>p2p_httpAddress</code></td>
+<td>string</td>
+<td>localhost:9906</td>
+<td>Address other services use to connect to HTTP API</td>
+<td>Affects how other services discover the P2P HTTP API</td>
+</tr>
+<tr>
+<td><code>p2p_httpListenAddress</code></td>
+<td>string</td>
+<td>""</td>
+<td>Interface and port to listen on for HTTP connections</td>
+<td>Controls network binding for the HTTP server</td>
+</tr>
+<tr>
+<td><code>securityLevelHTTP</code></td>
+<td>int</td>
+<td>0</td>
+<td>HTTP security level (0=HTTP, 1=HTTPS)</td>
+<td>Determines whether HTTP or HTTPS is used for web connections</td>
+</tr>
+<tr>
+<td><code>server_certFile</code></td>
+<td>string</td>
+<td>""</td>
+<td>Path to SSL certificate file</td>
+<td>Required for HTTPS when security level is 1</td>
+</tr>
+<tr>
+<td><code>server_keyFile</code></td>
+<td>string</td>
+<td>""</td>
+<td>Path to SSL key file</td>
+<td>Required for HTTPS when security level is 1</td>
+</tr>
+</tbody>
+</table>
+<h3 id="peer-to-peer-topics">Peer-to-Peer Topics</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>p2p_block_topic</code></td>
+<td>string</td>
+<td>""</td>
+<td>Topic name for block announcements</td>
+<td>Controls subscription and publication to the block channel</td>
+</tr>
+<tr>
+<td><code>p2p_subtree_topic</code></td>
+<td>string</td>
+<td>""</td>
+<td>Topic name for subtree announcements</td>
+<td>Controls subscription and publication to the subtree channel</td>
+</tr>
+<tr>
+<td><code>p2p_mining_on_topic</code></td>
+<td>string</td>
+<td>""</td>
+<td>Topic name for mining status announcements</td>
+<td>Controls subscription and publication to the mining status channel</td>
+</tr>
+<tr>
+<td><code>p2p_rejected_tx_topic</code></td>
+<td>string</td>
+<td>""</td>
+<td>Topic name for rejected transaction announcements</td>
+<td>Controls subscription to rejected transaction notifications</td>
+</tr>
+<tr>
+<td><code>p2p_handshake_topic</code></td>
+<td>string</td>
+<td>""</td>
+<td><strong>REQUIRED</strong> - Topic name for peer handshake messages</td>
+<td>Used for version and verack exchanges between peers. Service will fail to start if not configured.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="authentication-and-security">Authentication and Security</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>p2p_peer_id</code></td>
+<td>string</td>
+<td>""</td>
+<td>Unique identifier for the P2P node</td>
+<td>Used to identify this node in the P2P network</td>
+</tr>
+<tr>
+<td><code>p2p_private_key</code></td>
+<td>string</td>
+<td>""</td>
+<td>Private key for P2P authentication</td>
+<td>Provides cryptographic identity for the node; if not provided, will be automatically generated and persistently stored in the blockchain database</td>
+</tr>
+<tr>
+<td><code>p2p_shared_key</code></td>
+<td>string</td>
+<td>""</td>
+<td><strong>REQUIRED for private networks</strong> - Shared key for private network communication</td>
+<td>When provided, ensures only nodes with the same shared key can communicate</td>
+</tr>
+</tbody>
+</table>
+<h3 id="ban-management">Ban Management</h3>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>p2p_ban_threshold</code></td>
+<td>int</td>
+<td>100</td>
+<td>Score threshold at which peers are banned</td>
+<td>Controls how aggressively misbehaving peers are banned</td>
+</tr>
+<tr>
+<td><code>p2p_ban_duration</code></td>
+<td>duration</td>
+<td>24h</td>
+<td>Duration for which peers remain banned</td>
+<td>Controls how long banned peers are excluded from the network</td>
+</tr>
+</tbody>
+</table>
+<h2 id="configuration-validation-rules">Configuration Validation Rules</h2>
+<p>The P2P service enforces several validation rules during startup:</p>
+<h3 id="required-configuration">Required Configuration</h3>
+<ul>
+<li><code>p2p_handshake_topic</code> - Must be set or service will fail with "p2p_handshake_topic not set in config"</li>
+</ul>
+<h3 id="network-address-validation">Network Address Validation</h3>
+<ul>
+<li>Listen addresses must be valid multiaddress format</li>
+<li>Port numbers must be within valid range (1-65535)</li>
+<li>Advertise addresses support both IP addresses and domain names</li>
+<li>When advertise addresses omit ports, <code>p2p_port</code> value is automatically used</li>
+</ul>
+<h3 id="private-network-requirements">Private Network Requirements</h3>
+<ul>
+<li>When <code>p2p_shared_key</code> is provided, all peers must use the same shared key</li>
+<li>Private DHT mode (<code>p2p_dht_use_private: true</code>) restricts peer discovery to trusted nodes</li>
+</ul>
+<h3 id="key-management">Key Management</h3>
+<ul>
+<li>If <code>p2p_private_key</code> is not provided, a new Ed25519 key is automatically generated and persisted to blockchain store</li>
+<li>The key generation happens on first startup and the same key is reused on subsequent restarts</li>
+<li>Private key format must be compatible with libp2p cryptographic standards (64-byte Ed25519 format: 32-byte private + 32-byte public)</li>
+</ul>
+<h2 id="configuration-dependencies">Configuration Dependencies</h2>
+<p>The P2P service requires integration with several other services:</p>
+<h2 id="configuration-interactions-and-dependencies">Configuration Interactions and Dependencies</h2>
+<h3 id="network-binding-and-discovery">Network Binding and Discovery</h3>
+<p>The P2P service's network presence is controlled by several interrelated settings:</p>
+<ul>
+<li><code>p2p_listen_addresses</code> determines which interfaces/ports the service listens on</li>
+<li><code>p2p_advertise_addresses</code> controls what addresses are advertised to peers</li>
+<li>Each address can be specified with or without a port (e.g., <code>192.168.1.1</code> or <code>example.com:9906</code>)</li>
+<li>For addresses without a port, the system automatically uses the value from <code>p2p_port</code></li>
+<li>Both IP addresses and domain names are supported with proper multiaddress formatting</li>
+<li><code>p2p_port</code> provides a default when addresses don't specify ports</li>
+<li>If no <code>p2p_listen_addresses</code> are specified, the service may not be reachable</li>
+<li>The gRPC and HTTP listen addresses control how other services can interact with the P2P service</li>
+</ul>
+<p>These settings should be configured together based on your network architecture and security requirements.</p>
+<h3 id="peer-discovery-and-connection">Peer Discovery and Connection</h3>
+<p>Peer discovery in the P2P service uses a multi-layered approach:</p>
+<ul>
+<li><code>p2p_bootstrapAddresses</code> provides initial entry points to the network</li>
+<li><code>p2p_bootstrap_persistent</code> controls whether bootstrap servers are treated as persistent connections that automatically reconnect</li>
+<li><code>p2p_static_peers</code> ensures connections to specific peers regardless of DHT discovery</li>
+<li><code>p2p_dht_protocol_id</code> and <code>p2p_dht_use_private</code> affect the DHT-based peer discovery mechanism</li>
+<li><code>p2p_optimise_retries</code> impacts connection retry behavior when peers are unreachable</li>
+</ul>
+<p>In private network deployments, you should configure static peers and bootstrap addresses carefully to ensure nodes can find each other.</p>
+<h4 id="bootstrap-vs-static-peers">Bootstrap vs Static Peers</h4>
+<p>By default, bootstrap addresses are used only for initial network discovery and DHT bootstrapping. If you need bootstrap servers to maintain persistent connections that automatically reconnect after disconnection, enable <code>p2p_bootstrap_persistent=true</code>. This will treat bootstrap addresses as static peers for connection purposes while still using them for DHT bootstrapping.</p>
+<h3 id="security-and-authentication">Security and Authentication</h3>
+<p>The P2P service uses several security mechanisms:</p>
+<ul>
+<li><code>p2p_private_key</code> establishes the node's identity, which is reflected in its <code>p2p_peer_id</code></li>
+<li><code>p2p_shared_key</code> enables private network functionality, restricting communication to nodes with the same shared key</li>
+<li>If no private key is provided, it will be auto-generated and stored in the blockchain store</li>
+<li>The ban system uses a score-based approach where peers accumulate points for bad behavior</li>
+</ul>
+<p>These settings enable secure and authenticated communication between nodes in the network.</p>
+<h2 id="8-other-resources">8. Other Resources</h2>
+<p><a href="../../../references/services/p2p_reference/">P2P Reference</a></p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright © 2025 BSV Blockchain Org.
+    </div>
+  
+  
+</div>
+      
+        <div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/bitcoin-sv/teranode" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.7.2 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2024 Fonticons, Inc.--><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8M97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    <script id="__config" type="application/json">{"base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.f8cc74c7.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.c8b220af.min.js"></script>
+      
+        <script src="../../../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
+      
+    
+  </body>
+</html>

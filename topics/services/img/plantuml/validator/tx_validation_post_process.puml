@@ -1,0 +1,89 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Server" as Server
+entity "Validator" as Validator
+participant "TxValidator" as TxValidator
+database "UTXO Store" as UTXOStore
+participant "Block Assembly" as BlockAssembly
+queue "Rejected Tx Kafka Producer" as RejectedKafka
+queue "Tx Meta Kafka Producer" as TxMetaKafka
+participant "Blockchain Client" as BlockchainClient
+
+Server -> Server: ValidateTransaction()
+Server -> Validator: Validate(ctx, tx, blockHeight)
+activate Validator
+
+Validator -> BlockchainClient: GetFSMCurrentState()
+Validator -> Validator: validateInternal()
+activate Validator
+
+Validator -> TxValidator: validateTransaction()
+TxValidator -> Validator: Return result
+
+alt if TX is valid
+    Validator -> Validator: spendUtxos()
+    Validator -> UTXOStore: Spend() # Mark TX input UTXOs as spent
+
+    Validator -> Validator: storeTxInUtxoMap()
+    Validator -> UTXOStore: Create(locked=true) \n# Persist new UTXOs from TX as locked
+    note right of UTXOStore
+      UTXOs are initially created as locked
+      (first phase of two-phase commit)
+    end note
+
+    alt if Tx Meta Kafka Producer exists
+        Validator -> TxMetaKafka: Publish tx meta
+    end
+
+    alt if !blockAssemblyDisabled
+        Validator -> BlockAssembly: Store()
+        alt if error in block assembler store
+            Validator -> UTXOStore: Delete() # reverseTxMetaStore
+            Validator -> UTXOStore: Unspend() # reverseSpends
+            Validator --> Server: Return error
+        else if successful
+            Validator -> UTXOStore: SetLocked(txHash, false)  \n # Set the UTXOs as locked \n # after successful addition to block assembly
+            note right of UTXOStore
+              Second phase of two-phase commit:
+              UTXOs are now marked as spendable
+            end note
+        end
+    end
+
+else if TX is invalid
+    Validator -> RejectedKafka: Publish rejected TX
+end
+
+deactivate Validator
+
+Validator -> Server: Return validation result
+deactivate Validator
+
+alt if TX is invalid
+    Server -> Server: Return error response
+end
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

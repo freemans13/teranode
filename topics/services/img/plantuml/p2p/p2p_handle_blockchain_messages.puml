@@ -1,0 +1,51 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+
+participant "Blockchain Service" as Blockchain
+participant "P2P Server" as P2PServer
+participant "Kafka" as Kafka
+queue "PubSub System" as PubSub
+participant "Remote Peer" as RemotePeer
+
+Blockchain -> P2PServer: Block notification
+activate P2PServer
+P2PServer -> P2PServer: processBlockchainNotification()
+P2PServer -> P2PServer: handleBlockNotification()
+activate P2PServer
+P2PServer -> PubSub: s.topics[blockTopicName].Publish(ctx, BlockMessage)
+P2PServer -> Kafka: Produce KafkaBlockTopicMessage
+deactivate P2PServer
+deactivate P2PServer
+
+PubSub -> RemotePeer: Propagate block message
+activate RemotePeer
+RemotePeer -> RemotePeer: handleBlockTopic()
+RemotePeer -> Kafka: Produce KafkaBlockTopicMessage
+deactivate RemotePeer
+
+note over P2PServer: No separate bestBlockTopic\nBlock info shared via handshakes
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

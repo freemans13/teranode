@@ -1,0 +1,51 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+
+participant "Validator Service" as Validator
+participant "Kafka" as Kafka
+participant "P2P Server (Node 1)" as P2PServer
+participant "PubSub System" as PubSub
+participant "P2P Node 2" as Node2
+
+Validator -> Validator: ValidateWithOptions() fails
+activate Validator
+Validator -> Kafka: Publish KafkaRejectedTxTopicMessage
+deactivate Validator
+
+Kafka -> P2PServer: rejectedHandler() consumes message
+activate P2PServer
+P2PServer -> P2PServer: Create RejectedTxMessage
+P2PServer -> PubSub: s.topics[rejectedTxTopicName].Publish(ctx, rejectedTxMessageBytes)
+deactivate P2PServer
+
+PubSub -> Node2: Message propagated via topic
+activate Node2
+Node2 -> Node2: (No handler implemented)
+deactivate Node2
+
+note over Node2: Nodes subscribe to rejectedTxTopic\nbut lack handlers for incoming messages
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

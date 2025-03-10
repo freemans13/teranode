@@ -1,0 +1,41 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Peer (Client)" as Client
+participant "gRPC Server (Bootstrap Service)" as Server
+database "Subscribers" as Subs
+
+Client -> Server : GetNodes()
+activate Server
+
+Server -> Subs : Fetch Nodes List
+activate Subs
+Subs --> Server : Nodes List
+deactivate Subs
+
+Server --> Client : Return Nodes List
+deactivate Server
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

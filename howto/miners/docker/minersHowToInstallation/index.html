@@ -1,0 +1,6508 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../../../developersHowToTeranodeCLI/">
+      
+      
+        <link rel="next" href="../../kubernetes/minersHowToInstallation/">
+      
+      
+      <link rel="icon" href="../../../../topics/architecture/img/bsvblockchain_blue_logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.7">
+    
+    
+      
+        <title>Docker - Teranode</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../../assets/stylesheets/main.8608ea7d.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        
+        <link rel="stylesheet" href="../../../../assets/external/fonts.googleapis.com/css.49ea35f2.css">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../../../overrides/custom.css">
+    
+    <script>__md_scope=new URL("../../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#how-to-install-teranode-with-docker-compose" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../../../topics/architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Teranode
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Docker
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../../.." class="md-tabs__link">
+        
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../../tutorials/developers/developerSetup/" class="md-tabs__link">
+          
+  
+  Tutorials
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../../../locallyRunningServices/" class="md-tabs__link">
+          
+  
+  How-To Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../../topics/teranodeIntro/" class="md-tabs__link">
+          
+  
+  Key Topics
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../../../references/projectStructure/" class="md-tabs__link">
+          
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+      
+  <img src="../../../../topics/architecture/img/bsvblockchain_logo.svg" alt="logo">
+
+    </a>
+    Teranode
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../.." class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Home
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Tutorials
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            Tutorials
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../tutorials/developers/developerSetup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../tutorials/miners/minersGettingStarted/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Miners Getting Started
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    How-To Guides
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            How-To Guides
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../locallyRunningServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Services Locally
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../howToRemoteDebugTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Debugging Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../generatingProtobuf/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Generating Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../addingNewProtobufServices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Adding Protobuf
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../configuringGrpcLogging/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Configuring gRPC Logging
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../runningTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Running Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../automatedTestingHowTo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Automated Testing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../makefile/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Makefile Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../bugReporting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Bug Reporting
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../developersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Developer's Guide to Teranode-CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_11" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3_11" id="__nav_3_11_label" tabindex="">
+            
+  
+  <span class="md-ellipsis">
+    Miners
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_11_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3_11">
+            <span class="md-nav__icon md-icon"></span>
+            Miners
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../howToUseTheTestMiner.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Using Test Miner
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_11_2" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_2" id="__nav_3_11_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Installation
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_2_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3_11_2">
+            <span class="md-nav__icon md-icon"></span>
+            Installation
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#index" class="md-nav__link">
+    <span class="md-ellipsis">
+      Index
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#introduction" class="md-nav__link">
+    <span class="md-ellipsis">
+      Introduction
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#prerequisites" class="md-nav__link">
+    <span class="md-ellipsis">
+      Prerequisites
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hardware-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      Hardware Requirements
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#software-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      Software Requirements
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#network-considerations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network Considerations
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#installation-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      Installation Process
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Installation Process">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#teranode-initial-block-synchronization" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Initial Block Synchronization
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Initial Block Synchronization">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#full-p2p-download" class="md-nav__link">
+    <span class="md-ellipsis">
+      Full P2P Download
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#initial-data-set-installation" class="md-nav__link">
+    <span class="md-ellipsis">
+      Initial Data Set Installation
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#teranode-installation-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Installation Types
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Installation Types">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pre-built-binaries" class="md-nav__link">
+    <span class="md-ellipsis">
+      Pre-built Binaries
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#docker-container" class="md-nav__link">
+    <span class="md-ellipsis">
+      Docker Container
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#docker-compose" class="md-nav__link">
+    <span class="md-ellipsis">
+      Docker Compose
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#installing-teranode-with-docker-compose" class="md-nav__link">
+    <span class="md-ellipsis">
+      Installing Teranode with Docker Compose
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Installing Teranode with Docker Compose">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#step-1-create-repository" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 1: Create Repository
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 1: Create Repository">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#open-terminal" class="md-nav__link">
+    <span class="md-ellipsis">
+      Open Terminal
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#clone-repository" class="md-nav__link">
+    <span class="md-ellipsis">
+      Clone Repository
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-2-configure-environment-settings-context-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 2: Configure Environment Settings Context [Optional]
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 2: Configure Environment Settings Context [Optional]">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#create-environment-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      Create Environment File
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set-context-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      Set Context (Optional)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#authenticate-with-aws-ecr" class="md-nav__link">
+    <span class="md-ellipsis">
+      Authenticate with AWS ECR
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-3-prepare-local-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 3: Prepare Local Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 3: Prepare Local Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#review-settings-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      Review Settings File
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#settings-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      Settings Reference
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-4-pull-docker-images" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 4: Pull Docker Images
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 4: Pull Docker Images">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#navigate-to-docker-compose-directory" class="md-nav__link">
+    <span class="md-ellipsis">
+      Navigate to Docker Compose Directory
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pull-docker-images" class="md-nav__link">
+    <span class="md-ellipsis">
+      Pull Docker Images
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-5-start-the-teranode-stack" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 5: Start the Teranode Stack
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-6-verify-services" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 6: Verify Services
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 6: Verify Services">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#check-service-status" class="md-nav__link">
+    <span class="md-ellipsis">
+      Check Service Status
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#verify-service-health" class="md-nav__link">
+    <span class="md-ellipsis">
+      Verify Service Health
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-7-access-monitoring-tools" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 7: Access Monitoring Tools
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-8-interact-with-teranode" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 8: Interact with Teranode
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-9-logging-and-troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 9: Logging and Troubleshooting
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 9: Logging and Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#view-all-service-logs" class="md-nav__link">
+    <span class="md-ellipsis">
+      View All Service Logs
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#view-specific-service-logs" class="md-nav__link">
+    <span class="md-ellipsis">
+      View Specific Service Logs
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-10-docker-log-rotation" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 10: Docker Log Rotation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-11-stopping-the-stack" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 11: Stopping the Stack
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#optimizations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Optimizations
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#aerospike-operations-and-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Aerospike Operations and Configuration
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Aerospike Operations and Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#aerospike-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Aerospike Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#aerospike-administration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Aerospike Administration
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#docker-logs-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Docker Logs Management
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Docker Logs Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#system-wide-docker-log-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      System-wide Docker Log Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#per-service-log-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Per-Service Log Configuration
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#teranode-network-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Network Architecture
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Network Architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#svnode-p2p-network" class="md-nav__link">
+    <span class="md-ellipsis">
+      SVNode P2P Network
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#teranode-p2p-network" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode P2P Network
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#teranode-network-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Network Requirements
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#asset-service-setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      Asset Service Setup
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Asset Service Setup">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#basic-asset-service-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Basic Asset Service Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#asset-service-with-nginx-caching" class="md-nav__link">
+    <span class="md-ellipsis">
+      Asset Service with Nginx Caching
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#asset-service-viewer" class="md-nav__link">
+    <span class="md-ellipsis">
+      Asset Service Viewer
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rpc-interface" class="md-nav__link">
+    <span class="md-ellipsis">
+      RPC Interface
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="RPC Interface">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#rpc-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      RPC Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rpc-usage-example" class="md-nav__link">
+    <span class="md-ellipsis">
+      RPC Usage Example
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#teranode-cli-command-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      teranode-cli Command Reference
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="teranode-cli Command Reference">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#accessing-teranode-cli" class="md-nav__link">
+    <span class="md-ellipsis">
+      Accessing teranode-cli
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#available-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      Available Commands
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#common-cli-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Common CLI Operations
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#teranode-reset-procedures" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Reset Procedures
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Reset Procedures">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-aerospike-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      1. Aerospike Clean-up
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-postgres-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      2. Postgres Clean-up
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-filesystem-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      3. Filesystem Clean-up
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#teranode-seeding" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Seeding
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Seeding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#step-1-export-from-sv-node" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 1: Export from SV Node
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-2-seed-teranode" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 2: Seed Teranode
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-3-complete-seeding-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 3: Complete Seeding Process
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cpu-mining" class="md-nav__link">
+    <span class="md-ellipsis">
+      CPU Mining
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#advanced-configuration-examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      Advanced Configuration Examples
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Advanced Configuration Examples">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#private-network-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Private Network Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-connection-optimization" class="md-nav__link">
+    <span class="md-ellipsis">
+      Peer Connection Optimization
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#settings-override-examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      Settings Override Examples
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#network-specific-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network-Specific Settings
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      Troubleshooting
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#common-issues-and-solutions" class="md-nav__link">
+    <span class="md-ellipsis">
+      Common Issues and Solutions
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#log-analysis" class="md-nav__link">
+    <span class="md-ellipsis">
+      Log Analysis
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#settings-reference_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Settings Reference
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kubernetes/minersHowToInstallation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kubernetes/minersHowToInstallationDeprecated/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Deprecated
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_3" id="__nav_3_11_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Configuration
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_3">
+            <span class="md-nav__icon md-icon"></span>
+            Configuration
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersHowToAerospikeTuning/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Aerospike Tuning
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersHowToInteractWithAssetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersHowToInteractWithFSM/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    FSM Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersHowToInteractWithRPCServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC Server Interaction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_4" id="__nav_3_11_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Start/Stop
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_4">
+            <span class="md-nav__icon md-icon"></span>
+            Start/Stop
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../minersHowToStopStartDockerTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_5" id="__nav_3_11_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Updating Teranode
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_5">
+            <span class="md-nav__icon md-icon"></span>
+            Updating Teranode
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_6" id="__nav_3_11_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Security Best Practices
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_6">
+            <span class="md-nav__icon md-icon"></span>
+            Security Best Practices
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_7" id="__nav_3_11_7_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Troubleshooting
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_7">
+            <span class="md-nav__icon md-icon"></span>
+            Troubleshooting
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_8" id="__nav_3_11_8_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Additional
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_8">
+            <span class="md-nav__icon md-icon"></span>
+            Additional
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersHowToCPUMiner/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    CPU Mining Setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersHowToResetTeranode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Reset Teranode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersHowToSyncTheNode/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Sync the Node
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersHowToTeranodeCLI/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode CLI
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../minersManagingDiskSpace/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Managing Disk Space
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../kubernetes/minersHowToBackup/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Backup (Kubernetes)
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Key Topics
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            Key Topics
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/teranodeIntro/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Introduction
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/architecture/teranode-overall-system-design/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/architecture/teranode-architecture-brief/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Architecture Brief
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/architecture/teranode-microservices-overview/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Microservices Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/architecture/stateManagement/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    State Management
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/architecture/understandingDoubleSpends/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding Double Spends
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/technologyStack/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Technology Stack
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/understandingTheTestingFramework/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Understanding the Testing Framework
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/functionalRequirementTests/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Functional Requirement Tests
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_10" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_10" id="__nav_4_10_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Features
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_10">
+            <span class="md-nav__icon md-icon"></span>
+            Features
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/features/two_phase_commit/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Two Phase Commit
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_11" id="__nav_4_11_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_11">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/alert/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/assetServer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Server
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/blockAssembly/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/blockValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/blockchain/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/propagation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/subtreeValidation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/validator/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_12" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_12" id="__nav_4_12_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_12_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_12">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/blockPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/p2p/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/legacy/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Legacy
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/rpc/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/services/utxoPersister/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_13" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_13" id="__nav_4_13_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_13">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/stores/blob/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/stores/utxo/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_14" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Data Model
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_14">
+            <span class="md-nav__icon md-icon"></span>
+            Data Model
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/datamodel/block_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/datamodel/block_header_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Header Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/datamodel/subtree_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/datamodel/transaction_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Transaction Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/datamodel/utxo_data_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Data Model
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_15" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Kafka
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_15">
+            <span class="md-nav__icon md-icon"></span>
+            Kafka
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/kafka/kafka/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Overview
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Commands
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_16">
+            <span class="md-nav__icon md-icon"></span>
+            Commands
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/commands/chainIntegrity.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Chain Integrity
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/commands/propagationBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/commands/seeder/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Seeder
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../topics/commands/txBlaster.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    TX Blaster
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Reference
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            Reference
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/projectStructure/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Project Structure
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2" id="__nav_5_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    API & Protobuf
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2">
+            <span class="md-nav__icon md-icon"></span>
+            API & Protobuf
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/errorHandling/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Error Handling
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/glossary/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Glossary
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/codingConventions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Coding Conventions
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/kafkaMessageFormat/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Kafka Message Format
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/networkConsensusRules/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Network Consensus Rules
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_2_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_2_6" id="__nav_5_2_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Protobuf API
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_5_2_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_2_6">
+            <span class="md-nav__icon md-icon"></span>
+            Protobuf API
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/protobuf_docs/alertProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator Proto
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_3" id="__nav_5_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Core Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_3">
+            <span class="md-nav__icon md-icon"></span>
+            Core Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/alert_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Alert Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/asset_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Asset Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/blockassembly_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Assembly
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/blockvalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/blockchain_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockchain
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/propagation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Propagation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/subtreevalidation_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Subtree Validation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/validator_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Validator
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_4" id="__nav_5_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Overlay Services
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_4">
+            <span class="md-nav__icon md-icon"></span>
+            Overlay Services
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/blockpersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Block Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/p2p_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/legacy_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    P2P Legacy Service
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/rpc_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    RPC
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/services/utxopersister_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Persister
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Stores
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            Stores
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/stores/blob_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blob Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/stores/utxo_reference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    UTXO Store
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_6" id="__nav_5_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Miscellaneous
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_6">
+            <span class="md-nav__icon md-icon"></span>
+            Miscellaneous
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Git Commit Signing Setup Guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/licenseInformation/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Licensing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/prometheusMetrics/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Prometheus Metrics
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/settings/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Settings
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/teranodeDaemonReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Teranode Daemon Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/testingTechnicalReference/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Testing Technical Reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Third-Party Software Requirements
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#index" class="md-nav__link">
+    <span class="md-ellipsis">
+      Index
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#introduction" class="md-nav__link">
+    <span class="md-ellipsis">
+      Introduction
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#prerequisites" class="md-nav__link">
+    <span class="md-ellipsis">
+      Prerequisites
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hardware-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      Hardware Requirements
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#software-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      Software Requirements
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#network-considerations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network Considerations
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#installation-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      Installation Process
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Installation Process">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#teranode-initial-block-synchronization" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Initial Block Synchronization
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Initial Block Synchronization">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#full-p2p-download" class="md-nav__link">
+    <span class="md-ellipsis">
+      Full P2P Download
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#initial-data-set-installation" class="md-nav__link">
+    <span class="md-ellipsis">
+      Initial Data Set Installation
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#teranode-installation-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Installation Types
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Installation Types">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pre-built-binaries" class="md-nav__link">
+    <span class="md-ellipsis">
+      Pre-built Binaries
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#docker-container" class="md-nav__link">
+    <span class="md-ellipsis">
+      Docker Container
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#docker-compose" class="md-nav__link">
+    <span class="md-ellipsis">
+      Docker Compose
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#installing-teranode-with-docker-compose" class="md-nav__link">
+    <span class="md-ellipsis">
+      Installing Teranode with Docker Compose
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Installing Teranode with Docker Compose">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#step-1-create-repository" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 1: Create Repository
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 1: Create Repository">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#open-terminal" class="md-nav__link">
+    <span class="md-ellipsis">
+      Open Terminal
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#clone-repository" class="md-nav__link">
+    <span class="md-ellipsis">
+      Clone Repository
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-2-configure-environment-settings-context-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 2: Configure Environment Settings Context [Optional]
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 2: Configure Environment Settings Context [Optional]">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#create-environment-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      Create Environment File
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set-context-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      Set Context (Optional)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#authenticate-with-aws-ecr" class="md-nav__link">
+    <span class="md-ellipsis">
+      Authenticate with AWS ECR
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-3-prepare-local-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 3: Prepare Local Settings
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 3: Prepare Local Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#review-settings-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      Review Settings File
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#settings-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      Settings Reference
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-4-pull-docker-images" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 4: Pull Docker Images
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 4: Pull Docker Images">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#navigate-to-docker-compose-directory" class="md-nav__link">
+    <span class="md-ellipsis">
+      Navigate to Docker Compose Directory
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pull-docker-images" class="md-nav__link">
+    <span class="md-ellipsis">
+      Pull Docker Images
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-5-start-the-teranode-stack" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 5: Start the Teranode Stack
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-6-verify-services" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 6: Verify Services
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 6: Verify Services">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#check-service-status" class="md-nav__link">
+    <span class="md-ellipsis">
+      Check Service Status
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#verify-service-health" class="md-nav__link">
+    <span class="md-ellipsis">
+      Verify Service Health
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-7-access-monitoring-tools" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 7: Access Monitoring Tools
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-8-interact-with-teranode" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 8: Interact with Teranode
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-9-logging-and-troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 9: Logging and Troubleshooting
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Step 9: Logging and Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#view-all-service-logs" class="md-nav__link">
+    <span class="md-ellipsis">
+      View All Service Logs
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#view-specific-service-logs" class="md-nav__link">
+    <span class="md-ellipsis">
+      View Specific Service Logs
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-10-docker-log-rotation" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 10: Docker Log Rotation
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-11-stopping-the-stack" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 11: Stopping the Stack
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#optimizations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Optimizations
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#aerospike-operations-and-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Aerospike Operations and Configuration
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Aerospike Operations and Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#aerospike-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Aerospike Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#aerospike-administration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Aerospike Administration
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#docker-logs-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      Docker Logs Management
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Docker Logs Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#system-wide-docker-log-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      System-wide Docker Log Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#per-service-log-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Per-Service Log Configuration
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#teranode-network-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Network Architecture
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Network Architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#svnode-p2p-network" class="md-nav__link">
+    <span class="md-ellipsis">
+      SVNode P2P Network
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#teranode-p2p-network" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode P2P Network
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#teranode-network-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Network Requirements
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#asset-service-setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      Asset Service Setup
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Asset Service Setup">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#basic-asset-service-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Basic Asset Service Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#asset-service-with-nginx-caching" class="md-nav__link">
+    <span class="md-ellipsis">
+      Asset Service with Nginx Caching
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#asset-service-viewer" class="md-nav__link">
+    <span class="md-ellipsis">
+      Asset Service Viewer
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rpc-interface" class="md-nav__link">
+    <span class="md-ellipsis">
+      RPC Interface
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="RPC Interface">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#rpc-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      RPC Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rpc-usage-example" class="md-nav__link">
+    <span class="md-ellipsis">
+      RPC Usage Example
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#teranode-cli-command-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      teranode-cli Command Reference
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="teranode-cli Command Reference">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#accessing-teranode-cli" class="md-nav__link">
+    <span class="md-ellipsis">
+      Accessing teranode-cli
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#available-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      Available Commands
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#common-cli-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Common CLI Operations
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#teranode-reset-procedures" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Reset Procedures
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Reset Procedures">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-aerospike-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      1. Aerospike Clean-up
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-postgres-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      2. Postgres Clean-up
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-filesystem-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      3. Filesystem Clean-up
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#teranode-seeding" class="md-nav__link">
+    <span class="md-ellipsis">
+      Teranode Seeding
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Teranode Seeding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#step-1-export-from-sv-node" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 1: Export from SV Node
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-2-seed-teranode" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 2: Seed Teranode
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#step-3-complete-seeding-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      Step 3: Complete Seeding Process
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cpu-mining" class="md-nav__link">
+    <span class="md-ellipsis">
+      CPU Mining
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#advanced-configuration-examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      Advanced Configuration Examples
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Advanced Configuration Examples">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#private-network-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Private Network Configuration
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-connection-optimization" class="md-nav__link">
+    <span class="md-ellipsis">
+      Peer Connection Optimization
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#settings-override-examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      Settings Override Examples
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#network-specific-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Network-Specific Settings
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      Troubleshooting
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#common-issues-and-solutions" class="md-nav__link">
+    <span class="md-ellipsis">
+      Common Issues and Solutions
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#log-analysis" class="md-nav__link">
+    <span class="md-ellipsis">
+      Log Analysis
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#settings-reference_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Settings Reference
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<h1 id="how-to-install-teranode-with-docker-compose">How to Install Teranode with Docker Compose</h1>
+<p>Last modified: 28-Jul-2025</p>
+<h2 id="index">Index</h2>
+<ul>
+<li><a href="#introduction">Introduction</a></li>
+<li><a href="#prerequisites">Prerequisites</a></li>
+<li><a href="#hardware-requirements">Hardware Requirements</a></li>
+<li><a href="#software-requirements">Software Requirements</a></li>
+<li><a href="#network-considerations">Network Considerations</a></li>
+<li><a href="#installation-process">Installation Process</a><ul>
+<li><a href="#teranode-initial-block-synchronization">Teranode Initial Block Synchronization</a><ul>
+<li><a href="#full-p2p-download">Full P2P Download</a></li>
+<li><a href="#initial-data-set-installation">Initial Data Set Installation</a></li>
+</ul>
+</li>
+<li><a href="#teranode-installation-types">Teranode Installation Types</a><ul>
+<li><a href="#pre-built-binaries">Pre-built Binaries</a></li>
+<li><a href="#docker-container">Docker Container</a></li>
+<li><a href="#docker-compose">Docker Compose</a></li>
+</ul>
+</li>
+<li><a href="#installing-teranode-with-docker-compose">Installing Teranode with Docker Compose</a></li>
+</ul>
+</li>
+<li><a href="#settings-reference">Reference Settings</a></li>
+</ul>
+<h2 id="introduction">Introduction</h2>
+<p>This guide provides step-by-step instructions for installing Teranode using Docker Compose. Notice that this approach is only recommended for testing purposes and not for production usage.</p>
+<p>This guide is applicable to:</p>
+<ol>
+<li>
+<p>Miners and node operators testing Teranode.</p>
+</li>
+<li>
+<p>Single-node Teranode setups, using Docker Compose setup.</p>
+</li>
+<li>
+<p>Configurations designed to connect to and process the BSV mainnet with current production load.</p>
+</li>
+</ol>
+<p>This guide does not cover:</p>
+<ol>
+<li>
+<p>Advanced clustering configurations.</p>
+</li>
+<li>
+<p>Scaled-out Teranode configurations. The Teranode installation described in this document is capable of handling the regular BSV production load, not the scaled-out 1 million tps configuration.</p>
+</li>
+<li>
+<p>Custom mining software integration.</p>
+</li>
+<li>
+<p>Advanced network configurations.</p>
+</li>
+<li>
+<p>Any sort of source code build or manipulation of any kind.</p>
+</li>
+</ol>
+<h2 id="prerequisites">Prerequisites</h2>
+<ul>
+<li>Docker Engine 17.03+</li>
+<li>Docker Compose</li>
+<li>AWS CLI</li>
+<li>100GB+ available disk space</li>
+<li>Stable internet connection</li>
+<li>Root or sudo access</li>
+</ul>
+<h2 id="hardware-requirements">Hardware Requirements</h2>
+<p>The Teranode team will provide you with current hardware recommendations. These recommendations will be:</p>
+<ol>
+<li>Tailored to your specific configuration settings</li>
+<li>Designed to handle the expected production transaction volume</li>
+<li>Updated regularly to reflect the latest performance requirements</li>
+</ol>
+<p>This ensures your system is appropriately equipped to manage the projected workload efficiently.</p>
+<h2 id="software-requirements">Software Requirements</h2>
+<p>Teranode relies on a number of third-party software dependencies, some of which can be sourced from different vendors.</p>
+<p>BSV provides both a Docker Compose that initialises all dependencies within a single server node, and a <code>Kubernetes operator</code> that provides a production-live multi-node setup. This document covers the Docker Compose approach.</p>
+<p>This section will outline the various vendors in use in Teranode.</p>
+<p>To know more, please refer to the <a href="../../../../references/thirdPartySoftwareRequirements/">Third Party Reference Documentation</a></p>
+<p>Note - if using Docker Compose, the shared Docker storage, which is automatically managed by Docker Compose, is used instead. This approach provides a more accessible testing environment while still allowing for essential functionality and performance evaluation.</p>
+<h2 id="network-considerations">Network Considerations</h2>
+<p>Network requirements for running a Teranode BSV node:</p>
+<ul>
+<li>Inbound: 5-50 GB per day</li>
+<li>Outbound: 50-150 GB per day</li>
+</ul>
+<p>Key considerations:</p>
+<ol>
+<li>Ensure reliable internet connection with sufficient bandwidth</li>
+<li>Plan for higher bandwidth during initial blockchain synchronization</li>
+<li>Monitor network usage against ISP limits</li>
+</ol>
+<h2 id="installation-process">Installation Process</h2>
+<h3 id="teranode-initial-block-synchronization">Teranode Initial Block Synchronization</h3>
+<p>Teranode requires an initial block synchronization to function properly. There are two approaches for completing the synchronization process.</p>
+<h4 id="full-p2p-download">Full P2P Download</h4>
+<ul>
+<li>Start the node and download all blocks from genesis using peer-to-peer (P2P) network.</li>
+<li>This method downloads the entire blockchain history.</li>
+</ul>
+<p><strong>Pros:</strong></p>
+<ul>
+<li>Simple to implement</li>
+<li>Ensures the node has the complete blockchain history</li>
+</ul>
+<p><strong>Cons:</strong></p>
+<ul>
+<li>Time-consuming process</li>
+<li>Can take 5-8 days, depending on available bandwidth</li>
+</ul>
+<h4 id="initial-data-set-installation">Initial Data Set Installation</h4>
+<p>To speed up the initial synchronization process, you have the option to seed Teranode from pre-existing data. To know more about this approach, please refer to the <a href="../../minersHowToSyncTheNode/">How to Sync the Node</a> guide.</p>
+<p>Pros:</p>
+<ul>
+<li>Significantly faster than full P2P download</li>
+<li>Allows for quicker node setup</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>Requires additional steps</li>
+<li>The data set must be validated, to ensure it has not been tampered with</li>
+</ul>
+<p>Where possible, BSV recommends using the Initial Data Set Installation approach.</p>
+<h3 id="teranode-installation-types">Teranode Installation Types</h3>
+<p>Teranode supports four installation methods:</p>
+<ul>
+<li>Pre-built Binaries</li>
+<li>Docker Container</li>
+<li>Docker Compose</li>
+<li>Kubernetes Operator</li>
+</ul>
+<p>Note: Only Docker Compose (testing) and Kubernetes Operator (production) are officially supported.</p>
+<h4 id="pre-built-binaries">Pre-built Binaries</h4>
+<ul>
+<li>Pre-built executables are available for both arm64 and amd64 architectures.</li>
+<li>This method provides the most flexibility but requires manual setup of dependencies.</li>
+<li>Suitable for users who need fine-grained control over their installation.</li>
+</ul>
+<h4 id="docker-container">Docker Container</h4>
+<ul>
+<li>A Docker image is published to a Docker registry, containing the Teranode binary and internal dependencies.</li>
+<li>This method offers a balance between ease of use and customization.</li>
+<li>Ideal for users familiar with Docker who want to integrate Teranode into existing container ecosystems.</li>
+</ul>
+<h4 id="docker-compose">Docker Compose</h4>
+<ul>
+<li>A Docker Compose file is provided to alpha testing miners.</li>
+<li>This method sets up a single-node Teranode instance along with all required external dependencies.</li>
+<li>
+<p>Components included:</p>
+<ul>
+<li>Teranode Docker image</li>
+<li>Kafka</li>
+<li>PostgreSQL</li>
+<li>Aerospike</li>
+<li>Grafana</li>
+<li>Prometheus</li>
+<li>Docker Shared Storage</li>
+</ul>
+</li>
+<li>
+<p>Advantages:</p>
+<ul>
+<li>Easiest method to get a full Teranode environment running quickly.</li>
+<li>Automatically manages start order and networking between components.</li>
+<li>Used by developers and QA for testing, ensuring reliability.</li>
+</ul>
+</li>
+<li>
+<p>Considerations:</p>
+<ul>
+<li>This setup uses predefined external dependencies, which may not be customizable.</li>
+<li>While convenient for development and testing, it is not optimized, nor intended, for production usage.</li>
+</ul>
+</li>
+</ul>
+<p>Note: The Docker Compose method is recommended for testing in single node environments as it provides a consistent environment that mirrors the development setup. However, for production deployments or specific performance requirements, users need to consider using the Kubernetes operator approach (separate document).</p>
+<h3 id="installing-teranode-with-docker-compose">Installing Teranode with Docker Compose</h3>
+<p><strong>Prerequisites</strong>:</p>
+<ul>
+<li>
+<p>Docker and Docker Compose installed on your system</p>
+</li>
+<li>
+<p>The Alpha testing Teranode docker compose file should have been checked out in your system (see the next section)</p>
+</li>
+<li>
+<p>Sufficient disk space (at least 100GB recommended)</p>
+</li>
+<li>
+<p>A stable internet connection</p>
+</li>
+</ul>
+<h4 id="step-1-create-repository">Step 1: Create Repository</h4>
+<h5 id="open-terminal">Open Terminal</h5>
+<p>Open a terminal or command prompt.</p>
+<h5 id="clone-repository">Clone Repository</h5>
+<p>Clone the Teranode repository:</p>
+<div class="highlight"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span><span class="nv">$YOUR_WORKING_DIR</span>
+git<span class="w"> </span>clone<span class="w"> </span>git@github.com:bsv-blockchain/teranode.git
+<span class="nb">cd</span><span class="w"> </span>teranode
+</code></pre></div>
+<h4 id="step-2-configure-environment-settings-context-optional">Step 2: Configure Environment Settings Context [Optional]</h4>
+<h5 id="create-environment-file">Create Environment File</h5>
+<p>Create a <code>.env</code> file in the root directory of the project.</p>
+<h5 id="set-context-optional">Set Context (Optional)</h5>
+<p>While not required (your docker compose file will be preconfigured), the following line can be used to set the context:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">SETTINGS_CONTEXT_1</span><span class="o">=</span>docker.m
+</code></pre></div>
+<h5 id="authenticate-with-aws-ecr">Authenticate with AWS ECR</h5>
+<p>Authenticate with AWS ECR (please check with your Teranode team for the latest credentials).</p>
+<p>This step is not mandatory, but useful if you want to create settings variants for specific contexts.</p>
+<h4 id="step-3-prepare-local-settings">Step 3: Prepare Local Settings</h4>
+<h5 id="review-settings-file">Review Settings File</h5>
+<p>You can see the current settings under the <code>$YOUR_WORKING_DIR/teranode/settings.conf</code> file. You can override any settings here.</p>
+<h5 id="settings-reference">Settings Reference</h5>
+<p>For a list of settings, and their default values, please refer to the reference at the end of this document.</p>
+<h4 id="step-4-pull-docker-images">Step 4: Pull Docker Images</h4>
+<h5 id="navigate-to-docker-compose-directory">Navigate to Docker Compose Directory</h5>
+<p>Go to either the testnet Docker compose folder:</p>
+<div class="highlight"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span><span class="nv">$YOUR_WORKING_DIR</span>/teranode/deploy/docker/testnet
+</code></pre></div>
+<p>Or to the mainnet Docker compose folder:</p>
+<div class="highlight"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span><span class="nv">$YOUR_WORKING_DIR</span>/teranode/deploy/docker/mainnet
+</code></pre></div>
+<h5 id="pull-docker-images">Pull Docker Images</h5>
+<p>Pull the required Docker images:</p>
+<div class="highlight"><pre><span></span><code>docker-compose<span class="w"> </span>pull
+</code></pre></div>
+<h4 id="step-5-start-the-teranode-stack">Step 5: Start the Teranode Stack</h4>
+<ol>
+<li>
+<p>When running on a box without a public IP, you should enable <code>legacy_config_Upnp</code> (in your settings file), so you don't get banned by the SV Nodes.</p>
+</li>
+<li>
+<p>Launch the entire Teranode stack using Docker Compose:</p>
+</li>
+</ol>
+<div class="highlight"><pre><span></span><code>docker-compose<span class="w"> </span>up<span class="w"> </span>-d
+</code></pre></div>
+<p>Force the node to transition to Run mode:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>blockchain<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>--fsmstate<span class="w"> </span>running
+</code></pre></div>
+<p>or LegacySync mode:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>blockchain<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>--fsmstate<span class="w"> </span>legacysyncing
+</code></pre></div>
+<p>You can verify the current state with:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>blockchain<span class="w"> </span>teranode-cli<span class="w"> </span>getfsmstate
+</code></pre></div>
+<h4 id="step-6-verify-services">Step 6: Verify Services</h4>
+<h5 id="check-service-status">Check Service Status</h5>
+<p>Check if all services are running correctly:</p>
+<div class="highlight"><pre><span></span><code>docker-compose<span class="w"> </span>ps
+</code></pre></div>
+<p>Example output:</p>
+<table>
+<thead>
+<tr>
+<th>NAME</th>
+<th>IMAGE</th>
+<th>COMMAND</th>
+<th>SERVICE</th>
+<th>CREATED</th>
+<th>STATUS</th>
+<th>PORTS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>aerospike</td>
+<td>aerospike:ce-7.1.0.6</td>
+<td><code>/usr/bin/as-tini-st…</code></td>
+<td>aerospike</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes</td>
+<td>0.0.0.0:3000-&gt;3000/tcp, :::3000-&gt;3000/tcp, 3001-3002/tcp</td>
+</tr>
+<tr>
+<td>aerospike-exporter</td>
+<td>aerospike/aerospike-prometheus-exporter:latest</td>
+<td><code>/docker-entrypoint.…</code></td>
+<td>aerospike-exporter</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes</td>
+<td>9145/tcp</td>
+</tr>
+<tr>
+<td>asset</td>
+<td>ghcr.io/bsv-blockchain/teranode:v0.5.50</td>
+<td><code>/app/entrypoint.sh …</code></td>
+<td>asset</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes (healthy)</td>
+<td>0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:8090-&gt;8090/tcp, :::8090-&gt;8090/tcp, 0.0.0.0:32796-&gt;4040/tcp, [::]:32796-&gt;4040/tcp, 0.0.0.0:32797-&gt;8000/tcp, [::]:32797-&gt;8000/tcp, 0.0.0.0:32798-&gt;8091/tcp, [::]:32798-&gt;8091/tcp, 0.0.0.0:32799-&gt;9091/tcp, [::]:32799-&gt;9091/tcp</td>
+</tr>
+<tr>
+<td>blockassembly</td>
+<td>ghcr.io/bsv-blockchain/teranode:v0.5.50</td>
+<td><code>/app/entrypoint.sh …</code></td>
+<td>blockassembly</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes (healthy)</td>
+<td>0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32768-&gt;4040/tcp, [::]:32768-&gt;4040/tcp, 0.0.0.0:32772-&gt;8000/tcp, [::]:32772-&gt;8000/tcp, 0.0.0.0:32774-&gt;8085/tcp, [::]:32774-&gt;8085/tcp, 0.0.0.0:32777-&gt;8285/tcp, [::]:32777-&gt;8285/tcp, 0.0.0.0:32779-&gt;9091/tcp, [::]:32779-&gt;9091/tcp</td>
+</tr>
+<tr>
+<td>blockchain</td>
+<td>ghcr.io/bsv-blockchain/teranode:v0.5.50</td>
+<td><code>/app/entrypoint.sh …</code></td>
+<td>blockchain</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes (healthy)</td>
+<td>0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32769-&gt;4040/tcp, [::]:32769-&gt;4040/tcp, 0.0.0.0:32771-&gt;8000/tcp, [::]:32771-&gt;8000/tcp, 0.0.0.0:32775-&gt;8082/tcp, [::]:32775-&gt;8082/tcp, 0.0.0.0:32776-&gt;8087/tcp, [::]:32776-&gt;8087/tcp, 0.0.0.0:32778-&gt;9091/tcp, [::]:32778-&gt;9091/tcp</td>
+</tr>
+<tr>
+<td>blockvalidation</td>
+<td>ghcr.io/bsv-blockchain/teranode:v0.5.50</td>
+<td><code>/app/entrypoint.sh …</code></td>
+<td>blockvalidation</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes (healthy)</td>
+<td>0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32781-&gt;4040/tcp, [::]:32781-&gt;4040/tcp, 0.0.0.0:32787-&gt;8000/tcp, [::]:32787-&gt;8000/tcp, 0.0.0.0:32788-&gt;8088/tcp, [::]:32788-&gt;8088/tcp, 0.0.0.0:32790-&gt;8188/tcp, [::]:32790-&gt;8188/tcp, 0.0.0.0:32792-&gt;9091/tcp, [::]:32792-&gt;9091/tcp</td>
+</tr>
+<tr>
+<td>grafana</td>
+<td>grafana/grafana:latest</td>
+<td><code>/run.sh</code></td>
+<td>grafana</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes</td>
+<td>0.0.0.0:3005-&gt;3000/tcp, [::]:3005-&gt;3000/tcp</td>
+</tr>
+<tr>
+<td>kafka-console-shared</td>
+<td>docker.redpanda.com/redpandadata/console:latest</td>
+<td><code>/bin/sh -c 'echo \"$…'</code></td>
+<td>kafka-console-shared</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes</td>
+<td>0.0.0.0:8080-&gt;8080/tcp, :::8080-&gt;8080/tcp</td>
+</tr>
+<tr>
+<td>kafka-shared</td>
+<td>vectorized/redpanda:latest</td>
+<td><code>/entrypoint.sh 'red…'</code></td>
+<td>kafka-shared</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes</td>
+<td>8082/tcp, 9644/tcp, 0.0.0.0:9092-9093-&gt;9092-9093/tcp, :::9092-9093-&gt;9092-9093/tcp, 0.0.0.0:32794-&gt;8081/tcp, [::]:32794-&gt;8081/tcp</td>
+</tr>
+<tr>
+<td>legacy</td>
+<td>ghcr.io/bsv-blockchain/teranode:v0.5.50</td>
+<td><code>/app/entrypoint.sh …</code></td>
+<td>legacy</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes</td>
+<td>0/tcp, 3005/tcp, 0.0.0.0:8333-&gt;8333/tcp, :::8333-&gt;8333/tcp, 9292/tcp, 0.0.0.0:18333-&gt;18333/tcp, :::18333-&gt;18333/tcp, 0.0.0.0:32782-&gt;4040/tcp, [::]:32782-&gt;4040/tcp, 0.0.0.0:32783-&gt;8000/tcp, [::]:32783-&gt;8000/tcp, 0.0.0.0:32784-&gt;8098/tcp, [::]:32784-&gt;8098/tcp, 0.0.0.0:32785-&gt;8099/tcp, [::]:32785-&gt;8099/tcp, 0.0.0.0:32786-&gt;9091/tcp, [::]:32786-&gt;9091/tcp</td>
+</tr>
+<tr>
+<td>postgres</td>
+<td>postgres:latest</td>
+<td><code>docker-entrypoint.s…</code></td>
+<td>postgres</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes (healthy)</td>
+<td>0.0.0.0:5432-&gt;5432/tcp, :::5432-&gt;5432/tcp</td>
+</tr>
+<tr>
+<td>prometheus</td>
+<td>prom/prometheus:v2.44.0</td>
+<td><code>/bin/prometheus --c…</code></td>
+<td>prometheus</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes</td>
+<td>0.0.0.0:9090-&gt;9090/tcp, :::9090-&gt;9090/tcp</td>
+</tr>
+<tr>
+<td>rpc</td>
+<td>ghcr.io/bsv-blockchain/teranode:v0.5.50</td>
+<td><code>/app/entrypoint.sh …</code></td>
+<td>rpc</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes</td>
+<td>0/tcp, 3005/tcp, 8098/tcp, 0.0.0.0:9292-&gt;9292/tcp, :::9292-&gt;9292/tcp, 0.0.0.0:32770-&gt;4040/tcp, [::]:32770-&gt;4040/tcp, 0.0.0.0:32773-&gt;8000/tcp, [::]:32773-&gt;8000/tcp, 0.0.0.0:32780-&gt;9091/tcp, [::]:32780-&gt;9091/tcp</td>
+</tr>
+<tr>
+<td>subtreevalidation</td>
+<td>ghcr.io/bsv-blockchain/teranode:v0.5.50</td>
+<td><code>/app/entrypoint.sh …</code></td>
+<td>subtreevalidation</td>
+<td>2 minutes ago</td>
+<td>Up 2 minutes (healthy)</td>
+<td>0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32789-&gt;4040/tcp, [::]:32789-&gt;4040/tcp, 0.0.0.0:32791-&gt;8000/tcp, [::]:32791-&gt;8000/tcp, 0.0.0.0:32793-&gt;8086/tcp, [::]:32793-&gt;8086/tcp, 0.0.0.0:32795-&gt;9091/tcp, [::]:32795-&gt;9091/tcp</td>
+</tr>
+</tbody>
+</table>
+<h5 id="verify-service-health">Verify Service Health</h5>
+<p>Ensure all services show a status of "Up" or "Healthy".</p>
+<h4 id="step-7-access-monitoring-tools">Step 7: Access Monitoring Tools</h4>
+<ol>
+<li>
+<p><strong>Grafana</strong>: Access the Grafana dashboard at <code>http://localhost:3005</code></p>
+<ul>
+<li>Default credentials are <code>admin/admin</code></li>
+<li>Navigate to the "Teranode - Service Overview" dashboard for key metrics</li>
+<li>Explore other dashboards for detailed service metrics. For example, you can check the Legacy sync metrics in the "Teranode - Legacy Service" dashboard.</li>
+</ul>
+</li>
+<li>
+<p><strong>Kafka Console</strong>: Available internally on port 8080</p>
+</li>
+<li>
+<p><strong>Prometheus</strong>: Available internally on port 9090</p>
+</li>
+<li>
+<p><strong>Teranode Blockchain Viewer</strong>: A basic blockchain viewer is available and can be accessed via the asset container. It provides an interface to browse blockchain data.</p>
+<ul>
+<li><strong>Port</strong>: Exposed on port <strong>8090</strong> of the asset container.</li>
+<li><strong>Access URL</strong>: <a href="http://localhost:8090/viewer">http://localhost:8090/viewer</a></li>
+</ul>
+</li>
+</ol>
+<p>Note: You must set the setting <code>dashboard_enabled</code> as true in order to see the viewer.</p>
+<h4 id="step-8-interact-with-teranode">Step 8: Interact with Teranode</h4>
+<ul>
+<li>
+<p>The various Teranode services expose different ports for interaction:</p>
+<ul>
+<li><strong>Blockchain service</strong>: Port 8082</li>
+<li><strong>Asset service</strong>: Ports 8090</li>
+<li><strong>Miner service</strong>: Ports 8089, 8092, 8099</li>
+<li><strong>P2P service</strong>: Ports 9905, 9906</li>
+<li><strong>RPC service</strong>: 9292</li>
+</ul>
+</li>
+</ul>
+<p>Notice that those ports might be mapped to random ports on your host machine. You can check the mapping by running <code>docker-compose ps</code>.</p>
+<h4 id="step-9-logging-and-troubleshooting">Step 9: Logging and Troubleshooting</h4>
+<h5 id="view-all-service-logs">View All Service Logs</h5>
+<p>View logs for all services:</p>
+<div class="highlight"><pre><span></span><code>docker-compose<span class="w"> </span>logs
+</code></pre></div>
+<h5 id="view-specific-service-logs">View Specific Service Logs</h5>
+<p>View logs for a specific service (e.g., teranode-blockchain):</p>
+<div class="highlight"><pre><span></span><code>docker-compose<span class="w"> </span>logs<span class="w"> </span>-f<span class="w"> </span>legacy
+docker-compose<span class="w"> </span>logs<span class="w"> </span>-f<span class="w"> </span>blockchain
+docker-compose<span class="w"> </span>logs<span class="w"> </span>-f<span class="w"> </span>asset
+</code></pre></div>
+<h4 id="step-10-docker-log-rotation">Step 10: Docker Log Rotation</h4>
+<p>Teranode is very verbose and will output a lot of information, especially with logLevel=DEBUG. To avoid running out of disk space, you can specify logging options directly in your docker-compose.yml file for each service.</p>
+<div class="highlight"><pre><span></span><code><span class="nt">services</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">[</span><span class="nv">servicename</span><span class="p p-Indicator">]:</span>
+<span class="w">    </span><span class="nt">logging</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">options</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">max-size</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;100m&quot;</span>
+<span class="w">        </span><span class="nt">max-file</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;3&quot;</span>
+</code></pre></div>
+<h4 id="step-11-stopping-the-stack">Step 11: Stopping the Stack</h4>
+<ol>
+<li>To stop all services:</li>
+</ol>
+<div class="highlight"><pre><span></span><code>docker-compose<span class="w"> </span>down
+</code></pre></div>
+<p>Additional Notes:</p>
+<ul>
+<li>The <code>data</code> directory (under <code>testnet</code> or <code>mainnet</code>) will contain persistent data. This includes blockchain data and other persistent storage required by the Teranode components. By default, Docker Compose is configured to mount these directories into the respective containers, ensuring that data persists across restarts and container recreation. Ensure regular backups.</li>
+<li>Under no circumstances should you use this Docker Compose approach for production usage.</li>
+<li>Please discuss with the Teranode support team for advanced configuration options and optimizations not covered in the present document.</li>
+</ul>
+<h2 id="optimizations">Optimizations</h2>
+<p>If you have local access to SV Nodes, you can use them to speed up the initial block synchronization too. You can set <code>legacy_connect_peers: "172.x.x.x:8333|10.x.x.x:8333"</code> in your <code>docker-compose.yml</code> to force the legacy service to only connect to those peers.</p>
+<h2 id="aerospike-operations-and-configuration">Aerospike Operations and Configuration</h2>
+<p>Teranode includes Aerospike 8.0 community edition for storing the UTXO set. The Aerospike database stores all indexes in memory and the data on disk.</p>
+<h3 id="aerospike-configuration">Aerospike Configuration</h3>
+<p>The default configuration is set to stop writing when 50% of the system memory has been consumed. To future proof, you might want to run a dedicated cluster, with more memory and disk space allocated.</p>
+<p>See <a href="https://github.com/bsv-blockchain/teranode-public/blob/master/docker/base/aerospike.conf">aerospike.conf / stop-writes-sys-memory-pct</a></p>
+<p>By default, the Aerospike data is written to a single mount mounted in the <code>aerospike</code> container. For performance reasons, it is recommended to use at least 4 dedicated disks for the Aerospike data.</p>
+<p>See <a href="https://github.com/bsv-blockchain/teranode-public/blob/master/docker/base/aerospike.conf">aerospike.conf / storage-engine</a></p>
+<h3 id="aerospike-administration">Aerospike Administration</h3>
+<p>You can access the Aerospike container and run administrative commands:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>aerospike<span class="w"> </span>/bin/bash
+
+<span class="c1"># Command for basic sanity checking</span>
+asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;info&quot;</span>
+asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;summary -l&quot;</span>
+</code></pre></div>
+<p>For more information about Aerospike, you can access the <a href="https://www.aerospike.com/docs">Aerospike documentation</a>.</p>
+<h2 id="docker-logs-management">Docker Logs Management</h2>
+<p>Teranode is very verbose and will output a lot of information, especially with <code>logLevel=DEBUG</code>. Make sure to setup log rotation for the containers to avoid running out of disk space.</p>
+<h3 id="system-wide-docker-log-configuration">System-wide Docker Log Configuration</h3>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;cat &lt;&lt;EOF &gt; /etc/docker/daemon.json</span>
+<span class="s1">{</span>
+<span class="s1">  &quot;log-driver&quot;: &quot;json-file&quot;,</span>
+<span class="s1">  &quot;log-opts&quot;: {</span>
+<span class="s1">    &quot;max-size&quot;: &quot;100m&quot;</span>
+<span class="s1">  }</span>
+<span class="s1">}</span>
+<span class="s1">EOF&#39;</span>
+sudo<span class="w"> </span>systemctl<span class="w"> </span>restart<span class="w"> </span>docker
+</code></pre></div>
+<h3 id="per-service-log-configuration">Per-Service Log Configuration</h3>
+<p>Alternatively, you can specify logging options directly in your docker-compose.yml file for each service:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">services</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">[</span><span class="nv">servicename</span><span class="p p-Indicator">]:</span>
+<span class="w">    </span><span class="nt">logging</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">driver</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;json-file&quot;</span>
+<span class="w">      </span><span class="nt">options</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">max-size</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;100m&quot;</span>
+<span class="w">        </span><span class="nt">max-file</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;3&quot;</span>
+</code></pre></div>
+<h2 id="teranode-network-architecture">Teranode Network Architecture</h2>
+<p>Teranode offers two network connectivity options:</p>
+<h3 id="svnode-p2p-network">SVNode P2P Network</h3>
+<ul>
+<li><strong>Description</strong>: All data transmitted over P2P connections (via <code>legacy</code> service)</li>
+<li><strong>Use Case</strong>: Traditional Bitcoin SV network connectivity</li>
+<li><strong>Characteristics</strong>: Compatible with existing SV Node infrastructure</li>
+</ul>
+<h3 id="teranode-p2p-network">Teranode P2P Network</h3>
+<ul>
+<li><strong>Description</strong>: Only small messages over P2P, with bulk data downloaded via HTTP(S) (via <code>peer</code> and <code>asset</code> services)</li>
+<li><strong>Use Case</strong>: Enhanced performance and stability</li>
+<li><strong>Characteristics</strong>: Significant performance advantages over traditional SV Node network</li>
+</ul>
+<h3 id="teranode-network-requirements">Teranode Network Requirements</h3>
+<p>To connect to the Teranode network, you'll need:</p>
+<ol>
+<li><strong>Public-facing <code>peer</code> service</strong> exposed via TCP (defaults to port 9905, P2P_PORT setting)</li>
+<li><strong>Public-facing <code>asset</code> service</strong> exposed via HTTP(S) (selective endpoint exposure recommended)</li>
+<li><strong>Valid SSL certificates</strong> if using HTTPS for the asset service</li>
+</ol>
+<h2 id="asset-service-setup">Asset Service Setup</h2>
+<p>The asset service provides HTTP access to blockchain data. For production deployments, you should configure proper caching and security.</p>
+<h3 id="basic-asset-service-configuration">Basic Asset Service Configuration</h3>
+<p>Update your configuration with your publicly accessible endpoints:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">asset_httpPublicAddress</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>https://teranode-1-asset-cache.example.com/api/v1
+<span class="nv">peer_p2pPublicAddress</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>/ip4/1.2.3.4/tcp/9905
+</code></pre></div>
+<h3 id="asset-service-with-nginx-caching">Asset Service with Nginx Caching</h3>
+<p>For the <code>asset</code> service, we have provided an <code>asset-cache</code> example using nginx to limit endpoints and provide a caching mechanism. This improves performance and provides better security by exposing only necessary endpoints.</p>
+<h3 id="asset-service-viewer">Asset Service Viewer</h3>
+<p>The asset service includes a web-based viewer for blockchain data:</p>
+<ul>
+<li><strong>Port</strong>: Exposed on <strong>port 8090</strong> of the asset container</li>
+<li><strong>Access URL</strong>: <code>http://localhost:8090/viewer</code></li>
+</ul>
+<h2 id="rpc-interface">RPC Interface</h2>
+<p>A SVNode compatible RPC interface is available for interacting with Teranode programmatically.</p>
+<h3 id="rpc-configuration">RPC Configuration</h3>
+<ul>
+<li><strong>Port</strong>: 9292</li>
+<li><strong>Default Credentials</strong>: <code>bitcoin:bitcoin</code></li>
+<li><strong>Protocol</strong>: JSON-RPC over HTTP</li>
+</ul>
+<h3 id="rpc-usage-example">RPC Usage Example</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>--user<span class="w"> </span>bitcoin:bitcoin<span class="w"> </span>--data-binary<span class="w"> </span><span class="s1">&#39;{&quot;jsonrpc&quot;:&quot;1.0&quot;,&quot;id&quot;:&quot;curltext&quot;,&quot;method&quot;:&quot;version&quot;,&quot;params&quot;:[]}&#39;</span><span class="w"> </span>-H<span class="w"> </span><span class="s1">&#39;content-type: text/plain;&#39;</span><span class="w"> </span>http://localhost:9292/
+</code></pre></div>
+<blockquote>
+<p><strong>Note</strong>: Most methods have not been implemented yet. The RPC interface is primarily for compatibility and basic operations.</p>
+</blockquote>
+<h2 id="teranode-cli-command-reference">teranode-cli Command Reference</h2>
+<p>The <code>teranode-cli</code> is a command-line tool that can be used to interact with the Teranode services. It is available in all containers.</p>
+<h3 id="accessing-teranode-cli">Accessing teranode-cli</h3>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>blockchain<span class="w"> </span>teranode-cli
+</code></pre></div>
+<h3 id="available-commands">Available Commands</h3>
+<p>Running <code>teranode-cli</code> without arguments will show a list of all available commands:</p>
+<div class="highlight"><pre><span></span><code>Usage:<span class="w"> </span>teranode-cli<span class="w"> </span>&lt;command&gt;<span class="w"> </span><span class="o">[</span>options<span class="o">]</span>
+
+Available<span class="w"> </span>Commands:
+<span class="w">  </span>aerospikereader<span class="w">      </span>Aerospike<span class="w"> </span>Reader
+<span class="w">  </span>checkblocktemplate<span class="w">   </span>Check<span class="w"> </span>block<span class="w"> </span>template
+<span class="w">  </span>export-blocks<span class="w">        </span>Export<span class="w"> </span>blockchain<span class="w"> </span>to<span class="w"> </span>CSV
+<span class="w">  </span>filereader<span class="w">           </span>File<span class="w"> </span>Reader
+<span class="w">  </span>getfsmstate<span class="w">          </span>Get<span class="w"> </span>the<span class="w"> </span>current<span class="w"> </span>FSM<span class="w"> </span>State
+<span class="w">  </span>import-blocks<span class="w">        </span>Import<span class="w"> </span>blockchain<span class="w"> </span>from<span class="w"> </span>CSV
+<span class="w">  </span>seeder<span class="w">               </span>Seeder
+<span class="w">  </span>setfsmstate<span class="w">          </span>Set<span class="w"> </span>the<span class="w"> </span>FSM<span class="w"> </span>State
+<span class="w">  </span>settings<span class="w">             </span>Settings
+
+Use<span class="w"> </span><span class="s1">&#39;teranode-cli &lt;command&gt; --help&#39;</span><span class="w"> </span><span class="k">for</span><span class="w"> </span>more<span class="w"> </span>information<span class="w"> </span>about<span class="w"> </span>a<span class="w"> </span><span class="nb">command</span>
+</code></pre></div>
+<h3 id="common-cli-operations">Common CLI Operations</h3>
+<p><strong>Check FSM State</strong>:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>blockchain<span class="w"> </span>teranode-cli<span class="w"> </span>getfsmstate
+</code></pre></div>
+<p><strong>Set FSM State to Legacy Syncing</strong>:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>blockchain<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>--fsmstate<span class="w"> </span>LEGACYSYNCING
+</code></pre></div>
+<p><strong>Set FSM State to Running</strong>:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>blockchain<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>--fsmstate<span class="w"> </span>RUNNING
+</code></pre></div>
+<h2 id="teranode-reset-procedures">Teranode Reset Procedures</h2>
+<p>If you require to sync a Teranode from scratch, you will need to clean-up data from Aerospike, Postgres, and your filesystem.</p>
+<h3 id="1-aerospike-clean-up">1. Aerospike Clean-up</h3>
+<p>See the <a href="https://aerospike.com/docs/server/operations/manage/sets#truncating-a-set-in-a-namespace">Aerospike documentation</a> for more information.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Access Aerospike container</span>
+docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>aerospike<span class="w"> </span>/bin/bash
+
+<span class="c1"># Truncate the UTXO set</span>
+asadm<span class="w"> </span>--enable<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;manage truncate ns utxo-store set utxo&quot;</span>
+
+<span class="c1"># Verify the total records count, should slowly decrease to 0</span>
+asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;info&quot;</span>
+</code></pre></div>
+<h3 id="2-postgres-clean-up">2. Postgres Clean-up</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Access Postgres container</span>
+docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>postgres<span class="w"> </span>psql<span class="w"> </span>-U<span class="w"> </span>postgres
+
+<span class="c1"># Connect to the database used by Teranode</span>
+<span class="nv">postgres</span><span class="o">=</span>&gt;<span class="w"> </span><span class="se">\c</span><span class="w"> </span>&lt;db_name&gt;
+
+<span class="c1"># Sanity count check</span>
+<span class="nv">teranode_mainnet</span><span class="o">=</span>&gt;<span class="w"> </span>SELECT<span class="w"> </span>COUNT<span class="o">(</span>*<span class="o">)</span><span class="w"> </span>FROM<span class="w"> </span>blocks<span class="p">;</span>
+<span class="w"> </span>count
+--------
+<span class="w"> </span><span class="m">123123</span>
+<span class="o">(</span><span class="m">1</span><span class="w"> </span>row<span class="o">)</span>
+
+<span class="c1"># Truncate the blocks and state tables</span>
+TRUNCATE<span class="w"> </span>TABLE<span class="w"> </span>blocks<span class="w"> </span>RESTART<span class="w"> </span>IDENTITY<span class="w"> </span>CASCADE<span class="p">;</span>
+TRUNCATE<span class="w"> </span>TABLE<span class="w"> </span>state<span class="w"> </span>RESTART<span class="w"> </span>IDENTITY<span class="w"> </span>CASCADE<span class="p">;</span>
+TRUNCATE<span class="w"> </span>TABLE<span class="w"> </span>bans<span class="w"> </span>RESTART<span class="w"> </span>IDENTITY<span class="w"> </span>CASCADE<span class="p">;</span>
+TRUNCATE<span class="w"> </span>TABLE<span class="w"> </span>alert_system_alert_messages<span class="w"> </span>RESTART<span class="w"> </span>IDENTITY<span class="w"> </span>CASCADE<span class="p">;</span>
+TRUNCATE<span class="w"> </span>TABLE<span class="w"> </span>alert_system_public_keys<span class="w"> </span>RESTART<span class="w"> </span>IDENTITY<span class="w"> </span>CASCADE<span class="p">;</span>
+
+<span class="c1"># Verify the table was truncated</span>
+SELECT<span class="w"> </span>COUNT<span class="o">(</span>*<span class="o">)</span><span class="w"> </span>FROM<span class="w"> </span>blocks<span class="p">;</span>
+<span class="w"> </span>count
+-------
+<span class="w">     </span><span class="m">0</span>
+<span class="o">(</span><span class="m">1</span><span class="w"> </span>row<span class="o">)</span>
+
+<span class="c1"># Dropping these indexes will significantly speed up seeding</span>
+<span class="c1"># The blockchain service will re-create them</span>
+DROP<span class="w"> </span>INDEX<span class="w"> </span>idx_chain_work_id<span class="p">;</span>
+DROP<span class="w"> </span>INDEX<span class="w"> </span>idx_chain_work_peer_id<span class="p">;</span>
+</code></pre></div>
+<h3 id="3-filesystem-clean-up">3. Filesystem Clean-up</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Define your data mount point</span>
+<span class="nv">DATA_MOUNT_POINT</span><span class="o">=</span>/mnt/teranode
+sudo<span class="w"> </span>rm<span class="w"> </span>-rf<span class="w"> </span><span class="nv">$DATA_MOUNT_POINT</span>/*
+
+<span class="c1"># Or for Docker Compose setup</span>
+sudo<span class="w"> </span>rm<span class="w"> </span>-rf<span class="w"> </span>~/teranode-public/docker/testnet/data/*
+sudo<span class="w"> </span>rm<span class="w"> </span>-rf<span class="w"> </span>~/teranode-public/docker/mainnet/data/*
+</code></pre></div>
+<h2 id="teranode-seeding">Teranode Seeding</h2>
+<p>If you have access to an SV Node, you can speed up the Initial Block Download (IBD) by seeding the Teranode with an export from SV Node. Only run this on a gracefully shut down SV Node instance (e.g., after using the RPC <code>stop</code> method).</p>
+<h3 id="step-1-export-from-sv-node">Step 1: Export from SV Node</h3>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span>/mnt/teranode/seed:/mnt/teranode/seed<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--entrypoint<span class="o">=</span><span class="s2">&quot;&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="m">434394763103</span>.dkr.ecr.eu-north-1.amazonaws.com/teranode-public:v0.8.12<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>/app/teranode-cli<span class="w"> </span>bitcointoutxoset<span class="w"> </span>-bitcoinDir<span class="o">=</span>/home/ubuntu/bitcoin-data<span class="w"> </span>-outputDir<span class="o">=</span>/mnt/teranode/seed/export
+</code></pre></div>
+<p>This script assumes your <code>bitcoin-data</code> directory is located in <code>/home/ubuntu/bitcoin-data</code> and contains the <code>blocks</code> and <code>chainstate</code> directories. It will generate <code>${blockhash}.utxo-headers</code> and <code>${blockhash}.utxo-set</code> files.</p>
+<blockquote>
+<p><strong>Note</strong>: If you get a <code>Block hash mismatch between last block and chainstate</code> error message, you should try starting and stopping the SV Node again, it means there are still a few unprocessed blocks.</p>
+</blockquote>
+<h3 id="step-2-seed-teranode">Step 2: Seed Teranode</h3>
+<p>Once you have the export, you can seed any fresh Teranode with the following command:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-e<span class="w"> </span><span class="nv">SETTINGS_CONTEXT</span><span class="o">=</span>docker.m<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span><span class="si">${</span><span class="nv">teranode</span><span class="p">-location</span><span class="si">}</span>/docker/base/settings_local.conf:/app/settings_local.conf<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span><span class="si">${</span><span class="nv">teranode</span><span class="p">-location</span><span class="si">}</span>/docker/mainnet/data/teranode:/app/data<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span>/mnt/teranode/seed:/mnt/teranode/seed<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--network<span class="w"> </span>my-teranode-network<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--entrypoint<span class="o">=</span><span class="s2">&quot;&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="m">434394763103</span>.dkr.ecr.eu-north-1.amazonaws.com/teranode-public:v0.8.12<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>/app/teranode-cli<span class="w"> </span>seeder<span class="w"> </span>-inputDir<span class="w"> </span>/mnt/teranode/seed<span class="w"> </span>-hash<span class="w"> </span>0000000000013b8ab2cd513b0261a14096412195a72a0c4827d229dcc7e0f7af
+</code></pre></div>
+<h3 id="step-3-complete-seeding-process">Step 3: Complete Seeding Process</h3>
+<p>For Docker Compose setup, use the following instructions:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Stop all services</span>
+docker<span class="w"> </span>compose<span class="w"> </span>down
+
+<span class="c1"># Clear out the postgres, aerospike and external data</span>
+sudo<span class="w"> </span>rm<span class="w"> </span>-rf<span class="w"> </span>~/teranode-public/docker/testnet/data/*
+
+<span class="c1"># Bring up the dependent services</span>
+<span class="c1"># Blockchain service will insert the correct genesis block for your selected network</span>
+docker<span class="w"> </span>compose<span class="w"> </span>up<span class="w"> </span>-d<span class="w"> </span>aerospike<span class="w"> </span>postgres<span class="w"> </span>kafka-shared<span class="w"> </span>blockchain
+
+<span class="c1"># Wait to make sure genesis block gets inserted</span>
+<span class="c1"># You will see it in the blockchain logs as `genesis block inserted`</span>
+docker<span class="w"> </span>compose<span class="w"> </span>logs<span class="w"> </span>-f<span class="w"> </span>-n<span class="w"> </span><span class="m">100</span><span class="w"> </span>blockchain
+
+<span class="c1"># Run the seeder (see command above)</span>
+docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span>...
+
+<span class="c1"># Bring down blockchain to reset the internal caches</span>
+docker<span class="w"> </span>compose<span class="w"> </span>down<span class="w"> </span>blockchain
+
+<span class="c1"># Bring all other services back online</span>
+docker<span class="w"> </span>compose<span class="w"> </span>up<span class="w"> </span>-d
+
+<span class="c1"># Transition Teranode to LEGACYSYNCING</span>
+docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>blockchain<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>--fsmstate<span class="w"> </span>LEGACYSYNCING
+</code></pre></div>
+<h2 id="cpu-mining">CPU Mining</h2>
+<p>For CPU mining setup with Teranode, please refer to the dedicated guide:</p>
+<ul>
+<li><strong><a href="../../minersHowToCPUMiner/">CPU Mining Guide</a></strong> - Complete setup instructions for CPU mining with Teranode</li>
+</ul>
+<p>This guide covers the BSV CPU miner configuration, parameters, troubleshooting, and usage examples.</p>
+<blockquote>
+<p><strong>Note</strong>: The example address used here is a testnet address, linked to the <a href="https://bsvfaucet.org/">BSV Faucet</a>. For mainnet mining, use a valid mainnet address.</p>
+</blockquote>
+<h2 id="advanced-configuration-examples">Advanced Configuration Examples</h2>
+<h3 id="private-network-configuration">Private Network Configuration</h3>
+<p>When running on a box without a public IP, you should enable <code>legacy_config_Upnp</code> in your settings file to avoid getting banned by the SV Nodes:</p>
+<div class="highlight"><pre><span></span><code>legacy_config_Upnp = true
+</code></pre></div>
+<h3 id="peer-connection-optimization">Peer Connection Optimization</h3>
+<p>If you have local access to SV Nodes, that will speed up the IBD. You can set specific peer connections in your docker-compose.yml:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">environment</span><span class="p">:</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">legacy_config_ConnectPeers=172.x.x.x:8333|10.x.x.x:8333</span>
+</code></pre></div>
+<h3 id="settings-override-examples">Settings Override Examples</h3>
+<p>You can override any setting using environment variables in your docker-compose.yml. See the <code>x-teranode-settings</code> section for examples:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">x-teranode-settings</span><span class="p">:</span><span class="w"> </span><span class="nl">&amp;teranode-settings</span>
+<span class="w">  </span><span class="nt">SETTINGS_CONTEXT</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">docker.m</span>
+<span class="w">  </span><span class="c1"># Override specific settings</span>
+<span class="w">  </span><span class="nt">logLevel</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">DEBUG</span>
+<span class="w">  </span><span class="nt">legacy_config_Upnp</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;true&quot;</span>
+<span class="w">  </span><span class="nt">asset_httpPublicAddress</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;https://your-domain.com/api/v1&quot;</span>
+</code></pre></div>
+<h3 id="network-specific-settings">Network-Specific Settings</h3>
+<p><strong>Testnet Configuration</strong>:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">environment</span><span class="p">:</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">SETTINGS_CONTEXT=docker.t</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">legacy_config_TestNet=true</span>
+</code></pre></div>
+<p><strong>Mainnet Configuration</strong>:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">environment</span><span class="p">:</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">SETTINGS_CONTEXT=docker.m</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">legacy_config_TestNet=false</span>
+</code></pre></div>
+<h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="common-issues-and-solutions">Common Issues and Solutions</h3>
+<p><strong>Issue</strong>: Container fails to start with permission errors
+<strong>Solution</strong>: Ensure proper file permissions on data directories:</p>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>chown<span class="w"> </span>-R<span class="w"> </span><span class="m">1000</span>:1000<span class="w"> </span>./data/
+</code></pre></div>
+<p><strong>Issue</strong>: Aerospike stops writing due to memory limits
+<strong>Solution</strong>: Increase system memory or adjust <code>stop-writes-sys-memory-pct</code> in aerospike.conf</p>
+<p><strong>Issue</strong>: Postgres connection errors
+<strong>Solution</strong>: Check database initialization and ensure proper network connectivity between containers</p>
+<p><strong>Issue</strong>: Slow synchronization
+<strong>Solution</strong>:</p>
+<ul>
+<li>Use seeding process for faster initial sync</li>
+<li>Configure specific peer connections for better connectivity</li>
+<li>Ensure adequate system resources (CPU, memory, disk I/O)</li>
+</ul>
+<h3 id="log-analysis">Log Analysis</h3>
+<p>Monitor service logs for troubleshooting:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Follow logs for all containers</span>
+docker<span class="w"> </span>compose<span class="w"> </span>logs<span class="w"> </span>-f<span class="w"> </span>-n<span class="w"> </span><span class="m">100</span>
+
+<span class="c1"># Follow logs for specific container</span>
+docker<span class="w"> </span>logs<span class="w"> </span>-f<span class="w"> </span>legacy<span class="w"> </span>-n<span class="w"> </span><span class="m">100</span>
+
+<span class="c1"># Check container health status</span>
+docker<span class="w"> </span>ps<span class="w"> </span>--format<span class="w"> </span><span class="s2">&quot;table {{.Names}}\t{{.Status}}\t{{.Ports}}&quot;</span>
+</code></pre></div>
+<h2 id="settings-reference_1">Settings Reference</h2>
+<p>You can find the pre-configured <a href="https://github.com/bsv-blockchain/teranode/blob/main/settings.conf">settings file</a>. You can refer to this document in order to identify the current system behaviour and in order to override desired settings in your <code>settings_local.conf</code>.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright © 2025 BSV Blockchain Org.
+    </div>
+  
+  
+</div>
+      
+        <div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/bitcoin-sv/teranode" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.7.2 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2024 Fonticons, Inc.--><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8M97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    <script id="__config" type="application/json">{"base": "../../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../../assets/javascripts/workers/search.f8cc74c7.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../../../../assets/javascripts/bundle.c8b220af.min.js"></script>
+      
+        <script src="../../../../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -1,0 +1,57 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+actor "UI User" as UI_USER
+participant "UI Dashboard" as UI
+participant "AssetService (HTTP)" as AssetService
+participant "UTXO Store" as UTXOStore
+database "DataStore" as Datastore
+
+UI_USER -> UI: Request to View UTXO Data
+activate UI
+
+UI -> AssetService: Request UTXO Data
+activate AssetService
+
+AssetService -> UTXOStore: Get()
+activate UTXOStore
+
+UTXOStore -> Datastore: Fetch UTXO Data
+activate Datastore
+Datastore --> UTXOStore: UTXO Data
+deactivate Datastore
+
+UTXOStore --> AssetService: UTXO Data
+deactivate UTXOStore
+
+
+AssetService --> UI: Response with UTXO Data
+deactivate AssetService
+
+UI --> UI_USER: UTXO Data Loaded
+
+deactivate UI
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

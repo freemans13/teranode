@@ -1,0 +1,73 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+
+participant "Node 1" as Node1
+queue "PubSub System" as PubSub
+participant "Node 2" as Node2
+queue "Notification Channel" as notificationChannel
+queue "Kafka" as Kafka
+participant "Block Validator" as BlockValidationClient
+participant "Subtree Validator" as SubtreeValidationClient
+
+=== New Block Notification ===
+Node1 -> Node1: blockchainSubscriptionListener(ctx)
+alt notification.Type == model.NotificationType_Block
+    Node1 -> PubSub: s.topics[blockTopicName].Publish(ctx, blockMessageBytes)
+end
+
+PubSub -> Node2: s.topics[blockTopicName]
+activate Node2
+Node2 -> Node2: handleBlockTopic(ctx)
+Node2 --> Kafka: Send block over kafka_blocksConfig topic  (hash, blockMessage.DataHubUrl)
+Kafka -> BlockValidationClient: Consume block from kafka_blocksConfig topic
+deactivate Node2
+
+=== New Mined Block Notification ===
+Node1 -> Node1: blockchainSubscriptionListener(ctx)
+alt notification.Type == model.NotificationType_MiningOn
+    Node1 -> PubSub: s.topics[miningOnTopicName].Publish(ctx, miningOnMessageBytes)
+end
+
+PubSub -> Node2: s.topics[miningOnTopicName]
+activate Node2
+Node2 -> Node2: handleMiningOnTopic(ctx)
+Node2 -> notificationChannel: notify miningOnMessage to s.notificationCh
+deactivate Node2
+
+=== New Subtree Notification ===
+Node1 -> Node1: blockchainSubscriptionListener(ctx)
+alt notification.Type == model.NotificationType_Subtree
+    Node1 -> PubSub: s.topics[subtreeTopicName].Publish(ctx, subtreeMessageBytes)
+end
+
+PubSub -> Node2: s.topics[subtreeTopicName]
+activate Node2
+Node2 -> Node2: handleSubtreeTopic(ctx)
+Node2 -> Kafka: Send subtree over kafka_subtreesConfig topic (hash, subtreeMessage.DataHubUrl)
+Node2 -> notificationChannel: notify subtreeMessage to s.notificationCh
+deactivate Node2
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

@@ -1,0 +1,72 @@
+@startuml overview
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+actor TxBlaster
+actor Propagation
+database txStore
+actor Validator
+database txMetaStore
+actor BlockAssembler
+participant SubtreeProcessor
+database utxoStore
+database subtreeStore
+Actor Blockchain
+database blockchainStore
+actor Miner
+
+TxBlaster -[#blue]> Propagation : grpc:ProcessTransaction(tx)
+Propagation -[#red]-> txStore: storeTransaction
+Propagation -[#blue]> Validator: grpc:ValidateTransaction(tx)
+
+Validator -[#red]-> utxoStore: Spend
+Validator -[#red]-> txMetaStore: Create
+Validator -[#red]-> txMetaStore: (if-duplicate) Delete
+Validator -[#blue]> BlockAssembler: grpc:AddTx(tx)
+
+BlockAssembler -> SubtreeProcessor: Add(tx)
+SubtreeProcessor -[#red]> utxoStore: Store
+SubtreeProcessor -> SubtreeProcessor : addNode
+SubtreeProcessor -> SubtreeProcessor : newSubtreeChan
+SubtreeProcessor -[#red]-> subtreeStore : Set
+
+
+
+Miner -[#blue]> BlockAssembler : grpc:getMiningCandidate()
+Miner -> Miner : randomDelay()
+Miner -[#blue]> BlockAssembler : grpc:SubmitMiningSolution(solution))
+
+BlockAssembler -[#red]-> txMetaStore: setMined
+BlockAssembler -[#blue]> Blockchain : grpc:AddBlock(block)
+BlockAssembler -[#red]-> txStore : Set(coinbase tx)
+BlockAssembler -[#red]-> subtreeStore : SetTTL(hash) (expire subtrees that have been mined)
+Blockchain -[#red]-> blockchainStore : StoreBlock
+Blockchain -[#blue]> BlockAssembler : grpc:SendNotification(block)
+BlockAssembler -[#blue]> Blockchain : grpc:GetBestBlockHeader()
+BlockAssembler -> BlockAssembler : (if-new-block)
+BlockAssembler -[#blue]> Blockchain : grpc:GetBlock(hash)
+BlockAssembler -[#blue]> SubtreeProcessor : grpc:MoveForwardBlock(block)
+BlockAssembler -[#blue]> Blockchain : grpc:SetState(block)
+Blockchain -[#red]-> blockchainStore : SetState(block)
+
+
+@enduml

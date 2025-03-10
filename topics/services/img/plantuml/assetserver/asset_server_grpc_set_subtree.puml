@@ -1,0 +1,74 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Block Assembly Server\n(services/blockassembly/Server.go)" as BlockAssemblyServer
+participant "Remote TTL\n(services/blockassembly/remotettl.go)" as RemoteTTL
+participant "Asset Client\n(asset/Client.go)" as AssetClient
+participant "Asset Server\n(asset/Server.go)" as AssetServer
+database "Blob Subtree Store" as BlobStore
+
+== New Subtree Scenario ==
+BlockAssemblyServer -> RemoteTTL : Set(ctx, subtree)
+activate RemoteTTL
+RemoteTTL -> AssetClient : set(ctx, subtree)
+activate AssetClient
+AssetClient -> AssetServer : Set(ctx, subtree)
+activate AssetServer
+AssetServer -> BlobStore : Set(ctx, subtree)
+activate BlobStore
+BlobStore --> AssetServer
+deactivate BlobStore
+AssetServer --> AssetClient
+deactivate AssetServer
+AssetClient --> RemoteTTL
+deactivate AssetClient
+RemoteTTL --> BlockAssemblyServer
+deactivate RemoteTTL
+
+== Clear Subtree DAH Scenario ==
+BlockAssemblyServer -> BlockAssemblyServer : submitMiningSolution(ctx, block)
+activate BlockAssemblyServer
+BlockAssemblyServer -> BlockAssemblyServer : removeSubtreesDAH(ctx, Block)
+loop For Each Subtree in the Block
+    BlockAssemblyServer -> RemoteTTL : SetDAH(ctx, dah)
+    activate RemoteTTL
+    RemoteTTL -> AssetClient : SetDAH(ctx, dah)
+    activate AssetClient
+    AssetClient -> AssetServer : SetDAH(ctx, dah)
+    activate AssetServer
+    AssetServer -> BlobStore : SetDAH(ctx, dah)
+    activate BlobStore
+    BlobStore --> AssetServer
+    deactivate BlobStore
+    AssetServer --> AssetClient
+    deactivate AssetServer
+    AssetClient --> RemoteTTL
+    deactivate AssetClient
+    RemoteTTL --> BlockAssemblyServer
+    deactivate RemoteTTL
+end
+deactivate BlockAssemblyServer
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

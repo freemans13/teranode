@@ -1,0 +1,81 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Block Validation\n(BlockValidation.go)" as BV
+participant "Subtree Validation Client" as SVC
+participant "Subtree Validation Server" as SVS
+participant "Validator" as Validator
+database "Subtree Store" as SubtreeStore
+database "UTXO Store" as UTXOStore
+participant "Remote Asset Server" as RemoteServer
+
+BV -> BV: validateBlockSubtrees(ctx, block, baseUrl)
+activate BV
+
+loop for each subtree in the block
+    BV -> SVC: CheckSubtreeFromBlock(ctx, subtreeHash, baseURL, blockHeight, blockHash)
+    activate SVC
+    SVC -> SVS: CheckSubtreeFromBlock(ctx, request)
+    deactivate SVC
+    activate SVS
+
+    SVS -> SVS: checkSubtree(ctx, request)
+    activate SVS
+
+    SVS -> SVS: Attempt to obtain lock for Subtree
+
+    alt if lock obtained and subtree doesn't exist
+        SVS -> RemoteServer: Get subtree data (if not legacy)
+        RemoteServer --> SVS: Subtree data
+
+        SVS -> Validator: ValidateSubtreeInternal(ctx, v, blockHeight)
+        activate Validator
+
+        Validator -> UTXOStore: Process tx metadata
+        UTXOStore --> Validator: Tx metadata
+
+        alt if missing transactions
+            Validator -> RemoteServer: Get missing transactions
+            RemoteServer --> Validator: Missing transactions
+            Validator -> Validator: Process missing transactions
+        end
+
+        Validator -> Validator: Create and populate subtree
+        Validator -> SubtreeStore: Store subtree and metadata
+        SubtreeStore --> Validator: Storage confirmation
+
+        Validator --> SVS: Validation result
+        deactivate Validator
+    else if subtree already exists
+        SVS -> SVS: Return existing subtree status
+    end
+
+    deactivate SVS
+    SVS --> SVC: CheckSubtreeFromBlockResponse
+    SVC --> BV: Validation result
+end
+
+deactivate BV
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+@enduml

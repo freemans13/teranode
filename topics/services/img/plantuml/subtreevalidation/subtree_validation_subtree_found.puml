@@ -1,0 +1,62 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "P2P" as P2P
+participant "Kafka" as Kafka
+participant "Subtree Validation Server" as SVS
+participant "Validator" as Validator
+database "Subtree Store" as SubtreeStore
+
+P2P -> P2P: handleSubtreeTopic(msg)
+activate P2P
+P2P -> Kafka: Publish KafkaSubtreeTopicMessage
+deactivate P2P
+
+Kafka -> SVS: subtreesHandler() consumes message
+activate SVS
+
+SVS -> SubtreeStore: subtreeStore.Exists(spanCtx, subtreeHash[:])
+activate SubtreeStore
+SubtreeStore --> SVS: subtreeExists / err
+deactivate SubtreeStore
+
+alt Subtree doesn't exist
+    SVS -> SVS: Obtain a lock on the Subtree
+
+    SVS -> Validator: ValidateSubtreeInternal(ctx, validateSubtreeMessage)
+    activate Validator
+    Validator --> SVS: Validation result
+    deactivate Validator
+
+    alt Invalid subtree
+        SVS -> Kafka: Publish KafkaInvalidSubtreeTopicMessage
+        Kafka -> P2P: invalidSubtreeHandler() consumes
+        P2P -> P2P: Ban peer that sent invalid subtree
+    end
+end
+
+deactivate SVS
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

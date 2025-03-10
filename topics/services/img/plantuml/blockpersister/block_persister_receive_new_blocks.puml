@@ -1,0 +1,61 @@
+@startuml block_persister_process_blocks
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Block Persister Service" as BlockPersister
+participant "Blockchain Service" as Blockchain
+participant "State Management" as State
+database "File Storage" as FileStorage
+
+loop Processing Loop
+    BlockPersister -> State: Get Last Persisted Height
+    State --> BlockPersister: Last Height
+
+    BlockPersister -> Blockchain: Get Best Block Header
+    Blockchain --> BlockPersister: Best Block Meta
+
+    alt Need to Process Next Block
+        BlockPersister -> Blockchain: Get Block at Height+1
+        Blockchain --> BlockPersister: Block Data
+
+        BlockPersister -> BlockPersister: Get Block Bytes
+        BlockPersister -> BlockPersister: Persist Block
+
+        BlockPersister -> FileStorage: Store Block File (.block)
+
+        loop for each Subtree in the Block
+            BlockPersister -> FileStorage: Read Subtree File (.subtree)
+            BlockPersister -> BlockPersister: Process Subtree
+            BlockPersister -> FileStorage: Write Subtree Data File (.subtreeData)
+            BlockPersister -> FileStorage: Update Subtree DAH (Delete-At-Height)
+        end
+
+        BlockPersister -> FileStorage: Store UTXO Files\n(.utxo-additions, .utxo-deletions)
+
+        BlockPersister -> State: Update Last Persisted Height
+    else No New Blocks
+        BlockPersister -> BlockPersister: Sleep for Configured Duration
+    end
+end
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+@enduml

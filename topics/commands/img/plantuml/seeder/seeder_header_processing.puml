@@ -1,0 +1,55 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+title Seeder Header Processing
+
+participant "Seeder" as Seeder
+participant "BlockchainStore" as BlockStore
+participant "File" as File
+participant "UTXOPersister" as UTPersister
+
+activate Seeder
+
+Seeder -> BlockStore: Initialize
+Seeder -> File: Open headers file
+Seeder -> UTPersister: GetHeaderFromReader()
+UTPersister --> Seeder: Magic number
+
+loop for each header
+    Seeder -> UTPersister: NewUTXOHeaderFromReader()
+    UTPersister --> Seeder: UTXO Header
+
+    Seeder -> Seeder: Create model.Block
+    Seeder -> BlockStore: StoreBlock()
+    BlockStore --> Seeder: Block stored
+
+    Seeder -> Seeder: Update processing stats
+end
+
+Seeder -> Seeder: Log processing summary
+
+deactivate Seeder
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

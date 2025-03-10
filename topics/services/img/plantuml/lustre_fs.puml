@@ -1,0 +1,52 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+!define RECTANGLE class
+
+RECTANGLE BlockAssembly {
+  <color:grey><i><size:10>This will push subtree</size></i></color>
+  <color:grey><i><size:10>to the shared filesystem
+}
+
+RECTANGLE BlockValidation {
+}
+
+RECTANGLE SubtreetValidation {
+    <color:grey><i><size:10>This will push subtrees</size></i></color>
+  <color:grey><i><size:10>to the shared filesystem
+}
+
+RECTANGLE AssetService {
+}
+
+RECTANGLE LustreFS {
+}
+
+RECTANGLE S3 {}
+
+BlockAssembly -- LustreFS : subtrees DAH >
+BlockValidation -- LustreFS : subtrees DAH <
+SubtreeValidation -- LustreFS : subtrees DAH >
+AssetService -- LustreFS : subtrees DAH <
+LustreFS -- S3 : subtrees (permanent) >
+@enduml

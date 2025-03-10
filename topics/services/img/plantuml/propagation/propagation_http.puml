@@ -1,0 +1,81 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+
+participant "HTTP Client" as Client
+participant "HTTP Server" as HTTP
+participant "PropagationServer" as Server
+participant "Tx Store" as TxStore
+participant "Kafka Producer" as KafkaProducer
+participant "Validator" as ValidationService
+
+activate Server
+
+Server -> HTTP: Setup HTTP handlers
+activate HTTP
+
+loop HTTP Request Handling
+    alt POST /tx (single transaction)
+        Client -> HTTP: POST /tx
+        activate Client
+        HTTP -> Server: handleSingleTx(w, r)
+        activate Server
+        Server -> Server: Read transaction from body
+        Server -> Server: ProcessTransaction(ctx, tx)
+    else POST /txs (multiple transactions)
+        Client -> HTTP: POST /txs
+        HTTP -> Server: handleMultipleTx(w, r)
+        Server -> Server: Read all transactions from body
+        loop for each transaction
+            Server -> Server: ProcessTransactionInternal(ctx, tx)
+        end
+    end
+
+        Server -> TxStore: storeTransaction(ctx, tx)
+        activate TxStore
+        TxStore --> Server: Storage confirmation
+        deactivate TxStore
+
+        alt if Kafka Producer is configured
+            Server -> KafkaProducer: Send transaction
+            activate KafkaProducer
+            KafkaProducer --> Server: Confirmation
+            deactivate KafkaProducer
+        else if direct validation
+            Server -> ValidationService: Validate(ctx, tx)
+            activate ValidationService
+            ValidationService --> Server: ValidationResult
+            deactivate ValidationService
+        end
+
+        Server --> HTTP: Transactions processed
+        deactivate Server
+        HTTP -> Client: Response (implicit, as it's a stream)
+        deactivate Client
+end
+
+deactivate HTTP
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

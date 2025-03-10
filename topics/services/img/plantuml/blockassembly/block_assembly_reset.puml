@@ -1,0 +1,60 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+actor Client
+participant "Block Assembler" as Assembler
+participant "Blockchain Client" as BlockchainClient
+participant "Subtree Processor" as Processor
+
+Client -> Assembler : ResetBlockAssembly()
+activate Assembler
+
+Assembler -> Assembler : resetCh <- struct{}{}
+Assembler -> BlockchainClient : GetBestBlockHeader(ctx)
+activate BlockchainClient
+BlockchainClient --> Assembler : bestBlockchainBlockHeader, meta, err
+deactivate BlockchainClient
+
+Assembler -> Assembler : getReorgBlocks(ctx, bestBlockchainBlockHeader)
+Assembler -> Processor : Reset(b.bestBlockHeader.Load(), moveBackBlocks, moveForwardBlocks)
+activate Processor
+Processor --> Assembler : ResetResponse
+deactivate Processor
+
+alt if reset was successful
+    Assembler -> Assembler : Update bestBlockHeader and bestBlockHeight
+else if reset failed
+    Assembler -> Assembler : Set bestBlockHeader from Processor's current block header
+end
+
+Assembler -> Assembler : SetState(ctx)
+Assembler -> Assembler : setCurrentChain(ctx)
+
+Assembler -> Assembler : Set resetWaitCount and resetWaitTime
+
+Assembler --> Client : EmptyMessage{}
+deactivate Assembler
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

@@ -1,0 +1,68 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Block Validation" as BlockValidation
+participant "Tx Store" as TxStore
+participant "Subtree Store" as SubtreeStore
+
+== Initialize Stores ==
+BlockValidation -> BlockValidation: New(logger, txStoreURL, subtreeStoreURL)
+activate BlockValidation
+BlockValidation -> TxStore: NewStore(logger, txStoreURL)
+activate TxStore
+TxStore --> BlockValidation: txStore
+deactivate TxStore
+BlockValidation -> SubtreeStore: NewStore(logger, subtreeStoreURL, opts...)
+activate SubtreeStore
+SubtreeStore --> BlockValidation: subtreeStore
+deactivate SubtreeStore
+
+== Get Transaction ==
+BlockValidation -> TxStore: Get(ctx, txHash)
+activate TxStore
+TxStore --> BlockValidation: txBytes, err
+deactivate TxStore
+
+== Store Transaction ==
+BlockValidation -> TxStore: Set(ctx, txHash, txBytes)
+activate TxStore
+TxStore --> BlockValidation: err
+deactivate TxStore
+
+== Check Subtree Exists ==
+BlockValidation -> SubtreeStore: Exists(ctx, subtreeHash)
+activate SubtreeStore
+SubtreeStore --> BlockValidation: exists, err
+deactivate SubtreeStore
+
+== Store Subtree ==
+BlockValidation -> SubtreeStore: Set(ctx, subtreeHash, subtreeBytes, options...)
+activate SubtreeStore
+SubtreeStore --> BlockValidation: err
+deactivate SubtreeStore
+
+deactivate BlockValidation
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

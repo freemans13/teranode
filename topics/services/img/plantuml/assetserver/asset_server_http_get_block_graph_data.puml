@@ -1,0 +1,44 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "HTTP Client" as Client
+participant "HTTP Server\n(asset/http_impl/http.go)" as HTTPServer
+participant "Repository" as Repo
+participant "BlockchainClient" as BC
+
+Client -> HTTPServer : GET /blockgraphdata/:period
+activate HTTPServer
+HTTPServer -> Repo : GetBlockGraphData(ctx, period)
+activate Repo
+Repo -> BC : GetBlockGraphData(ctx, periodMillis)
+activate BC
+BC --> Repo : *model.BlockDataPoints
+deactivate BC
+Repo --> HTTPServer : *model.BlockDataPoints
+deactivate Repo
+HTTPServer --> Client : JSON Response (Block Graph Data)
+deactivate HTTPServer
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

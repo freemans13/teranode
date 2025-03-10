@@ -1,0 +1,76 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Validator" as ValidateSubtree
+entity "Subtree Data" as SubtreeData
+participant "Util HTTP Request" as Util
+database "Subtree Store" as SubtreeStore
+database "Tx Meta Cache" as TxMetaStore
+database "UTXO Store" as UTXOStore
+participant "Block Assembly" as BlockAssembly
+
+ValidateSubtree -> ValidateSubtree: ValidateSubtreeInternal(ctx, v ValidateSubtree, blockHeight uint32)
+activate ValidateSubtree
+
+ValidateSubtree -> SubtreeStore: Exists(ctx, subtreeHash[:])
+SubtreeStore --> ValidateSubtree: subtreeExists / err
+
+alt subtreeExists is false
+    loop retry mechanism
+        ValidateSubtree -> Util: getSubtreeTxHashes(ctx, subtreeHash, baseURL)
+        Util --> ValidateSubtree: txHashes / err
+
+        ValidateSubtree -> ValidateSubtree: processTxMetaUsingCache(ctx, txHashes, txMetaSlice, failFast)
+        ValidateSubtree -> ValidateSubtree: processTxMetaUsingStore(ctx, txHashes, txMetaSlice, batched, failFast)
+
+        alt missing transactions
+            ValidateSubtree -> ValidateSubtree: processMissingTransactions(ctx, subtreeHash, missingTxHashes, baseURL, txMetaSlice, blockHeight)
+            ValidateSubtree -> UTXOStore: spendUtxos(ctx, tx, blockHeight)
+            ValidateSubtree -> UTXOStore: storeTxInUtxoMap(ctx, tx, blockHeight)
+
+            alt if !blockAssemblyDisabled
+                ValidateSubtree -> BlockAssembly: Store(ctx, txData)
+            end
+        end
+    end
+
+    loop for each transaction
+        ValidateSubtree -> SubtreeData: AddNode(txHash, txMeta.Fee, txMeta.SizeInBytes)
+        ValidateSubtree -> SubtreeData: SetParentTxHashes(subtreeIdx, txMeta.ParentTxHashes)
+    end
+
+    ValidateSubtree -> ValidateSubtree: Check if merkle root matches subtreeHash
+
+    ValidateSubtree -> SubtreeStore: Set(ctx, merkleRoot[:], completeSubtreeMetaBytes)
+    ValidateSubtree -> SubtreeStore: Set(ctx, merkleRoot[:], completeSubtreeBytes)
+end
+
+ValidateSubtree -> ValidateSubtree: SetSubtreeExists(subtreeHash)
+
+ValidateSubtree --> Caller: err
+
+deactivate ValidateSubtree
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

@@ -1,0 +1,97 @@
+@startuml overview
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+actor p2p
+actor BlockValidation
+participant blockValidation
+actor Blockchain
+database blockchainStore
+actor Asset
+participant block
+database subtreeStore
+participant blockassembly
+database txmetaStore
+database txStore
+actor Validator
+database utxoStore
+actor BlockAssembler
+
+
+p2p -[#blue]> BlockValidation : grpc:BlockFound(hash)
+BlockValidation -[#blue]> Blockchain : grpc:GetBlockExists(hash)
+Blockchain -[#red]-> blockchainStore : GetBlockExists(hash)
+group processBlockFound(hash)
+BlockValidation -[#blue]> Blockchain : grpc:GetBlockExists(hash)
+Blockchain -[#red]-> blockchainStore : GetBlockExists(hash)
+group getBlock(hash)
+BlockValidation -[#green]--> Asset : http:GetBlock(/block/<hash>))
+Asset -[#blue]> Blockchain : grpc:getBlock(hash)
+Blockchain -[#red]-> blockchainStore : GetBlock(hash)
+end
+BlockValidation -[#blue]> Blockchain : grpc:GetBlockExists(previous hash)
+Blockchain -[#red]-> blockchainStore : GetBlockExists(previous hash)
+BlockValidation -> blockValidation : ValidateBlock(block)
+
+loop each subtree
+blockValidation -[#red]-> subtreeStore : Exists(subtree hash)
+blockValidation -[#green]--> Asset : http:GetSubtree(/subtree/<hash>)
+Asset -[#red]-> subtreeStore : GetSubtree(hash)
+loop each tx
+blockValidation -[#red]-> txmetaStore : Get(tx hash)
+group blessMissingTransaction
+blockValidation -[#red]-> txStore: Get(tx hash)
+group if not found
+blockValidation -[#green]--> Asset : http:GetTransaction(/tx/<hash>)
+blockValidation -[#red]-> txStore : Set(tx)
+end
+blockValidation -[#blue]> Validator : grpc:Validate(tx)
+Validator -> Validator : Validate(tx)
+Validator -[#red]-> utxoStore : Spend(utxo)
+Validator -[#red]-> txmetaStore : Create(tx)
+Validator -[#blue]> BlockAssembler : Store(tx) ??? really?
+Validator -[#red]-> utxoStore : Store(tx)
+blockValidation -[#red]-> txmetaStore : Get(tx)
+end
+end
+end
+blockValidation -[#blue]> Blockchain : grpc:getBlockHeaders(previous 100 blocks)
+Blockchain -[#red]-> blockchainStore : GetBlockHeaders(previous 100 blocks)
+blockValidation -[#red]-> txmetaStore : Create(coinbase tx)
+blockValidation -> block : Valid(block headers)
+blockValidation -[#blue]> Blockchain : grpc:AddBlock(block)
+Blockchain -[#red]-> blockchainStore : StoreBlock(block)
+blockValidation -> block : getSubtrees()
+loop each subtree
+block -[#red]-> subtreeStore : get
+
+end
+blockValidation -> blockassembly : UpdateTxMinedStatus(block)
+loop each subtree
+loop eace tx
+blockassembly -[#red]-> txmetaStore : SetMined(tx)
+end
+end
+blockValidation -[#red]-> txStore : Set(coinbase tx)
+end
+
+@enduml
