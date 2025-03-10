@@ -173,6 +173,33 @@
       ]
     },
     {
+      "name": "TERANODE - dev.legacy.testnet",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      "buildFlags": "-tags=aerospike",
+      "env": {
+        "SETTINGS_CONTEXT": "dev.legacy.testnet",
+        "local_test_start_from_state": "RUNNING",
+      },
+    },
+    {
+      "name": "TERANODE - dev.legacy.testnet (no legacy)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/.",
+      "buildFlags": "-tags=aerospike",
+      "env": {
+        "SETTINGS_CONTEXT": "dev.legacy.testnet",
+        "local_test_start_from_state": "RUNNING",
+      },
+      "args": [
+        "-legacy=0",
+      ]
+    },
+    {
       "name": "Get Extended Tx",
       "type": "go",
       "request": "launch",
