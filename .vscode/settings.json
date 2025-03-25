@@ -136,7 +136,6 @@
     "protogen",
     "protojson",
     "pubkey",
-    "quic",
     "Redpanda",
     "regtest",
     "resp",
