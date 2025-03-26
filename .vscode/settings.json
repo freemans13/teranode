@@ -255,9 +255,11 @@
   "editor.suggest.showWords": false,
   "editor.suggestOnTriggerCharacters": false,
   "files.exclude": {
-    "**/.history": true
+    "**/.history": true,
+    "**/.history/**": true
   },
   "search.exclude": {
-    "**/.history": true
+    "**/.history": true,
+    "**/.history/**": true
   }
 }
