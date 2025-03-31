@@ -244,8 +244,8 @@
   ],
   "cSpell.language": "en,en-US,en-GB,lorem",
   "sonarlint.connectedMode.project": {
-    "connectionId": "UbsvSonarQube",
-    "projectKey": "ubsv"
+    "connectionId": "https-sonarqube-prod-ubsv-dev",
+    "projectKey": "teranode"
   },
   "makefile.configureOnOpen": false,
   "github.copilot.enable": false,
