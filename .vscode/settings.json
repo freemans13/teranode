@@ -136,7 +136,6 @@
     "protogen",
     "protojson",
     "pubkey",
-    "quic",
     "Redpanda",
     "regtest",
     "resp",
@@ -245,8 +244,8 @@
   ],
   "cSpell.language": "en,en-US,en-GB,lorem",
   "sonarlint.connectedMode.project": {
-    "connectionId": "UbsvSonarQube",
-    "projectKey": "ubsv"
+    "connectionId": "https-sonarqube-prod-ubsv-dev",
+    "projectKey": "teranode"
   },
   "makefile.configureOnOpen": false,
   "github.copilot.enable": false,
@@ -256,9 +255,11 @@
   "editor.suggest.showWords": false,
   "editor.suggestOnTriggerCharacters": false,
   "files.exclude": {
-    "**/.history": true
+    "**/.history": true,
+    "**/.history/**": true
   },
   "search.exclude": {
-    "**/.history": true
+    "**/.history": true,
+    "**/.history/**": true
   }
 }
