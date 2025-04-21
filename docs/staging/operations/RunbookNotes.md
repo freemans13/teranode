@@ -118,9 +118,9 @@ kgp --- see all current services running in a given node (Kubernetes running Doc
 
 ----
 
-Apologies, but what command can I run to reset p2p bootstrap server so that m2 p2p service starts working again? I’ve tried stopping and starting p2pbootstrap but that didn’t do anything
+How to reset a service that isn.t working properly
 
-k delete pod -n p2pbootstrap --all
+k delete pod -n [namespace] --all
 
 in each even
 
