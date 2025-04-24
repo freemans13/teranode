@@ -179,8 +179,8 @@
     "Traefik",
     "ttlcache",
     "TTLs",
-    "TTLSET",
-    "TTLUNSET",
+    "DAHSET",
+    "DAHUNSET",
     "txblast",
     "txblaster",
     "txblockidcheck",
@@ -260,6 +260,9 @@
   },
   "search.exclude": {
     "**/.history": true,
+    "**/.history/**": true
+  },
+  "files.watcherExclude": {
     "**/.history/**": true
   }
 }
