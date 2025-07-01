@@ -22,8 +22,35 @@ usage() {
     exit 1
 }
 
+# Function to get RDS endpoint based on environment
+get_rds_endpoint() {
+    local env_type="$1"
+    local eks_num="$2"
+
+    # Query AWS RDS to find the endpoint
+    local db_identifier="${env_type}-eks-${eks_num}"
+
+    echo "Looking up RDS endpoint for ${db_identifier}..." >&2
+
+    local endpoint=$(aws rds describe-db-instances \
+        --query "DBInstances[?contains(DBInstanceIdentifier, '${db_identifier}')].Endpoint.Address" \
+        --output text 2>/dev/null)
+
+    if [ -z "$endpoint" ] || [ "$endpoint" = "None" ]; then
+        echo "Error: Could not find RDS instance matching '${db_identifier}'" >&2
+        echo "Available RDS instances:" >&2
+        aws rds describe-db-instances --query "DBInstances[].DBInstanceIdentifier" --output table >&2
+        return 1
+    fi
+
+    # If multiple endpoints returned, take the first one
+    endpoint=$(echo "$endpoint" | head -n1)
+
+    echo "Found RDS endpoint: $endpoint" >&2
+    echo "$endpoint"
+}
+
 # Default values
-PG_HOST=""
 PG_PORT="5432"
 SKIP_CONFIRM=false
 ALL_TERANET_STAGE=false
@@ -96,6 +123,13 @@ reset_namespace() {
         return 1
     fi
 
+    # Get the RDS endpoint dynamically
+    PG_HOST=$(get_rds_endpoint "$ENV_TYPE" "$EKS_NUM")
+    if [ $? -ne 0 ]; then
+        echo "Failed to get RDS endpoint for $ENV_TYPE-eks-$EKS_NUM"
+        return 1
+    fi
+
     # Derive other namespaces and database names
     AEROSPIKE_NS="aerospike-${ENV_TYPE}-eks-${NETWORK_TYPE}-$INSTANCE_NUM"
     APP_NS="$NAMESPACE"
@@ -142,6 +176,7 @@ reset_namespace() {
     fi
 
     echo "Starting reset process for namespace: $NAMESPACE"
+    echo "Using PostgreSQL host: $PG_HOST"
 
     # Step 1: Delete all Aerospike PVCs in the namespace (in background)
     echo "Deleting Aerospike PVCs (in background)..."
