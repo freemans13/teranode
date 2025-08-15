@@ -415,7 +415,7 @@ func TestSubtreeProcessor_CompleteSubtreeTracking(t *testing.T) {
 		err = stp.processCompleteSubtree(false)
 		require.NoError(t, err)
 
-		// Should have tracked 4 nodes (excluding coinbase)
+		// Should have tracked 5 nodes (including coinbase)
 		// Check the first value in the ring
 		count := 0
 		actualNodes := 0
@@ -428,13 +428,13 @@ func TestSubtreeProcessor_CompleteSubtreeTracking(t *testing.T) {
 			}
 		})
 		require.Equal(t, 1, count, "Should have tracked one subtree")
-		require.Equal(t, 4, actualNodes,
-			"Should track correct number of non-coinbase nodes")
+		require.Equal(t, 5, actualNodes,
+			"Should track total number of nodes including coinbase")
 
 		// Test that old samples are removed after limit
-		// First, fill up to 99 samples (we already have 1)
+		// First, fill up remaining slots (we already have 1, buffer size is 18)
 		r := stp.subtreeNodeCounts.Next() // Skip the first one we already added
-		for i := 0; i < 98; i++ {
+		for i := 0; i < 16; i++ { // 17 more to reach 18 total
 			r.Value = 5
 			r = r.Next()
 		}
@@ -457,7 +457,7 @@ func TestSubtreeProcessor_CompleteSubtreeTracking(t *testing.T) {
 			require.NoError(t, err)
 		}
 
-		// This should add one more, reaching 100
+		// This should add one more, reaching 18 (full buffer)
 		err = stp.processCompleteSubtree(false)
 		require.NoError(t, err)
 
@@ -468,7 +468,7 @@ func TestSubtreeProcessor_CompleteSubtreeTracking(t *testing.T) {
 				count++
 			}
 		})
-		require.Equal(t, 100, count, "Should have 100 samples")
+		require.Equal(t, 18, count, "Should have 18 samples (full buffer)")
 
 		// Add one more to test that it maintains the limit
 		stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(8)
@@ -489,15 +489,15 @@ func TestSubtreeProcessor_CompleteSubtreeTracking(t *testing.T) {
 		err = stp.processCompleteSubtree(false)
 		require.NoError(t, err)
 
-		// Should still be at max 100 samples (ring automatically overwrites oldest)
+		// Should still be at max 18 samples (ring automatically overwrites oldest)
 		count = 0
 		stp.subtreeNodeCounts.Do(func(v interface{}) {
 			if v != nil {
 				count++
 			}
 		})
-		require.Equal(t, 100, count,
-			"Should still have 100 samples (ring overwrites oldest)")
+		require.Equal(t, 18, count,
+			"Should still have 18 samples (ring overwrites oldest)")
 	})
 }
 
@@ -567,5 +567,406 @@ func TestSubtreeProcessor_MinimumSizeRespected(t *testing.T) {
 		require.Equal(t, settings.BlockAssembly.MinimumMerkleItemsPerSubtree,
 			stp.currentItemsPerFile,
 			"Size should not go below minimum")
+	})
+}
+
+// TestSubtreeProcessor_HighVolumeScaling tests that the dynamic sizing correctly
+// scales up when there's genuinely high transaction volume
+func TestSubtreeProcessor_HighVolumeScaling(t *testing.T) {
+	// Setup
+	settings := test.CreateBaseTestSettings()
+	settings.BlockAssembly.UseDynamicSubtreeSize = true
+	settings.BlockAssembly.InitialMerkleItemsPerSubtree = 64
+	settings.BlockAssembly.MinimumMerkleItemsPerSubtree = 4
+	settings.BlockAssembly.MaximumMerkleItemsPerSubtree = 32768
+
+	newSubtreeChan := make(chan NewSubtreeRequest)
+	done := make(chan struct{})
+	defer close(done)
+
+	// Handle channel reads to prevent blocking
+	go func() {
+		for {
+			select {
+			case req := <-newSubtreeChan:
+				if req.ErrChan != nil {
+					req.ErrChan <- nil
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	subtreeStore := blob_memory.New()
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, settings, utxoStoreURL)
+	require.NoError(t, err)
+
+	mockBlockchainClient := &blockchain.Mock{}
+
+	stp, err := NewSubtreeProcessor(
+		ctx,
+		ulogger.TestLogger{},
+		settings,
+		subtreeStore,
+		mockBlockchainClient,
+		utxoStore,
+		newSubtreeChan,
+	)
+	require.NoError(t, err)
+
+	t.Run("scales up with sustained high volume", func(t *testing.T) {
+		// Start with a moderate size
+		stp.currentItemsPerFile = 64
+		
+		// Simulate high transaction volume (1000+ tx/s)
+		// With size 64, we'd be creating subtrees very frequently
+		// Let's say we're seeing 90% full subtrees (57-58 nodes each)
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 57 + (i % 3) // 57, 58, 59, 57, 58, 59...
+			r = r.Next()
+		}
+		
+		// Subtrees are being created every 50ms (20 per second)
+		// This represents ~1140 transactions per second (57 * 20)
+		stp.blockIntervals = []time.Duration{
+			50 * time.Millisecond,
+			50 * time.Millisecond,
+			50 * time.Millisecond,
+		}
+		
+		initialSize := stp.currentItemsPerFile
+		stp.adjustSubtreeSize()
+		
+		// Size should increase significantly due to high volume and fast creation
+		require.Greater(t, stp.currentItemsPerFile, initialSize,
+			"Size should increase with high transaction volume")
+		
+		// With ratio = 1000ms/50ms = 20, and starting at 64,
+		// new size would be 64*20 = 1280, rounded to 2048
+		// But capped at 2x per adjustment = 128
+		require.Equal(t, 128, stp.currentItemsPerFile,
+			"Size should double with very high load")
+	})
+
+	t.Run("continues scaling with extreme volume", func(t *testing.T) {
+		// Now at 128, still seeing high volume
+		stp.currentItemsPerFile = 128
+		
+		// Even higher utilization now (120+ nodes per subtree)
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 120 + (i % 5) // 120-124 nodes
+			r = r.Next()
+		}
+		
+		// Still creating subtrees very fast (25ms intervals)
+		// This represents ~4800 tx/s (120 * 40)
+		stp.blockIntervals = []time.Duration{
+			25 * time.Millisecond,
+			25 * time.Millisecond,
+			25 * time.Millisecond,
+		}
+		
+		stp.adjustSubtreeSize()
+		
+		// Should continue scaling up
+		require.Equal(t, 256, stp.currentItemsPerFile,
+			"Should continue doubling with extreme load")
+	})
+
+	t.Run("scales to maximum with massive volume", func(t *testing.T) {
+		// Set near maximum to test ceiling
+		stp.currentItemsPerFile = 16384
+		
+		// Extremely high volume - nearly full subtrees
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 16000 + (i * 30) // 16000-16270 nodes
+			r = r.Next()
+		}
+		
+		// Creating subtrees every 10ms (100 per second)
+		// This represents 1.6M tx/s!
+		stp.blockIntervals = []time.Duration{
+			10 * time.Millisecond,
+			10 * time.Millisecond,
+			10 * time.Millisecond,
+		}
+		
+		stp.adjustSubtreeSize()
+		
+		// Should hit the maximum
+		require.Equal(t, settings.BlockAssembly.MaximumMerkleItemsPerSubtree,
+			stp.currentItemsPerFile,
+			"Should reach maximum size with massive volume")
+	})
+
+	t.Run("scales down when volume decreases", func(t *testing.T) {
+		// Start at a high size from previous high volume
+		stp.currentItemsPerFile = 8192
+		
+		// Volume has dropped significantly (only 100-200 tx per subtree)
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 100 + (i * 10) // 100-190 nodes
+			r = r.Next()
+		}
+		
+		// Subtrees now created every 2 seconds
+		stp.blockIntervals = []time.Duration{
+			2 * time.Second,
+			2 * time.Second,
+			2 * time.Second,
+		}
+		
+		stp.adjustSubtreeSize()
+		
+		// With ratio = 1s/2s = 0.5, size should halve
+		// But utilization is also low (100-190 out of 8192 = ~2%)
+		// So it should decrease based on low utilization
+		require.Less(t, stp.currentItemsPerFile, 8192,
+			"Size should decrease when volume drops")
+		require.LessOrEqual(t, stp.currentItemsPerFile, 4096,
+			"Should decrease significantly with low utilization")
+	})
+
+	t.Run("handles burst traffic correctly", func(t *testing.T) {
+		// Start at a reasonable size
+		stp.currentItemsPerFile = 256
+		
+		// Sudden burst - subtrees are completely full
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 5; i++ {
+			r.Value = 255 // Nearly full
+			r = r.Next()
+		}
+		
+		// Creating subtrees very rapidly during burst
+		stp.blockIntervals = []time.Duration{
+			20 * time.Millisecond,
+			20 * time.Millisecond,
+			20 * time.Millisecond,
+		}
+		
+		stp.adjustSubtreeSize()
+		
+		// Should increase to handle burst
+		require.Greater(t, stp.currentItemsPerFile, 256,
+			"Should increase size to handle burst traffic")
+		
+		// Now simulate burst ending
+		stp.currentItemsPerFile = 512 // After increase
+		
+		// Traffic back to much lower (20-30 nodes per subtree)
+		r = stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 20 + (i % 10)
+			r = r.Next()
+		}
+		
+		// Normal intervals again
+		stp.blockIntervals = []time.Duration{
+			1 * time.Second,
+			1 * time.Second,
+			1 * time.Second,
+		}
+		
+		stp.adjustSubtreeSize()
+		
+		// Should decrease back down (utilization ~5%)
+		require.Less(t, stp.currentItemsPerFile, 512,
+			"Should decrease after burst ends with low utilization")
+	})
+
+	t.Run("realistic high volume scenario", func(t *testing.T) {
+		// Simulate realistic high-volume scenario
+		// Target: 100,000 tx/s (current BSV record levels)
+		// If we want subtrees every second with 100k tx/s,
+		// we need subtree size of ~100,000
+		
+		// Start small and let it scale
+		stp.currentItemsPerFile = 1024
+		
+		// First adjustment - seeing 950+ nodes per subtree
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 950 + (i * 5) // 950-995 nodes
+			r = r.Next()
+		}
+		
+		// Creating subtrees every 100ms (10 per second)
+		// This is ~9500 tx/s
+		stp.blockIntervals = []time.Duration{
+			100 * time.Millisecond,
+			100 * time.Millisecond,
+			100 * time.Millisecond,
+		}
+		
+		// Should scale up over multiple adjustments
+		sizes := []int{}
+		for i := 0; i < 5; i++ {
+			prevSize := stp.currentItemsPerFile
+			stp.adjustSubtreeSize()
+			sizes = append(sizes, stp.currentItemsPerFile)
+			
+			// Simulate continued high load
+			if stp.currentItemsPerFile > prevSize {
+				// Update node counts to match new size
+				newNodeCount := int(float64(stp.currentItemsPerFile) * 0.93) // 93% full
+				r = stp.subtreeNodeCounts
+				for j := 0; j < 10; j++ {
+					r.Value = newNodeCount + (j % 10)
+					r = r.Next()
+				}
+			}
+		}
+		
+		// Should have scaled up significantly
+		require.Greater(t, stp.currentItemsPerFile, 1024,
+			"Should scale up from initial size")
+		
+		// Log the scaling progression
+		t.Logf("Size progression with high volume: 1024 -> %v", sizes)
+		
+		// Final size should be appropriate for the load
+		// With 100ms intervals and needing to handle ~950 tx per subtree,
+		// optimal size would be around 2048-4096
+		require.GreaterOrEqual(t, stp.currentItemsPerFile, 2048,
+			"Should reach appropriate size for sustained high volume")
+		require.LessOrEqual(t, stp.currentItemsPerFile, 8192,
+			"Should not overshoot reasonable size")
+	})
+}
+
+// TestSubtreeProcessor_VolumeThresholds tests the 50-node threshold for volume detection
+func TestSubtreeProcessor_VolumeThresholds(t *testing.T) {
+	// Setup
+	settings := test.CreateBaseTestSettings()
+	settings.BlockAssembly.UseDynamicSubtreeSize = true
+	settings.BlockAssembly.InitialMerkleItemsPerSubtree = 64
+	settings.BlockAssembly.MinimumMerkleItemsPerSubtree = 4
+	settings.BlockAssembly.MaximumMerkleItemsPerSubtree = 32768
+
+	newSubtreeChan := make(chan NewSubtreeRequest)
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		for {
+			select {
+			case req := <-newSubtreeChan:
+				if req.ErrChan != nil {
+					req.ErrChan <- nil
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	subtreeStore := blob_memory.New()
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, settings, utxoStoreURL)
+	require.NoError(t, err)
+
+	mockBlockchainClient := &blockchain.Mock{}
+
+	stp, err := NewSubtreeProcessor(
+		ctx,
+		ulogger.TestLogger{},
+		settings,
+		subtreeStore,
+		mockBlockchainClient,
+		utxoStore,
+		newSubtreeChan,
+	)
+	require.NoError(t, err)
+
+	t.Run("just below threshold blocks increase", func(t *testing.T) {
+		stp.currentItemsPerFile = 64
+		
+		// 49 nodes per subtree - just below threshold
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 49
+			r = r.Next()
+		}
+		
+		// Fast creation that would normally trigger increase
+		stp.blockIntervals = []time.Duration{
+			100 * time.Millisecond,
+			100 * time.Millisecond,
+			100 * time.Millisecond,
+		}
+		
+		initialSize := stp.currentItemsPerFile
+		stp.adjustSubtreeSize()
+		
+		// Should NOT increase due to low volume check
+		require.Equal(t, initialSize, stp.currentItemsPerFile,
+			"Should not increase with 49 nodes (below 50 threshold)")
+	})
+
+	t.Run("just above threshold allows increase", func(t *testing.T) {
+		stp.currentItemsPerFile = 64
+		
+		// 60 nodes per subtree - well above threshold and high utilization (93.75%)
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 60
+			r = r.Next()
+		}
+		
+		// Same fast creation
+		stp.blockIntervals = []time.Duration{
+			100 * time.Millisecond,
+			100 * time.Millisecond,
+			100 * time.Millisecond,
+		}
+		
+		initialSize := stp.currentItemsPerFile
+		stp.adjustSubtreeSize()
+		
+		// Should increase now that we're above threshold with high utilization
+		require.Greater(t, stp.currentItemsPerFile, initialSize,
+			"Should increase with 60 nodes (above 50 threshold with high utilization)")
+	})
+
+	t.Run("exactly at threshold with high utilization allows increase", func(t *testing.T) {
+		stp.currentItemsPerFile = 60
+		
+		// Exactly 50 nodes per subtree - 83% utilization triggers high path
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 50
+			r = r.Next()
+		}
+		
+		// Fast creation
+		stp.blockIntervals = []time.Duration{
+			100 * time.Millisecond,
+			100 * time.Millisecond,
+			100 * time.Millisecond,
+		}
+		
+		initialSize := stp.currentItemsPerFile
+		stp.adjustSubtreeSize()
+		
+		// Should increase at exactly 50 with high utilization
+		require.Greater(t, stp.currentItemsPerFile, initialSize,
+			"Should increase with exactly 50 nodes when utilization > 80%")
 	})
 }
