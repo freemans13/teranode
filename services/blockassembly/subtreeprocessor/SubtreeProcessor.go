@@ -158,7 +158,7 @@ type SubtreeProcessor struct {
 
 	// subtreeNodeCounts tracks the actual node count in recent subtrees using a ring buffer
 	// With ~10 min blocks, 18 samples = ~3 hours of history for good stability
-	subtreeNodeCounts *ring.Ring
+	subtreeNodeCounts     *ring.Ring
 	subtreeNodeCountsSize int // Size of the ring buffer
 
 	// txChan receives transaction batches for processing
@@ -912,7 +912,7 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 			totalNodes += v.(int)
 		}
 	})
-	
+
 	if count > 0 {
 		avgNodesPerSubtree := float64(totalNodes) / float64(count)
 
@@ -953,7 +953,7 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 		} else if utilization > 0.8 {
 			// Subtrees are nearly full, might need to increase size
 			// But only if we're also creating them too fast AND we have significant volume
-			
+
 			// Don't increase size if average nodes per subtree is small (< 50)
 			// This prevents size creep with low transaction volumes
 			if avgNodesPerSubtree < 50 {
@@ -963,7 +963,7 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 				stp.blockIntervals = make([]time.Duration, 0)
 				return
 			}
-			
+
 			stp.logger.Debugf("[adjustSubtreeSize] High utilization (%.2f%%), checking timing...\n", utilization*100)
 		} else {
 			// Utilization is reasonable (10-80%), keep current size
@@ -1049,7 +1049,7 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 			}
 		}
 	})
-	
+
 	if hasData && newSize > currentSize {
 		// Only increase if we've actually seen subtrees that would benefit
 		// Add some buffer (2x max seen) but round to power of 2
