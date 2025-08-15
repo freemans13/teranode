@@ -16,6 +16,7 @@ package subtreeprocessor
 
 import (
 	"bufio"
+	"container/ring"
 	"context"
 	"encoding/binary"
 	"io"
@@ -155,8 +156,10 @@ type SubtreeProcessor struct {
 	// maxBlockSamples is the number of block samples to keep for averaging
 	maxBlockSamples int
 
-	// subtreeNodeCounts tracks the actual node count in recent subtrees
-	subtreeNodeCounts []int
+	// subtreeNodeCounts tracks the actual node count in recent subtrees using a ring buffer
+	// With ~10 min blocks, 18 samples = ~3 hours of history for good stability
+	subtreeNodeCounts *ring.Ring
+	subtreeNodeCountsSize int // Size of the ring buffer
 
 	// txChan receives transaction batches for processing
 	txChan chan *[]TxIDAndFee
@@ -338,6 +341,14 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 
 	queue := NewLockFreeQueue()
 
+	// Calculate subtree sample size based on expected block time
+	// With ~10 min blocks, 18 samples = ~3 hours of history
+	// This provides good stability without excessive memory usage
+	// - Long enough to smooth out temporary fluctuations
+	// - Short enough to adapt to genuine load changes (e.g., day/night cycles)
+	// - Small memory footprint (18 * sizeof(int) = 144 bytes)
+	const subtreeSampleSize = 18
+
 	stp := &SubtreeProcessor{
 		settings:                  tSettings,
 		currentItemsPerFile:       initialItemsPerFile,
@@ -345,7 +356,8 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 		subtreesInBlock:           0,
 		blockIntervals:            make([]time.Duration, 0, 10),
 		maxBlockSamples:           10,
-		subtreeNodeCounts:         make([]int, 0, 100),
+		subtreeNodeCounts:         ring.New(subtreeSampleSize),
+		subtreeNodeCountsSize:     subtreeSampleSize,
 		txChan:                    make(chan *[]TxIDAndFee, tSettings.SubtreeValidation.TxChanBufferSize),
 		getSubtreesChan:           make(chan chan []*subtreepkg.Subtree),
 		getSubtreeHashesChan:      make(chan chan []chainhash.Hash),
@@ -891,13 +903,18 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 	currentSize := stp.currentItemsPerFile
 
 	// First check if we have actual subtree utilization data
-	if len(stp.subtreeNodeCounts) > 0 {
-		// Calculate average actual node count in recent subtrees
-		var totalNodes int
-		for _, count := range stp.subtreeNodeCounts {
-			totalNodes += count
+	// Count non-nil values in the ring
+	count := 0
+	totalNodes := 0
+	stp.subtreeNodeCounts.Do(func(v interface{}) {
+		if v != nil {
+			count++
+			totalNodes += v.(int)
 		}
-		avgNodesPerSubtree := float64(totalNodes) / float64(len(stp.subtreeNodeCounts))
+	})
+	
+	if count > 0 {
+		avgNodesPerSubtree := float64(totalNodes) / float64(count)
 
 		// Calculate utilization percentage
 		utilization := avgNodesPerSubtree / float64(currentSize)
@@ -929,7 +946,8 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 			}
 
 			// Reset counters for next adjustment
-			stp.subtreeNodeCounts = make([]int, 0, 100)
+			// Clear the ring buffer
+			stp.subtreeNodeCounts = ring.New(stp.subtreeNodeCountsSize)
 			stp.blockIntervals = make([]time.Duration, 0)
 			return
 		} else if utilization > 0.8 {
@@ -1021,13 +1039,18 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 
 	// Final check: if we have utilization data, don't increase size beyond what's needed
 	// This prevents size increases when transaction volume is low
-	if len(stp.subtreeNodeCounts) > 0 && newSize > currentSize {
-		var maxNodes int
-		for _, count := range stp.subtreeNodeCounts {
-			if count > maxNodes {
-				maxNodes = count
+	maxNodes := 0
+	hasData := false
+	stp.subtreeNodeCounts.Do(func(v interface{}) {
+		if v != nil {
+			hasData = true
+			if nodeCount := v.(int); nodeCount > maxNodes {
+				maxNodes = nodeCount
 			}
 		}
+	})
+	
+	if hasData && newSize > currentSize {
 		// Only increase if we've actually seen subtrees that would benefit
 		// Add some buffer (2x max seen) but round to power of 2
 		neededSize := int(math.Pow(2, math.Ceil(math.Log2(float64(maxNodes*2)))))
@@ -1120,11 +1143,9 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	// Track the actual number of nodes in this subtree (excluding coinbase at index 0)
 	actualNodeCount := len(stp.currentSubtree.Nodes) - 1
 	if actualNodeCount > 0 {
-		stp.subtreeNodeCounts = append(stp.subtreeNodeCounts, actualNodeCount)
-		// Keep only recent samples
-		if len(stp.subtreeNodeCounts) > 100 {
-			stp.subtreeNodeCounts = stp.subtreeNodeCounts[1:]
-		}
+		// Add to ring buffer (overwrites oldest value automatically)
+		stp.subtreeNodeCounts.Value = actualNodeCount
+		stp.subtreeNodeCounts = stp.subtreeNodeCounts.Next()
 	}
 
 	// Add the subtree to the chain

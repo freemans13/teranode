@@ -72,7 +72,12 @@ func TestSubtreeProcessor_LowVolumeNeverIncreases(t *testing.T) {
 		stp.currentItemsPerFile = 8
 		
 		// Simulate 87.5% utilization (7 nodes in size-8 subtree)
-		stp.subtreeNodeCounts = []int{7, 7, 7, 7, 7}
+		// Populate the ring buffer
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 5; i++ {
+			r.Value = 7
+			r = r.Next()
+		}
 		
 		// Even with fast subtree creation (200ms intervals)
 		stp.blockIntervals = []time.Duration{
@@ -94,7 +99,11 @@ func TestSubtreeProcessor_LowVolumeNeverIncreases(t *testing.T) {
 		stp.currentItemsPerFile = 32
 		
 		// Simulate 6.25% utilization (2 nodes in size-32 subtree)
-		stp.subtreeNodeCounts = []int{2, 2, 2, 2, 2}
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 5; i++ {
+			r.Value = 2
+			r = r.Next()
+		}
 		stp.blockIntervals = []time.Duration{1 * time.Second}
 		
 		stp.adjustSubtreeSize()
@@ -111,7 +120,11 @@ func TestSubtreeProcessor_LowVolumeNeverIncreases(t *testing.T) {
 		stp.currentItemsPerFile = 16
 		
 		// Simulate 50% utilization (8 nodes in size-16 subtree)
-		stp.subtreeNodeCounts = []int{8, 8, 8, 8, 8}
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 5; i++ {
+			r.Value = 8
+			r = r.Next()
+		}
 		stp.blockIntervals = []time.Duration{1 * time.Second}
 		
 		initialSize := stp.currentItemsPerFile
@@ -178,7 +191,12 @@ func TestSubtreeProcessor_UsageBasedCapping(t *testing.T) {
 		
 		// High utilization with moderate volume
 		// Max 27 nodes seen, average 25
-		stp.subtreeNodeCounts = []int{23, 25, 27, 24, 26, 25, 24, 26, 25, 25}
+		nodes := []int{23, 25, 27, 24, 26, 25, 24, 26, 25, 25}
+		r := stp.subtreeNodeCounts
+		for _, n := range nodes {
+			r.Value = n
+			r = r.Next()
+		}
 		
 		// Very fast subtree creation that would normally trigger 4x increase
 		stp.blockIntervals = []time.Duration{
@@ -199,7 +217,12 @@ func TestSubtreeProcessor_UsageBasedCapping(t *testing.T) {
 		stp.currentItemsPerFile = 64
 		
 		// High utilization with high volume (> 50 nodes)
-		stp.subtreeNodeCounts = []int{60, 62, 58, 61, 59, 60, 61, 60, 60, 60}
+		nodes := []int{60, 62, 58, 61, 59, 60, 61, 60, 60, 60}
+		r := stp.subtreeNodeCounts
+		for _, n := range nodes {
+			r.Value = n
+			r = r.Next()
+		}
 		
 		// Fast creation that justifies increase
 		stp.blockIntervals = []time.Duration{
@@ -269,7 +292,12 @@ func TestSubtreeProcessor_RealWorldScenario(t *testing.T) {
 	t.Run("adapts to changing load patterns", func(t *testing.T) {
 		// Start with high load
 		stp.currentItemsPerFile = 1024
-		stp.subtreeNodeCounts = []int{900, 950, 920, 940, 910}
+		nodes := []int{900, 950, 920, 940, 910}
+		r := stp.subtreeNodeCounts
+		for _, n := range nodes {
+			r.Value = n
+			r = r.Next()
+		}
 		stp.blockIntervals = []time.Duration{500 * time.Millisecond}
 		
 		stp.adjustSubtreeSize()
@@ -279,7 +307,12 @@ func TestSubtreeProcessor_RealWorldScenario(t *testing.T) {
 		
 		// Transition to low load (2-4 tx/s scenario)
 		stp.currentItemsPerFile = highLoadSize
-		stp.subtreeNodeCounts = []int{3, 4, 2, 3, 4, 3, 2, 4, 3, 3}
+		nodes = []int{3, 4, 2, 3, 4, 3, 2, 4, 3, 3}
+		r = stp.subtreeNodeCounts
+		for _, n := range nodes {
+			r.Value = n
+			r = r.Next()
+		}
 		stp.blockIntervals = []time.Duration{1 * time.Second}
 		
 		// Should decrease over multiple adjustments
@@ -293,7 +326,12 @@ func TestSubtreeProcessor_RealWorldScenario(t *testing.T) {
 			
 			// Reset counters as the real code does
 			if stp.currentItemsPerFile < prevSize {
-				stp.subtreeNodeCounts = []int{3, 4, 2, 3, 4, 3, 2, 4, 3, 3}
+				nodes = []int{3, 4, 2, 3, 4, 3, 2, 4, 3, 3}
+				r = stp.subtreeNodeCounts
+				for _, n := range nodes {
+					r.Value = n
+					r = r.Next()
+				}
 			}
 		}
 		
@@ -378,16 +416,28 @@ func TestSubtreeProcessor_CompleteSubtreeTracking(t *testing.T) {
 		require.NoError(t, err)
 		
 		// Should have tracked 4 nodes (excluding coinbase)
-		require.Len(t, stp.subtreeNodeCounts, 1)
-		require.Equal(t, 4, stp.subtreeNodeCounts[0],
+		// Check the first value in the ring
+		count := 0
+		actualNodes := 0
+		stp.subtreeNodeCounts.Do(func(v interface{}) {
+			if v != nil {
+				count++
+				if count == 1 {
+					actualNodes = v.(int)
+				}
+			}
+		})
+		require.Equal(t, 1, count, "Should have tracked one subtree")
+		require.Equal(t, 4, actualNodes,
 			"Should track correct number of non-coinbase nodes")
 		
 		// Test that old samples are removed after limit
 		// First, fill up to 99 samples (we already have 1)
+		r := stp.subtreeNodeCounts.Next() // Skip the first one we already added
 		for i := 0; i < 98; i++ {
-			stp.subtreeNodeCounts = append(stp.subtreeNodeCounts, 5)
+			r.Value = 5
+			r = r.Next()
 		}
-		require.Len(t, stp.subtreeNodeCounts, 99)
 		
 		// Create another subtree that should trigger the limit
 		stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(8)
@@ -410,7 +460,15 @@ func TestSubtreeProcessor_CompleteSubtreeTracking(t *testing.T) {
 		// This should add one more, reaching 100
 		err = stp.processCompleteSubtree(false)
 		require.NoError(t, err)
-		require.Len(t, stp.subtreeNodeCounts, 100)
+		
+		// Count values in ring
+		count = 0
+		stp.subtreeNodeCounts.Do(func(v interface{}) {
+			if v != nil {
+				count++
+			}
+		})
+		require.Equal(t, 100, count, "Should have 100 samples")
 		
 		// Add one more to test that it maintains the limit
 		stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(8)
@@ -431,9 +489,15 @@ func TestSubtreeProcessor_CompleteSubtreeTracking(t *testing.T) {
 		err = stp.processCompleteSubtree(false)
 		require.NoError(t, err)
 		
-		// Should still be at max 100 samples (oldest one removed)
-		require.Len(t, stp.subtreeNodeCounts, 100,
-			"Should limit tracked samples to 100")
+		// Should still be at max 100 samples (ring automatically overwrites oldest)
+		count = 0
+		stp.subtreeNodeCounts.Do(func(v interface{}) {
+			if v != nil {
+				count++
+			}
+		})
+		require.Equal(t, 100, count,
+			"Should still have 100 samples (ring overwrites oldest)")
 	})
 }
 
@@ -490,7 +554,11 @@ func TestSubtreeProcessor_MinimumSizeRespected(t *testing.T) {
 		stp.currentItemsPerFile = 4 // At minimum
 		
 		// Extremely low utilization that would normally trigger decrease
-		stp.subtreeNodeCounts = []int{1, 1, 1, 1, 1}
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 5; i++ {
+			r.Value = 1
+			r = r.Next()
+		}
 		stp.blockIntervals = []time.Duration{5 * time.Second}
 		
 		stp.adjustSubtreeSize()
