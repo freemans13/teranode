@@ -15,6 +15,7 @@ import (
 	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -29,11 +30,40 @@ const (
 )
 
 func TestCreatePingMessage(t *testing.T) {
-	msg, err := createPingMessage(baseURL)
-	require.NoError(t, err)
-	assert.Equal(t, asset_api.Type_PING.String(), msg.Type)
-	assert.Equal(t, baseURL, msg.BaseURL)
-	assert.NotEmpty(t, msg.Timestamp)
+	t.Run("with P2PNode", func(t *testing.T) {
+		// Create a mock P2PNode
+		mockP2PNode := new(MockServerP2PNode)
+		testPeerID, _ := peer.Decode("QmTestPeerID123")
+		mockP2PNode.On("HostID").Return(testPeerID)
+
+		// Create server with mock P2PNode
+		server := &Server{
+			P2PNode: mockP2PNode,
+			logger:  ulogger.New("test-server"),
+		}
+
+		msg, err := server.createPingMessage(baseURL)
+		require.NoError(t, err)
+		assert.Equal(t, asset_api.Type_PING.String(), msg.Type)
+		assert.Equal(t, baseURL, msg.BaseURL)
+		assert.Equal(t, testPeerID.String(), msg.PeerID)
+		assert.NotEmpty(t, msg.Timestamp)
+	})
+
+	t.Run("without P2PNode", func(t *testing.T) {
+		// Create server without P2PNode
+		server := &Server{
+			P2PNode: nil,
+			logger:  ulogger.New("test-server"),
+		}
+
+		msg, err := server.createPingMessage(baseURL)
+		require.NoError(t, err)
+		assert.Equal(t, asset_api.Type_PING.String(), msg.Type)
+		assert.Equal(t, baseURL, msg.BaseURL)
+		assert.Empty(t, msg.PeerID) // PeerID should be empty when P2PNode is nil
+		assert.NotEmpty(t, msg.Timestamp)
+	})
 }
 
 func TestBroadcastMessage(t *testing.T) {
@@ -142,14 +172,17 @@ func TestBroadcastMessage(t *testing.T) {
 }
 
 func TestHandleClientMessages(t *testing.T) {
-	s := &Server{
-		logger: &ulogger.TestLogger{},
-	}
-
 	t.Run("Normal operation", func(t *testing.T) {
+		s := &Server{
+			gCtx:   t.Context(),
+			logger: &ulogger.TestLogger{},
+		}
+
 		ch := make(chan []byte, 1)
 		deadClientCh := make(chan chan []byte, 1)
-		ws := &testWebSocketConn{t: t}
+		ws := &testWebSocketConn{
+			t: t,
+		}
 
 		done := make(chan struct{})
 		go func() {
@@ -170,6 +203,11 @@ func TestHandleClientMessages(t *testing.T) {
 	})
 
 	t.Run("Write error", func(t *testing.T) {
+		s := &Server{
+			gCtx:   t.Context(),
+			logger: &ulogger.TestLogger{},
+		}
+
 		ch := make(chan []byte, 1)
 		deadClientCh := make(chan chan []byte, 1)
 		ws := &testWebSocketConn{t: t, writeError: assert.AnError}
@@ -209,7 +247,7 @@ type testWebSocketConn struct {
 
 func (c *testWebSocketConn) WriteMessage(messageType int, data []byte) error {
 	c.writeCount++
-	c.t.Logf("WriteMessage called with data: %s", string(data))
+	c.t.Logf("WriteMessage called with message type %d, data: %s", messageType, string(data))
 
 	return c.writeError
 }
@@ -273,13 +311,25 @@ func TestStartNotificationProcessor(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		require.True(t, clientChannels.contains(clientCh), errClientNotAdded)
 
+		// First, drain the initial node_status message
+		select {
+		case msg := <-clientCh:
+			var initialMsg notificationMsg
+			err := json.Unmarshal(msg, &initialMsg)
+			require.NoError(t, err)
+			assert.Equal(t, "node_status", initialMsg.Type, "First message should be node_status")
+		case <-time.After(100 * time.Millisecond):
+			// No initial message is OK too if the server doesn't have a P2PNode
+		}
+
+		// Send our test notification
 		testNotification := &notificationMsg{
 			Type:    "test",
 			BaseURL: baseURL,
 		}
 		notificationCh <- testNotification
 
-		// Verify client received notification
+		// Verify client received the test notification
 		select {
 		case msg := <-clientCh:
 			var received notificationMsg
@@ -288,7 +338,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 			assert.Equal(t, testNotification.Type, received.Type, "Unexpected notification type")
 			assert.Equal(t, testNotification.BaseURL, received.BaseURL, "Unexpected notification baseURL")
 		case <-time.After(time.Second):
-			t.Fatal("Timeout waiting for notification")
+			t.Fatal("Timeout waiting for test notification")
 		}
 	})
 
@@ -346,6 +396,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 func TestHandleWebSocket(t *testing.T) {
 	// Create server with logger
 	s := &Server{
+		gCtx:   t.Context(),
 		logger: &ulogger.TestLogger{},
 	}
 
@@ -420,20 +471,34 @@ func TestHandleWebSocket(t *testing.T) {
 
 		t.Log("Connected to WebSocket server")
 
-		// Send test notification
+		// First, read the initial node_status message that's sent automatically
+		t.Log("Reading initial node_status message")
+		err = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+		require.NoError(t, err)
+
+		messageType, message, err := ws.ReadMessage()
+		require.NoError(t, err)
+		assert.Equal(t, websocket.TextMessage, messageType)
+
+		var initialMsg notificationMsg
+		err = json.Unmarshal(message, &initialMsg)
+		require.NoError(t, err)
+		assert.Equal(t, "node_status", initialMsg.Type, "First message should be node_status")
+
+		// Now send test notification
 		testNotification := &notificationMsg{
 			Type:    "test",
 			BaseURL: baseURL,
 		}
 		notificationCh <- testNotification
 
-		// Read response with timeout
+		// Read the test message
 		t.Log("Waiting for test message")
 
 		err = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
 		require.NoError(t, err)
 
-		messageType, message, err := ws.ReadMessage()
+		messageType, message, err = ws.ReadMessage()
 		require.NoError(t, err)
 		assert.Equal(t, websocket.TextMessage, messageType)
 

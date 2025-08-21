@@ -1,7 +1,7 @@
 <script lang="ts">
   import PageWithMenu from '$internal/components/page/template/menu/index.svelte'
   import { onMount, onDestroy } from 'svelte'
-  import { messages, sock, connectionAttempts } from '$internal/stores/p2pStore'
+  import { messages, sock, connectionAttempts, currentNodePeerID } from '$internal/stores/p2pStore'
   import { drawPeerNetwork, cleanupPeerNetwork } from './peerNetwork'
   import i18n from '$internal/i18n'
 
@@ -12,10 +12,9 @@
   let syncConnectionMap = new Map() // Store when we first connected to each sync peer
   let processedMessageCount = 0 // Track how many messages we've processed
   let hasReceivedMessages = false // Track if we've ever received any messages
-  let currentNodePeerID = '' // Store our node's peer ID
+  // currentNodePeerID is imported from the p2pStore
   let messageHashes = new Map() // Track message hashes to detect duplicates
   let mounted = false // Track if component is mounted
-  let firstNodeStatusReceived = false // Track if we've received the first node_status
 
   onMount(() => {
     mounted = true
@@ -25,7 +24,7 @@
       const nodes = Array.from(peerDataMap.values())
 
       if (vis && nodes.length > 0) {
-        drawPeerNetwork(vis, nodes, currentNodePeerID, syncConnectionMap)
+        drawPeerNetwork(vis, nodes, $currentNodePeerID, syncConnectionMap)
       }
     }
   })
@@ -44,8 +43,6 @@
     if (currentMessageCount < processedMessageCount) {
       peerDataMap.clear()
       processedMessageCount = 0
-      currentNodePeerID = ''
-      firstNodeStatusReceived = false
     }
 
     // Process only unprocessed messages
@@ -131,21 +128,17 @@
             uptime: msg.uptime,
             miner_name: msg.miner_name,
             listen_mode: msg.listen_mode,
+            chain_work: msg.chain_work,
             sync_peer_id: msg.sync_peer_id || null, // Explicitly set to null if undefined
             sync_peer_height: msg.sync_peer_height,
             sync_peer_block_hash: msg.sync_peer_block_hash,
             sync_connected_at: msg.sync_connected_at, // Now coming from server
+            client_name: msg.client_name || '', // Add client_name field
           })
           messageHashes.set(messageHash, Date.now())
           dataChanged = true
-
-          // The very first node_status message we receive is from our own node
-          // (sent immediately upon WebSocket connection)
-          if (!firstNodeStatusReceived) {
-            currentNodePeerID = peerId
-            firstNodeStatusReceived = true
-            console.log('Identified current node from first node_status:', currentNodePeerID)
-          }
+          
+          // Current node identification is now handled automatically in p2pStore
         }
       } else if (msg.type === 'miningon' || msg.type === 'mining_on') {
         // Check for duplicate miningOn
@@ -204,10 +197,10 @@
       const nodes = Array.from(peerDataMap.values())
 
       if (mounted && vis && nodes.length > 0) {
-        drawPeerNetwork(vis, nodes, currentNodePeerID, syncConnectionMap)
+        drawPeerNetwork(vis, nodes, $currentNodePeerID, syncConnectionMap)
       } else if (mounted && vis && nodes.length === 0) {
         // Clear the visualization if no nodes
-        drawPeerNetwork(vis, [], currentNodePeerID, syncConnectionMap)
+        drawPeerNetwork(vis, [], $currentNodePeerID, syncConnectionMap)
       }
     }
   }

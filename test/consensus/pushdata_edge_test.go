@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/stretchr/testify/require"
 )
@@ -13,11 +14,11 @@ import (
 // TestPushDataEdgeCases tests edge cases for PUSHDATA operations
 func TestPushDataEdgeCases(t *testing.T) {
 	tests := []struct {
-		name           string
-		scriptStr      string
-		expectedBytes  []byte
-		expectedError  bool
-		strictMode     bool
+		name          string
+		scriptStr     string
+		expectedBytes []byte
+		expectedError bool
+		strictMode    bool
 	}{
 		// PUSHDATA1 tests
 		{
@@ -56,7 +57,7 @@ func TestPushDataEdgeCases(t *testing.T) {
 			expectedBytes: nil,
 			expectedError: true,
 		},
-		
+
 		// PUSHDATA2 tests
 		{
 			name:          "PUSHDATA2 zero length",
@@ -88,7 +89,7 @@ func TestPushDataEdgeCases(t *testing.T) {
 			expectedBytes: nil,
 			expectedError: true,
 		},
-		
+
 		// PUSHDATA4 tests
 		{
 			name:          "PUSHDATA4 zero length",
@@ -108,7 +109,7 @@ func TestPushDataEdgeCases(t *testing.T) {
 			expectedBytes: append([]byte{0x4e, 0x00, 0x00, 0x01, 0x00}, makeBytes(65536)...),
 			expectedError: false,
 		},
-		
+
 		// Edge cases with unnecessary PUSHDATA usage
 		{
 			name:          "Unnecessary PUSHDATA1 for small push",
@@ -122,7 +123,7 @@ func TestPushDataEdgeCases(t *testing.T) {
 			expectedBytes: []byte{0x4d, 0x04, 0x00, 0x01, 0x02, 0x03, 0x04},
 			expectedError: false,
 		},
-		
+
 		// Mixed operations
 		{
 			name:          "PUSHDATA1 followed by opcode",
@@ -136,7 +137,7 @@ func TestPushDataEdgeCases(t *testing.T) {
 			expectedBytes: []byte{0x4c, 0x01, 0xff, 0x4c, 0x02, 0x01, 0x02},
 			expectedError: false,
 		},
-		
+
 		// Hex prefix edge cases
 		{
 			name:          "PUSHDATA1 decimal length",
@@ -145,7 +146,7 @@ func TestPushDataEdgeCases(t *testing.T) {
 			expectedError: false,
 		},
 	}
-	
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var parser *ScriptParser
@@ -154,15 +155,15 @@ func TestPushDataEdgeCases(t *testing.T) {
 			} else {
 				parser = NewScriptParser()
 			}
-			
+
 			result, err := parser.ParseScript(test.scriptStr)
-			
+
 			if test.expectedError {
 				require.Error(t, err, "Expected error for script: %s", test.scriptStr)
 			} else {
 				require.NoError(t, err, "Unexpected error for script: %s", test.scriptStr)
-				require.Equal(t, test.expectedBytes, result, 
-					"Mismatch for script: %s\nExpected: %x\nGot: %x", 
+				require.Equal(t, test.expectedBytes, result,
+					"Mismatch for script: %s\nExpected: %x\nGot: %x",
 					test.scriptStr, test.expectedBytes, result)
 			}
 		})
@@ -184,10 +185,10 @@ func TestPushDataBoundaries(t *testing.T) {
 			},
 			validateBytes: func(result []byte) error {
 				if len(result) != 76 { // 1 byte push opcode + 75 bytes data
-					return fmt.Errorf("expected 76 bytes, got %d", len(result))
+					return errors.NewProcessingError("expected 76 bytes, got %d", len(result))
 				}
 				if result[0] != 0x4b { // Direct push of 75 bytes
-					return fmt.Errorf("expected direct push opcode 0x4b, got 0x%02x", result[0])
+					return errors.NewProcessingError("expected direct push opcode 0x4b, got 0x%02x", result[0])
 				}
 				return nil
 			},
@@ -200,13 +201,13 @@ func TestPushDataBoundaries(t *testing.T) {
 			},
 			validateBytes: func(result []byte) error {
 				if len(result) != 78 { // 1 byte PUSHDATA1 + 1 byte length + 76 bytes data
-					return fmt.Errorf("expected 78 bytes, got %d", len(result))
+					return errors.NewProcessingError("expected 78 bytes, got %d", len(result))
 				}
 				if result[0] != 0x4c { // PUSHDATA1
-					return fmt.Errorf("expected PUSHDATA1 opcode 0x4c, got 0x%02x", result[0])
+					return errors.NewProcessingError("expected PUSHDATA1 opcode 0x4c, got 0x%02x", result[0])
 				}
 				if result[1] != 0x4c { // Length 76
-					return fmt.Errorf("expected length 76 (0x4c), got 0x%02x", result[1])
+					return errors.NewProcessingError("expected length 76 (0x4c), got 0x%02x", result[1])
 				}
 				return nil
 			},
@@ -219,13 +220,13 @@ func TestPushDataBoundaries(t *testing.T) {
 			},
 			validateBytes: func(result []byte) error {
 				if len(result) != 257 { // 1 byte PUSHDATA1 + 1 byte length + 255 bytes data
-					return fmt.Errorf("expected 257 bytes, got %d", len(result))
+					return errors.NewProcessingError("expected 257 bytes, got %d", len(result))
 				}
 				if result[0] != 0x4c { // PUSHDATA1
-					return fmt.Errorf("expected PUSHDATA1 opcode 0x4c, got 0x%02x", result[0])
+					return errors.NewProcessingError("expected PUSHDATA1 opcode 0x4c, got 0x%02x", result[0])
 				}
 				if result[1] != 0xff { // Length 255
-					return fmt.Errorf("expected length 255 (0xff), got 0x%02x", result[1])
+					return errors.NewProcessingError("expected length 255 (0xff), got 0x%02x", result[1])
 				}
 				return nil
 			},
@@ -238,28 +239,28 @@ func TestPushDataBoundaries(t *testing.T) {
 			},
 			validateBytes: func(result []byte) error {
 				if len(result) != 259 { // 1 byte PUSHDATA2 + 2 bytes length + 256 bytes data
-					return fmt.Errorf("expected 259 bytes, got %d", len(result))
+					return errors.NewProcessingError("expected 259 bytes, got %d", len(result))
 				}
 				if result[0] != 0x4d { // PUSHDATA2
-					return fmt.Errorf("expected PUSHDATA2 opcode 0x4d, got 0x%02x", result[0])
+					return errors.NewProcessingError("expected PUSHDATA2 opcode 0x4d, got 0x%02x", result[0])
 				}
 				// Check little-endian length
 				if result[1] != 0x00 || result[2] != 0x01 { // 256 = 0x0100 little-endian
-					return fmt.Errorf("expected length 256 (0x0001), got 0x%02x%02x", result[1], result[2])
+					return errors.NewProcessingError("expected length 256 (0x0001), got 0x%02x%02x", result[1], result[2])
 				}
 				return nil
 			},
 		},
 	}
-	
+
 	parser := NewScriptParser()
-	
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			script := test.buildScript()
 			result, err := parser.ParseScript(script)
 			require.NoError(t, err)
-			
+
 			if validateErr := test.validateBytes(result); validateErr != nil {
 				t.Error(validateErr)
 			}
@@ -270,79 +271,79 @@ func TestPushDataBoundaries(t *testing.T) {
 // TestPushDataMinimalEncoding tests MINIMALDATA flag enforcement
 func TestPushDataMinimalEncoding(t *testing.T) {
 	tests := []struct {
-		name        string
-		scriptHex   string
-		flags       uint32
-		shouldFail  bool
-		errorType   ScriptError
+		name       string
+		scriptHex  string
+		flags      uint32
+		shouldFail bool
+		errorType  ScriptError
 	}{
 		{
-			name:        "Direct push when should use direct push - valid",
-			scriptHex:   "01ff", // Push 1 byte using direct push
-			flags:       SCRIPT_VERIFY_MINIMALDATA,
-			shouldFail:  false,
+			name:       "Direct push when should use direct push - valid",
+			scriptHex:  "01ff", // Push 1 byte using direct push
+			flags:      SCRIPT_VERIFY_MINIMALDATA,
+			shouldFail: false,
 		},
 		{
-			name:        "PUSHDATA1 for 1 byte - invalid with MINIMALDATA",
-			scriptHex:   "4c01ff", // PUSHDATA1 pushing 1 byte
-			flags:       SCRIPT_VERIFY_MINIMALDATA,
-			shouldFail:  true,
-			errorType:   SCRIPT_ERR_MINIMALDATA,
+			name:       "PUSHDATA1 for 1 byte - invalid with MINIMALDATA",
+			scriptHex:  "4c01ff", // PUSHDATA1 pushing 1 byte
+			flags:      SCRIPT_VERIFY_MINIMALDATA,
+			shouldFail: true,
+			errorType:  SCRIPT_ERR_MINIMALDATA,
 		},
 		{
-			name:        "PUSHDATA1 for 75 bytes - invalid with MINIMALDATA",
-			scriptHex:   "4c4b" + makeHexString(75), // PUSHDATA1 pushing 75 bytes
-			flags:       SCRIPT_VERIFY_MINIMALDATA,
-			shouldFail:  true,
-			errorType:   SCRIPT_ERR_MINIMALDATA,
+			name:       "PUSHDATA1 for 75 bytes - invalid with MINIMALDATA",
+			scriptHex:  "4c4b" + makeHexString(75), // PUSHDATA1 pushing 75 bytes
+			flags:      SCRIPT_VERIFY_MINIMALDATA,
+			shouldFail: true,
+			errorType:  SCRIPT_ERR_MINIMALDATA,
 		},
 		{
-			name:        "PUSHDATA1 for 76 bytes - valid",
-			scriptHex:   "4c4c" + makeHexString(76), // PUSHDATA1 pushing 76 bytes
-			flags:       SCRIPT_VERIFY_MINIMALDATA,
-			shouldFail:  false,
+			name:       "PUSHDATA1 for 76 bytes - valid",
+			scriptHex:  "4c4c" + makeHexString(76), // PUSHDATA1 pushing 76 bytes
+			flags:      SCRIPT_VERIFY_MINIMALDATA,
+			shouldFail: false,
 		},
 		{
-			name:        "PUSHDATA2 for 255 bytes - invalid with MINIMALDATA",
-			scriptHex:   "4dff00" + makeHexString(255), // PUSHDATA2 pushing 255 bytes
-			flags:       SCRIPT_VERIFY_MINIMALDATA,
-			shouldFail:  true,
-			errorType:   SCRIPT_ERR_MINIMALDATA,
+			name:       "PUSHDATA2 for 255 bytes - invalid with MINIMALDATA",
+			scriptHex:  "4dff00" + makeHexString(255), // PUSHDATA2 pushing 255 bytes
+			flags:      SCRIPT_VERIFY_MINIMALDATA,
+			shouldFail: true,
+			errorType:  SCRIPT_ERR_MINIMALDATA,
 		},
 		{
-			name:        "PUSHDATA2 for 256 bytes - valid",
-			scriptHex:   "4d0001" + makeHexString(256), // PUSHDATA2 pushing 256 bytes
-			flags:       SCRIPT_VERIFY_MINIMALDATA,
-			shouldFail:  false,
+			name:       "PUSHDATA2 for 256 bytes - valid",
+			scriptHex:  "4d0001" + makeHexString(256), // PUSHDATA2 pushing 256 bytes
+			flags:      SCRIPT_VERIFY_MINIMALDATA,
+			shouldFail: false,
 		},
 		{
-			name:        "PUSHDATA4 for small push - invalid with MINIMALDATA",
-			scriptHex:   "4e04000000" + "01020304", // PUSHDATA4 pushing 4 bytes
-			flags:       SCRIPT_VERIFY_MINIMALDATA,
-			shouldFail:  true,
-			errorType:   SCRIPT_ERR_MINIMALDATA,
+			name:       "PUSHDATA4 for small push - invalid with MINIMALDATA",
+			scriptHex:  "4e04000000" + "01020304", // PUSHDATA4 pushing 4 bytes
+			flags:      SCRIPT_VERIFY_MINIMALDATA,
+			shouldFail: true,
+			errorType:  SCRIPT_ERR_MINIMALDATA,
 		},
 	}
-	
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			scriptBytes, err := hex.DecodeString(test.scriptHex)
 			require.NoError(t, err)
-			
+
 			// Create a script that uses the push and then drops it
 			script := bscript.NewFromBytes(scriptBytes)
-			script.AppendOpcodes(bscript.OpDROP)
-			script.AppendOpcodes(bscript.Op1) // Leave true on stack
-			
+			_ = script.AppendOpcodes(bscript.OpDROP)
+			_ = script.AppendOpcodes(bscript.Op1) // Leave true on stack
+
 			// Create test builder
 			tb := NewTestBuilder(script, test.name, test.flags, false, 0)
-			
+
 			if test.shouldFail {
 				tb.SetScriptError(test.errorType)
 			} else {
 				tb.SetScriptError(SCRIPT_ERR_OK)
 			}
-			
+
 			// Note: DoTest would need to be enhanced to handle MINIMALDATA validation
 			// For now, this test structure shows how it would be tested
 		})
@@ -381,14 +382,14 @@ func TestPushDataRawOpcodes(t *testing.T) {
 			expectedBytes: []byte{0x02, 0x01, 0x02, bscript.OpDUP, 0x01, 0xff},
 		},
 	}
-	
+
 	parser := NewScriptParser()
-	
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			result, err := parser.ParseScript(test.scriptStr)
 			require.NoError(t, err)
-			
+
 			if !bytes.Equal(result, test.expectedBytes) {
 				t.Errorf("Script parsing mismatch\nInput: %s\nExpected: %x\nGot: %x",
 					test.scriptStr, test.expectedBytes, result)

@@ -107,7 +107,7 @@ import (
 //   - Binary response size can be calculated as n * 80 bytes
 //   - Hex response size can be calculated as n * 160 characters
 //   - Default limit of 100 headers can be adjusted via 'n' parameter
-//   - Maximum limit of 1000 headers per request
+//   - Maximum limit of 10_000 headers per request
 func (h *HTTP) GetBlockHeadersToCommonAncestor(mode ReadMode) func(c echo.Context) error {
 	return func(c echo.Context) error {
 		hashStr := c.Param("hash")
@@ -131,6 +131,10 @@ func (h *HTTP) GetBlockHeadersToCommonAncestor(mode ReadMode) func(c echo.Contex
 		numberOfHeaders, err := h.parseNumberOfHeaders(c.QueryParam("n"))
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		if numberOfHeaders > 10_000 {
+			numberOfHeaders = 10_000
 		}
 
 		var (
@@ -195,8 +199,8 @@ func (h *HTTP) parseNumberOfHeaders(nStr string) (int, error) {
 		return 100, nil
 	}
 
-	if n > 1000 {
-		return 1000, nil
+	if n > 10_000 {
+		return 10_000, nil
 	}
 
 	return n, nil

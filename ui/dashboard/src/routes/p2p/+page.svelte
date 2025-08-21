@@ -63,11 +63,13 @@
   $: actualCollapseState = byPeer ? true : collapseMsgContent
 
   let byPeer = false
+  let rawMode = false // Toggle for showing raw JSON
   let filter = ''
   let showLocalMessages = false // Toggle for showing local messages (off by default)
   let groupedMessages: any = {}
   let filteredMessages: any[] = []
   let peers: string[] = []
+  let peerClientNames: { [key: string]: string } = {} // Map peer IDs to client names
 
   // Message type filter
   let messageTypeSet = new Set(['All'])
@@ -140,6 +142,7 @@
           message.base_url?.toLowerCase().includes(f) ||
           message.miner?.toLowerCase().includes(f) ||
           message.miner_name?.toLowerCase().includes(f) ||
+          message.client_name?.toLowerCase().includes(f) ||
           message.peer_id?.toLowerCase().includes(f) ||
           message.peerID?.toLowerCase().includes(f) ||
           message.peer?.toLowerCase().includes(f) ||
@@ -151,6 +154,7 @@
 
     if (byPeer) {
       let newGroupedMessages: any = {}
+      let newPeerClientNames: { [key: string]: string } = {}
 
       filteredMessages.forEach((message, index) => {
         // Compare with lowercase since we convert types to lowercase
@@ -162,6 +166,11 @@
             newGroupedMessages[peerId] = []
           }
           newGroupedMessages[peerId].push(message)
+          
+          // Extract client name if available and not already stored
+          if (!newPeerClientNames[peerId] && message.client_name) {
+            newPeerClientNames[peerId] = message.client_name
+          }
         } else {
         }
       })
@@ -175,6 +184,7 @@
       })
 
       groupedMessages = newGroupedMessages
+      peerClientNames = newPeerClientNames
     }
 
     peers = Object.keys(groupedMessages).length > 0 ? Object.keys(groupedMessages) : []
@@ -217,6 +227,15 @@
           labelAlignment="center"
         />
 
+        <Switch
+          size="small"
+          name="rawMode"
+          label="Raw JSON"
+          bind:checked={rawMode}
+          labelPlacement="left"
+          labelAlignment="center"
+        />
+
         <div class="filter-group">
           <span class="filter-label">Filter:</span>
           <Dropdown
@@ -245,11 +264,11 @@
     <div class="container">
       {#each peers as peer}
         <div class="column">
-          <div class="peer">
+          <div class="peer" title={peer}>
             <Typo
               variant="text"
               size="sm"
-              value={peer}
+              value={peerClientNames[peer] || '(not set)'}
               color="rgba(255, 255, 255, 0.66)"
               wrap={false}
             />
@@ -262,6 +281,7 @@
                 collapse={actualCollapseState}
                 titleMinW={actualCollapseState ? 'auto' : '80px'}
                 hidePeer={true}
+                {rawMode}
               />
             {/each}
           </div>
@@ -278,6 +298,7 @@
               source="p2p"
               collapse={actualCollapseState}
               titleMinW={actualCollapseState ? 'auto' : '120px'}
+              {rawMode}
             />
           {/each}
         </div>

@@ -1,6 +1,6 @@
 module github.com/bitcoin-sv/teranode
 
-go 1.24.5
+go 1.25.0
 
 replace github.com/in-toto/in-toto-golang => github.com/in-toto/in-toto-golang v0.9.0
 
@@ -15,7 +15,7 @@ require (
 	github.com/bitcoin-sv/go-sdk v1.1.21
 	github.com/bitcoin-sv/testcontainers-aerospike-go v0.2.2
 	github.com/bsv-blockchain/go-bt/v2 v2.4.6
-	github.com/bsv-blockchain/go-chaincfg v1.1.2
+	github.com/bsv-blockchain/go-chaincfg v1.3.0
 	github.com/bsv-blockchain/go-subtree v1.0.1
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
@@ -29,7 +29,7 @@ require (
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/greatroar/blobloom v0.8.0
 	github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus v1.1.0
-	github.com/jarcoal/httpmock v1.3.1
+	github.com/jarcoal/httpmock v1.4.1
 	github.com/jellydator/ttlcache/v3 v3.3.0
 	github.com/json-iterator/go v1.1.12
 	github.com/kpango/fastime v1.1.9
@@ -68,7 +68,7 @@ require (
 	golang.org/x/text v0.27.0 // indirect
 	golang.org/x/time v0.12.0
 	google.golang.org/grpc v1.74.2
-	google.golang.org/protobuf v1.36.6
+	google.golang.org/protobuf v1.36.7
 	gopkg.in/DataDog/dd-trace-go.v1 v1.67.0
 	k8s.io/api v0.33.3
 	k8s.io/apimachinery v0.33.3
@@ -155,14 +155,14 @@ require (
 
 require (
 	github.com/bitcoin-sv/alert-system v0.2.0
-	github.com/bsv-blockchain/go-batcher v1.0.0
+	github.com/bsv-blockchain/go-batcher v1.1.0
 	github.com/bsv-blockchain/go-bn v1.0.3
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p v1.2.1
 	github.com/bsv-blockchain/go-safe-conversion v1.0.1
 	github.com/bsv-blockchain/go-sdk v1.2.6
 	github.com/bsv-blockchain/go-tx-map v1.0.5
-	github.com/bsv-blockchain/go-wire v1.0.4
+	github.com/bsv-blockchain/go-wire v1.0.6
 	github.com/felixge/fgprof v0.9.5
 	github.com/gocarina/gocsv v0.0.0-20240520201108-78e41c74b4b1
 	github.com/libsv/go-p2p v0.3.3

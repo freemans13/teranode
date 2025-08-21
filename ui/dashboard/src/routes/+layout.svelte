@@ -111,6 +111,12 @@
         label: $i18n.t('page.network.menu-label'),
       },
       {
+        icon: 'icon-arrow-transfer-line',
+        iconSelected: 'icon-arrow-transfer-line',
+        path: '/ancestors',
+        label: $i18n.t('page.ancestors.menu-label'),
+      },
+      {
         icon: 'icon-bell-line',
         iconSelected: 'icon-bell-solid',
         path: '/updates',
@@ -140,7 +146,9 @@
       items = $pageLinks.items.map((route) => ({
         ...route,
         selected:
-          (pathname === '/' && route.path == '/') || pathname.indexOf(`${route.path}/`) === 0,
+          (pathname === '/' && route.path == '/') || 
+          pathname === route.path || 
+          pathname.indexOf(`${route.path}/`) === 0,
       }))
       $pageLinks.items = items
     }

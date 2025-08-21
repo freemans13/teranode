@@ -311,7 +311,12 @@
           "confirmations_value": "{{ count }} Confirmations",
           "sizeInBytes": "Tx Size",
           "fee_rate": "Fee Rate",
-          "fee_paid": "Fee Paid"
+          "fee_paid": "Fee Paid",
+          "blockHeight": "Block Height",
+          "subtree": "Subtree",
+          "fee": "Fee",
+          "lockTime": "Lock Time",
+          "type": "Transaction Type"
         }
       },
       "txs": {
@@ -349,16 +354,21 @@
       "menu-label": "Peers",
       "title": "Peer Network"
     },
+    "ancestors": {
+      "menu-label": "Ancestors"
+    },
     "network": {
       "menu-label": "Network",
       "live": "Live",
       "nodes": {
         "title": "Connected Nodes",
         "fields": {
+          "client_name": "Node",
           "base_url": "Address",
           "version": "Version",
           "fsm_state": "State",
           "height": "Height",
+          "chainwork_score": "Chainwork",
           "tx_assembly": "TX Assembly",
           "uptime": "Uptime",
           "tx_count": "TX Count",
@@ -366,6 +376,7 @@
           "miner": "Miner",
           "listen_mode": "Mode",
           "hash": "Latest hash",
+          "hash_and_miner": "Latest Block",
           "previousblockhash": "Previous hash",
           "receivedAt": "Last seen",
           "last_update": "Last Update"
@@ -420,6 +431,6 @@
   },
   "global": {
     "warning": "",
-    "warning_2": "---- Alpha Testing in Progress  Expect Breaks & Resets! ----"
+    "warning_2": ""
   }
 }

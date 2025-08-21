@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -61,8 +62,7 @@ import (
 )
 
 const (
-	banActionAdd  = "add" // Action constant for adding a ban
-	privateKeyKey = "p2p.privateKey"
+	banActionAdd = "add" // Action constant for adding a ban
 
 	// Default values for peer map cleanup
 	defaultPeerMapMaxSize         = 100000           // Maximum entries in peer maps
@@ -248,41 +248,57 @@ func NewServer(
 
 	privateKey := tSettings.P2P.PrivateKey
 
-	// Attempt to read the private key from the blockchain service if not provided in settings
-	var pk *crypto.PrivKey
+	// Attempt to get the private key if not provided in settings
+	// The private key can come from:
+	// 1. tSettings.P2P.PrivateKey (already loaded from config/environment)
+	// 2. Read from p2p.key file
+	// 3. Generate new key and save to p2p.key file
 	if privateKey == "" {
-		pk, err = readPrivateKey(ctx, blockchainClient)
-		if err != nil {
-			logger.Debugf("error reading private key: %v; will generate a new key instead", err)
-		}
-	}
-	// if found private key, encode it to hex and put it in config
-	if pk != nil {
-		// Get the raw private key bytes (32 bytes) and public key bytes (32 bytes)
-		// to create the 64-byte Ed25519 format expected by the p2p library
-		rawPriv, err := (*pk).Raw()
-		if err != nil {
-			return nil, errors.NewServiceError("error getting raw private key bytes", err)
-		}
+		// Construct the key file path (same directory as teranode_peers.json)
+		keyFilePath := getPeerCacheFilePath(tSettings.P2P.PeerCacheDir)
+		// Replace the filename from teranode_peers.json to p2p.key
+		keyFilePath = filepath.Join(filepath.Dir(keyFilePath), "p2p.key")
 
-		// Get the public key and its raw bytes
-		pubKey := (*pk).GetPublic()
-		rawPub, err := pubKey.Raw()
-		if err != nil {
-			return nil, errors.NewServiceError("error getting raw public key bytes", err)
-		}
+		if keyData, err := os.ReadFile(keyFilePath); err == nil {
+			// File exists, use its content
+			privateKey = strings.TrimSpace(string(keyData))
+			logger.Infof("[P2P] Loaded private key from file: %s", keyFilePath)
+		} else if os.IsNotExist(err) {
+			// File doesn't exist, generate new key and save it
+			logger.Infof("[P2P] Private key not found, generating new key...")
 
-		// Combine private (32 bytes) + public (32 bytes) = 64 bytes total
-		ed25519Key := append(rawPriv, rawPub...)
-		privateKey = hex.EncodeToString(ed25519Key)
-		logger.Infof("loaded existing P2P private key from database")
-	}
+			// Generate a new Ed25519 private key for libp2p
+			privKey, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+			if err != nil {
+				return nil, errors.NewServiceError("failed to generate P2P private key", err)
+			}
 
-	// If still no private key (not in settings and not in database), generate and store a new one
-	if privateKey == "" {
-		privateKey, err = generateAndStorePrivateKey(ctx, blockchainClient, logger)
-		if err != nil {
-			return nil, errors.NewServiceError("failed to generate and store private key", err)
+			// Get raw bytes for the hex format (private + public)
+			rawPriv, err := privKey.Raw()
+			if err != nil {
+				return nil, errors.NewServiceError("failed to get raw private key bytes", err)
+			}
+
+			pubKey := privKey.GetPublic()
+			rawPub, err := pubKey.Raw()
+			if err != nil {
+				return nil, errors.NewServiceError("failed to get raw public key bytes", err)
+			}
+
+			// Combine private (32 bytes) + public (32 bytes) = 64 bytes total
+			ed25519Key := append(rawPriv, rawPub...)
+			privateKey = hex.EncodeToString(ed25519Key)
+
+			// Save to file with secure permissions (0600)
+			if err := os.WriteFile(keyFilePath, []byte(privateKey), 0600); err != nil {
+				logger.Errorf("[P2P] Failed to save private key to file %s: %v", keyFilePath, err)
+				return nil, errors.NewServiceError(fmt.Sprintf("failed to save private key to file %s", keyFilePath), err)
+			}
+
+			logger.Infof("[P2P] Generated and saved new P2P private key to file: %s", keyFilePath)
+		} else {
+			// Some other error reading the file
+			return nil, errors.NewServiceError(fmt.Sprintf("error reading private key file %s", keyFilePath), err)
 		}
 	}
 
@@ -416,7 +432,7 @@ func NewServer(
 	}
 
 	// Initialize the sync manager for peer selection
-	p2pServer.syncManager = NewSyncManager(logger, tSettings.ChainCfgParams)
+	p2pServer.syncManager = NewSyncManager(logger, tSettings)
 
 	p2pServer.banManager = NewPeerBanManager(ctx, &myBanEventHandler{server: p2pServer}, tSettings)
 
@@ -685,6 +701,9 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 		// Start the SyncManager
 		s.syncManager.Start(ctx)
+
+		// Start a goroutine to process buffered announcements after initial sync period
+		go s.processBufferedAnnouncementsWhenReady(ctx)
 	}
 
 	// Send initial handshake (version)
@@ -992,15 +1011,17 @@ type NodeStatusMessage struct {
 	FSMState          string  `json:"fsm_state"`
 	StartTime         int64   `json:"start_time"`
 	Uptime            float64 `json:"uptime"`
-	MinerName         string  `json:"miner_name"`
+	ClientName        string  `json:"client_name"` // Name of this node client
+	MinerName         string  `json:"miner_name"`  // Name of the miner that mined the best block
 	ListenMode        string  `json:"listen_mode"`
+	ChainWork         string  `json:"chain_work"`                     // Chain work as hex string
 	SyncPeerID        string  `json:"sync_peer_id,omitempty"`         // ID of the peer we're syncing from
 	SyncPeerHeight    int32   `json:"sync_peer_height,omitempty"`     // Height of the sync peer
 	SyncPeerBlockHash string  `json:"sync_peer_block_hash,omitempty"` // Best block hash of the sync peer
 	SyncConnectedAt   int64   `json:"sync_connected_at,omitempty"`    // Unix timestamp when we first connected to this sync peer
 }
 
-func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, from string) {
+func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string) {
 	var nodeStatusMessage NodeStatusMessage
 	if err := json.Unmarshal(m, &nodeStatusMessage); err != nil {
 		s.logger.Errorf("[handleNodeStatusTopic] json unmarshal error: %v", err)
@@ -1011,13 +1032,13 @@ func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, from strin
 	isSelf := from == s.P2PNode.HostID().String()
 
 	// Log all received node_status messages for debugging
-	s.logger.Infof("[handleNodeStatusTopic] Received node_status from %s (peer_id: %s, is_self: %v, version: %s, height: %d)",
+	s.logger.Debugf("[handleNodeStatusTopic] Received node_status from %s (peer_id: %s, is_self: %v, version: %s, height: %d)",
 		from, nodeStatusMessage.PeerID, isSelf, nodeStatusMessage.Version, nodeStatusMessage.BestHeight)
 
 	// Skip further processing for our own messages (peer height updates, etc.)
 	// but still forward to WebSocket
 	if !isSelf {
-		s.logger.Infof("[handleNodeStatusTopic] Processing node_status from remote peer %s (peer_id: %s)", from, nodeStatusMessage.PeerID)
+		s.logger.Debugf("[handleNodeStatusTopic] Processing node_status from remote peer %s (peer_id: %s)", from, nodeStatusMessage.PeerID)
 	} else {
 		s.logger.Debugf("[handleNodeStatusTopic] forwarding our own node status (peer_id: %s) with is_self=true", nodeStatusMessage.PeerID)
 	}
@@ -1036,8 +1057,10 @@ func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, from strin
 		FSMState:          nodeStatusMessage.FSMState,
 		StartTime:         nodeStatusMessage.StartTime,
 		Uptime:            nodeStatusMessage.Uptime,
+		ClientName:        nodeStatusMessage.ClientName,
 		MinerName:         nodeStatusMessage.MinerName,
 		ListenMode:        nodeStatusMessage.ListenMode,
+		ChainWork:         nodeStatusMessage.ChainWork,
 		SyncPeerID:        nodeStatusMessage.SyncPeerID,
 		SyncPeerHeight:    nodeStatusMessage.SyncPeerHeight,
 		SyncPeerBlockHash: nodeStatusMessage.SyncPeerBlockHash,
@@ -1048,6 +1071,11 @@ func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, from strin
 	if !isSelf && nodeStatusMessage.BestHeight > 0 && nodeStatusMessage.PeerID != "" {
 		if peerID, err := peer.Decode(nodeStatusMessage.PeerID); err == nil {
 			s.P2PNode.UpdatePeerHeight(peerID, int32(nodeStatusMessage.BestHeight)) //nolint:gosec
+
+			// Update sync manager with peer height from node status
+			if s.syncManager != nil {
+				s.syncManager.UpdatePeerHeight(peerID, int32(nodeStatusMessage.BestHeight))
+			}
 		}
 	}
 }
@@ -1085,6 +1113,11 @@ func (s *Server) handleHandshakeTopic(ctx context.Context, m []byte, from string
 			s.logger.Debugf("[handleHandshakeTopic] Peer %s already has starting height set", peerID2.String())
 		}
 		s.P2PNode.UpdatePeerHeight(peerID2, int32(hs.BestHeight)) //nolint:gosec
+
+		// Update sync manager with peer height
+		if s.syncManager != nil {
+			s.syncManager.UpdatePeerHeight(peerID2, int32(hs.BestHeight))
+		}
 	}
 
 	s.logger.Infof("[handleHandshakeTopic] Message type: %s, from peer: %s, height: %d", hs.Type, hs.PeerID, hs.BestHeight)
@@ -1176,6 +1209,12 @@ func (s *Server) checkAndTriggerSync(hs p2p.HandshakeMessage, localHeight uint32
 		return
 	}
 
+	// Skip sending to Kafka during initial sync period - wait for sync peer selection to complete
+	if s.syncManager != nil && !s.syncManager.IsInitialSyncComplete() {
+		s.logger.Debugf("[checkAndTriggerSync] skipping height sync, initial sync period not complete")
+		return
+	}
+
 	// update peer height and store starting height if first time seeing this peer
 	peerID2, err := peer.Decode(hs.PeerID)
 	if err != nil {
@@ -1192,16 +1231,20 @@ func (s *Server) checkAndTriggerSync(hs p2p.HandshakeMessage, localHeight uint32
 	}
 	s.P2PNode.UpdatePeerHeight(peerID2, int32(hs.BestHeight)) //nolint:gosec
 
+	// Store the peer's best block hash for node status reporting
+	if hs.BestHash != "" {
+		s.peerBlockHashes.Store(peerID2, hs.BestHash)
+	}
+
 	// Update SyncManager with new peer height
 	// This will evaluate sync candidacy and potentially select this peer as sync peer
 	wasSelectedAsSyncPeer := false
 	if s.syncManager != nil {
 		wasSelectedAsSyncPeer = s.syncManager.UpdatePeerHeight(peerID2, int32(hs.BestHeight))
-	}
-
-	// Store the peer's best block hash for node status reporting
-	if hs.BestHash != "" {
-		s.peerBlockHashes.Store(peerID2, hs.BestHash)
+		// Log current sync state for debugging
+		if syncPeer := s.syncManager.GetSyncPeer(); syncPeer != "" {
+			s.logger.Debugf("[checkAndTriggerSync] Current sync peer: %s", syncPeer)
+		}
 	}
 
 	// Send to Kafka if this peer is ahead of us AND is our sync peer
@@ -1210,8 +1253,7 @@ func (s *Server) checkAndTriggerSync(hs p2p.HandshakeMessage, localHeight uint32
 		isSyncPeer := wasSelectedAsSyncPeer || (s.syncManager != nil && s.syncManager.IsSyncPeer(peerID2))
 
 		if isSyncPeer {
-			s.logger.Infof("[checkAndTriggerSync] Sync peer %s has higher block (%s) at height %d > %d, triggering sync via Kafka",
-				hs.PeerID, hs.BestHash, hs.BestHeight, localHeight)
+			s.logger.Infof("[checkAndTriggerSync] Sync peer %s has higher block (%s) at height %d > %d, triggering sync via Kafka", hs.PeerID, hs.BestHash, hs.BestHeight, localHeight)
 
 			// Send peer's block info to Kafka if we have a producer client
 			if s.blocksKafkaProducerClient != nil {
@@ -1236,12 +1278,10 @@ func (s *Server) checkAndTriggerSync(hs p2p.HandshakeMessage, localHeight uint32
 			}
 		} else {
 			// Peer is ahead but not our sync peer
-			s.logger.Debugf("[checkAndTriggerSync] Peer %s has higher block (%s) at height %d > %d, but is not sync peer",
-				hs.PeerID, hs.BestHash, hs.BestHeight, localHeight)
+			s.logger.Debugf("[checkAndTriggerSync] Peer %s has higher block (%s) at height %d > %d, but is not sync peer", hs.PeerID, hs.BestHash, hs.BestHeight, localHeight)
 		}
 	} else if hs.BestHash != "" && hs.BestHeight > 0 {
-		s.logger.Debugf("[checkAndTriggerSync] peer %s has block %s at height %d (our height: %d), not requesting",
-			hs.PeerID, hs.BestHash, hs.BestHeight, localHeight)
+		s.logger.Debugf("[checkAndTriggerSync] peer %s has block %s at height %d (our height: %d), not requesting", hs.PeerID, hs.BestHash, hs.BestHeight, localHeight)
 	}
 }
 
@@ -1425,7 +1465,9 @@ func (s *Server) publishNodeStatus(ctx context.Context) {
 	}
 }
 
-func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
+// getNodeStatusMessage creates a notification message with the current node's status.
+// This is used both for periodic broadcasts and for sending to newly connected WebSocket clients.
+func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 	// Get best block info
 	var bestBlockHeader *model.BlockHeader
 	var bestBlockMeta *model.BlockHeaderMeta
@@ -1458,7 +1500,18 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 
 	// TODO: Get actual tx count from block assembly service when API is available
 	txCountInAssembly := 0
-	minerName := s.settings.Coinbase.ArbitraryText // Get miner name from coinbase configuration
+
+	// Get client name from settings
+	clientName := ""
+	if s.settings != nil {
+		clientName = s.settings.ClientName
+	}
+
+	// Get miner name from the best block metadata
+	minerName := ""
+	if bestBlockMeta != nil {
+		minerName = bestBlockMeta.Miner
+	}
 
 	// Get block hash string
 	blockHashStr := ""
@@ -1473,6 +1526,12 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 	height := uint32(0)
 	if bestBlockMeta != nil {
 		height = bestBlockMeta.Height
+	}
+
+	// Get chainwork
+	chainWorkStr := ""
+	if bestBlockMeta != nil && bestBlockMeta.ChainWork != nil {
+		chainWorkStr = hex.EncodeToString(bestBlockMeta.ChainWork)
 	}
 
 	// Get sync peer information
@@ -1517,25 +1576,82 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 		}
 	}
 
-	// Create node status message
-	nodeStatusMessage := NodeStatusMessage{
+	// Get peer ID safely
+	peerID := ""
+	if s.P2PNode != nil {
+		peerID = s.P2PNode.HostID().String()
+	}
+
+	// Get version, commit, and listen mode safely
+	version := ""
+	commit := ""
+	listenMode := ""
+
+	if s.settings != nil {
+		version = s.settings.Version
+		commit = s.settings.Commit
+		listenMode = s.settings.P2P.ListenMode
+	}
+
+	// Get start time safely
+	startTime := int64(0)
+	if !s.startTime.IsZero() {
+		startTime = s.startTime.Unix()
+	}
+
+	// Return the notification message
+	return &notificationMsg{
+		Timestamp:         time.Now().UTC().Format(isoFormat),
 		Type:              "node_status",
 		BaseURL:           s.AssetHTTPAddressURL,
-		PeerID:            s.P2PNode.HostID().String(),
-		Version:           s.settings.Version,
-		CommitHash:        s.settings.Commit,
+		PeerID:            peerID,
+		Version:           version,
+		CommitHash:        commit,
 		BestBlockHash:     blockHashStr,
 		BestHeight:        height,
 		TxCountInAssembly: txCountInAssembly,
 		FSMState:          fsmState,
-		StartTime:         s.startTime.Unix(),
+		StartTime:         startTime,
 		Uptime:            uptime,
+		ClientName:        clientName,
 		MinerName:         minerName,
-		ListenMode:        s.settings.P2P.ListenMode,
+		ListenMode:        listenMode,
+		ChainWork:         chainWorkStr,
 		SyncPeerID:        syncPeerID,
 		SyncPeerHeight:    syncPeerHeight,
 		SyncPeerBlockHash: syncPeerBlockHash,
 		SyncConnectedAt:   syncConnectedAt,
+	}
+}
+
+func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
+	// Get the node status message
+	notificationMsg := s.getNodeStatusMessage(ctx)
+	if notificationMsg == nil {
+		return errors.NewError("failed to get node status message", nil)
+	}
+
+	// Create the NodeStatusMessage for P2P publishing
+	nodeStatusMessage := NodeStatusMessage{
+		Type:              "node_status",
+		BaseURL:           notificationMsg.BaseURL,
+		PeerID:            notificationMsg.PeerID,
+		Version:           notificationMsg.Version,
+		CommitHash:        notificationMsg.CommitHash,
+		BestBlockHash:     notificationMsg.BestBlockHash,
+		BestHeight:        notificationMsg.BestHeight,
+		TxCountInAssembly: notificationMsg.TxCountInAssembly,
+		FSMState:          notificationMsg.FSMState,
+		StartTime:         notificationMsg.StartTime,
+		Uptime:            notificationMsg.Uptime,
+		ClientName:        notificationMsg.ClientName,
+		MinerName:         notificationMsg.MinerName,
+		ListenMode:        notificationMsg.ListenMode,
+		ChainWork:         notificationMsg.ChainWork,
+		SyncPeerID:        notificationMsg.SyncPeerID,
+		SyncPeerHeight:    notificationMsg.SyncPeerHeight,
+		SyncPeerBlockHash: notificationMsg.SyncPeerBlockHash,
+		SyncConnectedAt:   notificationMsg.SyncConnectedAt,
 	}
 
 	msgBytes, err := json.Marshal(nodeStatusMessage)
@@ -1550,27 +1666,8 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 	}
 	s.logger.Debugf("[handleNodeStatusNotification] Successfully published node_status message")
 
-	// Also send to local WebSocket clients
-	s.notificationCh <- &notificationMsg{
-		Timestamp:         time.Now().UTC().Format(isoFormat),
-		Type:              "node_status",
-		BaseURL:           nodeStatusMessage.BaseURL,
-		PeerID:            nodeStatusMessage.PeerID,
-		Version:           nodeStatusMessage.Version,
-		CommitHash:        nodeStatusMessage.CommitHash,
-		BestBlockHash:     nodeStatusMessage.BestBlockHash,
-		BestHeight:        nodeStatusMessage.BestHeight,
-		TxCountInAssembly: nodeStatusMessage.TxCountInAssembly,
-		FSMState:          nodeStatusMessage.FSMState,
-		StartTime:         nodeStatusMessage.StartTime,
-		Uptime:            nodeStatusMessage.Uptime,
-		MinerName:         nodeStatusMessage.MinerName,
-		ListenMode:        nodeStatusMessage.ListenMode,
-		SyncPeerID:        nodeStatusMessage.SyncPeerID,
-		SyncPeerHeight:    nodeStatusMessage.SyncPeerHeight,
-		SyncPeerBlockHash: nodeStatusMessage.SyncPeerBlockHash,
-		SyncConnectedAt:   nodeStatusMessage.SyncConnectedAt,
-	}
+	// Send to local WebSocket clients
+	s.notificationCh <- notificationMsg
 
 	return nil
 }
@@ -1807,7 +1904,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, from string) {
 		return
 	}
 
-	s.logger.Debugf("[handleBlockTopic] got p2p block notification for %s from %s", blockMessage.Hash, blockMessage.PeerID)
+	s.logger.Debugf("[handleBlockTopic] got p2p block notification for %s from %s (originator: %s)", blockMessage.Hash, from, blockMessage.PeerID)
 
 	s.notificationCh <- &notificationMsg{
 		Timestamp: time.Now().UTC().Format(isoFormat),
@@ -1818,7 +1915,9 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, from string) {
 		PeerID:    blockMessage.PeerID,
 	}
 
-	if from == s.P2PNode.HostID().String() {
+	// Ignore our own messages - check both the immediate sender and the original peer
+	if from == s.P2PNode.HostID().String() || blockMessage.PeerID == s.P2PNode.HostID().String() {
+		s.logger.Debugf("[handleBlockTopic] ignoring own block message for %s", blockMessage.Hash)
 		return
 	}
 
@@ -1826,6 +1925,30 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, from string) {
 	if s.banManager.IsBanned(from) {
 		s.logger.Debugf("[handleBlockTopic] ignoring block notification from banned peer %s", from)
 		return
+	}
+
+	// Check if we should buffer this announcement during initial sync period
+	if s.syncManager != nil && !s.syncManager.IsInitialSyncComplete() {
+		s.logger.Infof("[handleBlockTopic] Initial sync not complete, buffering block announcement for %s from %s", blockMessage.Hash, from)
+		announcement := &BlockAnnouncement{
+			Hash:       blockMessage.Hash,
+			Height:     blockMessage.Height,
+			DataHubURL: blockMessage.DataHubURL,
+			PeerID:     blockMessage.PeerID,
+			From:       from,
+			Timestamp:  time.Now(),
+		}
+
+		if s.syncManager.BufferBlockAnnouncement(announcement) {
+			// Announcement was buffered, don't process it now
+			s.logger.Infof("[handleBlockTopic] Block announcement for %s buffered successfully", blockMessage.Hash)
+			return
+		}
+		s.logger.Warnf("[handleBlockTopic] Failed to buffer block announcement for %s", blockMessage.Hash)
+	} else if s.syncManager == nil {
+		s.logger.Debugf("[handleBlockTopic] SyncManager not initialized, processing block announcement normally")
+	} else {
+		s.logger.Debugf("[handleBlockTopic] Initial sync complete, processing block announcement normally")
 	}
 
 	hash, err = chainhash.NewHashFromStr(blockMessage.Hash)
@@ -1841,6 +1964,32 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, from string) {
 	}
 	s.blockPeerMap.Store(blockMessage.Hash, entry)
 	s.logger.Debugf("[handleBlockTopic] storing peer %s for block %s", from, blockMessage.Hash)
+
+	// Check if we're syncing and should discard this announcement
+	if s.syncManager != nil {
+		syncPeer := s.syncManager.GetSyncPeer()
+		if syncPeer != "" {
+			// We have a sync peer, check if we're syncing
+			if syncing, err := s.isBlockchainSynchingOrCatchingUp(s.gCtx); err == nil && syncing {
+				// Get sync peer's height through the sync manager
+				syncPeerHeight := s.syncManager.GetPeerHeight(syncPeer)
+
+				// Discard announcements from peers that are behind our sync peer
+				if blockMessage.Height < uint32(syncPeerHeight) {
+					s.logger.Debugf("[handleBlockTopic] Discarding block announcement at height %d from %s (below sync peer height %d)",
+						blockMessage.Height, from, syncPeerHeight)
+					return
+				}
+
+				// Also skip if it's not from our sync peer
+				peerID, err := peer.Decode(blockMessage.PeerID)
+				if err != nil || peerID != syncPeer {
+					s.logger.Debugf("[handleBlockTopic] Skipping block announcement for %s during sync (not from sync peer)", blockMessage.Hash)
+					return
+				}
+			}
+		}
+	}
 
 	// send block to kafka, if configured
 	if s.blocksKafkaProducerClient != nil {
@@ -1877,7 +2026,7 @@ func (s *Server) handleSubtreeTopic(ctx context.Context, m []byte, from string) 
 		return
 	}
 
-	s.logger.Debugf("[handleSubtreeTopic] got p2p subtree notification for %s from %s", subtreeMessage.Hash, subtreeMessage.PeerID)
+	s.logger.Debugf("[handleSubtreeTopic] got p2p subtree notification for %s from %s (originator: %s)", subtreeMessage.Hash, from, subtreeMessage.PeerID)
 
 	if s.isBlacklistedBaseURL(subtreeMessage.DataHubURL) {
 		s.logger.Errorf("[handleSubtreeTopic] Blocked subtree notification from blacklisted baseURL: %s", subtreeMessage.DataHubURL)
@@ -1892,7 +2041,9 @@ func (s *Server) handleSubtreeTopic(ctx context.Context, m []byte, from string) 
 		PeerID:    subtreeMessage.PeerID,
 	}
 
-	if from == s.P2PNode.HostID().String() {
+	// Ignore our own messages - check both the immediate sender and the original peer
+	if from == s.P2PNode.HostID().String() || subtreeMessage.PeerID == s.P2PNode.HostID().String() {
+		s.logger.Debugf("[handleSubtreeTopic] ignoring own subtree message for %s", subtreeMessage.Hash)
 		return
 	}
 
@@ -1998,7 +2149,7 @@ func (s *Server) handleMiningOnTopic(ctx context.Context, m []byte, from string)
 		return
 	}
 
-	s.logger.Debugf("[handleMiningOnTopic] got p2p mining on notification for %s from %s", miningOnMessage.Hash, miningOnMessage.PeerID)
+	s.logger.Debugf("[handleMiningOnTopic] got p2p mining on notification for %s from %s (originator: %s)", miningOnMessage.Hash, from, miningOnMessage.PeerID)
 
 	// Send to notification channel first (including our own messages for WebSocket clients)
 	s.logger.Debugf("[handleMiningOnTopic] sending mining_on message to notificationCh for WebSocket clients")
@@ -2015,18 +2166,72 @@ func (s *Server) handleMiningOnTopic(ctx context.Context, m []byte, from string)
 		TxCount:      miningOnMessage.TxCount,
 	}
 
-	// Skip further processing for our own messages
-	if from == s.P2PNode.HostID().String() {
+	// Skip further processing for our own messages - check both the immediate sender and the original peer
+	if from == s.P2PNode.HostID().String() || miningOnMessage.PeerID == s.P2PNode.HostID().String() {
+		s.logger.Debugf("[handleMiningOnTopic] ignoring own mining_on message for %s", miningOnMessage.Hash)
 		return
 	}
 
 	// add height to peer info
 	s.P2PNode.UpdatePeerHeight(peer.ID(miningOnMessage.PeerID), int32(miningOnMessage.Height)) //nolint:gosec
 
+	// Update sync manager with peer height from mining message
+	if s.syncManager != nil {
+		if peerID, err := peer.Decode(miningOnMessage.PeerID); err == nil {
+			s.syncManager.UpdatePeerHeight(peerID, int32(miningOnMessage.Height))
+		}
+	}
+
 	// Skip notifications from banned peers by PeerID
 	if s.banManager.IsBanned(from) {
 		s.logger.Debugf("[handleMiningOnTopic] got p2p mining on notification from banned peer %s", from)
 		return
+	}
+
+	// Check if we should buffer this announcement during initial sync period
+	if s.syncManager != nil && !s.syncManager.IsInitialSyncComplete() {
+		s.logger.Infof("[handleMiningOnTopic] Initial sync not complete, buffering mining_on announcement for %s from %s", miningOnMessage.Hash, from)
+		announcement := &BlockAnnouncement{
+			Hash:       miningOnMessage.Hash,
+			Height:     miningOnMessage.Height,
+			DataHubURL: miningOnMessage.DataHubURL,
+			PeerID:     miningOnMessage.PeerID,
+			From:       from,
+			Timestamp:  time.Now(),
+		}
+
+		if s.syncManager.BufferBlockAnnouncement(announcement) {
+			// Announcement was buffered, don't process it now
+			s.logger.Infof("[handleMiningOnTopic] Mining_on announcement for %s buffered successfully", miningOnMessage.Hash)
+			return
+		}
+		s.logger.Warnf("[handleMiningOnTopic] Failed to buffer mining_on announcement for %s", miningOnMessage.Hash)
+	}
+
+	// Check if we're syncing and should discard this announcement
+	if s.syncManager != nil {
+		syncPeer := s.syncManager.GetSyncPeer()
+		if syncPeer != "" {
+			// We have a sync peer, check if we're syncing
+			if syncing, err := s.isBlockchainSynchingOrCatchingUp(s.gCtx); err == nil && syncing {
+				// Get sync peer's height through the sync manager
+				syncPeerHeight := s.syncManager.GetPeerHeight(syncPeer)
+
+				// Discard announcements from peers that are behind our sync peer
+				if miningOnMessage.Height < uint32(syncPeerHeight) {
+					s.logger.Debugf("[handleMiningOnTopic] Discarding mining_on announcement at height %d from %s (below sync peer height %d)",
+						miningOnMessage.Height, from, syncPeerHeight)
+					return
+				}
+
+				// Also skip if it's not from our sync peer
+				peerID, err := peer.Decode(miningOnMessage.PeerID)
+				if err != nil || peerID != syncPeer {
+					s.logger.Debugf("[handleMiningOnTopic] Skipping mining_on announcement for %s during sync (not from sync peer)", miningOnMessage.Hash)
+					return
+				}
+			}
+		}
 	}
 
 	// Send peer's block info to Kafka if we have a producer client
@@ -2408,7 +2613,6 @@ func (s *Server) disconnectBannedPeerByID(ctx context.Context, peerID peer.ID, r
 	s.logger.Debugf("[disconnectBannedPeerByID] Peer %s not found in connected peers", peerID)
 }
 
-
 func (s *Server) getIPFromMultiaddr(ctx context.Context, maddr ma.Multiaddr) (net.IP, error) {
 	// try to get the IP address component
 	if ip, err := maddr.ValueForProtocol(ma.P_IP4); err == nil {
@@ -2684,6 +2888,105 @@ func (s *Server) startInvalidBlockConsumer(ctx context.Context) error {
 	return nil
 }
 
+// processBufferedAnnouncementsWhenReady waits for initial sync period to complete
+// then processes buffered block announcements based on whether we need a sync peer
+func (s *Server) processBufferedAnnouncementsWhenReady(ctx context.Context) {
+	// Wait for initial sync period to complete
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+			if s.syncManager.IsInitialSyncComplete() {
+				// Initial sync period is complete
+				announcements := s.syncManager.GetBufferedAnnouncements()
+
+				if len(announcements) == 0 {
+					s.logger.Debugf("[processBufferedAnnouncements] No buffered announcements to process")
+					return
+				}
+
+				// Check if we need a sync peer (meaning we're behind)
+				if s.syncManager.NeedsSyncPeer() {
+					syncPeer := s.syncManager.GetSyncPeer()
+
+					// Find the best block (highest height) from the sync peer
+					var bestAnnouncement *BlockAnnouncement
+					for _, announcement := range announcements {
+						if peer.ID(announcement.PeerID) == syncPeer {
+							if bestAnnouncement == nil || announcement.Height > bestAnnouncement.Height {
+								bestAnnouncement = announcement
+							}
+						}
+					}
+
+					if bestAnnouncement != nil {
+						s.logger.Infof("[processBufferedAnnouncements] Sending sync peer %s best block at height %d to Kafka (discarding %d other announcements)", syncPeer, bestAnnouncement.Height, len(announcements)-1)
+
+						// Send only the best block to Kafka
+						if s.blocksKafkaProducerClient != nil {
+							msg := &kafkamessage.KafkaBlockTopicMessage{
+								Hash: bestAnnouncement.Hash,
+								URL:  bestAnnouncement.DataHubURL,
+							}
+
+							value, err := proto.Marshal(msg)
+							if err != nil {
+								s.logger.Errorf("[processBufferedAnnouncements] error marshaling sync peer's best block: %v", err)
+							} else {
+								s.blocksKafkaProducerClient.Publish(&kafka.Message{
+									Value: value,
+								})
+
+								// Store in blockPeerMap
+								entry := peerMapEntry{
+									peerID:    bestAnnouncement.From,
+									timestamp: bestAnnouncement.Timestamp,
+								}
+								s.blockPeerMap.Store(bestAnnouncement.Hash, entry)
+							}
+						}
+					} else {
+						s.logger.Infof("[processBufferedAnnouncements] No announcements from sync peer %s in %d buffered announcements", syncPeer, len(announcements))
+					}
+				} else {
+					// We're caught up, process the buffered announcements
+					s.logger.Infof("[processBufferedAnnouncements] Processing %d buffered announcements", len(announcements))
+
+					for _, announcement := range announcements {
+						// Send to Kafka
+						if s.blocksKafkaProducerClient != nil {
+							msg := &kafkamessage.KafkaBlockTopicMessage{
+								Hash: announcement.Hash,
+								URL:  announcement.DataHubURL,
+							}
+
+							value, err := proto.Marshal(msg)
+							if err != nil {
+								s.logger.Errorf("[processBufferedAnnouncements] error marshaling KafkaBlockTopicMessage: %v", err)
+								continue
+							}
+
+							s.blocksKafkaProducerClient.Publish(&kafka.Message{
+								Value: value,
+							})
+
+							// Also store in blockPeerMap
+							entry := peerMapEntry{
+								peerID:    announcement.From,
+								timestamp: announcement.Timestamp,
+							}
+							s.blockPeerMap.Store(announcement.Hash, entry)
+						}
+					}
+				}
+
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) processInvalidBlockMessage(message *kafka.KafkaMessage) error {
 	ctx := context.Background()
 
@@ -2796,81 +3099,6 @@ func (s *Server) isBlockchainSynchingOrCatchingUp(ctx context.Context) (bool, er
 // Returns:
 //   - Pointer to the retrieved private key, or nil if no key exists
 //   - Error if storage access fails or key unmarshaling fails
-func readPrivateKey(ctx context.Context, blockchainClient blockchain.ClientI) (*crypto.PrivKey, error) {
-	// Read private key from the state store
-	if blockchainClient == nil {
-		return nil, errors.NewServiceError("error reading private key", nil)
-	}
-
-	privBytes, err := blockchainClient.GetState(ctx, privateKeyKey)
-	if err != nil {
-		return nil, err
-	}
-	// Unmarshal the private key bytes into a key
-	priv, err := crypto.UnmarshalPrivateKey(privBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	return &priv, nil
-}
-
-// generateAndStorePrivateKey generates a new Ed25519 private key and stores it to the blockchain state store.
-// This function creates a new cryptographic identity for the P2P node when no existing key is found.
-// The generated key is persisted to ensure the node maintains the same peer ID across restarts.
-//
-// Parameters:
-//   - ctx: Context for the operation, used for state store operations
-//   - blockchainClient: Client for accessing persistent key storage
-//   - logger: Logger for recording key generation events
-//
-// Returns:
-//   - Hex-encoded private key string ready for use in p2p.Config
-//   - Error if key generation or storage fails
-func generateAndStorePrivateKey(ctx context.Context, blockchainClient blockchain.ClientI, logger ulogger.Logger) (string, error) {
-	if blockchainClient == nil {
-		return "", errors.NewServiceError("blockchain client is nil, cannot store private key", nil)
-	}
-
-	// generate new Ed25519 private key
-	privateKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
-	if err != nil {
-		return "", errors.NewServiceError("failed to generate Ed25519 private key", err)
-	}
-
-	// marshal the private key to bytes for storage
-	keyBytes, err := crypto.MarshalPrivateKey(privateKey)
-	if err != nil {
-		return "", errors.NewServiceError("failed to marshal private key", err)
-	}
-
-	// store the private key in the blockchain state store
-	err = blockchainClient.SetState(ctx, privateKeyKey, keyBytes)
-	if err != nil {
-		return "", errors.NewServiceError("failed to store private key in database", err)
-	}
-
-	// Get the raw private key bytes (32 bytes) and public key bytes (32 bytes)
-	// to create the 64-byte Ed25519 format expected by the p2p library
-	rawPriv, err := privateKey.Raw()
-	if err != nil {
-		return "", errors.NewServiceError("failed to get raw private key bytes", err)
-	}
-
-	// Get the public key and its raw bytes
-	pubKey := privateKey.GetPublic()
-	rawPub, err := pubKey.Raw()
-	if err != nil {
-		return "", errors.NewServiceError("failed to get raw public key bytes", err)
-	}
-
-	// Combine private (32 bytes) + public (32 bytes) = 64 bytes total
-	ed25519Key := append(rawPriv, rawPub...)
-	hexKey := hex.EncodeToString(ed25519Key)
-	logger.Infof("generated and stored new P2P private key")
-
-	return hexKey, nil
-}
 
 // cleanupPeerMaps performs periodic cleanup of blockPeerMap and subtreePeerMap
 // It removes entries older than TTL and enforces size limits using LRU eviction

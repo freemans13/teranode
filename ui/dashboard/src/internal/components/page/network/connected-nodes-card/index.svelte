@@ -7,7 +7,7 @@
   import TableToggle from '$internal/components/table-toggle/index.svelte'
   import i18n from '$internal/i18n'
   import { tableVariant } from '$internal/stores/nav'
-  import { getColDefs, renderCells } from './data'
+  import { getColDefs, renderCells, getRenderProps } from './data'
 
   const pageKey = 'page.network.nodes'
 
@@ -77,7 +77,7 @@
   <Table
     name="nodes"
     {variant}
-    idField="base_url"
+    idField="peer_id"
     {colDefs}
     {data}
     pagination={{
@@ -88,7 +88,7 @@
     pager={false}
     expandUp={true}
     {renderCells}
-    getRenderProps={null}
+    {getRenderProps}
     getRowIconActions={null}
     on:action={() => {}}
   />
@@ -141,5 +141,70 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  
+  /* Highlight the current node name */
+  :global(.current-node-name) {
+    color: #4a9eff !important;
+    font-weight: bold;
+  }
+  
+  /* Column header alignments */
+  /* Version - explicitly left align */
+  :global(th:nth-child(2)),
+  :global(.th:nth-child(2)) {
+    text-align: left !important;
+  }
+  
+  :global(th:nth-child(2) .table-cell-row),
+  :global(.th:nth-child(2) .table-cell-row) {
+    text-align: left !important;
+    justify-content: flex-start !important;
+  }
+  
+  :global(th:nth-child(4)), /* Height - right align */
+  :global(.th:nth-child(4)),
+  :global(th:nth-child(6)), /* Chainwork - right align */
+  :global(.th:nth-child(6)),
+  :global(th:nth-child(7)), /* TX Assembly - right align */
+  :global(.th:nth-child(7)),
+  :global(th:nth-child(8)), /* Uptime - right align */
+  :global(.th:nth-child(8)),
+  :global(th:nth-child(10)), /* Last Update - right align */
+  :global(.th:nth-child(10)) {
+    text-align: right !important;
+  }
+  
+  :global(th:nth-child(4) .table-cell-row),
+  :global(.th:nth-child(4) .table-cell-row),
+  :global(th:nth-child(6) .table-cell-row),
+  :global(.th:nth-child(6) .table-cell-row),
+  :global(th:nth-child(7) .table-cell-row),
+  :global(.th:nth-child(7) .table-cell-row),
+  :global(th:nth-child(8) .table-cell-row),
+  :global(.th:nth-child(8) .table-cell-row),
+  :global(th:nth-child(10) .table-cell-row),
+  :global(.th:nth-child(10) .table-cell-row) {
+    justify-content: flex-end !important;
+  }
+  
+  /* Right-align numeric values */
+  :global(.num) {
+    text-align: right !important;
+    display: block !important;
+    width: 100% !important;
+  }
+  
+  :global(.chainwork-score-top) {
+    color: #15b241 !important;
+    font-weight: bold;
+    font-size: 16px;
+  }
+
+  :global(.chainwork-score-other) {
+    color: #ffd700 !important;
+    font-weight: bold;
+    font-size: 16px;
   }
 </style>

@@ -37,13 +37,15 @@ type notificationMsg struct {
 	Version           string  `json:"version,omitempty"`         // Node version
 	CommitHash        string  `json:"commit_hash,omitempty"`     // Git commit hash
 	BestBlockHash     string  `json:"best_block_hash,omitempty"` // Best block hash
-	BestHeight        uint32  `json:"best_height,omitempty"`     // Best block height
+	BestHeight        uint32  `json:"best_height"`               // Best block height
 	TxCountInAssembly int     `json:"tx_count_in_assembly"`      // Transaction count in block assembly
 	FSMState          string  `json:"fsm_state,omitempty"`       // FSM state
 	StartTime         int64   `json:"start_time,omitempty"`      // Node start time
 	Uptime            float64 `json:"uptime,omitempty"`          // Node uptime in seconds
-	MinerName         string  `json:"miner_name,omitempty"`      // Miner name
+	ClientName        string  `json:"client_name,omitempty"`     // Client name of this node
+	MinerName         string  `json:"miner_name,omitempty"`      // Miner name that mined the best block
 	ListenMode        string  `json:"listen_mode,omitempty"`     // Listen mode
+	ChainWork         string  `json:"chain_work,omitempty"`      // Chain work as hex string
 	// Sync peer fields
 	SyncPeerID        string `json:"sync_peer_id,omitempty"`         // ID of the peer we're syncing from
 	SyncPeerHeight    int32  `json:"sync_peer_height,omitempty"`     // Height of the sync peer
@@ -156,28 +158,49 @@ func (s *Server) broadcastMessage(data []byte, clientChannels *clientChannelMap)
 }
 
 // createPingMessage creates a ping notification message
-func createPingMessage(baseURL string) (*notificationMsg, error) {
-	return &notificationMsg{
+func (s *Server) createPingMessage(baseURL string) (*notificationMsg, error) {
+	msg := &notificationMsg{
 		Timestamp: time.Now().UTC().Format(isoFormat),
 		Type:      asset_api.Type_PING.String(),
 		BaseURL:   baseURL,
-	}, nil
+	}
+
+	// Add PeerID if P2PNode is available
+	if s.P2PNode != nil {
+		msg.PeerID = s.P2PNode.HostID().String()
+	}
+
+	return msg, nil
 }
 
 // handleClientMessages processes messages for a single websocket client
 func (s *Server) handleClientMessages(ws WebSocketConn, ch chan []byte, deadClientCh chan<- chan []byte) {
-	for data := range ch {
-		err := ws.WriteMessage(websocket.TextMessage, data)
-		if err != nil {
-			deadClientCh <- ch
-
-			if err.Error() == "write: connection reset by peer" {
-				s.logger.Infof("Connection Lost: %v", err)
-			} else {
-				s.logger.Errorf("Failed to Send notification WS message: %v", err)
+ClientMessageLoop:
+	for {
+		select {
+		case <-s.gCtx.Done():
+			// Global context is done, close the WebSocket connection
+			s.logger.Infof("Closing WebSocket connection due to global context cancellation")
+			return
+		case data := <-ch:
+			if data == nil {
+				s.logger.Warnf("Received nil data on client channel, closing connection")
+				deadClientCh <- ch
+				return
 			}
 
-			break
+			err := ws.WriteMessage(websocket.TextMessage, data)
+			if err != nil {
+				deadClientCh <- ch
+
+				if err.Error() == "write: connection reset by peer" {
+					s.logger.Infof("Connection Lost: %v", err)
+				} else {
+					s.logger.Errorf("Failed to Send notification WS message: %v", err)
+				}
+
+				break ClientMessageLoop
+			}
 		}
 	}
 }
@@ -200,10 +223,12 @@ func (s *Server) startNotificationProcessor(
 			return
 		case newClient := <-newClientCh:
 			clientChannels.add(newClient)
+			// Send initial node_status messages to the new client
+			s.sendInitialNodeStatuses(newClient)
 		case deadClient := <-deadClientCh:
 			clientChannels.remove(deadClient)
 		case <-pingTimer.C:
-			msg, err := createPingMessage(baseURL)
+			msg, err := s.createPingMessage(baseURL)
 			if err != nil {
 				s.logger.Errorf("Failed to create ping message: %v", err)
 				continue
@@ -228,6 +253,29 @@ func (s *Server) startNotificationProcessor(
 	}
 }
 
+// sendInitialNodeStatuses sends the current node's status to a newly connected client
+// This ensures the UI can identify which node is the current one
+func (s *Server) sendInitialNodeStatuses(clientCh chan []byte) {
+	// Always generate a fresh node_status message for our node
+	ourStatus := s.getNodeStatusMessage(context.Background())
+	if ourStatus == nil {
+		s.logger.Warnf("[sendInitialNodeStatuses] Failed to get current node status")
+		return
+	}
+
+	// Send our node's status as the first message
+	if data, err := json.Marshal(ourStatus); err == nil {
+		select {
+		case clientCh <- data:
+			s.logger.Debugf("[sendInitialNodeStatuses] Sent current node status (peer_id: %s) to new client", ourStatus.PeerID)
+		default:
+			s.logger.Warnf("[sendInitialNodeStatuses] Failed to send current node status - channel full")
+		}
+	} else {
+		s.logger.Errorf("[sendInitialNodeStatuses] Failed to marshal current node status: %v", err)
+	}
+}
+
 func (s *Server) HandleWebSocket(notificationCh chan *notificationMsg, baseURL string) func(c echo.Context) error {
 	clientChannels := newClientChannelMap()
 	newClientCh := make(chan chan []byte, 1_000)
@@ -246,15 +294,16 @@ func (s *Server) HandleWebSocket(notificationCh chan *notificationMsg, baseURL s
 			return err
 		}
 
-		// Add client channel to the processor
-		newClientCh <- ch
-
-		// Start message handling in a goroutine
+		// Start message handling goroutine FIRST
+		// This needs to be ready to process messages from the channel
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
 			s.handleClientMessages(ws, ch, deadClientCh)
 		}()
+
+		// Add client channel to the notification processor
+		newClientCh <- ch
 
 		// Wait for either context cancellation or message handling to complete
 		select {
