@@ -341,7 +341,13 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtreeHash chain
 	// Now store the buffered data to disk
 	err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, buffer.Bytes())
 	if err != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data: %v", err)
+		// If the subtree data already exists, that's fine - it means another node
+		// already stored this exact same subtree (same hash = same content)
+		if errors.Is(err, errors.ErrBlobAlreadyExists) {
+			u.logger.Debugf("[processSubtreeDataStream] subtree data already exists for %s, continuing", subtreeHash.String())
+		} else {
+			return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data: %v", err)
+		}
 	}
 
 	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s directly from stream",
