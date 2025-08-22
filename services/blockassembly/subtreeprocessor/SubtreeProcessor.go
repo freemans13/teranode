@@ -1152,18 +1152,6 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 		stp.subtreeNodeCounts = stp.subtreeNodeCounts.Next()
 	}
 
-	// Track the actual number of nodes in this subtree
-	// We don't exclude coinbase because:
-	// 1. Only the first subtree in a block has a coinbase
-	// 2. The coinbase is still a transaction that takes space
-	// 3. For sizing decisions, we care about total throughput
-	actualNodeCount := len(stp.currentSubtree.Nodes)
-	if actualNodeCount > 0 {
-		// Add to ring buffer (overwrites oldest value automatically)
-		stp.subtreeNodeCounts.Value = actualNodeCount
-		stp.subtreeNodeCounts = stp.subtreeNodeCounts.Next()
-	}
-
 	// Add the subtree to the chain
 	stp.chainedSubtrees = append(stp.chainedSubtrees, stp.currentSubtree)
 	stp.chainedSubtreeCount.Add(1)
