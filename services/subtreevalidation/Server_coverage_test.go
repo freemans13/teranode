@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bitcoin-sv/teranode/pkg/fileformat"
 	"github.com/bitcoin-sv/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bitcoin-sv/teranode/services/validator"
+	"github.com/bitcoin-sv/teranode/stores/blob"
 	"github.com/bitcoin-sv/teranode/stores/blob/memory"
 	"github.com/bitcoin-sv/teranode/stores/utxo"
 	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
@@ -464,8 +466,12 @@ func TestServerStop(t *testing.T) {
 // TestCheckSubtreeFromBlock tests the CheckSubtreeFromBlock method
 func TestCheckSubtreeFromBlock(t *testing.T) {
 	t.Run("error in checkSubtreeFromBlock", func(t *testing.T) {
+		mockSubtreeStore := &blob.MockStore{}
+		mockSubtreeStore.On("Exists", mock.Anything, mock.Anything, fileformat.FileTypeSubtree, mock.Anything).Return(false, nil)
+
 		server := &Server{
-			logger: ulogger.TestLogger{},
+			logger:       ulogger.TestLogger{},
+			subtreeStore: mockSubtreeStore,
 		}
 
 		request := &subtreevalidation_api.CheckSubtreeFromBlockRequest{
@@ -475,6 +481,7 @@ func TestCheckSubtreeFromBlock(t *testing.T) {
 		response, err := server.CheckSubtreeFromBlock(context.Background(), request)
 		require.Error(t, err)
 		require.Nil(t, response)
+		mockSubtreeStore.AssertExpectations(t)
 	})
 
 	t.Run("nil hash error", func(t *testing.T) {
@@ -643,9 +650,13 @@ func TestPublishInvalidSubtree(t *testing.T) {
 // TestCheckSubtreeFromBlockInternal tests the checkSubtreeFromBlock internal method
 func TestCheckSubtreeFromBlockInternal(t *testing.T) {
 	t.Run("missing base URL", func(t *testing.T) {
+		mockSubtreeStore := &blob.MockStore{}
+		mockSubtreeStore.On("Exists", mock.Anything, mock.Anything, fileformat.FileTypeSubtree, mock.Anything).Return(false, nil)
+
 		server := &Server{
-			logger: ulogger.TestLogger{},
-			stats:  gocore.NewStat("test"),
+			logger:       ulogger.TestLogger{},
+			stats:        gocore.NewStat("test"),
+			subtreeStore: mockSubtreeStore,
 		}
 
 		request := &subtreevalidation_api.CheckSubtreeFromBlockRequest{
@@ -656,6 +667,7 @@ func TestCheckSubtreeFromBlockInternal(t *testing.T) {
 		require.Error(t, err)
 		require.False(t, ok)
 		require.Contains(t, err.Error(), "Missing base URL")
+		mockSubtreeStore.AssertExpectations(t)
 	})
 
 	t.Run("invalid hash", func(t *testing.T) {

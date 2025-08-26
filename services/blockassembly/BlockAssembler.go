@@ -237,6 +237,12 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 
 	b.setCurrentRunningState(StateStarting)
 
+	// Set callback to clear mining candidate cache when subtree size changes
+	subtreeProcessor.SetOnSubtreeSizeChanged(func() {
+		b.invalidateMiningCandidateCache()
+		b.logger.Infof("[BlockAssembler] Mining candidate cache cleared after subtree resize")
+	})
+
 	return b, nil
 }
 
@@ -246,6 +252,14 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 //   - uint64: Total transaction count
 func (b *BlockAssembler) TxCount() uint64 {
 	return b.subtreeProcessor.TxCount()
+}
+
+// IsMiningPaused checks if mining operations should be paused.
+// This happens when the SubtreeProcessor is resizing subtrees to ensure
+// we don't create mining candidates with inconsistent subtree sizes.
+func (b *BlockAssembler) IsMiningPaused() bool {
+	state := b.subtreeProcessor.GetCurrentRunningState()
+	return state == subtreeprocessor.StateResizingSubtrees
 }
 
 // QueueLength returns the current length of the transaction queue.
@@ -392,6 +406,17 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
 			case responseCh := <-b.miningCandidateCh:
 				b.setCurrentRunningState(StateGetMiningCandidate)
 				// start, stat, _ := util.NewStatFromContext(context, "miningCandidateCh", channelStats)
+
+				// Check if mining is paused (e.g., during subtree resizing)
+				if b.IsMiningPaused() {
+					b.logger.Debugf("[BlockAssembler] Mining candidate request rejected - mining is paused")
+					utils.SafeSend(responseCh, &miningCandidateResponse{
+						err: errors.NewProcessingError("mining operations are paused"),
+					})
+					b.setCurrentRunningState(StateRunning)
+					continue
+				}
+
 				// wait for the reset to complete before getting a new mining candidate
 				// 2 blocks && at least 20 minutes
 
@@ -605,17 +630,29 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 
 	// Wait for any pending blocks to be processed before loading unmined transactions
 	if !b.skipWaitForPendingBlocks {
+		b.logger.Infof("[BlockAssembler] waiting for pending blocks to be processed...")
 		if err = b.waitForPendingBlocks(ctx); err != nil {
-			b.logger.Errorf("[BlockAssembler] failed to wait for pending blocks: %v", err)
+			if ctx.Err() != nil {
+				b.logger.Infof("[BlockAssembler] startup interrupted during waitForPendingBlocks: %v", ctx.Err())
+			} else {
+				b.logger.Errorf("[BlockAssembler] failed to wait for pending blocks: %v", err)
+			}
 			return
 		}
+		b.logger.Infof("[BlockAssembler] pending blocks processed, continuing startup...")
 	}
 
 	// Load unmined transactions (this includes cleanup of old unmined transactions first)
+	b.logger.Infof("[BlockAssembler] loading unmined transactions...")
 	if err = b.loadUnminedTransactions(ctx); err != nil {
-		b.logger.Errorf("[BlockAssembler] failed to load un-mined transactions: %v", err)
+		if ctx.Err() != nil {
+			b.logger.Infof("[BlockAssembler] startup interrupted during loadUnminedTransactions: %v", ctx.Err())
+		} else {
+			b.logger.Errorf("[BlockAssembler] failed to load un-mined transactions: %v", err)
+		}
 		return
 	}
+	b.logger.Infof("[BlockAssembler] unmined transactions loaded, continuing startup...")
 
 	b.startChannelListeners(ctx)
 
@@ -1375,7 +1412,21 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error
 	unminedTransactions := make([]*utxo.UnminedTransaction, 0, 1024*1024) // preallocate a large slice to avoid reallocations
 	lockedTransactions := make([]chainhash.Hash, 0, 1024)
 
+	// Add progress tracking
+	loadedCount := 0
+	lastLogTime := time.Now()
+
 	for {
+		// Check for context cancellation to allow interruption
+		select {
+		case <-ctx.Done():
+			b.logger.Warnf("[BlockAssembler] loading unmined transactions interrupted after %d transactions: %v",
+				loadedCount, ctx.Err())
+			return ctx.Err()
+		default:
+			// Continue processing
+		}
+
 		unminedTransaction, err := it.Next(ctx)
 		if err != nil {
 			return errors.NewProcessingError("error getting unmined transaction", err)
@@ -1386,12 +1437,21 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error
 		}
 
 		unminedTransactions = append(unminedTransactions, unminedTransaction)
+		loadedCount++
 
 		if unminedTransaction.Locked {
 			// if the transaction is locked, we need to add it to the locked transactions list, so we can unlock them
 			lockedTransactions = append(lockedTransactions, *unminedTransaction.Hash)
 		}
+
+		// Log progress every 10 seconds to show it's not stuck
+		if time.Since(lastLogTime) > 10*time.Second {
+			b.logger.Infof("[BlockAssembler] loaded %d unmined transactions so far...", loadedCount)
+			lastLogTime = time.Now()
+		}
 	}
+
+	b.logger.Infof("[BlockAssembler] loaded %d unmined transactions total", loadedCount)
 
 	// order the transactions by createdAt
 	sort.Slice(unminedTransactions, func(i, j int) bool {
@@ -1399,7 +1459,24 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error
 		return unminedTransactions[i].CreatedAt < unminedTransactions[j].CreatedAt
 	})
 
+	b.logger.Infof("[BlockAssembler] adding %d unmined transactions to subtree processor", len(unminedTransactions))
+
+	addedCount := 0
+	lastAddLogTime := time.Now()
+
 	for _, unminedTransaction := range unminedTransactions {
+		// Check for context cancellation more frequently (every 100 transactions)
+		if addedCount%100 == 0 {
+			select {
+			case <-ctx.Done():
+				b.logger.Warnf("[BlockAssembler] adding unmined transactions interrupted after %d/%d transactions: %v",
+					addedCount, len(unminedTransactions), ctx.Err())
+				return ctx.Err()
+			default:
+				// Continue processing
+			}
+		}
+
 		subtreeNode := subtree.SubtreeNode{
 			Hash:        *unminedTransaction.Hash,
 			Fee:         unminedTransaction.Fee,
@@ -1409,7 +1486,17 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error
 		if err = b.subtreeProcessor.AddDirectly(subtreeNode, unminedTransaction.TxInpoints, true); err != nil {
 			return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
 		}
+		addedCount++
+
+		// Log progress every 10 seconds
+		if time.Since(lastAddLogTime) > 10*time.Second {
+			b.logger.Infof("[BlockAssembler] added %d/%d unmined transactions to subtree processor...",
+				addedCount, len(unminedTransactions))
+			lastAddLogTime = time.Now()
+		}
 	}
+
+	b.logger.Infof("[BlockAssembler] successfully added all %d unmined transactions to subtree processor", addedCount)
 
 	// unlock any locked transactions
 	if len(lockedTransactions) > 0 {

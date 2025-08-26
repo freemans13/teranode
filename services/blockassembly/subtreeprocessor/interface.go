@@ -230,4 +230,12 @@ type Interface interface {
 	// DeDuplicateTransactions triggers deduplication of transactions in the processor.
 	// This removes duplicate transactions to maintain processing efficiency.
 	DeDuplicateTransactions()
+
+	// SetOnSubtreeSizeChanged sets a callback to be invoked when the subtree size changes.
+	// This is typically used to clear mining job caches that depend on subtree structure.
+	// The callback should be efficient as it may be called during block processing.
+	//
+	// Parameters:
+	//   - callback: Function to invoke when subtree size changes, can be nil to clear
+	SetOnSubtreeSizeChanged(callback func())
 }

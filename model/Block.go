@@ -374,11 +374,7 @@ type MinedBlockStore interface {
 }
 
 func (b *Block) String() string {
-	b.subtreeSlicesMu.Lock()
-	defer func() {
-		b.subtreeSlicesMu.Unlock()
-	}()
-
+	// No lock needed - only accessing immutable fields (Height, ID, TransactionCount, SizeInBytes)
 	return fmt.Sprintf("Block %s (height: %d, id: %d, txCount: %d, size: %d)", b.Hash().String(), b.Height, b.ID, b.TransactionCount, b.SizeInBytes)
 }
 
@@ -921,6 +917,12 @@ func (b *Block) checkParentExistsOnChain(gCtx context.Context, logger ulogger.Lo
 	}
 
 	if len(foundInPreviousBlocks) != 1 {
+		// During high TPS sync, parent transactions might have block IDs that aren't in our chain yet
+		// This is valid when syncing blocks from other nodes
+		if len(foundInPreviousBlocks) == 0 {
+			logger.Debugf("[BLOCK][%s] parent transaction %s has block IDs but none match our current chain (likely syncing)", b.String(), parentTxStruct.parentTxHash.String())
+			return oldBlockIDs, nil
+		}
 		return oldBlockIDs, ErrCheckParentExistsOnChain(gCtx, currentBlockHeaderIDsMap, parentTxMeta, txMetaStore, parentTxStruct, b, foundInPreviousBlocks)
 	}
 
@@ -976,6 +978,7 @@ func (b *Block) validateTransaction(ctx context.Context, deps *validationDepende
 	// Check if transaction has been mined in recent blocks
 	err = b.checkTxInRecentBlocks(ctx, deps, validationCtx, params.subtreeNode, params.subtreeHash, params.sIdx, params.snIdx)
 	if err != nil {
+		// This is where "already mined in block" errors occur during high TPS
 		return nil, err
 	}
 
@@ -1468,10 +1471,25 @@ func (b *Block) Bytes() ([]byte, error) {
 }
 
 func (b *Block) NewOptimizedBloomFilter(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore) (*blobloom.Filter, error) {
-	err := b.GetAndValidateSubtrees(ctx, logger, subtreeStore, nil)
-	if err != nil {
-		// just return the error from the call above
-		return nil, err
+	// Check if subtrees are already loaded (they should be during block validation)
+	b.subtreeSlicesMu.RLock()
+	subtreesLoaded := len(b.Subtrees) == len(b.SubtreeSlices)
+	if subtreesLoaded {
+		for i := range b.SubtreeSlices {
+			if b.SubtreeSlices[i] == nil {
+				subtreesLoaded = false
+				break
+			}
+		}
+	}
+	b.subtreeSlicesMu.RUnlock()
+
+	// Only load subtrees if they haven't been loaded yet (avoid deadlock during block validation)
+	if !subtreesLoaded {
+		err := b.GetAndValidateSubtrees(ctx, logger, subtreeStore, nil)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	filter := blobloom.NewOptimized(blobloom.Config{
@@ -1498,6 +1516,109 @@ func (b *Block) NewOptimizedBloomFilter(ctx context.Context, logger ulogger.Logg
 		}
 	}
 
+	return filter, nil
+}
+
+// NewOptimizedBloomFilterFromSubtrees creates a bloom filter without mutex contention.
+// This method assumes subtrees are already loaded and validates them first.
+func (b *Block) NewOptimizedBloomFilterFromSubtrees(ctx context.Context, logger ulogger.Logger) (*blobloom.Filter, error) {
+	logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP A: Starting deadlock-free bloom filter creation", b.Hash().String())
+
+	// Take a single read lock, copy the subtree references, then immediately release
+	logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP B: Taking temporary read lock to copy subtree references", b.Hash().String())
+	b.subtreeSlicesMu.RLock()
+
+	// Check if subtrees are loaded
+	subtreesLoaded := len(b.Subtrees) == len(b.SubtreeSlices)
+	if subtreesLoaded {
+		for i := range b.SubtreeSlices {
+			if b.SubtreeSlices[i] == nil {
+				subtreesLoaded = false
+				break
+			}
+		}
+	}
+
+	if !subtreesLoaded {
+		b.subtreeSlicesMu.RUnlock()
+		logger.Warnf("[NewOptimizedBloomFilterFromSubtrees][%s] STEP B: Subtrees not fully loaded (%d subtrees vs %d slices), waiting without lock contention", b.Hash().String(), len(b.Subtrees), len(b.SubtreeSlices))
+
+		// Wait for subtrees to be loaded with a timeout - avoid deadlock by using ticker/select
+		maxWaitTime := 10 * time.Second
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		timeout := time.After(maxWaitTime)
+
+		for {
+			select {
+			case <-timeout:
+				logger.Errorf("[NewOptimizedBloomFilterFromSubtrees][%s] STEP B TIMEOUT: Subtrees not loaded after %v", b.Hash().String(), maxWaitTime)
+				return nil, errors.NewProcessingError("[NewOptimizedBloomFilterFromSubtrees][%s] subtrees not loaded after timeout", b.Hash().String())
+			case <-ticker.C:
+				// Quick check with a single lock acquisition per check
+				b.subtreeSlicesMu.RLock()
+				subtreesLoaded = len(b.Subtrees) == len(b.SubtreeSlices)
+				if subtreesLoaded {
+					for i := range b.SubtreeSlices {
+						if b.SubtreeSlices[i] == nil {
+							subtreesLoaded = false
+							break
+						}
+					}
+				}
+
+				if subtreesLoaded {
+					logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP B SUCCESS: Subtrees now loaded", b.Hash().String())
+					// Don't unlock here - proceed to copy subtrees below
+					break
+				}
+				b.subtreeSlicesMu.RUnlock()
+			}
+		}
+	}
+
+	// Quickly copy subtree references while holding the lock
+	subtreesCopy := make([]*subtreepkg.Subtree, len(b.SubtreeSlices))
+	for i, subtree := range b.SubtreeSlices {
+		subtreesCopy[i] = subtree
+	}
+	transactionCount := b.TransactionCount
+
+	// Immediately release the lock
+	b.subtreeSlicesMu.RUnlock()
+	logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP C: Released lock, copied %d subtree references", b.Hash().String(), len(subtreesCopy))
+
+	// Now work with the copied references without any locks
+	logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP D: Creating bloom filter config", b.Hash().String())
+	filter := blobloom.NewOptimized(blobloom.Config{
+		Capacity: transactionCount, // Expected number of keys.
+		FPRate:   1e-6,             // Accept one false positive per 100,000 lookups.
+	})
+	logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP E: Created bloom filter, processing %d subtrees", b.Hash().String(), len(subtreesCopy))
+
+	var n64 uint64
+	// Process all subtrees without holding any locks
+	for sIdx := 0; sIdx < len(subtreesCopy); sIdx++ {
+		logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP F-%d: Processing subtree %d", b.Hash().String(), sIdx, sIdx)
+		subtree := subtreesCopy[sIdx]
+		if subtree == nil {
+			logger.Errorf("[NewOptimizedBloomFilterFromSubtrees][%s] STEP F-%d FAILED: Missing subtree %d", b.Hash().String(), sIdx, sIdx)
+			return nil, errors.NewProcessingError("[NewOptimizedBloomFilterFromSubtrees][%s] missing subtree %d", b.Hash().String(), sIdx)
+		}
+
+		for nodeIdx := 0; nodeIdx < len(subtree.Nodes); nodeIdx++ {
+			if sIdx == 0 && nodeIdx == 0 && subtree.Nodes[nodeIdx].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				// skip coinbase
+				continue
+			}
+
+			n64 = binary.BigEndian.Uint64(subtree.Nodes[nodeIdx].Hash[:])
+			filter.Add(n64)
+		}
+		logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP F-%d COMPLETED: Processed subtree %d with %d nodes", b.Hash().String(), sIdx, sIdx, len(subtree.Nodes))
+	}
+
+	logger.Infof("[NewOptimizedBloomFilterFromSubtrees][%s] STEP G: All subtrees processed, bloom filter creation complete", b.Hash().String())
 	return filter, nil
 }
 

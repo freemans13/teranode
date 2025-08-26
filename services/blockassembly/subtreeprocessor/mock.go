@@ -153,3 +153,8 @@ func (m *MockSubtreeProcessor) SetCurrentBlockHeader(blockHeader *model.BlockHea
 func (m *MockSubtreeProcessor) DeDuplicateTransactions() {
 	m.Called()
 }
+
+// SetOnSubtreeSizeChanged implements Interface.SetOnSubtreeSizeChanged
+func (m *MockSubtreeProcessor) SetOnSubtreeSizeChanged(callback func()) {
+	m.Called(callback)
+}

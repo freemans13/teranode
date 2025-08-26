@@ -258,6 +258,12 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 		return errors.NewServiceError("failed to init block assembler", err)
 	}
 
+	// Set callback to clear job cache when subtree size changes
+	ba.blockAssembler.subtreeProcessor.SetOnSubtreeSizeChanged(func() {
+		ba.logger.Infof("[BlockAssembly] Clearing job cache due to subtree size change")
+		ba.jobStore.DeleteAll()
+	})
+
 	// Apply the skip flag if it was set before Init
 	if ba.skipWaitForPendingBlocks {
 		ba.blockAssembler.SetSkipWaitForPendingBlocks(true)
@@ -379,7 +385,7 @@ func (ba *BlockAssembly) storeSubtreeMetaWithRetry(ctx context.Context, subtreeR
 			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree meta already exists", subtreeRetry.subtreeHash.String())
 		} else {
 			ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to retry store subtree meta: %s", subtreeRetry.subtreeHash.String(), err)
-			ba.handleRetryLogic(subtreeRetry, subtreeRetryChan, "subtree meta")
+			ba.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "subtree meta")
 		}
 	}
 
@@ -400,7 +406,7 @@ func (ba *BlockAssembly) storeSubtreeDataWithRetry(ctx context.Context, subtreeR
 			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree already exists", subtreeRetry.subtreeHash.String())
 		} else {
 			ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to retry store subtree: %s", subtreeRetry.subtreeHash.String(), err)
-			ba.handleRetryLogic(subtreeRetry, subtreeRetryChan, "subtree")
+			ba.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "subtree")
 		}
 	}
 
@@ -408,7 +414,7 @@ func (ba *BlockAssembly) storeSubtreeDataWithRetry(ctx context.Context, subtreeR
 }
 
 // handleRetryLogic manages the retry logic for failed storage operations.
-func (ba *BlockAssembly) handleRetryLogic(subtreeRetry *subtreeRetrySend, subtreeRetryChan chan *subtreeRetrySend, itemType string) {
+func (ba *BlockAssembly) handleRetryLogic(ctx context.Context, subtreeRetry *subtreeRetrySend, subtreeRetryChan chan *subtreeRetrySend, itemType string) {
 	if subtreeRetry.retries > 10 {
 		ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to retry store %s, retries exhausted", subtreeRetry.subtreeHash.String(), itemType)
 		return
@@ -417,7 +423,12 @@ func (ba *BlockAssembly) handleRetryLogic(subtreeRetry *subtreeRetrySend, subtre
 	subtreeRetry.retries++
 	go func() {
 		// backoff and wait before re-adding to retry queue
-		retry.BackoffAndSleep(subtreeRetry.retries, 2, time.Second)
+		// Use context.Background() for the goroutine since the parent context might be cancelled
+		// but we still want to complete the retry
+		if err := retry.BackoffAndSleep(context.Background(), subtreeRetry.retries, 2, time.Second); err != nil {
+			ba.logger.Debugf("[BlockAssembly:Init][%s] retry backoff cancelled: %v", subtreeRetry.subtreeHash.String(), err)
+			return
+		}
 
 		// re-add the subtree to the retry queue
 		subtreeRetryChan <- subtreeRetry
@@ -872,6 +883,12 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 	if !isRunning {
 		return nil, errors.WrapGRPC(errors.NewStateError("cannot get mining candidate when FSM is not in RUNNING state"))
 	}
+	
+	// Check if mining is paused due to resize
+	if ba.blockAssembler.IsMiningPaused() {
+		ba.logger.Warnf("[GetMiningCandidate] BLOCKED: Mining is paused during subtree resize operation")
+		return nil, errors.WrapGRPC(errors.NewProcessingError("Mining is currently paused for subtree resizing"))
+	}
 
 	includeSubtreeHashes := req.IncludeSubtrees
 
@@ -986,6 +1003,13 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	)
 
 	defer endSpan()
+	
+	// Check if mining is paused due to resize
+	if ba.blockAssembler.IsMiningPaused() {
+		ba.logger.Warnf("[submitMiningSolution] REJECTED: Mining is paused during subtree resize operation for job %s", jobID)
+		return &blockassembly_api.OKResponse{Ok: false}, 
+			errors.NewProcessingError("[submitMiningSolution] Mining is currently paused for subtree resizing")
+	}
 
 	storeID, err := chainhash.NewHash(req.SubmitMiningSolutionRequest.Id)
 	if err != nil {
