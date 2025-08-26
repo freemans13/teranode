@@ -423,10 +423,8 @@ func (ba *BlockAssembly) handleRetryLogic(ctx context.Context, subtreeRetry *sub
 	subtreeRetry.retries++
 	go func() {
 		// backoff and wait before re-adding to retry queue
-		// Use context.Background() for the goroutine since the parent context might be cancelled
-		// but we still want to complete the retry
-		if err := retry.BackoffAndSleep(context.Background(), subtreeRetry.retries, 2, time.Second); err != nil {
-			ba.logger.Debugf("[BlockAssembly:Init][%s] retry backoff cancelled: %v", subtreeRetry.subtreeHash.String(), err)
+		if err := retry.BackoffAndSleep(ctx, subtreeRetry.retries, 2, time.Second); err != nil {
+			ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: context cancelled", subtreeRetry.subtreeHash.String())
 			return
 		}
 
@@ -883,7 +881,7 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 	if !isRunning {
 		return nil, errors.WrapGRPC(errors.NewStateError("cannot get mining candidate when FSM is not in RUNNING state"))
 	}
-	
+
 	// Check if mining is paused due to resize
 	if ba.blockAssembler.IsMiningPaused() {
 		ba.logger.Warnf("[GetMiningCandidate] BLOCKED: Mining is paused during subtree resize operation")
@@ -1003,11 +1001,11 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	)
 
 	defer endSpan()
-	
+
 	// Check if mining is paused due to resize
 	if ba.blockAssembler.IsMiningPaused() {
 		ba.logger.Warnf("[submitMiningSolution] REJECTED: Mining is paused during subtree resize operation for job %s", jobID)
-		return &blockassembly_api.OKResponse{Ok: false}, 
+		return &blockassembly_api.OKResponse{Ok: false},
 			errors.NewProcessingError("[submitMiningSolution] Mining is currently paused for subtree resizing")
 	}
 
