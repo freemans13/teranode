@@ -254,8 +254,7 @@ func TestServerHandlers(t *testing.T) {
 	t.Run("Test stream handler behaviour", func(t *testing.T) {
 		// Create a minimal Server for testing
 		server := &Server{
-			logger: ulogger.New("test-server", ulogger.WithLevel("ERROR")),
-			gCtx:   context.Background(),
+			gCtx: context.Background(),
 		}
 
 		// Set up a flag to track if handleBlockTopic was called
@@ -264,7 +263,7 @@ func TestServerHandlers(t *testing.T) {
 		blockTopicSender := ""
 
 		// Set up a test handler function to capture calls
-		blockHandler := func(ctx context.Context, msg []byte, from string) {
+		blockHandler := func(_ context.Context, msg []byte, from string) {
 			blockTopicHandlerCalled = true
 			blockTopicMsg = msg
 			blockTopicSender = from
@@ -2819,7 +2818,7 @@ func TestNewServer_ConfigValidation(t *testing.T) {
 			tc.modify(s)
 
 			_, err := NewServer(ctx, logger, s,
-				nil, nil, nil, nil, nil, nil,
+				nil, nil, nil, nil, nil, nil, nil,
 			)
 
 			require.Error(t, err)
@@ -2850,7 +2849,7 @@ func TestPrivateKeyHandling(t *testing.T) {
 		// No expectations set
 
 		// Execute
-		server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil)
+		server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil, nil)
 
 		// Verify
 		require.NoError(t, err)
@@ -2863,6 +2862,7 @@ func TestPrivateKeyHandling(t *testing.T) {
 		mockClient := &blockchain.Mock{}
 
 		settings := createBaseTestSettings()
+		settings.P2P.PeerCacheDir = ""
 		settings.P2P.PrivateKey = "" // No key in settings
 		settings.P2P.StaticPeers = []string{}
 		settings.P2P.ListenAddresses = []string{"127.0.0.1"}
@@ -2870,7 +2870,7 @@ func TestPrivateKeyHandling(t *testing.T) {
 		// No blockchain client expectations - we don't use it for key storage anymore
 
 		// Execute
-		server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil)
+		server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil, nil)
 
 		// Verify
 		require.NoError(t, err)
@@ -2894,7 +2894,7 @@ func TestPrivateKeyHandling(t *testing.T) {
 		// No blockchain client expectations - we don't use it for key storage anymore
 
 		// Execute
-		_, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil)
+		_, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil, nil)
 
 		// Verify - should fail with invalid key
 		require.Error(t, err)
@@ -2984,7 +2984,7 @@ func TestServerInitHTTPPublicAddressSet(t *testing.T) {
 		Scheme: "sqlitememory",
 	}
 
-	server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil)
+	server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	err = server.Init(ctx)
@@ -3005,7 +3005,7 @@ func TestServerInitHTTPPublicAddressEmpty(t *testing.T) {
 		Scheme: "sqlitememory",
 	}
 
-	server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil)
+	server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	err = server.Init(ctx)
@@ -3025,7 +3025,7 @@ func TestServerSetupHTTPServer(t *testing.T) {
 		Scheme: "sqlitememory",
 	}
 
-	server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil)
+	server, err := NewServer(ctx, logger, settings, mockClient, nil, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	err = server.Init(ctx)
@@ -3124,7 +3124,7 @@ func TestServerStartFull(t *testing.T) {
 	// Ensure only one NAT manager is configured
 	settings.P2P.EnableNATPortMap = false
 
-	server, err := NewServer(ctx, logger, settings, mockBlockchain, nil, nil, mockRejectedKafka, mockBlocksProducer, mockSubtreeProducer)
+	server, err := NewServer(ctx, logger, settings, mockBlockchain, nil, nil, nil, mockRejectedKafka, mockBlocksProducer, mockSubtreeProducer)
 	require.NoError(t, err)
 
 	server.rejectedTxKafkaConsumerClient = mockRejectedKafka
