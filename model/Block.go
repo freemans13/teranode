@@ -73,6 +73,7 @@ type Block struct {
 	txMap           txmap.TxMap
 	medianTimestamp uint32
 	settings        *settings.Settings
+	mu              sync.RWMutex // protects TransactionCount and SizeInBytes during concurrent access
 }
 
 func NewBlock(header *BlockHeader, coinbase *bt.Tx, subtrees []*chainhash.Hash, transactionCount uint64, sizeInBytes uint64, blockHeight uint32, id uint32, optionalSettings *settings.Settings) (*Block, error) {
@@ -374,7 +375,8 @@ type MinedBlockStore interface {
 }
 
 func (b *Block) String() string {
-	// No lock needed - only accessing immutable fields (Height, ID, TransactionCount, SizeInBytes)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	return fmt.Sprintf("Block %s (height: %d, id: %d, txCount: %d, size: %d)", b.Hash().String(), b.Height, b.ID, b.TransactionCount, b.SizeInBytes)
 }
 
@@ -1240,9 +1242,11 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 		}
 	}
 
+	b.mu.Lock()
 	b.TransactionCount = txCount.Load()
 	// header + transaction count + size in bytes + coinbase tx size
 	b.SizeInBytes = sizeInBytes.Load() + 80 + util.VarintSize(b.TransactionCount) + uint64(b.CoinbaseTx.Size()) // nolint: gosec
+	b.mu.Unlock()
 
 	// TODO something with conflicts
 
