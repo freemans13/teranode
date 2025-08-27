@@ -1101,7 +1101,9 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 
 	// Calculate average subtree creation interval if we have data
 	var avgSubtreeInterval time.Duration
-	if len(stp.blockIntervals) > 0 {
+	stp.Lock()
+	blockIntervalsLen := len(stp.blockIntervals)
+	if blockIntervalsLen > 0 {
 		var sum time.Duration
 		validCount := 0
 		for _, interval := range stp.blockIntervals {
@@ -1114,6 +1116,7 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 			avgSubtreeInterval = sum / time.Duration(validCount)
 		}
 	}
+	stp.Unlock()
 
 	// Log when we have very low activity
 	if avgTPS < 10 || len(stp.recentBlockStats) < 3 {
@@ -1432,7 +1435,9 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 	prometheusSubtreeProcessorDynamicSubtreeSize.Set(float64(targetSize))
 
 	// Reset intervals for next block
+	stp.Lock()
 	stp.blockIntervals = make([]time.Duration, 0)
+	stp.Unlock()
 }
 
 // rebuildSubtreesWithNewSize rebuilds all existing subtrees with the new size to ensure
@@ -2714,11 +2719,13 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 
 		if stp.subtreesInBlock > 0 {
 			avgIntervalPerSubtree := blockDuration / time.Duration(stp.subtreesInBlock)
+			stp.Lock()
 			stp.blockIntervals = append(stp.blockIntervals, avgIntervalPerSubtree)
 
 			if len(stp.blockIntervals) > stp.maxBlockSamples {
 				stp.blockIntervals = stp.blockIntervals[1:]
 			}
+			stp.Unlock()
 		}
 	}
 
