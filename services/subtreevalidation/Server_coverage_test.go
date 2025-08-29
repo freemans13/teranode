@@ -303,7 +303,7 @@ func TestServerHealth(t *testing.T) {
 
 	t.Run("readiness check with no dependencies", func(t *testing.T) {
 		logger := ulogger.TestLogger{}
-		tSettings := test.CreateBaseTestSettings()
+		tSettings := test.CreateBaseTestSettings(t)
 		tSettings.SubtreeValidation.GRPCListenAddress = ""
 
 		server := &Server{
@@ -318,7 +318,7 @@ func TestServerHealth(t *testing.T) {
 
 	t.Run("readiness check with dependencies", func(t *testing.T) {
 		logger := ulogger.TestLogger{}
-		tSettings := test.CreateBaseTestSettings()
+		tSettings := test.CreateBaseTestSettings(t)
 		tSettings.SubtreeValidation.GRPCListenAddress = ""
 
 		utxoStore := &utxo.MockUtxostore{}
@@ -344,7 +344,7 @@ func TestServerHealth(t *testing.T) {
 
 	t.Run("readiness check with gRPC configured", func(t *testing.T) {
 		logger := ulogger.TestLogger{}
-		tSettings := test.CreateBaseTestSettings()
+		tSettings := test.CreateBaseTestSettings(t)
 		tSettings.SubtreeValidation.GRPCListenAddress = "localhost:8086"
 
 		server := &Server{
@@ -361,7 +361,7 @@ func TestServerHealth(t *testing.T) {
 // TestServerHealthGRPC tests the HealthGRPC method
 func TestServerHealthGRPC(t *testing.T) {
 	logger := ulogger.TestLogger{}
-	tSettings := test.CreateBaseTestSettings()
+	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.SubtreeValidation.GRPCListenAddress = ""
 
 	server := &Server{
@@ -488,7 +488,7 @@ func TestCheckSubtreeFromBlock(t *testing.T) {
 		server := &Server{
 			logger:                        ulogger.TestLogger{},
 			prioritySubtreeCheckActiveMap: make(map[string]bool),
-			settings:                      test.CreateBaseTestSettings(),
+			settings:                      test.CreateBaseTestSettings(t),
 		}
 
 		request := &subtreevalidation_api.CheckSubtreeFromBlockRequest{
@@ -515,7 +515,7 @@ func TestCheckSubtreeFromBlock(t *testing.T) {
 // TestServerProcessOrphans tests the processOrphans method
 func TestServerProcessOrphans(t *testing.T) {
 	logger := ulogger.TestLogger{}
-	tSettings := test.CreateBaseTestSettings()
+	tSettings := test.CreateBaseTestSettings(t)
 
 	server := &Server{
 		logger:          logger,
@@ -541,7 +541,7 @@ func TestInitialiseInvalidSubtreeKafkaProducer(t *testing.T) {
 	t.Run("successful initialization", func(t *testing.T) {
 		ctx := context.Background()
 		logger := ulogger.TestLogger{}
-		tSettings := test.CreateBaseTestSettings()
+		tSettings := test.CreateBaseTestSettings(t)
 		tSettings.Kafka.InvalidSubtrees = "invalid-subtrees-topic"
 
 		// Set up memory Kafka
@@ -556,7 +556,7 @@ func TestInitialiseInvalidSubtreeKafkaProducer(t *testing.T) {
 	t.Run("initialization with invalid URL", func(t *testing.T) {
 		ctx := context.Background()
 		logger := ulogger.TestLogger{}
-		tSettings := test.CreateBaseTestSettings()
+		tSettings := test.CreateBaseTestSettings(t)
 		tSettings.Kafka.InvalidSubtrees = "invalid-subtrees-topic"
 
 		// Use an invalid URL that will cause an error during producer creation

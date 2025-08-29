@@ -21,6 +21,7 @@ import (
 	"github.com/bitcoin-sv/teranode/stores/utxo"
 	utxosql "github.com/bitcoin-sv/teranode/stores/utxo/sql"
 	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bitcoin-sv/teranode/util/kafka"
 	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -145,7 +146,7 @@ func setup(t *testing.T) *testContext {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 
-	tSettings := test.CreateBaseTestSettings()
+	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.ChainCfgParams = &chaincfg.MainNetParams
 	// Clear the default addresses since we're not starting the servers in tests
 	tSettings.BlockChain.GRPCListenAddress = ""
@@ -239,7 +240,7 @@ func mockBlock(ctx *testContext, t *testing.T) *model.Block {
 	_, err = ctx.utxoStore.Create(context.Background(), tx1, 0)
 	require.NoError(t, err)
 
-	tSettings := test.CreateBaseTestSettings()
+	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.ChainCfgParams = &chaincfg.MainNetParams
 	hashPrevBlock := tSettings.ChainCfgParams.GenesisHash
 
@@ -388,7 +389,7 @@ func Test_getBlockHeadersToCommonAncestor(t *testing.T) {
 	headers := make([]*model.BlockHeader, 0, 150)
 
 	// Get genesis block hash from chain params
-	tSettings := test.CreateBaseTestSettings()
+	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.ChainCfgParams = &chaincfg.MainNetParams
 	prevHash := tSettings.ChainCfgParams.GenesisHash
 
@@ -614,7 +615,7 @@ func Test_GetLastNBlocks(t *testing.T) {
 	ctx := setup(t)
 
 	// Create and store unique blocks
-	tSettings := test.CreateBaseTestSettings()
+	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.ChainCfgParams = &chaincfg.MainNetParams
 	prevHash := tSettings.ChainCfgParams.GenesisHash
 
@@ -678,7 +679,7 @@ func Test_GetBlockHeadersFromCommonAncestor(t *testing.T) {
 	headers := make([]*model.BlockHeader, 0, 150)
 
 	// Get genesis block hash from chain params
-	tSettings := test.CreateBaseTestSettings()
+	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.ChainCfgParams = &chaincfg.MainNetParams
 	prevHash := tSettings.ChainCfgParams.GenesisHash
 
@@ -1035,4 +1036,79 @@ func Test_GetBlockLocator(t *testing.T) {
 		require.NotNil(t, response)
 		assert.NotNil(t, response.Locator)
 	})
+}
+
+func TestBlockchainStart(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+
+	// settings
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.ChainCfgParams = &chaincfg.MainNetParams
+	tSettings.BlockChain.GRPCListenAddress = ""
+	tSettings.BlockChain.HTTPListenAddress = ""
+
+	// in-store memory
+	storeURL, err := url.Parse("sqlitememory:///blockchain")
+	require.NoError(t, err)
+	blockchainStore, err := sql.New(logger, storeURL, tSettings)
+	require.NoError(t, err)
+
+	// kafka mock producer
+	mockProducer := kafka.NewKafkaAsyncProducerMock()
+
+	// Instantiate server passing mockProducer
+	server, err := New(ctx, logger, tSettings, blockchainStore, mockProducer)
+	require.NoError(t, err)
+	require.NotNil(t, server)
+
+	require.NoError(t, server.Init(ctx))
+
+	readyCh := make(chan struct{})
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = server.Start(runCtx, readyCh)
+	}()
+
+	select {
+	case <-readyCh:
+
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for blockchain server to start")
+	}
+
+	cancel()
+}
+
+func TestBlockchainStartGRPCError(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.ChainCfgParams = &chaincfg.MainNetParams
+
+	tSettings.BlockChain.HTTPListenAddress = "127.0.0.1:0"
+
+	tSettings.BlockChain.GRPCListenAddress = "bad:address"
+
+	storeURL, err := url.Parse("sqlitememory:///blockchain_error")
+	require.NoError(t, err)
+	blockchainStore, err := sql.New(logger, storeURL, tSettings)
+	require.NoError(t, err)
+
+	mockProducer := kafka.NewKafkaAsyncProducerMock()
+
+	server, err := New(ctx, logger, tSettings, blockchainStore, mockProducer)
+	require.NoError(t, err)
+
+	require.NoError(t, server.Init(ctx))
+
+	readyCh := make(chan struct{})
+	err = server.Start(ctx, readyCh)
+
+	require.Error(t, err)
+
+	require.Contains(t, err.Error(), "can't start GRPC server")
 }
