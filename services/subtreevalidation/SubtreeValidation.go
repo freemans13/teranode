@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -213,6 +214,14 @@ func (u *Server) DelTxMetaCacheMulti(ctx context.Context, hash *chainhash.Hash) 
 //   - []*bt.Tx: Slice of retrieved transactions
 //   - error: Any error encountered during retrieval
 func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash chainhash.Hash, txHashes []utxo.UnresolvedMetaData, baseURL string) ([]*bt.Tx, error) {
+	// Validate that baseURL is a proper HTTP/HTTPS URL and not a peer ID
+	parsedURL, err := url.Parse(baseURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		u.logger.Errorf("[getMissingTransactionsBatch][%s] Invalid baseURL '%s' - must be valid http/https URL, not peer ID",
+			subtreeHash.String(), baseURL)
+		return nil, errors.NewExternalError("[getMissingTransactionsBatch][%s] invalid baseURL - not a valid http/https URL", subtreeHash.String())
+	}
+
 	log := false
 
 	utxoStoreURL := u.settings.UtxoStore.UtxoStore
@@ -562,34 +571,9 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			return nil, nil
 		}
 
-		// The function was called by BlockFound, and we had not already blessed the subtree, so we load the subtree from the store to get the hashes
-		// get subtree from network over http using the baseUrl
-		retries := uint(0)
-
-	RetryLoop:
-		for retries < 3 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			default:
-				txHashes, err = u.getSubtreeTxHashes(ctx, stat, &v.SubtreeHash, v.BaseURL)
-				if err != nil {
-					if retries < 2 {
-						backoff := time.Duration(1<<retries) * time.Second
-						u.logger.Warnf("[ValidateSubtreeInternal][%s] failed to get subtree from network (try %d), will retry in %s", v.SubtreeHash.String(), retries, backoff.String())
-						select {
-						case <-ctx.Done():
-							return nil, ctx.Err()
-						case <-time.After(backoff):
-						}
-						retries++
-					} else {
-						return nil, errors.NewServiceError("[ValidateSubtreeInternal][%s] failed to get subtree from network", v.SubtreeHash.String(), err)
-					}
-				} else {
-					break RetryLoop
-				}
-			}
+		txHashes, err = u.getSubtreeTxHashes(ctx, stat, &v.SubtreeHash, v.BaseURL)
+		if err != nil {
+			return nil, errors.NewServiceError("[ValidateSubtreeInternal][%s] failed to get subtree from network", v.SubtreeHash.String(), err)
 		}
 	}
 
@@ -679,7 +663,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			// 2. ...then attempt to load the txMeta from the store (i.e - aerospike in production)
 			missed, err = u.processTxMetaUsingStore(ctx, txHashes, txMetaSlice, blockIds, batched, failFast)
 			if err != nil {
-				// Don't wrap the error again, processTxMetaUsingStore returns the correctly formated error.
+				// Don't wrap the error again, processTxMetaUsingStore returns the correctly formatted error.
 				return nil, err
 			}
 		}
@@ -1036,7 +1020,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 					errorsFound.Add(1)
 
 					lastErrorMu.Lock()
-					lastError = errors.NewProcessingError("[validateSubtree][%s] failed to bless missing transaction: %s: %v", subtreeHash.String(), tx.TxIDChainHash().String(), err)
+					lastError = errors.NewProcessingError("[validateSubtree][%s] failed to bless missing transaction: %s", subtreeHash.String(), tx.TxIDChainHash().String(), err)
 					lastErrorMu.Unlock()
 
 					// TODO handle storage and service errors differently
@@ -1184,14 +1168,15 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 
 	var missingTxs []missingTx
 
+	err = nil
+
 	if subtreeDataExists {
 		u.logger.Debugf("[validateSubtree][%s] fetching %d missing txs from subtreeData file", subtreeHash.String(), len(missingTxHashes))
 
 		missingTxs, err = u.getMissingTransactionsFromFile(ctx, subtreeHash, missingTxHashes, allTxs)
-		if err != nil {
-			return nil, errors.NewProcessingError("[validateSubtree][%s] failed to get missing transactions from subtreeData", subtreeHash.String(), err)
-		}
-	} else {
+	}
+
+	if !subtreeDataExists || err != nil {
 		u.logger.Debugf("[validateSubtree][%s] fetching %d missing txs", subtreeHash.String(), len(missingTxHashes))
 
 		missingTxs, err = u.getMissingTransactionsFromPeer(ctx, subtreeHash, missingTxHashes, baseURL)
@@ -1299,8 +1284,9 @@ func (u *Server) prepareTxsPerLevel(ctx context.Context, transactions []missingT
 			if parentWrapper, exists := txMap[parentHash]; exists {
 				wrapper.someParentsInBlock = true
 				// Update the maximum parent level found
-				if parentWrapper.childLevelInBlock >= maxParentLevel {
-					maxParentLevel = parentWrapper.childLevelInBlock + 1 // Increment to account for the current transaction level
+				// Child must be at one level higher than its highest parent
+				if parentWrapper.childLevelInBlock+1 > maxParentLevel {
+					maxParentLevel = parentWrapper.childLevelInBlock + 1
 				}
 			}
 		}

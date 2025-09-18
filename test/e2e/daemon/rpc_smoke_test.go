@@ -17,7 +17,6 @@ import (
 	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/go-subtree"
@@ -124,19 +123,15 @@ func TestSendTxAndCheckState(t *testing.T) {
 
 	block := td.MineAndWait(t, 1)
 
-	err = block.GetAndValidateSubtrees(ctx, td.Logger, td.SubtreeStore, nil)
+	err = block.GetAndValidateSubtrees(ctx, td.Logger, td.SubtreeStore)
 	require.NoError(t, err)
 
 	err = block.CheckMerkleRoot(ctx)
 	require.NoError(t, err)
 
-	fallbackGetFunc := func(subtreeHash chainhash.Hash) error {
-		return block.SubTreesFromBytes(subtreeHash[:])
-	}
-
 	var subtree []*subtree.Subtree
 
-	subtree, err = block.GetSubtrees(ctx, td.Logger, td.SubtreeStore, fallbackGetFunc)
+	subtree, err = block.GetSubtrees(ctx, td.Logger, td.SubtreeStore)
 	require.NoError(t, err)
 
 	blFound := false
@@ -274,8 +269,7 @@ func TestShouldNotProcessNonFinalTx(t *testing.T) {
 
 	// Generate initial blocks
 	// CSVHeight is the block height at which the CSV rules are activated including lock time
-	_, err = td.CallRPC(td.Ctx, "generate", []any{tSettings.ChainCfgParams.CSVHeight + 1})
-	require.NoError(t, err)
+	td.MineAndWait(t, tSettings.ChainCfgParams.CSVHeight+1)
 
 	block1, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 1)
 	require.NoError(t, err)
@@ -353,8 +347,7 @@ func TestShouldRejectOversizedTx(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate initial blocks to get coinbase funds
-	_, err = td.CallRPC(td.Ctx, "generate", []any{101})
-	require.NoError(t, err)
+	td.MineBlocks(t, 101)
 
 	// Get the policy settings to know the max tx size
 	maxTxSize := td.Settings.Policy.MaxTxSizePolicy
@@ -444,8 +437,7 @@ func TestShouldRejectOversizedScript(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate initial blocks to get coinbase funds
-	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{101})
-	require.NoError(t, err)
+	td.MineBlocks(t, 101)
 
 	// Get the policy settings to know the max script size
 	maxScriptSize := td.Settings.Policy.MaxScriptSizePolicy
@@ -529,8 +521,7 @@ func TestShouldAllowChainedTransactionsUseRpc(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate initial blocks
-	_, err = td.CallRPC(td.Ctx, "generate", []any{101})
-	require.NoError(t, err)
+	td.MineBlocks(t, 101)
 
 	tSettings := td.Settings
 
@@ -582,8 +573,7 @@ func TestShouldAllowChainedTransactionsUseRpc(t *testing.T) {
 	waitForBlockAssemblyToProcessTx(t, td, tx1.TxIDChainHash().String())
 
 	// Generate one block to include TX1
-	_, err = td.CallRPC(td.Ctx, "generate", []any{1})
-	require.NoError(t, err)
+	td.MineBlocks(t, 1)
 
 	// Create second recipient's key pair
 	privateKey2, err := bec.NewPrivateKey()
@@ -623,25 +613,20 @@ func TestShouldAllowChainedTransactionsUseRpc(t *testing.T) {
 	waitForBlockAssemblyToProcessTx(t, td, tx2.TxIDChainHash().String())
 
 	// Generate one block to include TX2
-	_, err = td.CallRPC(td.Ctx, "generate", []any{1})
-	require.NoError(t, err)
+	td.MineBlocks(t, 1)
 
 	// Get the block containing TX2 (should be at height 103)
 	block103, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 103)
 	require.NoError(t, err)
 
 	// Verify block103 contains TX2
-	err = block103.GetAndValidateSubtrees(td.Ctx, td.Logger, td.SubtreeStore, nil)
+	err = block103.GetAndValidateSubtrees(td.Ctx, td.Logger, td.SubtreeStore)
 	require.NoError(t, err)
 
 	err = block103.CheckMerkleRoot(td.Ctx)
 	require.NoError(t, err)
 
-	fallbackGetFunc := func(subtreeHash chainhash.Hash) error {
-		return block103.SubTreesFromBytes(subtreeHash[:])
-	}
-
-	subtree, err := block103.GetSubtrees(td.Ctx, td.Logger, td.SubtreeStore, fallbackGetFunc)
+	subtree, err := block103.GetSubtrees(td.Ctx, td.Logger, td.SubtreeStore)
 	require.NoError(t, err)
 
 	tx2Found := false
@@ -674,8 +659,7 @@ func TestDoubleInput(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate initial blocks to get coinbase funds
-	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{101})
-	require.NoError(t, err)
+	td.MineBlocks(t, 101)
 
 	// Create a transaction with an oversized script
 	block1, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 1)

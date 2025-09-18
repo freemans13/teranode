@@ -905,11 +905,11 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 		MiningCandidate: miningCandidate,
 	}, jobTTL) // create a new job with a TTL, will be cleaned up automatically
 
-	// decouple the tracing context to not cancel the context when the subtree DAH is being saved in the background
-	decoupledCtx, _, endSpan := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleMiningOn")
-	defer endSpan()
-
 	go func() {
+		// decouple the tracing context to not cancel the context when the subtree DAH is being saved in the background
+		decoupledCtx, _, endSpan := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleMiningOn")
+		defer endSpan()
+
 		previousHash, err := chainhash.NewHash(miningCandidate.PreviousHash)
 		if err != nil {
 			ba.logger.Errorf("failed to convert previous hash: %s", err)
@@ -933,6 +933,13 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 			miningCandidate.SubtreeHashes[i] = subtree.RootHash()[:]
 		}
 	}
+
+	ba.logger.Infof("[GetMiningCandidate][%s] returning mining candidate with %d transactions, %d subtrees, total size %d bytes",
+		utils.ReverseAndHexEncodeSlice(miningCandidate.Id),
+		miningCandidate.NumTxs+1, // +1 for coinbase
+		len(miningCandidate.SubtreeHashes),
+		miningCandidate.SizeWithoutCoinbase,
+	)
 
 	return miningCandidate, nil
 }
@@ -1138,73 +1145,52 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		SubtreeSlices:    job.Subtrees,
 	}
 
-	startTime := time.Now()
+	// set the settings on the block for validation
+	block.SetSettings(ba.settings)
 
-	ba.logger.Infof("[BlockAssembly][%s][%s] validating block", jobID, block.Header.Hash())
 	// check fully valid, including whether difficulty in header is low enough
-	if ok, err := block.Valid(ctx, ba.logger, nil, nil, nil, nil, nil, nil, nil); !ok {
+	// TODO add more checks to the Valid function, like whether the parent/child relationships are OK
+	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, nil, nil); !ok {
 		ba.logger.Errorf("[BlockAssembly][%s][%s] invalid block: %v - %v", jobID, block.Hash().String(), block.Header, err)
+
+		// the subtreeprocessor created an invalid block, we must reset
+		ba.blockAssembler.Reset()
+
+		// remove the job, we cannot use it anymore
+		ba.jobStore.Delete(*storeID)
+
 		return nil, errors.NewProcessingError("[BlockAssembly][%s][%s] invalid block", jobID, block.Hash().String(), err)
 	}
 
-	ba.logger.Infof("[BlockAssembly][%s][%s] validating block DONE in %s", jobID, block.Header.Hash(), time.Since(startTime).String())
+	// decouple the tracing context to not cancel the context when the block is being saved, even if we cancel the request
+	callerCtx, _, endSpan := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleBlockSaving")
+	defer endSpan()
 
-	// TODO context was being canceled, is this hiding a different problem?
-	err = ba.txStore.Set(context.Background(), block.CoinbaseTx.TxIDChainHash().CloneBytes(), fileformat.FileTypeTx, block.CoinbaseTx.ExtendedBytes())
-	if err != nil {
-		ba.logger.Errorf("[BlockAssembly][%s][%s] error storing coinbase tx in tx store: %v", jobID, block.Hash().String(), err)
+	if ba.txStore != nil {
+		err = ba.txStore.Set(callerCtx, block.CoinbaseTx.TxIDChainHash().CloneBytes(), fileformat.FileTypeTx, block.CoinbaseTx.ExtendedBytes())
+		if err != nil {
+			ba.logger.Errorf("[BlockAssembly][%s][%s] error storing coinbase tx in tx store: %v", jobID, block.Hash().String(), err)
+		}
 	}
-
-	// TODO why is this needed?
-	// _, err = ba.txMetaStore.Create(cntxt, block.CoinbaseTx)
-	// if err != nil {
-	//	ba.logger.Errorf("[BlockAssembly] error storing coinbase tx in tx meta store: %v", err)
-	// }
 
 	ba.logger.Debugf("[BlockAssembly][%s][%s] add block to blockchain", jobID, block.Header.Hash())
 	ba.logger.Debugf("[BlockAssembly][%s][%s] block difficulty: %s", jobID, block.Header.Hash(), block.Header.Bits.CalculateDifficulty().String())
 	ba.logger.Debugf("[BlockAssembly][%s][%s] time since previous block: %s", jobID, block.Header.Hash(), time.Since(time.Unix(int64(ba.blockAssembler.bestBlockHeader.Load().Timestamp), 0)).String())
-	// add block to the blockchain
-	if err = ba.blockchainClient.AddBlock(ctx, block, ""); err != nil {
-		return nil, errors.NewServiceError("[BlockAssembly][%s][%s] failed to add block", jobID, block.Hash().String(), err)
+
+	// add the new block to the blockchain
+	if err = ba.blockchainClient.AddBlock(callerCtx, block, ""); err != nil {
+		return nil, errors.NewProcessingError("[BlockAssembly][%s][%s] failed to add block", jobID, block.Hash().String(), err)
 	}
 
-	// don't wait for blockchain to notify us of new block.
-	// if we are mining initial blocks or mining 'immediately' then we won't get notified quick enough
-	// and we'll fork unnecessarily
-	ba.blockAssembler.UpdateBestBlock(ctx)
-
-	// decouple the tracing context to not cancel the context when the subtree DAH is being saved in the background
-	callerCtx, _, endSpan := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleSubtreeDAH")
-	defer endSpan()
-
+	// remove the subtrees from the DAH in the background
 	go func() {
-		// TODO what do we do if this fails, the subtrees DAH and tx meta status still needs to be updated
-		g, gCtx := errgroup.WithContext(callerCtx)
+		callerDAHCtx, _, endSpanDAH := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleDHARemoval")
+		defer endSpanDAH()
 
-		g.Go(func() error {
-			timeStart := time.Now()
-
-			ba.logger.Infof("[BlockAssembly][%s][%s] remove subtrees DAH", jobID, block.Header.Hash())
-
-			if err := ba.removeSubtreesDAH(gCtx, block); err != nil {
-				// TODO retry
-				ba.logger.Errorf("[BlockAssembly][%s][%s] failed to remove subtrees DAH: %v", jobID, block.Header.Hash(), err)
-			}
-
-			ba.logger.Infof("[BlockAssembly][%s][%s] remove subtrees DAH DONE in %s", jobID, block.Header.Hash(), time.Since(timeStart).String())
-
-			return nil
-		})
-
-		if err = g.Wait(); err != nil {
-			ba.logger.Errorf("[BlockAssembly][%s][InvalidateBlock] block is not valid: %v", block.String(), err)
-
-			if !errors.Is(err, context.Canceled) {
-				if err = ba.blockchainClient.InvalidateBlock(callerCtx, block.Header.Hash()); err != nil {
-					ba.logger.Errorf("[BlockAssembly][%s][InvalidateBlock] failed to invalidate block: %s", block.Header.Hash(), err)
-				}
-			}
+		if err := ba.removeSubtreesDAH(callerDAHCtx, block); err != nil {
+			// we don't return an error here, we have already added the block to the chain
+			// if this fails, it will be retried in the block validation service
+			ba.logger.Errorf("[BlockAssembly][%s][%s] failed to remove subtrees DAH: %v", jobID, block.Header.Hash(), err)
 		}
 	}()
 
@@ -1288,6 +1274,7 @@ func (ba *BlockAssembly) removeSubtreesDAH(ctx context.Context, block *model.Blo
 	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "removeSubtreesDAH",
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyUpdateSubtreesDAH),
+		tracing.WithLogMessage(ba.logger, "[removeSubtreesDAH][%s] remove subtree DAHs for %d subtrees", block.Hash().String(), len(block.Subtrees)),
 	)
 	defer deferFn()
 
@@ -1298,9 +1285,7 @@ func (ba *BlockAssembly) removeSubtreesDAH(ctx context.Context, block *model.Blo
 	g, gCtx := errgroup.WithContext(callerCtx)
 	util.SafeSetLimit(g, ba.settings.BlockAssembly.SubtreeProcessorConcurrentReads)
 
-	startTime := time.Now()
-
-	ba.logger.Infof("[removeSubtreesDAH][%s] updating subtree DAHs", block.Hash().String())
+	errorFound := atomic.Bool{}
 
 	// update the subtree DAHs
 	for _, subtreeHash := range block.Subtrees {
@@ -1308,41 +1293,28 @@ func (ba *BlockAssembly) removeSubtreesDAH(ctx context.Context, block *model.Blo
 		subtreeHash := subtreeHash
 
 		g.Go(func() error {
-			// TODO this would be better as a batch operation
 			if err := ba.subtreeStore.SetDAH(gCtx, subtreeHashBytes, fileformat.FileTypeSubtree, 0); err != nil {
-				// TODO should this retry? We are in a bad state when this happens
+				// we don't return an error here, we want to try to update all subtrees
+				// if this fails, it will be retried in the block validation service
 				ba.logger.Errorf("[removeSubtreesDAH][%s][%s] failed to update subtree DAH: %v", block.Hash().String(), subtreeHash.String(), err)
+				errorFound.Store(true)
 			}
 
 			return nil
 		})
 	}
 
-	if err = g.Wait(); err != nil {
-		return errors.WrapGRPC(err)
-	}
+	// wait for all updates to finish
+	_ = g.Wait()
 
-	// update block subtrees_set to true
-	if err = ba.blockchainClient.SetBlockSubtreesSet(ctx, block.Hash()); err != nil {
-		return errors.WrapGRPC(
-			errors.NewServiceError("[ValidateBlock][%s] failed to set block subtrees_set", block.Hash().String(), err))
+	if !errorFound.Load() {
+		// update block subtrees_set to true
+		if err = ba.blockchainClient.SetBlockSubtreesSet(ctx, block.Hash()); err != nil {
+			return errors.WrapGRPC(errors.NewServiceError("[ValidateBlock][%s] failed to set block subtrees_set", block.Hash().String(), err))
+		}
 	}
-
-	ba.logger.Infof("[removeSubtreesDAH][%s] updating subtree DAHs DONE in %s", block.Hash().String(), time.Since(startTime).String())
 
 	return nil
-}
-
-func (ba *BlockAssembly) DeDuplicateBlockAssembly(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error) {
-	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "DeDuplicateBlockAssembly",
-		tracing.WithParentStat(ba.stats),
-		tracing.WithLogMessage(ba.logger, "[DeDuplicateBlockAssembly] called"),
-	)
-	defer deferFn()
-
-	ba.blockAssembler.DeDuplicateTransactions()
-
-	return &blockassembly_api.EmptyMessage{}, nil
 }
 
 func (ba *BlockAssembly) ResetBlockAssembly(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error) {
@@ -1387,7 +1359,7 @@ func (ba *BlockAssembly) ResetBlockAssembly(ctx context.Context, _ *blockassembl
 func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.StateMessage, error) {
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "GetBlockAssemblyState",
 		tracing.WithParentStat(ba.stats),
-		tracing.WithLogMessage(ba.logger, "[GetBlockAssemblyState] called"),
+		tracing.WithDebugLogMessage(ba.logger, "[GetBlockAssemblyState] called"),
 	)
 	defer deferFn()
 
@@ -1472,9 +1444,12 @@ func (ba *BlockAssembly) GetBlockAssemblyTxs(ctx context.Context, _ *blockassemb
 //   - *blockassembly_api.GetCurrentDifficultyResponse: Response containing the current difficulty
 //   - error: Any error encountered during retrieval
 func (ba *BlockAssembly) GetCurrentDifficulty(_ context.Context, _ *blockassembly_api.EmptyMessage) (resp *blockassembly_api.GetCurrentDifficultyResponse, err error) {
-	cd := ba.blockAssembler.currentDifficulty.Load()
-	dif := cd.CalculateDifficulty()
-	f, _ := dif.Float64()
+	nBits, err := ba.blockAssembler.getNextNbits(time.Now().Unix())
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("error getting next nbits", err))
+	}
+
+	f, _ := nBits.CalculateDifficulty().Float64()
 
 	return &blockassembly_api.GetCurrentDifficultyResponse{
 		Difficulty: f,
@@ -1520,7 +1495,8 @@ func (ba *BlockAssembly) GenerateBlocks(ctx context.Context, req *blockassembly_
 	for i := 0; i < int(req.Count); i++ {
 		err := ba.generateBlock(ctx, req.Address)
 		if err != nil {
-			return nil, errors.WrapGRPC(errors.NewProcessingError("error generating block", err))
+			ba.logger.Errorf("[GenerateBlocks] failed to generate block %d of %d: %v", i+1, req.Count, err)
+			return nil, errors.WrapGRPC(errors.NewProcessingError("error generating block %d of %d", i+1, req.Count, err))
 		}
 	}
 
@@ -1672,17 +1648,46 @@ func (ba *BlockAssembly) generateBlock(ctx context.Context, address *string) err
 		},
 	}
 
+	// Store the current best block hash before submission
+	previousBestHash := ba.blockAssembler.bestBlockHeader.Load().Hash()
+
 	resp, err := ba.submitMiningSolution(ctx, req)
 	if err != nil {
 		ba.logger.Errorf("[generateBlock] error submitting block: %v", err)
 		return errors.NewProcessingError("error submitting block", err)
 	}
 
-	if resp.Ok {
-		return nil
+	if !resp.Ok {
+		return bt.ErrTxNil
 	}
 
-	return bt.ErrTxNil
+	// Wait for the best block header to be updated after successful submission
+	// This prevents the "already mining on top of the same block" error when generating multiple blocks
+	return ba.waitForBestBlockHeaderUpdate(ctx, previousBestHash)
+}
+
+// waitForBestBlockHeaderUpdate waits for the best block header to be updated after block submission
+func (ba *BlockAssembly) waitForBestBlockHeaderUpdate(ctx context.Context, previousBestHash *chainhash.Hash) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			ba.logger.Warnf("[generateBlock] timeout waiting for best block header update after submitting block")
+			// Continue anyway - the block was submitted successfully
+			return nil
+		case <-ticker.C:
+			currentBestHash := ba.blockAssembler.bestBlockHeader.Load().Hash()
+			if !currentBestHash.IsEqual(previousBestHash) {
+				// Best block has been updated
+				return nil
+			}
+		}
+	}
 }
 
 // SetSkipWaitForPendingBlocks sets the flag to skip waiting for pending blocks during startup.

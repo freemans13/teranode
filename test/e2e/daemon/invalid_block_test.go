@@ -15,7 +15,6 @@ import (
 	helper "github.com/bitcoin-sv/teranode/test/utils"
 	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	primitives "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/stretchr/testify/assert"
@@ -186,17 +185,13 @@ func TestOrphanTx(t *testing.T) {
 	block3, err := node1.BlockchainClient.GetBlockByHeight(node1Ctx, 3)
 	require.NoError(t, err)
 
-	err = block3.GetAndValidateSubtrees(node1Ctx, node1.Logger, node1.SubtreeStore, nil)
+	err = block3.GetAndValidateSubtrees(node1Ctx, node1.Logger, node1.SubtreeStore)
 	require.NoError(t, err)
 
 	err = block3.CheckMerkleRoot(node1Ctx)
 	require.NoError(t, err)
 
-	fallbackGetFunc := func(subtreeHash chainhash.Hash) error {
-		return block3.SubTreesFromBytes(subtreeHash[:])
-	}
-
-	subtree, err := block3.GetSubtrees(node1Ctx, node1.Logger, node1.SubtreeStore, fallbackGetFunc)
+	subtree, err := block3.GetSubtrees(node1Ctx, node1.Logger, node1.SubtreeStore)
 	require.NoError(t, err)
 
 	blFound := false
@@ -604,10 +599,7 @@ func TestUnminedConflictResolution(t *testing.T) {
 	// require.NoError(t, err)
 
 	blocksToGenerate := node1.Settings.GlobalBlockHeightRetention
-	_, err = node1.CallRPC(node1.Ctx, "generate", []any{blocksToGenerate + 1})
-	require.NoError(t, err)
-
-	time.Sleep(10 * time.Second)
+	node1.MineAndWait(t, blocksToGenerate+1)
 
 	t.Logf("Get block 5 from node1")
 

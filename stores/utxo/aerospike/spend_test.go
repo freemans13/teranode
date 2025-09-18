@@ -52,7 +52,7 @@ func TestStore_SpendMultiRecord(t *testing.T) {
 
 		var tErr *errors.Error
 		require.ErrorAs(t, err, &tErr)
-		require.Equal(t, errors.ERR_TX_INVALID, tErr.Code())
+		require.Equal(t, errors.ERR_UTXO_ERROR, tErr.Code())
 		require.ErrorIs(t, spends[0].Err, errors.ErrSpent)
 		require.Equal(t, spendTx.TxIDChainHash().String(), spends[0].ConflictingTxID.String())
 	})
@@ -84,8 +84,10 @@ func TestStore_SpendMultiRecord(t *testing.T) {
 		assert.False(t, ok)
 
 		// mine the tx
-		err = store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 101, BlockHeight: 101, SubtreeIdx: 101})
+		blockIDsMap, err := store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 101, BlockHeight: 101, SubtreeIdx: 101})
 		require.NoError(t, err)
+		assert.Len(t, blockIDsMap, 1)
+		assert.Equal(t, uint32(101), blockIDsMap[*tx.TxIDChainHash()][0])
 
 		utxoHashes := make([]*chainhash.Hash, len(tx.Outputs))
 		for vOut, txOut := range tx.Outputs {

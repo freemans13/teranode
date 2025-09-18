@@ -528,6 +528,7 @@ func handleGetRawTransaction(ctx context.Context, s *RPCServer, cmd interface{},
 
 		outputs[i] = bsvjson.Vout{
 			Value: float64(txOut.Satoshis),
+			N:     uint32(i),
 			ScriptPubKey: bsvjson.ScriptPubKeyResult{
 				Addresses: addressStrings,
 				Asm:       asm,
@@ -936,7 +937,7 @@ func handleGetMiningCandidate(ctx context.Context, s *RPCServer, cmd interface{}
 	ctx, _, deferFn := tracing.Tracer("rpc").Start(ctx, "handleGetMiningCandidate",
 		tracing.WithParentStat(RPCStat),
 		tracing.WithHistogram(prometheusHandleGetMiningCandidate),
-		tracing.WithLogMessage(s.logger, "[handleGetMiningCandidate] called"),
+		tracing.WithDebugLogMessage(s.logger, "[handleGetMiningCandidate] called"),
 	)
 	defer deferFn()
 
@@ -1567,12 +1568,15 @@ func handleInvalidateBlock(ctx context.Context, s *RPCServer, cmd interface{}, _
 
 	c := cmd.(*bsvjson.InvalidateBlockCmd)
 
+	// Log the RPC request
+	s.logger.Infof("[handleInvalidateBlock] RPC request to invalidate block %s", c.BlockHash)
+
 	ch, err := chainhash.NewHashFromStr(c.BlockHash)
 	if err != nil {
 		return nil, rpcDecodeHexError(c.BlockHash)
 	}
 
-	err = s.blockchainClient.InvalidateBlock(ctx, ch)
+	_, err = s.blockchainClient.InvalidateBlock(ctx, ch)
 	if err != nil {
 		return nil, err
 	}

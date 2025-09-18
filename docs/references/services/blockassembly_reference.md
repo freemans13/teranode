@@ -113,6 +113,9 @@ type BlockAssembler struct {
     // cleanupService manages background cleanup tasks
     cleanupService cleanup.Service
 
+    // cleanupServiceLoaded indicates if the cleanup service has been loaded
+    cleanupServiceLoaded atomic.Bool
+
     // unminedCleanupTicker manages periodic cleanup of old unmined transactions
     unminedCleanupTicker *time.Ticker
 
@@ -121,6 +124,9 @@ type BlockAssembler struct {
 
     // skipWaitForPendingBlocks allows tests to skip waiting for pending blocks during startup
     skipWaitForPendingBlocks bool
+
+    // unminedTransactionsLoading indicates if unmined transactions are currently being loaded
+    unminedTransactionsLoading atomic.Bool
 }
 ```
 
@@ -159,9 +165,6 @@ type SubtreeProcessor struct {
 
     // reorgBlockChan handles blockchain reorganization requests
     reorgBlockChan chan reorgBlocksRequest
-
-    // deDuplicateTransactionsCh triggers transaction deduplication
-    deDuplicateTransactionsCh chan struct{}
 
     // resetCh handles requests to reset the processor state
     resetCh chan *resetBlocks
@@ -347,14 +350,6 @@ func (ba *BlockAssembly) SubtreeCount() int
 
 Returns the total number of subtrees managed by the block assembly service.
 
-#### DeDuplicateBlockAssembly
-
-```go
-func (ba *BlockAssembly) DeDuplicateBlockAssembly(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error)
-```
-
-Triggers deduplication of transactions in the block assembly service to remove duplicate transactions.
-
 #### ResetBlockAssembly
 
 ```go
@@ -407,6 +402,22 @@ func (ba *BlockAssembly) GetBlockAssemblyBlockCandidate(ctx context.Context, _ *
 ```
 
 Retrieves the current block assembly block candidate, including detailed information about the candidate's construction.
+
+#### GetBlockAssemblyTxs
+
+```go
+func (ba *BlockAssembly) GetBlockAssemblyTxs(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.GetBlockAssemblyTxsResponse, error)
+```
+
+Retrieves all transaction hashes currently held in the block assembly service. Returns both the count and list of transaction hashes for monitoring and debugging purposes.
+
+#### SetSkipWaitForPendingBlocks
+
+```go
+func (ba *BlockAssembly) SetSkipWaitForPendingBlocks(skip bool)
+```
+
+Sets the flag to skip waiting for pending blocks during startup. This is primarily used in test environments to prevent blocking on pending blocks.
 
 ### BlockAssembler
 
@@ -490,14 +501,6 @@ func (b *BlockAssembler) RemoveTx(hash chainhash.Hash) error
 
 Removes a transaction from the block assembler by its hash.
 
-#### DeDuplicateTransactions
-
-```go
-func (b *BlockAssembler) DeDuplicateTransactions()
-```
-
-Triggers deduplication of transactions in the subtree processor.
-
 #### Reset
 
 ```go
@@ -579,14 +582,6 @@ func (stp *SubtreeProcessor) Remove(hash chainhash.Hash) error
 ```
 
 Prevents a transaction from being processed from the queue into a subtree, and removes it if already present. This can only take place before the delay time in the queue has passed.
-
-#### DeDuplicateTransactions
-
-```go
-func (stp *SubtreeProcessor) DeDuplicateTransactions()
-```
-
-Removes duplicate transactions from the processor.
 
 #### GetCompletedSubtreesForMiningCandidate
 

@@ -356,6 +356,12 @@ type UtxoStoreSettings struct {
 	MaxMinedBatchSize              int
 	BlockHeightRetentionAdjustment int32 // Adjustment to GlobalBlockHeightRetention (can be positive or negative)
 	DisableDAHCleaner              bool  // Disable the DAH cleaner process completely
+	// Cleanup-specific settings
+	CleanupParentUpdateBatcherSize           int // Batch size for parent record updates during cleanup
+	CleanupParentUpdateBatcherDurationMillis int // Batch duration for parent record updates during cleanup (ms)
+	CleanupDeleteBatcherSize                 int // Batch size for record deletions during cleanup
+	CleanupDeleteBatcherDurationMillis       int // Batch duration for record deletions during cleanup (ms)
+	CleanupMaxConcurrentOperations           int // Maximum concurrent operations during cleanup processing
 }
 
 type P2PSettings struct {
@@ -423,7 +429,6 @@ type P2PSettings struct {
 	BanDuration  time.Duration
 
 	// Sync manager configuration
-	InitialSyncDelay   time.Duration // Initial delay before starting sync operations
 	MinPeersForSync    int           // Minimum number of peers needed before selecting sync peer
 	MaxWaitForMinPeers time.Duration // Maximum time to wait for minimum peers
 	ForceSyncPeer      string        // Force sync from specific peer ID, overrides automatic selection
@@ -480,7 +485,6 @@ type SubtreeValidationSettings struct {
 	ProcessTxMetaUsingStoreBatchSize          int
 	ProcessTxMetaUsingStoreConcurrency        int
 	ProcessTxMetaUsingStoreMissingTxThreshold int
-	SubtreeFoundChConcurrency                 int
 	SubtreeBlockHeightRetention               uint32
 	SubtreeDAHConcurrency                     int
 	SubtreeValidationTimeout                  int

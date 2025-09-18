@@ -22,6 +22,8 @@ local BIN_TOTAL_EXTRA_RECS = "totalExtraRecs"
 local BIN_LOCKED = "locked"
 local BIN_UTXOS = "utxos"
 local BIN_UTXO_SPENDABLE_IN = "utxoSpendableIn"
+local BIN_LAST_SPENT_STATE = "lastSpentState"  -- Tracks last signaled state: "ALLSPENT" or "NOTALLSPENT"
+local BIN_DELETED_CHILDREN = "deletedChildren"  -- Tracks which child transactions have already been deleted
 
 -- Status constants
 local STATUS_OK = "OK"
@@ -36,6 +38,7 @@ local ERROR_CODE_ALREADY_FROZEN = "ALREADY_FROZEN"
 local ERROR_CODE_FROZEN_UNTIL = "FROZEN_UNTIL"
 local ERROR_CODE_COINBASE_IMMATURE = "COINBASE_IMMATURE"
 local ERROR_CODE_SPENT = "SPENT"
+local ERROR_CODE_INVALID_SPEND = "INVALID_SPEND"
 local ERROR_CODE_UTXOS_NOT_FOUND = "UTXOS_NOT_FOUND"
 local ERROR_CODE_UTXO_NOT_FOUND = "UTXO_NOT_FOUND"
 local ERROR_CODE_UTXO_INVALID_SIZE = "UTXO_INVALID_SIZE"
@@ -51,6 +54,7 @@ local MSG_ALREADY_FROZEN = "UTXO is already frozen"
 local MSG_FROZEN_UNTIL = "UTXO is not spendable until block "
 local MSG_COINBASE_IMMATURE = "Coinbase UTXO can only be spent when it matures"
 local MSG_SPENT = "Already spent by "
+local MSG_INVALID_SPEND = "Invalid spend"
 
 local SIGNAL_ALL_SPENT = "ALLSPENT"
 local SIGNAL_NOT_ALL_SPENT = "NOTALLSPENT"
@@ -118,6 +122,19 @@ local function spendingDataBytesToHex(b)
     for i = 33, 36, 1 do
         hex = hex .. string.format("%02x", b[i])
     end
+    return hex
+end
+
+-- Function to convert a spending byte array to a reverse tx hexadecimal string
+local function spendingDataBytesToTxHex(b)
+    local hex = ""
+
+    -- The first 32 bytes are the txID
+    -- And we want to reverse it
+    for i = 32, 1, -1 do
+        hex = hex .. string.format("%02x", b[i])
+    end
+
     return hex
 end
 
@@ -296,6 +313,7 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
     local blockIDs = rec[BIN_BLOCK_IDS]
 
     local errors = map()
+    local deletedChildren = rec[BIN_DELETED_CHILDREN]
     
     -- loop through the spends
     for spend in list.iterator(spends) do
@@ -332,7 +350,22 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
         -- Handle already spent UTXO
         if existingSpendingData then            
             if bytes_equal(existingSpendingData, spendingData) then
-                -- Already spent with same data, skip this one
+                -- Already spent with same data
+
+                if deletedChildren ~= nil then
+                    -- Check whether this child tx (by txid) exists in the deletedChildren map, if yes, error out
+                    local childTxID = spendingDataBytesToTxHex(existingSpendingData)
+                    if deletedChildren[childTxID] then
+                        local error = map()
+
+                        error[FIELD_ERROR_CODE] = ERROR_CODE_INVALID_SPEND
+                        error[FIELD_MESSAGE] = MSG_INVALID_SPEND
+                        error[FIELD_SPENDING_DATA] = spendingDataBytesToHex(existingSpendingData)
+
+                        errors[offset] = error
+                    end
+                end
+
                 goto continue
             elseif isFrozen(existingSpendingData) then
                 local error = map()
@@ -470,7 +503,7 @@ function unspend(rec, offset, utxoHash, currentBlockHeight, blockHeightRetention
 end
 
 --
-function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blockHeightRetention)
+function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blockHeightRetention, unsetMined)
     local response = map()
     
     if not aerospike:exists(rec) then 
@@ -492,21 +525,61 @@ function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blo
         rec[BIN_SUBTREE_IDXS] = list()
     end
 
-    -- Append the value to the list in the specified bin
     local blocks = rec[BIN_BLOCK_IDS]
-    blocks[#blocks + 1] = blockID
-    rec[BIN_BLOCK_IDS] = blocks
-
     local heights = rec[BIN_BLOCK_HEIGHTS]
-    heights[#heights + 1] = blockHeight
-    rec[BIN_BLOCK_HEIGHTS] = heights
-
     local subtreeIdxs = rec[BIN_SUBTREE_IDXS]
-    subtreeIdxs[#subtreeIdxs + 1] = subtreeIdx
-    rec[BIN_SUBTREE_IDXS] = subtreeIdxs
 
-    rec[BIN_UNMINED_SINCE] = nil
-    
+    if unsetMined then
+        -- Remove the block id and height/subtreeIdx at the same index from the bin if it exists, the block was invalidated
+        local newBlocks = list()
+        local newBlockHeights = list()
+        local newSubtreeIdxs = list()
+
+        for i = 1, #blocks do
+            local b = blocks[i]
+            if b ~= blockID then
+                newBlocks[#newBlocks + 1] = b
+                newBlockHeights[#newBlockHeights + 1] = heights[i]
+                newSubtreeIdxs[#newSubtreeIdxs + 1] = subtreeIdxs[i]
+            end
+        end
+
+        rec[BIN_BLOCK_IDS] = newBlocks
+        rec[BIN_BLOCK_HEIGHTS] = newBlockHeights
+        rec[BIN_SUBTREE_IDXS] = newSubtreeIdxs
+    else
+        -- Append the value to the list in the specified bin if it doesn't already exist
+        local blockExists = false
+
+        for b in list.iterator(blocks) do
+            if b == blockID then
+                blockExists = true
+                break
+            end
+        end
+
+        if not blockExists then
+            blocks[#blocks + 1] = blockID
+            rec[BIN_BLOCK_IDS] = blocks
+
+            heights[#heights + 1] = blockHeight
+            rec[BIN_BLOCK_HEIGHTS] = heights
+
+            subtreeIdxs[#subtreeIdxs + 1] = subtreeIdx
+            rec[BIN_SUBTREE_IDXS] = subtreeIdxs
+        end
+    end
+
+    -- Also add the block ids to the response
+    response[FIELD_BLOCK_IDS] = blocks
+
+    -- if we have blocks in the record, then it is no longer unmined
+    if blocks and #blocks > 0 then
+        rec[BIN_UNMINED_SINCE] = nil
+    else
+        rec[BIN_UNMINED_SINCE] = currentBlockHeight
+    end
+
     -- set the record to not be locked again, if it was locked, since if was just mined into a block
     if rec[BIN_LOCKED] then
         rec[BIN_LOCKED] = false
@@ -824,11 +897,25 @@ function setDeleteAtHeight(rec, currentBlockHeight, blockHeightRetention)
 
     -- Handle pagination records
     if totalExtraRecs == nil then
-        -- This is a pagination record: check if all the UTXOs are spent
+        -- Default nil to NOTALLSPENT (initial state when record is created with unspent UTXOs)
+        local lastState = rec[BIN_LAST_SPENT_STATE] or SIGNAL_NOT_ALL_SPENT
+        
+        local currentState
+        -- Determine current state
         if rec[BIN_SPENT_UTXOS] == rec[BIN_RECORD_UTXOS] then
-            return SIGNAL_ALL_SPENT, nil
+            currentState = SIGNAL_ALL_SPENT
         else
-            return SIGNAL_NOT_ALL_SPENT, nil
+            currentState = SIGNAL_NOT_ALL_SPENT
+        end
+        
+        -- Only signal if state has changed
+        if lastState ~= currentState then
+            -- State transition detected, update and signal
+            rec[BIN_LAST_SPENT_STATE] = currentState
+            return currentState, nil
+        else
+            -- No state change, don't signal
+            return "", nil
         end
     end
     

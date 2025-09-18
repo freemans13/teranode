@@ -135,9 +135,6 @@ type BlockAssembler struct {
 	// blockchainSubscriptionCh receives blockchain notifications
 	blockchainSubscriptionCh chan *blockchain.Notification
 
-	// currentDifficulty stores the current mining difficulty target
-	currentDifficulty atomic.Pointer[model.NBit]
-
 	// defaultMiningNBits stores the default mining difficulty
 	defaultMiningNBits *model.NBit
 
@@ -169,6 +166,16 @@ type BlockAssembler struct {
 
 	// unminedTransactionsLoading indicates if unmined transactions are currently being loaded
 	unminedTransactionsLoading atomic.Bool
+}
+
+type blockHeaderWithMeta struct {
+	header *model.BlockHeader
+	meta   *model.BlockHeaderMeta
+}
+
+type blockWithMeta struct {
+	block *model.Block
+	meta  *model.BlockHeaderMeta
 }
 
 // CachedMiningCandidate holds a cached mining candidate with expiration
@@ -283,7 +290,7 @@ func (b *BlockAssembler) SubtreeCount() int {
 //
 // Parameters:
 //   - ctx: Context for cancellation
-func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
+func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 	var (
 		err       error
 		readyOnce sync.Once
@@ -293,8 +300,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
 	// this will be used to reset the subtree processor when a new block is mined
 	b.blockchainSubscriptionCh, err = b.blockchainClient.Subscribe(ctx, "BlockAssembler")
 	if err != nil {
-		b.logger.Errorf("[BlockAssembler] error subscribing to blockchain notifications: %v", err)
-		return
+		return errors.NewProcessingError("[BlockAssembler] error subscribing to blockchain notifications: %v", err)
 	}
 
 	readyCh := make(chan struct{})
@@ -331,7 +337,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
 				// reset the block assembly
 				b.logger.Warnf("[BlockAssembler][Reset] resetting: %d: %s -> %d: %s", b.bestBlockHeight.Load(), b.bestBlockHeader.Load().Hash(), meta.Height, bestBlockchainBlockHeader.String())
 
-				moveBackBlocks, moveForwardBlocks, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
+				moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
 				if err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error getting reorg blocks: %w", err)
 					b.setCurrentRunningState(StateRunning)
@@ -339,7 +345,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
 					continue
 				}
 
-				if len(moveBackBlocks) == 0 && len(moveForwardBlocks) == 0 {
+				if len(moveBackBlocksWithMeta) == 0 && len(moveForwardBlocksWithMeta) == 0 {
 					b.logger.Errorf("[BlockAssembler][Reset] no reorg blocks found, invalid reset")
 					b.setCurrentRunningState(StateRunning)
 
@@ -355,6 +361,18 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
 				}
 
 				currentHeight := meta.Height
+
+				moveBackBlocks := make([]*model.Block, len(moveBackBlocksWithMeta))
+				for i, withMeta := range moveBackBlocksWithMeta {
+					moveBackBlocks[i] = withMeta.block
+				}
+
+				moveForwardBlocks := make([]*model.Block, len(moveForwardBlocksWithMeta))
+				for i, withMeta := range moveForwardBlocksWithMeta {
+					moveForwardBlocks[i] = withMeta.block
+				}
+
+				b.logger.Warnf("[BlockAssembler][Reset] resetting to new best block header: %d", meta.Height)
 
 				if response := b.subtreeProcessor.Reset(b.bestBlockHeader.Load(), moveBackBlocks, moveForwardBlocks, isLegacySync); response.Err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", response.Err)
@@ -374,7 +392,15 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
 					currentHeight = bestBlockchainBlockHeaderMeta.Height
 				}
 
-				b.logger.Warnf("[BlockAssembler][Reset] resetting to new best block header: %d", meta.Height)
+				// make sure we have processed all pending blocks before loading unmined transactions
+				if err = b.waitForPendingBlocks(ctx); err != nil {
+					b.logger.Errorf("[BlockAssembler][Reset] error waiting for pending blocks: %v", err)
+				}
+
+				// reload the unmined transactions
+				if err = b.loadUnminedTransactions(ctx); err != nil {
+					b.logger.Errorf("[BlockAssembler][Reset] error loading unmined transactions: %v", err)
+				}
 
 				b.setBestBlockHeader(bestBlockchainBlockHeader, currentHeight)
 
@@ -458,7 +484,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
 				b.setCurrentRunningState(StateBlockchainSubscription)
 
 				if notification.Type == model.NotificationType_Block {
-					b.UpdateBestBlock(ctx)
+					b.processNewBlockAnnouncement(ctx)
 				}
 
 				b.setCurrentRunningState(StateRunning)
@@ -472,24 +498,24 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) {
 
 	select {
 	case <-time.After(time.Second * 30):
-		b.logger.Errorf("[BlockAssembler] timeout waiting for blockchain subscription to be ready")
-		return
+		return errors.NewProcessingError("[BlockAssembler] timeout waiting for blockchain subscription to be ready")
 	case <-readyCh:
 	case <-ctx.Done():
-		return
+		return nil
 	}
 
+	return nil
 }
 
-// UpdateBestBlock updates the best block information.
+// processNewBlockAnnouncement updates the best block information.
 //
 // Parameters:
 //   - ctx: Context for cancellation
-func (b *BlockAssembler) UpdateBestBlock(ctx context.Context) {
-	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "UpdateBestBlock",
+func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
+	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "processNewBlockAnnouncement",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockAssemblerUpdateBestBlock),
-		tracing.WithLogMessage(b.logger, "[UpdateBestBlock] called"),
+		tracing.WithLogMessage(b.logger, "[processNewBlockAnnouncement] called"),
 	)
 	defer func() {
 		deferFn()
@@ -557,13 +583,6 @@ func (b *BlockAssembler) UpdateBestBlock(ctx context.Context) {
 	if err = b.SetState(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		b.logger.Errorf("[BlockAssembler][%s] error setting state: %v", bestBlockchainBlockHeader.Hash(), err)
 	}
-
-	currentDifficulty, err := b.blockchainClient.GetNextWorkRequired(ctx, bestBlockchainBlockHeader.Hash())
-	if err != nil && !errors.Is(err, context.Canceled) {
-		b.logger.Errorf("[BlockAssembler][%s] error getting next work required: %v", bestBlockchainBlockHeader.Hash(), err)
-	}
-
-	b.currentDifficulty.Store(currentDifficulty)
 }
 
 func (b *BlockAssembler) setBestBlockHeader(bestBlockchainBlockHeader *model.BlockHeader, height uint32) {
@@ -583,7 +602,7 @@ func (b *BlockAssembler) setBestBlockHeader(bestBlockchainBlockHeader *model.Blo
 	// Parameters:
 	//   - bestBlockchainBlockHeader: The new best block header to set
 	//   - height: The height of the new best block
-	b.logger.Infof("[BlockAssembler][%s] setting best block header: %d", bestBlockchainBlockHeader.Hash(), height)
+	b.logger.Infof("[BlockAssembler][%s] setting best block header to height %d", bestBlockchainBlockHeader.Hash(), height)
 
 	b.bestBlockHeader.Store(bestBlockchainBlockHeader)
 	b.bestBlockHeight.Store(height)
@@ -592,13 +611,10 @@ func (b *BlockAssembler) setBestBlockHeader(bestBlockchainBlockHeader *model.Blo
 	b.invalidateMiningCandidateCache()
 
 	if b.cleanupServiceLoaded.Load() && b.cleanupService != nil && height > 0 {
-		err := b.cleanupService.UpdateBlockHeight(height)
-		if err != nil {
+		if err := b.cleanupService.UpdateBlockHeight(height); err != nil {
 			b.logger.Errorf("[BlockAssembler] cleanup service error updating block height: %v", err)
 		}
 	}
-
-	b.logger.Infof("[BlockAssembler][%s] set best block header to: %d", b.bestBlockHeader.Load().Hash(), b.bestBlockHeight.Load())
 }
 
 // setCurrentRunningState sets the current operational state.
@@ -626,7 +642,9 @@ func (b *BlockAssembler) GetCurrentRunningState() State {
 // Returns:
 //   - error: Any error encountered during startup
 func (b *BlockAssembler) Start(ctx context.Context) (err error) {
-	b.initState(ctx)
+	if err = b.initState(ctx); err != nil {
+		return errors.NewProcessingError("[BlockAssembler] failed to initialize state: %v", err)
+	}
 
 	// Wait for any pending blocks to be processed before loading unmined transactions
 	if !b.skipWaitForPendingBlocks {
@@ -654,7 +672,9 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	}
 	b.logger.Infof("[BlockAssembler] unmined transactions loaded, continuing startup...")
 
-	b.startChannelListeners(ctx)
+	if err = b.startChannelListeners(ctx); err != nil {
+		return errors.NewProcessingError("[BlockAssembler] failed to start channel listeners: %v", err)
+	}
 
 	// Check if the UTXO store supports cleanup operations
 	if !b.settings.UtxoStore.DisableDAHCleaner {
@@ -684,45 +704,38 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	return nil
 }
 
-func (b *BlockAssembler) initState(ctx context.Context) {
+func (b *BlockAssembler) initState(ctx context.Context) error {
 	bestBlockHeader, bestBlockHeight, err := b.GetState(ctx)
 	if err != nil {
-		// TODO what is the best way to handle errors wrapped in grpc rpc errors?
-		if strings.Contains(err.Error(), sql.ErrNoRows.Error()) {
+		if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), sql.ErrNoRows.Error()) {
 			b.logger.Warnf("[BlockAssembler] no state found in blockchain db")
 		} else {
 			b.logger.Errorf("[BlockAssembler] error getting state from blockchain db: %v", err)
 		}
 	} else {
-		b.logger.Infof("[BlockAssembler] setting best block header from state: %d: %s", b.bestBlockHeight.Load(), b.bestBlockHeader.Load().Hash())
-		b.subtreeProcessor.SetCurrentBlockHeader(b.bestBlockHeader.Load())
+		b.logger.Infof("[BlockAssembler] setting best block header from state: %d: %s", bestBlockHeight, bestBlockHeader.Hash())
+		b.setBestBlockHeader(bestBlockHeader, bestBlockHeight)
+		b.subtreeProcessor.InitCurrentBlockHeader(bestBlockHeader)
 	}
-
-	b.setBestBlockHeader(bestBlockHeader, bestBlockHeight)
 
 	// we did not get any state back from the blockchain db, so we get the current best block header
 	if b.bestBlockHeader.Load() == nil || b.bestBlockHeight.Load() == 0 {
 		header, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
 		if err != nil {
-			b.logger.Errorf("[BlockAssembler] error getting best block header: %v", err)
+			// we must return an error here since we cannot continue without a best block header
+			return errors.NewProcessingError("[BlockAssembler] error getting best block header: %v", err)
 		} else {
 			b.logger.Infof("[BlockAssembler] setting best block header from GetBestBlockHeader: %s", b.bestBlockHeader.Load().Hash())
-
 			b.setBestBlockHeader(header, meta.Height)
-			b.subtreeProcessor.SetCurrentBlockHeader(b.bestBlockHeader.Load())
+			b.subtreeProcessor.InitCurrentBlockHeader(header)
 		}
 	}
-
-	currentDifficulty, err := b.blockchainClient.GetNextWorkRequired(ctx, b.bestBlockHeader.Load().Hash())
-	if err != nil {
-		b.logger.Errorf("[BlockAssembler] error getting next work required: %v", err)
-	}
-
-	b.currentDifficulty.Store(currentDifficulty)
 
 	if err = b.SetState(ctx); err != nil {
 		b.logger.Errorf("[BlockAssembler] error setting state: %v", err)
 	}
+
+	return nil
 }
 
 // GetState retrieves the current state of the block assembler from the blockchain.
@@ -804,11 +817,6 @@ func (b *BlockAssembler) RemoveTx(hash chainhash.Hash) error {
 	return b.subtreeProcessor.Remove(hash)
 }
 
-// DeDuplicateTransactions triggers deduplication of transactions in the subtree processor.
-func (b *BlockAssembler) DeDuplicateTransactions() {
-	b.subtreeProcessor.DeDuplicateTransactions()
-}
-
 // Reset triggers a reset of the block assembler state.
 // This operation runs asynchronously to prevent blocking.
 func (b *BlockAssembler) Reset() {
@@ -842,7 +850,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	currentHeight := b.bestBlockHeight.Load()
 
 	// Return cached if still valid (same height and within timeout)
-	if b.cachedCandidate.candidate != nil &&
+	if !b.settings.ChainCfgParams.ReduceMinDifficulty && b.cachedCandidate.candidate != nil &&
 		b.cachedCandidate.lastHeight == currentHeight &&
 		time.Since(b.cachedCandidate.lastUpdate) < b.settings.BlockAssembly.MiningCandidateCacheTimeout {
 		candidate := b.cachedCandidate.candidate
@@ -889,7 +897,15 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 
 	// Generate new candidate
 	responseCh := make(chan *miningCandidateResponse)
-	utils.SafeSend(b.miningCandidateCh, responseCh, 10*time.Second)
+
+	select {
+	case <-ctx.Done():
+		// context cancelled, do not send
+	case <-time.After(1 * time.Second):
+		return nil, nil, errors.NewServiceError("timeout sending mining candidate request")
+	case b.miningCandidateCh <- responseCh:
+		// sent successfully
+	}
 
 	// wait for 10 seconds for the response
 	var candidate *model.MiningCandidate
@@ -899,6 +915,8 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	var err error
 
 	select {
+	case <-ctx.Done():
+		// context cancelled, do not send
 	case <-time.After(10 * time.Second):
 		// make sure to close the channel, otherwise the for select will hang, because no one is reading from it
 		close(responseCh)
@@ -967,8 +985,9 @@ func (b *BlockAssembler) getMiningCandidate() (*model.MiningCandidate, []*subtre
 	var coinbaseValue uint64
 
 	currentHeight := b.bestBlockHeight.Load() + 1
+
 	// Log initial state for debugging
-	b.logger.Infof("Starting coinbase calculation for height %d", currentHeight)
+	b.logger.Debugf("Starting coinbase calculation for height %d", currentHeight)
 
 	// Get the hash of the last subtree in the list...
 	// We do this by using the same subtree processor logic to get the top tree hash.
@@ -1046,41 +1065,20 @@ func (b *BlockAssembler) getMiningCandidate() (*model.MiningCandidate, []*subtre
 		id = topTree.RootHash()
 	}
 
-	nBits, err := b.getNextNbits()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	currentDifficulty := b.currentDifficulty.Load()
-	if nBits == nil {
-		if currentDifficulty != nil {
-			b.logger.Warnf("nextNbits is nil. Setting to current difficulty")
-
-			nBits = currentDifficulty
-		} else {
-			b.logger.Warnf("nextNbits and current difficulty are nil. Setting to pow limit bits")
-
-			bitsBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(bitsBytes, b.settings.ChainCfgParams.PowLimitBits)
-
-			nBits, err = model.NewNBitFromSlice(bitsBytes)
-			if err != nil {
-				return nil, nil, errors.NewBlockInvalidError("failed to create NBit from Bits", err)
-			}
-
-			b.currentDifficulty.Store(nBits)
-		}
-	} else {
-		b.currentDifficulty.Store(nBits)
-	}
-
-	timeNowUint32, err := safeconversion.Int64ToUint32(time.Now().Unix())
+	timeNow := time.Now().Unix()
+	b.logger.Debugf("Current time: %d", timeNow)
+	timeNowUint32, err := safeconversion.Int64ToUint32(timeNow)
 	if err != nil {
 		return nil, nil, errors.NewProcessingError("error converting time now", err)
 	}
 
 	timeBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(timeBytes, timeNowUint32)
+
+	nBits, err := b.getNextNbits(timeNow)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Log coinbase value before adding subsidy
 	feesOnly := coinbaseValue
@@ -1158,21 +1156,64 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 
 	prometheusBlockAssemblerReorg.Inc()
 
-	moveBackBlocks, moveForwardBlocks, err := b.getReorgBlocks(ctx, header, height)
+	moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, header, height)
 	if err != nil {
 		return errors.NewProcessingError("error getting reorg blocks", err)
 	}
 
-	if (len(moveBackBlocks) > 5 || len(moveForwardBlocks) > 5) && b.bestBlockHeight.Load() > 1000 {
+	if (len(moveBackBlocksWithMeta) > 5 || len(moveForwardBlocksWithMeta) > 5) && b.bestBlockHeight.Load() > 1000 {
 		// large reorg, log it and Reset the block assembler
 		b.Reset()
 
-		return errors.NewBlockAssemblyResetError("large reorg, moveBackBlocks: %d, moveForwardBlocks: %d, resetting block assembly", len(moveBackBlocks), len(moveForwardBlocks))
+		return errors.NewBlockAssemblyResetError("large reorg, moveBackBlocks: %d, moveForwardBlocks: %d, resetting block assembly", len(moveBackBlocksWithMeta), len(moveForwardBlocksWithMeta))
 	}
 
-	// now do the reorg in the subtree processor
-	if err = b.subtreeProcessor.Reorg(moveBackBlocks, moveForwardBlocks); err != nil {
-		return errors.NewProcessingError("error doing reorg", err)
+	hasInvalidBlock := false
+
+	moveBackBlocks := make([]*model.Block, len(moveBackBlocksWithMeta))
+	for i, moveBackBlockWithMeta := range moveBackBlocksWithMeta {
+		if moveBackBlockWithMeta.meta.Invalid {
+			hasInvalidBlock = true
+		}
+
+		moveBackBlocks[i] = moveBackBlockWithMeta.block
+	}
+
+	moveForwardBlocks := make([]*model.Block, len(moveForwardBlocksWithMeta))
+	for i, moveForwardBlockWithMeta := range moveForwardBlocksWithMeta {
+		moveForwardBlocks[i] = moveForwardBlockWithMeta.block
+	}
+
+	reset := hasInvalidBlock
+
+	if !hasInvalidBlock {
+		// now do the reorg in the subtree processor
+		if err = b.subtreeProcessor.Reorg(moveBackBlocks, moveForwardBlocks); err != nil {
+			b.logger.Warnf("[BlockAssembler] error doing reorg, will reset instead: %v", err)
+			// fallback to full reset
+			reset = true
+		}
+	}
+
+	if reset {
+		// we have an invalid block in the reorg or reorg failed, we need to reset the block assembly and load the unmined transactions again
+		b.logger.Warnf("[BlockAssembler] reorg contains invalid block, resetting block assembly, moveBackBlocks: %d, moveForwardBlocks: %d", len(moveBackBlocks), len(moveForwardBlocks))
+
+		if resp := b.subtreeProcessor.Reset(nil, moveBackBlocks, moveForwardBlocks, false); resp.Err != nil {
+			return errors.NewProcessingError("error resetting block assembly after reorg with invalid block", resp.Err)
+		}
+
+		// wait for any pending blocks to be processed before loading unmined transactions, this will include invalidated blocks
+		if err = b.waitForPendingBlocks(ctx); err != nil {
+			// we cannot continue if we have not processed all pending blocks
+			return errors.NewProcessingError("[BlockAssembler] failed to wait for pending blocks", err)
+		}
+
+		// load unmined transactions again, but only after all blocks have been mined_set properly
+		if err = b.loadUnminedTransactions(ctx); err != nil {
+			// we cannot continue if we have not loaded unmined transactions successfully
+			return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions", err)
+		}
 	}
 
 	prometheusBlockAssemblerReorgDuration.Observe(float64(time.Since(startTime).Microseconds()) / 1_000_000)
@@ -1191,7 +1232,7 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 //   - []*model.Block: Blocks to move down
 //   - []*model.Block: Blocks to move up
 //   - error: Any error encountered
-func (b *BlockAssembler) getReorgBlocks(ctx context.Context, header *model.BlockHeader, height uint32) ([]*model.Block, []*model.Block, error) {
+func (b *BlockAssembler) getReorgBlocks(ctx context.Context, header *model.BlockHeader, height uint32) ([]blockWithMeta, []blockWithMeta, error) {
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "getReorgBlocks",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockAssemblerGetReorgBlocksDuration),
@@ -1199,34 +1240,40 @@ func (b *BlockAssembler) getReorgBlocks(ctx context.Context, header *model.Block
 	)
 	defer deferFn()
 
-	moveBackBlockHeaders, moveForwardBlockHeaders, err := b.getReorgBlockHeaders(ctx, header, height)
+	moveBackBlockHeadersWithMeta, moveForwardBlockHeadersWithMeta, err := b.getReorgBlockHeaders(ctx, header, height)
 	if err != nil {
 		return nil, nil, errors.NewServiceError("error getting reorg block headers", err)
 	}
 
 	// moveForwardBlocks will contain all blocks we need to move up to get to the new tip from the common ancestor
-	moveForwardBlocks := make([]*model.Block, 0, len(moveForwardBlockHeaders))
+	moveForwardBlocks := make([]blockWithMeta, 0, len(moveForwardBlockHeadersWithMeta))
 
 	// moveBackBlocks will contain all blocks we need to move down to get to the common ancestor
-	moveBackBlocks := make([]*model.Block, 0, len(moveBackBlockHeaders))
+	moveBackBlocks := make([]blockWithMeta, 0, len(moveBackBlockHeadersWithMeta))
 
 	var block *model.Block
-	for _, blockHeader := range moveForwardBlockHeaders {
-		block, err = b.blockchainClient.GetBlock(ctx, blockHeader.Hash())
+	for _, headerWithMeta := range moveForwardBlockHeadersWithMeta {
+		block, err = b.blockchainClient.GetBlock(ctx, headerWithMeta.header.Hash())
 		if err != nil {
 			return nil, nil, errors.NewServiceError("error getting block", err)
 		}
 
-		moveForwardBlocks = append(moveForwardBlocks, block)
+		moveForwardBlocks = append(moveForwardBlocks, blockWithMeta{
+			block: block,
+			meta:  headerWithMeta.meta,
+		})
 	}
 
-	for _, blockHeader := range moveBackBlockHeaders {
-		block, err = b.blockchainClient.GetBlock(ctx, blockHeader.Hash())
+	for _, headerWithMeta := range moveBackBlockHeadersWithMeta {
+		block, err = b.blockchainClient.GetBlock(ctx, headerWithMeta.header.Hash())
 		if err != nil {
 			return nil, nil, errors.NewServiceError("error getting block", err)
 		}
 
-		moveBackBlocks = append(moveBackBlocks, block)
+		moveBackBlocks = append(moveBackBlocks, blockWithMeta{
+			block: block,
+			meta:  headerWithMeta.meta,
+		})
 	}
 
 	return moveBackBlocks, moveForwardBlocks, nil
@@ -1235,7 +1282,7 @@ func (b *BlockAssembler) getReorgBlocks(ctx context.Context, header *model.Block
 // getReorgBlockHeaders returns the block headers that need to be moved down and up to get to the new tip
 // it is based on a common ancestor between the current chain and the new chain
 // TODO optimize this function
-func (b *BlockAssembler) getReorgBlockHeaders(ctx context.Context, header *model.BlockHeader, height uint32) ([]*model.BlockHeader, []*model.BlockHeader, error) {
+func (b *BlockAssembler) getReorgBlockHeaders(ctx context.Context, header *model.BlockHeader, height uint32) ([]blockHeaderWithMeta, []blockHeaderWithMeta, error) {
 	if header == nil {
 		return nil, nil, errors.NewError("header is nil")
 	}
@@ -1300,27 +1347,43 @@ FoundAncestor:
 	// Get headers from current tip down to common ancestor
 	headerCount := bestBlockHeight - commonAncestorMeta.Height + 1
 
-	moveBackBlockHeaders, _, err := b.blockchainClient.GetBlockHeaders(ctx, b.bestBlockHeader.Load().Hash(), uint64(headerCount))
+	moveBackBlockHeaders, moveBackBlockHeaderMetas, err := b.blockchainClient.GetBlockHeaders(ctx, b.bestBlockHeader.Load().Hash(), uint64(headerCount))
 	if err != nil {
 		return nil, nil, errors.NewServiceError("error getting current chain headers", err)
 	}
 
+	moveBackBlockHeadersWithMeta := make([]blockHeaderWithMeta, 0, len(moveBackBlockHeaders))
+	for i, moveBackBlockHeader := range moveBackBlockHeaders {
+		moveBackBlockHeadersWithMeta = append(moveBackBlockHeadersWithMeta, blockHeaderWithMeta{
+			header: moveBackBlockHeader,
+			meta:   moveBackBlockHeaderMetas[i],
+		})
+	}
+
 	// Handle empty moveBackBlockHeaders or when length is 1 (only common ancestor)
-	var filteredMoveBack []*model.BlockHeader
+	var filteredMoveBack []blockHeaderWithMeta
 	if len(moveBackBlockHeaders) > 1 {
-		filteredMoveBack = moveBackBlockHeaders[:len(moveBackBlockHeaders)-1]
+		filteredMoveBack = moveBackBlockHeadersWithMeta[:len(moveBackBlockHeadersWithMeta)-1]
 	}
 
 	// Get headers from new tip down to common ancestor
-	moveForwardBlockHeaders, _, err := b.blockchainClient.GetBlockHeaders(ctx, header.Hash(), uint64(height-commonAncestorMeta.Height))
+	moveForwardBlockHeaders, moveForwardBlockHeaderMetas, err := b.blockchainClient.GetBlockHeaders(ctx, header.Hash(), uint64(height-commonAncestorMeta.Height))
 	if err != nil {
 		return nil, nil, errors.NewServiceError("error getting new chain headers", err)
 	}
 
+	moveForwardBlockHeadersWithMeta := make([]blockHeaderWithMeta, 0, len(moveForwardBlockHeaders))
+	for i, moveForwardBlockHeader := range moveForwardBlockHeaders {
+		moveForwardBlockHeadersWithMeta = append(moveForwardBlockHeadersWithMeta, blockHeaderWithMeta{
+			header: moveForwardBlockHeader,
+			meta:   moveForwardBlockHeaderMetas[i],
+		})
+	}
+
 	// reverse moveForwardBlocks slice
-	for i := len(moveForwardBlockHeaders)/2 - 1; i >= 0; i-- {
-		opp := len(moveForwardBlockHeaders) - 1 - i
-		moveForwardBlockHeaders[i], moveForwardBlockHeaders[opp] = moveForwardBlockHeaders[opp], moveForwardBlockHeaders[i]
+	for i := len(moveForwardBlockHeadersWithMeta)/2 - 1; i >= 0; i-- {
+		opp := len(moveForwardBlockHeadersWithMeta) - 1 - i
+		moveForwardBlockHeadersWithMeta[i], moveForwardBlockHeadersWithMeta[opp] = moveForwardBlockHeadersWithMeta[opp], moveForwardBlockHeadersWithMeta[i]
 	}
 
 	maxGetReorgHashes := b.settings.BlockAssembly.MaxGetReorgHashes
@@ -1329,7 +1392,7 @@ FoundAncestor:
 		return nil, nil, errors.NewProcessingError("reorg is too big, max block reorg: %d", maxGetReorgHashes)
 	}
 
-	return filteredMoveBack, moveForwardBlockHeaders, nil
+	return filteredMoveBack, moveForwardBlockHeadersWithMeta, nil
 }
 
 // getNextNbits retrieves the next required work difficulty target.
@@ -1337,8 +1400,8 @@ FoundAncestor:
 // Returns:
 //   - *model.NBit: Next difficulty target
 //   - error: Any error encountered during retrieval
-func (b *BlockAssembler) getNextNbits() (*model.NBit, error) {
-	nbit, err := b.blockchainClient.GetNextWorkRequired(context.Background(), b.bestBlockHeader.Load().Hash())
+func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) {
+	nbit, err := b.blockchainClient.GetNextWorkRequired(context.Background(), b.bestBlockHeader.Load().Hash(), nextBlockTime)
 	if err != nil {
 		return nil, errors.NewProcessingError("error getting next work required", err)
 	}
@@ -1403,6 +1466,17 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error
 	}
 
 	b.logger.Infof("[BlockAssembler] now loading remaining unmined transactions")
+
+	// Wait for the unmined_since index to be ready before attempting to get the iterator
+	// This is similar to how the cleanup service waits for the delete_at_height index
+	if indexWaiter, ok := b.utxoStore.(interface {
+		WaitForIndexReady(ctx context.Context, indexName string) error
+	}); ok {
+		if err := indexWaiter.WaitForIndexReady(ctx, "unminedSinceIndex"); err != nil {
+			b.logger.Warnf("[BlockAssembler] failed to wait for unmined_since index: %v", err)
+			// Continue anyway as this may be a non-Aerospike store
+		}
+	}
 
 	it, err := b.utxoStore.GetUnminedTxIterator()
 	if err != nil {

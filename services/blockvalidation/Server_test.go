@@ -146,7 +146,7 @@ func TestOneTransaction(t *testing.T) {
 	_ = subtreeStore.Set(ctx, subtrees[0].RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
 
 	// loads the subtrees into the block
-	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore, nil)
+	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore)
 	require.NoError(t, err)
 
 	// err = blockValidationService.CheckMerkleRoot(block)
@@ -212,7 +212,7 @@ func TestTwoTransactions(t *testing.T) {
 	_ = subtreeStore.Set(ctx, subtrees[0].RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
 
 	// loads the subtrees into the block
-	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore, nil)
+	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore)
 	require.NoError(t, err)
 
 	// err = blockValidationService.CheckMerkleRoot(block)
@@ -301,7 +301,7 @@ func TestMerkleRoot(t *testing.T) {
 	// require.NoError(t, err)
 
 	// loads the subtrees into the block
-	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore, nil)
+	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore)
 	require.NoError(t, err)
 
 	// err = blockValidationService.CheckMerkleRoot(block)
@@ -311,6 +311,21 @@ func TestMerkleRoot(t *testing.T) {
 
 func TestTtlCache(t *testing.T) {
 	cache := ttlcache.New[chainhash.Hash, bool]()
+
+	// Ensure cleanup happens
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			cache.Stop()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// Successfully stopped
+		case <-time.After(100 * time.Millisecond):
+			// Timeout - cache might not have been started yet
+		}
+	}()
 
 	for _, txID := range txIDs {
 		hash, _ := chainhash.NewHashFromStr(txID)
@@ -393,7 +408,7 @@ func Test_Server_processBlockFound(t *testing.T) {
 
 	txStore := memory.New()
 
-	blockchainClient, err := blockchain.NewLocalClient(ulogger.TestLogger{}, blockchainStore, nil, utxoStore)
+	blockchainClient, err := blockchain.NewLocalClient(ulogger.TestLogger{}, tSettings, blockchainStore, nil, utxoStore)
 	require.NoError(t, err)
 
 	kafkaConsumerClient := &kafka.KafkaConsumerGroup{}
@@ -404,7 +419,7 @@ func Test_Server_processBlockFound(t *testing.T) {
 	s := New(ulogger.TestLogger{}, tSettings, nil, txStore, utxoStore, nil, blockchainClient, kafkaConsumerClient, nil)
 	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, subtreeStore, txStore, utxoStore, nil, nil)
 
-	err = s.processBlockFound(context.Background(), block.Hash(), "legacy", block)
+	err = s.processBlockFound(context.Background(), block.Hash(), "legacy", "", block)
 	require.NoError(t, err)
 }
 
@@ -470,15 +485,15 @@ func TestServer_catchup(t *testing.T) {
 		testCtx, testCancel := context.WithCancel(ctx)
 		defer testCancel()
 
-		// Setup
-		mockBlockchainStore := blockchain_store.NewMockStore()
-		mockBlockchainClient, err := blockchain.NewLocalClient(logger, mockBlockchainStore, nil, nil)
-		require.NoError(t, err)
-
 		tSettings := test.CreateBaseTestSettings(t)
 		tSettings.GlobalBlockHeightRetention = uint32(0)
 		tSettings.ChainCfgParams.CoinbaseMaturity = 100
 		tSettings.BlockValidation.SecretMiningThreshold = 100
+
+		// Setup
+		mockBlockchainStore := blockchain_store.NewMockStore()
+		mockBlockchainClient, err := blockchain.NewLocalClient(logger, tSettings, mockBlockchainStore, nil, nil)
+		require.NoError(t, err)
 
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		if err != nil {
@@ -606,7 +621,7 @@ func TestServer_catchup(t *testing.T) {
 				return httpmock.NewBytesResponse(200, responseBytes), nil
 			})
 
-		err = server.catchup(ctx, lastBlock, baseURL)
+		err = server.catchup(ctx, lastBlock, baseURL, "test-peer-001")
 		require.NoError(t, err)
 	})
 }
@@ -704,7 +719,7 @@ func TestServer_blockHandler_processBlockFound_happyPath(t *testing.T) {
 	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 	mockBlockchain.On("AddBlock", mock.Anything, testBlock, mock.Anything, mock.Anything).Return(nil)
 	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{1}, nil)
-	mockBlockchain.On("InvalidateBlock", mock.Anything, testBlock.Hash()).Return(nil)
+	mockBlockchain.On("InvalidateBlock", mock.Anything, testBlock.Hash()).Return([]chainhash.Hash{}, nil)
 	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
 	mockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{testBlock.Header}, []*model.BlockHeaderMeta{{Height: 100}}, nil)
@@ -1072,6 +1087,7 @@ func Test_BlockFound(t *testing.T) {
 	t.Run("block already exists", func(t *testing.T) {
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 		}
 
@@ -1102,6 +1118,7 @@ func Test_BlockFound(t *testing.T) {
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
@@ -1141,6 +1158,7 @@ func Test_BlockFound(t *testing.T) {
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
@@ -1178,6 +1196,7 @@ func Test_BlockFound(t *testing.T) {
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
@@ -1259,6 +1278,7 @@ func Test_ProcessBlock(t *testing.T) {
 			utxoStore:                     utxoStore,
 			recentBlocksBloomFilters:      txmap.NewSyncedMap[chainhash.Hash, *model.BlockBloomFilter](),
 			blockBloomFiltersBeingCreated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			stats:                         gocore.NewStat("test"),
 		}
 
@@ -1302,6 +1322,7 @@ func Test_ProcessBlock(t *testing.T) {
 			utxoStore:                     utxoStore,
 			recentBlocksBloomFilters:      txmap.NewSyncedMap[chainhash.Hash, *model.BlockBloomFilter](),
 			blockBloomFiltersBeingCreated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			stats:                         gocore.NewStat("test"),
 		}
 
@@ -1403,6 +1424,7 @@ func Test_ValidateBlock(t *testing.T) {
 			utxoStore:                     utxoStore,
 			recentBlocksBloomFilters:      txmap.NewSyncedMap[chainhash.Hash, *model.BlockBloomFilter](),
 			blockBloomFiltersBeingCreated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			stats:                         gocore.NewStat("test"),
 		}
 
@@ -1472,6 +1494,7 @@ func Test_ValidateBlock(t *testing.T) {
 			utxoStore:                     utxoStore,
 			recentBlocksBloomFilters:      txmap.NewSyncedMap[chainhash.Hash, *model.BlockBloomFilter](),
 			blockBloomFiltersBeingCreated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			stats:                         gocore.NewStat("test"),
 		}
 
@@ -1522,6 +1545,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 		// Create minimal BlockValidation
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,
@@ -1571,6 +1595,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 		// Create minimal BlockValidation
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,
@@ -1605,6 +1630,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 		// Create minimal BlockValidation
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,

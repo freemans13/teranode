@@ -68,7 +68,12 @@ func TestMoveDownMoveUpWhenNewBlockIsGenerated(t *testing.T) {
 		SettingsContext: "docker.host.teranode2.daemon",
 		SettingsOverrideFunc: func(s *settings.Settings) {
 			s.BlockValidation.SecretMiningThreshold = 9999
-			s.ChainCfgParams.CoinbaseMaturity = 4
+			// Create a copy to avoid race conditions
+			if s.ChainCfgParams != nil {
+				chainParams := *s.ChainCfgParams
+				chainParams.CoinbaseMaturity = 4
+				s.ChainCfgParams = &chainParams
+			}
 		},
 		FSMState: blockchain.FSMStateRUNNING,
 	})
@@ -91,7 +96,12 @@ func TestMoveDownMoveUpWhenNewBlockIsGenerated(t *testing.T) {
 		SettingsContext: "docker.host.teranode1.daemon",
 		SettingsOverrideFunc: func(s *settings.Settings) {
 			s.BlockValidation.SecretMiningThreshold = 9999
-			s.ChainCfgParams.CoinbaseMaturity = 4
+			// Create a copy to avoid race conditions
+			if s.ChainCfgParams != nil {
+				chainParams := *s.ChainCfgParams
+				chainParams.CoinbaseMaturity = 4
+				s.ChainCfgParams = &chainParams
+			}
 		},
 	})
 	defer node1.Stop(t)
@@ -132,7 +142,12 @@ func TestMoveDownMoveUpWhenNoNewBlockIsGenerated(t *testing.T) {
 		SettingsContext: "docker.host.teranode2.daemon",
 		SettingsOverrideFunc: func(s *settings.Settings) {
 			s.BlockValidation.SecretMiningThreshold = 9999
-			s.ChainCfgParams.CoinbaseMaturity = 4
+			// Create a copy to avoid race conditions
+			if s.ChainCfgParams != nil {
+				chainParams := *s.ChainCfgParams
+				chainParams.CoinbaseMaturity = 4
+				s.ChainCfgParams = &chainParams
+			}
 		},
 		FSMState: blockchain.FSMStateRUNNING,
 	})
@@ -151,7 +166,12 @@ func TestMoveDownMoveUpWhenNoNewBlockIsGenerated(t *testing.T) {
 		SettingsContext: "docker.host.teranode1.daemon",
 		SettingsOverrideFunc: func(s *settings.Settings) {
 			s.BlockValidation.SecretMiningThreshold = 9999
-			s.ChainCfgParams.CoinbaseMaturity = 4
+			// Create a copy to avoid race conditions
+			if s.ChainCfgParams != nil {
+				chainParams := *s.ChainCfgParams
+				chainParams.CoinbaseMaturity = 4
+				s.ChainCfgParams = &chainParams
+			}
 		},
 	})
 	defer node1.Stop(t)
@@ -336,7 +356,7 @@ func TestInvalidBlock(t *testing.T) {
 	require.Equal(t, uint32(3), node1BestBlockHeaderMeta.Height)
 
 	// Invalidate best block 3
-	err = node1.BlockchainClient.InvalidateBlock(t.Context(), node1BestBlockHeader.Hash())
+	_, err = node1.BlockchainClient.InvalidateBlock(t.Context(), node1BestBlockHeader.Hash())
 	require.NoError(t, err)
 
 	// Best block should be 2

@@ -18,21 +18,25 @@ import (
 )
 
 type txMinedStatus interface {
-	SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) error
+	SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error)
 }
 
 type txMinedMessage struct {
-	ctx         context.Context
-	logger      ulogger.Logger
-	txMetaStore txMinedStatus
-	block       *Block
-	blockID     uint32
-	done        chan error
+	ctx           context.Context
+	logger        ulogger.Logger
+	txMetaStore   txMinedStatus
+	block         *Block
+	blockID       uint32
+	chainBlockIDs []uint32
+	unsetMined    bool
+	done          chan error
 }
 
 var (
-	txMinedChan = make(chan *txMinedMessage, 1024)
-	txMinedOnce sync.Once
+	txMinedChan      = make(chan *txMinedMessage, 1024)
+	txMinedOnce      sync.Once
+	workerSettings   *settings.Settings
+	workerSettingsMu sync.RWMutex
 
 	// prometheus metrics
 	prometheusUpdateTxMinedCh       prometheus.Counter
@@ -40,7 +44,23 @@ var (
 	prometheusUpdateTxMinedDuration prometheus.Histogram
 )
 
+func setWorkerSettings(tSettings *settings.Settings) {
+	workerSettingsMu.Lock()
+	defer workerSettingsMu.Unlock()
+
+	workerSettings = tSettings
+}
+
+func getWorkerSettings() *settings.Settings {
+	workerSettingsMu.Lock()
+	defer workerSettingsMu.Unlock()
+
+	return workerSettings
+}
+
 func initWorker(tSettings *settings.Settings) {
+	setWorkerSettings(tSettings)
+
 	prometheusUpdateTxMinedCh = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "teranode",
 		Subsystem: "model",
@@ -72,13 +92,20 @@ func initWorker(tSettings *settings.Settings) {
 					}
 				}()
 
+				chainBlockIDsMap := make(map[uint32]bool, len(msg.chainBlockIDs))
+				for _, bID := range msg.chainBlockIDs {
+					chainBlockIDsMap[bID] = true
+				}
+
 				if err := updateTxMinedStatus(
 					msg.ctx,
 					msg.logger,
-					tSettings,
+					getWorkerSettings(),
 					msg.txMetaStore,
 					msg.block,
 					msg.blockID,
+					chainBlockIDsMap,
+					msg.unsetMined,
 				); err != nil {
 					msg.done <- err
 				} else {
@@ -91,7 +118,8 @@ func initWorker(tSettings *settings.Settings) {
 	}()
 }
 
-func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, txMetaStore txMinedStatus, block *Block, blockID uint32) error {
+func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, txMetaStore txMinedStatus,
+	block *Block, blockID uint32, chainBlockIDs []uint32, unsetMined ...bool) error {
 	// start the worker, if not already started
 	txMinedOnce.Do(func() { initWorker(tSettings) })
 
@@ -102,13 +130,20 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 
 	done := make(chan error)
 
+	unsetTxMined := false
+	if len(unsetMined) > 0 {
+		unsetTxMined = unsetMined[0]
+	}
+
 	txMinedChan <- &txMinedMessage{
-		ctx:         ctx,
-		logger:      logger,
-		txMetaStore: txMetaStore,
-		block:       block,
-		blockID:     blockID,
-		done:        done,
+		ctx:           ctx,
+		logger:        logger,
+		txMetaStore:   txMetaStore,
+		block:         block,
+		blockID:       blockID,
+		chainBlockIDs: chainBlockIDs,
+		unsetMined:    unsetTxMined, // whether to unset the mined status
+		done:          done,
 	}
 
 	prometheusUpdateTxMinedCh.Inc()
@@ -116,7 +151,8 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 	return <-done
 }
 
-func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, txMetaStore txMinedStatus, block *Block, blockID uint32) (err error) {
+func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, txMetaStore txMinedStatus,
+	block *Block, blockID uint32, chainBlockIDsMap map[uint32]bool, unsetMined bool) (err error) {
 	ctx, _, endSpan := tracing.Tracer("model").Start(ctx, "updateTxMinedStatus",
 		tracing.WithHistogram(prometheusUpdateTxMinedDuration),
 		tracing.WithTag("txid", block.Hash().String()),
@@ -140,6 +176,12 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 		subtree := subtree
 
 		if subtree == nil {
+			if unsetMined {
+				// if unsetting, we can ignore missing subtrees
+				logger.Warnf("[UpdateTxMinedStatus][%s] unsetting mined status, missing subtree %d of %d - ignoring", block.String(), subtreeIdx, len(block.Subtrees))
+				continue
+			}
+
 			return errors.NewProcessingError("[UpdateTxMinedStatus][%s] missing subtree %d of %d", block.String(), subtreeIdx, len(block.Subtrees))
 		}
 
@@ -147,6 +189,7 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 			BlockID:     blockID,
 			BlockHeight: block.Height,
 			SubtreeIdx:  subtreeIdx,
+			UnsetMined:  unsetMined,
 		}
 
 		g.Go(func() error {
@@ -179,11 +222,12 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 						default:
 						}
 
-						if err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo); err != nil {
+						blockIDsMap, err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo)
+						if err != nil {
 							if retries >= maxRetries {
 								return errors.NewProcessingError("[UpdateTxMinedStatus][%s] error setting mined tx", block.Hash().String(), err)
 							} else {
-								backoff := time.Duration(1+(2*retries)) * time.Second
+								backoff := time.Duration(1+(200*retries)) * time.Millisecond
 								logger.Warnf("[UpdateTxMinedStatus][%s] error setting mined tx, retrying in %s: %v", block.Hash().String(), backoff.String(), err)
 
 								// Use a timer with context cancellation check
@@ -196,6 +240,20 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 								}
 							}
 						} else {
+							if !minedBlockInfo.UnsetMined {
+								// check that all blockIDs are not already on our chain
+								if len(chainBlockIDsMap) > 0 {
+									for _, bIDs := range blockIDsMap {
+										for _, bID := range bIDs {
+											if _, exists := chainBlockIDsMap[bID]; exists && bID != blockID {
+												// this transaction is already on our chain, the block is invalid
+												return errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain, blockID %d", block.Hash().String(), bID)
+											}
+										}
+									}
+								}
+							}
+
 							break
 						}
 
@@ -219,11 +277,12 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 
 					logger.Debugf("[UpdateTxMinedStatus][%s][%s] for %d remainder hashes", block.String(), block.Subtrees[subtreeIdx].String(), len(hashes))
 
-					if err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo); err != nil {
+					blockIDsMap, err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo)
+					if err != nil {
 						if retries >= maxRetries {
 							return errors.NewProcessingError("[UpdateTxMinedStatus][%s] error setting remainder batch mined tx", block.Hash().String(), err)
 						} else {
-							backoff := time.Duration(1+(2*retries)) * time.Second
+							backoff := time.Duration(1+(200*retries)) * time.Millisecond
 							logger.Warnf("[UpdateTxMinedStatus][%s] error setting remainder batch mined tx, retrying in %s: %v", block.Hash().String(), backoff.String(), err)
 
 							// Use a timer with context cancellation check
@@ -238,6 +297,20 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 
 						retries++
 					} else {
+						if !minedBlockInfo.UnsetMined {
+							// check that all blockIDs are not already on our chain
+							if len(chainBlockIDsMap) > 0 {
+								for hash, bIDs := range blockIDsMap {
+									for _, bID := range bIDs {
+										if _, exists := chainBlockIDsMap[bID]; exists && bID != blockID {
+											// this transaction is already on our chain, the block is invalid
+											return errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain: %s, blockID %d", block.Hash().String(), hash.String(), bID)
+										}
+									}
+								}
+							}
+						}
+
 						break
 					}
 				}

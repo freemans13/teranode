@@ -97,7 +97,7 @@ service BlockchainAPI {
   rpc GetBlockHeader(GetBlockHeaderRequest) returns (GetBlockHeaderResponse) {}
 
   // InvalidateBlock marks a block as invalid in the blockchain.
-  rpc InvalidateBlock(InvalidateBlockRequest) returns (google.protobuf.Empty) {}
+  rpc InvalidateBlock(InvalidateBlockRequest) returns (InvalidateBlockResponse) {}
 
   // RevalidateBlock restores a previously invalidated block.
   rpc RevalidateBlock(RevalidateBlockRequest) returns (google.protobuf.Empty) {}
@@ -343,6 +343,11 @@ message InvalidateBlockRequest {
   bytes blockHash = 1;  // Hash of the block to invalidate
 }
 
+// InvalidateBlockResponse contains the result of block invalidation.
+message InvalidateBlockResponse {
+  repeated bytes invalidatedBlocks = 1;  // List of invalidated block hashes
+}
+
 // RevalidateBlockRequest requests to revalidate a block.
 message RevalidateBlockRequest {
   bytes blockHash = 1;  // Hash of the block to revalidate
@@ -472,7 +477,8 @@ message GetHashOfAncestorBlockResponse {
 
 // GetNextWorkRequiredRequest requests difficulty calculation.
 message GetNextWorkRequiredRequest {
-  bytes blockHash = 1;  // Reference block hash
+  bytes previousBlockHash = 1;  // Reference block hash
+  int64 currentBlockTime = 2;  // Current block time is only used for emaergency difficulty adjustment on testnet-type networks
 }
 
 // GetNextWorkRequiredResponse contains difficulty target.

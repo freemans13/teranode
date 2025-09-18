@@ -808,10 +808,12 @@ func (b *Blockchain) AddBlock(ctx context.Context, request *blockchain_api.AddBl
 		}
 	}
 
-	_, _ = b.SendNotification(ctx, &blockchain_api.Notification{
+	if _, err = b.SendNotification(ctx, &blockchain_api.Notification{
 		Type: model.NotificationType_Block,
 		Hash: block.Hash().CloneBytes(),
-	})
+	}); err != nil {
+		b.logger.Errorf("[AddBlock] error sending notification for new block %s: %v", block.Hash(), err)
+	}
 
 	return &emptypb.Empty{}, nil
 }
@@ -1085,48 +1087,29 @@ func (b *Blockchain) GetNextWorkRequired(ctx context.Context, request *blockchai
 	)
 	defer deferFn()
 
-	var nBits *model.NBit
+	if request.CurrentBlockTime == 0 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetNextWorkRequired] request's current block time is not valid", nil))
+	}
 
 	bytesLittleEndian := make([]byte, 4)
 	binary.LittleEndian.PutUint32(bytesLittleEndian, b.settings.ChainCfgParams.PowLimitBits)
-	defaultNbits, _ := model.NewNBitFromSlice(bytesLittleEndian)
 
-	if b.difficulty == nil {
-		b.logger.Debugf("difficulty is null")
-
-		nBits = defaultNbits
-	} else {
-		hash, err := chainhash.NewHash(request.BlockHash)
-		if err != nil {
-			return nil, errors.WrapGRPC(errors.NewBlockNotFoundError("[Blockchain][GetNextWorkRequired] request's block hash is not valid", err))
-		}
-
-		blockHeaders, metas, err := b.store.GetBlockHeaders(ctx, hash, 2)
-		if err != nil {
-			return nil, errors.WrapGRPC(err)
-		}
-
-		if len(blockHeaders) == 0 {
-			return nil, errors.WrapGRPC(errors.NewBlockNotFoundError("[Blockchain] could not GetBlockHeaders for hash %s", hash.String()))
-		}
-
-		var testnetArgs []int64
-
-		if b.settings.ChainCfgParams.ReduceMinDifficulty {
-			testnetArgs = append(testnetArgs, int64(blockHeaders[0].Timestamp))
-		}
-
-		nBitsp, err := b.difficulty.CalcNextWorkRequired(ctx, blockHeaders[0], metas[0].Height, testnetArgs...)
-		if err == nil {
-			nBits = nBitsp
-		} else {
-			b.logger.Debugf("error in GetNextWorkRequired: %v", err)
-
-			nBits = defaultNbits
-		}
-
-		b.logger.Debugf("difficulty adjustment. Difficulty set to %s", nBits.String())
+	hash, err := chainhash.NewHash(request.PreviousBlockHash)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewBlockNotFoundError("[Blockchain][GetNextWorkRequired] request's block hash is not valid", err))
 	}
+
+	blockHeader, meta, err := b.store.GetBlockHeader(ctx, hash)
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	nBits, err := b.difficulty.CalcNextWorkRequired(ctx, blockHeader, meta.Height, request.CurrentBlockTime)
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	b.logger.Debugf("difficulty adjustment. Difficulty set to %s", nBits.String())
 
 	return &blockchain_api.GetNextWorkRequiredResponse{
 		Bits: nBits.CloneBytes(),
@@ -1805,7 +1788,7 @@ func (b *Blockchain) GetBlockHeaderIDs(ctx context.Context, request *blockchain_
 // Returns:
 //   - *emptypb.Empty: Empty response on successful invalidation
 //   - error: Any error encountered during the invalidation process
-func (b *Blockchain) InvalidateBlock(ctx context.Context, request *blockchain_api.InvalidateBlockRequest) (*emptypb.Empty, error) {
+func (b *Blockchain) InvalidateBlock(ctx context.Context, request *blockchain_api.InvalidateBlockRequest) (*blockchain_api.InvalidateBlockResponse, error) {
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "InvalidateBlock",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainInvalidateBlock),
@@ -1819,22 +1802,51 @@ func (b *Blockchain) InvalidateBlock(ctx context.Context, request *blockchain_ap
 	}
 
 	// invalidate block will also invalidate all child blocks
-	err = b.store.InvalidateBlock(ctx, blockHash)
+	invalidatedHashes, err := b.store.InvalidateBlock(ctx, blockHash)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
 	}
 
+	// Log successful invalidation with count
+	if len(invalidatedHashes) > 1 {
+		b.logger.Infof("[InvalidateBlock] Invalidated block %s and %d child blocks", blockHash.String(), len(invalidatedHashes)-1)
+	} else {
+		b.logger.Infof("[InvalidateBlock] Invalidated block %s", blockHash.String())
+	}
+
+	invalidatedHashBytes := make([][]byte, len(invalidatedHashes))
+
+	for i, hash := range invalidatedHashes {
+		// this will trigger lots of notifications, but it's fine - subscribers should handle that
+		if _, err = b.SendNotification(ctx, &blockchain_api.Notification{
+			Type: model.NotificationType_Block,
+			Hash: hash.CloneBytes(),
+		}); err != nil {
+			b.logger.Errorf("[Blockchain] Error sending notification for invalidated block %s: %v", hash, err)
+		}
+
+		invalidatedHashBytes[i] = hash.CloneBytes()
+	}
+
+	// Clear any cached difficulty that may depend on the previous best tip
+	b.difficulty.ResetCache()
+
+	// send notifications about the new latest block, so subscribers can update their state
 	bestBlock, _, err := b.store.GetBestBlockHeader(ctx)
 	if err != nil {
 		b.logger.Errorf("[Blockchain] Error getting best block header: %v", err)
 	} else {
-		_, _ = b.SendNotification(ctx, &blockchain_api.Notification{
+		if _, err = b.SendNotification(ctx, &blockchain_api.Notification{
 			Type: model.NotificationType_Block,
 			Hash: bestBlock.Hash().CloneBytes(),
-		})
+		}); err != nil {
+			b.logger.Errorf("[Blockchain] Error sending notification for best block %s: %v", bestBlock.Hash(), err)
+		}
 	}
 
-	return &emptypb.Empty{}, nil
+	return &blockchain_api.InvalidateBlockResponse{
+		InvalidatedBlocks: invalidatedHashBytes,
+	}, nil
 }
 
 // RevalidateBlock restores a previously invalidated block.
@@ -1891,11 +1903,22 @@ func (b *Blockchain) RevalidateBlock(ctx context.Context, request *blockchain_ap
 		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[Blockchain][RevalidateBlock] request's hash is not valid", err))
 	}
 
-	// invalidate block will also invalidate all child blocks
+	// revalidate block will NOT revalidate child blocks - they need to be revalidated manually if needed
 	err = b.store.RevalidateBlock(ctx, blockHash)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
 	}
+
+	// send notification about the revalidated block
+	if _, err = b.SendNotification(ctx, &blockchain_api.Notification{
+		Type: model.NotificationType_Block,
+		Hash: blockHash.CloneBytes(),
+	}); err != nil {
+		b.logger.Errorf("[Blockchain] Error sending notification for revalidated block %s: %v", blockHash, err)
+	}
+
+	// Clear any cached difficulty that may depend on the previous best tip
+	b.difficulty.ResetCache()
 
 	return &emptypb.Empty{}, nil
 }

@@ -3,6 +3,8 @@ package asset
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"testing"
@@ -20,6 +22,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// getFreePort finds a free port to use for testing
+func getFreePort(t *testing.T) int {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	require.NoError(t, err)
+	l, err := net.ListenTCP("tcp", addr)
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+	return port
+}
+
 type testCtx struct {
 	server           *Server
 	logger           ulogger.Logger
@@ -33,6 +46,10 @@ func testSetup(t *testing.T) *testCtx {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	settings := test.CreateBaseTestSettings(t)
+
+	// Use dynamic port to avoid conflicts
+	httpPort := getFreePort(t)
+	settings.Asset.HTTPListenAddress = fmt.Sprintf("localhost:%d", httpPort)
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
@@ -49,7 +66,7 @@ func testSetup(t *testing.T) *testCtx {
 	require.NoError(t, err)
 	blockchainStore, err := blockchainstore.NewStore(logger, storeURL, settings)
 	require.NoError(t, err)
-	blockchainClient, err := blockchain.NewLocalClient(logger, blockchainStore, nil, nil)
+	blockchainClient, err := blockchain.NewLocalClient(logger, settings, blockchainStore, nil, nil)
 	require.NoError(t, err)
 
 	server := NewServer(logger, settings, utxoStore, txSore, subtreeStore, blockPersisterStore, blockchainClient)

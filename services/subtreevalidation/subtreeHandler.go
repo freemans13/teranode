@@ -66,31 +66,19 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 			if errors.Is(err, errors.ErrSubtreeExists) {
 				// if the error is subtree exists, then return nil, so that the kafka message is marked as committed.
 				// So the message will not be consumed again.
-				u.logger.Infof("[consumerMessageHandler] Subtree already exists, marking Kafka message as completed.\n")
+				u.logger.Infof("[consumerMessageHandler] Subtree already exists - skipping")
 				return nil
 			}
 
-			// currently, the following cases are considered recoverable:
-			// ERR_SERVICE_ERROR, ERR_STORAGE_ERROR, ERR_CONTEXT_ERROR, ERR_THRESHOLD_EXCEEDED, ERR_EXTERNAL_ERROR
-			// all other cases, including but not limited to, are considered as unrecoverable:
-			// ERR_PROCESSING, ERR_SUBTREE_INVALID, ERR_SUBTREE_INVALID_FORMAT, ERR_INVALID_ARGUMENT, ERR_SUBTREE_EXISTS, ERR_TX_INVALID
-
-			// if error is not nil, check if the error is a recoverable error.
-			// If the error is a recoverable error, then return the error, so that it kafka message is not marked as committed.
-			// So the message will be consumed again.
-			notFoundError := errors.Is(err, errors.ErrSubtreeNotFound)
-			recoverableError := errors.Is(err, errors.ErrServiceError) || errors.Is(err, errors.ErrStorageError) || errors.Is(err, errors.ErrThresholdExceeded) || errors.Is(err, errors.ErrContextCanceled) || errors.Is(err, errors.ErrExternal)
-
-			if recoverableError && !notFoundError {
-				u.logger.Errorf("[consumerMessageHandler] Recoverable error processing kafka message, returning error, not marking Kafka message as complete: %v", err)
-				return err
+			if errors.Is(err, errors.ErrContextCanceled) {
+				// if the error is context canceled, then return nil, so that the kafka message is marked as committed.
+				// So the message will not be consumed again.
+				u.logger.Infof("[consumerMessageHandler] Context canceled, skipping: %v", err)
+				return nil
 			}
 
-			// error is not nil and not recoverable, so it is unrecoverable error, and it should not be tried again
-			// kafka message should be committed, so return nil to mark message.
-			u.logger.Errorf("[consumerMessageHandler] Unrecoverable error processing kafka message, marking Kafka message as completed: %v", err)
-
-			return nil
+			u.logger.Errorf("[consumerMessageHandler] error processing kafka message, %v", err)
+			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -99,6 +87,16 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 
 func (u *Server) subtreesHandler(msg *kafka.KafkaMessage) error {
 	if msg != nil {
+		blockIDsMap := u.currentBlockIDsMap.Load()
+		if blockIDsMap == nil {
+			return errors.NewProcessingError("failed to get block IDs map during subtree validation")
+		}
+
+		bestBlockHeaderMeta := u.bestBlockHeaderMeta.Load()
+		if bestBlockHeaderMeta == nil {
+			return errors.NewProcessingError("failed to get best block header meta during subtree validation")
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
@@ -156,9 +154,9 @@ func (u *Server) subtreesHandler(msg *kafka.KafkaMessage) error {
 			AllowFailFast: true,
 		}
 
-		// the blockIDs map is not passed into this function since we want to validate all the transactions and
-		// warm up the cache if possible. The blockIDs check will be done when a block is mined.
-		if subtree, err = u.ValidateSubtreeInternal(ctx, v, 0, nil); err != nil {
+		// validate the subtree as if it is for the next block height
+		// this is because subtrees are always validated ahead of time before they are needed for a block
+		if subtree, err = u.ValidateSubtreeInternal(ctx, v, bestBlockHeaderMeta.Height+1, *blockIDsMap); err != nil {
 			return err
 		}
 

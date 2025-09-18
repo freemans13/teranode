@@ -219,7 +219,6 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	appSettings.P2P.EnableNATService = false
 	appSettings.P2P.EnableNATPortMap = false
 
-	appSettings.P2P.InitialSyncDelay = 0
 	appSettings.P2P.MinPeersForSync = 0
 	appSettings.P2P.MaxWaitForMinPeers = 0
 
@@ -279,8 +278,10 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	// composeDependencies = StartDaemonDependencies(ctx, t, !opts.SkipRemoveDataDir, calculateDependencies(t, opts.Settings))
 	// }
 
-	appSettings.ChainCfgParams = &chaincfg.RegressionNetParams
-	appSettings.ChainCfgParams.CoinbaseMaturity = 1
+	// Create a copy of RegressionNetParams to avoid race conditions
+	chainParams := chaincfg.RegressionNetParams
+	chainParams.CoinbaseMaturity = 1
+	appSettings.ChainCfgParams = &chainParams
 
 	absPath, err := filepath.Abs(path)
 	require.NoError(t, err)
@@ -944,7 +945,7 @@ func (td *TestDaemon) CreateTransactionWithOptions(t *testing.T, options ...tran
 
 // MineToMaturityAndGetSpendableCoinbaseTx mines blocks to maturity and returns the spendable coinbase transaction.
 func (td *TestDaemon) MineToMaturityAndGetSpendableCoinbaseTx(t *testing.T, ctx context.Context) *bt.Tx {
-	_, err := td.CallRPC(ctx, "generate", []any{uint32(td.Settings.ChainCfgParams.CoinbaseMaturity + 1)})
+	err := td.generateBlocks(t, uint32(td.Settings.ChainCfgParams.CoinbaseMaturity+1))
 	require.NoError(t, err)
 
 	var lastBlock *model.Block
@@ -964,23 +965,125 @@ func (td *TestDaemon) MineToMaturityAndGetSpendableCoinbaseTx(t *testing.T, ctx 
 	return coinbaseTx
 }
 
+// generateBlocks generates the specified number of blocks and waits for them to be available.
+// This prevents race conditions where tests try to fetch blocks immediately after generation.
+// This is a private helper function - tests should use MineAndWait() instead.
+func (td *TestDaemon) generateBlocks(t *testing.T, numBlocks uint32) error {
+	// Get current height before generating
+	_, meta, err := td.BlockchainClient.GetBestBlockHeader(td.Ctx)
+	if err != nil {
+		return errors.NewUnknownError("failed to get best block header: %w", err)
+	}
+	startHeight := meta.Height
+
+	// Generate blocks in batches to avoid RPC limits
+	const batchSize = 100
+	for generated := uint32(0); generated < numBlocks; {
+		remaining := min(batchSize, numBlocks-generated)
+
+		_, err = td.CallRPC(td.Ctx, "generate", []any{remaining})
+		if err != nil {
+			return errors.NewUnknownError("failed to generate %d blocks (batch %d/%d): %w", remaining, generated, numBlocks, err)
+		}
+
+		// Wait for this batch of blocks to be available before generating the next batch
+		intermediateTarget := startHeight + generated + remaining
+		if err = td.waitForBlockHeight(t, intermediateTarget, remaining); err != nil {
+			return errors.NewUnknownError("failed waiting for batch %d blocks at height %d: %w", remaining, intermediateTarget, err)
+		}
+
+		generated += remaining
+	}
+
+	return nil
+}
+
+// waitForBlockHeight waits for the blockchain to reach the specified height with proper timeout and logging.
+func (td *TestDaemon) waitForBlockHeight(t *testing.T, targetHeight uint32, numBlocks uint32) error {
+	// Calculate timeout: 2 seconds per block with a minimum of 10 seconds
+	timeout := time.Duration(max(10, numBlocks*2)) * time.Second
+	ctx, cancel := context.WithTimeout(td.Ctx, timeout)
+	defer cancel()
+
+	// Set up polling ticker - use fixed interval for bulk generation
+	// Exponential backoff is counterproductive when waiting for many blocks
+	pollInterval := 100 * time.Millisecond
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	attempts := 0
+	startTime := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Timeout - get final status for error message
+			currentHeight := td.getCurrentHeight()
+			if t != nil {
+				t.Logf("Timeout after %v: target=%d, current=%d, attempts=%d",
+					time.Since(startTime), targetHeight, currentHeight, attempts)
+			}
+			return errors.NewUnknownError("timeout waiting for block %d (current: %d)",
+				targetHeight, currentHeight)
+
+		case <-ticker.C:
+			attempts++
+
+			// Check current height
+			currentHeight := td.getCurrentHeight()
+
+			// Log progress periodically
+			if attempts%50 == 0 && t != nil {
+				t.Logf("Waiting for block %d, current: %d (attempt %d)",
+					targetHeight, currentHeight, attempts)
+			}
+
+			// Check if we've reached target height
+			if currentHeight >= targetHeight {
+				// Verify we can actually fetch the block
+				if _, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, targetHeight); err == nil {
+					return nil
+				}
+				// Block header exists but data isn't ready - keep polling
+			}
+		}
+	}
+}
+
+// getCurrentHeight safely gets the current blockchain height, returning 0 on error.
+func (td *TestDaemon) getCurrentHeight() uint32 {
+	_, meta, err := td.BlockchainClient.GetBestBlockHeader(td.Ctx)
+	if err != nil || meta == nil {
+		return 0
+	}
+	return meta.Height
+}
+
 // MineAndWait mines the specified number of blocks and waits for them to be added to the blockchain.
 func (td *TestDaemon) MineAndWait(t *testing.T, blockCount uint32) *model.Block {
-	// Get the current block height
+	// Get the current block height before generating
 	_, meta, err := td.BlockchainClient.GetBestBlockHeader(td.Ctx)
 	require.NoError(t, err)
+	startHeight := meta.Height
 
-	_, err = td.CallRPC(td.Ctx, "generate", []any{blockCount})
+	// Use generateBlocks to handle all generation, batching, and waiting logic
+	err = td.generateBlocks(t, blockCount)
 	require.NoError(t, err)
 
-	endHeight := meta.Height + blockCount
+	// Calculate the target height and fetch the final block
+	endHeight := startHeight + blockCount
 
 	var lastBlock *model.Block
-
 	lastBlock, err = td.BlockchainClient.GetBlockByHeight(td.Ctx, endHeight)
 	require.NoError(t, err)
 
 	return lastBlock
+}
+
+// MineBlocks is a convenience function that mines blocks without returning the last block.
+// This is useful for tests that just need to generate blocks but don't need the block data.
+func (td *TestDaemon) MineBlocks(t *testing.T, blockCount uint32) {
+	_ = td.MineAndWait(t, blockCount)
 }
 
 // CreateTestBlock creates a test block with the given previous block, nonce, and transactions.

@@ -3,26 +3,25 @@
 
 ## Table of Contents
 
-- [blockassembly_api.proto](#blockassembly_api.proto)
-    - [AddTxBatchRequest](#AddTxBatchRequest)
-    - [AddTxBatchResponse](#AddTxBatchResponse)
-    - [AddTxRequest](#AddTxRequest)
-    - [AddTxResponse](#AddTxResponse)
-    - [EmptyMessage](#EmptyMessage)
-    - [GenerateBlocksRequest](#GenerateBlocksRequest)
-    - [GetBlockAssemblyBlockCandidateResponse](#GetBlockAssemblyBlockCandidateResponse)
-    - [GetCurrentDifficultyResponse](#GetCurrentDifficultyResponse)
-    - [GetMiningCandidateRequest](#GetMiningCandidateRequest)
-    - [HealthResponse](#HealthResponse)
-    - [NewChaintipAndHeightRequest](#NewChaintipAndHeightRequest)
-    - [OKResponse](#OKResponse)
-    - [RemoveTxRequest](#RemoveTxRequest)
-    - [StateMessage](#StateMessage)
-    - [SubmitMiningSolutionRequest](#SubmitMiningSolutionRequest)
-
-    - [BlockAssemblyAPI](#BlockAssemblyAPI)
-
-- [Scalar Value Types](#scalar-value-types)
+- [blockassembly\_api.proto](#blockassembly_apiproto)
+    - [AddTxBatchRequest](#addtxbatchrequest)
+    - [AddTxBatchResponse](#addtxbatchresponse)
+    - [AddTxRequest](#addtxrequest)
+    - [AddTxResponse](#addtxresponse)
+    - [EmptyMessage](#emptymessage)
+    - [GenerateBlocksRequest](#generateblocksrequest)
+    - [GetCurrentDifficultyResponse](#getcurrentdifficultyresponse)
+    - [GetMiningCandidateRequest](#getminingcandidaterequest)
+    - [HealthResponse](#healthresponse)
+    - [NewChaintipAndHeightRequest](#newchaintipandheightrequest)
+    - [RemoveTxRequest](#removetxrequest)
+    - [StateMessage](#statemessage)
+    - [SubmitMiningSolutionRequest](#submitminingsolutionrequest)
+    - [OKResponse](#okresponse)
+    - [GetBlockAssemblyBlockCandidateResponse](#getblockassemblyblockcandidateresponse)
+    - [GetBlockAssemblyTxsResponse](#getblockassemblytxsresponse)
+    - [BlockAssemblyAPI](#blockassemblyapi)
+    - [Scalar Value Types](#scalar-value-types)
 
 
 
@@ -30,6 +29,8 @@
 <p align="right"><a href="#top">Top</a></p>
 
 ## blockassembly_api.proto
+
+> Package blockassembly_api defines the gRPC service interface for block assembly operations.
 
 
 
@@ -218,6 +219,8 @@ Message containing the state of the block assembly service.
 | queueCount | [int64](#int64) |  | the size of the queue |
 | currentHeight | [uint32](#uint32) |  | the height of the chaintip |
 | currentHash | [string](#string) |  | the hash of the chaintip |
+| removeMapCount | [uint32](#uint32) |  | the number of transactions in the remove map |
+| subtrees | [string](#string) | repeated | the hashes of the current subtrees |
 
 
 
@@ -269,6 +272,22 @@ Response for the GetBlockAssemblyBlockCandidate method.
 
 
 
+
+
+<a name="GetBlockAssemblyTxsResponse"></a>
+
+### GetBlockAssemblyTxsResponse
+Response for the GetBlockAssemblyTxs method.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| txCount | [uint64](#uint64) |  | the number of transactions in the block assembly |
+| txs | [string](#string) | repeated | the transactions currently being assembled in the block assembly |
+
+
+
+
  <!-- end messages -->
 
  <!-- end enums -->
@@ -279,7 +298,7 @@ Response for the GetBlockAssemblyBlockCandidate method.
 <a name="BlockAssemblyAPI"></a>
 
 ### BlockAssemblyAPI
-The Block Assembly Service is responsible for assembling new blocks and adding them to the blockchain.
+Responsible for assembling new blocks and managing the blockchain's block creation process. This service handles transaction management, mining operations, and block state management.
 
 | Method Name | Request Type | Response Type | Description |
 | ----------- | ------------ | ------------- | ------------|
@@ -290,12 +309,12 @@ The Block Assembly Service is responsible for assembling new blocks and adding t
 | GetMiningCandidate | [GetMiningCandidateRequest](#blockassembly_api-GetMiningCandidateRequest) | [model.MiningCandidate](#model-MiningCandidate) | Retrieves a block template ready for mining. Includes all necessary components for miners to begin work. |
 | GetCurrentDifficulty | [EmptyMessage](#blockassembly_api-EmptyMessage) | [GetCurrentDifficultyResponse](#blockassembly_api-GetCurrentDifficultyResponse) | Retrieves the current network mining difficulty. Used by miners to understand the current mining requirements. |
 | SubmitMiningSolution | [SubmitMiningSolutionRequest](#blockassembly_api-SubmitMiningSolutionRequest) | [OKResponse](#blockassembly_api-OKResponse) | Submits a solved block to the network. Includes the proof-of-work solution and block details. |
-| DeDuplicateBlockAssembly | [EmptyMessage](#blockassembly_api-EmptyMessage) | [EmptyMessage](#blockassembly_api-EmptyMessage) | Removes duplicate transactions from the assembly process. Ensures transaction uniqueness within blocks. |
 | ResetBlockAssembly | [EmptyMessage](#blockassembly_api-EmptyMessage) | [EmptyMessage](#blockassembly_api-EmptyMessage) | Resets the block assembly state. Useful for handling reorgs or recovering from errors. |
 | GetBlockAssemblyState | [EmptyMessage](#blockassembly_api-EmptyMessage) | [StateMessage](#blockassembly_api-StateMessage) | Retrieves the current state of block assembly. Provides detailed information about the assembly process status. |
 | GenerateBlocks | [GenerateBlocksRequest](#blockassembly_api-GenerateBlocksRequest) | [EmptyMessage](#blockassembly_api-EmptyMessage) | Creates new blocks (typically for testing purposes). Allows specification of block count and recipient address. |
 | CheckBlockAssembly | [EmptyMessage](#blockassembly_api-EmptyMessage) | [OKResponse](#blockassembly_api-OKResponse) | Checks the current state of block assembly. This verifies that the block assembly and subtree processor are functioning correctly. |
 | GetBlockAssemblyBlockCandidate | [EmptyMessage](#blockassembly_api-EmptyMessage) | [GetBlockAssemblyBlockCandidateResponse](#blockassembly_api-GetBlockAssemblyBlockCandidateResponse) | Retrieves the current block candidate from block assembly. |
+| GetBlockAssemblyTxs | [EmptyMessage](#blockassembly_api-EmptyMessage) | [GetBlockAssemblyTxsResponse](#blockassembly_api-GetBlockAssemblyTxsResponse) | Retrieves the transactions currently being assembled in the block assembly. This provides visibility into the transactions that are candidates for inclusion in the next block. NOTE: this method is primarily for debugging purposes and may not be suitable for production use. |
 
  <!-- end services -->
 

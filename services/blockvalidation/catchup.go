@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"net/url"
 	"sync/atomic"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
-	"github.com/bsv-blockchain/go-wire"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -32,8 +32,8 @@ const (
 type CatchupContext struct {
 	blockUpTo               *model.Block
 	baseURL                 string
+	peerID                  string
 	startTime               time.Time
-	bestBlockHeader         *model.BlockHeader
 	commonAncestorHash      *chainhash.Hash
 	commonAncestorMeta      *model.BlockHeaderMeta
 	commonAncestorIndex     int // Index of common ancestor in peer headers
@@ -66,26 +66,38 @@ type CatchupContext struct {
 //
 // Returns:
 //   - error: If any step fails or safety checks are violated
-func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, baseURL string) (err error) {
+func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, baseURL string, peerID string) (err error) {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "catchup",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[catchup][%s] starting catchup to %s", blockUpTo.Hash().String(), baseURL),
 	)
 	defer deferFn()
 
-	// TEMP TEMP TEMP for testing
-	if u.settings.ChainCfgParams.Net == wire.TeraTestNet {
-		u.settings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{
-			// nolint:govet
-			{500, newHashFromStr("0000000004cebafe8b90f095a5bb76e5bfeb2b20a5d71fc9ce498d5ed0a3b06c")},
-			// nolint:govet
-			{750, newHashFromStr("0000000005e105e65e60fe0483bfaa5558310ed285ae60b7edb58f4a1f283da3")},
+	// Validate that we have a baseURL for making HTTP requests
+	if baseURL == "" {
+		return errors.NewInvalidArgumentError("baseURL is required for catchup")
+	}
+
+	// Validate that baseURL is a proper HTTP/HTTPS URL and not a peer ID
+	// Special case: "legacy" is allowed for blocks from the legacy service
+	if baseURL != "legacy" {
+		parsedURL, err := url.Parse(baseURL)
+		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+			u.logger.Errorf("[catchup][%s] Invalid baseURL '%s' - must be valid http/https URL, not peer ID. PeerID: %s",
+				blockUpTo.Hash().String(), baseURL, peerID)
+			return errors.NewProcessingError("[catchup][%s] invalid baseURL - not a valid http/https URL", blockUpTo.Hash().String())
 		}
+	}
+
+	// Use baseURL as fallback if peerID is not provided (for backward compatibility)
+	if peerID == "" {
+		peerID = baseURL
 	}
 
 	catchupCtx := &CatchupContext{
 		blockUpTo: blockUpTo,
 		baseURL:   baseURL,
+		peerID:    peerID,
 		startTime: time.Now(),
 	}
 
@@ -227,13 +239,12 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 func (u *Server) fetchHeaders(ctx context.Context, catchupCtx *CatchupContext) error {
 	u.logger.Debugf("[catchup][%s] Step 1: Fetching headers from peer %s", catchupCtx.blockUpTo.Hash().String(), catchupCtx.baseURL)
 
-	result, bestBlockHeader, err := u.catchupGetBlockHeaders(ctx, catchupCtx.blockUpTo, catchupCtx.baseURL)
+	result, _, err := u.catchupGetBlockHeaders(ctx, catchupCtx.blockUpTo, catchupCtx.baseURL, catchupCtx.peerID)
 	if err != nil {
 		return errors.NewProcessingError("[catchup][%s] failed to get block headers: %w", catchupCtx.blockUpTo.Hash().String(), err)
 	}
 
 	catchupCtx.headersFetchResult = result
-	catchupCtx.bestBlockHeader = bestBlockHeader
 
 	u.logger.Infof("[catchup][%s] Fetched %d headers from peer", catchupCtx.blockUpTo.Hash().String(), len(result.Headers))
 
@@ -329,11 +340,11 @@ func (u *Server) validateForkDepth(catchupCtx *CatchupContext) error {
 		u.logger.Errorf("[catchup][%s] fork depth (%d blocks) exceeds coinbase maturity (%d blocks)", catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth, u.settings.ChainCfgParams.CoinbaseMaturity)
 
 		// Record malicious attempt
-		u.recordMaliciousAttempt(catchupCtx.baseURL, "coinbase_maturity_violation")
+		u.recordMaliciousAttempt(catchupCtx.peerID, "coinbase_maturity_violation")
 
 		// Record error metric
 		if prometheusCatchupErrors != nil {
-			prometheusCatchupErrors.WithLabelValues(catchupCtx.baseURL, "coinbase_maturity_violation").Inc()
+			prometheusCatchupErrors.WithLabelValues(catchupCtx.peerID, "coinbase_maturity_violation").Inc()
 		}
 
 		return errors.NewServiceError("[catchup][%s] fork depth (%d) exceeds coinbase maturity (%d)", catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth, u.settings.ChainCfgParams.CoinbaseMaturity)
@@ -356,7 +367,7 @@ func (u *Server) validateForkDepth(catchupCtx *CatchupContext) error {
 func (u *Server) checkSecretMining(ctx context.Context, catchupCtx *CatchupContext) error {
 	u.logger.Debugf("[catchup][%s] Step 4: Checking for secret mining", catchupCtx.blockUpTo.Hash().String())
 
-	return u.checkSecretMiningFromCommonAncestor(ctx, catchupCtx.blockUpTo, catchupCtx.baseURL, catchupCtx.commonAncestorHash, catchupCtx.commonAncestorMeta)
+	return u.checkSecretMiningFromCommonAncestor(ctx, catchupCtx.blockUpTo, catchupCtx.baseURL, catchupCtx.peerID, catchupCtx.commonAncestorHash, catchupCtx.commonAncestorMeta)
 }
 
 // filterHeaders filters headers to only those after the common ancestor that we don't have.
@@ -559,8 +570,13 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	size.Store(int64(len(catchupCtx.blockHeaders)))
 	validateBlocksChan := make(chan *model.Block, size.Load())
 
+	bestBlockHeader, _, err := u.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return errors.NewProcessingError("failed to get best block header", err)
+	}
+
 	// Check if we need to change FSM state
-	newBlocksOnOurChain := len(catchupCtx.blockHeaders) > 0 && catchupCtx.blockHeaders[0].HashPrevBlock.IsEqual(catchupCtx.bestBlockHeader.Hash())
+	newBlocksOnOurChain := len(catchupCtx.blockHeaders) > 0 && catchupCtx.blockHeaders[0].HashPrevBlock.IsEqual(bestBlockHeader.Hash())
 
 	// Set FSM state if needed
 	if newBlocksOnOurChain {
@@ -678,16 +694,18 @@ func (u *Server) filterExistingBlocks(ctx context.Context, headers []*model.Bloc
 // Updates peer metrics and logs security warnings.
 //
 // Parameters:
-//   - peerURL: URL of the malicious peer
+//   - peerID: P2P peer identifier of the malicious peer
 //   - reason: Description of the malicious behavior
-func (u *Server) recordMaliciousAttempt(peerURL string, reason string) {
-	if u.peerMetrics != nil {
-		peerMetric := u.peerMetrics.GetOrCreatePeerMetrics(peerURL)
+func (u *Server) recordMaliciousAttempt(peerID string, reason string) {
+	if u.peerMetrics != nil && peerID != "" {
+		peerMetric := u.peerMetrics.GetOrCreatePeerMetrics(peerID)
 		peerMetric.RecordMaliciousAttempt()
-		u.logger.Warnf("Recorded malicious attempt from peer %s: %s", peerURL, reason)
+		u.logger.Warnf("Recorded malicious attempt from peer %s: %s", peerID, reason)
 	}
 
-	u.logger.Errorf("SECURITY: Peer %s attempted %s - should be banned (banning not yet implemented)", peerURL, reason)
+	if peerID != "" {
+		u.logger.Errorf("SECURITY: Peer %s attempted %s - should be banned (banning not yet implemented)", peerID, reason)
+	}
 }
 
 // setFSMCatchingBlocks sets the FSM state to CATCHINGBLOCKS.
@@ -747,6 +765,7 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan *model.Block, g
 	i := 0
 	blockUpTo := catchupCtx.blockUpTo
 	baseURL := catchupCtx.baseURL
+	peerID := catchupCtx.peerID
 
 	// validate the blocks while getting them from the other node
 	// this will block until all blocks are validated
@@ -773,34 +792,10 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan *model.Block, g
 			// Get cached headers for validation
 			cachedHeaders, _ := u.headerChainCache.GetValidationHeaders(block.Hash())
 
-			// Determine if this specific block can use quick validation
-			// A block can use quick validation if it's at or below the highest verified checkpoint height
-			canUseQuickValidation := catchupCtx.useQuickValidation && block.Height <= catchupCtx.highestCheckpointHeight
-			tryNormalValidation := true // Default to normal validation, we'll unset if quick validation is used
-
-			// If block is below checkpoint, use quick validation directly
-			if canUseQuickValidation {
-				// Quick validation: create UTXOs for the block and validate transactions in parallel
-				if err := u.blockValidation.quickValidateBlock(gCtx, block, baseURL); err != nil {
-					if prometheusCatchupErrors != nil {
-						prometheusCatchupErrors.WithLabelValues(baseURL, "validation_failure").Inc()
-					}
-
-					u.logger.Warnf("[catchup:validateBlocksOnChannel][%s] quick validation failed for block %s, removing .subtree files: %v", blockUpTo.Hash().String(), block.Hash().String(), err)
-
-					// since the quick validation failed, we will have to remove the .subtree files, which will trigger
-					// the normal validation to re-create the UTXOs and validate the transactions
-					for _, subtreeHash := range block.Subtrees {
-						if err = u.subtreeStore.Del(gCtx, subtreeHash[:], fileformat.FileTypeSubtree); err != nil {
-							if !errors.Is(err, errors.ErrNotFound) {
-								return errors.NewProcessingError("[catchup:validateBlocksOnChannel][%s] failed to remove subtree file %s", blockUpTo.Hash().String(), subtreeHash.String(), err)
-							}
-						}
-					}
-				} else {
-					// Quick validation succeeded, skip normal validation
-					tryNormalValidation = false
-				}
+			// Try quick validation if applicable
+			tryNormalValidation, err := u.tryQuickValidation(gCtx, block, catchupCtx, baseURL)
+			if err != nil {
+				return err
 			}
 
 			if tryNormalValidation {
@@ -816,14 +811,19 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan *model.Block, g
 				if err := u.blockValidation.ValidateBlockWithOptions(gCtx, block, baseURL, nil, opts); err != nil {
 					u.logger.Errorf("[catchup:validateBlocksOnChannel][%s] failed to validate block %s at position %d: %v", blockUpTo.Hash().String(), block.Hash().String(), i, err)
 
-					// mark block as invalid, we did not add it to the chain, since we did not do optimistic mining
-					if markErr := u.blockchainClient.AddBlock(gCtx, block, baseURL, options.WithInvalid(true)); markErr != nil {
-						u.logger.Errorf("[catchup:validateBlocksOnChannel][%s] failed to store block %s and mark as invalid: %v", blockUpTo.Hash().String(), block.Hash().String(), markErr)
+					// Only mark block as invalid for consensus violations (ErrBlockInvalid or ErrTxInvalid)
+					// Other errors like missing data, storage issues, or processing errors should not mark the block as invalid
+					if errors.Is(err, errors.ErrBlockInvalid) || errors.Is(err, errors.ErrTxInvalid) {
+						u.logger.Warnf("[catchup:validateBlocksOnChannel][%s] block %s violates consensus rules, marking as invalid", blockUpTo.Hash().String(), block.Hash().String())
+						if markErr := u.blockchainClient.AddBlock(gCtx, block, peerID, options.WithInvalid(true)); markErr != nil {
+							u.logger.Errorf("[catchup:validateBlocksOnChannel][%s] failed to store invalid block %s: %v", blockUpTo.Hash().String(), block.Hash().String(), markErr)
+						}
 					}
+					// For recoverable errors (storage, processing, missing data), don't mark as invalid - just fail and retry later
 
 					// Record metric for validation failure
 					if prometheusCatchupErrors != nil {
-						prometheusCatchupErrors.WithLabelValues(baseURL, "validation_failure").Inc()
+						prometheusCatchupErrors.WithLabelValues(peerID, "validation_failure").Inc()
 					}
 
 					return err
@@ -841,6 +841,45 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan *model.Block, g
 	u.logger.Infof("[catchup:validateBlocksOnChannel][%s] completed validation of %d blocks", blockUpTo.Hash().String(), i)
 
 	return nil
+}
+
+// tryQuickValidation attempts quick validation for checkpointed blocks
+// Returns true if normal validation should be tried, false if quick validation succeeded
+func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, catchupCtx *CatchupContext, baseURL string) (bool, error) {
+	// Determine if this specific block can use quick validation
+	// A block can use quick validation if it's at or below the highest verified checkpoint height
+	canUseQuickValidation := catchupCtx.useQuickValidation && block.Height <= catchupCtx.highestCheckpointHeight
+
+	// If block is not eligible for quick validation, use normal validation
+	if !canUseQuickValidation {
+		return true, nil
+	}
+
+	// Quick validation: create UTXOs for the block and validate transactions in parallel
+	if err := u.blockValidation.quickValidateBlock(ctx, block, baseURL); err != nil {
+		if prometheusCatchupErrors != nil {
+			prometheusCatchupErrors.WithLabelValues(baseURL, "validation_failure").Inc()
+		}
+
+		u.logger.Warnf("[catchup:validateBlocksOnChannel][%s] quick validation failed for block %s, removing .subtree files: %v",
+			catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)
+
+		// since the quick validation failed, we will have to remove the .subtree files, which will trigger
+		// the normal validation to re-create the UTXOs and validate the transactions
+		for _, subtreeHash := range block.Subtrees {
+			if err = u.subtreeStore.Del(ctx, subtreeHash[:], fileformat.FileTypeSubtree); err != nil {
+				if !errors.Is(err, errors.ErrNotFound) {
+					return false, errors.NewProcessingError("[catchup:validateBlocksOnChannel][%s] failed to remove subtree file %s",
+						catchupCtx.blockUpTo.Hash().String(), subtreeHash.String(), err)
+				}
+			}
+		}
+		// Quick validation failed, try normal validation
+		return true, nil
+	}
+
+	// Quick validation succeeded, skip normal validation
+	return false, nil
 }
 
 // getHighestCheckpointHeight returns the height of the highest checkpoint
@@ -885,7 +924,7 @@ func getLowestCheckpointHeight(checkpoints []chaincfg.Checkpoint) uint32 {
 //
 // Returns:
 //   - error: If secret mining is detected
-func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockUpTo *model.Block, baseURL string, commonAncestorHash *chainhash.Hash, commonAncestorMeta *model.BlockHeaderMeta) error {
+func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockUpTo *model.Block, baseURL string, peerID string, commonAncestorHash *chainhash.Hash, commonAncestorMeta *model.BlockHeaderMeta) error {
 	// Check whether the common ancestor is more than X blocks behind our current chain.
 	// This indicates potential secret mining.
 	currentHeight := u.utxoStore.GetBlockHeight()
@@ -900,8 +939,8 @@ func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockU
 	u.logger.Errorf("[catchup][%s] is potentially a secretly mined chain from common ancestor %s at height %d, ignoring", blockUpTo.Hash().String(), commonAncestorHash.String(), commonAncestorMeta.Height)
 
 	// Record error metric for secret mining
-	if prometheusCatchupErrors != nil {
-		prometheusCatchupErrors.WithLabelValues(baseURL, "secret_mining").Inc()
+	if prometheusCatchupErrors != nil && peerID != "" {
+		prometheusCatchupErrors.WithLabelValues(peerID, "secret_mining").Inc()
 	}
 
 	// Log metrics for secret mining detection
@@ -910,8 +949,8 @@ func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockU
 		currentHeight-commonAncestorMeta.Height, u.settings.BlockValidation.SecretMiningThreshold)
 
 	// Record the malicious attempt for this peer
-	if u.peerMetrics != nil {
-		peerMetric := u.peerMetrics.GetOrCreatePeerMetrics(baseURL)
+	if u.peerMetrics != nil && peerID != "" {
+		peerMetric := u.peerMetrics.GetOrCreatePeerMetrics(peerID)
 		peerMetric.RecordMaliciousAttempt()
 		u.logger.Warnf("[catchup][%s] recorded malicious attempt from peer %s for secret mining", blockUpTo.Hash().String(), baseURL)
 	}

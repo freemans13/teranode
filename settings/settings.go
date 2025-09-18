@@ -279,11 +279,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CircuitBreakerSuccessThreshold: getInt("blockvalidation_circuit_breaker_success_threshold", 2, alternativeContext...),
 			CircuitBreakerTimeoutSeconds:   getInt("blockvalidation_circuit_breaker_timeout_seconds", 30, alternativeContext...),
 			// Block fetching configuration
-			FetchLargeBatchSize:     getInt("blockvalidation_fetch_large_batch_size", 100, alternativeContext...),
-			FetchNumWorkers:         getInt("blockvalidation_fetch_num_workers", 16, alternativeContext...),
-			FetchBufferSize:         getInt("blockvalidation_fetch_buffer_size", 500, alternativeContext...),
-			SubtreeFetchConcurrency: getInt("blockvalidation_subtree_fetch_concurrency", 8, alternativeContext...),
-			ExtendTransactionTimeout: getDuration("blockvalidation_extend_transaction_timeout", 120*time.Second, alternativeContext...),
+			FetchLargeBatchSize:             getInt("blockvalidation_fetch_large_batch_size", 100, alternativeContext...),
+			FetchNumWorkers:                 getInt("blockvalidation_fetch_num_workers", 16, alternativeContext...),
+			FetchBufferSize:                 getInt("blockvalidation_fetch_buffer_size", 500, alternativeContext...),
+			SubtreeFetchConcurrency:         getInt("blockvalidation_subtree_fetch_concurrency", 8, alternativeContext...),
+			ExtendTransactionTimeout:        getDuration("blockvalidation_extend_transaction_timeout", 120*time.Second, alternativeContext...),
 			GetBlockTransactionsConcurrency: getInt("blockvalidation_get_block_transactions_concurrency", 64, alternativeContext...),
 		},
 		Validator: ValidatorSettings{
@@ -342,6 +342,12 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MaxMinedBatchSize:              getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment: getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
 			DisableDAHCleaner:              getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
+			// Cleanup-specific settings with reasonable defaults
+			CleanupParentUpdateBatcherSize:           getInt("utxostore_cleanupParentUpdateBatcherSize", 100, alternativeContext...),
+			CleanupParentUpdateBatcherDurationMillis: getInt("utxostore_cleanupParentUpdateBatcherDurationMillis", 10, alternativeContext...),
+			CleanupDeleteBatcherSize:                 getInt("utxostore_cleanupDeleteBatcherSize", 256, alternativeContext...),
+			CleanupDeleteBatcherDurationMillis:       getInt("utxostore_cleanupDeleteBatcherDurationMillis", 10, alternativeContext...),
+			CleanupMaxConcurrentOperations:           getInt("utxostore_cleanupMaxConcurrentOperations", 128, alternativeContext...),
 		},
 		P2P: P2PSettings{
 			BestBlockTopic:      getString("p2p_bestblock_topic", "", alternativeContext...),
@@ -390,7 +396,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BanThreshold:    getInt("p2p_ban_threshold", 100, alternativeContext...),
 			BanDuration:     getDuration("p2p_ban_duration", 24*time.Hour),
 			// Sync manager configuration
-			InitialSyncDelay:      getDuration("p2p_initial_sync_delay", 5*time.Second),
 			MinPeersForSync:       getInt("p2p_min_peers_for_sync", 2, alternativeContext...),
 			MaxWaitForMinPeers:    getDuration("p2p_max_wait_for_min_peers", 20*time.Second),
 			ForceSyncPeer:         getString("p2p_force_sync_peer", "", alternativeContext...),
@@ -440,7 +445,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ProcessTxMetaUsingStoreBatchSize:          getInt("subtreevalidation_processTxMetaUsingStore_BatchSize", 1024, alternativeContext...),
 			ProcessTxMetaUsingStoreConcurrency:        getInt("subtreevalidation_processTxMetaUsingStore_Concurrency", 32, alternativeContext...),
 			ProcessTxMetaUsingStoreMissingTxThreshold: getInt("subtreevalidation_processTxMetaUsingStore_MissingTxThreshold", 1, alternativeContext...),
-			SubtreeFoundChConcurrency:                 getInt("subtreevalidation_subtreeFoundChConcurrency", 1, alternativeContext...),
 			SubtreeBlockHeightRetention:               getUint32("subtreevalidation_subtreeBlockHeightRetention", globalBlockHeightRetention),
 			SubtreeDAHConcurrency:                     getInt("subtreevalidation_subtreeDAHConcurrency", 8, alternativeContext...),
 			SubtreeValidationTimeout:                  getInt("subtreevalidation_subtreeValidationTimeout", 1000, alternativeContext...),

@@ -4,7 +4,9 @@ package blockassembly
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,6 +32,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// getFreePort returns a free port number on localhost
+func getFreePort(t *testing.T) int {
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
 // setupTest initializes the test environment and returns a cleanup function.
 // The cleanup function should be deferred by the calling test.
 func setupTest(t *testing.T) (*nodehelpers.BlockchainDaemon, *BlockAssembly, context.Context, context.CancelFunc, func()) {
@@ -43,6 +53,12 @@ func setupTest(t *testing.T) (*nodehelpers.BlockchainDaemon, *BlockAssembly, con
 
 	// Setup block assembly service
 	tSettings := blockchainDaemon.Settings
+
+	// Use a dynamic port for BlockAssembly to avoid conflicts
+	baPort := getFreePort(t)
+	tSettings.BlockAssembly.GRPCListenAddress = fmt.Sprintf("localhost:%d", baPort)
+	tSettings.BlockAssembly.GRPCAddress = fmt.Sprintf("localhost:%d", baPort)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	memStore := memory.New()
 	blobStore := memory.New()
@@ -56,17 +72,16 @@ func setupTest(t *testing.T) (*nodehelpers.BlockchainDaemon, *BlockAssembly, con
 	utxoStore, err := sql.New(ctx, logger, settings, utxoStoreURL)
 	require.NoError(t, err)
 
-	blockchainClient, err := blockchain.NewClient(ctx, ulogger.TestLogger{}, tSettings, "test")
-	require.NoError(t, err)
-
-	err = blockchainClient.Run(ctx, "test")
-	require.NoError(t, err, "Blockchain client failed to start")
-
-	ba := New(ulogger.TestLogger{}, tSettings, memStore, utxoStore, blobStore, blockchainClient)
+	// Use the blockchain client from the daemon which is already connected and running
+	ba := New(ulogger.TestLogger{}, tSettings, memStore, utxoStore, blobStore, blockchainDaemon.BlockchainClient)
 	require.NotNil(t, ba)
 
 	// Skip waiting for pending blocks in tests to prevent hanging
 	ba.SetSkipWaitForPendingBlocks(true)
+
+	// Log the gRPC addresses
+	t.Logf("BlockAssembly GRPCListenAddress: %s", tSettings.BlockAssembly.GRPCListenAddress)
+	t.Logf("BlockAssembly GRPCAddress: %s", tSettings.BlockAssembly.GRPCAddress)
 
 	err = ba.Init(ctx)
 	require.NoError(t, err)
@@ -159,7 +174,7 @@ func Test_CoinbaseSubsidyHeight(t *testing.T) {
 
 	ba.blockAssembler.bestBlockHeader.Store(h)
 	ba.blockAssembler.bestBlockHeight.Store(m.Height)
-	ba.blockAssembler.subtreeProcessor.SetCurrentBlockHeader(ba.blockAssembler.bestBlockHeader.Load())
+	ba.blockAssembler.subtreeProcessor.InitCurrentBlockHeader(ba.blockAssembler.bestBlockHeader.Load())
 	mc, st, err := ba.blockAssembler.getMiningCandidate()
 	require.NoError(t, err, "Failed to get mining candidate")
 	assert.NotNil(t, mc, "Mining candidate should not be nil")

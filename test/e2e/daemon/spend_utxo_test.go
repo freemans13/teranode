@@ -30,8 +30,7 @@ func TestShouldAllowSpendAllUtxos(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate initial blocks
-	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{101})
-	require.NoError(t, err)
+	td.MineAndWait(t, 101)
 
 	// Generate private key and address for recipient
 	privateKey1, err := bec.NewPrivateKey()
@@ -108,7 +107,7 @@ func TestShouldAllowSpendAllUtxos(t *testing.T) {
 	block102, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 102)
 	require.NoError(t, err)
 
-	err = block102.GetAndValidateSubtrees(td.Ctx, td.Logger, td.SubtreeStore, nil)
+	err = block102.GetAndValidateSubtrees(td.Ctx, td.Logger, td.SubtreeStore)
 	require.NoError(t, err)
 
 	err = block102.CheckMerkleRoot(td.Ctx)

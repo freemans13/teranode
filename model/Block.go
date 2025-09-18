@@ -486,7 +486,7 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	// missing the subtreeStore should only happen when we are validating an internal block
 	if subtreeStore != nil && len(b.Subtrees) > 0 {
 		// 6. Get and validate any missing subtrees.
-		if err = b.GetAndValidateSubtrees(ctx, logger, subtreeStore, nil); err != nil {
+		if err = b.GetAndValidateSubtrees(ctx, logger, subtreeStore); err != nil {
 			return false, err
 		}
 
@@ -1104,21 +1104,21 @@ func (b *Block) getFromAerospike(logger ulogger.Logger, parentTxStruct missingPa
 	return errors.NewServiceError("aerospike response: %v", response)
 }
 
-func (b *Block) GetSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, fallbackGetFunc func(subtreeHash chainhash.Hash) error) ([]*subtreepkg.Subtree, error) {
+func (b *Block) GetSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore) ([]*subtreepkg.Subtree, error) {
 	startTime := time.Now()
 	defer func() {
 		prometheusBlockGetSubtrees.Observe(time.Since(startTime).Seconds())
 	}()
 
 	// get the subtree slices from the subtree store
-	if err := b.GetAndValidateSubtrees(ctx, logger, subtreeStore, fallbackGetFunc); err != nil {
+	if err := b.GetAndValidateSubtrees(ctx, logger, subtreeStore); err != nil {
 		return nil, err
 	}
 
 	return b.SubtreeSlices, nil
 }
 
-func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, fallbackGetFunc func(subtreeHash chainhash.Hash) error) error {
+func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore) error {
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "GetAndValidateSubtrees",
 		tracing.WithHistogram(prometheusBlockGetAndValidateSubtrees),
 	)
@@ -1175,13 +1175,11 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 				findSubtree := func() (io.ReadCloser, error) {
 					readCloser, err := subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtree)
 					if err != nil {
-						if errors.Is(err, errors.ErrNotFound) && fallbackGetFunc != nil {
-							if err := fallbackGetFunc(*subtreeHash); err != nil {
-								return nil, errors.NewSubtreeNotFoundError("failed to get subtree via fallback method", err)
-							}
-
+						if errors.Is(err, errors.ErrNotFound) {
 							return subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtree)
 						}
+
+						return nil, err
 					}
 
 					return readCloser, err
@@ -1234,6 +1232,9 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 
 	for sIdx := 0; sIdx < len(b.SubtreeSlices); sIdx++ {
 		subtree := b.SubtreeSlices[sIdx]
+		if subtree == nil {
+			return errors.NewBlockInvalidError("[BLOCK][%s][ID %d] subtree %d of %d was loaded but is nil", b.String(), b.ID, sIdx, nrOfSubtrees)
+		}
 		if sIdx == 0 {
 			subtreeSize = subtree.Length()
 		} else if subtree.Length() != subtreeSize && sIdx != nrOfSubtrees-1 {
@@ -1469,7 +1470,7 @@ func (b *Block) Bytes() ([]byte, error) {
 }
 
 func (b *Block) NewOptimizedBloomFilter(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore) (*blobloom.Filter, error) {
-	err := b.GetAndValidateSubtrees(ctx, logger, subtreeStore, nil)
+	err := b.GetAndValidateSubtrees(ctx, logger, subtreeStore)
 	if err != nil {
 		return nil, err
 	}

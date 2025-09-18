@@ -50,6 +50,7 @@ import (
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bitcoin-sv/teranode/settings"
@@ -184,6 +185,36 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
 	// defer cancelTimeout()
 
+	// Try the operation with retry logic for lock errors
+	var txMeta *meta.Data
+	var err error
+
+	for attempt := 0; attempt <= 3; attempt++ {
+		txMeta, err = s.createWithRetry(ctx, tx, blockHeight, options)
+
+		// If no error or not a lock error, return immediately
+		if err == nil || !isLockError(err) {
+			return txMeta, err
+		}
+
+		// For lock errors, retry with backoff
+		if attempt < 3 {
+			backoff := time.Duration(100<<attempt) * time.Millisecond // 100ms, 200ms, 400ms
+			s.logger.Warnf("Database lock error during create (attempt %d): %v, retrying in %v", attempt+1, err, backoff)
+
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+				// Continue to next attempt
+			}
+		}
+	}
+
+	return txMeta, err
+}
+
+func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
 	txMeta, err := util.TxMetaDataFromTx(tx)
 	if err != nil {
 		return nil, errors.NewProcessingError("failed to get tx meta data", err)
@@ -742,6 +773,36 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.Ignore
 		}
 	}()
 
+	// try the operation with retry logic for lock errors
+	var spends []*utxo.Spend
+	var err error
+
+	for attempt := 0; attempt <= 3; attempt++ {
+		spends, err = s.spendWithRetry(ctx, tx, ignoreFlags...)
+
+		// if no error or not a lock error, return immediately
+		if err == nil || !isLockError(err) {
+			return spends, err
+		}
+
+		// for lock errors, retry with backoff
+		if attempt < 3 {
+			backoff := time.Duration(100<<attempt) * time.Millisecond // 100ms, 200ms, 400ms
+			s.logger.Warnf("Database lock error during spend (attempt %d): %v, retrying in %v", attempt+1, err, backoff)
+
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+				// continue to next attempt
+			}
+		}
+	}
+
+	return spends, err
+}
+
+func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	blockHeight := s.GetBlockHeight()
 
 	spends, err := utxo.GetSpends(tx)
@@ -779,6 +840,8 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.Ignore
 	`
 
 	if s.engine == "postgres" {
+		// use FOR UPDATE without SKIP LOCKED to ensure we wait for locked rows
+		// rather than skipping them, which can cause false "not found" errors
 		q1 += ` FOR UPDATE`
 	}
 
@@ -820,10 +883,15 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.Ignore
 				errorFound = true
 
 				if errors.Is(err, sql.ErrNoRows) {
-					spend.Err = errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+					// with SKIP LOCKED, this could mean the row is locked by another transaction or it genuinely doesn't exist
+					if s.engine == "postgres" {
+						spend.Err = errors.NewStorageError("output %s:%d not found or locked by another transaction", spend.TxID, spend.Vout)
+					} else {
+						spend.Err = errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+					}
+				} else {
+					spend.Err = errors.NewStorageError("[Spend] failed: SELECT output FOR UPDATE %s:%d - %v", spend.TxID, spend.Vout, err)
 				}
-
-				spend.Err = errors.NewStorageError("[Spend] failed: SELECT output FOR UPDATE NOWAIT %s:%d", spend.TxID, spend.Vout, err)
 
 				continue
 			}
@@ -890,7 +958,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.Ignore
 			// If this utxo has a coinbase spending height, check it is time to spend it
 			if coinbaseSpendingHeight > 0 && blockHeight < coinbaseSpendingHeight {
 				errorFound = true
-				spend.Err = errors.NewStorageError("[Spend]coinbase utxo not ready to spend for %s:%d", spend.TxID, spend.Vout)
+				spend.Err = errors.NewStorageError("[Spend] coinbase utxo not ready to spend for %s:%d", spend.TxID, spend.Vout)
 
 				continue
 			}
@@ -928,7 +996,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.Ignore
 	}
 
 	if errorFound {
-		return spends, errors.NewTxInvalidError("One or more UTXOs could not be spent")
+		return spends, errors.NewUtxoError("One or more UTXOs could not be spent")
 	} else {
 		if err = txn.Commit(); err != nil {
 			return nil, errors.NewStorageError("[Spend] failed to commit transaction", err)
@@ -1134,18 +1202,279 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	return nil
 }
 
-func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) error {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
+func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	// Check if we're using PostgreSQL or SQLite
+	isPostgres := s.storeURL.Scheme == "postgres"
+
+	// For SQLite or small batches, fall back to the original implementation
+	// SQLite doesn't support array operations, and small batches don't benefit from bulk operations
+	if !isPostgres || len(hashes) < 10 {
+		// Add timeout context for the original implementation
+		ctxWithTimeout, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
+		defer cancelTimeout()
+		return s.setMinedMultiOriginal(ctxWithTimeout, hashes, minedBlockInfo)
+	}
+
+	// For very large batches, split into smaller chunks to avoid long-running transactions
+	const maxBatchSize = 500
+	if len(hashes) > maxBatchSize {
+		return s.setMinedMultiBatched(ctx, hashes, minedBlockInfo, maxBatchSize)
+	}
+
+	// Add timeout context and call the bulk implementation
+	ctxWithTimeout, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
 	defer cancelTimeout()
+	return s.setMinedMultiBulk(ctxWithTimeout, hashes, minedBlockInfo)
+}
+
+// setMinedMultiBatched handles very large batches by splitting them into smaller chunks
+// This avoids long-running transactions that can cause timeouts and deadlocks
+func (s *Store) setMinedMultiBatched(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo, batchSize int) (map[chainhash.Hash][]uint32, error) {
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	resultMap := make(map[chainhash.Hash][]uint32)
+
+	// Process hashes in batches
+	for i := 0; i < len(hashes); i += batchSize {
+		end := i + batchSize
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+
+		batch := hashes[i:end]
+
+		// Check context before processing each batch
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Process this batch with a timeout
+		ctxWithTimeout, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
+		batchResult, err := s.setMinedMultiBulk(ctxWithTimeout, batch, minedBlockInfo)
+		cancelTimeout()
+
+		if err != nil {
+			return nil, errors.NewStorageError("SQL error in batched operation (batch %d-%d): %v", i, end-1, err)
+		}
+
+		// Merge results
+		for hash, blockIDs := range batchResult {
+			resultMap[hash] = blockIDs
+		}
+	}
+
+	return resultMap, nil
+}
+
+// setMinedMultiBulk is the core bulk implementation for medium-sized batches
+func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	// Check if context is already cancelled before starting
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 
 	// Start a database transaction
 	txn, err := s.db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	// Use a flag to track if we should rollback
+	committed := false
 	defer func() {
-		_ = txn.Rollback()
+		if !committed {
+			if rollbackErr := txn.Rollback(); rollbackErr != nil {
+				// Log rollback error but don't override original error
+				s.logger.Warnf("Failed to rollback bulk transaction: %v", rollbackErr)
+			}
+		}
+	}()
+
+	// Convert hashes to byte arrays for PostgreSQL
+	hashBytes := make([][]byte, len(hashes))
+	for i, hash := range hashes {
+		hashBytes[i] = hash[:]
+	}
+
+	// Step 1: Bulk check which transactions exist
+	// Using ANY array operator for bulk comparison
+	qCheckExists := `
+		SELECT hash
+		FROM transactions
+		WHERE hash = ANY($1::bytea[])
+	`
+
+	// Check context before first database operation
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	rows, err := txn.QueryContext(ctx, qCheckExists, pq.Array(hashBytes))
+	if err != nil {
+		return nil, errors.NewStorageError("SQL error checking transaction existence: %v", err)
+	}
+
+	existingHashes := make(map[chainhash.Hash]bool)
+	for rows.Next() {
+		var hashBytes []byte
+		if err := rows.Scan(&hashBytes); err != nil {
+			rows.Close()
+			return nil, errors.NewStorageError("SQL error scanning existing hash: %v", err)
+		}
+		var hash chainhash.Hash
+		copy(hash[:], hashBytes)
+		existingHashes[hash] = true
+	}
+	rows.Close()
+
+	// If no transactions exist, return early
+	if len(existingHashes) == 0 {
+		// Commit empty transaction
+		if err = txn.Commit(); err != nil {
+			return nil, errors.NewStorageError("SQL error committing empty transaction: %v", err)
+		}
+		committed = true
+		return make(map[chainhash.Hash][]uint32), nil
+	}
+
+	// Prepare array of existing hashes only
+	existingHashBytes := make([][]byte, 0, len(existingHashes))
+	for hash := range existingHashes {
+		h := hash // Create a copy to avoid pointer issues
+		existingHashBytes = append(existingHashBytes, h[:])
+	}
+
+	// Check context before block_ids operations
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	if minedBlockInfo.UnsetMined {
+		// Step 2a: Bulk delete block_ids for unsetting mined status
+		qBulkRemove := `
+			DELETE FROM block_ids
+			WHERE transaction_id IN (
+				SELECT id FROM transactions WHERE hash = ANY($1::bytea[])
+			)
+			AND block_id = $2
+		`
+		if _, err = txn.ExecContext(ctx, qBulkRemove, pq.Array(existingHashBytes), minedBlockInfo.BlockID); err != nil {
+			return nil, errors.NewStorageError("SQL error bulk removing block_ids: %v", err)
+		}
+	} else {
+		// Step 2b: Bulk insert block_ids for setting mined status
+		qBulkInsert := `
+			INSERT INTO block_ids (transaction_id, block_id, block_height, subtree_idx)
+			SELECT t.id, $2, $3, $4
+			FROM transactions t
+			WHERE t.hash = ANY($1::bytea[])
+			ON CONFLICT DO NOTHING
+		`
+		if _, err = txn.ExecContext(ctx, qBulkInsert, pq.Array(existingHashBytes), minedBlockInfo.BlockID, minedBlockInfo.BlockHeight, minedBlockInfo.SubtreeIdx); err != nil {
+			return nil, errors.NewStorageError("SQL error bulk inserting block_ids: %v", err)
+		}
+	}
+
+	// Check context before transaction updates
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Step 3: Bulk update transactions to mark as mined
+	qBulkUpdate := `
+		UPDATE transactions
+		SET locked = false, unmined_since = NULL
+		WHERE hash = ANY($1::bytea[])
+	`
+	if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes)); err != nil {
+		return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+	}
+
+	// Check context before final fetch operation
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Step 4: Bulk fetch all block IDs for the transactions
+	qBulkGetBlockIDs := `
+		SELECT t.hash, array_agg(b.block_id ORDER BY b.block_id)
+		FROM transactions t
+		LEFT JOIN block_ids b ON t.id = b.transaction_id
+		WHERE t.hash = ANY($1::bytea[])
+		GROUP BY t.hash
+	`
+
+	rows, err = txn.QueryContext(ctx, qBulkGetBlockIDs, pq.Array(existingHashBytes))
+	if err != nil {
+		return nil, errors.NewStorageError("SQL error bulk fetching block IDs: %v", err)
+	}
+
+	blockIDsMap := make(map[chainhash.Hash][]uint32)
+	for rows.Next() {
+		var hashBytes []byte
+		var blockIDs pq.Int32Array
+		if err := rows.Scan(&hashBytes, &blockIDs); err != nil {
+			rows.Close()
+			return nil, errors.NewStorageError("SQL error scanning block IDs: %v", err)
+		}
+		var hash chainhash.Hash
+		copy(hash[:], hashBytes)
+
+		// Convert pq.Int32Array to []uint32, filtering out NULLs (converted to 0)
+		var uint32BlockIDs []uint32
+		for _, id := range blockIDs {
+			if id > 0 { // Skip NULL values which become 0
+				uint32BlockIDs = append(uint32BlockIDs, uint32(id))
+			}
+		}
+		blockIDsMap[hash] = uint32BlockIDs
+	}
+	rows.Close()
+
+	// Commit the transaction
+	if err = txn.Commit(); err != nil {
+		return nil, errors.NewStorageError("SQL error committing transaction: %v", err)
+	}
+	committed = true
+
+	return blockIDsMap, nil
+}
+
+// setMinedMultiOriginal is the original implementation that works with both SQLite and PostgreSQL
+// but uses individual queries for each transaction (slower for large batches)
+func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	// Start a database transaction
+	txn, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+
+	// Use a flag to track if we should rollback
+	committed := false
+	defer func() {
+		if !committed {
+			if rollbackErr := txn.Rollback(); rollbackErr != nil {
+				// Log rollback error but don't override original error
+				s.logger.Warnf("Failed to rollback original transaction: %v", rollbackErr)
+			}
+		}
 	}()
 
 	// Update the block_ids
@@ -1164,6 +1493,13 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		ON CONFLICT DO NOTHING;
     `
 
+	// remove if minedBlockInfo.SetMined is false
+	qRemove := `
+		DELETE FROM block_ids
+		WHERE transaction_id = (SELECT id FROM transactions WHERE hash = $1)
+		AND block_id = $2;
+	`
+
 	q2 := `
 		UPDATE transactions SET
 		 locked = false
@@ -1171,25 +1507,74 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		WHERE hash = $1;
 	`
 
+	qGet := `
+		SELECT block_id FROM block_ids
+		WHERE transaction_id = (SELECT id FROM transactions WHERE hash = $1)
+	`
+
+	blockIDsMap := make(map[chainhash.Hash][]uint32)
+
 	for _, hash := range hashes {
-		// TODO set all the values from minedBlockInfo
-		if _, err = txn.ExecContext(ctx, q, hash[:], minedBlockInfo.BlockID, minedBlockInfo.BlockHeight, minedBlockInfo.SubtreeIdx); err != nil {
-			return errors.NewStorageError("SQL error calling SetMinedMulti on tx %s:%v", hash.String(), err)
+		// First check if the transaction exists
+		var txExists bool
+		err := txn.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", hash[:]).Scan(&txExists)
+		if err != nil {
+			return nil, errors.NewStorageError("SQL error checking transaction existence for %s: %v", hash.String(), err)
 		}
+
+		// Skip if transaction doesn't exist yet (it might be processed later in the same block)
+		if !txExists {
+			continue
+		}
+
+		if minedBlockInfo.UnsetMined {
+			// remove the block ID from the transaction
+			if _, err = txn.ExecContext(ctx, qRemove, hash[:], minedBlockInfo.BlockID); err != nil {
+				return nil, errors.NewStorageError("SQL error calling SetMinedMulti on tx %s:%v", hash.String(), err)
+			}
+		} else {
+			if _, err = txn.ExecContext(ctx, q, hash[:], minedBlockInfo.BlockID, minedBlockInfo.BlockHeight, minedBlockInfo.SubtreeIdx); err != nil {
+				return nil, errors.NewStorageError("SQL error calling SetMinedMulti on tx %s:%v", hash.String(), err)
+			}
+		}
+
+		// get the current block IDs for the transaction
+		rows, err := txn.QueryContext(ctx, qGet, hash[:])
+		if err != nil {
+			return nil, errors.NewStorageError("SQL error calling get block IDs on tx %s:%v", hash.String(), err)
+		}
+
+		var blockIDs []uint32
+		for rows.Next() {
+			var blockID uint32
+			if err := rows.Scan(&blockID); err != nil {
+				rows.Close()
+
+				return nil, errors.NewStorageError("SQL error scanning block ID on tx %s:%v", hash.String(), err)
+			}
+			blockIDs = append(blockIDs, blockID)
+		}
+		rows.Close()
+
+		blockIDsMap[*hash] = blockIDs
 	}
 
 	for _, hash := range hashes {
-		if _, err = txn.ExecContext(ctx, q2, hash[:]); err != nil {
-			return errors.NewStorageError("SQL error calling update locked on tx %s:%v", hash.String(), err)
+		// Only update transactions that exist in blockIDsMap (which means they exist in the database)
+		if _, exists := blockIDsMap[*hash]; exists {
+			if _, err = txn.ExecContext(ctx, q2, hash[:]); err != nil {
+				return nil, errors.NewStorageError("SQL error calling update locked on tx %s:%v", hash.String(), err)
+			}
 		}
 	}
 
 	// Commit the transaction
 	if err = txn.Commit(); err != nil {
-		return err
+		return nil, errors.NewStorageError("SQL error committing original transaction: %v", err)
 	}
+	committed = true
 
-	return nil
+	return blockIDsMap, nil
 }
 
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
@@ -1315,7 +1700,8 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 		AND o.idx = $2
 	`
 
-	for _, input := range tx.Inputs {
+	var missingInputs []int
+	for i, input := range tx.Inputs {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1325,11 +1711,27 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 				continue
 			}
 
+			// Skip if already decorated
+			if input.PreviousTxScript != nil {
+				continue
+			}
+
 			err := s.db.QueryRowContext(ctx, q, input.PreviousTxIDChainHash()[:], input.PreviousTxOutIndex).Scan(&input.PreviousTxScript, &input.PreviousTxSatoshis)
 			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					// Track missing inputs - they might be in the same block being processed
+					missingInputs = append(missingInputs, i)
+					continue
+				}
 				return err
 			}
 		}
+	}
+
+	// If we have missing inputs, return an error indicating they couldn't be found
+	// The caller (ExtendTransaction) will handle this by trying alternative methods
+	if len(missingInputs) > 0 {
+		return errors.NewProcessingError("failed to decorate previous outputs for tx %s", tx.TxIDChainHash())
 	}
 
 	return nil
@@ -1553,10 +1955,20 @@ func createPostgresSchema(db *usql.DB) error {
 
 	// Add the new foreign key constraint with ON DELETE CASCADE for inputs
 	if _, err := db.Exec(`
-		ALTER TABLE inputs
-		ADD CONSTRAINT inputs_transaction_id_fkey
-		FOREIGN KEY (transaction_id)
-		REFERENCES transactions(id) ON DELETE CASCADE;
+		DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.table_constraints
+				WHERE table_name = 'inputs'
+				AND constraint_type = 'FOREIGN KEY'
+				AND constraint_name = 'inputs_transaction_id_fkey'
+			) THEN
+				ALTER TABLE inputs
+				ADD CONSTRAINT inputs_transaction_id_fkey
+				FOREIGN KEY (transaction_id)
+				REFERENCES transactions(id) ON DELETE CASCADE;
+			END IF;
+		END $$;
 	`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not add new foreign key constraint with CASCADE on inputs table - [%+v]", err)
@@ -1603,10 +2015,20 @@ func createPostgresSchema(db *usql.DB) error {
 
 	// Add the new foreign key constraint with ON DELETE CASCADE for outputs
 	if _, err := db.Exec(`
-		ALTER TABLE outputs
-		ADD CONSTRAINT outputs_transaction_id_fkey
-		FOREIGN KEY (transaction_id)
-		REFERENCES transactions(id) ON DELETE CASCADE;
+		DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.table_constraints
+				WHERE table_name = 'outputs'
+				AND constraint_type = 'FOREIGN KEY'
+				AND constraint_name = 'outputs_transaction_id_fkey'
+			) THEN
+				ALTER TABLE outputs
+				ADD CONSTRAINT outputs_transaction_id_fkey
+				FOREIGN KEY (transaction_id)
+				REFERENCES transactions(id) ON DELETE CASCADE;
+			END IF;
+		END $$;
 	`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not add new foreign key constraint with CASCADE on outputs table - [%+v]", err)
@@ -1687,10 +2109,20 @@ func createPostgresSchema(db *usql.DB) error {
 
 	// Add the new foreign key constraint with ON DELETE CASCADE
 	if _, err := db.Exec(`
-		ALTER TABLE block_ids
-		ADD CONSTRAINT block_ids_transaction_id_fkey
-		FOREIGN KEY (transaction_id)
-		REFERENCES transactions(id) ON DELETE CASCADE;
+		DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.table_constraints
+				WHERE table_name = 'block_ids'
+				AND constraint_type = 'FOREIGN KEY'
+				AND constraint_name = 'block_ids_transaction_id_fkey'
+			) THEN
+				ALTER TABLE block_ids
+				ADD CONSTRAINT block_ids_transaction_id_fkey
+				FOREIGN KEY (transaction_id)
+				REFERENCES transactions(id) ON DELETE CASCADE;
+			END IF;
+		END $$;
 	`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not add new foreign key constraint with CASCADE - [%+v]", err)
@@ -2063,8 +2495,8 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	args = append([]interface{}{preserveUntilHeight}, args...)
 
 	query := fmt.Sprintf(`
-    UPDATE transactions 
-    SET preserve_until = ?, delete_at_height = NULL 
+    UPDATE transactions
+    SET preserve_until = ?, delete_at_height = NULL
     WHERE hash IN (%s)
 	`, strings.Join(placeholders, ","))
 
@@ -2090,7 +2522,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	deleteAtHeight := currentHeight + s.settings.GetUtxoStoreBlockHeightRetention()
 
 	query := `
-		UPDATE transactions 
+		UPDATE transactions
 		SET delete_at_height = ?, preserve_until = NULL
 		WHERE preserve_until IS NOT NULL AND preserve_until <= ?
 	`
@@ -2113,4 +2545,30 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 // RawDB returns the underlying *usql.DB connection. For test/debug use only.
 func (s *Store) RawDB() *usql.DB {
 	return s.db
+}
+
+// isLockError checks if the error is a database lock/deadlock error
+func isLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// PostgreSQL deadlock/lock errors
+	if pqErr, ok := err.(*pq.Error); ok {
+		// 40001: serialization_failure
+		// 40P01: deadlock_detected
+		// 55P03: lock_not_available
+		return pqErr.Code == "40001" || pqErr.Code == "40P01" || pqErr.Code == "55P03"
+	}
+
+	// SQLite busy/locked errors
+	if sqliteErr, ok := err.(*sqlite.Error); ok {
+		return sqliteErr.Code() == sqlite3.SQLITE_BUSY || sqliteErr.Code() == sqlite3.SQLITE_LOCKED
+	}
+
+	// Check error message for common lock patterns
+	errStr := err.Error()
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "deadlock") ||
+		strings.Contains(errStr, "lock timeout")
 }

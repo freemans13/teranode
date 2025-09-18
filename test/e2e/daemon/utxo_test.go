@@ -11,7 +11,6 @@ import (
 	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/stretchr/testify/assert"
@@ -34,8 +33,7 @@ func TestFreezeAndUnfreezeUtxos(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate initial blocks
-	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{101})
-	require.NoError(t, err)
+	td.MineAndWait(t, 101)
 
 	privateKey1, err := bec.NewPrivateKey()
 	require.NoError(t, err, "Failed to generate private key")
@@ -150,17 +148,13 @@ func TestFreezeAndUnfreezeUtxos(t *testing.T) {
 	block102, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 102)
 	require.NoError(t, err)
 
-	err = block102.GetAndValidateSubtrees(td.Ctx, td.Logger, td.SubtreeStore, nil)
+	err = block102.GetAndValidateSubtrees(td.Ctx, td.Logger, td.SubtreeStore)
 	require.NoError(t, err)
 
 	err = block102.CheckMerkleRoot(td.Ctx)
 	require.NoError(t, err)
 
-	fallbackGetFunc := func(subtreeHash chainhash.Hash) error {
-		return block102.SubTreesFromBytes(subtreeHash[:])
-	}
-
-	subtree, err := block102.GetSubtrees(td.Ctx, td.Logger, td.SubtreeStore, fallbackGetFunc)
+	subtree, err := block102.GetSubtrees(td.Ctx, td.Logger, td.SubtreeStore)
 	require.NoError(t, err)
 
 	blFound := false
@@ -305,8 +299,7 @@ func TestSubtreeBlockHeightRetention(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate initial blocks
-	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{101})
-	require.NoError(t, err)
+	td.MineAndWait(t, 101)
 
 	// Get coinbase transaction from block 1
 	block1, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 1)
@@ -404,8 +397,7 @@ func TestSubtreeBlockHeightRetention(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate one more block to reach retention height
-	_, err = td.CallRPC(td.Ctx, "generate", []any{300})
-	require.NoError(t, err)
+	td.MineAndWait(t, 300)
 
 	time.Sleep(cleanerInterval)
 

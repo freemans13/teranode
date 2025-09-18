@@ -557,9 +557,14 @@ func (c *Client) GetBlockHeadersFromOldest(ctx context.Context, chainTipHash, ta
 }
 
 // GetNextWorkRequired calculates the required proof of work for the next block.
-func (c *Client) GetNextWorkRequired(ctx context.Context, blockHash *chainhash.Hash) (*model.NBit, error) {
+func (c *Client) GetNextWorkRequired(ctx context.Context, previousBlockHash *chainhash.Hash, currentBlockTime int64) (*model.NBit, error) {
+	if currentBlockTime == 0 {
+		return nil, errors.NewProcessingError("currentBlockTime cannot be zero")
+	}
+
 	resp, err := c.client.GetNextWorkRequired(ctx, &blockchain_api.GetNextWorkRequiredRequest{
-		BlockHash: blockHash[:],
+		PreviousBlockHash: previousBlockHash[:],
+		CurrentBlockTime:  currentBlockTime,
 	})
 	if err != nil {
 		return nil, errors.UnwrapGRPC(err)
@@ -917,17 +922,29 @@ func (c *Client) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHe
 }
 
 // InvalidateBlock marks a block as invalid in the blockchain.
-func (c *Client) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) error {
-	_, err := c.client.InvalidateBlock(ctx, &blockchain_api.InvalidateBlockRequest{
+func (c *Client) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) ([]chainhash.Hash, error) {
+	resp, err := c.client.InvalidateBlock(ctx, &blockchain_api.InvalidateBlockRequest{
 		BlockHash: blockHash.CloneBytes(),
 	})
-
-	unwrappedErr := errors.UnwrapGRPC(err)
-	if unwrappedErr == nil {
-		return nil
+	if err != nil {
+		return nil, errors.UnwrapGRPC(err)
 	}
 
-	return unwrappedErr
+	if resp == nil {
+		return nil, errors.NewProcessingError("invalidate block did not return a valid response")
+	}
+
+	invalidatedHashes := make([]chainhash.Hash, 0, len(resp.InvalidatedBlocks))
+	for _, hashBytes := range resp.InvalidatedBlocks {
+		hash, err := chainhash.NewHash(hashBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		invalidatedHashes = append(invalidatedHashes, *hash)
+	}
+
+	return invalidatedHashes, nil
 }
 
 // RevalidateBlock restores a previously invalidated block.
