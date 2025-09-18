@@ -4,12 +4,12 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
 	"github.com/bitcoin-sv/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bitcoin-sv/teranode/services/validator"
 	"github.com/bitcoin-sv/teranode/stores/blob"
@@ -467,8 +467,26 @@ func TestServerStop(t *testing.T) {
 // TestCheckSubtreeFromBlock tests the CheckSubtreeFromBlock method
 func TestCheckSubtreeFromBlock(t *testing.T) {
 	t.Run("error in checkSubtreeFromBlock", func(t *testing.T) {
+		// Reset the global quorum state to allow initialization
+		once = sync.Once{}
+		q = nil
+
+		// Create a temporary directory for the quorum
+		tempDir, err := os.MkdirTemp("", "test-quorum-*")
+		require.NoError(t, err)
+		defer os.RemoveAll(tempDir)
+
 		mockSubtreeStore := &blob.MockStore{}
-		mockSubtreeStore.On("Exists", mock.Anything, mock.Anything, fileformat.FileTypeSubtree, mock.Anything).Return(false, nil)
+		// Note: We don't expect Exists to be called anymore since the error happens before reaching the quorum check
+		// The error "Missing base URL in request" happens immediately in checkSubtreeFromBlock
+
+		// Initialize the global quorum with the mock store
+		q, err = NewQuorum(
+			ulogger.TestLogger{},
+			mockSubtreeStore,
+			tempDir,
+		)
+		require.NoError(t, err)
 
 		server := &Server{
 			logger:       ulogger.TestLogger{},
@@ -481,15 +499,36 @@ func TestCheckSubtreeFromBlock(t *testing.T) {
 
 		response, err := server.CheckSubtreeFromBlock(context.Background(), request)
 		require.Error(t, err)
+		require.Contains(t, err.Error(), "Missing base URL in request")
 		require.Nil(t, response)
-		mockSubtreeStore.AssertExpectations(t)
+		// No mock expectations since we error out before calling the store
 	})
 
 	t.Run("nil hash error", func(t *testing.T) {
+		// Reset the global quorum state to allow initialization
+		once = sync.Once{}
+		q = nil
+
+		// Create a temporary directory for the quorum
+		tempDir, err := os.MkdirTemp("", "test-quorum-*")
+		require.NoError(t, err)
+		defer os.RemoveAll(tempDir)
+
+		mockSubtreeStore := &blob.MockStore{}
+
+		// Initialize the global quorum with the mock store
+		q, err = NewQuorum(
+			ulogger.TestLogger{},
+			mockSubtreeStore,
+			tempDir,
+		)
+		require.NoError(t, err)
+
 		server := &Server{
 			logger:                        ulogger.TestLogger{},
 			prioritySubtreeCheckActiveMap: make(map[string]bool),
 			settings:                      test.CreateBaseTestSettings(t),
+			subtreeStore:                  mockSubtreeStore,
 		}
 
 		request := &subtreevalidation_api.CheckSubtreeFromBlockRequest{
@@ -651,8 +690,25 @@ func TestPublishInvalidSubtree(t *testing.T) {
 // TestCheckSubtreeFromBlockInternal tests the checkSubtreeFromBlock internal method
 func TestCheckSubtreeFromBlockInternal(t *testing.T) {
 	t.Run("missing base URL", func(t *testing.T) {
+		// Reset the global quorum state to allow initialization
+		once = sync.Once{}
+		q = nil
+
+		// Create a temporary directory for the quorum
+		tempDir, err := os.MkdirTemp("", "test-quorum-*")
+		require.NoError(t, err)
+		defer os.RemoveAll(tempDir)
+
 		mockSubtreeStore := &blob.MockStore{}
-		mockSubtreeStore.On("Exists", mock.Anything, mock.Anything, fileformat.FileTypeSubtree, mock.Anything).Return(false, nil)
+		// Note: We don't expect Exists to be called since error happens before quorum check
+
+		// Initialize the global quorum with the mock store
+		q, err = NewQuorum(
+			ulogger.TestLogger{},
+			mockSubtreeStore,
+			tempDir,
+		)
+		require.NoError(t, err)
 
 		server := &Server{
 			logger:       ulogger.TestLogger{},
@@ -668,7 +724,7 @@ func TestCheckSubtreeFromBlockInternal(t *testing.T) {
 		require.Error(t, err)
 		require.False(t, ok)
 		require.Contains(t, err.Error(), "Missing base URL")
-		mockSubtreeStore.AssertExpectations(t)
+		// No mock expectations since we error out before calling the store
 	})
 
 	t.Run("invalid hash", func(t *testing.T) {

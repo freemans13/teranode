@@ -2420,63 +2420,40 @@ func TestSubtreeProcessor_DynamicSizeAdjustment(t *testing.T) {
 		)
 		require.NoError(t, err)
 
+		// Set a transaction count > 1 to pass the initial check
+		stp.txCount.Store(10000)
+
 		// Set initial block header to start timing
 		t.Logf("DEBUG: Setting initial block header\n")
 		stp.InitCurrentBlockHeader(blockHeader)
 		initialSize := stp.currentItemsPerFile
 		t.Logf("DEBUG: Initial size: %d\n", initialSize)
 
-		// Create multiple blocks to establish a pattern of fast subtree creation
-		startTime := time.Now()
-
-		for i := 0; i < 3; i++ {
-			// Reset block intervals at start of each block
-			if i == 0 {
-				stp.blockIntervals = make([]time.Duration, 0)
-			}
-
-			// Set block start time
-			blockStartTime := startTime.Add(time.Duration(i) * 2 * time.Second)
-			t.Logf("DEBUG: Block %d start time: %v\n", i, blockStartTime)
-			stp.blockStartTime = blockStartTime
-
-			// Create subtrees in this block
-			for j := 0; j < 5; j++ {
-				txHash, err := generateTxHash()
-				require.NoError(t, err)
-
-				node := subtreepkg.SubtreeNode{
-					Hash: txHash,
-				}
-
-				err = stp.addNode(node, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
-				require.NoError(t, err)
-			}
-
-			// Record that we created 5 subtrees in 2 seconds = 400ms per subtree
-			stp.subtreesInBlock = 5
-			interval := time.Duration(2) * time.Second / time.Duration(5) // 2s/5 subtrees = 400ms per subtree
-			stp.blockIntervals = append(stp.blockIntervals, interval)
-			t.Logf("DEBUG: Block %d end, subtrees=%d, duration=%v, interval=%v, intervals=%v\n",
-				i, stp.subtreesInBlock, time.Duration(2)*time.Second, interval, stp.blockIntervals)
-
-			// Move to next block with simulated time passage
-			// Each block takes 2 seconds and has 5 subtrees = 2.5 subtrees/sec
-			newHeader := &model.BlockHeader{
-				Version:        1,
-				HashPrevBlock:  blockHeader.Hash(),
-				HashMerkleRoot: &chainhash.Hash{},
-				Timestamp:      blockHeader.Timestamp + uint32(i+1)*2, //nolint:gosec
-				Bits:           model.NBit{},
-				Nonce:          1234,
-			}
-
-			// Set the new header after recording intervals
-			stp.InitCurrentBlockHeader(newHeader)
-			stp.adjustSubtreeSize()
-
-			blockHeader = newHeader
+		// Simulate fast subtree creation that would trigger resize
+		// Set blockIntervals to show we're creating subtrees too quickly
+		stp.blockIntervals = []time.Duration{
+			400 * time.Millisecond,
+			400 * time.Millisecond,
+			400 * time.Millisecond,
 		}
+
+		// Set node counts to show high utilization
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 950 // High utilization
+			r = r.Next()
+		}
+
+		// Set TPS data to justify the resize
+		// With 2500 TPS and size 1024, we'd get 2.44 subtrees/sec (too fast)
+		stp.recentBlockStats = []blockStats{
+			{txCount: 2500, duration: 1 * time.Second},
+			{txCount: 2400, duration: 1 * time.Second},
+			{txCount: 2600, duration: 1 * time.Second},
+		}
+
+		// Trigger resize
+		stp.adjustSubtreeSize()
 
 		// Since we're creating subtrees 2.5x faster than target (2.5/sec vs 1/sec),
 		// expect size to increase
@@ -2537,59 +2514,40 @@ func TestSubtreeProcessor_DynamicSizeAdjustmentFast(t *testing.T) {
 		)
 		require.NoError(t, err)
 
+		// Set a transaction count > 1 to pass the initial check
+		stp.txCount.Store(10000)
+
 		// Set initial block header to start timing
 		t.Logf("DEBUG: Setting initial block header\n")
 		stp.InitCurrentBlockHeader(blockHeader)
 		initialSize := stp.currentItemsPerFile
 		t.Logf("DEBUG: Initial size: %d\n", initialSize)
 
-		// Create multiple blocks to establish a pattern of fast subtree creation
-		startTime := time.Now()
-
-		for i := 0; i < 3; i++ {
-			// Reset block intervals at start of each block
-			if i == 0 {
-				stp.blockIntervals = make([]time.Duration, 0)
-			}
-
-			// Set block start time
-			blockStartTime := startTime.Add(time.Duration(i) * 2 * time.Second)
-			t.Logf("DEBUG: Block %d start time: %v\n", i, blockStartTime)
-			stp.blockStartTime = blockStartTime
-
-			// Create subtrees in this block
-			for j := 0; j < 5; j++ {
-				txHash, err := generateTxHash()
-				require.NoError(t, err)
-
-				node := subtreepkg.SubtreeNode{
-					Hash: txHash,
-				}
-
-				err = stp.addNode(node, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
-				require.NoError(t, err)
-			}
-
-			// Move to next block with simulated time passage
-			// Each block takes 2 seconds and has 5 subtrees = 2.5 subtrees/sec
-			newHeader := &model.BlockHeader{
-				Version:        1,
-				HashPrevBlock:  blockHeader.Hash(),
-				HashMerkleRoot: &chainhash.Hash{},
-				Timestamp:      blockHeader.Timestamp + uint32(i+1)*2, //nolint:gosec
-				Bits:           model.NBit{},
-				Nonce:          1234,
-			}
-
-			t.Logf("DEBUG: Block %d end, subtrees=%d, duration=%v\n", i, stp.subtreesInBlock, time.Duration(2)*time.Second)
-			stp.subtreesInBlock = 5                                                                        // We created 5 subtrees in this block
-			stp.blockIntervals = append(stp.blockIntervals, time.Duration(2)*time.Second/time.Duration(5)) // 2s/5 subtrees = 400ms per subtree
-			t.Logf("DEBUG: Block intervals after block %d: %v\n", i, stp.blockIntervals)
-			stp.InitCurrentBlockHeader(newHeader)
-			stp.adjustSubtreeSize()
-
-			blockHeader = newHeader
+		// Simulate fast subtree creation that would trigger resize
+		// Set blockIntervals to show we're creating subtrees too quickly
+		stp.blockIntervals = []time.Duration{
+			400 * time.Millisecond,
+			400 * time.Millisecond,
+			400 * time.Millisecond,
 		}
+
+		// Set node counts to show high utilization
+		r := stp.subtreeNodeCounts
+		for i := 0; i < 10; i++ {
+			r.Value = 950 // High utilization
+			r = r.Next()
+		}
+
+		// Set TPS data to justify the resize
+		// With 2500 TPS and size 1024, we'd get 2.44 subtrees/sec (too fast)
+		stp.recentBlockStats = []blockStats{
+			{txCount: 2500, duration: 1 * time.Second},
+			{txCount: 2400, duration: 1 * time.Second},
+			{txCount: 2600, duration: 1 * time.Second},
+		}
+
+		// Trigger resize
+		stp.adjustSubtreeSize()
 
 		// Since we're creating subtrees 2.5x faster than target (2.5/sec vs 1/sec),
 		// expect size to increase

@@ -2738,11 +2738,9 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 	// Update previous block header for next interval calculation
 	stp.previousBlockHeader = block.Header
 
-	// Try to adjust subtree size if needed (fire and forget)
-	// We're already in the processor goroutine, so do this async to avoid blocking
-	go func() {
-		stp.adjustSubtreeSize()
-	}()
+	// Try to adjust subtree size if needed
+	// This is safe to call directly as adjustSubtreeSize is non-blocking
+	stp.adjustSubtreeSize()
 
 	// Mark the block as processed
 	if err := stp.blockchainClient.SetBlockProcessedAt(ctx, block.Header.Hash()); err != nil {
