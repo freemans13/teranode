@@ -57,7 +57,7 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 	// Go through each batch item and set the tx to be locked
 	for _, batchItem := range batch {
 		// We will do the master record first...
-		keySource := uaerospike.CalculateKeySource(&batchItem.txHash, batchItem.childIndex)
+		keySource := uaerospike.CalculateKeySourceInternal(&batchItem.txHash, batchItem.childIndex)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {

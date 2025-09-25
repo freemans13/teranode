@@ -72,7 +72,6 @@ import (
 	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 )
@@ -325,14 +324,8 @@ func (s *Store) prepareSpendBatches(batch []*batchSpend, batchID uint64) (map[ke
 	aeroKeyMap := make(map[string]*aerospike.Key)
 	batchesByKey := make(map[keyIgnoreLocked][]aerospike.MapValue, len(batch))
 
-	sUtxoBatchSizeUint32, err := safeconversion.IntToUint32(s.utxoBatchSize)
-	if err != nil {
-		s.logger.Errorf("Could not convert utxoBatchSize (%d) to uint32", s.utxoBatchSize)
-		return nil, err
-	}
-
 	for idx, bItem := range batch {
-		key, err := s.getOrCreateAerospikeKey(bItem, sUtxoBatchSizeUint32, aeroKeyMap)
+		key, err := s.getOrCreateAerospikeKey(bItem, s.utxoBatchSize, aeroKeyMap)
 		if err != nil {
 			bItem.errCh <- err
 			continue
@@ -357,8 +350,8 @@ func (s *Store) prepareSpendBatches(batch []*batchSpend, batchID uint64) (map[ke
 }
 
 // getOrCreateAerospikeKey gets or creates an Aerospike key for the spend
-func (s *Store) getOrCreateAerospikeKey(bItem *batchSpend, utxoBatchSize uint32, keyMap map[string]*aerospike.Key) (*aerospike.Key, error) {
-	keySource := uaerospike.CalculateKeySource(bItem.spend.TxID, bItem.spend.Vout/utxoBatchSize)
+func (s *Store) getOrCreateAerospikeKey(bItem *batchSpend, utxoBatchSize int, keyMap map[string]*aerospike.Key) (*aerospike.Key, error) {
+	keySource := uaerospike.CalculateKeySource(bItem.spend.TxID, bItem.spend.Vout, utxoBatchSize)
 	keySourceStr := string(keySource)
 
 	if key, ok := keyMap[keySourceStr]; ok {
@@ -884,7 +877,7 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 	batchRecords := make([]aerospike.BatchRecordIfc, len(batch))
 
 	for i, b := range batch {
-		keySource := uaerospike.CalculateKeySource(b.txID, b.childIdx)
+		keySource := uaerospike.CalculateKeySourceInternal(b.txID, b.childIdx)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
