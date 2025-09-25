@@ -120,20 +120,21 @@ jobs:
           version: latest
           args: --timeout=5m --issues-exit-code=0 --output.checkstyle.path=golangci-lint-report.xml
 
-      - uses: twingate/github-action@v1.5
-        with:
-          service-key: ${{ secrets.TWINGATE_GH_ACTIONS_SERVICE_KEY }}
-        continue-on-error: true
+      # Disable Twingate and Sonar, we will switch to public SonarCloud once code is public
+      #- uses: twingate/github-action@v1.5
+      #  with:
+      #    service-key: ${{ secrets.TWINGATE_GH_ACTIONS_SERVICE_KEY }}
+      #  continue-on-error: true
 
-      - name: SonarQube Scan
-        uses: sonarsource/sonarqube-scan-action@v5
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: https://sonarqube.prod.ubsv.dev
+      #- name: SonarQube Scan
+      #  uses: sonarsource/sonarqube-scan-action@v5
+      #  env:
+      #    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      #    SONAR_HOST_URL: https://sonarqube.prod.ubsv.dev
 
-      - name: SonarQube Quality Gate check
-        uses: sonarsource/sonarqube-quality-gate-action@v1.2.0
-        timeout-minutes: 10
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: https://sonarqube.prod.ubsv.dev
+      #- name: SonarQube Quality Gate check
+      #  uses: sonarsource/sonarqube-quality-gate-action@v1.2.0
+      #  timeout-minutes: 10
+      #  env:
+      #    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      #    SONAR_HOST_URL: https://sonarqube.prod.ubsv.dev
