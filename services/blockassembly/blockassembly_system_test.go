@@ -343,18 +343,19 @@ func TestShouldFollowLongerChain(t *testing.T) {
 
 	t.Logf("Initial block height: %d", initialHeight)
 
-	// Create chain A (higher difficulty)
+	// Create chain A (higher difficulty) - use deterministic timestamp
 	chainABits, _ := model.NewNBitFromString("1d00ffff")
+	baseTimestamp := uint32(1234567890) // Fixed timestamp for deterministic testing
 	chainAHeader1 := &model.BlockHeader{
 		Version:        1,
 		HashPrevBlock:  initialHeader.Hash(),
 		HashMerkleRoot: &chainhash.Hash{},
 		Nonce:          1,
 		Bits:           *chainABits,
-		Timestamp:      uint32(time.Now().Unix()), //nolint:gosec
+		Timestamp:      baseTimestamp,
 	}
 
-	// Create chain B (lower difficulty)
+	// Create chain B (lower difficulty) - use deterministic timestamp
 	chainBBits, _ := model.NewNBitFromString("207fffff") // Lower difficulty
 	chainBHeader1 := &model.BlockHeader{
 		Version:        1,
@@ -362,7 +363,7 @@ func TestShouldFollowLongerChain(t *testing.T) {
 		HashMerkleRoot: &chainhash.Hash{},
 		Nonce:          2,
 		Bits:           *chainBBits,
-		Timestamp:      uint32(time.Now().Unix()), //nolint:gosec
+		Timestamp:      baseTimestamp + 1, // Slightly different timestamp
 	}
 
 	// Store blocks from both chains
