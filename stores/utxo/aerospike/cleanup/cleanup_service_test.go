@@ -617,7 +617,7 @@ func TestBatchingIntegration(t *testing.T) {
 
 			// Create one parent UTXO record
 			parentTxHash := chainhash.HashH([]byte("parent-tx"))
-			keySource := uaerospike.CalculateKeySource(&parentTxHash, 0)
+			keySource := uaerospike.CalculateKeySource(&parentTxHash, 0, 1)
 			parentKey, _ := aerospike.NewKey(namespace, set, keySource)
 
 			writePolicy := aerospike.NewWritePolicy(0, 0)
@@ -1038,7 +1038,7 @@ func TestBatchingIntegration(t *testing.T) {
 			txHash := chainhash.HashH([]byte("external-tx"))
 
 			// Create parent UTXO record
-			keySource := uaerospike.CalculateKeySource(&parentTxHash, 0)
+			keySource := uaerospike.CalculateKeySource(&parentTxHash, 0, 1)
 			parentKey, _ := aerospike.NewKey(namespace, set, keySource)
 
 			writePolicy := aerospike.NewWritePolicy(0, 0)

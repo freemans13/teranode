@@ -42,7 +42,7 @@ func TestAlertSystem(t *testing.T) {
 		}
 
 		// Create a key for the UTXO
-		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/uint32(store.GetUtxoBatchSize())) //nolint:gosec
+		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, store.GetUtxoBatchSize()) //nolint:gosec
 		key, aErr := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, aErr)
 
@@ -95,7 +95,7 @@ func TestAlertSystem(t *testing.T) {
 		}
 
 		// Create a key for the UTXO
-		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/uint32(store.GetUtxoBatchSize())) //nolint:gosec
+		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, store.GetUtxoBatchSize())
 		key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, err)
 
@@ -185,7 +185,7 @@ func TestAlertSystem(t *testing.T) {
 		}
 
 		// Create a key for the UTXO
-		keySource := uaerospike.CalculateKeySource(utxoRec.TxID, utxoRec.Vout/uint32(store.GetUtxoBatchSize())) //nolint:gosec
+		keySource := uaerospike.CalculateKeySource(utxoRec.TxID, utxoRec.Vout, store.GetUtxoBatchSize())
 		key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, err)
 

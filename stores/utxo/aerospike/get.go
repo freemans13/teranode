@@ -133,12 +133,7 @@ type batchOutpoint struct {
 func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
 	prometheusUtxoMapGet.Inc()
 
-	sUtxoBatchSizeUint32, err := safeconversion.IntToUint32(s.utxoBatchSize)
-	if err != nil {
-		return nil, err
-	}
-
-	keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/sUtxoBatchSizeUint32)
+	keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, s.utxoBatchSize)
 
 	key, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 	if aErr != nil {
@@ -178,7 +173,7 @@ func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendRespo
 	if value != nil {
 		utxos, ok := value.Bins[fields.Utxos.String()].([]interface{})
 		if ok {
-			b, ok := utxos[spend.Vout%sUtxoBatchSizeUint32].([]byte)
+			b, ok := utxos[spend.Vout%uint32(s.utxoBatchSize)].([]byte)
 			if ok {
 				if len(b) < 32 {
 					return nil, errors.NewProcessingError("invalid utxo hash length", nil)
@@ -1049,7 +1044,7 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 		default: // Empty default to prevent blocking
 		}
 
-		keySource := uaerospike.CalculateKeySource(txID, uint32(recordNum)) // nolint: gosec
+		keySource := uaerospike.CalculateKeySourceInternal(txID, uint32(recordNum)) // nolint: gosec
 
 		extraKey, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {

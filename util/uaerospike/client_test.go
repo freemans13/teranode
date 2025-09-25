@@ -54,6 +54,55 @@ func TestClient_Put(t *testing.T) {
 
 func TestCalculateKeySource(t *testing.T) {
 	tests := []struct {
+		name      string
+		hash      *chainhash.Hash
+		vout      uint32
+		batchSize int
+		expected  func([]byte) bool
+	}{
+		{
+			name:      "zero offset returns hash bytes",
+			hash:      &chainhash.Hash{0x01, 0x02, 0x03},
+			vout:      0,
+			batchSize: 1,
+			expected: func(result []byte) bool {
+				return len(result) == chainhash.HashSize && result[0] == 0x01 && result[1] == 0x02 && result[2] == 0x03
+			},
+		},
+		{
+			name:      "non-zero offset appends to hash",
+			hash:      &chainhash.Hash{0x01, 0x02, 0x03},
+			vout:      1,
+			batchSize: 1,
+			expected: func(result []byte) bool {
+				return len(result) == chainhash.HashSize+4 && result[0] == 0x01 && result[chainhash.HashSize] == 0x01
+			},
+		},
+		{
+			name:      "large offset",
+			hash:      &chainhash.Hash{0xFF},
+			vout:      0xFFFFFFFF,
+			batchSize: 1,
+			expected: func(result []byte) bool {
+				return len(result) == chainhash.HashSize+4 &&
+					result[chainhash.HashSize] == 0xFF &&
+					result[chainhash.HashSize+1] == 0xFF &&
+					result[chainhash.HashSize+2] == 0xFF &&
+					result[chainhash.HashSize+3] == 0xFF
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := CalculateKeySource(tt.hash, tt.vout, tt.batchSize)
+			assert.True(t, tt.expected(result), "Unexpected result for %s", tt.name)
+		})
+	}
+}
+
+func TestCalculateKeySourceInternal(t *testing.T) {
+	tests := []struct {
 		name     string
 		hash     *chainhash.Hash
 		num      uint32
@@ -91,7 +140,7 @@ func TestCalculateKeySource(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := CalculateKeySource(tt.hash, tt.num)
+			result := CalculateKeySourceInternal(tt.hash, tt.num)
 			assert.True(t, tt.expected(result), "Unexpected result for %s", tt.name)
 		})
 	}
@@ -171,13 +220,13 @@ func BenchmarkCalculateKeySource(b *testing.B) {
 
 	b.Run("WithZeroOffset", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			_ = CalculateKeySource(hash, 0)
+			_ = CalculateKeySource(hash, 0, 1)
 		}
 	})
 
 	b.Run("WithNonZeroOffset", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			_ = CalculateKeySource(hash, uint32(i))
+			_ = CalculateKeySource(hash, uint32(i), 1)
 		}
 	})
 }

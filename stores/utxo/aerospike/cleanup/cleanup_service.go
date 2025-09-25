@@ -435,7 +435,7 @@ func (s *Service) sendParentUpdateBatch(batch []*batchParentUpdate) {
 
 		var itemParents []*parentInfo
 		for _, input := range item.inputs {
-			keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex)
+			keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.settings.UtxoStore.UtxoBatchSize)
 			parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
 			if err != nil {
 				// Send error to this batch item immediately
@@ -579,6 +579,18 @@ func (s *Service) sendDeleteBatch(batch []*batchDelete) {
 			batch[i].errCh <- nil
 		}
 	}
+}
+
+func (s *Service) ProcessSingleRecord(txid *chainhash.Hash, inputs []*bt.Input) error {
+	errCh := make(chan error)
+
+	s.parentUpdateBatcher.Put(&batchParentUpdate{
+		txHash: txid,
+		inputs: inputs,
+		errCh:  errCh,
+	})
+
+	return <-errCh
 }
 
 // processRecordCleanup processes a single record for cleanup using batchers

@@ -743,7 +743,7 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 			s.logger.Errorf("Could not convert binIdx (%d) to uint32", binIdx)
 		}
 
-		keySource := uaerospike.CalculateKeySource(bItem.txHash, binIdxUint32)
+		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, binIdxUint32)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
@@ -839,7 +839,7 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 			s.logger.Errorf("Could not convert i (%d) to uint32", i)
 		}
 
-		keySource := uaerospike.CalculateKeySource(bItem.txHash, iUint32)
+		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, iUint32)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {

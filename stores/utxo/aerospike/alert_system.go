@@ -65,7 +65,6 @@ import (
 	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
 	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bitcoin-sv/teranode/util/uaerospike"
-	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 )
 
 // FreezeUTXOs marks UTXOs as frozen by setting their spending transaction ID to FF...FF.
@@ -89,13 +88,8 @@ func (s *Store) FreezeUTXOs(_ context.Context, spends []*utxo.Spend, tSettings *
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(spends))
 
-	sUtxoBatchSizeUint32, err := safeconversion.IntToUint32(s.utxoBatchSize)
-	if err != nil {
-		return err
-	}
-
 	for _, spend := range spends {
-		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/sUtxoBatchSizeUint32)
+		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, s.utxoBatchSize)
 
 		aeroKey, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if aErr != nil {
@@ -111,7 +105,7 @@ func (s *Store) FreezeUTXOs(_ context.Context, spends []*utxo.Spend, tSettings *
 	batchID := s.batchID.Add(1)
 
 	batchPolicy := util.GetAerospikeBatchPolicy(tSettings)
-	if err = s.client.BatchOperate(batchPolicy, batchRecords); err != nil {
+	if err := s.client.BatchOperate(batchPolicy, batchRecords); err != nil {
 		return errors.NewStorageError("[FREEZE_BATCH_LUA][%d] failed to batch freeze %d aerospike utxos", batchID, len(spends), err)
 	}
 
@@ -170,13 +164,8 @@ func (s *Store) UnFreezeUTXOs(_ context.Context, spends []*utxo.Spend, tSettings
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(spends))
 
-	sUtxoBatchSizeUint32, err := safeconversion.IntToUint32(s.utxoBatchSize)
-	if err != nil {
-		return err
-	}
-
 	for _, spend := range spends {
-		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/sUtxoBatchSizeUint32)
+		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, s.utxoBatchSize)
 
 		aeroKey, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if aErr != nil {
@@ -242,12 +231,7 @@ func (s *Store) UnFreezeUTXOs(_ context.Context, spends []*utxo.Spend, tSettings
 //   - Original UTXO is not frozen
 //   - Reassignment fails
 func (s *Store) ReAssignUTXO(_ context.Context, oldUtxo *utxo.Spend, newUtxo *utxo.Spend, tSettings *settings.Settings) error {
-	sUtxoBatchSizeUint32, err := safeconversion.IntToUint32(s.utxoBatchSize)
-	if err != nil {
-		return err
-	}
-
-	keySource := uaerospike.CalculateKeySource(oldUtxo.TxID, oldUtxo.Vout/sUtxoBatchSizeUint32)
+	keySource := uaerospike.CalculateKeySource(oldUtxo.TxID, oldUtxo.Vout, s.utxoBatchSize)
 
 	aeroKey, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 	if aErr != nil {
