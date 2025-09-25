@@ -1879,7 +1879,18 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	return nil
 }
 
+// DBExecutor interface for database operations needed by schema creation
+type DBExecutor interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	Close() error
+}
+
 func createPostgresSchema(db *usql.DB) error {
+	return createPostgresSchemaImpl(db)
+}
+
+// createPostgresSchemaImpl contains the actual implementation, now testable
+func createPostgresSchemaImpl(db DBExecutor) error {
 	if _, err := db.Exec(`
       CREATE TABLE IF NOT EXISTS transactions (
          id               BIGSERIAL PRIMARY KEY
