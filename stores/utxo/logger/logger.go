@@ -290,6 +290,13 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	return err
 }
 
+func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	err := s.store.MarkTransactionsOnLongestChain(ctx, txHashes, onLongestChain)
+	s.logger.Debugf("[UTXOStore][logger][MarkTransactionsOnLongestChain] txHashes %v onLongestChain %v err %v : %s", txHashes, onLongestChain, err, caller())
+
+	return err
+}
+
 func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error) {
 	hashes, err := s.store.QueryOldUnminedTransactions(ctx, cutoffBlockHeight)
 	s.logger.Debugf("[UTXOStore][logger][QueryOldUnminedTransactions] cutoffBlockHeight %d count %d err %v : %s", cutoffBlockHeight, len(hashes), err, caller())

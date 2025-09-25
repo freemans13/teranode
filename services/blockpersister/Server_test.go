@@ -1064,6 +1064,9 @@ func (m *MockUTXOStore) SetConflicting(ctx context.Context, txHashes []chainhash
 func (m *MockUTXOStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
 	return nil
 }
+func (m *MockUTXOStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	return nil
+}
 func (m *MockUTXOStore) SetBlockHeight(height uint32) error     { return nil }
 func (m *MockUTXOStore) GetBlockHeight() uint32                 { return 0 }
 func (m *MockUTXOStore) SetMedianBlockTime(height uint32) error { return nil }
