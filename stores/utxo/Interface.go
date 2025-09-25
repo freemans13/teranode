@@ -204,10 +204,11 @@ func WithLocked(b bool) CreateOption {
 }
 
 type MinedBlockInfo struct {
-	BlockID     uint32
-	BlockHeight uint32
-	SubtreeIdx  int
-	UnsetMined  bool // if true, the mined info will be removed from the tx
+	BlockID        uint32
+	BlockHeight    uint32
+	SubtreeIdx     int
+	OnLongestChain bool
+	UnsetMined     bool // if true, the mined info will be removed from the tx
 }
 
 // Store defines the interface for UTXO management operations.
@@ -296,6 +297,11 @@ type Store interface {
 
 	// SetLocked marks transactions as locked for spending.
 	SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error
+
+	// MarkTransactionsOnLongestChain marks transactions as being on the longest chain or not.
+	// When onLongestChain is true, the unminedSince field is unset (transaction is mined).
+	// When onLongestChain is false, the unminedSince field is set to the current block height.
+	MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error
 
 	// internal state functions
 

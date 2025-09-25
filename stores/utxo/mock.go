@@ -168,6 +168,13 @@ func (m *MockUtxostore) SetLocked(ctx context.Context, txHashes []chainhash.Hash
 	return args.Error(0)
 }
 
+// MarkTransactionsOnLongestChain mocks the marking of transactions as being on the longest chain.
+// Returns the configured mock response for longest chain marking operations.
+func (m *MockUtxostore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	args := m.Called(ctx, txHashes, onLongestChain)
+	return args.Error(0)
+}
+
 // SetBlockHeight mocks the setting of the current block height in the UTXO store.
 // Returns the configured mock response for block height update operations.
 func (m *MockUtxostore) SetBlockHeight(height uint32) error {

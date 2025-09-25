@@ -318,6 +318,8 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
 			mock.Anything).
 			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Once()
+		currentState := blockchain.FSMStateRUNNING
+		server.blockchainClient.(*blockchain.Mock).On("GetFSMCurrentState", mock.Anything).Return(&currentState, nil).Once()
 
 		// Create test transactions
 		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
@@ -1262,6 +1264,10 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	// Set up default mock for CheckBlockIsInCurrentChain to return true (on main chain)
 	mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).
 		Return(true, nil).Maybe()
+
+	currentState := blockchain.FSMStateRUNNING
+	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).
+		Return(&currentState, nil).Maybe()
 
 	// Create orphanage to avoid nil pointer dereference
 	orphanage := expiringmap.New[chainhash.Hash, *bt.Tx](time.Minute * 10)

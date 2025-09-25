@@ -140,6 +140,11 @@ func (m *MockStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, se
 	return args.Error(0)
 }
 
+func (m *MockStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	args := m.Called(ctx, txHashes, onLongestChain)
+	return args.Error(0)
+}
+
 func (m *MockStore) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error) {
 	args := m.Called(ctx, cutoffBlockHeight)
 	return args.Get(0).([]chainhash.Hash), args.Error(1)

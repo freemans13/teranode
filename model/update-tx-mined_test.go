@@ -56,21 +56,21 @@ func TestUpdateTxMinedStatus(t *testing.T) {
 		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 		require.NoError(t, err)
 
-		_, err = utxoStore.Create(context.Background(), tx0, 0)
+		_, err = utxoStore.Create(context.Background(), tx0, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx1, 0)
+		_, err = utxoStore.Create(context.Background(), tx1, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx2, 0)
+		_, err = utxoStore.Create(context.Background(), tx2, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx3, 0)
+		_, err = utxoStore.Create(context.Background(), tx3, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx4, 0)
+		_, err = utxoStore.Create(context.Background(), tx4, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx5, 0)
+		_, err = utxoStore.Create(context.Background(), tx5, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx6, 0)
+		_, err = utxoStore.Create(context.Background(), tx6, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx7, 0)
+		_, err = utxoStore.Create(context.Background(), tx7, 1)
 		require.NoError(t, err)
 
 		block := &Block{}
@@ -122,6 +122,7 @@ func TestUpdateTxMinedStatus(t *testing.T) {
 			block,
 			1,
 			[]uint32{0},
+			true,
 			false,
 		)
 		require.NoError(t, err)
@@ -167,6 +168,7 @@ func TestUpdateTxMinedStatus(t *testing.T) {
 			block,
 			1,
 			[]uint32{0},
+			false,
 			true,
 		)
 		require.NoError(t, err)
@@ -262,7 +264,7 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 		// Chain contains block IDs 5 and 10
 		chainBlockIDs := []uint32{5, 10}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs)
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs, true)
 
 		// Should get BlockInvalidError because transaction was already mined in block 5 (on current chain)
 		require.Error(t, err)
@@ -286,7 +288,7 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 		// Chain contains different block IDs
 		chainBlockIDs := []uint32{5, 10, 15}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs)
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs, true)
 
 		// Should succeed because transactions are not on current chain
 		require.NoError(t, err)
@@ -307,7 +309,7 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 
 		chainBlockIDs := []uint32{5, 10, 15}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs)
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs, true)
 
 		// Should succeed because it's the same block being mined
 		require.NoError(t, err)
@@ -328,7 +330,7 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 		// Empty chain block IDs - should skip validation
 		chainBlockIDs := []uint32{}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs)
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs, true)
 
 		require.NoError(t, err)
 
@@ -376,7 +378,7 @@ func TestUpdateTxMinedStatus_RetryLogic(t *testing.T) {
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(expectedBlockIDsMap, nil).Once()
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -392,7 +394,7 @@ func TestUpdateTxMinedStatus_RetryLogic(t *testing.T) {
 				Return(emptyBlockIDsMap, errors.NewStorageError("persistent storage error")).Once()
 		}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error setting remainder batch mined tx")
@@ -437,7 +439,7 @@ func TestUpdateTxMinedStatus_ContextCancellation(t *testing.T) {
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Maybe()
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "context canceled")
@@ -452,7 +454,7 @@ func TestUpdateTxMinedStatus_ContextCancellation(t *testing.T) {
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Maybe()
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "context canceled")
@@ -486,7 +488,7 @@ func TestUpdateTxMinedStatus_ConfigurationDisabled(t *testing.T) {
 	setWorkerSettings(tSettings)
 
 	// Should not call SetMinedMulti when disabled
-	err := UpdateTxMinedStatus(ctx, logger, tSettings, freshMockStore, block, 15, []uint32{})
+	err := UpdateTxMinedStatus(ctx, logger, tSettings, freshMockStore, block, 15, []uint32{}, true)
 
 	require.NoError(t, err)
 	// Allow some time for any async processing to complete
@@ -535,7 +537,7 @@ func TestUpdateTxMinedStatus_DifferentBatchSizes(t *testing.T) {
 	freshMockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 		Return(expectedBlockIDsMap, nil).Times(2) // 2 calls: first with 2 hashes, second with 1 hash
 
-	err := UpdateTxMinedStatus(ctx, logger, tSettings, freshMockStore, multiTxBlock, 15, []uint32{})
+	err := UpdateTxMinedStatus(ctx, logger, tSettings, freshMockStore, multiTxBlock, 15, []uint32{}, true)
 
 	require.NoError(t, err)
 	// Allow some time for any async processing to complete
@@ -586,7 +588,7 @@ func TestUpdateTxMinedStatus_CoinbasePlaceholderHandling(t *testing.T) {
 			}).
 			Return(expectedBlockIDsMap, nil).Once()
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -615,7 +617,7 @@ func TestUpdateTxMinedStatus_CoinbasePlaceholderHandling(t *testing.T) {
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(expectedBlockIDsMap, nil).Once()
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, wrongPosBlock, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, wrongPosBlock, 15, []uint32{}, true)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -672,7 +674,7 @@ func TestUpdateTxMinedStatus_ConcurrentProcessing(t *testing.T) {
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(expectedBlockIDsMap, nil).Times(3)
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -700,7 +702,7 @@ func TestUpdateTxMinedStatus_MissingSubtree(t *testing.T) {
 		block.Subtrees = []*chainhash.Hash{newTx(1).TxIDChainHash()}
 		block.SubtreeSlices = []*subtree.Subtree{nil} // Missing subtree
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "missing subtree")
@@ -758,7 +760,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -790,7 +792,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 		// Chain contains block IDs that conflict
 		chainBlockIDsMap := map[uint32]bool{5: true, 10: true, 15: true}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "block contains a transaction already on our chain")
@@ -826,7 +828,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "context canceled")
@@ -856,7 +858,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, disabledSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, disabledSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.NoError(t, err)
 		mockStore.AssertNotCalled(t, "SetMinedMulti")
@@ -896,7 +898,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 		// Chain contains block ID 5 and 15
 		chainBlockIDsMap := map[uint32]bool{5: true, 15: true}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		// Should fail because tx1 conflicts (block ID 5 is on current chain)
 		require.Error(t, err)
@@ -929,7 +931,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{5: true, 10: true}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		// Should succeed because no existing block IDs to conflict with
 		require.NoError(t, err)
@@ -966,7 +968,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		// Should succeed without calling SetMinedMulti (no nodes to process)
 		require.NoError(t, err)
@@ -992,7 +994,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		// Should succeed without calling SetMinedMulti (all placeholders skipped)
 		require.NoError(t, err)
@@ -1034,7 +1036,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, largeBatchSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, largeBatchSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -1077,7 +1079,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, boundarySettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, boundarySettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -1109,7 +1111,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.Error(t, err)
 		assert.True(t,

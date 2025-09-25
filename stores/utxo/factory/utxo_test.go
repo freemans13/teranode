@@ -134,6 +134,11 @@ func (m *MockUTXOStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash
 	return nil
 }
 
+func (m *MockUTXOStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	args := m.Called(ctx, txHashes, onLongestChain)
+	return args.Error(0)
+}
+
 // TestNewStore_UnknownScheme tests handling of unknown database scheme
 func TestNewStore_UnknownScheme(t *testing.T) {
 	ctx := context.Background()

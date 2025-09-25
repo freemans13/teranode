@@ -1396,13 +1396,26 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 	}
 
 	// Step 3: Bulk update transactions to mark as mined
-	qBulkUpdate := `
+	qBulkUpdateLongestChain := `
 		UPDATE transactions
 		SET locked = false, unmined_since = NULL
 		WHERE hash = ANY($1::bytea[])
 	`
-	if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes)); err != nil {
-		return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+
+	qBulkUpdateNotLongestChain := `
+		UPDATE transactions
+		SET locked = false
+		WHERE hash = ANY($1::bytea[])
+	`
+
+	if minedBlockInfo.OnLongestChain {
+		if _, err = txn.ExecContext(ctx, qBulkUpdateLongestChain, pq.Array(existingHashBytes)); err != nil {
+			return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+		}
+	} else {
+		if _, err = txn.ExecContext(ctx, qBulkUpdateNotLongestChain, pq.Array(existingHashBytes)); err != nil {
+			return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+		}
 	}
 
 	// Check context before final fetch operation
@@ -1500,10 +1513,16 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 		AND block_id = $2;
 	`
 
-	q2 := `
+	qLongestChain := `
 		UPDATE transactions SET
 		 locked = false
 		,unmined_since = NULL
+		WHERE hash = $1;
+	`
+
+	qNotOnLongestChain := `
+		UPDATE transactions SET
+		 locked = false
 		WHERE hash = $1;
 	`
 
@@ -1562,8 +1581,14 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 	for _, hash := range hashes {
 		// Only update transactions that exist in blockIDsMap (which means they exist in the database)
 		if _, exists := blockIDsMap[*hash]; exists {
-			if _, err = txn.ExecContext(ctx, q2, hash[:]); err != nil {
-				return nil, errors.NewStorageError("SQL error calling update locked on tx %s:%v", hash.String(), err)
+			if minedBlockInfo.OnLongestChain {
+				if _, err = txn.ExecContext(ctx, qLongestChain, hash[:]); err != nil {
+					return nil, errors.NewStorageError("SQL error calling update longest chain on tx %s:%v", hash.String(), err)
+				}
+			} else {
+				if _, err = txn.ExecContext(ctx, qNotOnLongestChain, hash[:]); err != nil {
+					return nil, errors.NewStorageError("SQL error calling update locked on tx %s:%v", hash.String(), err)
+				}
 			}
 		}
 	}
@@ -1873,6 +1898,44 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		_, err := s.db.ExecContext(ctx, q, conflictingTxHash[:], setValue)
 		if err != nil {
 			return errors.NewStorageError("failed to set locked flag for %s", conflictingTxHash, err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	var q string
+
+	if onLongestChain {
+		// Transaction is on longest chain - unset unminedSince field (set to NULL)
+		q = `
+			UPDATE transactions
+			SET unmined_since = NULL
+			WHERE hash = $1
+		`
+
+		for _, txHash := range txHashes {
+			_, err := s.db.ExecContext(ctx, q, txHash[:])
+			if err != nil {
+				return errors.NewStorageError("failed to mark transaction as on longest chain for %s", txHash, err)
+			}
+		}
+	} else {
+		// Transaction is not on longest chain - set unminedSince to current block height
+		currentBlockHeight := s.GetBlockHeight()
+
+		q = `
+			UPDATE transactions
+			SET unmined_since = $2
+			WHERE hash = $1
+		`
+
+		for _, txHash := range txHashes {
+			_, err := s.db.ExecContext(ctx, q, txHash[:], currentBlockHeight)
+			if err != nil {
+				return errors.NewStorageError("failed to mark transaction as not on longest chain for %s", txHash, err)
+			}
 		}
 	}
 

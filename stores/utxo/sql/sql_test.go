@@ -52,6 +52,7 @@ import (
 
 	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bitcoin-sv/teranode/stores/utxo"
+	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
 	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
 	"github.com/bitcoin-sv/teranode/stores/utxo/tests"
 	utxo2 "github.com/bitcoin-sv/teranode/test/longtest/stores/utxo"
@@ -311,9 +312,10 @@ func TestSetMinedMulti(t *testing.T) {
 		_ = it.Close()
 
 		blockIDsMap, err := utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{
-			BlockID:     1,
-			BlockHeight: 1,
-			SubtreeIdx:  0,
+			BlockID:        1,
+			BlockHeight:    1,
+			SubtreeIdx:     0,
+			OnLongestChain: true,
 		})
 		require.NoError(t, err)
 		require.Len(t, blockIDsMap, 1)
@@ -343,7 +345,7 @@ func TestSetMinedMulti(t *testing.T) {
 
 		utxoStore, tx := setup(ctx, t)
 
-		_, err := utxoStore.Create(ctx, tx, 0)
+		_, err := utxoStore.Create(ctx, tx, 1)
 		require.NoError(t, err)
 
 		err = utxoStore.SetLocked(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true)
@@ -363,12 +365,33 @@ func TestSetMinedMulti(t *testing.T) {
 		require.Len(t, blockIDsMap[*tx.TxIDChainHash()], 1)
 		require.Equal(t, uint32(1), blockIDsMap[*tx.TxIDChainHash()][0])
 
-		meta, err = utxoStore.GetMeta(ctx, tx.TxIDChainHash())
+		meta, err = utxoStore.Get(ctx, tx.TxIDChainHash(), append(utxo.MetaFields, fields.UnminedSince)...)
 		require.NoError(t, err)
 
 		assert.Len(t, meta.BlockIDs, 1)
 		assert.Equal(t, uint32(1), meta.BlockIDs[0])
 		assert.False(t, meta.Locked)
+		assert.Equal(t, uint32(1), meta.UnminedSince)
+
+		// now mine it on the longest chain
+		blockIDsMap, err = utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{
+			BlockID:        2,
+			BlockHeight:    2,
+			SubtreeIdx:     0,
+			OnLongestChain: true,
+		})
+		require.NoError(t, err)
+		require.Len(t, blockIDsMap, 1)
+		require.Len(t, blockIDsMap[*tx.TxIDChainHash()], 2)
+		require.Equal(t, []uint32{1, 2}, blockIDsMap[*tx.TxIDChainHash()])
+
+		meta, err = utxoStore.Get(ctx, tx.TxIDChainHash(), append(utxo.MetaFields, fields.UnminedSince)...)
+		require.NoError(t, err)
+
+		assert.Len(t, meta.BlockIDs, 2)
+		assert.Equal(t, []uint32{1, 2}, meta.BlockIDs)
+		assert.False(t, meta.Locked)
+		assert.Zero(t, meta.UnminedSince)
 	})
 }
 

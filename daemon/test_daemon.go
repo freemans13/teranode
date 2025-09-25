@@ -35,6 +35,7 @@ import (
 	"github.com/bitcoin-sv/teranode/stores/blob"
 	"github.com/bitcoin-sv/teranode/stores/blob/options"
 	"github.com/bitcoin-sv/teranode/stores/utxo"
+	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
 	"github.com/bitcoin-sv/teranode/test/utils/transactions"
 	"github.com/bitcoin-sv/teranode/test/utils/wait"
 	"github.com/bitcoin-sv/teranode/ulogger"
@@ -743,6 +744,20 @@ func (td *TestDaemon) VerifyConflictingInUtxoStore(t *testing.T, conflictValue b
 	}
 }
 
+// VerifyOnLongestChainInUtxoStore verifies that the expected conflicting transactions are marked as conflicting in the UTXO store on the longest chain.
+func (td *TestDaemon) VerifyOnLongestChainInUtxoStore(t *testing.T, tx *bt.Tx) {
+	readTx, err := td.UtxoStore.Get(td.Ctx, tx.TxIDChainHash(), fields.UnminedSince)
+	require.NoError(t, err, "Failed to get transaction %s", tx.String())
+	assert.Zero(t, readTx.UnminedSince, "Expected transaction %s to be on the longest chain", tx.TxIDChainHash().String())
+}
+
+// VerifyNotOnLongestChainInUtxoStore verifies that the expected conflicting transactions are marked as conflicting in the UTXO store on the longest chain.
+func (td *TestDaemon) VerifyNotOnLongestChainInUtxoStore(t *testing.T, tx *bt.Tx) {
+	readTx, err := td.UtxoStore.Get(td.Ctx, tx.TxIDChainHash(), fields.UnminedSince)
+	require.NoError(t, err, "Failed to get transaction %s", tx.String())
+	assert.Greater(t, readTx.UnminedSince, uint32(0), "Expected transaction %s to be on the longest chain", tx.TxIDChainHash().String())
+}
+
 // VerifyNotInBlockAssembly checks that the given transactions are not present in the block assembly candidate's subtrees.
 func (td *TestDaemon) VerifyNotInBlockAssembly(t *testing.T, txs ...*bt.Tx) {
 	// get a mining candidate and check the subtree does not contain the given transactions
@@ -1303,6 +1318,28 @@ finished:
 		require.Equal(t, previousBlockHash.String(), getBlockByHeight.Header.Hash().String(), blockHashMismatch, height)
 
 		previousBlockHash = getBlockByHeight.Header.HashPrevBlock
+	}
+}
+
+func (td *TestDaemon) WaitForBlockBeingMined(t *testing.T, block *model.Block) {
+	// try to wait for the block to be mined for maximum 30 sec
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("[waitForBlockBeingMined] block not mined within 30 seconds")
+		default:
+			blockMined, err := td.BlockchainClient.GetBlockIsMined(ctx, block.Hash())
+			require.NoError(t, err)
+
+			if blockMined {
+				return
+			}
+
+			time.Sleep(1 * time.Second)
+		}
 	}
 }
 

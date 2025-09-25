@@ -1314,12 +1314,12 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 
 	bestBlockHeader, bestBlockMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
-		s.logger.Errorf("error getting best block header: %v", err)
+		return map[string]interface{}{}, errors.NewProcessingError("error getting best block header: %v", err)
 	}
 
 	chainWorkHash, err := chainhash.NewHash(bestBlockMeta.ChainWork)
 	if err != nil {
-		s.logger.Errorf("error creating chain work hash: %v", err)
+		return map[string]interface{}{}, errors.NewProcessingError("error creating chain work hash: %v", err)
 	}
 
 	difficultyBigFloat := bestBlockHeader.Bits.CalculateDifficulty()

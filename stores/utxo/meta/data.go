@@ -59,8 +59,8 @@ type Data struct {
 	LockTime uint32 `json:"lockTime"`
 
 	// UnminedSince is the block height when an unmined transaction was first stored.
-	// When set to a block height value, it indicates the transaction is unmined.
-	// When 0, it indicates the transaction has been mined.
+	// When set to a block height value, it indicates the transaction is unmined on the longest chain.
+	// When 0, it indicates the transaction has been mined on the longest chain.
 	UnminedSince uint32 `json:"unminedSince"`
 
 	// Frozen is a flag indicating if the transaction is frozen

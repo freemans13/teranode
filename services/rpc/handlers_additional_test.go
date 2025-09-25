@@ -2217,9 +2217,8 @@ func TestHandleGetblockchaininfoComprehensive(t *testing.T) {
 		}
 
 		// This handler will panic when bestBlockMeta is nil
-		assert.Panics(t, func() {
-			_, _ = handleGetblockchaininfo(context.Background(), s, nil, nil)
-		})
+		_, err := handleGetblockchaininfo(t.Context(), s, nil, nil)
+		require.Error(t, err)
 	})
 }
 

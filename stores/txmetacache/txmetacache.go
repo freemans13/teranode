@@ -924,6 +924,20 @@ func (t *TxMetaCache) SetLocked(ctx context.Context, txHashes []chainhash.Hash, 
 	return nil
 }
 
+// MarkTransactionsOnLongestChain marks transactions as being on the longest chain or not.
+// This is a stub implementation that currently does nothing.
+//
+// Parameters:
+// - ctx: Context for the operation
+// - txHashes: Array of transaction hashes to mark as on/not on longest chain
+// - onLongestChain: Whether transactions are on the longest chain
+//
+// Returns:
+// - Error if the operation fails (currently always returns nil)
+func (t *TxMetaCache) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	return nil
+}
+
 // SetBlockHeight updates the current block height in the underlying store.
 // This is critical for cache expiration as it determines which cached entries are considered stale.
 // The block height is a fundamental parameter for the cache's LRU-like eviction policy, which

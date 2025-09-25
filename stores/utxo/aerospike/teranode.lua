@@ -519,7 +519,7 @@ function unspend(rec, offset, utxoHash, currentBlockHeight, blockHeightRetention
 end
 
 --
-function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blockHeightRetention, unsetMined)
+function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blockHeightRetention, onLongestChain, unsetMined)
     local response = map()
     
     if not aerospike:exists(rec) then 
@@ -589,9 +589,11 @@ function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blo
     -- Also add the block ids to the response
     response[FIELD_BLOCK_IDS] = blocks
 
-    -- if we have blocks in the record, then it is no longer unmined
+    -- if we have a block in the record on the longest chain, then it is no longer unmined
     if blocks and #blocks > 0 then
-        rec[BIN_UNMINED_SINCE] = nil
+        if onLongestChain then
+            rec[BIN_UNMINED_SINCE] = nil
+        end
     else
         rec[BIN_UNMINED_SINCE] = currentBlockHeight
     end

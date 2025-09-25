@@ -1355,7 +1355,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp.InitCurrentBlockHeader(blockHeader)
 
-		_, err = stp.moveBackBlock(context.Background(), &model.Block{
+		_, _, err = stp.moveBackBlock(context.Background(), &model.Block{
 			Header: prevBlockHeader,
 			Subtrees: []*chainhash.Hash{
 				subtree1.RootHash(),
@@ -1422,7 +1422,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		originalState := captureSubtreeProcessorState(stp)
 
 		// Test nil block
-		_, err = stp.moveBackBlock(context.Background(), nil)
+		_, _, err = stp.moveBackBlock(context.Background(), nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "you must pass in a block to moveBackBlock")
 
@@ -1464,7 +1464,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test empty block processing
-		_, err = stp.moveBackBlock(context.Background(), emptyBlock)
+		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock)
 		require.NoError(t, err)
 
 		// Verify state after processing empty block
@@ -1516,7 +1516,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree store error
-		_, err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1568,7 +1568,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test coinbase placeholder handling
-		_, err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder)
 		require.NoError(t, err)
 
 		// Verify the coinbase placeholder was handled correctly
@@ -1611,7 +1611,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test SetBlockProcessedAt error (should not cause overall failure)
-		_, err = stp.moveBackBlock(context.Background(), emptyBlock)
+		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock)
 		require.NoError(t, err) // Error in SetBlockProcessedAt should not fail the operation
 	})
 
@@ -1687,7 +1687,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test single subtree processing
-		_, err = stp.moveBackBlock(context.Background(), singleSubtreeBlock)
+		_, _, err = stp.moveBackBlock(context.Background(), singleSubtreeBlock)
 		require.NoError(t, err)
 
 		// Verify result
@@ -1740,7 +1740,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree creation failure
-		_, err = stp.moveBackBlock(context.Background(), emptyBlock)
+		err = stp.reorgBlocks(context.Background(), []*model.Block{emptyBlock}, []*model.Block{})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error creating new subtree")
 
@@ -1792,7 +1792,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree deserialization failure
-		_, err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1849,7 +1849,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta deserialization failure
-		_, err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1903,7 +1903,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta retrieval failure
-		_, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1986,7 +1986,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// This should succeed since the UTXO exists and can be deleted
-		_, err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase)
 		require.NoError(t, err) // This will pass, but we've tested the delete path
 
 		// Verify state was properly updated after successful operation
@@ -2074,7 +2074,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// This should succeed because addNode with skipNotification=true will handle duplicates gracefully
-		_, err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx)
 		require.NoError(t, err) // addNode with skipNotification doesn't fail on duplicates
 
 		// Verify state was properly updated after successful operation
@@ -3048,7 +3048,7 @@ func TestMoveBackBlockChildrenRemoval(t *testing.T) {
 		}
 
 		// Call moveBackBlockCreateNewSubtrees directly
-		_, err = stp.moveBackBlockCreateNewSubtrees(ctx, block)
+		_, _, err = stp.moveBackBlockCreateNewSubtrees(ctx, block)
 		require.NoError(t, err, "moveBackBlockCreateNewSubtrees should succeed")
 	})
 }
@@ -3104,7 +3104,7 @@ func TestMoveForwardBlock_BlockHeaderValidation(t *testing.T) {
 		}
 
 		// moveForwardBlock should fail with parent mismatch
-		err := stp.moveForwardBlock(context.Background(), invalidBlock, false, map[chainhash.Hash]bool{})
+		_, err := stp.moveForwardBlock(context.Background(), invalidBlock, false, map[chainhash.Hash]bool{}, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "does not match the current block header")
 	})
@@ -3413,7 +3413,7 @@ func TestMoveBackBlockCreateNewSubtrees_ErrorRecovery(t *testing.T) {
 		originalState := captureSubtreeProcessorState(stp)
 
 		// Call moveBackBlockCreateNewSubtrees
-		_, err = stp.moveBackBlockCreateNewSubtrees(context.Background(), block)
+		_, _, err = stp.moveBackBlockCreateNewSubtrees(context.Background(), block)
 
 		// Should handle corrupted data gracefully or return appropriate error
 		if err != nil {

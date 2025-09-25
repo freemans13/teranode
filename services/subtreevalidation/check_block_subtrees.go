@@ -417,13 +417,24 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	u.logger.Infof("[processTransactionsInLevels] Processing transactions across %d levels", maxLevel+1)
 
-	// Pre-process validation options
-	processedValidatorOptions := validator.ProcessOptions(
+	validatorOptions := []validator.Option{
 		validator.WithSkipPolicyChecks(true),
 		validator.WithCreateConflicting(true),
 		validator.WithIgnoreLocked(true),
-		validator.WithAddTXToBlockAssembly(false),
-	)
+	}
+
+	currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
+	if err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] Failed to get FSM current state", err)
+	}
+
+	// During legacy syncing or catching up, disable adding transactions to block assembly
+	if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
+		validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
+	}
+
+	// Pre-process validation options
+	processedValidatorOptions := validator.ProcessOptions(validatorOptions...)
 
 	// Track validation results
 	var (
