@@ -139,7 +139,7 @@ type BlockAssembler struct {
 	defaultMiningNBits *model.NBit
 
 	// resetCh handles reset requests for the assembler
-	resetCh chan struct{}
+	resetCh chan chan error
 
 	// resetWaitCount tracks the number of blocks to wait after reset
 	resetWaitCount atomic.Int32
@@ -235,7 +235,7 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 		currentChainMap:     make(map[chainhash.Hash]uint32, tSettings.BlockAssembly.MaxBlockReorgCatchup),
 		currentChainMapIDs:  make(map[uint32]struct{}, tSettings.BlockAssembly.MaxBlockReorgCatchup),
 		defaultMiningNBits:  defaultMiningBits,
-		resetCh:             make(chan struct{}, 2),
+		resetCh:             make(chan chan error, 2),
 		resetWaitCount:      atomic.Int32{},
 		resetWaitDuration:   atomic.Int32{},
 		currentRunningState: atomic.Value{},
@@ -309,12 +309,16 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 				// it's created by the blockchain client's Subscribe method
 				return
 
-			case <-b.resetCh:
+			case errCh := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
 
 				bestBlockchainBlockHeader, meta, err = b.blockchainClient.GetBestBlockHeader(ctx)
 				if err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error getting best block header: %v", err)
+					if errCh != nil {
+						errCh <- errors.NewProcessingError("[Reset] error getting best block header: %v", err)
+					}
+
 					b.setCurrentRunningState(StateRunning)
 
 					continue
@@ -326,6 +330,10 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 				moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
 				if err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error getting reorg blocks: %w", err)
+					if errCh != nil {
+						errCh <- errors.NewProcessingError("[Reset] error getting reorg blocks: %v", err)
+					}
+
 					b.setCurrentRunningState(StateRunning)
 
 					continue
@@ -333,6 +341,10 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 
 				if len(moveBackBlocksWithMeta) == 0 && len(moveForwardBlocksWithMeta) == 0 {
 					b.logger.Errorf("[BlockAssembler][Reset] no reorg blocks found, invalid reset")
+					if errCh != nil {
+						errCh <- errors.NewProcessingError("[Reset] no reorg blocks found, invalid reset")
+					}
+
 					b.setCurrentRunningState(StateRunning)
 
 					continue
@@ -369,6 +381,10 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 					_, bestBlockchainBlockHeaderMeta, err := b.blockchainClient.GetBlockHeader(ctx, bestBlockchainBlockHeader.Hash())
 					if err != nil {
 						b.logger.Errorf("[BlockAssembler][Reset] error getting best block header meta: %v", err)
+						if errCh != nil {
+							errCh <- errors.NewProcessingError("[Reset] error getting best block header meta: %v", err)
+						}
+
 						b.setCurrentRunningState(StateRunning)
 
 						continue
@@ -381,17 +397,31 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 				// make sure we have processed all pending blocks before loading unmined transactions
 				if err = b.waitForPendingBlocks(ctx); err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error waiting for pending blocks: %v", err)
+
+					if errCh != nil {
+						errCh <- errors.NewProcessingError("[Reset] error waiting for pending blocks: %v", err)
+						continue
+					}
 				}
 
 				// reload the unmined transactions
 				if err = b.loadUnminedTransactions(ctx); err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error loading unmined transactions: %v", err)
+
+					if errCh != nil {
+						errCh <- errors.NewStorageError("[Reset] error loading unmined transactions: %v", err)
+						continue
+					}
 				}
 
 				b.setBestBlockHeader(bestBlockchainBlockHeader, currentHeight)
 
 				if err = b.SetState(ctx); err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error setting state: %v", err)
+
+					if errCh != nil {
+						errCh <- errors.NewProcessingError("[Reset] error setting state: %v", err)
+					}
 				}
 
 				prometheusBlockAssemblyCurrentBlockHeight.Set(float64(b.bestBlockHeight.Load()))
@@ -402,6 +432,11 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 				resetWaitTimeInt32, err := safeconversion.Int64ToInt32(time.Now().Add(b.settings.BlockAssembly.ResetWaitDuration).Unix())
 				if err != nil {
 					b.logger.Errorf("[BlockAssembler][Reset] error converting reset wait time: %v", err)
+
+					if errCh != nil {
+						errCh <- errors.NewProcessingError("[Reset] error converting reset wait time: %v", err)
+						continue
+					}
 				}
 
 				b.resetWaitDuration.Store(resetWaitTimeInt32)
@@ -410,7 +445,14 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 
 				// empty out the reset channel
 				for len(b.resetCh) > 0 {
-					<-b.resetCh
+					bufferedErrCh := <-b.resetCh
+					if bufferedErrCh != nil {
+						bufferedErrCh <- nil
+					}
+				}
+
+				if errCh != nil {
+					errCh <- nil
 				}
 
 				b.setCurrentRunningState(StateRunning)
@@ -785,7 +827,13 @@ func (b *BlockAssembler) RemoveTx(hash chainhash.Hash) error {
 func (b *BlockAssembler) Reset() {
 	// run in a go routine to prevent blocking
 	go func() {
-		b.resetCh <- struct{}{}
+		errCh := make(chan error, 1)
+
+		b.resetCh <- errCh
+
+		if err := <-errCh; err != nil {
+			b.logger.Errorf("[BlockAssembler] error resetting: %v", err)
+		}
 	}()
 }
 
@@ -1126,8 +1174,18 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 
 	if (len(moveBackBlocksWithMeta) >= int(b.settings.ChainCfgParams.CoinbaseMaturity) || len(moveForwardBlocksWithMeta) >= int(b.settings.ChainCfgParams.CoinbaseMaturity)) && b.bestBlockHeight.Load() > 1000 {
 		// large reorg, log it and Reset the block assembler
-		b.Reset()
+		b.logger.Warnf("[BlockAssembler] large reorg detected, resetting block assembly, moveBackBlocks: %d, moveForwardBlocks: %d", len(moveBackBlocksWithMeta), len(moveForwardBlocksWithMeta))
 
+		errCh := make(chan error, 1)
+
+		// make sure we wait for the reset to complete
+		b.resetCh <- errCh
+
+		if err = <-errCh; err != nil {
+			b.logger.Errorf("[BlockAssembler] error resetting after large reorg: %v", err)
+		}
+
+		// return an error to indicate we reset due to a large reorg
 		return errors.NewBlockAssemblyResetError("large reorg, moveBackBlocks: %d, moveForwardBlocks: %d, resetting block assembly", len(moveBackBlocksWithMeta), len(moveForwardBlocksWithMeta))
 	}
 

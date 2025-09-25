@@ -119,7 +119,7 @@ func TestNoHotLoopInResetHandler(t *testing.T) {
 	b := &BlockAssembler{
 		unminedTransactionsLoading: atomic.Bool{},
 		currentRunningState:        atomic.Value{},
-		resetCh:                    make(chan struct{}, 2),
+		resetCh:                    make(chan chan error, 2),
 	}
 
 	// Initialize the state
@@ -129,7 +129,7 @@ func TestNoHotLoopInResetHandler(t *testing.T) {
 	b.unminedTransactionsLoading.Store(true)
 
 	// Send a reset signal
-	b.resetCh <- struct{}{}
+	b.resetCh <- nil
 
 	// With the new implementation, the reset handler will:
 	// 1. Receive the reset signal
