@@ -19,6 +19,7 @@ import (
 	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bitcoin-sv/teranode/services/blockchain"
 	"github.com/bitcoin-sv/teranode/stores/blob/memory"
+	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
 	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
 	nodehelpers "github.com/bitcoin-sv/teranode/test/nodeHelpers"
 	"github.com/bitcoin-sv/teranode/ulogger"
@@ -787,7 +788,7 @@ func TestShouldHandleReorg(t *testing.T) {
 		TransactionCount: 1,
 		Subtrees:         []*chainhash.Hash{},
 	}
-	err = ba.blockchainClient.AddBlock(ctx, blockA, "")
+	err = ba.blockchainClient.AddBlock(ctx, blockA, "", options.WithMinedSet(true))
 	require.NoError(t, err)
 
 	// Wait for the block to be processed
@@ -825,7 +826,7 @@ func TestShouldHandleReorg(t *testing.T) {
 		Subtrees:         []*chainhash.Hash{},
 	}
 
-	err = ba.blockchainClient.AddBlock(ctx, blockB, "")
+	err = ba.blockchainClient.AddBlock(ctx, blockB, "", options.WithMinedSet(true))
 	require.NoError(t, err)
 
 	// Wait for the reorganization to complete
@@ -1002,7 +1003,7 @@ func TestShouldHandleReorgWithLongerChain(t *testing.T) {
 		TransactionCount: 1,
 		Subtrees:         []*chainhash.Hash{},
 	}
-	err = ba.blockchainClient.AddBlock(ctx, blockA1, "")
+	err = ba.blockchainClient.AddBlock(ctx, blockA1, "", options.WithMinedSet(true))
 	require.NoError(t, err)
 
 	blockA2 := &model.Block{
@@ -1011,7 +1012,7 @@ func TestShouldHandleReorgWithLongerChain(t *testing.T) {
 		TransactionCount: 1,
 		Subtrees:         []*chainhash.Hash{},
 	}
-	err = ba.blockchainClient.AddBlock(ctx, blockA2, "")
+	err = ba.blockchainClient.AddBlock(ctx, blockA2, "", options.WithMinedSet(true))
 	require.NoError(t, err)
 
 	blockA3 := &model.Block{
@@ -1020,7 +1021,7 @@ func TestShouldHandleReorgWithLongerChain(t *testing.T) {
 		TransactionCount: 1,
 		Subtrees:         []*chainhash.Hash{},
 	}
-	err = ba.blockchainClient.AddBlock(ctx, blockA3, "")
+	err = ba.blockchainClient.AddBlock(ctx, blockA3, "", options.WithMinedSet(true))
 	require.NoError(t, err)
 
 	blockA4 := &model.Block{
@@ -1029,7 +1030,7 @@ func TestShouldHandleReorgWithLongerChain(t *testing.T) {
 		TransactionCount: 1,
 		Subtrees:         []*chainhash.Hash{},
 	}
-	err = ba.blockchainClient.AddBlock(ctx, blockA4, "")
+	err = ba.blockchainClient.AddBlock(ctx, blockA4, "", options.WithMinedSet(true))
 	require.NoError(t, err)
 
 	// Wait for the block to be processed
@@ -1062,7 +1063,7 @@ func TestShouldHandleReorgWithLongerChain(t *testing.T) {
 		TransactionCount: 1,
 		Subtrees:         []*chainhash.Hash{},
 	}
-	err = ba.blockchainClient.AddBlock(ctx, blockB, "")
+	err = ba.blockchainClient.AddBlock(ctx, blockB, "", options.WithMinedSet(true))
 	require.NoError(t, err)
 
 	// Wait for the reorganization to complete by checking for the expected best block

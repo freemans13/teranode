@@ -547,7 +547,7 @@ func (m *MockStore) ExportBlockDB(ctx context.Context, hash *chainhash.Hash) (*f
 }
 
 func (m *MockStore) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32) (bool, error) {
-	panic(implementMe)
+	return true, nil
 }
 
 func (m *MockStore) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {

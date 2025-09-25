@@ -22,14 +22,15 @@ type txMinedStatus interface {
 }
 
 type txMinedMessage struct {
-	ctx           context.Context
-	logger        ulogger.Logger
-	txMetaStore   txMinedStatus
-	block         *Block
-	blockID       uint32
-	chainBlockIDs []uint32
-	unsetMined    bool
-	done          chan error
+	ctx            context.Context
+	logger         ulogger.Logger
+	txMetaStore    txMinedStatus
+	block          *Block
+	blockID        uint32
+	chainBlockIDs  []uint32
+	onLongestChain bool
+	unsetMined     bool
+	done           chan error
 }
 
 var (
@@ -105,6 +106,7 @@ func initWorker(tSettings *settings.Settings) {
 					msg.block,
 					msg.blockID,
 					chainBlockIDsMap,
+					msg.onLongestChain,
 					msg.unsetMined,
 				); err != nil {
 					msg.done <- err
@@ -119,7 +121,7 @@ func initWorker(tSettings *settings.Settings) {
 }
 
 func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, txMetaStore txMinedStatus,
-	block *Block, blockID uint32, chainBlockIDs []uint32, unsetMined ...bool) error {
+	block *Block, blockID uint32, chainBlockIDs []uint32, onLongestChain bool, unsetMined ...bool) error {
 	// start the worker, if not already started
 	txMinedOnce.Do(func() { initWorker(tSettings) })
 
@@ -136,14 +138,15 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 	}
 
 	txMinedChan <- &txMinedMessage{
-		ctx:           ctx,
-		logger:        logger,
-		txMetaStore:   txMetaStore,
-		block:         block,
-		blockID:       blockID,
-		chainBlockIDs: chainBlockIDs,
-		unsetMined:    unsetTxMined, // whether to unset the mined status
-		done:          done,
+		ctx:            ctx,
+		logger:         logger,
+		txMetaStore:    txMetaStore,
+		block:          block,
+		blockID:        blockID,
+		chainBlockIDs:  chainBlockIDs,
+		onLongestChain: onLongestChain,
+		unsetMined:     unsetTxMined, // whether to unset the mined status
+		done:           done,
 	}
 
 	prometheusUpdateTxMinedCh.Inc()
@@ -152,7 +155,7 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 }
 
 func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, txMetaStore txMinedStatus,
-	block *Block, blockID uint32, chainBlockIDsMap map[uint32]bool, unsetMined bool) (err error) {
+	block *Block, blockID uint32, chainBlockIDsMap map[uint32]bool, onLongestChain, unsetMined bool) (err error) {
 	ctx, _, endSpan := tracing.Tracer("model").Start(ctx, "updateTxMinedStatus",
 		tracing.WithHistogram(prometheusUpdateTxMinedDuration),
 		tracing.WithTag("txid", block.Hash().String()),
@@ -186,10 +189,11 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 		}
 
 		minedBlockInfo := utxo.MinedBlockInfo{
-			BlockID:     blockID,
-			BlockHeight: block.Height,
-			SubtreeIdx:  subtreeIdx,
-			UnsetMined:  unsetMined,
+			BlockID:        blockID,
+			BlockHeight:    block.Height,
+			SubtreeIdx:     subtreeIdx,
+			OnLongestChain: onLongestChain,
+			UnsetMined:     unsetMined,
 		}
 
 		g.Go(func() error {

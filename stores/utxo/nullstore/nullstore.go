@@ -167,6 +167,10 @@ func (m *NullStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, se
 	return nil
 }
 
+func (m *NullStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	return nil
+}
+
 func (m *NullStore) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error) {
 	return []chainhash.Hash{}, nil
 }

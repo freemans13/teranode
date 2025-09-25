@@ -176,7 +176,7 @@ require (
 	github.com/bsv-blockchain/go-p2p v1.2.1
 	github.com/bsv-blockchain/go-safe-conversion v1.0.3
 	github.com/bsv-blockchain/go-sdk v1.2.6
-	github.com/bsv-blockchain/go-tx-map v1.0.5
+	github.com/bsv-blockchain/go-tx-map v1.1.0
 	github.com/bsv-blockchain/go-wire v1.0.6
 	github.com/felixge/fgprof v0.9.5
 	github.com/gocarina/gocsv v0.0.0-20240520201108-78e41c74b4b1

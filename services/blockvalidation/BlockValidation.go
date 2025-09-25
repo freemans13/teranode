@@ -413,6 +413,11 @@ func (u *BlockValidation) start(ctx context.Context) error {
 					continue
 				}
 
+				if blockHeaderMeta.Invalid {
+					// if the block is invalid, we don't set the tx mined
+					continue
+				}
+
 				if blockHeaderMeta != nil && blockHeaderMeta.MinedSet {
 					u.logger.Infof("[BlockValidation:start][%s] block already has mined_set true, skipping setTxMined", blockHash.String())
 					continue
@@ -420,7 +425,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 
 				_ = u.blockHashesCurrentlyValidated.Put(*blockHash)
 
-				if err = u.setTxMined(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
+				if err = u.setTxMined(ctx, blockHash); err != nil {
 					// Check if context is done before logging
 					select {
 					case <-ctx.Done():
@@ -431,8 +436,8 @@ func (u *BlockValidation) start(ctx context.Context) error {
 					u.logger.Errorf("[BlockValidation:start][%s] failed setTxMined: %s", blockHash.String(), err)
 
 					// Always remove from map on failure to prevent blocking child blocks
-					if err := u.blockHashesCurrentlyValidated.Delete(*blockHash); err != nil {
-						u.logger.Errorf("[BlockValidation:start][%s] failed to delete blockHash from blockHashesCurrentlyValidated: %s", blockHash.String(), err)
+					if deleteErr := u.blockHashesCurrentlyValidated.Delete(*blockHash); deleteErr != nil {
+						u.logger.Errorf("[BlockValidation:start][%s] failed to delete blockHash from blockHashesCurrentlyValidated: %s", blockHash.String(), deleteErr)
 					}
 
 					if !errors.Is(err, errors.ErrBlockNotFound) {
@@ -753,8 +758,10 @@ func (u *BlockValidation) setTxMined(ctx context.Context, blockHash *chainhash.H
 	defer deferFn()
 
 	var (
-		block *model.Block
-		ids   []uint32
+		block           *model.Block
+		blockHeaderMeta *model.BlockHeaderMeta
+		onLongestChain  bool
+		ids             []uint32
 	)
 
 	cachedBlock, blockWasAlreadyCached := u.lastValidatedBlocks.Get(*blockHash)
@@ -781,9 +788,14 @@ func (u *BlockValidation) setTxMined(ctx context.Context, blockHash *chainhash.H
 		}
 	}
 
-	_, _, err = u.blockchainClient.GetBlockHeader(ctx, blockHash)
+	_, blockHeaderMeta, err = u.blockchainClient.GetBlockHeader(ctx, blockHash)
 	if err != nil {
 		return errors.NewServiceError("[setTxMined][%s] failed to get block header from blockchain", blockHash.String(), err)
+	}
+
+	onLongestChain, err = u.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{blockHeaderMeta.ID})
+	if err != nil {
+		return errors.NewServiceError("[setTxMined][%s] failed to check if block is on longest chain", blockHash.String(), err)
 	}
 
 	if len(unsetMined) > 0 && unsetMined[0] {
@@ -836,6 +848,7 @@ func (u *BlockValidation) setTxMined(ctx context.Context, blockHash *chainhash.H
 		block,
 		ids[0],
 		ids[0:], // all the block IDs are needed to check the transactions have not already been mined on our chain
+		onLongestChain,
 		unsetMined...,
 	); err != nil {
 		// check whether we got already mined errors and mark the block as invalid

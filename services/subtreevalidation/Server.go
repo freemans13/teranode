@@ -740,6 +740,22 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 			AllowFailFast: false,
 		}
 
+		validatorOptions := []validator.Option{
+			validator.WithSkipPolicyChecks(true),
+			validator.WithCreateConflicting(true),
+			validator.WithIgnoreLocked(true),
+		}
+
+		currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
+		if err != nil {
+			return false, errors.NewProcessingError("[CheckSubtree] Failed to get FSM current state", err)
+		}
+
+		// During legacy syncing or catching up, disable adding transactions to block assembly
+		if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
+			validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
+		}
+
 		// Call the validateSubtreeInternal method
 		// making sure to skip policy checks, since we are validating a block that has already been mined
 		if _, err = u.ValidateSubtreeInternal(
@@ -747,10 +763,7 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 			v,
 			request.BlockHeight,
 			blockIds,
-			validator.WithSkipPolicyChecks(true),
-			validator.WithAddTXToBlockAssembly(false),
-			validator.WithCreateConflicting(true),
-			validator.WithIgnoreLocked(true),
+			validatorOptions...,
 		); err != nil {
 			return false, errors.NewProcessingError("[CheckSubtree] Failed to validate legacy subtree %s", hash.String(), err)
 		}

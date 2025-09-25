@@ -164,8 +164,8 @@ github.com/bsv-blockchain/go-sdk v1.2.6 h1:6J1I1rBNhCZuQ64OoNAZICMVDKYEEGYkmsD21
 github.com/bsv-blockchain/go-sdk v1.2.6/go.mod h1:Dc8WX7olShuMHLfNTBpVQnkxZWbu3djbAer/73yMcd4=
 github.com/bsv-blockchain/go-subtree v1.0.4 h1:e3ABtI1o8jlp6ZW/hAhvr8D9ULYM/hf/vuJGczGWPSw=
 github.com/bsv-blockchain/go-subtree v1.0.4/go.mod h1:yQACV4GUDmM3gtx/+RgJBi5hbJ1TbvOh7Mj5Z2uazWI=
-github.com/bsv-blockchain/go-tx-map v1.0.5 h1:bCG2OmU6FDJLhcEnrtfORi51tIGr98YXxyMSw2oZ+88=
-github.com/bsv-blockchain/go-tx-map v1.0.5/go.mod h1:oo9xG4DxHFenRK4SU5SngX8pmDOEoJlkk6QhuKnsn3w=
+github.com/bsv-blockchain/go-tx-map v1.1.0 h1:m26SaIqIbMtWzoZ+W7yD3t1UUP5vuHcOnJ8NXQNFses=
+github.com/bsv-blockchain/go-tx-map v1.1.0/go.mod h1:xKY7n53DqdjyE27jWrfhbR9ukyTgIsib6KB7gmdtsdA=
 github.com/bsv-blockchain/go-wire v1.0.6 h1:rMVASfuXtrZB1ZaZEl+/tvmXfdPMf4KY8Pew7/VeyQ0=
 github.com/bsv-blockchain/go-wire v1.0.6/go.mod h1:Jp6ekSmh/KZL1Gm/OPmbyMspNsficSgjXxlJ6bFD0Hs=
 github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd h1:R/opQEbFEy9JGkIguV40SvRY1uliPX8ifOvi6ICsFCw=
