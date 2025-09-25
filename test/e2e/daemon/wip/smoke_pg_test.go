@@ -172,7 +172,7 @@ func TestShouldAllowFairTxUseRpcWithPostgres(t *testing.T) {
 	assert.Equal(t, block202.Hash().String(), blockchainInfo.Result.BestBlockHash)
 	assert.Equal(t, "regtest", blockchainInfo.Result.Chain)
 	assert.Equal(t, "9601000000000000000000000000000000000000000000000000000000000000", blockchainInfo.Result.Chainwork)
-	assert.Equal(t, string("4.6565423739069247246592908691514574469873245939403288293276821765520783128832e-10"), blockchainInfo.Result.Difficulty)
+	assert.Equal(t, float64(4.6565423739069247e-10), blockchainInfo.Result.Difficulty)
 	assert.Equal(t, int(863341), blockchainInfo.Result.Headers)
 	assert.Equal(t, int(0), blockchainInfo.Result.Mediantime)
 	assert.False(t, blockchainInfo.Result.Pruned)

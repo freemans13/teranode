@@ -91,6 +91,24 @@ func TestCalculateKeySource(t *testing.T) {
 					result[chainhash.HashSize+3] == 0xFF
 			},
 		},
+		{
+			name:      "zero batchSize returns nil",
+			hash:      &chainhash.Hash{0x01, 0x02, 0x03},
+			vout:      1,
+			batchSize: 0,
+			expected: func(result []byte) bool {
+				return result == nil
+			},
+		},
+		{
+			name:      "negative batchSize returns nil",
+			hash:      &chainhash.Hash{0x01, 0x02, 0x03},
+			vout:      1,
+			batchSize: -1,
+			expected: func(result []byte) bool {
+				return result == nil
+			},
+		},
 	}
 
 	for _, tt := range tests {

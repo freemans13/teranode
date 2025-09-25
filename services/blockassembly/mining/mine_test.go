@@ -89,12 +89,9 @@ func TestMine_ContextCancellation(t *testing.T) {
 
 	// Should return nil solution due to immediate context cancellation
 	// The current implementation may return either nil solution or nonce overflow error
-	if err != nil {
-		assert.Contains(t, err.Error(), "context canceled")
-		assert.Nil(t, solution)
-	} else {
-		assert.Nil(t, solution)
-	}
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context canceled")
+	assert.Nil(t, solution)
 }
 
 func TestMine_ContextCancellationDuringMining(t *testing.T) {
@@ -122,8 +119,9 @@ func TestMine_ContextCancellationDuringMining(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, solution.BlockHash)
 	} else {
-		// If no solution, that's also acceptable due to context cancellation
-		assert.NoError(t, err) // Current implementation doesn't return context error
+		// If no solution, it should be due to context cancellation
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context canceled")
 	}
 }
 

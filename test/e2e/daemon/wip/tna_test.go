@@ -15,6 +15,8 @@ import (
 )
 
 func TestSingleTransactionPropagationWithUtxoPostgres(t *testing.T) {
+	SharedTestLock.Lock()
+	defer SharedTestLock.Unlock()
 	ctx := context.Background()
 
 	td := utils.SetupPostgresTestDaemon(t, ctx, "test-single-txs")
@@ -54,6 +56,8 @@ func TestSingleTransactionPropagationWithUtxoPostgres(t *testing.T) {
 }
 
 func TestMultipleTransactionsPropagationWithUtxoPostgres(t *testing.T) {
+	SharedTestLock.Lock()
+	defer SharedTestLock.Unlock()
 	ctx := context.Background()
 
 	td := utils.SetupPostgresTestDaemon(t, ctx, "test-multiple-txs")
@@ -91,6 +95,8 @@ func TestMultipleTransactionsPropagationWithUtxoPostgres(t *testing.T) {
 }
 
 func TestConcurrentTransactionsPropagationWithUtxoPostgres(t *testing.T) {
+	SharedTestLock.Lock()
+	defer SharedTestLock.Unlock()
 	ctx := context.Background()
 
 	td := utils.SetupPostgresTestDaemon(t, ctx, "test-concurrent-txs")

@@ -25,7 +25,7 @@ func TestBlockSubsidy(t *testing.T) {
 		SettingsContext: "dev.system.test",
 	})
 
-	defer td.Stop(t)
+	defer td.Stop(t, true)
 
 	// Set run state
 	err := td.BlockchainClient.Run(td.Ctx, "test")
