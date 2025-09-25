@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/stretchr/testify/mock"
+	"google.golang.org/grpc"
 )
 
 // Mock implements a mock version of the ClientI interface for testing.
@@ -136,4 +137,113 @@ func (m *Mock) GetTransactionHashes(ctx context.Context) ([]string, error) {
 	}
 
 	return args.Get(0).([]string), nil
+}
+
+// mockBlockAssemblyAPIClient is a mock implementation of BlockAssemblyAPIClient
+type mockBlockAssemblyAPIClient struct {
+	mock.Mock
+}
+
+func (m *mockBlockAssemblyAPIClient) HealthGRPC(ctx context.Context, in *blockassembly_api.EmptyMessage, opts ...grpc.CallOption) (*blockassembly_api.HealthResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.HealthResponse), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) AddTx(ctx context.Context, in *blockassembly_api.AddTxRequest, opts ...grpc.CallOption) (*blockassembly_api.AddTxResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.AddTxResponse), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) RemoveTx(ctx context.Context, in *blockassembly_api.RemoveTxRequest, opts ...grpc.CallOption) (*blockassembly_api.EmptyMessage, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.EmptyMessage), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) AddTxBatch(ctx context.Context, in *blockassembly_api.AddTxBatchRequest, opts ...grpc.CallOption) (*blockassembly_api.AddTxBatchResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.AddTxBatchResponse), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) GetMiningCandidate(ctx context.Context, in *blockassembly_api.GetMiningCandidateRequest, opts ...grpc.CallOption) (*model.MiningCandidate, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.MiningCandidate), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) GetCurrentDifficulty(ctx context.Context, in *blockassembly_api.EmptyMessage, opts ...grpc.CallOption) (*blockassembly_api.GetCurrentDifficultyResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.GetCurrentDifficultyResponse), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) SubmitMiningSolution(ctx context.Context, in *blockassembly_api.SubmitMiningSolutionRequest, opts ...grpc.CallOption) (*blockassembly_api.OKResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.OKResponse), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) ResetBlockAssembly(ctx context.Context, in *blockassembly_api.EmptyMessage, opts ...grpc.CallOption) (*blockassembly_api.EmptyMessage, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.EmptyMessage), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) GetBlockAssemblyState(ctx context.Context, in *blockassembly_api.EmptyMessage, opts ...grpc.CallOption) (*blockassembly_api.StateMessage, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.StateMessage), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) GenerateBlocks(ctx context.Context, in *blockassembly_api.GenerateBlocksRequest, opts ...grpc.CallOption) (*blockassembly_api.EmptyMessage, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.EmptyMessage), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) CheckBlockAssembly(ctx context.Context, in *blockassembly_api.EmptyMessage, opts ...grpc.CallOption) (*blockassembly_api.OKResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.OKResponse), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) GetBlockAssemblyBlockCandidate(ctx context.Context, in *blockassembly_api.EmptyMessage, opts ...grpc.CallOption) (*blockassembly_api.GetBlockAssemblyBlockCandidateResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.GetBlockAssemblyBlockCandidateResponse), args.Error(1)
+}
+
+func (m *mockBlockAssemblyAPIClient) GetBlockAssemblyTxs(ctx context.Context, in *blockassembly_api.EmptyMessage, opts ...grpc.CallOption) (*blockassembly_api.GetBlockAssemblyTxsResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockassembly_api.GetBlockAssemblyTxsResponse), args.Error(1)
 }

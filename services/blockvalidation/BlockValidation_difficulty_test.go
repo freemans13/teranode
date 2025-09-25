@@ -112,12 +112,12 @@ func TestValidateBlock_IncorrectDifficultyBits(t *testing.T) {
 	mockBlockchain.On("GetBlockExists", mock.Anything, blockHeader.Hash()).Return(false, nil).Once()
 	mockBlockchain.On("GetBlockHeaders", mock.Anything, prevBlockHeader.Hash(), mock.Anything).
 		Return([]*model.BlockHeader{prevBlockHeader}, []*model.BlockHeaderMeta{{ID: 0, Height: 0}}, nil).Once()
-	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
+	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil).Maybe()
+	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil).Maybe()
 
 	// Mock Subscribe for blockchain notifications
 	notificationChan := make(chan *blockchain_api.Notification, 1)
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil)
+	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil).Maybe()
 
 	// Mock GetNextWorkRequired to return the expected difficulty
 	mockBlockchain.On("GetNextWorkRequired", mock.Anything, prevBlockHeader.Hash(), mock.Anything).
@@ -240,12 +240,12 @@ func TestValidateBlock_DoesNotMeetTargetDifficulty(t *testing.T) {
 	mockBlockchain.On("GetBlockExists", mock.Anything, blockHeader.Hash()).Return(false, nil).Once()
 	mockBlockchain.On("GetBlockHeaders", mock.Anything, prevBlockHeader.Hash(), mock.Anything).
 		Return([]*model.BlockHeader{prevBlockHeader}, []*model.BlockHeaderMeta{{ID: 0, Height: 0}}, nil).Once()
-	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
+	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil).Maybe()
+	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil).Maybe()
 
 	// Mock Subscribe for blockchain notifications
 	notificationChan := make(chan *blockchain_api.Notification, 1)
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil)
+	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil).Maybe()
 
 	// Mock GetNextWorkRequired to return the expected difficulty
 	mockBlockchain.On("GetNextWorkRequired", mock.Anything, prevBlockHeader.Hash(), mock.Anything).
