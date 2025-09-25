@@ -68,7 +68,7 @@ func ReadAerospike(logger ulogger.Logger, settings *settings.Settings, txIDStrin
 	fmt.Printf("Reading record from %s.%s\n", namespace, setName)
 
 	// Create the Aerospike key for the given transaction ID
-	keySource := uaerospike.CalculateKeySource(hash, 0)
+	keySource := uaerospike.CalculateKeySourceInternal(hash, 0)
 
 	var key *aero.Key
 	key, err = aero.NewKey(namespace, setName, keySource)
@@ -125,7 +125,7 @@ func ReadAerospike(logger ulogger.Logger, settings *settings.Settings, txIDStrin
 
 			for i := uint32(1); i <= nrRecordsUint32; i++ {
 				// Calculate the key source for the additional records
-				keySource = uaerospike.CalculateKeySource(hash, i)
+				keySource = uaerospike.CalculateKeySourceInternal(hash, i)
 
 				// Create a new key for the additional record
 				key, err = aero.NewKey(namespace, setName, keySource)

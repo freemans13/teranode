@@ -63,7 +63,6 @@ import (
 	"github.com/bitcoin-sv/teranode/stores/utxo"
 	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bitcoin-sv/teranode/util/uaerospike"
-	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 )
 
 // Unspend operations handle reverting spent UTXOs back to an unspent state.
@@ -148,12 +147,7 @@ func (s *Store) unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 func (s *Store) unspendLua(spend *utxo.Spend) error {
 	policy := util.GetAerospikeWritePolicy(s.settings, 0)
 
-	sUtxoBatchSizeUint32, err := safeconversion.IntToUint32(s.utxoBatchSize)
-	if err != nil {
-		s.logger.Errorf("Could not convert utxoBatchSize (%d) to uint32", s.utxoBatchSize)
-	}
-
-	keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/sUtxoBatchSizeUint32)
+	keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, s.utxoBatchSize)
 
 	key, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 	if aErr != nil {

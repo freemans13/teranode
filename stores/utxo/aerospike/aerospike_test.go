@@ -80,15 +80,17 @@ import (
 func TestCalculateKeySource(t *testing.T) {
 	hash := chainhash.HashH([]byte("test"))
 
-	h := uaerospike.CalculateKeySource(&hash, 0)
+	batchSize := 1
+
+	h := uaerospike.CalculateKeySource(&hash, 0, batchSize)
 	assert.Equal(t, hash[:], h)
 
-	h = uaerospike.CalculateKeySource(&hash, 1)
+	h = uaerospike.CalculateKeySource(&hash, 1, batchSize)
 	extra := make([]byte, 4)
 	binary.LittleEndian.PutUint32(extra, uint32(1))
 	assert.Equal(t, append(hash[:], extra...), h)
 
-	h = uaerospike.CalculateKeySource(&hash, 2)
+	h = uaerospike.CalculateKeySource(&hash, 2, batchSize)
 	extra = make([]byte, 4)
 	binary.LittleEndian.PutUint32(extra, uint32(2))
 	assert.Equal(t, append(hash[:], extra...), h)

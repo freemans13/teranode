@@ -267,8 +267,18 @@ func (c *Client) BatchOperate(policy *aerospike.BatchPolicy, records []aerospike
 	return c.Client.BatchOperate(policy, records)
 }
 
-// CalculateKeySource generates a key source based on the transaction hash and an optional offset.
-func CalculateKeySource(hash *chainhash.Hash, num uint32) []byte {
+// CalculateKeySource generates a key source based on the transaction hash, vout, and batch size.
+func CalculateKeySource(hash *chainhash.Hash, vout uint32, batchSize int) []byte {
+	if batchSize < 0 {
+		return nil
+	}
+
+	num := vout / uint32(batchSize)
+
+	return CalculateKeySourceInternal(hash, num)
+}
+
+func CalculateKeySourceInternal(hash *chainhash.Hash, num uint32) []byte {
 	if num == 0 {
 		// Fast path: just return cloned hash bytes
 		return hash.CloneBytes()

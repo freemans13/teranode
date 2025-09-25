@@ -96,7 +96,7 @@ func TestStore_SpendMultiRecord(t *testing.T) {
 			require.NoError(t, err)
 
 			//nolint:gosec
-			keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(vOut/store.GetUtxoBatchSize()))
+			keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(vOut), store.GetUtxoBatchSize())
 			key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 			require.NoError(t, err)
 
@@ -134,7 +134,7 @@ func TestStore_SpendMultiRecord(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, uint32(0), dah)
 
-		keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(0))
+		keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(0), 1)
 		mainRecordKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, err)
 
