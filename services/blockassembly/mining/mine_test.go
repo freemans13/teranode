@@ -90,7 +90,7 @@ func TestMine_ContextCancellation(t *testing.T) {
 	// Should return nil solution due to immediate context cancellation
 	// The current implementation may return either nil solution or nonce overflow error
 	if err != nil {
-		assert.Contains(t, err.Error(), "nonce overflow")
+		assert.Contains(t, err.Error(), "context canceled")
 		assert.Nil(t, solution)
 	} else {
 		assert.Nil(t, solution)

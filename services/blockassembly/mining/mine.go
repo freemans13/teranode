@@ -66,7 +66,7 @@ func Mine(ctx context.Context, tSettings *settings.Settings, candidate *model.Mi
 	for {
 		select {
 		case <-ctx.Done():
-			break
+			return nil, ctx.Err()
 		default:
 			blockHeader := model.BlockHeader{
 				Version:        candidate.Version,
