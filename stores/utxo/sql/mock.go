@@ -311,10 +311,11 @@ func CreateTestHashes(count int) []*chainhash.Hash {
 // CreateTestMinedBlockInfo creates a test MinedBlockInfo for testing
 func CreateTestMinedBlockInfo() utxo.MinedBlockInfo {
 	return utxo.MinedBlockInfo{
-		BlockID:     1,
-		BlockHeight: 100,
-		SubtreeIdx:  0,
-		UnsetMined:  false,
+		BlockID:        1,
+		BlockHeight:    100,
+		SubtreeIdx:     0,
+		UnsetMined:     false,
+		OnLongestChain: true,
 	}
 }
 

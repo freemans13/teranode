@@ -269,7 +269,7 @@ func (c *Client) BatchOperate(policy *aerospike.BatchPolicy, records []aerospike
 
 // CalculateKeySource generates a key source based on the transaction hash, vout, and batch size.
 func CalculateKeySource(hash *chainhash.Hash, vout uint32, batchSize int) []byte {
-	if batchSize < 0 {
+	if batchSize <= 0 {
 		return nil
 	}
 

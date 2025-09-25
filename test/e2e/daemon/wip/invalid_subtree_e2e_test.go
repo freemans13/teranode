@@ -26,6 +26,7 @@ func TestInvalidSubtree_BanScoreConfiguration(t *testing.T) {
 		SettingsOverrideFunc: func(s *settings.Settings) {
 			s.P2P.BanThreshold = 30 // Lower threshold for testing
 			s.P2P.BanDuration = 60 * time.Second
+			s.ChainCfgParams.CoinbaseMaturity = 2
 		},
 	})
 	defer node1.Stop(t)
@@ -38,6 +39,7 @@ func TestInvalidSubtree_BanScoreConfiguration(t *testing.T) {
 		SettingsOverrideFunc: func(s *settings.Settings) {
 			s.P2P.BanThreshold = 30
 			s.P2P.BanDuration = 60 * time.Second
+			s.ChainCfgParams.CoinbaseMaturity = 2
 		},
 	})
 	defer node2.Stop(t)

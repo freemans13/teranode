@@ -6,49 +6,56 @@ import (
 	"time"
 
 	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
-	utils "github.com/bitcoin-sv/teranode/test/utils"
+	"github.com/bitcoin-sv/teranode/services/blockchain"
+	"github.com/bitcoin-sv/teranode/settings"
+	helper "github.com/bitcoin-sv/teranode/test/utils"
 	"github.com/bitcoin-sv/teranode/test/utils/transactions"
 	"github.com/stretchr/testify/require"
 )
 
-type GetPeerInfoResponse struct {
-	Result []bsvjson.GetPeerInfoResult `json:"result"`
-	Error  *utils.JSONError            `json:"error"`
-	ID     int                         `json:"id"`
-}
-
 // TestInvalidBlockKafkaP2P_E2E spins up two daemons with P2P and Kafka enabled, generates a block with a duplicate transaction, submits it, and checks that the invalid block is detected and reported.
-func TestInvalidBlockKafkaP2P_E2E(t *testing.T) {
+func TestInvalidBlockBanScore(t *testing.T) {
+	SharedTestLock.Lock()
+	defer SharedTestLock.Unlock()
+
 	node1 := daemon.NewTestDaemon(t, daemon.TestOptions{
-		EnableRPC:         true,
-		EnableP2P:         true,
-		SettingsContext:   "docker.host.teranode1.daemon",
-		EnableFullLogging: false,
+		EnableRPC:       true,
+		EnableP2P:       true,
+		SettingsContext: "docker.host.teranode2.daemon",
+		FSMState:        blockchain.FSMStateRUNNING,
+		SettingsOverrideFunc: func(s *settings.Settings) {
+			s.ChainCfgParams.CoinbaseMaturity = 1
+		},
 	})
 	defer node1.Stop(t)
 
 	node2 := daemon.NewTestDaemon(t, daemon.TestOptions{
-		EnableRPC:         true,
-		EnableP2P:         true,
-		SettingsContext:   "docker.host.teranode2.daemon",
-		SkipRemoveDataDir: true,
-		EnableFullLogging: false,
+		EnableRPC:       true,
+		EnableP2P:       true,
+		SettingsContext: "docker.host.teranode1.daemon",
+		FSMState:        blockchain.FSMStateRUNNING,
+		SettingsOverrideFunc: func(s *settings.Settings) {
+			s.ChainCfgParams.CoinbaseMaturity = 1
+		},
 	})
 	defer node2.Stop(t)
 
-	time.Sleep(10 * time.Second)
+	// node2.ConnectToPeer(t, node1)
+	node1.ConnectToPeer(t, node2)
 
 	coinbaseTx := node1.MineToMaturityAndGetSpendableCoinbaseTx(t, node1.Ctx)
+
+	block2, err := node1.BlockchainClient.GetBlockByHeight(node1.Ctx, 2)
+	require.NoError(t, err)
+
+	blockWaitTime := 30 * time.Second
+	err = helper.WaitForNodeBlockHeight(t.Context(), node2.BlockchainClient, block2.Height, blockWaitTime)
+	require.NoError(t, err)
 
 	tx := node1.CreateTransactionWithOptions(t,
 		transactions.WithInput(coinbaseTx, 0),
 		transactions.WithP2PKHOutputs(1, 10000),
 	)
-
-	block2, err := node1.BlockchainClient.GetBlockByHeight(node1.Ctx, 2)
-	require.NoError(t, err)
-	node2.WaitForBlockHeight(t, block2, 10*time.Second)
 
 	err = node1.PropagationClient.ProcessTransaction(node1.Ctx, tx)
 	require.NoError(t, err)
@@ -63,9 +70,8 @@ func TestInvalidBlockKafkaP2P_E2E(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	// Submit the invalid block to node1
-	err = node1.BlockValidationClient.ValidateBlock(node1.Ctx, invalidBlock)
-	require.Error(t, err, "Block with duplicate tx should be rejected")
+	err = node1.BlockValidation.ValidateBlock(node1.Ctx, invalidBlock, "invalid_block", nil)
+	require.NoError(t, err, "Block with duplicate tx should be rejected")
 
 	bestHeight, _, err := node1.BlockchainClient.GetBestHeightAndTime(node1.Ctx)
 	require.NoError(t, err)

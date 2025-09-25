@@ -1,4 +1,4 @@
-package smoke_test
+package smoke
 
 import (
 	"context"
@@ -10,12 +10,15 @@ import (
 )
 
 func TestBlockchainSubscriptionReconnection(t *testing.T) {
+	SharedTestLock.Lock()
+	defer SharedTestLock.Unlock()
+
 	node := daemon.NewTestDaemon(t, daemon.TestOptions{
 		EnableRPC:       true,
 		EnableP2P:       true,
 		SettingsContext: "docker.host.teranode1.daemon",
 	})
-	defer node.Stop(t)
+	defer node.Stop(t, true)
 
 	// Subscribe to blockchain notifications
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

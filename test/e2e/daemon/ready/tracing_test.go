@@ -14,6 +14,8 @@ import (
 )
 
 func TestCheckSpanPropagation(t *testing.T) {
+	SharedTestLock.Lock()
+	defer SharedTestLock.Unlock()
 	td := daemon.NewTestDaemon(t, daemon.TestOptions{
 		EnableRPC: true,
 		EnableP2P: false,
@@ -26,6 +28,8 @@ func TestCheckSpanPropagation(t *testing.T) {
 			settings.TracingSampleRate = 1.0
 		},
 	})
+
+	defer td.Stop(t, true)
 
 	var err error
 
