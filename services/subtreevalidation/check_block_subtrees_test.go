@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -25,10 +26,12 @@ import (
 	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/ordishs/go-utils/expiringmap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestCheckBlockSubtrees(t *testing.T) {
@@ -646,6 +649,105 @@ func TestPrepareTxsPerLevel(t *testing.T) {
 		// Verify level structure exists
 		assert.GreaterOrEqual(t, maxLevel, uint32(0))
 		assert.NotNil(t, txsPerLevel)
+	})
+
+	t.Run("full block test", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		blockBytes, err := os.ReadFile("testdata/171/0000000023ffe4075b18e77ce7342b90a7deeb92e4b3681551253291c3522824.block")
+		require.NoError(t, err)
+
+		block, err := model.NewBlockFromBytes(blockBytes)
+		require.NoError(t, err)
+
+		allTxs := make([]*bt.Tx, 0, block.TransactionCount)
+		allTxsMu := sync.Mutex{}
+
+		g := errgroup.Group{}
+
+		// get all the transactions from all the subtrees in the block
+		for _, subtreeHash := range block.Subtrees {
+			subtreeHash := *subtreeHash
+
+			g.Go(func() error {
+				subtreeBytes, err := os.ReadFile("testdata/171/" + subtreeHash.String() + ".subtree")
+				require.NoError(t, err)
+
+				subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(len(subtreeBytes) / chainhash.HashSize)
+				require.NoError(t, err, fmt.Sprintf("failed to parse subtree %s", subtreeHash.String()))
+
+				for i := 0; i < len(subtreeBytes); i += chainhash.HashSize {
+					var h chainhash.Hash
+					copy(h[:], subtreeBytes[i:i+chainhash.HashSize])
+
+					if h.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+						err = subtree.AddCoinbaseNode()
+						require.NoError(t, err)
+					} else {
+						err = subtree.AddNode(h, 0, 0)
+						require.NoError(t, err)
+					}
+				}
+
+				subtreeDataBytes, err := os.ReadFile("testdata/171/" + subtreeHash.String() + ".subtree_data")
+				require.NoError(t, err)
+
+				subtreeData, err := subtreepkg.NewSubtreeDataFromBytes(subtree, subtreeDataBytes)
+				require.NoError(t, err)
+
+				for _, tx := range subtreeData.Txs {
+					if tx != nil {
+						allTxsMu.Lock()
+						allTxs = append(allTxs, tx)
+						allTxsMu.Unlock()
+					}
+				}
+
+				return nil
+			})
+		}
+
+		err = g.Wait()
+		require.NoError(t, err)
+
+		missingTxs := make([]missingTx, len(allTxs))
+		for i, tx := range allTxs {
+			missingTxs[i] = missingTx{
+				tx:  tx,
+				idx: i,
+			}
+		}
+
+		// Use the existing prepareTxsPerLevel logic to organize transactions by dependency levels
+		maxLevel, txsPerLevel, err := server.prepareTxsPerLevel(t.Context(), missingTxs)
+		require.NoError(t, err)
+
+		// for level, txs := range txsPerLevel {
+		// 	fmt.Printf("Level %d has %d transactions\n", level, len(txs))
+		// 	for _, tx := range txs {
+		// 		fmt.Printf("  TxID: %s\n", tx.tx.TxIDChainHash().String())
+		// 	}
+		// }
+
+		assert.Equal(t, uint32(12), maxLevel)
+		assert.NotNil(t, txsPerLevel)
+
+		// get the level of "0f3a71a9441084a263d0c7c18ea536793c93da0a50666d41ee0dc8ec07b7eced" (child)
+		// then get the level of "7198ecdae55f77cef5d8e8042adecae5e37fd149c17cd0a291d0c342251ee228" (parent)
+		// and make sure the level of the first is greater than the level of the second
+		var levelA, levelB int
+		for level, txs := range txsPerLevel {
+			for _, tx := range txs {
+				if tx.tx.TxIDChainHash().String() == "0f3a71a9441084a263d0c7c18ea536793c93da0a50666d41ee0dc8ec07b7eced" {
+					levelA = level
+				}
+				if tx.tx.TxIDChainHash().String() == "7198ecdae55f77cef5d8e8042adecae5e37fd149c17cd0a291d0c342251ee228" {
+					levelB = level
+				}
+			}
+		}
+		assert.Greater(t, levelA, levelB, "Expected level of first transaction to be greater than second")
 	})
 }
 
