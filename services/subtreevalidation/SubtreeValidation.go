@@ -1261,44 +1261,84 @@ func (u *Server) prepareTxsPerLevel(ctx context.Context, transactions []missingT
 		}
 	}
 
-	// Second pass: build dependency graph
+	// Second pass: calculate dependency levels using topological approach
+	// Build dependency graph first
+	dependencies := make(map[chainhash.Hash][]chainhash.Hash) // child -> parents
+	childrenMap := make(map[chainhash.Hash][]chainhash.Hash)  // parent -> children
+
 	for _, mTx := range transactions {
-		if mTx.tx == nil {
+		if mTx.tx == nil || mTx.tx.IsCoinbase() {
 			continue
 		}
 
-		wrapper := txMap[*mTx.tx.TxIDChainHash()]
+		txHash := *mTx.tx.TxIDChainHash()
+		dependencies[txHash] = make([]chainhash.Hash, 0)
+
+		// Check each input of the transaction to find its parents
+		for _, input := range mTx.tx.Inputs {
+			parentHash := *input.PreviousTxIDChainHash()
+
+			// check if parentHash exists in the map, which means it is part of the subtree
+			if _, exists := txMap[parentHash]; exists {
+				dependencies[txHash] = append(dependencies[txHash], parentHash)
+
+				if childrenMap[parentHash] == nil {
+					childrenMap[parentHash] = make([]chainhash.Hash, 0)
+				}
+				childrenMap[parentHash] = append(childrenMap[parentHash], txHash)
+			}
+		}
+	}
+
+	// Calculate levels using recursive approach with memoization
+	levelCache := make(map[chainhash.Hash]uint32)
+
+	var calculateLevel func(chainhash.Hash) uint32
+	calculateLevel = func(txHash chainhash.Hash) uint32 {
+		if level, exists := levelCache[txHash]; exists {
+			return level
+		}
+
+		// If no dependencies in subtree, level is 0
+		parents := dependencies[txHash]
+		if len(parents) == 0 {
+			levelCache[txHash] = 0
+			return 0
+		}
+
+		// Level is 1 + max(parent levels)
+		maxParentLevel := uint32(0)
+		for _, parentHash := range parents {
+			parentLevel := calculateLevel(parentHash)
+			if parentLevel > maxParentLevel {
+				maxParentLevel = parentLevel
+			}
+		}
+
+		level := maxParentLevel + 1
+		levelCache[txHash] = level
+		return level
+	}
+
+	// Calculate levels for all transactions and update wrappers
+	for _, mTx := range transactions {
+		if mTx.tx == nil || mTx.tx.IsCoinbase() {
+			continue
+		}
+
+		txHash := *mTx.tx.TxIDChainHash()
+		wrapper := txMap[txHash]
 		if wrapper == nil {
 			continue
 		}
 
-		maxParentLevel := uint32(0)
+		level := calculateLevel(txHash)
+		wrapper.childLevelInBlock = level
+		wrapper.someParentsInBlock = len(dependencies[txHash]) > 0
 
-		// Check each input of the transaction to find its parents
-		// and determine the maximum level of those parents
-		// This is done to ensure that we can process transactions in the correct order
-		for _, input := range wrapper.missingTx.tx.Inputs {
-			parentHash := *input.PreviousTxIDChainHash()
-
-			// check if parentHash exists in the map, which means it is part of the subtree and already processed
-			if parentWrapper, exists := txMap[parentHash]; exists {
-				wrapper.someParentsInBlock = true
-				// Update the maximum parent level found
-				// Child must be at one level higher than its highest parent
-				if parentWrapper.childLevelInBlock+1 > maxParentLevel {
-					maxParentLevel = parentWrapper.childLevelInBlock + 1
-				}
-			}
-		}
-
-		wrapper.childLevelInBlock = maxParentLevel
-
-		// increment the sizePerLevel for the current level
-		sizePerLevel[maxParentLevel]++
-
-		// Update the transaction's level in the block
-		if maxParentLevel > maxLevel {
-			maxLevel = maxParentLevel
+		sizePerLevel[level]++
+		if level > maxLevel {
+			maxLevel = level
 		}
 	}
 
