@@ -411,7 +411,12 @@ func TestDaemon_Start_AllServices(t *testing.T) {
 	d := New(loggerFactory, WithContext(ctx))
 	require.NotNil(t, d, "New daemon instance should not be nil")
 
-	ctxStart, cancelStart := context.WithTimeout(context.Background(), 60*time.Second)
+	// Use longer timeout for CI environments where services take longer to start
+	startupTimeout := 60 * time.Second
+	if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
+		startupTimeout = 180 * time.Second // 3 minutes for CI
+	}
+	ctxStart, cancelStart := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancelStart()
 
 	readyCh := make(chan struct{})
@@ -436,12 +441,13 @@ func TestDaemon_Start_AllServices(t *testing.T) {
 	}()
 
 	// Wait for services to be ready or timeout
+	t.Logf("Waiting for daemon startup with timeout: %v", startupTimeout)
 	select {
 	case <-readyCh:
 		t.Logf("Daemon and its services reported ready.")
 	case <-ctxStart.Done():
-		logger.Errorf("Timeout waiting for daemon and its services to be ready: %v", ctxStart.Err())
-		t.Fatal("Timeout waiting for daemon and its services to be ready")
+		logger.Errorf("Timeout waiting for daemon and its services to be ready after %v: %v", startupTimeout, ctxStart.Err())
+		t.Fatalf("Timeout waiting for daemon and its services to be ready after %v", startupTimeout)
 	}
 
 	// additional sleep for alert service
