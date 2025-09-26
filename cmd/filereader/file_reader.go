@@ -146,7 +146,7 @@ func ProcessFile(ctx context.Context, path string, logger ulogger.Logger, settin
 // readFile reads the contents of a file and processes it based on its type.
 func readFile(ctx context.Context, filename string, ext fileformat.FileType, logger ulogger.Logger,
 	settings *settings.Settings, r io.Reader, dir string) error {
-	br := bufio.NewReaderSize(r, 1024*1024)
+	br := bufio.NewReaderSize(r, 1024*128)
 
 	// Read the header
 	header, err := fileformat.ReadHeader(br)

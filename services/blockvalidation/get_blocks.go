@@ -453,7 +453,7 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	defer subtreeDataReader.Close()
 
 	// create a buffered reader to read the subtreeData
-	subtreeDataBufferedReader := io.NopCloser(bufio.NewReaderSize(subtreeDataReader, 2*1024*1024)) // 2MB buffer size
+	subtreeDataBufferedReader := io.NopCloser(bufio.NewReaderSize(subtreeDataReader, 1024*512))
 
 	// loading the subtree data like this will validate the data as it is read
 	// compared to the transactions in the subtree

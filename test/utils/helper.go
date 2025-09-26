@@ -275,7 +275,7 @@ func GetSubtreeTxHashes(ctx context.Context, logger ulogger.Logger, subtreeHash 
 
 	txHashes := make([]chainhash.Hash, 0, tSettings.BlockAssembly.InitialMerkleItemsPerSubtree)
 	buffer := make([]byte, chainhash.HashSize)
-	bufferedReader := bufio.NewReaderSize(body, 1024*1024*4) // 4MB buffer
+	bufferedReader := bufio.NewReaderSize(body, 1024*64)
 
 	logger.Debugf("[getSubtreeTxHashes][%s] processing subtree response into tx hashes", subtreeHash.String())
 

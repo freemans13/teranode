@@ -374,7 +374,7 @@ func LoadTxMetaIntoMemory() error {
 	defer file.Close()
 
 	// create a buffered reader for the file
-	bufReader := bufio.NewReaderSize(file, 55*1024*1024)
+	bufReader := bufio.NewReaderSize(file, 1024*64)
 
 	if err = ReadTxMeta(bufReader, TestCachedTxMetaStore.(*txmetacache.TxMetaCache)); err != nil {
 		return err

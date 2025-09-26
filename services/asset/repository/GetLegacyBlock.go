@@ -96,7 +96,7 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 				}
 
 				// create a buffered reader to read the subtree data
-				bufferedReader := bufio.NewReaderSize(subtreeDataReader, 2*1024*1024) // 2MB buffer size
+				bufferedReader := bufio.NewReaderSize(subtreeDataReader, 1024*512)
 
 				// process the subtree data streaming to the writer
 				for {

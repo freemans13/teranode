@@ -2709,6 +2709,10 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 				}
 			}
 
+			defer func() {
+				_ = subtreeReader.Close()
+			}()
+
 			// TODO add metrics about how many txs we are reading per second
 			txHashBuckets, conflictingNodes, err := DeserializeHashesFromReaderIntoBuckets(subtreeReader, transactionMap.Buckets())
 			if err != nil {
@@ -2929,7 +2933,7 @@ func DeserializeHashesFromReaderIntoBuckets(reader io.Reader, nBuckets uint16) (
 		}
 	}()
 
-	buf := bufio.NewReaderSize(reader, 1024*1024*16) // 16MB buffer
+	buf := bufio.NewReaderSize(reader, 1024*64)
 
 	if _, err = buf.Discard(48); err != nil { // skip headers
 		return nil, nil, errors.NewProcessingError("unable to read header", err)

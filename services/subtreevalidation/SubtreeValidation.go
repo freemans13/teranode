@@ -884,7 +884,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 
 	start = gocore.CurrentTime()
 	buffer := make([]byte, chainhash.HashSize)
-	bufferedReader := bufio.NewReaderSize(body, 1024*1024*4) // 4MB buffer
+	bufferedReader := bufio.NewReaderSize(body, 1024*128)
 
 	u.logger.Debugf("[getSubtreeTxHashes][%s] processing subtree response into tx hashes", subtreeHash.String())
 
