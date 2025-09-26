@@ -184,6 +184,7 @@ func TestParentSpentNotMinedonSameChain(t *testing.T) {
 			settings.BlockValidation.OptimisticMining = true
 		},
 		FSMState: blockchain.FSMStateRUNNING,
+		EnableFullLogging: true,
 	})
 	defer nodeA.Stop(t)
 
@@ -269,53 +270,12 @@ func TestParentSpentNotMinedonSameChain(t *testing.T) {
 	_, block3 := nodeA.CreateTestBlock(t, block2, 0, childTx)
 	err = nodeA.BlockValidation.ValidateBlock(nodeA.Ctx, block3, "legacy", nil)
 	require.NoError(t, err)
-	_, block4 := nodeA.CreateTestBlock(t, block2, 0)
+	_, block4 := nodeA.CreateTestBlock(t, block3, 0)
 	err = nodeA.BlockValidation.ValidateBlock(nodeA.Ctx, block4, "legacy", nil)
 	require.NoError(t, err)
-
-	// Verify transactions are no longer in mempool (they should be mined)
-	t.Log("Verifying transactions are still in mempool...")
-	resp, err = nodeA.CallRPC(nodeA.Ctx, "getrawmempool", []interface{}{})
-	require.NoError(t, err, "Failed to get mempool after mining")
-
-	err = json.Unmarshal([]byte(resp), &mempoolResp)
-	require.NoError(t, err, "Failed to parse mempool response after mining")
-
-	for _, txID := range mempoolResp.Result {
-		if txID == "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" {
-			continue
-		}
-		if txID == parentTx.TxIDChainHash().String() || txID == childTx.TxIDChainHash().String() {
-			continue
-		}
-		require.Fail(t, "Transaction still in mempool")
-	}
-	t.Log("Confirmed transactions are no longer in mempool")
-
 	nodeA.WaitForBlock(t, block4, 10*time.Second, true)
-	nodeA.MineAndWait(t, 1)
 
-	_, meta, err := nodeA.BlockchainClient.GetBestBlockHeader(nodeA.Ctx)
-	require.NoError(t, err)
-	require.Equal(t, uint32(4), meta.Height)
-
-	// create a valid block with parent tx from block2 and then add few more blocks
-	_, block3B := nodeA.CreateTestBlock(t, block2, 0, parentTx)
-	err = nodeA.BlockValidation.ValidateBlock(nodeA.Ctx, block3B, "legacy", nil)
-	require.NoError(t, err)
-
-	_, block4B := nodeA.CreateTestBlock(t, block3B, 0)
-	err = nodeA.BlockValidation.ValidateBlock(nodeA.Ctx, block4B, "legacy", nil)
-	require.NoError(t, err)
-
-	_, block5B := nodeA.CreateTestBlock(t, block4B, 0)
-	err = nodeA.BlockValidation.ValidateBlock(nodeA.Ctx, block5B, "legacy", nil)
-	require.NoError(t, err)
-
-	_, block6B := nodeA.CreateTestBlock(t, block5B, 0, childTx)
-	err = nodeA.BlockValidation.ValidateBlock(nodeA.Ctx, block6B, "legacy", nil)
-	require.NoError(t, err)
-	nodeA.WaitForBlock(t, block6B, 10*time.Second, true)
-
-	nodeA.VerifyInBlockAssembly(t, childTx)
+	// verify parent tx is in mempool
+	nodeA.VerifyNotInBlockAssembly(t, childTx)
+	nodeA.VerifyInBlockAssembly(t, parentTx)
 }

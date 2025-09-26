@@ -314,14 +314,20 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 
 				bestBlockchainBlockHeader, meta, err = b.blockchainClient.GetBestBlockHeader(ctx)
 				if err != nil {
-					b.logger.Errorf("[BlockAssembler][Reset] error getting best block header: %v", err)
-					if errCh != nil {
-						errCh <- errors.NewProcessingError("[Reset] error getting best block header: %v", err)
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] error getting best block header: %v", err)
+						if errCh != nil {
+							errCh <- errors.NewProcessingError("[Reset] error getting best block header: %v", err)
+						}
+
+						b.setCurrentRunningState(StateRunning)
+
+						continue
 					}
-
-					b.setCurrentRunningState(StateRunning)
-
-					continue
 				}
 
 				// reset the block assembly
@@ -329,33 +335,51 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 
 				moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
 				if err != nil {
-					b.logger.Errorf("[BlockAssembler][Reset] error getting reorg blocks: %w", err)
-					if errCh != nil {
-						errCh <- errors.NewProcessingError("[Reset] error getting reorg blocks: %v", err)
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] error getting reorg blocks: %w", err)
+						if errCh != nil {
+							errCh <- errors.NewProcessingError("[Reset] error getting reorg blocks: %v", err)
+						}
+
+						b.setCurrentRunningState(StateRunning)
+
+						continue
 					}
-
-					b.setCurrentRunningState(StateRunning)
-
-					continue
 				}
 
 				if len(moveBackBlocksWithMeta) == 0 && len(moveForwardBlocksWithMeta) == 0 {
-					b.logger.Errorf("[BlockAssembler][Reset] no reorg blocks found, invalid reset")
-					if errCh != nil {
-						errCh <- errors.NewProcessingError("[Reset] no reorg blocks found, invalid reset")
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] no reorg blocks found, invalid reset")
+						if errCh != nil {
+							errCh <- errors.NewProcessingError("[Reset] no reorg blocks found, invalid reset")
+						}
+
+						b.setCurrentRunningState(StateRunning)
+
+						continue
 					}
-
-					b.setCurrentRunningState(StateRunning)
-
-					continue
 				}
 
 				isLegacySync, err := b.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateLEGACYSYNCING)
 				if err != nil {
-					b.logger.Errorf("[BlockAssembler][Reset] error getting FSM state: %v", err)
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] error getting FSM state: %v", err)
 
-					// if we can't get the FSM state, we assume we are not in legacy sync, which is the default, but less optimized
-					isLegacySync = false
+						// if we can't get the FSM state, we assume we are not in legacy sync, which is the default, but less optimized
+						isLegacySync = false
+					}
 				}
 
 				currentHeight := meta.Height
@@ -373,54 +397,85 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 				b.logger.Warnf("[BlockAssembler][Reset] resetting to new best block header: %d", meta.Height)
 
 				if response := b.subtreeProcessor.Reset(b.bestBlockHeader.Load(), moveBackBlocks, moveForwardBlocks, isLegacySync); response.Err != nil {
-					b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", response.Err)
-					// something went wrong, we need to set the best block header in the block assembly to be the
-					// same as the subtree processor's best block header
-					bestBlockchainBlockHeader = b.subtreeProcessor.GetCurrentBlockHeader()
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", response.Err)
+						// something went wrong, we need to set the best block header in the block assembly to be the
+						// same as the subtree processor's best block header
+						bestBlockchainBlockHeader = b.subtreeProcessor.GetCurrentBlockHeader()
 
-					_, bestBlockchainBlockHeaderMeta, err := b.blockchainClient.GetBlockHeader(ctx, bestBlockchainBlockHeader.Hash())
-					if err != nil {
-						b.logger.Errorf("[BlockAssembler][Reset] error getting best block header meta: %v", err)
-						if errCh != nil {
-							errCh <- errors.NewProcessingError("[Reset] error getting best block header meta: %v", err)
+						var bestBlockchainBlockHeaderMeta *model.BlockHeaderMeta
+						_, bestBlockchainBlockHeaderMeta, err = b.blockchainClient.GetBlockHeader(ctx, bestBlockchainBlockHeader.Hash())
+						if err != nil {
+							// Check if context is cancelled to avoid logging after test completion
+							select {
+							case <-ctx.Done():
+								return
+							default:
+								b.logger.Errorf("[BlockAssembler][Reset] error getting best block header meta: %v", err)
+								if errCh != nil {
+									errCh <- errors.NewProcessingError("[Reset] error getting best block header meta: %v", err)
+								}
+
+								b.setCurrentRunningState(StateRunning)
+
+								continue
+							}
 						}
 
-						b.setCurrentRunningState(StateRunning)
-
-						continue
+						// set the new height based on the best block header from the subtree processor
+						currentHeight = bestBlockchainBlockHeaderMeta.Height
 					}
-
-					// set the new height based on the best block header from the subtree processor
-					currentHeight = bestBlockchainBlockHeaderMeta.Height
 				}
 
 				// make sure we have processed all pending blocks before loading unmined transactions
 				if err = b.waitForPendingBlocks(ctx); err != nil {
-					b.logger.Errorf("[BlockAssembler][Reset] error waiting for pending blocks: %v", err)
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] error waiting for pending blocks: %v", err)
 
-					if errCh != nil {
-						errCh <- errors.NewProcessingError("[Reset] error waiting for pending blocks: %v", err)
-						continue
+						if errCh != nil {
+							errCh <- errors.NewProcessingError("[Reset] error waiting for pending blocks: %v", err)
+							continue
+						}
 					}
 				}
 
 				// reload the unmined transactions
 				if err = b.loadUnminedTransactions(ctx); err != nil {
-					b.logger.Errorf("[BlockAssembler][Reset] error loading unmined transactions: %v", err)
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] error loading unmined transactions: %v", err)
 
-					if errCh != nil {
-						errCh <- errors.NewStorageError("[Reset] error loading unmined transactions: %v", err)
-						continue
+						if errCh != nil {
+							errCh <- errors.NewStorageError("[Reset] error loading unmined transactions: %v", err)
+							continue
+						}
 					}
 				}
 
 				b.setBestBlockHeader(bestBlockchainBlockHeader, currentHeight)
 
 				if err = b.SetState(ctx); err != nil {
-					b.logger.Errorf("[BlockAssembler][Reset] error setting state: %v", err)
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] error setting state: %v", err)
 
-					if errCh != nil {
-						errCh <- errors.NewProcessingError("[Reset] error setting state: %v", err)
+						if errCh != nil {
+							errCh <- errors.NewProcessingError("[Reset] error setting state: %v", err)
+						}
 					}
 				}
 
@@ -431,11 +486,17 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 
 				resetWaitTimeInt32, err := safeconversion.Int64ToInt32(time.Now().Add(b.settings.BlockAssembly.ResetWaitDuration).Unix())
 				if err != nil {
-					b.logger.Errorf("[BlockAssembler][Reset] error converting reset wait time: %v", err)
+					// Check if context is cancelled to avoid logging after test completion
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						b.logger.Errorf("[BlockAssembler][Reset] error converting reset wait time: %v", err)
 
-					if errCh != nil {
-						errCh <- errors.NewProcessingError("[Reset] error converting reset wait time: %v", err)
-						continue
+						if errCh != nil {
+							errCh <- errors.NewProcessingError("[Reset] error converting reset wait time: %v", err)
+							continue
+						}
 					}
 				}
 

@@ -148,7 +148,8 @@ install-tools:
 # make test will run all tests in the project except for the ones in the test directory
 .PHONY: test
 test:
-	set -o pipefail && go list ./... | grep -v github.com/bitcoin-sv/teranode/test/ | SETTINGS_CONTEXT=test xargs go test -v -race -tags "testtxmetacache" -count=1 -timeout=10m -coverprofile=coverage.out 2>&1 | grep -v "ld: warning:"
+	@mkdir -p /tmp/teranode-test-results
+	set -o pipefail && go list ./... | grep -v github.com/bitcoin-sv/teranode/test/ | SETTINGS_CONTEXT=test xargs go test -v -race -tags "testtxmetacache" -count=1 -timeout=10m -coverprofile=coverage.out 2>&1 | tee /tmp/teranode-test-results/test-results.txt | grep -v "ld: warning:"
 
 # run tests in the test/longtest directory
 .PHONY: longtest
@@ -158,7 +159,8 @@ longtest:
 # run tests in the test/sequentialtest directory in order, one by one
 .PHONY: sequentialtest
 sequentialtest:
-	logLevel=INFO test/scripts/run_tests_sequentially.sh
+	@mkdir -p /tmp/teranode-test-results
+	logLevel=INFO test/scripts/run_tests_sequentially.sh 2>&1 | tee /tmp/teranode-test-results/sequentialtest-results.txt
 
 .PHONY: testall
 testall: test longtest sequentialtest
@@ -166,8 +168,9 @@ testall: test longtest sequentialtest
 # run tests in the test/e2e/daemon directory
 .PHONY: smoketest
 smoketest:
-	# cd test/e2e/daemon && go test -race -tags "testtxmetacache" -count=1 -timeout=5m -parallel 1 -coverprofile=coverage.out ./test/e2e/daemon/ready/... 2>&1 | grep -v "ld: warning:" 
-	cd test/e2e/daemon/ready && SETTINGS_CONTEXT=$(or $(settings_context),$(SETTINGS_CONTEXT_DEFAULT)) go test -v -count=1 -race -timeout=5m -parallel 1 -run .
+	@mkdir -p /tmp/teranode-test-results
+	# cd test/e2e/daemon && go test -race -tags "testtxmetacache" -count=1 -timeout=5m -parallel 1 -coverprofile=coverage.out ./test/e2e/daemon/ready/... 2>&1 | grep -v "ld: warning:"
+	cd test/e2e/daemon/ready && SETTINGS_CONTEXT=$(or $(settings_context),$(SETTINGS_CONTEXT_DEFAULT)) go test -v -count=1 -race -timeout=5m -parallel 1 -run . 2>&1 | tee /tmp/teranode-test-results/smoketest-results.txt
 
 
 .PHONY: nightly-tests
