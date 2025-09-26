@@ -11,16 +11,16 @@
       
       
       
-      <link rel="icon" href="../../../topics/architecture/img/bsvblockchain_blue_logo.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.7">
+      <link rel="icon" href="../topics/architecture/img/bsvblockchain_blue_logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.14">
     
     
       
-        <title>RunbookNotes - Teranode</title>
+        <title>P2P NAT Traversal and Address Filtering - Teranode</title>
       
     
     
-      <link rel="stylesheet" href="../../../assets/stylesheets/main.8608ea7d.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.342714a4.min.css">
       
       
 
@@ -34,14 +34,14 @@
         
         
         
-        <link rel="stylesheet" href="../../../assets/external/fonts.googleapis.com/css.49ea35f2.css">
+        <link rel="stylesheet" href="../assets/external/fonts.googleapis.com/css.49ea35f2.css">
         <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
       
     
     
-      <link rel="stylesheet" href="../../../overrides/custom.css">
+      <link rel="stylesheet" href="../overrides/custom.css">
     
-    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -60,7 +60,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#load-k8s-shortcuts" class="md-skip">
+        <a href="#p2p-nat-traversal-and-address-filtering" class="md-skip">
           Skip to content
         </a>
       
@@ -76,9 +76,9 @@
 
 <header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+    <a href=".." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
       
-  <img src="../../../topics/architecture/img/bsvblockchain_logo.svg" alt="logo">
+  <img src="../topics/architecture/img/bsvblockchain_logo.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -95,7 +95,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              RunbookNotes
+              P2P NAT Traversal and Address Filtering
             
           </span>
         </div>
@@ -107,11 +107,13 @@
     
     
     
-      <label class="md-header__button md-icon" for="__search">
-        
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
-      </label>
-      <div class="md-search" data-md-component="search" role="dialog">
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
   <label class="md-search__overlay" for="__search"></label>
   <div class="md-search__inner" role="search">
     <form class="md-search__form" name="search">
@@ -145,6 +147,7 @@
     </div>
   </div>
 </div>
+      
     
     
   </nav>
@@ -159,9 +162,11 @@
   
   
   
+  
     <li class="md-tabs__item">
-      <a href="../../.." class="md-tabs__link">
+      <a href=".." class="md-tabs__link">
         
+  
   
     
   
@@ -176,11 +181,13 @@
   
   
   
+  
     
     
       <li class="md-tabs__item">
-        <a href="../../../tutorials/developers/developerSetup/" class="md-tabs__link">
+        <a href="../tutorials/developers/developerSetup/" class="md-tabs__link">
           
+  
   
   Tutorials
 
@@ -194,11 +201,13 @@
   
   
   
+  
     
     
       <li class="md-tabs__item">
-        <a href="../../../howto/locallyRunningServices/" class="md-tabs__link">
+        <a href="../howto/locallyRunningServices/" class="md-tabs__link">
           
+  
   
   How-To Guides
 
@@ -212,11 +221,13 @@
   
   
   
+  
     
     
       <li class="md-tabs__item">
-        <a href="../../../topics/teranodeIntro/" class="md-tabs__link">
+        <a href="../topics/teranodeIntro/" class="md-tabs__link">
           
+  
   
   Key Topics
 
@@ -230,11 +241,13 @@
   
   
   
+  
     
     
       <li class="md-tabs__item">
-        <a href="../../../references/projectStructure/" class="md-tabs__link">
+        <a href="../references/projectStructure/" class="md-tabs__link">
           
+  
   
   Reference
 
@@ -272,9 +285,9 @@
 
 <nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+    <a href=".." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
       
-  <img src="../../../topics/architecture/img/bsvblockchain_logo.svg" alt="logo">
+  <img src="../topics/architecture/img/bsvblockchain_logo.svg" alt="logo">
 
     </a>
     Teranode
@@ -289,8 +302,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../.." class="md-nav__link">
+      <a href=".." class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Home
@@ -312,6 +326,7 @@
     
     
     
+    
       
       
         
@@ -329,6 +344,7 @@
           
           <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Tutorials
@@ -353,8 +369,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../tutorials/developers/developerSetup/" class="md-nav__link">
+      <a href="../tutorials/developers/developerSetup/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Developer Setup
@@ -375,8 +392,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../tutorials/miners/minersGettingStarted/" class="md-nav__link">
+      <a href="../tutorials/miners/minersGettingStarted/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Miners Getting Started
@@ -406,6 +424,7 @@
     
     
     
+    
       
       
         
@@ -423,6 +442,7 @@
           
           <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     How-To Guides
@@ -447,8 +467,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/locallyRunningServices/" class="md-nav__link">
+      <a href="../howto/locallyRunningServices/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Running Services Locally
@@ -469,8 +490,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
+      <a href="../howto/howToRemoteDebugTeranode/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Debugging Teranode
@@ -491,8 +513,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/generatingProtobuf/" class="md-nav__link">
+      <a href="../howto/generatingProtobuf/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Generating Protobuf
@@ -513,8 +536,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/addingNewProtobufServices/" class="md-nav__link">
+      <a href="../howto/addingNewProtobufServices/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Adding Protobuf
@@ -535,8 +559,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/configuringGrpcLogging/" class="md-nav__link">
+      <a href="../howto/configuringGrpcLogging/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Configuring gRPC Logging
@@ -557,8 +582,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/runningTests/" class="md-nav__link">
+      <a href="../howto/runningTests/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Running Tests
@@ -579,8 +605,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/automatedTestingHowTo/" class="md-nav__link">
+      <a href="../howto/automatedTestingHowTo/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Automated Testing
@@ -601,8 +628,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/makefile/" class="md-nav__link">
+      <a href="../howto/makefile/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Makefile Guide
@@ -623,8 +651,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/bugReporting/" class="md-nav__link">
+      <a href="../howto/bugReporting/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Bug Reporting
@@ -645,8 +674,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
+      <a href="../howto/developersHowToTeranodeCLI/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Developer's Guide to Teranode-CLI
@@ -669,6 +699,7 @@
     
     
     
+    
       
       
         
@@ -686,6 +717,7 @@
           
           <label class="md-nav__link" for="__nav_3_11" id="__nav_3_11_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Miners
@@ -709,28 +741,7 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../../../howto/miners/howToUseTheTestMiner.md" class="md-nav__link">
-        
-  
-  <span class="md-ellipsis">
-    Using Test Miner
     
-  </span>
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
     
     
     
@@ -746,11 +757,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_2" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_1" >
         
           
-          <label class="md-nav__link" for="__nav_3_11_2" id="__nav_3_11_2_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_3_11_1" id="__nav_3_11_1_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Installation
@@ -761,8 +773,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_2_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_3_11_2">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_1">
             <span class="md-nav__icon md-icon"></span>
             Installation
           </label>
@@ -775,8 +787,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
+      <a href="../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Docker
@@ -797,8 +810,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
+      <a href="../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Kubernetes
@@ -819,8 +833,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToInstallationDeprecated/" class="md-nav__link">
+      <a href="../howto/miners/kubernetes/minersHowToInstallationDeprecated/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Deprecated
@@ -851,6 +866,7 @@
     
     
     
+    
       
       
         
@@ -863,11 +879,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_3" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_2" >
         
           
-          <label class="md-nav__link" for="__nav_3_11_3" id="__nav_3_11_3_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_3_11_2" id="__nav_3_11_2_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Configuration
@@ -878,8 +895,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_3_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_3_11_3">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_2">
             <span class="md-nav__icon md-icon"></span>
             Configuration
           </label>
@@ -892,8 +909,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
+      <a href="../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Docker
@@ -914,8 +932,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+      <a href="../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Kubernetes
@@ -936,8 +955,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Aerospike Tuning
@@ -958,8 +978,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Asset Server Interaction
@@ -980,8 +1001,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     FSM Interaction
@@ -1002,8 +1024,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     RPC Server Interaction
@@ -1034,6 +1057,7 @@
     
     
     
+    
       
       
         
@@ -1046,11 +1070,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_4" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_3" >
         
           
-          <label class="md-nav__link" for="__nav_3_11_4" id="__nav_3_11_4_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_3_11_3" id="__nav_3_11_3_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Start/Stop
@@ -1061,8 +1086,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_4_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_3_11_4">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_3">
             <span class="md-nav__icon md-icon"></span>
             Start/Stop
           </label>
@@ -1075,8 +1100,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
+      <a href="../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Docker
@@ -1097,8 +1123,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+      <a href="../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Kubernetes
@@ -1126,6 +1153,106 @@
   
   
   
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_11_4" id="__nav_3_11_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Updating Teranode
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_4">
+            <span class="md-nav__icon md-icon"></span>
+            Updating Teranode
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Docker
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Kubernetes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
     
     
     
@@ -1147,8 +1274,9 @@
           <label class="md-nav__link" for="__nav_3_11_5" id="__nav_3_11_5_label" tabindex="0">
             
   
+  
   <span class="md-ellipsis">
-    Updating Teranode
+    Security Best Practices
     
   </span>
   
@@ -1159,7 +1287,7 @@
         <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_5_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_3_11_5">
             <span class="md-nav__icon md-icon"></span>
-            Updating Teranode
+            Security Best Practices
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
@@ -1170,8 +1298,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+      <a href="../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Docker
@@ -1192,8 +1321,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+      <a href="../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Kubernetes
@@ -1221,6 +1351,7 @@
   
   
   
+    
     
     
     
@@ -1242,8 +1373,9 @@
           <label class="md-nav__link" for="__nav_3_11_6" id="__nav_3_11_6_label" tabindex="0">
             
   
+  
   <span class="md-ellipsis">
-    Security Best Practices
+    Troubleshooting
     
   </span>
   
@@ -1254,7 +1386,7 @@
         <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_6_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_3_11_6">
             <span class="md-nav__icon md-icon"></span>
-            Security Best Practices
+            Troubleshooting
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
@@ -1265,8 +1397,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
+      <a href="../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Docker
@@ -1287,8 +1420,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+      <a href="../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Kubernetes
@@ -1316,6 +1450,7 @@
   
   
   
+    
     
     
     
@@ -1337,100 +1472,6 @@
           <label class="md-nav__link" for="__nav_3_11_7" id="__nav_3_11_7_label" tabindex="0">
             
   
-  <span class="md-ellipsis">
-    Troubleshooting
-    
-  </span>
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_7_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_3_11_7">
-            <span class="md-nav__icon md-icon"></span>
-            Troubleshooting
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
-        
-  
-  <span class="md-ellipsis">
-    Docker
-    
-  </span>
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
-        
-  
-  <span class="md-ellipsis">
-    Kubernetes
-    
-  </span>
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-          
-        
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3_11_8" >
-        
-          
-          <label class="md-nav__link" for="__nav_3_11_8" id="__nav_3_11_8_label" tabindex="0">
-            
   
   <span class="md-ellipsis">
     Additional
@@ -1441,8 +1482,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_8_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_3_11_8">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_3_11_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_11_7">
             <span class="md-nav__icon md-icon"></span>
             Additional
           </label>
@@ -1455,8 +1496,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     CPU Mining Setup
@@ -1477,8 +1519,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToResetTeranode/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToResetTeranode/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Reset Teranode
@@ -1499,8 +1542,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToSyncTheNode/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToSyncTheNode/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Sync the Node
@@ -1521,8 +1565,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Teranode CLI
@@ -1543,8 +1588,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
+      <a href="../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Managing Disk Space
@@ -1565,8 +1611,32 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToBackup/" class="md-nav__link">
+      <a href="../howto/miners/minersHowToUseListenMode/" class="md-nav__link">
         
+  
+  
+  <span class="md-ellipsis">
+    Using Listen Mode
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../howto/miners/kubernetes/minersHowToBackup/" class="md-nav__link">
+        
+  
   
   <span class="md-ellipsis">
     Backup (Kubernetes)
@@ -1612,6 +1682,7 @@
     
     
     
+    
       
       
         
@@ -1629,6 +1700,7 @@
           
           <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Key Topics
@@ -1653,8 +1725,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/teranodeIntro/" class="md-nav__link">
+      <a href="../topics/teranodeIntro/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Teranode Introduction
@@ -1675,8 +1748,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/architecture/teranode-overall-system-design/" class="md-nav__link">
+      <a href="../topics/architecture/teranode-overall-system-design/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Architecture Overview
@@ -1697,8 +1771,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/architecture/teranode-architecture-brief/" class="md-nav__link">
+      <a href="../topics/architecture/teranode-architecture-brief/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Architecture Brief
@@ -1719,8 +1794,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/architecture/teranode-microservices-overview/" class="md-nav__link">
+      <a href="../topics/architecture/teranode-microservices-overview/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Microservices Overview
@@ -1741,8 +1817,32 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/architecture/stateManagement/" class="md-nav__link">
+      <a href="../topics/transactionLifecycle/" class="md-nav__link">
         
+  
+  
+  <span class="md-ellipsis">
+    Transaction Lifecycle
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../topics/architecture/stateManagement/" class="md-nav__link">
+        
+  
   
   <span class="md-ellipsis">
     State Management
@@ -1763,8 +1863,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/architecture/understandingDoubleSpends/" class="md-nav__link">
+      <a href="../topics/architecture/understandingDoubleSpends/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Understanding Double Spends
@@ -1785,8 +1886,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/technologyStack/" class="md-nav__link">
+      <a href="../topics/technologyStack/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Technology Stack
@@ -1807,8 +1909,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/understandingTheTestingFramework/" class="md-nav__link">
+      <a href="../topics/understandingTheTestingFramework/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Understanding the Testing Framework
@@ -1829,8 +1932,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/functionalRequirementTests/" class="md-nav__link">
+      <a href="../topics/functionalRequirementTests/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Functional Requirement Tests
@@ -1853,6 +1957,7 @@
     
     
     
+    
       
       
         
@@ -1865,11 +1970,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_10" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_11" >
         
           
-          <label class="md-nav__link" for="__nav_4_10" id="__nav_4_10_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_11" id="__nav_4_11_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Features
@@ -1880,8 +1986,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_10_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_10">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_11">
             <span class="md-nav__icon md-icon"></span>
             Features
           </label>
@@ -1894,8 +2000,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/features/two_phase_commit/" class="md-nav__link">
+      <a href="../topics/features/two_phase_commit/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Two Phase Commit
@@ -1926,6 +2033,7 @@
     
     
     
+    
       
       
         
@@ -1938,11 +2046,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_11" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_12" >
         
           
-          <label class="md-nav__link" for="__nav_4_11" id="__nav_4_11_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_12" id="__nav_4_12_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Core Services
@@ -1953,8 +2062,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_11_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_11">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_12_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_12">
             <span class="md-nav__icon md-icon"></span>
             Core Services
           </label>
@@ -1967,8 +2076,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/alert/" class="md-nav__link">
+      <a href="../topics/services/alert/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Alert Service
@@ -1989,8 +2099,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/assetServer/" class="md-nav__link">
+      <a href="../topics/services/assetServer/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Asset Server
@@ -2011,8 +2122,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/blockAssembly/" class="md-nav__link">
+      <a href="../topics/services/blockAssembly/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Assembly
@@ -2033,8 +2145,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/blockValidation/" class="md-nav__link">
+      <a href="../topics/services/blockValidation/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Validation
@@ -2055,8 +2168,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/blockchain/" class="md-nav__link">
+      <a href="../topics/services/blockchain/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Blockchain
@@ -2077,8 +2191,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/propagation/" class="md-nav__link">
+      <a href="../topics/services/propagation/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Propagation
@@ -2099,8 +2214,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/subtreeValidation/" class="md-nav__link">
+      <a href="../topics/services/subtreeValidation/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Subtree Validation
@@ -2121,8 +2237,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/validator/" class="md-nav__link">
+      <a href="../topics/services/validator/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Validator
@@ -2153,6 +2270,7 @@
     
     
     
+    
       
       
         
@@ -2165,11 +2283,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_12" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_13" >
         
           
-          <label class="md-nav__link" for="__nav_4_12" id="__nav_4_12_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_13" id="__nav_4_13_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Overlay Services
@@ -2180,8 +2299,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_12_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_12">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_13">
             <span class="md-nav__icon md-icon"></span>
             Overlay Services
           </label>
@@ -2194,8 +2313,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/blockPersister/" class="md-nav__link">
+      <a href="../topics/services/blockPersister/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Persister
@@ -2216,8 +2336,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/p2p/" class="md-nav__link">
+      <a href="../topics/services/p2p/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     P2P
@@ -2238,8 +2359,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/legacy/" class="md-nav__link">
+      <a href="../topics/services/legacy/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Legacy
@@ -2260,8 +2382,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/rpc/" class="md-nav__link">
+      <a href="../topics/services/rpc/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     RPC
@@ -2282,8 +2405,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/services/utxoPersister/" class="md-nav__link">
+      <a href="../topics/services/utxoPersister/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     UTXO Persister
@@ -2314,6 +2438,7 @@
     
     
     
+    
       
       
         
@@ -2326,11 +2451,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_13" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_14" >
         
           
-          <label class="md-nav__link" for="__nav_4_13" id="__nav_4_13_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Stores
@@ -2341,8 +2467,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_13_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_13">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_14">
             <span class="md-nav__icon md-icon"></span>
             Stores
           </label>
@@ -2355,8 +2481,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/stores/blob/" class="md-nav__link">
+      <a href="../topics/stores/blob/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Blob Store
@@ -2377,8 +2504,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/stores/utxo/" class="md-nav__link">
+      <a href="../topics/stores/utxo/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     UTXO Store
@@ -2409,6 +2537,7 @@
     
     
     
+    
       
       
         
@@ -2421,11 +2550,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_14" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_15" >
         
           
-          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Data Model
@@ -2436,8 +2566,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_14">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_15">
             <span class="md-nav__icon md-icon"></span>
             Data Model
           </label>
@@ -2450,8 +2580,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/datamodel/block_data_model/" class="md-nav__link">
+      <a href="../topics/datamodel/block_data_model/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Data Model
@@ -2472,8 +2603,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/datamodel/block_header_data_model/" class="md-nav__link">
+      <a href="../topics/datamodel/block_header_data_model/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Header Model
@@ -2494,8 +2626,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/datamodel/subtree_data_model/" class="md-nav__link">
+      <a href="../topics/datamodel/subtree_data_model/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Subtree Data Model
@@ -2516,8 +2649,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/datamodel/transaction_data_model/" class="md-nav__link">
+      <a href="../topics/datamodel/transaction_data_model/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Transaction Data Model
@@ -2538,8 +2672,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/datamodel/utxo_data_model/" class="md-nav__link">
+      <a href="../topics/datamodel/utxo_data_model/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     UTXO Data Model
@@ -2570,6 +2705,7 @@
     
     
     
+    
       
       
         
@@ -2582,11 +2718,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_15" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
         
           
-          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Kafka
@@ -2597,8 +2734,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_15">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_16">
             <span class="md-nav__icon md-icon"></span>
             Kafka
           </label>
@@ -2611,8 +2748,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/kafka/kafka/" class="md-nav__link">
+      <a href="../topics/kafka/kafka/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Kafka Overview
@@ -2643,6 +2781,7 @@
     
     
     
+    
       
       
         
@@ -2655,11 +2794,12 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_17" >
         
           
-          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_17" id="__nav_4_17_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Commands
@@ -2670,8 +2810,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_16">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_17_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_17">
             <span class="md-nav__icon md-icon"></span>
             Commands
           </label>
@@ -2684,52 +2824,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../topics/commands/chainIntegrity.md" class="md-nav__link">
+      <a href="../topics/commands/seeder/" class="md-nav__link">
         
   
-  <span class="md-ellipsis">
-    Chain Integrity
-    
-  </span>
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../../topics/commands/propagationBlaster.md" class="md-nav__link">
-        
-  
-  <span class="md-ellipsis">
-    Propagation Blaster
-    
-  </span>
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../../topics/commands/seeder/" class="md-nav__link">
-        
   
   <span class="md-ellipsis">
     Seeder
@@ -2743,28 +2840,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../../topics/commands/txBlaster.md" class="md-nav__link">
-        
-  
-  <span class="md-ellipsis">
-    TX Blaster
-    
-  </span>
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -2786,6 +2861,7 @@
   
   
   
+    
     
     
     
@@ -2806,6 +2882,7 @@
           
           <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Reference
@@ -2830,8 +2907,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/projectStructure/" class="md-nav__link">
+      <a href="../references/projectStructure/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Project Structure
@@ -2854,6 +2932,7 @@
     
     
     
+    
       
       
         
@@ -2871,6 +2950,7 @@
           
           <label class="md-nav__link" for="__nav_5_2" id="__nav_5_2_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     API & Protobuf
@@ -2895,8 +2975,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/errorHandling/" class="md-nav__link">
+      <a href="../references/errorHandling/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Error Handling
@@ -2917,8 +2998,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/glossary/" class="md-nav__link">
+      <a href="../references/glossary/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Glossary
@@ -2939,8 +3021,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/codingConventions/" class="md-nav__link">
+      <a href="../references/codingConventions/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Coding Conventions
@@ -2961,8 +3044,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/kafkaMessageFormat/" class="md-nav__link">
+      <a href="../references/kafkaMessageFormat/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Kafka Message Format
@@ -2983,8 +3067,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/networkConsensusRules/" class="md-nav__link">
+      <a href="../references/networkConsensusRules/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Network Consensus Rules
@@ -3007,6 +3092,7 @@
     
     
     
+    
       
       
         
@@ -3024,6 +3110,7 @@
           
           <label class="md-nav__link" for="__nav_5_2_6" id="__nav_5_2_6_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Protobuf API
@@ -3048,8 +3135,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/alertProto/" class="md-nav__link">
+      <a href="../references/protobuf_docs/alertProto/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Alert Proto
@@ -3070,8 +3158,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
+      <a href="../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Assembly Proto
@@ -3092,8 +3181,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
+      <a href="../references/protobuf_docs/blockchainProto/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Blockchain Proto
@@ -3114,8 +3204,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
+      <a href="../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Validation Proto
@@ -3136,8 +3227,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
+      <a href="../references/protobuf_docs/propagationProto/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Propagation Proto
@@ -3158,8 +3250,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+      <a href="../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Subtree Validation Proto
@@ -3180,8 +3273,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
+      <a href="../references/protobuf_docs/validatorProto/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Validator Proto
@@ -3220,6 +3314,7 @@
     
     
     
+    
       
       
         
@@ -3237,6 +3332,7 @@
           
           <label class="md-nav__link" for="__nav_5_3" id="__nav_5_3_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Core Services
@@ -3261,8 +3357,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/alert_reference/" class="md-nav__link">
+      <a href="../references/services/alert_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Alert Service
@@ -3283,8 +3380,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/asset_reference/" class="md-nav__link">
+      <a href="../references/services/asset_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Asset Service
@@ -3305,8 +3403,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockassembly_reference/" class="md-nav__link">
+      <a href="../references/services/blockassembly_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Assembly
@@ -3327,8 +3426,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockvalidation_reference/" class="md-nav__link">
+      <a href="../references/services/blockvalidation_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Validation
@@ -3349,8 +3449,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockchain_reference/" class="md-nav__link">
+      <a href="../references/services/blockchain_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Blockchain
@@ -3371,8 +3472,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/propagation_reference/" class="md-nav__link">
+      <a href="../references/services/propagation_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Propagation
@@ -3393,8 +3495,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/subtreevalidation_reference/" class="md-nav__link">
+      <a href="../references/services/subtreevalidation_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Subtree Validation
@@ -3415,8 +3518,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/validator_reference/" class="md-nav__link">
+      <a href="../references/services/validator_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Validator
@@ -3447,6 +3551,7 @@
     
     
     
+    
       
       
         
@@ -3464,6 +3569,7 @@
           
           <label class="md-nav__link" for="__nav_5_4" id="__nav_5_4_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Overlay Services
@@ -3488,8 +3594,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockpersister_reference/" class="md-nav__link">
+      <a href="../references/services/blockpersister_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Block Persister
@@ -3510,8 +3617,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/p2p_reference/" class="md-nav__link">
+      <a href="../references/services/p2p_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     P2P
@@ -3532,8 +3640,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/legacy_reference/" class="md-nav__link">
+      <a href="../references/services/legacy_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     P2P Legacy Service
@@ -3554,8 +3663,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/rpc_reference/" class="md-nav__link">
+      <a href="../references/services/rpc_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     RPC
@@ -3576,8 +3686,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/utxopersister_reference/" class="md-nav__link">
+      <a href="../references/services/utxopersister_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     UTXO Persister
@@ -3608,6 +3719,7 @@
     
     
     
+    
       
       
         
@@ -3625,6 +3737,7 @@
           
           <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Stores
@@ -3649,8 +3762,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/stores/blob_reference/" class="md-nav__link">
+      <a href="../references/stores/blob_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Blob Store
@@ -3671,8 +3785,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/stores/utxo_reference/" class="md-nav__link">
+      <a href="../references/stores/utxo_reference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     UTXO Store
@@ -3703,6 +3818,7 @@
     
     
     
+    
       
       
         
@@ -3720,6 +3836,7 @@
           
           <label class="md-nav__link" for="__nav_5_6" id="__nav_5_6_label" tabindex="0">
             
+  
   
   <span class="md-ellipsis">
     Miscellaneous
@@ -3744,8 +3861,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
+      <a href="../references/gitCommitSigningSetupGuide/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Git Commit Signing Setup Guide
@@ -3766,8 +3884,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/licenseInformation/" class="md-nav__link">
+      <a href="../references/licenseInformation/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Licensing
@@ -3788,8 +3907,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/prometheusMetrics/" class="md-nav__link">
+      <a href="../references/prometheusMetrics/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Prometheus Metrics
@@ -3810,8 +3930,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/" class="md-nav__link">
+      <a href="../references/settings/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Settings
@@ -3832,8 +3953,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/teranodeDaemonReference/" class="md-nav__link">
+      <a href="../references/teranodeDaemonReference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Teranode Daemon Reference
@@ -3854,8 +3976,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/testingTechnicalReference/" class="md-nav__link">
+      <a href="../references/testingTechnicalReference/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Testing Technical Reference
@@ -3876,8 +3999,9 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
+      <a href="../references/thirdPartySoftwareRequirements/" class="md-nav__link">
         
+  
   
   <span class="md-ellipsis">
     Third-Party Software Requirements
@@ -3926,6 +4050,161 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#problem" class="md-nav__link">
+    <span class="md-ellipsis">
+      Problem
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-libp2p-handles-nat" class="md-nav__link">
+    <span class="md-ellipsis">
+      How libp2p Handles NAT
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#solutions" class="md-nav__link">
+    <span class="md-ellipsis">
+      Solutions
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Solutions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#option-1-enable-autonat-service-recommended-for-nodes-behind-nat" class="md-nav__link">
+    <span class="md-ellipsis">
+      Option 1: Enable AutoNAT Service (Recommended for nodes behind NAT)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#option-2-explicitly-set-advertise-address" class="md-nav__link">
+    <span class="md-ellipsis">
+      Option 2: Explicitly Set Advertise Address
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#option-3-enable-nat-port-mapping" class="md-nav__link">
+    <span class="md-ellipsis">
+      Option 3: Enable NAT Port Mapping
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#option-4-enable-full-nat-traversal-suite" class="md-nav__link">
+    <span class="md-ellipsis">
+      Option 4: Enable Full NAT Traversal Suite
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#option-5-share-private-addresses-development-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      Option 5: Share Private Addresses (Development Only)
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-the-observed-address-mechanism-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      How the Observed Address Mechanism Works
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#debugging" class="md-nav__link">
+    <span class="md-ellipsis">
+      Debugging
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#best-practices" class="md-nav__link">
+    <span class="md-ellipsis">
+      Best Practices
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#implementation-details" class="md-nav__link">
+    <span class="md-ellipsis">
+      Implementation Details
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Implementation Details">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#address-advertisement-vs-filtering" class="md-nav__link">
+    <span class="md-ellipsis">
+      Address Advertisement vs Filtering
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-this-approach-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      Why This Approach Works
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-go-p2p-v1118-issue" class="md-nav__link">
+    <span class="md-ellipsis">
+      The go-p2p v1.1.18 Issue
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -3940,113 +4219,131 @@
 
 
 
-<p>~  $ aws configure
-AWS Access Key ID [None]: ...
-AWS Secret Access Key [None]: ....
-Default region name [None]: eu-north-1
-Default output format [None]:</p>
-<p>~  $ aws eks update-kubeconfig --name aws-teranode-playground --region ap-south-1
-Added new context arn:aws:eks:ap-south-1:434394763103:cluster/aws-teranode-playground to $HOME/.kube/config</p>
-<p>aws eks update-kubeconfig --name aws-teranode-playground --region  eu-west-1
-aws eks update-kubeconfig --name aws-teranode-playground --region  us-east-1
-aws eks update-kubeconfig --name aws-teranode-playground --region  ap-south-1</p>
-<p>this stuff is now under your
-~/.kube  $ vi config
- ~/.kube  $</p>
-<p>brew install kubectl</p>
-<p>kubectl get pod</p>
-<p>Adding under .zprofile:</p>
-<h1 id="load-k8s-shortcuts">Load k8s shortcuts</h1>
-<p>autoload -Uz compinit
-compinit
-source ~/.k8s_shortcuts.sh</p>
-<p>Docker is defined in the Dockerfile. This is what we run in the k8s</p>
-<p>main.go &rarr; os.Args(0) &rarr; run a command.
-We deploy the compiled binary once, they all run the same image. Kubernetes rules below will define what Dockers to run</p>
-<p>(see keti blockassembly-12312321 --bash) &rarr; ls -l &rarr; we have all the runs there.
-The teranode.run &rarr; is the binary that is run in the Docker image. We just have symlinks.</p>
-<hr />
-<p>Settings for M1 and M2 and other envs are in the settings.
-see settings with scaling.M1 suffixes.</p>
-<p>kcn m1 -- this switches me from one to another</p>
-<p>Roles can be seen as
-k get node ### all AWS machines in a given zone (node)
-k get node -L role</p>
-<p>In the CI, we can do:</p>
-<p>kustomize kustomization.yaml ## runs as part of the CI build &rarr; deploy-to-region.yaml
-- running this command - https://capture.dropbox.com/MYdvV14jbXe46Tym - it adds a images block at the end of the kustomization.yaml (during CI) - we do not want to commit this.
-- kustomize build . # populates all of the k8s yaml files and replaces the image and other stuff.</p>
-<p>asset-grpc-ingress.yaml - it shows the ingress (the way to get to the service from the outside world)
-ast-grpc - basically means grpc over port 80</p>
-<p>Host('m.scaling.usbv.dev')</p>
-<p>In the regional k8s folder, we have further kustomization.yaml that further customise per region. For example, it appends an 1 at the end of service  names in the M1 env, 2 in the M2 env, and so on. Also replace the spec names to Host('m1.scaling.usbv.dev') and so on.</p>
-<hr />
-<p>Questions:</p>
-<p>Do services need to be started in any specific order? YES -- see teranode/scripts/k8s/scaling/up.sh</p>
+<h1 id="p2p-nat-traversal-and-address-filtering">P2P NAT Traversal and Address Filtering</h1>
+<h2 id="problem">Problem</h2>
+<p>When a node is behind NAT with only private IP addresses (192.168.x.x, 10.x.x.x, 172.16.x.x), proper address discovery is critical:</p>
+<ol>
+<li>The node only has private IP addresses on its network interfaces</li>
+<li>go-p2p v1.1.18 aggressively filters private IPs when <code>advertiseAddresses</code> is empty</li>
+<li>This filtering prevents libp2p's observed address mechanism from working</li>
+<li>Nodes end up invisible to the network</li>
+</ol>
+<h2 id="how-libp2p-handles-nat">How libp2p Handles NAT</h2>
+<p>libp2p has several mechanisms for NAT traversal:</p>
+<ol>
+<li>
+<p><strong>Identify Protocol</strong>: When a peer connects to you, it tells you what address it sees you coming from. This "observed address" is your public IP as seen from the outside.</p>
+</li>
+<li>
+<p><strong>AutoNAT Service</strong>: Peers help each other determine if they are behind NAT and what their external address is.</p>
+</li>
+<li>
+<p><strong>UPnP/NAT-PMP</strong>: Automatically configures port forwarding on compatible routers.</p>
+</li>
+<li>
+<p><strong>Hole Punching (DCUtR)</strong>: Direct Connection Upgrade through Relay - allows peers behind NAT to establish direct connections.</p>
+</li>
+<li>
+<p><strong>Circuit Relay</strong>: Use other peers as relays when direct connection is not possible.</p>
+</li>
+</ol>
+<h2 id="solutions">Solutions</h2>
+<h3 id="option-1-enable-autonat-service-recommended-for-nodes-behind-nat">Option 1: Enable AutoNAT Service (Recommended for nodes behind NAT)</h3>
+<div class="highlight"><pre><span></span><code># In settings_local.conf
+p2p_enable_nat_service = true
+</code></pre></div>
+<p>This enables libp2p's AutoNAT service which:</p>
 <ul>
-<li>Blockchain server</li>
-<li>asset</li>
-<li>etc</li>
+<li>Helps determine your external address</li>
+<li>Allows the node to learn its public IP from other peers</li>
+<li>Automatically adds observed addresses to the advertised list</li>
 </ul>
-<p>Most critical appears to be the Blockchain Server.</p>
-<p>Block Assembly Service - if it restarts, it loses all transactions in memory.</p>
-<p>Interesting to test the stuff Sukhendu is doing:
-docker-compose up postgres
-docker-compose-ci-distributed.yaml teranode-1 (starts one of hte services)</p>
-<hr />
-<p>Simon - How do I change settings locally?</p>
-<p>ked block-assembly-213131 -- vi block-assembly.run (name might not be exact)</p>
-<p>after saving it &rarr; Kubernetes restarts the service automatically</p>
-<hr />
-<p>autoload -Uz compinit
-compinit
-source ~/.k8s_shortcuts.sh</p>
-<p>alias m1='kubectl config use-context arn:aws:eks:eu-west-1:434394763103:cluster/aws-teranode-playground; kcn m1'</p>
-<p>alias m2='kubectl config use-context arn:aws:eks:us-east-1:434394763103:cluster/aws-teranode-playground; kcn m2'</p>
-<p>alias m3='kubectl config use-context arn:aws:eks:ap-south-1:434394763103:cluster/aws-teranode-playground; kcn m3'</p>
-<hr />
-<p>kgp --- see all current services running in a given node (Kubernetes running Docker nodes)</p>
-<hr />
-<p>How to reset a service that isn.t working properly</p>
-<p>k delete pod -n [namespace] --all</p>
-<p>in each even</p>
-<p>then same for p2p service in m1 and m2</p>
-<p>k delete pod p2p1…</p>
-<hr />
-<p>kpg -n traefik</p>
-<hr />
-<p>kgpa - lists all services</p>
-<p>kubectl top pods</p>
-<p>or periodically
-watch -3 kubectl top pods</p>
-<p>start coinbase in M1 and M2</p>
-<p>ksd coinbase1 --replicas=1 (run in each server)</p>
-<hr />
-<p>start miner in M2</p>
-<p>ksd miner2 --replicas=1</p>
-<hr />
-<p>ksd propagation1 --replicas=13</p>
-<hr />
-<p>ksd tx-blaster1 --replicas=11 # should be run in M1 only</p>
-<hr />
-<p>k get node -L role | grep prop | wc -l ### check number of instances of a service in a node</p>
-<hr />
-<p>kl tx-blaster1-xxxxxx (whatever name appears in the kgp command)</p>
-<hr />
-<p>keti blockassembly1-234234-kpkvr ---bash
-mount</p>
-<hr />
-<p>k get pv ### shows persistent storage
-        &rarr; CLAIM label&rarr; m1/lustre-pv
-k describe pvc subtree-lustre-pv</p>
-<p>asset.yaml &rarr; lustre is in there.</p>
-<hr />
-<p>Forward asset server to my localhost</p>
-<p>export KUBECONFIG=~/.kube/config-m1</p>
-<p>kubectl port-forward asset1-63453452352-23452:8090:8090</p>
-<p>(remember ports are defined in the settings local file)</p>
-<hr />
-<p>Grafana stuff - it can be linked here for a way to check stuff out</p>
+<h3 id="option-2-explicitly-set-advertise-address">Option 2: Explicitly Set Advertise Address</h3>
+<p>If you know your public IP or domain:</p>
+<div class="highlight"><pre><span></span><code># In settings_local.conf
+p2p_advertise_addresses = [&quot;/ip4/203.0.113.1/tcp/9905&quot;]
+</code></pre></div>
+<p>This is ideal for:</p>
+<ul>
+<li>Nodes with static public IPs</li>
+<li>Kubernetes deployments with known ingress IPs</li>
+<li>Nodes behind reverse proxies</li>
+</ul>
+<h3 id="option-3-enable-nat-port-mapping">Option 3: Enable NAT Port Mapping</h3>
+<p>For routers that support UPnP or NAT-PMP:</p>
+<div class="highlight"><pre><span></span><code># In settings_local.conf
+p2p_enable_nat_port_map = true
+</code></pre></div>
+<h3 id="option-4-enable-full-nat-traversal-suite">Option 4: Enable Full NAT Traversal Suite</h3>
+<p>For maximum connectivity in challenging network environments:</p>
+<div class="highlight"><pre><span></span><code># In settings_local.conf
+p2p_enable_nat_service = true
+p2p_enable_nat_port_map = true
+p2p_enable_hole_punching = true
+p2p_enable_relay = true
+</code></pre></div>
+<h3 id="option-5-share-private-addresses-development-only">Option 5: Share Private Addresses (Development Only)</h3>
+<p>For local development or private networks:</p>
+<div class="highlight"><pre><span></span><code># In settings_local.conf
+p2p_share_private_addresses = true
+</code></pre></div>
+<p>⚠️ <strong>Warning</strong>: Only use this in controlled environments where peers can actually reach private IPs.</p>
+<h2 id="how-the-observed-address-mechanism-works">How the Observed Address Mechanism Works</h2>
+<ol>
+<li>Node A (behind NAT) connects outbound to Node B</li>
+<li>Node B sees the connection coming from Node A's public IP (e.g., 203.0.113.1:45678)</li>
+<li>Node B tells Node A: "I see you at 203.0.113.1:45678" via the Identify protocol</li>
+<li>Node A adds this "observed address" to its list of advertised addresses</li>
+<li>Node A can now tell other peers: "You can reach me at 203.0.113.1:45678"</li>
+<li>Other peers can now connect to Node A using this address</li>
+</ol>
+<h2 id="debugging">Debugging</h2>
+<p>To debug NAT traversal issues:</p>
+<ol>
+<li>Check the logs for warnings about unreachable nodes:</li>
+</ol>
+<div class="highlight"><pre><span></span><code>grep<span class="w"> </span><span class="s2">&quot;No peers connected\|NAT\|observed\|advertise&quot;</span><span class="w"> </span>teranode.log
+</code></pre></div>
+<ol>
+<li>Verify your configuration:</li>
+</ol>
+<div class="highlight"><pre><span></span><code>grep<span class="w"> </span><span class="s2">&quot;p2p_enable_nat\|p2p_advertise&quot;</span><span class="w"> </span>settings_local.conf
+</code></pre></div>
+<ol>
+<li>Test connectivity from another node:</li>
+</ol>
+<div class="highlight"><pre><span></span><code>telnet<span class="w"> </span>&lt;your-public-ip&gt;<span class="w"> </span><span class="m">9905</span>
+</code></pre></div>
+<h2 id="best-practices">Best Practices</h2>
+<ol>
+<li><strong>For Production</strong>: Always set explicit <code>p2p_advertise_addresses</code> with your public IP</li>
+<li><strong>For Cloud/Kubernetes</strong>: Use the load balancer or ingress IP in <code>p2p_advertise_addresses</code></li>
+<li><strong>For Development</strong>: Enable <code>p2p_enable_nat_service</code> for automatic address detection</li>
+<li><strong>For Home Networks</strong>: Enable <code>p2p_enable_nat_port_map</code> if your router supports it</li>
+</ol>
+<h2 id="implementation-details">Implementation Details</h2>
+<h3 id="address-advertisement-vs-filtering">Address Advertisement vs Filtering</h3>
+<p>The solution involves two stages:</p>
+<ol>
+<li><strong>Advertisement Stage</strong>: Nodes advertise their listen addresses (including private IPs) to enable libp2p's observed address detection</li>
+<li><strong>Filtering Stage</strong>: When sharing peer lists via GetPeers, nodes filter out private addresses unless explicitly configured to share them</li>
+</ol>
+<h3 id="why-this-approach-works">Why This Approach Works</h3>
+<ul>
+<li>Nodes behind NAT advertise their private addresses</li>
+<li>When they connect to public nodes, those nodes observe the NAT's public IP</li>
+<li>The public nodes tell the NAT'd node its observed public address via libp2p's Identify protocol</li>
+<li>The NAT'd node can then share this observed public address with other peers</li>
+<li>Private addresses are filtered when sharing peer lists (not when advertising own addresses)</li>
+</ul>
+<h3 id="the-go-p2p-v1118-issue">The go-p2p v1.1.18 Issue</h3>
+<p>The go-p2p library's AddrsFactory aggressively filters private IPs when advertiseAddresses is empty. This prevents the observed address mechanism from working because:</p>
+<ul>
+<li>The node has no addresses to advertise</li>
+<li>Peers can't tell it what public address they observe</li>
+<li>The node remains invisible to the network</li>
+</ul>
+<p>The solution is to always pass listen addresses to override this filtering, allowing the observed address mechanism to function properly.</p>
 
 
 
@@ -4107,12 +4404,14 @@ k describe pvc subtree-lustre-pv</p>
     </div>
     
     
-    <script id="__config" type="application/json">{"base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.f8cc74c7.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
     
-    
-      <script src="../../../assets/javascripts/bundle.c8b220af.min.js"></script>
       
-        <script src="../../../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
+      <script id="__config" type="application/json">{"base": "..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../assets/javascripts/workers/search.d50fe291.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.13a4f30d.min.js"></script>
+      
+        <script src="../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
       
     
   </body>
