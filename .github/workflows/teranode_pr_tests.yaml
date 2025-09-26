@@ -11,7 +11,7 @@ permissions:
 env:
   REPO: teranode
   SETTINGS_CONTEXT_DEFAULT: test
-  GO_VERSION: '1.25.1'
+  GO_VERSION: "1.25.1"
 
 jobs:
   golangci:
@@ -60,6 +60,14 @@ jobs:
           name: coverage-report
           path: coverage.out
           retention-days: 1
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: /tmp/teranode-test-results/test-results.txt
+          retention-days: 2
       # - name: Publish Test Summary Results
       #   if: always()
       #   run: npx github-actions-ctrf ctrf-report.json
@@ -88,6 +96,28 @@ jobs:
         continue-on-error: false
         env:
           settings_context: ${{ env.SETTINGS_CONTEXT_DEFAULT }}
+
+      - name: Run Long tests
+        run: make sequentialtest
+        continue-on-error: false
+        env:
+          settings_context: ${{ env.SETTINGS_CONTEXT_DEFAULT }}
+
+      - name: Upload smoketest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoketest-results
+          path: /tmp/teranode-test-results/smoketest-results.txt
+          retention-days: 2
+
+      - name: Upload sequentialtest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sequentialtest-results
+          path: /tmp/teranode-test-results/sequentialtest-results.txt
+          retention-days: 2
 
   sonarqube:
     name: Sonarqube

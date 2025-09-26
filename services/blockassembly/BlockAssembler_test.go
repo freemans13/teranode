@@ -22,6 +22,7 @@ import (
 	"github.com/bitcoin-sv/teranode/stores/blob/memory"
 	blockchainstore "github.com/bitcoin-sv/teranode/stores/blockchain"
 	utxoStore "github.com/bitcoin-sv/teranode/stores/utxo"
+	utxofields "github.com/bitcoin-sv/teranode/stores/utxo/fields"
 	utxostoresql "github.com/bitcoin-sv/teranode/stores/utxo/sql"
 	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bitcoin-sv/teranode/util"
@@ -1971,4 +1972,101 @@ func (m *MockCleanupService) Start(ctx context.Context) {
 func (m *MockCleanupService) UpdateBlockHeight(height uint32, doneCh ...chan string) error {
 	args := m.Called(height, doneCh)
 	return args.Error(0)
+}
+
+// containsHash is a helper to check if a slice of hashes contains a specific hash
+func containsHash(list []chainhash.Hash, target chainhash.Hash) bool {
+	for _, h := range list {
+		if h.Equal(target) {
+			return true
+		}
+	}
+	return false
+}
+
+// Test reproduces case: mined tx gets reloaded when unmined_since is incorrectly non-NULL
+func TestBlockAssembly_LoadUnminedTransactions_ReseedsMinedTx_WhenUnminedSinceNotCleared(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	items := setupBlockAssemblyTest(t)
+	require.NotNil(t, items)
+
+	// Create a test tx and insert into UTXO store as unmined initially (unmined_since set)
+	tx := newTx(42)
+	txHash := tx.TxIDChainHash()
+	_, err := items.utxoStore.Create(ctx, tx, 0) // blockHeight=0 -> unmined_since set to 0
+	require.NoError(t, err)
+
+	// Mark as mined on longest chain (this should clear unmined_since)
+	_, err = items.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, utxoStore.MinedBlockInfo{
+		BlockID:        1,
+		BlockHeight:    1,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
+	// Sanity check: metadata shows tx has at least one block ID (mined)
+	meta, err := items.utxoStore.Get(ctx, txHash, utxofields.BlockIDs)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(meta.BlockIDs), 1, "tx should be recorded as mined")
+
+	// BUG SIMULATION: incorrectly set unmined_since back to a non-null value
+	// This mimics a race or bad chain state where mined tx is treated as unmined
+	require.NoError(t, items.utxoStore.SetBlockHeight(2))
+	require.NoError(t, items.utxoStore.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*txHash}, false))
+
+	// Now force the assembler to reload unmined transactions
+	err = items.blockAssembler.loadUnminedTransactions(ctx)
+	require.NoError(t, err)
+
+	// Verify the transaction was (incorrectly) re-added to the assembler
+	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
+	assert.True(t, containsHash(hashes, *txHash),
+		"mined tx with incorrect unmined_since should have been reloaded into assembler")
+}
+
+// Test reproduces reorg corner-case: wrong status flip causes mined tx to be re-added
+func TestBlockAssembly_LoadUnminedTransactions_ReorgCornerCase_MisUnsetMinedStatus(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	items := setupBlockAssemblyTest(t)
+	require.NotNil(t, items)
+
+	// Prepare a mined tx on the main chain
+	tx := newTx(43)
+	txHash := tx.TxIDChainHash()
+	_, err := items.utxoStore.Create(ctx, tx, 0)
+	require.NoError(t, err)
+
+	_, err = items.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, utxoStore.MinedBlockInfo{
+		BlockID:        7,
+		BlockHeight:    7,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
+	// Simulate a reorg handling bug: flip status to not on longest chain (sets unmined_since)
+	require.NoError(t, items.utxoStore.SetBlockHeight(8))
+	// require.NoError(t, items.utxoStore.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*txHash}, false))
+	// Simulate a reorg corner-case bug: mined status incorrectly unset for a tx still on main chain
+	// We directly set unmined_since while leaving block_ids present (same chain)
+	if sqlStore, ok := items.utxoStore.(*utxostoresql.Store); ok {
+		_, err = sqlStore.RawDB().Exec("UPDATE transactions SET unmined_since = ? WHERE hash = ?", 8, txHash[:])
+		require.NoError(t, err)
+	} else {
+		t.Skip("test requires sql store to manipulate unmined_since directly")
+	}
+
+	// Reload unmined transactions as would happen after reset/reorg
+	err = items.blockAssembler.loadUnminedTransactions(ctx)
+	require.NoError(t, err)
+
+	// The mined tx should now be present in the assembler due to the incorrect flip
+	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
+	assert.True(t, containsHash(hashes, *txHash),
+		"tx incorrectly marked not-on-longest should be reloaded into assembler")
 }
