@@ -39,6 +39,7 @@ func (s *SampleService) Health(ctx context.Context, checkLiveness bool) (int, st
 func (s *SampleService) Init(ctx context.Context) error {
 	return nil
 }
+
 // Start starts the service and runs it until the context is cancelled.
 // It implements the Service interface start method.
 // The ready channel is signaled when the service is ready to accept requests.

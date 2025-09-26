@@ -11,15 +11,15 @@ import (
 // for testing Logger wrapper functionality without producing actual log output.
 type MockLogger struct {
 	// DebugCalls records all format strings passed to Debugf calls
-	DebugCalls    []string
+	DebugCalls []string
 	// InfoCalls records all format strings passed to Infof calls
-	InfoCalls     []string
+	InfoCalls []string
 	// WarnCalls records all format strings passed to Warnf calls
-	WarnCalls     []string
+	WarnCalls []string
 	// ErrorCalls records all format strings passed to Errorf calls
-	ErrorCalls    []string
+	ErrorCalls []string
 	// FatalCalls records all format strings passed to Fatalf calls
-	FatalCalls    []string
+	FatalCalls []string
 	// LogLevelValue stores the configured log level for testing LogLevel() method
 	LogLevelValue int
 }

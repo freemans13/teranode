@@ -4,7 +4,6 @@ package httpimpl
 
 import (
 	"encoding/json"
-	"fmt"
 
 	"github.com/bitcoin-sv/teranode/model"
 )
@@ -58,50 +57,34 @@ type blockHeaderResponse struct {
 //	    "miner": "Satoshi"
 //	}
 func (r *blockHeaderResponse) MarshalJSON() ([]byte, error) {
-	miner, _ := escapeJSON(r.Miner)
-
-	return []byte(fmt.Sprintf(`{"hash":"%s","version":%d,"previousblockhash":"%s","merkleroot":"%s","time":%d,"bits":"%s","nonce":%d,"height":%d,"txCount":%d,"sizeInBytes":%d,"miner":"%s"}`,
-		r.Hash,
-		r.Version,
-		r.HashPrevBlock.String(),
-		r.HashMerkleRoot.String(),
-		r.Timestamp,
-		r.Bits.String(),
-		r.Nonce,
-		r.Height,
-		r.TxCount,
-		r.SizeInBytes,
-		miner,
-	)), nil
-}
-
-// escapeJSON properly escapes a string for use in JSON output.
-// It handles special characters and ensures the resulting string
-// is valid for JSON encoding.
-//
-// Parameters:
-//   - input: Raw string to be escaped
-//
-// Returns:
-//   - string: Properly escaped string for JSON inclusion
-//   - error: Any error encountered during escaping process
-//
-// Example:
-//
-//	escaped, err := escapeJSON("Miner's Note: \"Hello\"")
-//	// Returns: "Miner\'s Note: \"Hello\""
-func escapeJSON(input string) (string, error) {
-	// Use json.Marshal to escape the input string.
-	escapedJSON, err := json.Marshal(input)
-	if err != nil {
-		return "", err
+	type aliasResponse struct {
+		Hash              string `json:"hash"`
+		Version           uint32 `json:"version"`
+		PreviousBlockHash string `json:"previousblockhash"`
+		MerkleRoot        string `json:"merkleroot"`
+		Time              uint32 `json:"time"`
+		Bits              string `json:"bits"`
+		Nonce             uint32 `json:"nonce"`
+		Height            uint32 `json:"height"`
+		TxCount           uint64 `json:"txCount"`
+		SizeInBytes       uint64 `json:"sizeInBytes"`
+		Miner             string `json:"miner"`
 	}
 
-	// Convert the JSON bytes to a string, removing the surrounding double quotes.
-	escapedString := string(escapedJSON[1 : len(escapedJSON)-1])
-
-	// Return the escaped string.
-	return escapedString, nil
+	a := aliasResponse{
+		Hash:              r.Hash,
+		Version:           r.Version,
+		PreviousBlockHash: r.HashPrevBlock.String(),
+		MerkleRoot:        r.HashMerkleRoot.String(),
+		Time:              r.Timestamp,
+		Bits:              r.Bits.String(),
+		Nonce:             r.Nonce,
+		Height:            r.Height,
+		TxCount:           r.TxCount,
+		SizeInBytes:       r.SizeInBytes,
+		Miner:             r.Miner,
+	}
+	return json.Marshal(a)
 }
 
 // UnmarshalJSON implements the json.Unmarshaler interface for blockHeaderResponse.
