@@ -42,14 +42,14 @@ type Config struct {
 	PeerNotifier PeerNotifier
 	// ChainParams defines the blockchain network parameters (mainnet, testnet, regtest)
 	// that determine consensus rules and network-specific constants.
-	ChainParams  *chaincfg.Params
+	ChainParams *chaincfg.Params
 
 	// DisableCheckpoints when true, disables the use of hardcoded checkpoints
 	// for faster initial blockchain synchronization.
 	DisableCheckpoints bool
 	// MaxPeers specifies the maximum number of peers that can be connected
 	// simultaneously for synchronization operations.
-	MaxPeers           int
+	MaxPeers int
 
 	// MinSyncPeerNetworkSpeed defines the minimum network speed (in bytes per second)
 	// required for a peer to be considered suitable for blockchain synchronization.

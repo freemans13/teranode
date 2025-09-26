@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/ordishs/go-utils"
 )
 
@@ -83,42 +82,27 @@ func (bi *BlockInfo) MarshalJSON() ([]byte, error) {
 
 	timestamp := time.Unix(int64(header.Timestamp), 0).UTC()
 
-	miner, err := escapeJSON(bi.Miner)
-	if err != nil {
-		return nil, errors.NewProcessingError("could not parse miner '%s'", bi.Miner, err)
+	type aliasResponse struct {
+		Height            uint32 `json:"height"`
+		Hash              string `json:"hash"`
+		PreviousBlockHash string `json:"previousblockhash"`
+		CoinbaseValue     uint64 `json:"coinbaseValue"`
+		Timestamp         string `json:"timestamp"`
+		TransactionCount  uint64 `json:"transactionCount"`
+		Size              uint64 `json:"size"`
+		Miner             string `json:"miner"`
 	}
 
-	return []byte(fmt.Sprintf(`
-	{
-		"height": %d,
-		"hash": "%s",
-		"previousblockhash": "%s",
-		"coinbaseValue": %d,
-		"timestamp": "%s",
-		"transactionCount": %d,
-		"size": %d,
-		"miner": "%s"
-	}`,
-		bi.Height,
-		hash.String(),
-		header.HashPrevBlock.String(),
-		bi.CoinbaseValue,
-		timestamp.Format(dateFormat),
-		bi.TransactionCount,
-		bi.Size,
-		miner)), nil
-}
-
-func escapeJSON(input string) (string, error) {
-	// Use json.Marshal to escape the input string.
-	escapedJSON, err := json.Marshal(input)
-	if err != nil {
-		return "", err
+	a := aliasResponse{
+		Height:            bi.Height,
+		Hash:              hash.String(),
+		PreviousBlockHash: header.HashPrevBlock.String(),
+		CoinbaseValue:     bi.CoinbaseValue,
+		Timestamp:         timestamp.Format(dateFormat),
+		TransactionCount:  bi.TransactionCount,
+		Size:              bi.Size,
+		Miner:             bi.Miner,
 	}
 
-	// Convert the JSON bytes to a string, removing the surrounding double quotes.
-	escapedString := string(escapedJSON[1 : len(escapedJSON)-1])
-
-	// Return the escaped string.
-	return escapedString, nil
+	return json.Marshal(a)
 }

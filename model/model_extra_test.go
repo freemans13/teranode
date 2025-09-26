@@ -391,87 +391,6 @@ func TestBlockInfo_MarshalJSON_TimestampFormat(t *testing.T) {
 	assert.Equal(t, "1970-01-01T00:00:00.000Z", timestamp)
 }
 
-func TestEscapeJSON(t *testing.T) {
-	testCases := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "Simple string",
-			input:    "Hello World",
-			expected: "Hello World",
-		},
-		{
-			name:     "String with quotes",
-			input:    "Hello \"World\"",
-			expected: "Hello \\\"World\\\"",
-		},
-		{
-			name:     "String with backslashes",
-			input:    "Hello\\World",
-			expected: "Hello\\\\World",
-		},
-		{
-			name:     "String with newlines",
-			input:    "Hello\nWorld",
-			expected: "Hello\\nWorld",
-		},
-		{
-			name:     "String with tabs",
-			input:    "Hello\tWorld",
-			expected: "Hello\\tWorld",
-		},
-		{
-			name:     "String with carriage returns",
-			input:    "Hello\rWorld",
-			expected: "Hello\\rWorld",
-		},
-		{
-			name:     "Empty string",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "String with forward slashes",
-			input:    "Hello/World",
-			expected: "Hello/World", // Forward slashes don't need escaping in JSON strings
-		},
-		{
-			name:     "Complex string with multiple special chars",
-			input:    "Test\"Line1\nLine2\tTab\\Backslash",
-			expected: "Test\\\"Line1\\nLine2\\tTab\\\\Backslash",
-		},
-		{
-			name:     "Unicode characters",
-			input:    "Hello 世界",
-			expected: "Hello 世界",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result, err := escapeJSON(tc.input)
-			require.NoError(t, err)
-			assert.Equal(t, tc.expected, result)
-		})
-	}
-}
-
-func TestEscapeJSON_EdgeCases(t *testing.T) {
-	// Test with all control characters
-	controlChars := "\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u0008\u0009\u000a\u000b\u000c\u000d\u000e\u000f"
-	result, err := escapeJSON(controlChars)
-	require.NoError(t, err)
-	assert.NotEmpty(t, result)
-
-	// The result should be properly escaped
-	assert.Contains(t, result, "\\u0000")
-	assert.Contains(t, result, "\\t") // Tab character
-	assert.Contains(t, result, "\\n") // Newline character
-	assert.Contains(t, result, "\\r") // Carriage return
-}
-
 func TestDateFormat_Constant(t *testing.T) {
 	// Test that the date format constant is correct ISO 8601 format
 	testTime := time.Date(2021, 1, 1, 15, 30, 45, 123000000, time.UTC)
@@ -555,10 +474,10 @@ func TestBlockInfo_MarshalJSON_Integration(t *testing.T) {
 
 		// Verify JSON is properly formatted
 		jsonStr := string(jsonBytes)
-		assert.Contains(t, jsonStr, `"height": 700000`)
-		assert.Contains(t, jsonStr, `"miner": "Test Miner"`)
-		assert.Contains(t, jsonStr, `"coinbaseValue": 625000000`)
-		assert.Contains(t, jsonStr, `"transactionCount": 2500`)
+		assert.Contains(t, jsonStr, `"height":700000`)
+		assert.Contains(t, jsonStr, `"miner":"Test Miner"`)
+		assert.Contains(t, jsonStr, `"coinbaseValue":625000000`)
+		assert.Contains(t, jsonStr, `"transactionCount":2500`)
 
 		// Verify proper JSON structure (no trailing commas, proper braces)
 		lines := strings.Split(strings.TrimSpace(jsonStr), "\n")
@@ -601,14 +520,5 @@ func BenchmarkBlockInfo_MarshalJSON(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = bi.MarshalJSON()
-	}
-}
-
-func BenchmarkEscapeJSON(b *testing.B) {
-	input := "Test\"String\\With\nSpecial\tChars"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = escapeJSON(input)
 	}
 }
