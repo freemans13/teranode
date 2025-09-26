@@ -307,7 +307,7 @@ func (u *Server) extractAndCollectTransactions(ctx context.Context, subtreeHash 
 	defer subtreeDataReader.Close()
 
 	// create buffered reader to accelerate reading from the stream
-	bufferedReader := bufio.NewReaderSize(subtreeDataReader, 4*1024*1024) // 4MB buffer size
+	bufferedReader := bufio.NewReaderSize(subtreeDataReader, 1024*128)
 
 	// Read transactions directly into the shared collection
 	txCount, err := u.readTransactionsFromSubtreeDataStream(bufferedReader, subtreeTransactions)

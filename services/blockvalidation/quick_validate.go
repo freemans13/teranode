@@ -264,7 +264,7 @@ func (u *BlockValidation) getBlockTransactions(ctx context.Context, block *model
 			defer subtreeReader.Close()
 
 			// create a buffered reader to read the subtree
-			bufferedReader := bufio.NewReaderSize(subtreeReader, 1*1024*1024) // 1MB buffer size
+			bufferedReader := bufio.NewReaderSize(subtreeReader, 1024*512) // 512KB buffer size
 
 			// subtree only contains the tx hashes (nodes) of the subtree. It is missing the fee and sizeInBytes
 			subtree, err := subtreepkg.NewSubtreeFromReader(bufferedReader)
@@ -281,7 +281,7 @@ func (u *BlockValidation) getBlockTransactions(ctx context.Context, block *model
 			}
 
 			// create a buffered reader to read the subtree data
-			bufferedReader = bufio.NewReaderSize(subtreeDataReader, 1*1024*1024) // 1MB buffer size
+			bufferedReader = bufio.NewReaderSize(subtreeDataReader, 1024*512) // 512KB buffer size
 
 			// the subtree data reader will make sure the data matches the transaction ids from the subtree
 			subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, bufferedReader)
