@@ -42,6 +42,14 @@ jobs:
           path: coverage.out
           retention-days: 1
 
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: /tmp/teranode-test-results/test-results.txt
+          retention-days: 2
+
   smoketest:
     name: smoketest
     runs-on: ubuntu-latest
@@ -67,6 +75,14 @@ jobs:
         continue-on-error: false
         env:
           settings_context: ${{ env.SETTINGS_CONTEXT_DEFAULT }}
+
+      - name: Upload smoketest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoketest-results
+          path: /tmp/teranode-test-results/smoketest-results.txt
+          retention-days: 2
 
   sonarqube:
     name: Sonarqube
