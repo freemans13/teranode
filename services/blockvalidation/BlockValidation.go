@@ -413,11 +413,6 @@ func (u *BlockValidation) start(ctx context.Context) error {
 					continue
 				}
 
-				if blockHeaderMeta.Invalid {
-					// if the block is invalid, we don't set the tx mined
-					continue
-				}
-
 				if blockHeaderMeta != nil && blockHeaderMeta.MinedSet {
 					u.logger.Infof("[BlockValidation:start][%s] block already has mined_set true, skipping setTxMined", blockHash.String())
 					continue
@@ -854,8 +849,14 @@ func (u *BlockValidation) setTxMined(ctx context.Context, blockHash *chainhash.H
 		// check whether we got already mined errors and mark the block as invalid
 		if errors.Is(err, errors.ErrBlockInvalid) {
 			u.logger.Errorf("[setTxMined][%s] block is invalid, contains transactions already on our chain: %s", block.Hash().String(), err)
+
 			// mark the block as invalid in the blockchain
 			u.markBlockAsInvalid(ctx, block, "contains transactions already on our chain: "+err.Error())
+
+			// update block mined_set to true, even if it was invalid, the transactions are all marked as mined, otherwise this error is not returned
+			if err = u.blockchainClient.SetBlockMinedSet(ctx, blockHash); err != nil {
+				return errors.NewServiceError("[setTxMined][%s] failed to set block mined", block.Hash().String(), err)
+			}
 		}
 
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)

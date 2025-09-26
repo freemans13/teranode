@@ -1341,16 +1341,6 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 	)
 	defer deferFn()
 
-	resetWaitCountUint32, err := safeconversion.Int32ToUint32(ba.blockAssembler.resetWaitCount.Load())
-	if err != nil {
-		return nil, errors.NewProcessingError("error converting reset wait count", err)
-	}
-
-	resetWaitTimeUint32, err := safeconversion.Int32ToUint32(ba.blockAssembler.resetWaitDuration.Load())
-	if err != nil {
-		return nil, errors.NewProcessingError("error converting reset wait time", err)
-	}
-
 	subtreeCountUint32, err := safeconversion.IntToUint32(ba.blockAssembler.SubtreeCount())
 	if err != nil {
 		return nil, errors.NewProcessingError("error converting subtree count", err)
@@ -1371,8 +1361,6 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 	return &blockassembly_api.StateMessage{
 		BlockAssemblyState:    StateStrings[ba.blockAssembler.GetCurrentRunningState()],
 		SubtreeProcessorState: subtreeprocessor.StateStrings[ba.blockAssembler.subtreeProcessor.GetCurrentRunningState()],
-		ResetWaitCount:        resetWaitCountUint32,
-		ResetWaitTime:         resetWaitTimeUint32,
 		SubtreeCount:          subtreeCountUint32,
 		TxCount:               ba.blockAssembler.TxCount(),
 		QueueCount:            ba.blockAssembler.QueueLength(),

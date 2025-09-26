@@ -54,8 +54,6 @@ func NewBlockchainDaemon(t *testing.T) (*BlockchainDaemon, error) {
 	logger := ulogger.NewErrorTestLogger(t, cancel)
 	tSettings := settings.NewSettings("dev.system.test")
 	tSettings.LocalTestStartFromState = "RUNNING"
-	tSettings.BlockAssembly.ResetWaitCount = 0
-	tSettings.BlockAssembly.ResetWaitDuration = 0
 
 	// Configure settings for in-memory Kafka
 	tSettings.Kafka.BlocksConfig.Scheme = memoryScheme

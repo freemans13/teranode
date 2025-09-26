@@ -20,6 +20,7 @@ type UnminedTransaction struct {
 	TxInpoints subtree.TxInpoints
 	CreatedAt  int
 	Locked     bool
+	BlockIDs   []uint32
 }
 
 // UnminedTxIterator provides an interface to iterate over unmined transactions efficiently.

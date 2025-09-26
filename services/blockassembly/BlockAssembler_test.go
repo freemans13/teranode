@@ -156,8 +156,6 @@ func TestBlockAssembly_Start(t *testing.T) {
 		initPrometheusMetrics()
 
 		tSettings := createTestSettings(t)
-		tSettings.BlockAssembly.ResetWaitCount = 2
-		tSettings.BlockAssembly.ResetWaitDuration = 20 * time.Minute
 		tSettings.ChainCfgParams.Net = wire.MainNet
 
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
@@ -172,6 +170,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return([]byte{}, sql.ErrNoRows)
 		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, &model.BlockHeaderMeta{Height: 0}, nil)
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -188,17 +187,12 @@ func TestBlockAssembly_Start(t *testing.T) {
 
 		err = blockAssembler.Start(t.Context())
 		require.NoError(t, err)
-
-		assert.Equal(t, int32(0), blockAssembler.resetWaitCount.Load())
-		assert.Equal(t, int32(0), blockAssembler.resetWaitDuration.Load())
 	})
 
 	t.Run("Start on testnet, inherits same wait as mainnet", func(t *testing.T) {
 		initPrometheusMetrics()
 
 		tSettings := createTestSettings(t)
-		tSettings.BlockAssembly.ResetWaitCount = 2
-		tSettings.BlockAssembly.ResetWaitDuration = 20 * time.Minute
 		tSettings.ChainCfgParams.Net = wire.TestNet
 
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
@@ -213,6 +207,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return([]byte{}, sql.ErrNoRows)
 		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, &model.BlockHeaderMeta{Height: 0}, nil)
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -229,9 +224,6 @@ func TestBlockAssembly_Start(t *testing.T) {
 
 		err = blockAssembler.Start(t.Context())
 		require.NoError(t, err)
-
-		assert.Equal(t, int32(0), blockAssembler.resetWaitCount.Load(), "resetWaitCount should be set on TestNet as on MainNet")
-		assert.Equal(t, int32(0), blockAssembler.resetWaitDuration.Load(), "resetWaitDuration must be no greater than now+configured duration")
 	})
 
 	t.Run("Start with existing state in blockchain", func(t *testing.T) {
@@ -270,6 +262,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		copy(stateBytes[4:], bestBlockHeader.Bytes())
 		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return(stateBytes, nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1}, nil)
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		nextBits := model.NBit{0xff, 0xff, 0x7f, 0x20}
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, bestBlockHeader.Hash(), mock.Anything).Return(&nextBits, nil)
@@ -311,6 +304,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return([]byte{}, sql.ErrNoRows)
 		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, &model.BlockHeaderMeta{Height: 0}, nil)
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -1719,21 +1713,6 @@ func TestBlockAssembly_RemoveTx(t *testing.T) {
 	})
 }
 
-func TestBlockAssembly_Reset(t *testing.T) {
-	t.Run("Reset triggers invalidation of mining candidate cache", func(t *testing.T) {
-		initPrometheusMetrics()
-		testItems := setupBlockAssemblyTest(t)
-		require.NotNil(t, testItems)
-
-		// Reset should invalidate the mining candidate cache
-		// Since Reset runs asynchronously, we can only verify it doesn't panic
-		testItems.blockAssembler.Reset()
-
-		// Give some time for the async reset to execute
-		time.Sleep(10 * time.Millisecond)
-	})
-}
-
 func TestBlockAssembly_Start_InitStateFailures(t *testing.T) {
 	t.Run("initState fails when blockchain client returns error", func(t *testing.T) {
 		initPrometheusMetrics()
@@ -1741,6 +1720,7 @@ func TestBlockAssembly_Start_InitStateFailures(t *testing.T) {
 		blockchainClient := &blockchain.Mock{}
 		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return([]byte{}, errors.NewProcessingError("blockchain db connection failed"))
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(nil, nil, errors.NewProcessingError("failed to get best block header"))
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -1789,6 +1769,7 @@ func TestBlockAssembly_Start_InitStateFailures(t *testing.T) {
 		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return([]byte{}, sql.ErrNoRows)
 		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, &model.BlockHeaderMeta{Height: 0}, nil)
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -2069,4 +2050,78 @@ func TestBlockAssembly_LoadUnminedTransactions_ReorgCornerCase_MisUnsetMinedStat
 	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
 	assert.True(t, containsHash(hashes, *txHash),
 		"tx incorrectly marked not-on-longest should be reloaded into assembler")
+}
+
+// TestBlockAssembly_LoadUnminedTransactions_SkipsTransactionsOnCurrentChain tests that
+// loadUnminedTransactions properly skips transactions that are already included
+// in blocks on the current best chain
+func TestBlockAssembly_LoadUnminedTransactions_SkipsTransactionsOnCurrentChain(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	items := setupBlockAssemblyTest(t)
+	require.NotNil(t, items)
+
+	// Create two test transactions
+	tx1 := newTx(100)
+	tx2 := newTx(101)
+	txHash1 := tx1.TxIDChainHash()
+	txHash2 := tx2.TxIDChainHash()
+
+	// Add both transactions to UTXO store as unmined initially
+	_, err := items.utxoStore.Create(ctx, tx1, 0)
+	require.NoError(t, err)
+	_, err = items.utxoStore.Create(ctx, tx2, 0)
+	require.NoError(t, err)
+
+	// Add the first test block (using existing blockHeader1 pattern)
+	bits, _ := model.NewNBitFromString("1d00ffff")
+	blockHeader1 := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  chaincfg.RegressionNetParams.GenesisHash,
+		HashMerkleRoot: &chainhash.Hash{},
+		Nonce:          1,
+		Bits:           *bits,
+	}
+	err = items.addBlock(blockHeader1)
+	require.NoError(t, err)
+
+	// Get the block ID for our test block
+	_, blockMeta, err := items.blockchainClient.GetBlockHeader(ctx, blockHeader1.Hash())
+	require.NoError(t, err)
+	blockID := blockMeta.ID
+
+	// Set tx1 as mined in our test block (this should make it part of current chain)
+	_, err = items.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{txHash1}, utxoStore.MinedBlockInfo{
+		BlockID:        blockID,
+		BlockHeight:    1,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, items.utxoStore.SetBlockHeight(blockID))
+
+	// re-add the unminedSince to tx1 to simulate the edge case
+	require.NoError(t, items.utxoStore.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*txHash1}, false))
+
+	// Leave tx2 as unmined (should be loaded into assembler)
+
+	// Set the block assembler's best block header to our test block
+	items.blockAssembler.setBestBlockHeader(blockHeader1, 1)
+
+	// Load unmined transactions
+	err = items.blockAssembler.loadUnminedTransactions(ctx)
+	require.NoError(t, err)
+
+	// Verify results
+	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
+
+	// tx1 should NOT be in the assembler (it's on the current chain)
+	assert.False(t, containsHash(hashes, *txHash1),
+		"transaction already on current chain should be skipped during loadUnminedTransactions")
+
+	// tx2 should be in the assembler (it's still unmined)
+	assert.True(t, containsHash(hashes, *txHash2),
+		"unmined transaction not on current chain should be loaded into assembler")
 }

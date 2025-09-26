@@ -54,6 +54,7 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 		fields.CreatedAt.String(),
 		fields.Conflicting.String(),
 		fields.Locked.String(),
+		fields.BlockIDs.String(),
 	}
 
 	policy := as.NewQueryPolicy()
@@ -151,6 +152,12 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 		return nil, err
 	}
 
+	blockIDs, err := processBlockIDs(rec.Record.Bins)
+	if err != nil {
+		it.closeWithLogging()
+		return nil, err
+	}
+
 	return &utxo.UnminedTransaction{
 		Hash:       txData.hash,
 		Fee:        txData.fee,
@@ -158,6 +165,7 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 		TxInpoints: txInpoints,
 		CreatedAt:  createdAt,
 		Locked:     locked,
+		BlockIDs:   blockIDs,
 	}, nil
 }
 

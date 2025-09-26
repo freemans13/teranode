@@ -33,8 +33,8 @@ func (m *MockSubtreeProcessor) GetCurrentLength() int {
 	return args.Int(0)
 }
 
-func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool) ResetResponse {
-	args := m.Called(blockHeader, moveBackBlocks, moveForwardBlocks, isLegacySync)
+func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool, postProcess func() error) ResetResponse {
+	args := m.Called(blockHeader, moveBackBlocks, moveForwardBlocks, isLegacySync, postProcess)
 	return args.Get(0).(ResetResponse)
 }
 

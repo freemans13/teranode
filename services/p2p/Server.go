@@ -1967,6 +1967,7 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 		}
 
 		s.blocksKafkaProducerClient.Publish(&kafka.Message{
+			Key:   hash.CloneBytes(),
 			Value: value,
 		})
 	}
@@ -2041,6 +2042,7 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, from string) {
 		}
 
 		s.subtreeKafkaProducerClient.Publish(&kafka.Message{
+			Key:   hash.CloneBytes(),
 			Value: value,
 		})
 	}

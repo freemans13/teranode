@@ -137,15 +137,13 @@ message OKResponse {
 message StateMessage {
   string blockAssemblyState = 1; // the state of the block assembly service
   string subtreeProcessorState = 2; // the state of the block assembly subtree processor
-  uint32 resetWaitCount = 3; // the number of blocks the reset has to wait for
-  uint32 resetWaitTime = 4; // the time in seconds the reset has to wait for
-  uint32 subtreeCount = 5; // the number of subtrees
-  uint64 txCount = 6; // the number of transactions
-  int64 queueCount = 7; // the size of the queue
-  uint32 currentHeight = 8; // the height of the chaintip
-  string currentHash = 9; // the hash of the chaintip
-  uint32 removeMapCount = 10; // the number of transactions in the remove map
-  repeated string subtrees = 11; // the hashes of the current subtrees
+  uint32 subtreeCount = 3; // the number of subtrees
+  uint64 txCount = 4; // the number of transactions
+  int64 queueCount = 5; // the size of the queue
+  uint32 currentHeight = 6; // the height of the chaintip
+  string currentHash = 7; // the hash of the chaintip
+  uint32 removeMapCount = 8; // the number of transactions in the remove map
+  repeated string subtrees = 9; // the hashes of the current subtrees
 }
 
 // Response containing the current difficulty of the blockchain.

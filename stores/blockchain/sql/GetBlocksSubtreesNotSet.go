@@ -175,6 +175,7 @@ func (s *SQL) getBlocksWithQuery(ctx context.Context, q string) ([]*model.Block,
 
 		block.TransactionCount = transactionCount
 		block.SizeInBytes = sizeInBytes
+		block.Height = height
 
 		if len(coinbaseTx) > 0 {
 			block.CoinbaseTx, err = bt.NewTxFromBytes(coinbaseTx)

@@ -87,8 +87,6 @@ func Test_HandleBlockDirect(t *testing.T) {
 	blockAssemblyClient.On("GetBlockAssemblyState", mock.Anything).Return(&blockassembly_api.StateMessage{
 		BlockAssemblyState:    "",
 		SubtreeProcessorState: "",
-		ResetWaitCount:        0,
-		ResetWaitTime:         0,
 		SubtreeCount:          0,
 		TxCount:               0,
 		QueueCount:            0,

@@ -234,8 +234,6 @@ type BlockAssemblySettings struct {
 	MinerWalletPrivateKeys              []string
 	DifficultyCache                     bool
 	UseDynamicSubtreeSize               bool
-	ResetWaitCount                      int32
-	ResetWaitDuration                   time.Duration
 	MiningCandidateCacheTimeout         time.Duration
 }
 

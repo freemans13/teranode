@@ -1289,7 +1289,7 @@ finished:
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	for state == nil || state.CurrentHash != expectedBlock.Header.Hash().String() {
+	for state == nil || state.CurrentHash != expectedBlock.Header.Hash().String() || state.BlockAssemblyState != "running" {
 		state, err = td.BlockAssemblyClient.GetBlockAssemblyState(td.Ctx)
 		require.NoError(t, err)
 

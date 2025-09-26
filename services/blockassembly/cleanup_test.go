@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bitcoin-sv/teranode/services/blockassembly/subtreeprocessor"
+	"github.com/bitcoin-sv/teranode/services/blockchain"
 	"github.com/bitcoin-sv/teranode/stores/utxo"
 	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bitcoin-sv/teranode/util/test"
@@ -123,6 +125,9 @@ func TestCleanupDuringStartup(t *testing.T) {
 			Return(nil, nil). // No unmined transactions
 			Once()
 
+		blockchainClient := &blockchain.Mock{}
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+
 		// Create BlockAssembler with mocked dependencies
 		ba := &BlockAssembler{
 			utxoStore:        mockStore,
@@ -130,6 +135,7 @@ func TestCleanupDuringStartup(t *testing.T) {
 			settings:         settings,
 			bestBlockHeight:  atomic.Uint32{},
 			subtreeProcessor: &subtreeprocessor.MockSubtreeProcessor{}, // Add a mock subtree processor
+			blockchainClient: blockchainClient,
 		}
 
 		// Set block height
@@ -222,6 +228,9 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 			Return(nil).
 			Once()
 
+		blockchainClient := &blockchain.Mock{}
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+
 		// Create BlockAssembler with mocked dependencies
 		ba := &BlockAssembler{
 			utxoStore:        mockStore,
@@ -229,6 +238,7 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 			settings:         settings,
 			bestBlockHeight:  atomic.Uint32{},
 			subtreeProcessor: mockSubtreeProcessor,
+			blockchainClient: blockchainClient,
 		}
 
 		// Set block height

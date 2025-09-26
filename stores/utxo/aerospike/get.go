@@ -830,7 +830,7 @@ func processBlockIDs(bins aerospike.BinMap) ([]uint32, error) {
 	}
 
 	if len(blockIDs) == 0 {
-		return nil, nil
+		return []uint32{}, nil
 	}
 
 	res := make([]uint32, len(blockIDs))

@@ -1792,7 +1792,7 @@ func (b *Blockchain) InvalidateBlock(ctx context.Context, request *blockchain_ap
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "InvalidateBlock",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainInvalidateBlock),
-		tracing.WithDebugLogMessage(b.logger, "[InvalidateBlock] called with hash %x", request.BlockHash),
+		tracing.WithDebugLogMessage(b.logger, "[InvalidateBlock] called with hash %s", utils.ReverseAndHexEncodeSlice(request.BlockHash)),
 	)
 	defer deferFn()
 
@@ -1817,14 +1817,6 @@ func (b *Blockchain) InvalidateBlock(ctx context.Context, request *blockchain_ap
 	invalidatedHashBytes := make([][]byte, len(invalidatedHashes))
 
 	for i, hash := range invalidatedHashes {
-		// this will trigger lots of notifications, but it's fine - subscribers should handle that
-		if _, err = b.SendNotification(ctx, &blockchain_api.Notification{
-			Type: model.NotificationType_Block,
-			Hash: hash.CloneBytes(),
-		}); err != nil {
-			b.logger.Errorf("[Blockchain] Error sending notification for invalidated block %s: %v", hash, err)
-		}
-
 		invalidatedHashBytes[i] = hash.CloneBytes()
 	}
 

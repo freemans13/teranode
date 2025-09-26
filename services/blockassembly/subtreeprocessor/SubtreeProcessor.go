@@ -37,6 +37,7 @@ import (
 	"github.com/bitcoin-sv/teranode/stores/blob/options"
 	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
 	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
+	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
 	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bitcoin-sv/teranode/util/tracing"
@@ -104,6 +105,9 @@ type resetBlocks struct {
 
 	// isLegacySync indicates whether this is a legacy synchronization operation
 	isLegacySync bool
+
+	// postProcess is an optional function to execute after the reset
+	postProcess func() error
 }
 
 // ResetResponse encapsulates the response from a reset operation.
@@ -525,7 +529,8 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 			case resetBlocksMsg := <-stp.resetCh:
 				stp.setCurrentRunningState(StateResetBlocks)
 
-				err = stp.reset(resetBlocksMsg.blockHeader, resetBlocksMsg.moveBackBlocks, resetBlocksMsg.moveForwardBlocks, resetBlocksMsg.isLegacySync)
+				err = stp.reset(resetBlocksMsg.blockHeader, resetBlocksMsg.moveBackBlocks, resetBlocksMsg.moveForwardBlocks,
+					resetBlocksMsg.isLegacySync, resetBlocksMsg.postProcess)
 
 				if resetBlocksMsg.responseCh != nil {
 					resetBlocksMsg.responseCh <- ResetResponse{Err: err}
@@ -658,7 +663,7 @@ func (stp *SubtreeProcessor) GetCurrentLength() int {
 //
 // Returns:
 //   - ResetResponse: Response containing any errors encountered
-func (stp *SubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool) ResetResponse {
+func (stp *SubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool, postProcess func() error) ResetResponse {
 	responseCh := make(chan ResetResponse)
 	stp.resetCh <- &resetBlocks{
 		blockHeader:       blockHeader,
@@ -666,12 +671,14 @@ func (stp *SubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlock
 		moveForwardBlocks: moveForwardBlocks,
 		responseCh:        responseCh,
 		isLegacySync:      isLegacySync,
+		postProcess:       postProcess,
 	}
 
 	return <-responseCh
 }
 
-func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool) error {
+func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block,
+	isLegacySync bool, postProcess func() error) error {
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(context.Background(), "reset",
 		tracing.WithParentStat(stp.stats),
 		tracing.WithHistogram(prometheusSubtreeProcessorReset),
@@ -684,23 +691,15 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	stp.chainedSubtreeCount.Store(0)
 
 	stp.currentSubtree, _ = subtreepkg.NewTreeByLeafCount(stp.currentItemsPerFile)
-	stp.txCount.Store(0)
+	if err := stp.currentSubtree.AddCoinbaseNode(); err != nil {
+		return errors.NewProcessingError("[SubtreeProcessor][Reset] error adding coinbase placeholder to new current subtree", err)
+	}
 
 	// clear current tx map
 	stp.currentTxMap.Clear()
 
-	// dequeue all transactions
-	stp.logger.Warnf("[SubtreeProcessor][Reset] Dequeueing all transactions")
-
-	validUntilMillis := time.Now().UnixMilli()
-
-	for {
-		_, _, time64, found := stp.queue.dequeue(0)
-		if !found || time64 > validUntilMillis {
-			// we are done
-			break
-		}
-	}
+	// reset tx count
+	stp.setTxCountFromSubtrees()
 
 	ctx := context.Background()
 
@@ -792,6 +791,26 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			}
 
 			stp.currentBlockHeader = block.Header
+		}
+	}
+
+	if postProcess != nil {
+		stp.logger.Infof("[SubtreeProcessor][Reset] PostProcessing block headers function called")
+		if err := postProcess(); err != nil {
+			return errors.NewProcessingError("[SubtreeProcessor][Reset] error in postProcess function", err)
+		}
+	}
+
+	// dequeue all transactions
+	stp.logger.Warnf("[SubtreeProcessor][Reset] Dequeueing all transactions")
+
+	validUntilMillis := time.Now().UnixMilli()
+
+	for {
+		_, _, time64, found := stp.queue.dequeue(0)
+		if !found || time64 > validUntilMillis {
+			// we are done
+			break
 		}
 	}
 
@@ -1783,8 +1802,28 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	}
 
 	if len(markNotOnLongestChain) > 0 {
-		if err = stp.utxoStore.MarkTransactionsOnLongestChain(ctx, markNotOnLongestChain, false); err != nil {
-			return errors.NewProcessingError("[reorgBlocks] error marking transactions as not on longest chain in utxo store", err)
+		if len(moveBackBlocks) == 1 && len(moveForwardBlocks) == 0 {
+			// special case: if we only moved back and did not move forward, it probably means we just invalidated a block
+			// in that case, we need to validate whether to update the transactions or not
+			_, blockHeaderMeta, err := stp.blockchainClient.GetBlockHeader(ctx, moveBackBlocks[0].Header.Hash())
+			if err != nil {
+				return errors.NewProcessingError("[reorgBlocks] error getting block header meta for block we moved back", err)
+			}
+
+			if blockHeaderMeta.Invalid {
+				// the block we moved back is invalid, so we cannot just mark all transactions as not on the longest chain
+				markNotOnLongestChain, err = stp.checkMarkNotOnLongestChain(ctx, moveBackBlocks[0], markNotOnLongestChain)
+				if err != nil {
+					return errors.NewProcessingError("[reorgBlocks] error checking which transactions to mark as not on longest chain", err)
+				}
+			}
+		}
+
+		// check again if we have any transactions to mark, after the checkMarkNotOnLongestChain
+		if len(markNotOnLongestChain) > 0 {
+			if err = stp.utxoStore.MarkTransactionsOnLongestChain(ctx, markNotOnLongestChain, false); err != nil {
+				return errors.NewProcessingError("[reorgBlocks] error marking transactions as not on longest chain in utxo store", err)
+			}
 		}
 	}
 
@@ -1807,9 +1846,90 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	}
 
 	// persist the current state
-	stp.finalizeBlockProcessing(ctx, moveForwardBlocks[len(moveForwardBlocks)-1])
+	if len(moveForwardBlocks) > 0 {
+		stp.finalizeBlockProcessing(ctx, moveForwardBlocks[len(moveForwardBlocks)-1])
+	} else if len(moveBackBlocks) > 0 {
+		// we only moved back, finalize with the last block we moved back
+		stp.finalizeBlockProcessing(ctx, moveBackBlocks[len(moveBackBlocks)-1])
+	} else {
+		return errors.NewProcessingError("[reorgBlocks] no blocks to finalize after reorg")
+	}
 
 	return nil
+}
+
+func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, invalidBlock *model.Block, markNotOnLongestChain []chainhash.Hash) ([]chainhash.Hash, error) {
+	stp.logger.Infof("[reorgBlocks] block %s we moved back is invalid, checking whether to mark transactions as not on longest chain", invalidBlock.String())
+
+	checkMarkNotOnLongestChain := make([]chainhash.Hash, 0, len(markNotOnLongestChain))
+
+	_, lastBlockHeaderMetas, err := stp.blockchainClient.GetBlockHeaders(ctx, invalidBlock.Header.HashPrevBlock, 1000)
+	if err != nil {
+		return nil, errors.NewProcessingError("[reorgBlocks] error getting last block headers", err)
+	}
+
+	lastBlockHeaderIDs := make(map[uint32]bool)
+	for _, header := range lastBlockHeaderMetas {
+		lastBlockHeaderIDs[header.ID] = true
+	}
+
+	txMetas := make([]*meta.Data, len(markNotOnLongestChain))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(stp.settings.UtxoStore.GetBatcherSize * 2)
+
+	// we need to check each transaction in the block we moved back and see if it is still on the longest chain or not
+	for idx, hash := range markNotOnLongestChain {
+		idx := idx
+		hashRef := &hash
+
+		g.Go(func() error {
+			txMeta, err := stp.utxoStore.Get(gCtx, hashRef, fields.BlockIDs)
+			if err != nil {
+				return errors.NewProcessingError("[reorgBlocks] error getting transaction from utxo store", err)
+			}
+
+			txMetas[idx] = txMeta
+
+			return nil
+		})
+	}
+
+	if err = g.Wait(); err != nil {
+		return nil, err
+	}
+
+	for idx, hash := range markNotOnLongestChain {
+		txMeta := txMetas[idx]
+		if txMeta == nil {
+			// transaction not found, not OK
+			return nil, errors.NewProcessingError("[reorgBlocks] error getting transaction %s from longest chain", hash.String(), err)
+		}
+
+		if len(txMeta.BlockIDs) == 1 && txMeta.BlockIDs[0] == invalidBlock.ID {
+			// the transaction is only in the invalid block, so it is definitely not on the longest chain
+			checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
+		} else {
+			for _, blockID := range txMeta.BlockIDs {
+				if lastBlockHeaderIDs[blockID] {
+					// the transaction is still in one of the last 1000 blocks, so it is still on the longest chain
+					// do not mark it as not on the longest chain
+					continue
+				}
+			}
+
+			// check BlockIDs to see if the transaction is still on the longest chain
+			onLongestChain, err := stp.blockchainClient.CheckBlockIsInCurrentChain(ctx, txMeta.BlockIDs)
+			if err != nil {
+				return nil, errors.NewProcessingError("[reorgBlocks] error checking if transaction is on longest chain", err)
+			}
+
+			if !onLongestChain {
+				checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
+			}
+		}
+	}
+
+	return checkMarkNotOnLongestChain, nil
 }
 
 // setTxCountFromSubtrees recalculates the total transaction count

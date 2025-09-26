@@ -63,7 +63,7 @@ func TestSQL_RevalidateBlock(t *testing.T) {
 		assert.Equal(t, 3, id)
 		assert.Equal(t, uint32(3), height)
 		assert.True(t, invalid)
-		assert.False(t, mined_set)
+		assert.True(t, mined_set)
 
 		// reset the mined_set to true, the revalidation should set it back to false
 		err = s.SetBlockMinedSet(t.Context(), block3.Hash())

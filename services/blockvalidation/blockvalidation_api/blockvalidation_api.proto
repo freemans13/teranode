@@ -36,6 +36,8 @@ message BlockFoundRequest {
 message ProcessBlockRequest {
   bytes block = 1;
   uint32 height = 2;
+  string base_url = 3;
+  string peer_id = 4; // P2P peer identifier for peerMetrics tracking
 }
 
 // swagger:model ValidateBlockRequest

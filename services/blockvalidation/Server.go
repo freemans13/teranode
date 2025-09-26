@@ -880,7 +880,12 @@ func (u *Server) ProcessBlock(ctx context.Context, request *blockvalidation_api.
 
 	block.Height = height
 
-	if err = u.processBlockFound(ctx, block.Header.Hash(), "legacy", "", block); err != nil {
+	baseURL := request.BaseUrl
+	if baseURL == "" {
+		baseURL = "legacy" // default to legacy if not provided
+	}
+
+	if err = u.processBlockFound(ctx, block.Header.Hash(), baseURL, request.PeerId, block); err != nil {
 		// error from processBlockFound is already wrapped
 		return nil, errors.WrapGRPC(err)
 	}

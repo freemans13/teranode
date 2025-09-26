@@ -87,6 +87,7 @@ func TestUnminedTxIterator_Integration(t *testing.T) {
 			assert.Equal(t, tx1Meta.SizeInBytes, unminedTransaction.Size)
 			assert.Len(t, unminedTransaction.TxInpoints.ParentTxHashes, 1)
 			assert.Greater(t, unminedTransaction.CreatedAt, 0)
+			assert.NotNil(t, unminedTransaction.BlockIDs)
 
 			count++
 		}

@@ -174,6 +174,11 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 
 	maxRetries := 10
 
+	var (
+		blockInvalidError   error
+		blockInvalidErrorMu = sync.Mutex{}
+	)
+
 	for subtreeIdx, subtree := range block.SubtreeSlices {
 		subtreeIdx := subtreeIdx
 		subtree := subtree
@@ -251,7 +256,9 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 										for _, bID := range bIDs {
 											if _, exists := chainBlockIDsMap[bID]; exists && bID != blockID {
 												// this transaction is already on our chain, the block is invalid
-												return errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain, blockID %d", block.Hash().String(), bID)
+												blockInvalidErrorMu.Lock()
+												blockInvalidError = errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain, blockID %d", block.Hash().String(), bID)
+												blockInvalidErrorMu.Unlock()
 											}
 										}
 									}
@@ -308,7 +315,9 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 									for _, bID := range bIDs {
 										if _, exists := chainBlockIDsMap[bID]; exists && bID != blockID {
 											// this transaction is already on our chain, the block is invalid
-											return errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain: %s, blockID %d", block.Hash().String(), hash.String(), bID)
+											blockInvalidErrorMu.Lock()
+											blockInvalidError = errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain: %s, blockID %d", block.Hash().String(), hash.String(), bID)
+											blockInvalidErrorMu.Unlock()
 										}
 									}
 								}
@@ -326,6 +335,11 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 
 	if err = g.Wait(); err != nil {
 		return errors.NewProcessingError("[UpdateTxMinedStatus][%s] error updating tx mined status", block.Hash().String(), err)
+	}
+
+	// if the block was found to be invalid, return that error
+	if blockInvalidError != nil {
+		return blockInvalidError
 	}
 
 	return nil

@@ -180,7 +180,7 @@ func TestAerospike(t *testing.T) {
 		assert.Len(t, value.TxInpoints.ParentTxHashes, 1)
 		assert.Equal(t, []chainhash.Hash{*parentTxHash}, value.TxInpoints.ParentTxHashes)
 		assert.Len(t, value.BlockIDs, 0)
-		assert.Nil(t, value.BlockIDs)
+		assert.NotNil(t, value.BlockIDs)
 
 		blockIDsMap, err := store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: blockID2, BlockHeight: 102, SubtreeIdx: 4})
 		require.NoError(t, err)

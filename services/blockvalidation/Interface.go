@@ -36,7 +36,7 @@ type Interface interface {
 	BlockFound(ctx context.Context, blockHash *chainhash.Hash, baseURL string, waitToComplete bool) error
 
 	// ProcessBlock validates and processes a complete block at the specified height.
-	ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32) error
+	ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, baseURL string, peerID string) error
 
 	// ValidateBlock validates a block using the provided request, but does not update any state or database tables.
 	// This is useful for validating blocks without committing them to the database.
@@ -55,7 +55,7 @@ func (mv *MockBlockValidation) BlockFound(ctx context.Context, blockHash *chainh
 	return nil
 }
 
-func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32) error {
+func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, baseURL string, peerID string) error {
 	return nil
 }
 

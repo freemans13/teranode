@@ -39,7 +39,7 @@ func (m *Mock) BlockFound(ctx context.Context, blockHash *chainhash.Hash, baseUR
 }
 
 // ProcessBlock performs a mock block processing.
-func (m *Mock) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32) error {
+func (m *Mock) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, baseURL string, peerID string) error {
 	args := m.Called(ctx, block, blockHeight)
 	return args.Error(0)
 }

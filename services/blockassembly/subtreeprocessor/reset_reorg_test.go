@@ -48,7 +48,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		}
 
 		// Test reset with no blocks to move
-		response := stp.Reset(targetHeader, nil, nil, false)
+		response := stp.Reset(targetHeader, nil, nil, false, nil)
 		assert.NoError(t, response.Err)
 	})
 
@@ -91,7 +91,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test reset with a block to move back
-		response := stp.Reset(targetHeader, []*model.Block{block1}, nil, false)
+		response := stp.Reset(targetHeader, []*model.Block{block1}, nil, false, nil)
 		assert.NoError(t, response.Err)
 	})
 
@@ -129,7 +129,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		}
 
 		// Test reset with a block to move forward
-		response := stp.Reset(targetHeader, nil, []*model.Block{block2}, false)
+		response := stp.Reset(targetHeader, nil, []*model.Block{block2}, false, nil)
 		assert.NoError(t, response.Err)
 	})
 
@@ -160,7 +160,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		}
 
 		// Test reset with legacy sync enabled
-		response := stp.Reset(targetHeader, nil, nil, true)
+		response := stp.Reset(targetHeader, nil, nil, true, nil)
 		assert.NoError(t, response.Err)
 	})
 
@@ -290,7 +290,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		// 1. Move back the specified blocks
 		// 2. Add their transactions back to the processor
 		// 3. Reset the processor state to the target header
-		response := stp.Reset(resetTargetHeader, []*model.Block{moveBackBlock2, moveBackBlock1}, nil, false)
+		response := stp.Reset(resetTargetHeader, []*model.Block{moveBackBlock2, moveBackBlock1}, nil, false, nil)
 
 		// Verify reset results
 		finalTxCount := stp.TxCount()
@@ -566,7 +566,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		// 3. duplicateTx should be handled properly (not duplicated)
 		// Note: We removed the concurrent transaction addition during reset as it was causing race conditions
 		// The test should verify that reset properly clears all existing transactions
-		response := stp.Reset(resetTargetHeader, []*model.Block{moveBackBlock}, []*model.Block{moveForwardBlock}, false)
+		response := stp.Reset(resetTargetHeader, []*model.Block{moveBackBlock}, []*model.Block{moveForwardBlock}, false, nil)
 
 		// Verify final state
 		finalTxMap := stp.GetCurrentTxMap()
@@ -594,7 +594,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 			assert.False(t, hasDuplicateTx, "All transactions should be cleared after reset")
 			assert.False(t, hasMoveBackOnlyTx, "All transactions should be cleared after reset")
 			assert.False(t, hasMoveForwardOnlyTx, "All transactions should be cleared after reset")
-			assert.Equal(t, uint64(0), finalTxCount, "Transaction count should be 0 after reset")
+			assert.Equal(t, uint64(1), finalTxCount, "Transaction count should be 1 after reset") // Only first coinbase tx
 
 			t.Logf("✅ RESET TEST PASSED: Reset properly cleared all transactions")
 		} else {

@@ -155,6 +155,43 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 		return nil, errors.NewProcessingError("failed to create tx inpoints from inputs", err)
 	}
 
+	blockIds := make([]uint32, 0, 2)
+
+	q3 := `
+			SELECT
+			    block_id
+			FROM block_ids
+			WHERE transaction_id = $1
+			ORDER BY block_id
+		`
+
+	rows2, err := it.store.db.QueryContext(ctx, q3, id)
+	if err != nil {
+		if err := it.Close(); err != nil {
+			it.store.logger.Warnf("failed to close iterator: %v", err)
+		}
+
+		it.err = err
+
+		return nil, it.err
+	}
+
+	defer rows2.Close()
+
+	for rows2.Next() {
+		var blockId uint32
+
+		if err = rows2.Scan(&blockId); err != nil {
+			if err = it.Close(); err != nil {
+				it.store.logger.Warnf("failed to close iterator: %v", err)
+			}
+
+			return nil, err
+		}
+
+		blockIds = append(blockIds, blockId)
+	}
+
 	return &utxo.UnminedTransaction{
 		Hash:       txID,
 		Fee:        fee,
@@ -162,6 +199,7 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 		TxInpoints: txInpoints,
 		CreatedAt:  int(insertedAt.UnixMilli()),
 		Locked:     locked,
+		BlockIDs:   blockIds,
 	}, nil
 }
 

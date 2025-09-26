@@ -58,9 +58,6 @@ func initStores(t *testing.T) (*memory.Memory, utxo.Store, *settings.Settings, b
 	tSettings.Policy.BlockMaxSize = 1000000
 	tSettings.ChainCfgParams = &chaincfg.MainNetParams
 
-	tSettings.BlockAssembly.ResetWaitCount = 0
-	tSettings.BlockAssembly.ResetWaitDuration = 0
-
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
 

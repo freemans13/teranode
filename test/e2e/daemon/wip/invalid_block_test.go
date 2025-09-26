@@ -427,7 +427,7 @@ func TestOrphanTxWithSingleNode(t *testing.T) {
 
 	_, block3 := node1.CreateTestBlock(t, block2, 3, childTx)
 
-	require.Error(t, node1.BlockValidationClient.ProcessBlock(node1.Ctx, block3, block3.Height))
+	require.Error(t, node1.BlockValidationClient.ProcessBlock(node1.Ctx, block3, block3.Height, "legacy", ""))
 
 	bestHeight, _, err := node1.BlockchainClient.GetBestHeightAndTime(node1.Ctx)
 	require.NoError(t, err)
@@ -634,7 +634,7 @@ func TestUnminedConflictResolution(t *testing.T) {
 	bestHeight, _, err := node1.BlockchainClient.GetBestHeightAndTime(node1.Ctx)
 	require.NoError(t, err)
 
-	assert.Equal(t, uint32(5), bestHeight) //TODO: this should be 6
+	assert.Equal(t, uint32(5), bestHeight) // TODO: this should be 6
 
 	bestHeight, _, err = node2.BlockchainClient.GetBestHeightAndTime(node2.Ctx)
 	require.NoError(t, err)
