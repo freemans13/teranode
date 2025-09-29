@@ -89,27 +89,43 @@ func (s *serviceClient) Resolve(ctx context.Context, host string, port string) (
 	return eps, nil
 }
 
-func (s *serviceClient) Watch(_ context.Context, host string) (<-chan watch.Event, chan struct{}, error) {
+func (s *serviceClient) Watch(ctx context.Context, host string) (<-chan watch.Event, chan struct{}, error) {
 	s.logger.Debugf("[k8s] Watch called with host: %s", host)
 
 	ev := make(chan watch.Event)
+	stop := make(chan struct{})
 
 	watchList := cache.NewListWatchFromClient(s.k8s.CoreV1().RESTClient(), "endpoints", s.namespace, fields.OneTermEqualSelector("metadata.name", host))
 	_, controller := cache.NewInformer(watchList, &v1.Endpoints{}, time.Second*5, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ev <- watch.Event{Type: watch.Added, Object: obj.(runtime.Object)}
+			select {
+			case ev <- watch.Event{Type: watch.Added, Object: obj.(runtime.Object)}:
+			case <-ctx.Done():
+			case <-stop:
+			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			ev <- watch.Event{Type: watch.Deleted, Object: obj.(runtime.Object)}
+			select {
+			case ev <- watch.Event{Type: watch.Deleted, Object: obj.(runtime.Object)}:
+			case <-ctx.Done():
+			case <-stop:
+			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			ev <- watch.Event{Type: watch.Modified, Object: newObj.(runtime.Object)}
+			select {
+			case ev <- watch.Event{Type: watch.Modified, Object: newObj.(runtime.Object)}:
+			case <-ctx.Done():
+			case <-stop:
+			}
 		},
 	})
 
-	stop := make(chan struct{})
+	go func() {
+		defer close(ev)
 
-	go controller.Run(stop)
+		// Start the controller with the stop channel
+		controller.Run(stop)
+	}()
 
 	return ev, stop, nil
 }

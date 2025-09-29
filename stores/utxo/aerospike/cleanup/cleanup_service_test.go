@@ -31,6 +31,7 @@ func createTestSettings() *settings.Settings {
 			CleanupDeleteBatcherSize:                 256,
 			CleanupDeleteBatcherDurationMillis:       10,
 			CleanupMaxConcurrentOperations:           128,
+			UtxoBatchSize:                            128, // Add missing UtxoBatchSize
 		},
 	}
 }
@@ -338,13 +339,15 @@ func TestDeleteAtHeight(t *testing.T) {
 	writePolicy := aerospike.NewWritePolicy(0, 0)
 
 	txIDParent := chainhash.HashH([]byte("parent"))
-	keyParent, _ := aerospike.NewKey(namespace, set, txIDParent[:])
+	keySourceParent := uaerospike.CalculateKeySource(&txIDParent, 0, 128)
+	keyParent, _ := aerospike.NewKey(namespace, set, keySourceParent)
 
 	txID1 := chainhash.HashH([]byte("test1"))
 	key1, _ := aerospike.NewKey(namespace, set, txID1[:])
 
 	txID2Parent := chainhash.HashH([]byte("parent2"))
-	keyParent2, _ := aerospike.NewKey(namespace, set, txID2Parent[:])
+	keySourceParent2 := uaerospike.CalculateKeySource(&txID2Parent, 0, 128)
+	keyParent2, _ := aerospike.NewKey(namespace, set, keySourceParent2)
 
 	txID2 := chainhash.HashH([]byte("test2"))
 	key2, _ := aerospike.NewKey(namespace, set, txID2[:])
