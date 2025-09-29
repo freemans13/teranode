@@ -1456,9 +1456,9 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 	}
 	if err != nil {
 		s.logger.Errorf("[handleNodeStatusNotification] error getting best block header: %s", err)
-		// Provide empty values if we can't get the best block
-		bestBlockHeader = &model.BlockHeader{}
-		bestBlockMeta = &model.BlockHeaderMeta{}
+		// Use genesis block as fallback when we can't get the best block
+		bestBlockHeader = model.GenesisBlockHeader
+		bestBlockMeta = model.GenesisBlockHeaderMeta
 	}
 
 	// Calculate uptime
