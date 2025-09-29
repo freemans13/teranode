@@ -1149,10 +1149,33 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "peer_cannot_provide_subtree_data")
 				u.logger.Errorf("[validateSubtree][%s] failed to get subtree data from %s: %v", subtreeHash.String(), url, subtreeDataErr)
 			} else {
-				if subtreeDataErr = u.subtreeStore.SetFromReader(ctx,
+				// load the subtree data, making sure to validate it against the subtree txs
+				// this is less efficient than reading straight to disk with SetFromReader, but we need to validate the
+				// data before storing it on disk
+				subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, body)
+				if err != nil {
+					u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
+				}
+
+				_ = body.Close()
+
+				// check that the last tx is the same, making sure we are not missing any transactions
+				if !subtree.Nodes[len(subtree.Nodes)-1].Hash.Equal(*subtreeData.Txs[len(subtreeData.Txs)-1].TxIDChainHash()) {
+					return nil, errors.NewProcessingError("[validateSubtree][%s] subtree data does not match subtree", subtreeHash.String())
+				}
+
+				subtreeDataBytes, err := subtreeData.Serialize()
+				if err != nil {
+					u.logger.Errorf("[validateSubtree][%s] failed to serialize subtree data: %v", subtreeHash.String(), err)
+				}
+
+				dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
+
+				if subtreeDataErr = u.subtreeStore.Set(ctx,
 					subtreeHash[:],
 					fileformat.FileTypeSubtreeData,
-					body,
+					subtreeDataBytes,
+					options.WithDeleteAt(dah),
 				); subtreeDataErr != nil {
 					u.logger.Errorf("[validateSubtree][%s] failed to store subtree data: %v", subtreeHash.String(), subtreeDataErr)
 				} else {
@@ -1430,6 +1453,12 @@ func (u *Server) getMissingTransactionsFromFile(ctx context.Context, subtreeHash
 	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, subtreeDataReader)
 	if err != nil {
 		return nil, err
+	}
+
+	// check that the last tx is the same, making sure we are not missing any transactions
+	lastSubtreeDataTx := subtreeData.Txs[len(subtreeData.Txs)-1]
+	if lastSubtreeDataTx == nil || !subtree.Nodes[len(subtree.Nodes)-1].Hash.Equal(*lastSubtreeDataTx.TxIDChainHash()) {
+		return nil, errors.NewProcessingError("[validateSubtree][%s] subtree data does not match subtree", subtreeHash.String())
 	}
 
 	subtreeLookupMap, err := subtree.GetMap()

@@ -15,6 +15,7 @@ import (
 	"github.com/bitcoin-sv/teranode/services/blockchain"
 	"github.com/bitcoin-sv/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bitcoin-sv/teranode/services/validator"
+	"github.com/bitcoin-sv/teranode/stores/blob/options"
 	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -87,6 +88,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}
 
+	// This only works on single instances, not in clustered environments
 	if shouldPauseProcessing {
 		u.logger.Infof("[CheckBlockSubtrees] Block %s is on our chain or extending it - pausing subtree processing", block.Hash().String())
 		u.pauseSubtreeProcessing.Store(true)
@@ -121,7 +123,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 	// Shared collection for all transactions across subtrees
 	var (
-		subtree         *subtreepkg.Subtree
 		subtreeTxs      = make([][]*bt.Tx, len(missingSubtrees))
 		allTransactions = make([]*bt.Tx, 0, block.TransactionCount)
 	)
@@ -130,6 +131,8 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
+	dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
+
 	for subtreeIdx, subtreeHash := range missingSubtrees {
 		subtreeHash := subtreeHash
 		subtreeIdx := subtreeIdx
@@ -137,6 +140,70 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, 1024) // Pre-allocate space for transactions in this subtree
 
 		g.Go(func() (err error) {
+			subtreeToCheckExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+			if err != nil {
+				return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree exists in store", subtreeHash.String(), err)
+			}
+
+			var subtreeToCheck *subtreepkg.Subtree
+
+			if subtreeToCheckExists {
+				// get the subtreeToCheck from the store
+				subtreeReader, err := u.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+				if err != nil {
+					return errors.NewStorageError("[CheckBlockSubtrees][%s] failed to get subtree from store", subtreeHash.String(), err)
+				}
+				defer subtreeReader.Close()
+
+				subtreeToCheck, err = subtreepkg.NewSubtreeFromReader(subtreeReader)
+				if err != nil {
+					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to deserialize subtree", subtreeHash.String(), err)
+				}
+			} else {
+				// get the subtree from the peer
+				url := fmt.Sprintf("%s/subtree/%s", request.BaseUrl, subtreeHash.String())
+
+				subtreeNodeBytes, err := util.DoHTTPRequest(gCtx, url)
+				if err != nil {
+					return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree from %s", subtreeHash.String(), url, err)
+				}
+
+				subtreeToCheck, err = subtreepkg.NewTreeByLeafCount(len(subtreeNodeBytes) / chainhash.HashSize)
+				if err != nil {
+					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to create subtree structure", subtreeHash.String(), err)
+				}
+
+				var nodeHash chainhash.Hash
+				for i := 0; i < len(subtreeNodeBytes)/chainhash.HashSize; i++ {
+					copy(nodeHash[:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
+
+					if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+						if err = subtreeToCheck.AddCoinbaseNode(); err != nil {
+							return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to add coinbase node to subtree", subtreeHash.String(), err)
+						}
+					} else {
+						if err = subtreeToCheck.AddNode(nodeHash, 0, 0); err != nil {
+							return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to add node to subtree", subtreeHash.String(), err)
+						}
+					}
+				}
+
+				if !subtreeHash.Equal(*subtreeToCheck.RootHash()) {
+					return errors.NewProcessingError("[CheckBlockSubtrees][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
+				}
+
+				subtreeBytes, err := subtreeToCheck.Serialize()
+				if err != nil {
+					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to serialize subtree", subtreeHash.String(), err)
+				}
+
+				// Store the subtreeToCheck for later processing
+				// we not set a DAH as this is part of a block and will be permanently stored anyway
+				if err = u.subtreeStore.Set(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah)); err != nil {
+					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to store subtree", subtreeHash.String(), err)
+				}
+			}
+
 			subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 			if err != nil {
 				return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
@@ -152,7 +219,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				}
 
 				// Process transactions directly from the stream while storing to disk
-				err = u.processSubtreeDataStream(gCtx, subtreeHash, body, &subtreeTxs[subtreeIdx])
+				err = u.processSubtreeDataStream(gCtx, subtreeToCheck, body, &subtreeTxs[subtreeIdx])
 				_ = body.Close()
 
 				if err != nil {
@@ -160,7 +227,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				}
 			} else {
 				// SubtreeData exists, extract transactions from stored file
-				err = u.extractAndCollectTransactions(gCtx, subtreeHash, &subtreeTxs[subtreeIdx])
+				err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx])
 				if err != nil {
 					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to extract transactions", subtreeHash.String(), err)
 				}
@@ -223,7 +290,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					AllowFailFast: false,
 				}
 
-				if subtree, err = u.ValidateSubtreeInternal(
+				subtree, err := u.ValidateSubtreeInternal(
 					ctx,
 					v,
 					block.Height,
@@ -231,7 +298,8 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					validator.WithSkipPolicyChecks(true),
 					validator.WithCreateConflicting(true),
 					validator.WithIgnoreLocked(true),
-				); err != nil {
+				)
+				if err != nil {
 					u.logger.Debugf("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err)
 					revalidateSubtreesMutex.Lock()
 					revalidateSubtrees = append(revalidateSubtrees, subtreeHash)
@@ -264,7 +332,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				AllowFailFast: false,
 			}
 
-			if subtree, err = u.ValidateSubtreeInternal(
+			subtree, err := u.ValidateSubtreeInternal(
 				ctx,
 				v,
 				block.Height,
@@ -272,7 +340,8 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				validator.WithSkipPolicyChecks(true),
 				validator.WithCreateConflicting(true),
 				validator.WithIgnoreLocked(true),
-			); err != nil {
+			)
+			if err != nil {
 				return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err)
 			}
 
@@ -292,15 +361,15 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 // extractAndCollectTransactions extracts all transactions from a subtree's data file
 // and adds them to the shared collection for block-wide processing
-func (u *Server) extractAndCollectTransactions(ctx context.Context, subtreeHash chainhash.Hash, subtreeTransactions *[]*bt.Tx) error {
+func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *subtreepkg.Subtree, subtreeTransactions *[]*bt.Tx) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "extractAndCollectTransactions",
 		tracing.WithParentStat(u.stats),
-		tracing.WithDebugLogMessage(u.logger, "[extractAndCollectTransactions] called for subtree %s", subtreeHash.String()),
+		tracing.WithDebugLogMessage(u.logger, "[extractAndCollectTransactions] called for subtree %s", subtree.RootHash().String()),
 	)
 	defer deferFn()
 
 	// Get subtreeData reader
-	subtreeDataReader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
+	subtreeDataReader, err := u.subtreeStore.GetIoReader(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
 	if err != nil {
 		return errors.NewStorageError("[extractAndCollectTransactions] failed to get subtreeData from store", err)
 	}
@@ -310,23 +379,27 @@ func (u *Server) extractAndCollectTransactions(ctx context.Context, subtreeHash 
 	bufferedReader := bufio.NewReaderSize(subtreeDataReader, 1024*128)
 
 	// Read transactions directly into the shared collection
-	txCount, err := u.readTransactionsFromSubtreeDataStream(bufferedReader, subtreeTransactions)
+	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, subtreeTransactions)
 	if err != nil {
 		return errors.NewProcessingError("[extractAndCollectTransactions] failed to read transactions from subtreeData", err)
 	}
 
-	u.logger.Debugf("[extractAndCollectTransactions] Extracted %d transactions from subtree %s", txCount, subtreeHash.String())
+	if txCount != subtree.Length() {
+		return errors.NewProcessingError("[extractAndCollectTransactions] transaction count mismatch: expected %d, got %d", subtree.Length(), txCount)
+	}
+
+	u.logger.Debugf("[extractAndCollectTransactions] Extracted %d transactions from subtree %s", txCount, subtree.RootHash().String())
 
 	return nil
 }
 
 // processSubtreeDataStream processes subtreeData directly from HTTP stream while storing to disk
 // This avoids the inefficiency of writing to disk and immediately reading back
-func (u *Server) processSubtreeDataStream(ctx context.Context, subtreeHash chainhash.Hash,
+func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreepkg.Subtree,
 	body io.ReadCloser, allTransactions *[]*bt.Tx) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processSubtreeDataStream",
 		tracing.WithParentStat(u.stats),
-		tracing.WithDebugLogMessage(u.logger, "[processSubtreeDataStream] called for subtree %s", subtreeHash.String()),
+		tracing.WithDebugLogMessage(u.logger, "[processSubtreeDataStream] called for subtree %s", subtree.RootHash().String()),
 	)
 	defer deferFn()
 
@@ -337,27 +410,37 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtreeHash chain
 	teeReader := io.TeeReader(body, &buffer)
 
 	// Read transactions directly into the shared collection from the stream
-	txCount, err := u.readTransactionsFromSubtreeDataStream(teeReader, allTransactions)
+	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, teeReader, allTransactions)
 	if err != nil {
 		return errors.NewProcessingError("[processSubtreeDataStream] failed to read transactions from stream", err)
 	}
 
+	// make sure the subtree transaction count matches what we read from the stream
+	if txCount != subtree.Length() {
+		return errors.NewProcessingError("[processSubtreeDataStream] transaction count mismatch: expected %d, got %d", subtree.Length(), txCount)
+	}
+
 	// Now store the buffered data to disk
-	err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, buffer.Bytes())
+	// we not set a DAH as this is part of a block and will be permanently stored anyway
+	err = u.subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, buffer.Bytes())
 	if err != nil {
 		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", err)
 	}
 
 	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s directly from stream",
-		txCount, subtreeHash.String())
+		txCount, subtree.RootHash().String())
 
 	return nil
 }
 
 // readTransactionsFromSubtreeDataStream reads transactions directly from subtreeData stream
 // This follows the same pattern as go-subtree's serializeFromReader but appends directly to the shared collection
-func (u *Server) readTransactionsFromSubtreeDataStream(reader io.Reader, subtreeTransactions *[]*bt.Tx) (int, error) {
-	txCount := 0
+func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtree, reader io.Reader, subtreeTransactions *[]*bt.Tx) (int, error) {
+	txIndex := 0
+
+	if len(subtree.Nodes) > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+		txIndex = 1
+	}
 
 	for {
 		tx := &bt.Tx{}
@@ -368,16 +451,32 @@ func (u *Server) readTransactionsFromSubtreeDataStream(reader io.Reader, subtree
 				// End of stream reached
 				break
 			}
-			return txCount, errors.NewProcessingError("[readTransactionsFromSubtreeDataStream] error reading transaction", err)
+			return txIndex, errors.NewProcessingError("[readTransactionsFromSubtreeDataStream] error reading transaction", err)
+		}
+
+		if tx.IsCoinbase() && txIndex == 1 {
+			// we did get an unexpected coinbase transaction
+			// reset the index to 0 to check the coinbase
+			txIndex = 0
 		}
 
 		tx.SetTxHash(tx.TxIDChainHash()) // Cache the transaction hash to avoid recomputing it
 
+		// Basic sanity check: ensure the transaction hash matches the expected hash from the subtree
+		if txIndex < subtree.Length() {
+			expectedHash := subtree.Nodes[txIndex].Hash
+			if !expectedHash.Equal(*tx.TxIDChainHash()) {
+				return txIndex, errors.NewProcessingError("[readTransactionsFromSubtreeDataStream] transaction hash mismatch at index %d: expected %s, got %s", txIndex, expectedHash.String(), tx.TxIDChainHash().String())
+			}
+		} else {
+			return txIndex, errors.NewProcessingError("[readTransactionsFromSubtreeDataStream] more transactions than expected in subtreeData")
+		}
+
 		*subtreeTransactions = append(*subtreeTransactions, tx)
-		txCount++
+		txIndex++
 	}
 
-	return txCount, nil
+	return txIndex, nil
 }
 
 // processTransactionsInLevels processes all transactions from all subtrees using level-based validation

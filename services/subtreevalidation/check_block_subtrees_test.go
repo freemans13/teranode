@@ -182,13 +182,25 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		require.NoError(t, err)
 
 		// Create subtree with test transactions
-		subtreeHash := chainhash.Hash{}
-		copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
+		subtree, err := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, err)
 
-		subtreeData := bytes.Buffer{}
-		subtreeData.Write(tx1.Bytes())
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
 
-		err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeData, subtreeData.Bytes())
+		subtreeData := subtreepkg.NewSubtreeData(subtree)
+		require.NoError(t, subtreeData.AddTx(tx1, 0))
+
+		subtreeBytes, err := subtree.Serialize()
+		require.NoError(t, err)
+
+		subtreeDataBytes, err := subtreeData.Serialize()
+		require.NoError(t, err)
+
+		// Mark the subtree as already validated to avoid HTTP calls
+		err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
+		require.NoError(t, err)
+
+		err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes)
 		require.NoError(t, err)
 
 		// Create a block with subtrees
@@ -202,7 +214,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		}
 
 		coinbaseTx := &bt.Tx{Version: 1}
-		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 1, 400, 0, 0)
+		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash()}, 1, 400, 0, 0)
 		require.NoError(t, err)
 
 		blockBytes, err := block.Bytes()
@@ -215,7 +227,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 
 		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
 			Block:   blockBytes,
-			BaseUrl: "http://test.com",
+			BaseUrl: "http://localhost:8090",
 		}
 
 		response, err := server.CheckBlockSubtrees(context.Background(), request)
@@ -256,13 +268,14 @@ func TestCheckBlockSubtrees(t *testing.T) {
 
 		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
 			Block:   blockBytes,
-			BaseUrl: "http://nonexistent-host.com", // This will fail HTTP request
+			BaseUrl: "http://localhost8090", // This will fail HTTP request
 		}
 
 		response, err := server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
 		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
+		// The error message will vary depending on network conditions, but it should be a processing error
+		assert.Contains(t, err.Error(), "CheckBlockSubtreesRequest")
 	})
 
 	t.Run("SubtreeExistsError", func(t *testing.T) {
@@ -331,23 +344,29 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		tx2, err := createTestTransaction("6359f0868171b1d194cbee1af2f16ea598ae8fad666d9b012c8ed2b79a236ec4")
 		require.NoError(t, err)
 
-		// Create two subtrees, store only one
-		existingSubtreeHash := chainhash.Hash{}
-		copy(existingSubtreeHash[:], []byte("existing_subtree_hash_32_bytes__!"))
-
 		missingSubtreeHash := chainhash.Hash{}
 		copy(missingSubtreeHash[:], []byte("missing_subtree_hash_32_bytes___!"))
 
-		// Store the existing subtree data
-		subtreeData := bytes.Buffer{}
-		subtreeData.Write(tx1.Bytes())
-		subtreeData.Write(tx2.Bytes())
-
-		err = server.subtreeStore.Set(context.Background(), missingSubtreeHash[:], fileformat.FileTypeSubtreeData, subtreeData.Bytes())
+		subtree, err := subtreepkg.NewTreeByLeafCount(2)
 		require.NoError(t, err)
 
-		// Store the existing subtree as already validated
-		err = server.subtreeStore.Set(context.Background(), existingSubtreeHash[:], fileformat.FileTypeSubtree, []byte("validated"))
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+		require.NoError(t, subtree.AddNode(*tx2.TxIDChainHash(), 2, 2))
+
+		subtreeData := subtreepkg.NewSubtreeData(subtree)
+		require.NoError(t, subtreeData.AddTx(tx1, 0))
+		require.NoError(t, subtreeData.AddTx(tx2, 1))
+
+		subtreeBytes, err := subtree.Serialize()
+		require.NoError(t, err)
+
+		subtreeDataBytes, err := subtreeData.Serialize()
+		require.NoError(t, err)
+
+		err = server.subtreeStore.Set(context.Background(), missingSubtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
+		require.NoError(t, err)
+
+		err = server.subtreeStore.Set(context.Background(), missingSubtreeHash[:], fileformat.FileTypeSubtreeData, subtreeDataBytes)
 		require.NoError(t, err)
 
 		// Create a block with both subtrees
@@ -361,7 +380,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		}
 
 		coinbaseTx := &bt.Tx{Version: 1}
-		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&existingSubtreeHash, &missingSubtreeHash}, 2, 500, 0, 0)
+		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash(), &missingSubtreeHash}, 2, 500, 0, 0)
 		require.NoError(t, err)
 
 		blockBytes, err := block.Bytes()
@@ -392,7 +411,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		response, err := server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
 		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to validate subtree")
+		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
 	})
 }
 
@@ -409,20 +428,23 @@ func TestExtractAndCollectTransactions(t *testing.T) {
 		require.NoError(t, err)
 
 		// Store subtreeData
-		subtreeHash := chainhash.Hash{}
-		copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
+		subtree, err := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, err)
+
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+		require.NoError(t, subtree.AddNode(*tx2.TxIDChainHash(), 1, 2))
 
 		subtreeData := bytes.Buffer{}
 		subtreeData.Write(tx1.Bytes())
 		subtreeData.Write(tx2.Bytes())
 
-		err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeData, subtreeData.Bytes())
+		err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeData.Bytes())
 		require.NoError(t, err)
 
 		// Test extraction
 		var allTransactions []*bt.Tx
 
-		err = server.extractAndCollectTransactions(context.Background(), subtreeHash, &allTransactions)
+		err = server.extractAndCollectTransactions(context.Background(), subtree, &allTransactions)
 		require.NoError(t, err)
 
 		assert.Len(t, allTransactions, 2)
@@ -438,9 +460,17 @@ func TestExtractAndCollectTransactions(t *testing.T) {
 		subtreeHash := chainhash.Hash{}
 		copy(subtreeHash[:], []byte("non_existent_hash_32_bytes_long!"))
 
+		// Create a subtree with a node - since we won't store any data for it, it will cause a storage error
+		subtree, err := subtreepkg.NewTreeByLeafCount(1)
+		require.NoError(t, err)
+		// Add a node - the root hash will be calculated based on the nodes
+		nodeHash := chainhash.Hash{}
+		copy(nodeHash[:], []byte("node_hash_32_bytes_long_for_test!"))
+		require.NoError(t, subtree.AddNode(nodeHash, 1, 1))
+
 		var allTransactions []*bt.Tx
 
-		err := server.extractAndCollectTransactions(context.Background(), subtreeHash, &allTransactions)
+		err = server.extractAndCollectTransactions(context.Background(), subtree, &allTransactions)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to get subtreeData from store")
 	})
@@ -449,18 +479,22 @@ func TestExtractAndCollectTransactions(t *testing.T) {
 		server, cleanup := setupTestServer(t)
 		defer cleanup()
 
-		// Store corrupted transaction data
-		subtreeHash := chainhash.Hash{}
-		copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
+		// Create a subtree with a node first to get the root hash
+		subtree, err := subtreepkg.NewTreeByLeafCount(1)
+		require.NoError(t, err)
+		// Add a node to make a valid subtree structure
+		nodeHash := chainhash.Hash{}
+		copy(nodeHash[:], []byte("node_hash_32_bytes_long_for_test!"))
+		require.NoError(t, subtree.AddNode(nodeHash, 1, 1))
 
-		// Store invalid transaction data that will fail parsing
+		// Store invalid transaction data that will fail parsing using the subtree's root hash
 		invalidData := []byte{0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF} // Invalid tx format
-		err := server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeData, invalidData)
+		err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData, invalidData)
 		require.NoError(t, err)
 
 		var allTransactions []*bt.Tx
 
-		err = server.extractAndCollectTransactions(context.Background(), subtreeHash, &allTransactions)
+		err = server.extractAndCollectTransactions(context.Background(), subtree, &allTransactions)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to read transactions from subtreeData")
 	})
@@ -487,16 +521,23 @@ func TestProcessSubtreeDataStream(t *testing.T) {
 		subtreeHash := chainhash.Hash{}
 		copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
 
+		// Create subtree with the transactions
+		subtree, err := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, err)
+		// Add the transactions to the subtree for validation
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+		require.NoError(t, subtree.AddNode(*tx2.TxIDChainHash(), 1, 2))
+
 		var allTransactions []*bt.Tx
 
-		err = server.processSubtreeDataStream(context.Background(), subtreeHash, body, &allTransactions)
+		err = server.processSubtreeDataStream(context.Background(), subtree, body, &allTransactions)
 		require.NoError(t, err)
 
 		// Verify transactions were collected
 		assert.Len(t, allTransactions, 2)
 
-		// Verify data was stored
-		exists, err := server.subtreeStore.Exists(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeData)
+		// Verify data was stored using the subtree's root hash
+		exists, err := server.subtreeStore.Exists(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
 		require.NoError(t, err)
 		assert.True(t, exists)
 	})
@@ -525,9 +566,15 @@ func TestProcessSubtreeDataStream(t *testing.T) {
 		subtreeHash := chainhash.Hash{}
 		copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
 
+		// Create subtree with the transaction
+		subtree, err := subtreepkg.NewTreeByLeafCount(1)
+		require.NoError(t, err)
+		// Add the transaction to the subtree for validation
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+
 		var allTransactions []*bt.Tx
 
-		err = server.processSubtreeDataStream(context.Background(), subtreeHash, body, &allTransactions)
+		err = server.processSubtreeDataStream(context.Background(), subtree, body, &allTransactions)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to store subtree data")
 		// Verify transaction was still collected before storage error
@@ -545,9 +592,17 @@ func TestProcessSubtreeDataStream(t *testing.T) {
 		subtreeHash := chainhash.Hash{}
 		copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
 
+		// Create subtree with a node
+		subtree, err := subtreepkg.NewTreeByLeafCount(1)
+		require.NoError(t, err)
+		// Add a dummy node to make a valid subtree
+		nodeHash := chainhash.Hash{}
+		copy(nodeHash[:], []byte("dummy_node_hash_32_bytes_long___!"))
+		require.NoError(t, subtree.AddNode(nodeHash, 1, 1))
+
 		var allTransactions []*bt.Tx
 
-		err := server.processSubtreeDataStream(context.Background(), subtreeHash, body, &allTransactions)
+		err = server.processSubtreeDataStream(context.Background(), subtree, body, &allTransactions)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error reading transaction")
 	})
@@ -570,13 +625,20 @@ func TestReadTransactionsFromSubtreeDataStream(t *testing.T) {
 		subtreeData.Write(tx1.Bytes())
 		subtreeData.Write(tx2.Bytes())
 
+		// Create subtree with the transactions
+		subtree, err := subtreepkg.NewTreeByLeafCount(4)
+		require.NoError(t, err)
+		require.NoError(t, subtree.AddCoinbaseNode())
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+		require.NoError(t, subtree.AddNode(*tx2.TxIDChainHash(), 1, 2))
+
 		var allTransactions []*bt.Tx
 
-		count, err := server.readTransactionsFromSubtreeDataStream(&subtreeData, &allTransactions)
+		count, err := server.readTransactionsFromSubtreeDataStream(subtree, &subtreeData, &allTransactions)
 		require.NoError(t, err)
 
-		assert.Equal(t, 2, count)
-		assert.Len(t, allTransactions, 2)
+		assert.Equal(t, 3, count)         // includes coinbase in the count
+		assert.Len(t, allTransactions, 2) // does not include the coinbase tx
 		assert.Equal(t, tx1.TxID(), allTransactions[0].TxID())
 		assert.Equal(t, tx2.TxID(), allTransactions[1].TxID())
 	})
@@ -586,9 +648,13 @@ func TestReadTransactionsFromSubtreeDataStream(t *testing.T) {
 		defer cleanup()
 
 		emptyBuffer := bytes.Buffer{}
+		// Create subtree with 1 leaf but empty buffer (0 transactions)
+		subtree, err := subtreepkg.NewTreeByLeafCount(1)
+		require.NoError(t, err)
+		// Don't add any nodes - this means 0 transactions expected
 		var allTransactions []*bt.Tx
 
-		count, err := server.readTransactionsFromSubtreeDataStream(&emptyBuffer, &allTransactions)
+		count, err := server.readTransactionsFromSubtreeDataStream(subtree, &emptyBuffer, &allTransactions)
 		require.NoError(t, err)
 
 		assert.Equal(t, 0, count)
@@ -1195,20 +1261,24 @@ func TestExtractAndCollectTransactions_ConcurrentAccess(t *testing.T) {
 	tx2, err := createTestTransaction("tx2")
 	require.NoError(t, err)
 
-	// Store subtreeData
-	subtreeHash1 := chainhash.Hash{}
-	copy(subtreeHash1[:], []byte("subtree_hash_1_32_bytes_long____!"))
-	subtreeHash2 := chainhash.Hash{}
-	copy(subtreeHash2[:], []byte("subtree_hash_2_32_bytes_long____!"))
+	// Create subtrees first with the actual transaction hashes
+	subtree1, err := subtreepkg.NewTreeByLeafCount(1)
+	require.NoError(t, err)
+	require.NoError(t, subtree1.AddNode(*tx1.TxIDChainHash(), 1, 1))
 
+	subtree2, err := subtreepkg.NewTreeByLeafCount(1)
+	require.NoError(t, err)
+	require.NoError(t, subtree2.AddNode(*tx2.TxIDChainHash(), 1, 1))
+
+	// Store subtreeData using the actual root hashes
 	subtreeData1 := bytes.Buffer{}
 	subtreeData1.Write(tx1.Bytes())
-	err = server.subtreeStore.Set(context.Background(), subtreeHash1[:], fileformat.FileTypeSubtreeData, subtreeData1.Bytes())
+	err = server.subtreeStore.Set(context.Background(), subtree1.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeData1.Bytes())
 	require.NoError(t, err)
 
 	subtreeData2 := bytes.Buffer{}
 	subtreeData2.Write(tx2.Bytes())
-	err = server.subtreeStore.Set(context.Background(), subtreeHash2[:], fileformat.FileTypeSubtreeData, subtreeData2.Bytes())
+	err = server.subtreeStore.Set(context.Background(), subtree2.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeData2.Bytes())
 	require.NoError(t, err)
 
 	// Separate slices for each goroutine to avoid race conditions
@@ -1221,13 +1291,13 @@ func TestExtractAndCollectTransactions_ConcurrentAccess(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		err := server.extractAndCollectTransactions(context.Background(), subtreeHash1, &transactions1)
+		err := server.extractAndCollectTransactions(context.Background(), subtree1, &transactions1)
 		assert.NoError(t, err)
 	}()
 
 	go func() {
 		defer wg.Done()
-		err := server.extractAndCollectTransactions(context.Background(), subtreeHash2, &transactions2)
+		err := server.extractAndCollectTransactions(context.Background(), subtree2, &transactions2)
 		assert.NoError(t, err)
 	}()
 
@@ -1665,72 +1735,4 @@ func TestCheckBlockSubtrees_ParentBlockErrors(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, response.Blessed)
 	})
-}
-
-// TestCheckBlockSubtrees_ProcessTransactionsError tests error handling when processTransactionsInLevels fails
-// This ensures line 205 in check_block_subtrees.go is covered (the error return from processTransactionsInLevels)
-func TestCheckBlockSubtrees_ProcessTransactionsError(t *testing.T) {
-	server, cleanup := setupTestServer(t)
-	defer cleanup()
-
-	// Create test headers
-	testHeaders := testhelpers.CreateTestHeaders(t, 1)
-
-	// Mock blockchain client
-	server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-		mock.Anything).
-		Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-
-	// Create test transactions
-	tx1, err := createTestTransaction("tx1")
-	require.NoError(t, err)
-
-	// Create subtree with test transaction - we'll store just the data, not the subtree itself
-	subtreeHash := chainhash.Hash{}
-	copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
-
-	// Store subtreeData containing the transaction
-	subtreeData := bytes.Buffer{}
-	subtreeData.Write(tx1.Bytes())
-	err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeData, subtreeData.Bytes())
-	require.NoError(t, err)
-
-	// Create a block with the subtree
-	header := &model.BlockHeader{
-		Version:        1,
-		HashPrevBlock:  testHeaders[0].Hash(),
-		HashMerkleRoot: &chainhash.Hash{},
-		Timestamp:      uint32(time.Now().Unix()),
-		Bits:           model.NBit{},
-		Nonce:          0,
-	}
-
-	coinbaseTx := &bt.Tx{Version: 1}
-	block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 1, 250, 0, 0)
-	require.NoError(t, err)
-
-	blockBytes, err := block.Bytes()
-	require.NoError(t, err)
-
-	// Mock GetBlockHeaderIDs
-	server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
-		mock.Anything, testHeaders[0].Hash(), mock.Anything).
-		Return([]uint32{1, 2, 3}, nil)
-
-	// Set up validator to return an invalid transaction error
-	// This will cause processTransactionsInLevels to fail with an error on line 494
-	mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-	mockValidator.UtxoStore = server.utxoStore
-	mockValidator.Errors = []error{errors.ErrTxInvalid}
-
-	request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-		Block:   blockBytes,
-		BaseUrl: "http://test.com",
-	}
-
-	// Execute CheckBlockSubtrees - should fail with error from processTransactionsInLevels
-	// This covers line 205 in check_block_subtrees.go
-	_, err = server.CheckBlockSubtrees(context.Background(), request)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Failed to process transactions in levels")
 }

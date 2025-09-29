@@ -293,6 +293,9 @@ func TestNewStore_BlockchainClientError(t *testing.T) {
 
 	// Register mock database initializer
 	mockStore := &MockUTXOStore{}
+	mockStore.On("SetBlockHeight", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockStore.On("SetMedianBlockTime", mock.Anything, mock.Anything).Return(nil).Maybe()
+
 	availableDatabases["memory"] = func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error) {
 		return mockStore, nil
 	}

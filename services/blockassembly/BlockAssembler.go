@@ -485,6 +485,8 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 		tracing.WithLogMessage(b.logger, "[processNewBlockAnnouncement] called"),
 	)
 	defer func() {
+		b.setCurrentRunningState(StateRunning)
+
 		deferFn()
 	}()
 

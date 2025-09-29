@@ -390,20 +390,64 @@ func TestShouldFollowLongerChain(t *testing.T) {
 	err = ba.blockchainClient.AddBlock(ctx, blockB, "")
 	require.NoError(t, err, "Failed to add Chain B block")
 
-	// Create new block assembler to check which chain it follows
-	newBA := New(ulogger.TestLogger{}, ba.settings, ba.txStore, ba.utxoStore, ba.subtreeStore, ba.blockchainClient)
-	require.NotNil(t, newBA)
-
-	err = newBA.Init(ctx)
-	require.NoError(t, err)
-
 	// Get the best block header from the new block assembler
 	bestHeader, _, err := ba.blockchainClient.GetBestBlockHeader(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, bestHeader)
 
 	// Assert that it followed chain A (higher difficulty)
-	assert.Equal(t, chainAHeader1.Hash(), bestHeader.Hash(), "Block assembler should follow the chain with higher difficulty")
+	assert.Equal(t, chainAHeader1.Hash(), bestHeader.Hash(), "Blockchain should show the higher chain")
+
+	WaitForBlock(t, blockA, 10*time.Second, ba.blockchainClient, ba.blockAssembler)
+
+	baBestBlock := ba.blockAssembler.bestBlockHeader.Load()
+	require.NotNil(t, baBestBlock)
+	assert.Equal(t, chainAHeader1.Hash(), baBestBlock.Hash(), "Block assembler should follow the chain with higher difficulty")
+}
+
+// waitForBlock waits until the expected block is found in the blockchain and verifies the chain integrity.
+// TODO remove this function and use the testdaemon, or refactor that to use this function
+func WaitForBlock(t *testing.T, expectedBlock *model.Block, timeout time.Duration, blockchainClient blockchain.ClientI, blockassembly *BlockAssembler) {
+	deadline := time.Now().Add(timeout)
+
+	var (
+		err         error
+		currentHash chainhash.Hash
+	)
+
+finished:
+	for {
+		switch {
+		case time.Now().After(deadline):
+			t.Fatalf("Timeout waiting for block %s", expectedBlock.Header.Hash().String())
+		default:
+			_, err = blockchainClient.GetBlock(t.Context(), expectedBlock.Header.Hash())
+			if err == nil {
+				break finished
+			}
+
+			if !errors.Is(err, errors.ErrBlockNotFound) {
+				t.Fatalf("Failed to get block at hash %s: %v", expectedBlock.Header.Hash().String(), err)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for currentHash.String() != expectedBlock.Header.Hash().String() {
+		currentBlockHeader := blockassembly.bestBlockHeader.Load()
+		if currentBlockHeader != nil {
+			currentHash = *currentBlockHeader.Hash()
+		}
+
+		if time.Now().After(deadline) {
+			t.Logf("Timeout waiting for block %s", expectedBlock.Header.Hash().String())
+			break
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	require.Equal(t, expectedBlock.Header.Hash().String(), currentHash.String(), "Expected block assembly to reach hash %s but got %s", expectedBlock.Header.Hash().String(), currentHash)
 }
 
 // This testcase tests TNA-3: Teranode must work on finding a difficult proof-of-work for its block

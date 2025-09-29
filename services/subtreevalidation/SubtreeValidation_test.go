@@ -887,6 +887,7 @@ func Test_getSubtreeMissingTxs(t *testing.T) {
 		assert.Equal(t, *hash1, *missingTxs[0].tx.TxIDChainHash())
 		assert.Equal(t, *hash2, *missingTxs[1].tx.TxIDChainHash())
 	})
+
 	t.Run("getSubtreeMissingTxs - from data with coinbase & odd number of txs", func(t *testing.T) {
 		txMetaStore, validatorClient, _, subtreeStore, blockchainClient, deferFunc := setup(t)
 		defer deferFunc()
@@ -935,6 +936,97 @@ func Test_getSubtreeMissingTxs(t *testing.T) {
 
 		// validate the txs are correct
 		assert.Equal(t, *hash2, *missingTxs[0].tx.TxIDChainHash())
+	})
+
+	t.Run("getSubtreeMissingTxs - from data with tx mismatch", func(t *testing.T) {
+		txMetaStore, validatorClient, _, subtreeStore, blockchainClient, deferFunc := setup(t)
+		defer deferFunc()
+
+		// Create a mock Server struct
+		s := &Server{
+			logger:           ulogger.TestLogger{},
+			settings:         tSettings,
+			utxoStore:        txMetaStore,
+			subtreeStore:     subtreeStore,
+			validatorClient:  validatorClient,
+			blockchainClient: blockchainClient,
+		}
+
+		coinbaseSubtree, err := subtreepkg.NewIncompleteTreeByLeafCount(3)
+		require.NoError(t, err)
+		require.NoError(t, coinbaseSubtree.AddCoinbaseNode())
+		require.NoError(t, coinbaseSubtree.AddNode(*hash2, 122, 2))
+		require.NoError(t, coinbaseSubtree.AddNode(*hash3, 123, 3))
+
+		unresolved := []utxo.UnresolvedMetaData{{
+			Hash: *hash2,
+		}}
+
+		subtreeDataBytes := make([]byte, 0, 2048)
+		subtreeDataBytes = append(subtreeDataBytes, tx3.ExtendedBytes()...)
+		subtreeDataBytes = append(subtreeDataBytes, tx2.ExtendedBytes()...)
+
+		err = subtreeStore.Set(t.Context(),
+			coinbaseSubtree.RootHash()[:],
+			fileformat.FileTypeSubtreeData,
+			subtreeDataBytes,
+		)
+		require.NoError(t, err)
+
+		allTxs := []chainhash.Hash{
+			subtreepkg.CoinbasePlaceholderHashValue,
+			*hash2,
+			*hash3,
+		}
+
+		_, err = s.getSubtreeMissingTxs(t.Context(), *coinbaseSubtree.RootHash(), coinbaseSubtree, unresolved, allTxs, "test")
+		require.Error(t, err, "should be an error since txs are in the wrong order")
+	})
+
+	t.Run("getSubtreeMissingTxs - from data with tx missing", func(t *testing.T) {
+		txMetaStore, validatorClient, _, subtreeStore, blockchainClient, deferFunc := setup(t)
+		defer deferFunc()
+
+		// Create a mock Server struct
+		s := &Server{
+			logger:           ulogger.TestLogger{},
+			settings:         tSettings,
+			utxoStore:        txMetaStore,
+			subtreeStore:     subtreeStore,
+			validatorClient:  validatorClient,
+			blockchainClient: blockchainClient,
+		}
+
+		coinbaseSubtree, err := subtreepkg.NewIncompleteTreeByLeafCount(3)
+		require.NoError(t, err)
+		require.NoError(t, coinbaseSubtree.AddCoinbaseNode())
+		require.NoError(t, coinbaseSubtree.AddNode(*hash2, 122, 2))
+		require.NoError(t, coinbaseSubtree.AddNode(*hash3, 123, 3))
+
+		unresolved := []utxo.UnresolvedMetaData{{
+			Hash: *hash2,
+		}}
+
+		subtreeDataBytes := make([]byte, 0, 2048)
+		subtreeDataBytes = append(subtreeDataBytes, tx2.ExtendedBytes()...)
+		// tx3 is missing to simulate a mismatch
+		// subtreeDataBytes = append(subtreeDataBytes, tx3.ExtendedBytes()...)
+
+		err = subtreeStore.Set(t.Context(),
+			coinbaseSubtree.RootHash()[:],
+			fileformat.FileTypeSubtreeData,
+			subtreeDataBytes,
+		)
+		require.NoError(t, err)
+
+		allTxs := []chainhash.Hash{
+			subtreepkg.CoinbasePlaceholderHashValue,
+			*hash2,
+			*hash3,
+		}
+
+		_, err = s.getSubtreeMissingTxs(t.Context(), *coinbaseSubtree.RootHash(), coinbaseSubtree, unresolved, allTxs, "test")
+		require.Error(t, err, "should be an error since we are missing a tx")
 	})
 }
 
