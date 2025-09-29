@@ -1128,12 +1128,8 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// large reorg, log it and Reset the block assembler
 		b.logger.Warnf("[BlockAssembler] large reorg detected, resetting block assembly, moveBackBlocks: %d, moveForwardBlocks: %d", len(moveBackBlocksWithMeta), len(moveForwardBlocksWithMeta))
 
-		errCh := make(chan error, 1)
-
 		// make sure we wait for the reset to complete
-		b.resetCh <- errCh
-
-		if err = <-errCh; err != nil {
+		if err = b.reset(ctx, false); err != nil {
 			b.logger.Errorf("[BlockAssembler] error resetting after large reorg: %v", err)
 		}
 
