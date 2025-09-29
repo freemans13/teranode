@@ -120,7 +120,7 @@ func (m *MockStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	return nil, nil
 }
 
-func (m *MockStore) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+func (m *MockStore) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return nil, errors.NewProcessingError("not implemented")
 }
 

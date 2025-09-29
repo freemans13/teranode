@@ -385,8 +385,26 @@ func (s *Client) sendBatchToBlockAssembly(ctx context.Context, batch []*batchIte
 //
 // Returns:
 //   - error: Any error encountered during reset
-func (s *Client) ResetBlockAssembly(_ context.Context) error {
-	_, err := s.client.ResetBlockAssembly(context.Background(), &blockassembly_api.EmptyMessage{})
+func (s *Client) ResetBlockAssembly(ctx context.Context) error {
+	_, err := s.client.ResetBlockAssembly(ctx, &blockassembly_api.EmptyMessage{})
+
+	unwrappedErr := errors.UnwrapGRPC(err)
+	if unwrappedErr == nil {
+		return nil
+	}
+
+	return unwrappedErr
+}
+
+// ResetBlockAssemblyFully triggers a full reset of the block assembly state.
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//
+// Returns:
+//   - error: Any error encountered during reset
+func (s *Client) ResetBlockAssemblyFully(ctx context.Context) error {
+	_, err := s.client.ResetBlockAssemblyFully(ctx, &blockassembly_api.EmptyMessage{})
 
 	unwrappedErr := errors.UnwrapGRPC(err)
 	if unwrappedErr == nil {

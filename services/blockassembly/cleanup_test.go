@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bitcoin-sv/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bitcoin-sv/teranode/services/blockchain"
 	"github.com/bitcoin-sv/teranode/stores/utxo"
@@ -100,16 +99,7 @@ func TestCleanupDuringStartup(t *testing.T) {
 		settings.UtxoStore.UnminedTxRetention = 5
 
 		// Setup expectations in order
-		var cleanupCalled, iteratorCalled bool
-
-		// Cleanup should be called first
-		mockStore.On("QueryOldUnminedTransactions", mock.Anything, uint32(95)). // 100 - 5
-											Return([]chainhash.Hash{}, nil).
-											Run(func(args mock.Arguments) {
-				cleanupCalled = true
-				assert.False(t, iteratorCalled, "Cleanup should be called before iterator")
-			}).
-			Once()
+		var iteratorCalled bool
 
 		// Then iterator should be called
 		mockIterator := new(MockUnminedTxIterator)
@@ -117,7 +107,6 @@ func TestCleanupDuringStartup(t *testing.T) {
 			Return(mockIterator, nil).
 			Run(func(args mock.Arguments) {
 				iteratorCalled = true
-				assert.True(t, cleanupCalled, "Iterator should be called after cleanup")
 			}).
 			Once()
 
@@ -126,7 +115,7 @@ func TestCleanupDuringStartup(t *testing.T) {
 			Once()
 
 		blockchainClient := &blockchain.Mock{}
-		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 
 		// Create BlockAssembler with mocked dependencies
 		ba := &BlockAssembler{
@@ -142,10 +131,9 @@ func TestCleanupDuringStartup(t *testing.T) {
 		ba.bestBlockHeight.Store(100)
 
 		// Call loadUnminedTransactions which includes cleanup
-		err := ba.loadUnminedTransactions(ctx)
+		err := ba.loadUnminedTransactions(ctx, false)
 
 		require.NoError(t, err)
-		assert.True(t, cleanupCalled)
 		assert.True(t, iteratorCalled)
 		mockStore.AssertExpectations(t)
 		mockIterator.AssertExpectations(t)
@@ -197,11 +185,6 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 			CreatedAt:  1000,
 		}
 
-		// Setup cleanup expectation
-		mockStore.On("QueryOldUnminedTransactions", mock.Anything, uint32(95)).
-			Return([]chainhash.Hash{}, nil).
-			Once()
-
 		// Setup iterator expectations - iterator should only return non-conflicting transactions
 		mockIterator := new(MockUnminedTxIterator)
 		mockStore.On("GetUnminedTxIterator").
@@ -229,7 +212,7 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 			Once()
 
 		blockchainClient := &blockchain.Mock{}
-		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 
 		// Create BlockAssembler with mocked dependencies
 		ba := &BlockAssembler{
@@ -245,7 +228,7 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 		ba.bestBlockHeight.Store(100)
 
 		// Call loadUnminedTransactions
-		err := ba.loadUnminedTransactions(ctx)
+		err := ba.loadUnminedTransactions(ctx, false)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)

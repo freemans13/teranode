@@ -216,8 +216,8 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	return blockIDsMap, err
 }
 
-func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
-	return s.store.GetUnminedTxIterator()
+func (s *Store) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
+	return s.store.GetUnminedTxIterator(false)
 }
 
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {

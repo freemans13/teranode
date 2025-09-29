@@ -576,7 +576,7 @@ func (t *TxMetaCache) SetMinedMultiParallel(ctx context.Context, hashes []*chain
 	return nil
 }
 
-func (t *TxMetaCache) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+func (t *TxMetaCache) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return nil, errors.NewProcessingError("not implemented")
 }
 

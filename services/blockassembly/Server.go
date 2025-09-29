@@ -1132,7 +1132,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		ba.logger.Errorf("[BlockAssembly][%s][%s] invalid block: %v - %v", jobID, block.Hash().String(), block.Header, err)
 
 		// the subtreeprocessor created an invalid block, we must reset
-		ba.blockAssembler.Reset()
+		ba.blockAssembler.Reset(false)
 
 		// remove the job, we cannot use it anymore
 		ba.jobStore.Delete(*storeID)
@@ -1308,7 +1308,25 @@ func (ba *BlockAssembly) ResetBlockAssembly(ctx context.Context, _ *blockassembl
 		return nil, errors.NewServiceError("service not ready - unmined transactions are still being loaded")
 	}
 
-	ba.blockAssembler.Reset()
+	ba.blockAssembler.Reset(false)
+
+	return &blockassembly_api.EmptyMessage{}, nil
+}
+
+func (ba *BlockAssembly) ResetBlockAssemblyFully(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error) {
+	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "ResetBlockAssemblyFully",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithLogMessage(ba.logger, "[ResetBlockAssemblyFully] called"),
+	)
+	defer deferFn()
+
+	// Check if unmined transactions are still being loaded
+	if ba.blockAssembler.unminedTransactionsLoading.Load() {
+		ba.logger.Warnf("[ResetBlockAssemblyFully] service not ready - unmined transactions are still being loaded")
+		return nil, errors.NewServiceError("service not ready - unmined transactions are still being loaded")
+	}
+
+	ba.blockAssembler.Reset(true)
 
 	return &blockassembly_api.EmptyMessage{}, nil
 }

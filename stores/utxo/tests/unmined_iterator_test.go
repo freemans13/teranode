@@ -74,7 +74,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 		require.NoError(t, store.Delete(ctx, tx1.TxIDChainHash()))
 		require.NoError(t, store.Delete(ctx, tx2.TxIDChainHash()))
 
-		it, err := store.GetUnminedTxIterator()
+		it, err := store.GetUnminedTxIterator(false)
 		require.NoError(t, err)
 
 		var count int
@@ -114,7 +114,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 		))
 		require.NoError(t, err)
 
-		it, err := store.GetUnminedTxIterator()
+		it, err := store.GetUnminedTxIterator(false)
 		require.NoError(t, err)
 
 		var count int
@@ -162,7 +162,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 		))
 		require.NoError(t, err)
 
-		it, err := store.GetUnminedTxIterator()
+		it, err := store.GetUnminedTxIterator(false)
 		require.NoError(t, err)
 
 		var count int
@@ -182,7 +182,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 	})
 
 	t.Run("iterator Close cancels context and marks done", func(t *testing.T) {
-		it, err := store.GetUnminedTxIterator()
+		it, err := store.GetUnminedTxIterator(false)
 		require.NoError(t, err)
 
 		assert.NoError(t, it.Close())

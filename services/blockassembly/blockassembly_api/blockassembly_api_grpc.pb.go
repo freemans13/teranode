@@ -28,6 +28,7 @@ const (
 	BlockAssemblyAPI_GetCurrentDifficulty_FullMethodName           = "/blockassembly_api.BlockAssemblyAPI/GetCurrentDifficulty"
 	BlockAssemblyAPI_SubmitMiningSolution_FullMethodName           = "/blockassembly_api.BlockAssemblyAPI/SubmitMiningSolution"
 	BlockAssemblyAPI_ResetBlockAssembly_FullMethodName             = "/blockassembly_api.BlockAssemblyAPI/ResetBlockAssembly"
+	BlockAssemblyAPI_ResetBlockAssemblyFully_FullMethodName        = "/blockassembly_api.BlockAssemblyAPI/ResetBlockAssemblyFully"
 	BlockAssemblyAPI_GetBlockAssemblyState_FullMethodName          = "/blockassembly_api.BlockAssemblyAPI/GetBlockAssemblyState"
 	BlockAssemblyAPI_GenerateBlocks_FullMethodName                 = "/blockassembly_api.BlockAssemblyAPI/GenerateBlocks"
 	BlockAssemblyAPI_CheckBlockAssembly_FullMethodName             = "/blockassembly_api.BlockAssemblyAPI/CheckBlockAssembly"
@@ -68,6 +69,10 @@ type BlockAssemblyAPIClient interface {
 	// ResetBlockAssembly resets the block assembly state.
 	// Useful for handling reorgs or recovering from errors.
 	ResetBlockAssembly(ctx context.Context, in *EmptyMessage, opts ...grpc.CallOption) (*EmptyMessage, error)
+	// ResetBlockAssemblyFully performs a complete reset of the block assembly state.
+	// This includes clearing all transactions and resetting internal structures.
+	// This will traverse the whole UTXO set and is more intensive than a standard reset.
+	ResetBlockAssemblyFully(ctx context.Context, in *EmptyMessage, opts ...grpc.CallOption) (*EmptyMessage, error)
 	// GetBlockAssemblyState retrieves the current state of block assembly.
 	// Provides detailed information about the assembly process status.
 	GetBlockAssemblyState(ctx context.Context, in *EmptyMessage, opts ...grpc.CallOption) (*StateMessage, error)
@@ -174,6 +179,16 @@ func (c *blockAssemblyAPIClient) ResetBlockAssembly(ctx context.Context, in *Emp
 	return out, nil
 }
 
+func (c *blockAssemblyAPIClient) ResetBlockAssemblyFully(ctx context.Context, in *EmptyMessage, opts ...grpc.CallOption) (*EmptyMessage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EmptyMessage)
+	err := c.cc.Invoke(ctx, BlockAssemblyAPI_ResetBlockAssemblyFully_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *blockAssemblyAPIClient) GetBlockAssemblyState(ctx context.Context, in *EmptyMessage, opts ...grpc.CallOption) (*StateMessage, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateMessage)
@@ -257,6 +272,10 @@ type BlockAssemblyAPIServer interface {
 	// ResetBlockAssembly resets the block assembly state.
 	// Useful for handling reorgs or recovering from errors.
 	ResetBlockAssembly(context.Context, *EmptyMessage) (*EmptyMessage, error)
+	// ResetBlockAssemblyFully performs a complete reset of the block assembly state.
+	// This includes clearing all transactions and resetting internal structures.
+	// This will traverse the whole UTXO set and is more intensive than a standard reset.
+	ResetBlockAssemblyFully(context.Context, *EmptyMessage) (*EmptyMessage, error)
 	// GetBlockAssemblyState retrieves the current state of block assembly.
 	// Provides detailed information about the assembly process status.
 	GetBlockAssemblyState(context.Context, *EmptyMessage) (*StateMessage, error)
@@ -306,6 +325,9 @@ func (UnimplementedBlockAssemblyAPIServer) SubmitMiningSolution(context.Context,
 }
 func (UnimplementedBlockAssemblyAPIServer) ResetBlockAssembly(context.Context, *EmptyMessage) (*EmptyMessage, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResetBlockAssembly not implemented")
+}
+func (UnimplementedBlockAssemblyAPIServer) ResetBlockAssemblyFully(context.Context, *EmptyMessage) (*EmptyMessage, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ResetBlockAssemblyFully not implemented")
 }
 func (UnimplementedBlockAssemblyAPIServer) GetBlockAssemblyState(context.Context, *EmptyMessage) (*StateMessage, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetBlockAssemblyState not implemented")
@@ -487,6 +509,24 @@ func _BlockAssemblyAPI_ResetBlockAssembly_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BlockAssemblyAPI_ResetBlockAssemblyFully_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EmptyMessage)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BlockAssemblyAPIServer).ResetBlockAssemblyFully(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BlockAssemblyAPI_ResetBlockAssemblyFully_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BlockAssemblyAPIServer).ResetBlockAssemblyFully(ctx, req.(*EmptyMessage))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _BlockAssemblyAPI_GetBlockAssemblyState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(EmptyMessage)
 	if err := dec(in); err != nil {
@@ -615,6 +655,10 @@ var BlockAssemblyAPI_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResetBlockAssembly",
 			Handler:    _BlockAssemblyAPI_ResetBlockAssembly_Handler,
+		},
+		{
+			MethodName: "ResetBlockAssemblyFully",
+			Handler:    _BlockAssemblyAPI_ResetBlockAssemblyFully_Handler,
 		},
 		{
 			MethodName: "GetBlockAssemblyState",

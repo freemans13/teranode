@@ -826,7 +826,7 @@ func processInputsToTxInpoints(bins aerospike.BinMap) (txInpoints subtree.TxInpo
 func processBlockIDs(bins aerospike.BinMap) ([]uint32, error) {
 	blockIDs, ok := bins[fields.BlockIDs.String()].([]interface{})
 	if !ok {
-		return nil, errors.NewTxInvalidError("missing block IDs")
+		return []uint32{}, nil
 	}
 
 	if len(blockIDs) == 0 {

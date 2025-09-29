@@ -33,6 +33,7 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 		,t.size_in_bytes
 		,t.inserted_at
 		,t.locked
+		,t.coinbase
 		FROM transactions t
 		WHERE t.unmined_since IS NOT NULL
 		  AND t.conflicting = false
@@ -70,9 +71,10 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 		sizeInBytes uint64
 		insertedAt  time.CustomTime
 		locked      bool
+		isCoinbase  bool
 	)
 
-	if err := it.rows.Scan(&id, &txID, &fee, &sizeInBytes, &insertedAt, &locked); err != nil {
+	if err := it.rows.Scan(&id, &txID, &fee, &sizeInBytes, &insertedAt, &locked, &isCoinbase); err != nil {
 		if err := it.Close(); err != nil {
 			it.store.logger.Warnf("failed to close iterator: %v", err)
 		}
@@ -107,6 +109,13 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 	}
 
 	defer rows.Close()
+
+	if isCoinbase {
+		// skip coinbase transactions
+		return &utxo.UnminedTransaction{
+			Skip: true,
+		}, nil
+	}
 
 	tx := bt.Tx{}
 
@@ -213,6 +222,6 @@ func (it *unminedTxIterator) Close() error {
 	return it.rows.Close()
 }
 
-func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+func (s *Store) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return newUnminedTxIterator(s)
 }

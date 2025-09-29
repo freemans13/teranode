@@ -141,6 +141,9 @@ type BlockAssembler struct {
 	// resetCh handles reset requests for the assembler
 	resetCh chan chan error
 
+	// resetFullCh handles full reset requests for the assembler
+	resetFullCh chan chan error
+
 	// currentRunningState tracks the current operational state
 	currentRunningState atomic.Value
 
@@ -230,6 +233,7 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 		currentChainMapIDs:  make(map[uint32]struct{}, tSettings.BlockAssembly.MaxBlockReorgCatchup),
 		defaultMiningNBits:  defaultMiningBits,
 		resetCh:             make(chan chan error, 2),
+		resetFullCh:         make(chan chan error, 2),
 		currentRunningState: atomic.Value{},
 		cachedCandidate:     &CachedMiningCandidate{},
 	}
@@ -299,11 +303,30 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 			case errCh := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
 
-				err := b.reset(ctx)
+				err := b.reset(ctx, false)
 
 				// empty out the reset channel
 				for len(b.resetCh) > 0 {
 					bufferedErrCh := <-b.resetCh
+					if bufferedErrCh != nil {
+						bufferedErrCh <- nil
+					}
+				}
+
+				if errCh != nil {
+					errCh <- err
+				}
+
+				b.setCurrentRunningState(StateRunning)
+
+			case errCh := <-b.resetFullCh:
+				b.setCurrentRunningState(StateResetting)
+
+				err := b.reset(ctx, true)
+
+				// empty out the reset channel
+				for len(b.resetFullCh) > 0 {
+					bufferedErrCh := <-b.resetFullCh
 					if bufferedErrCh != nil {
 						bufferedErrCh <- nil
 					}
@@ -371,7 +394,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 	return nil
 }
 
-func (b *BlockAssembler) reset(ctx context.Context) error {
+func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 	bestBlockchainBlockHeader, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
 		return errors.NewProcessingError("[Reset] error getting best block header", err)
@@ -383,10 +406,6 @@ func (b *BlockAssembler) reset(ctx context.Context) error {
 	moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
 	if err != nil {
 		return errors.NewProcessingError("[Reset] error getting reorg blocks", err)
-	}
-
-	if len(moveBackBlocksWithMeta) == 0 && len(moveForwardBlocksWithMeta) == 0 {
-		return errors.NewProcessingError("[Reset] no reorg blocks found, invalid reset")
 	}
 
 	isLegacySync, err := b.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateLEGACYSYNCING)
@@ -420,7 +439,7 @@ func (b *BlockAssembler) reset(ctx context.Context) error {
 	// in the for/select in the subtreeprocessor
 	postProcessFn := func() error {
 		// reload the unmined transactions
-		if err = b.loadUnminedTransactions(ctx); err != nil {
+		if err = b.loadUnminedTransactions(ctx, fullScan); err != nil {
 			return errors.NewProcessingError("[Reset] error loading unmined transactions", err)
 		}
 
@@ -597,7 +616,7 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	}
 
 	// Load unmined transactions (this includes cleanup of old unmined transactions first)
-	if err = b.loadUnminedTransactions(ctx); err != nil {
+	if err = b.loadUnminedTransactions(ctx, false); err != nil {
 		// we cannot start block assembly if we have not loaded unmined transactions successfully
 		return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions: %v", err)
 	}
@@ -749,12 +768,16 @@ func (b *BlockAssembler) RemoveTx(hash chainhash.Hash) error {
 
 // Reset triggers a reset of the block assembler state.
 // This operation runs asynchronously to prevent blocking.
-func (b *BlockAssembler) Reset() {
+func (b *BlockAssembler) Reset(fullReset bool) {
 	// run in a go routine to prevent blocking
 	go func() {
 		errCh := make(chan error, 1)
 
-		b.resetCh <- errCh
+		if fullReset {
+			b.resetFullCh <- errCh
+		} else {
+			b.resetCh <- errCh
+		}
 
 		if err := <-errCh; err != nil {
 			b.logger.Errorf("[BlockAssembler] error resetting: %v", err)
@@ -1145,7 +1168,7 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// we have an invalid block in the reorg or reorg failed, we need to reset the block assembly and load the unmined transactions again
 		b.logger.Warnf("[BlockAssembler] reorg contains invalid block, resetting block assembly, moveBackBlocks: %d, moveForwardBlocks: %d", len(moveBackBlocks), len(moveForwardBlocks))
 
-		if err = b.reset(ctx); err != nil {
+		if err = b.reset(ctx, false); err != nil {
 			return errors.NewProcessingError("error resetting block assembly after reorg with invalid block", err)
 		}
 	}
@@ -1363,7 +1386,7 @@ func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) 
 //
 // Returns:
 //   - error: Any error encountered during transaction loading or processing
-func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error) {
+func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan bool) (err error) {
 	// Set flag to indicate unmined transactions are being loaded
 	b.unminedTransactionsLoading.Store(true)
 	defer func() {
@@ -1372,63 +1395,61 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error
 		b.logger.Infof("[loadUnminedTransactions] unmined transaction loading completed")
 	}()
 
-	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "loadUnminedTransactions",
-		tracing.WithParentStat(b.stats),
-		tracing.WithLogMessage(b.logger, "[loadUnminedTransactions] starting cleanup of old unmined transactions before loading"),
-	)
-	defer deferFn(err)
-
 	if b.utxoStore == nil {
 		return errors.NewServiceError("[BlockAssembler] no utxostore")
 	}
 
-	currentBlockHeight := b.bestBlockHeight.Load()
+	scanHeaders := uint64(1000)
 
-	if currentBlockHeight > 0 {
-		cleanupCount, err := utxo.PreserveParentsOfOldUnminedTransactions(ctx, b.utxoStore, currentBlockHeight, b.settings, b.logger)
-
-		switch {
-		case err != nil:
-			b.logger.Errorf("[BlockAssembler] failed to cleanup old unmined transactions: %v", err)
-		case cleanupCount > 0:
-			b.logger.Infof("[BlockAssembler] cleanup completed - removed %d old unmined transactions", cleanupCount)
-		default:
-			b.logger.Infof("[BlockAssembler] cleanup completed - no old unmined transactions found")
+	if !fullScan {
+		// Wait for the unmined_since index to be ready before attempting to get the iterator
+		// This is similar to how the cleanup service waits for the delete_at_height index
+		if indexWaiter, ok := b.utxoStore.(interface {
+			WaitForIndexReady(ctx context.Context, indexName string) error
+		}); ok {
+			if err := indexWaiter.WaitForIndexReady(ctx, "unminedSinceIndex"); err != nil {
+				b.logger.Warnf("[BlockAssembler] failed to wait for unmined_since index: %v", err)
+				// Continue anyway as this may be a non-Aerospike store
+			}
 		}
 	} else {
-		b.logger.Infof("[BlockAssembler] skipping cleanup - block height is 0")
-	}
-
-	b.logger.Infof("[BlockAssembler] now loading remaining unmined transactions")
-
-	// Wait for the unmined_since index to be ready before attempting to get the iterator
-	// This is similar to how the cleanup service waits for the delete_at_height index
-	if indexWaiter, ok := b.utxoStore.(interface {
-		WaitForIndexReady(ctx context.Context, indexName string) error
-	}); ok {
-		if err := indexWaiter.WaitForIndexReady(ctx, "unminedSinceIndex"); err != nil {
-			b.logger.Warnf("[BlockAssembler] failed to wait for unmined_since index: %v", err)
-			// Continue anyway as this may be a non-Aerospike store
+		// get the full header count so we can do a full scan of all unmined transactions
+		_, bestBlockHeaderMeta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+		if err != nil {
+			return errors.NewProcessingError("error getting best block header meta", err)
 		}
+
+		if bestBlockHeaderMeta.Height > 0 {
+			scanHeaders = uint64(bestBlockHeaderMeta.Height)
+		} else {
+			scanHeaders = 1000
+		}
+
+		b.logger.Infof("[BlockAssembler] doing full scan of unmined transactions, scanning last %d headers", scanHeaders)
 	}
 
-	_, bestBlockHeadersMeta, err := b.blockchainClient.GetBlockHeaders(ctx, b.bestBlockHeader.Load().Hash(), 1000)
+	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, b.bestBlockHeader.Load().Hash(), scanHeaders)
 	if err != nil {
 		return errors.NewProcessingError("error getting best block headers", err)
 	}
 
-	bestBlockHeaderIDs := make(map[uint32]bool)
-	for _, meta := range bestBlockHeadersMeta {
-		bestBlockHeaderIDs[meta.ID] = true
+	bestBlockHeaderIDsMap := make(map[uint32]bool, len(bestBlockHeaderIDs))
+	for _, id := range bestBlockHeaderIDs {
+		bestBlockHeaderIDsMap[id] = true
 	}
 
-	it, err := b.utxoStore.GetUnminedTxIterator()
+	it, err := b.utxoStore.GetUnminedTxIterator(fullScan)
 	if err != nil {
 		return errors.NewProcessingError("error getting unmined tx iterator", err)
 	}
 
 	unminedTransactions := make([]*utxo.UnminedTransaction, 0, 1024*1024) // preallocate a large slice to avoid reallocations
 	lockedTransactions := make([]chainhash.Hash, 0, 1024)
+
+	// keep track of transactions that we need to mark as mined on the longest chain
+	// this is for transactions that are included in a block that is in the best chain
+	// but the transaction itself is still marked as unmined, this can happen if block assembly got dirty
+	markAsMinedOnLongestChain := make([]chainhash.Hash, 0, 1024)
 
 	for {
 		unminedTransaction, err := it.Next(ctx)
@@ -1440,18 +1461,27 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error
 			break
 		}
 
+		if unminedTransaction.Skip {
+			continue
+		}
+
 		if len(unminedTransaction.BlockIDs) > 0 {
 			// If the transaction is already included in a block that is in the best chain, skip it
-			skip := false
+			skipAlreadyMined := false
 			for _, blockID := range unminedTransaction.BlockIDs {
-				if bestBlockHeaderIDs[blockID] {
-					skip = true
+				if bestBlockHeaderIDsMap[blockID] {
+					skipAlreadyMined = true
 					break
 				}
 			}
 
-			if skip {
-				b.logger.Infof("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
+			if skipAlreadyMined {
+				b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
+
+				if unminedTransaction.UnminedSince > 0 {
+					markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, *unminedTransaction.Hash)
+				}
+
 				continue
 			}
 		}
@@ -1462,6 +1492,16 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context) (err error
 			// if the transaction is locked, we need to add it to the locked transactions list, so we can unlock them
 			lockedTransactions = append(lockedTransactions, *unminedTransaction.Hash)
 		}
+	}
+
+	// If we are in a full scan, we are doing an exhaustive check of the block assembly
+	// we need to mark transactions that are already mined on the longest chain in the utxo store
+	if fullScan && len(markAsMinedOnLongestChain) > 0 {
+		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, markAsMinedOnLongestChain, true); err != nil {
+			return errors.NewProcessingError("error marking transactions as mined on longest chain", err)
+		}
+
+		b.logger.Infof("[BlockAssembler] marked %d unmined transactions as mined on longest chain", len(markAsMinedOnLongestChain))
 	}
 
 	// order the transactions by createdAt

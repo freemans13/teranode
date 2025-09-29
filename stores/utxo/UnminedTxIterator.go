@@ -14,13 +14,15 @@ import (
 // UnminedTransaction represents an unmined transaction in the UTXO store.
 // It contains metadata about transactions that have been validated but not yet included in a block.
 type UnminedTransaction struct {
-	Hash       *chainhash.Hash
-	Fee        uint64
-	Size       uint64
-	TxInpoints subtree.TxInpoints
-	CreatedAt  int
-	Locked     bool
-	BlockIDs   []uint32
+	Hash         *chainhash.Hash
+	Fee          uint64
+	Size         uint64
+	TxInpoints   subtree.TxInpoints
+	CreatedAt    int
+	Locked       bool
+	Skip         bool
+	UnminedSince int
+	BlockIDs     []uint32
 }
 
 // UnminedTxIterator provides an interface to iterate over unmined transactions efficiently.

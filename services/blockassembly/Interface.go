@@ -108,6 +108,15 @@ type ClientI interface {
 	//   - error: Any error encountered during reset
 	ResetBlockAssembly(ctx context.Context) error
 
+	// ResetBlockAssemblyFully fully resets the block assembly state.
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation
+	//
+	// Returns:
+	//   - error: Any error encountered during reset
+	ResetBlockAssemblyFully(ctx context.Context) error
+
 	// GetBlockAssemblyState retrieves the current state of block assembly.
 	//
 	// Parameters:

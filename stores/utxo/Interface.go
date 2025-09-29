@@ -248,7 +248,7 @@ type Store interface {
 	SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo MinedBlockInfo) (map[chainhash.Hash][]uint32, error)
 
 	// GetUnminedTxIterator returns an iterator for all unmined transactions in the store.
-	GetUnminedTxIterator() (UnminedTxIterator, error)
+	GetUnminedTxIterator(fullScan bool) (UnminedTxIterator, error)
 
 	// QueryOldUnminedTransactions returns transaction hashes for unmined transactions older than the cutoff height.
 	// This method is used by the store-agnostic cleanup implementation.

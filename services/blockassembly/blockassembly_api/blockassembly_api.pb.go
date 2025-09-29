@@ -993,7 +993,8 @@ const file_services_blockassembly_blockassembly_api_blockassembly_api_proto_rawD
 	"\x05block\x18\x01 \x01(\fR\x05block\"I\n" +
 	"\x1bGetBlockAssemblyTxsResponse\x12\x18\n" +
 	"\atxCount\x18\x01 \x01(\x04R\atxCount\x12\x10\n" +
-	"\x03txs\x18\x02 \x03(\tR\x03txs2\xef\t\n" +
+	"\x03txs\x18\x02 \x03(\tR\x03txs2\xce\n" +
+	"\n" +
 	"\x10BlockAssemblyAPI\x12R\n" +
 	"\n" +
 	"HealthGRPC\x12\x1f.blockassembly_api.EmptyMessage\x1a!.blockassembly_api.HealthResponse\"\x00\x12L\n" +
@@ -1004,7 +1005,8 @@ const file_services_blockassembly_blockassembly_api_blockassembly_api_proto_rawD
 	"\x12GetMiningCandidate\x12,.blockassembly_api.GetMiningCandidateRequest\x1a\x16.model.MiningCandidate\"\x00\x12j\n" +
 	"\x14GetCurrentDifficulty\x12\x1f.blockassembly_api.EmptyMessage\x1a/.blockassembly_api.GetCurrentDifficultyResponse\"\x00\x12g\n" +
 	"\x14SubmitMiningSolution\x12..blockassembly_api.SubmitMiningSolutionRequest\x1a\x1d.blockassembly_api.OKResponse\"\x00\x12X\n" +
-	"\x12ResetBlockAssembly\x12\x1f.blockassembly_api.EmptyMessage\x1a\x1f.blockassembly_api.EmptyMessage\"\x00\x12[\n" +
+	"\x12ResetBlockAssembly\x12\x1f.blockassembly_api.EmptyMessage\x1a\x1f.blockassembly_api.EmptyMessage\"\x00\x12]\n" +
+	"\x17ResetBlockAssemblyFully\x12\x1f.blockassembly_api.EmptyMessage\x1a\x1f.blockassembly_api.EmptyMessage\"\x00\x12[\n" +
 	"\x15GetBlockAssemblyState\x12\x1f.blockassembly_api.EmptyMessage\x1a\x1f.blockassembly_api.StateMessage\"\x00\x12]\n" +
 	"\x0eGenerateBlocks\x12(.blockassembly_api.GenerateBlocksRequest\x1a\x1f.blockassembly_api.EmptyMessage\"\x00\x12V\n" +
 	"\x12CheckBlockAssembly\x12\x1f.blockassembly_api.EmptyMessage\x1a\x1d.blockassembly_api.OKResponse\"\x00\x12~\n" +
@@ -1055,26 +1057,28 @@ var file_services_blockassembly_blockassembly_api_blockassembly_api_proto_depIdx
 	0,  // 7: blockassembly_api.BlockAssemblyAPI.GetCurrentDifficulty:input_type -> blockassembly_api.EmptyMessage
 	9,  // 8: blockassembly_api.BlockAssemblyAPI.SubmitMiningSolution:input_type -> blockassembly_api.SubmitMiningSolutionRequest
 	0,  // 9: blockassembly_api.BlockAssemblyAPI.ResetBlockAssembly:input_type -> blockassembly_api.EmptyMessage
-	0,  // 10: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyState:input_type -> blockassembly_api.EmptyMessage
-	13, // 11: blockassembly_api.BlockAssemblyAPI.GenerateBlocks:input_type -> blockassembly_api.GenerateBlocksRequest
-	0,  // 12: blockassembly_api.BlockAssemblyAPI.CheckBlockAssembly:input_type -> blockassembly_api.EmptyMessage
-	0,  // 13: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyBlockCandidate:input_type -> blockassembly_api.EmptyMessage
-	0,  // 14: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyTxs:input_type -> blockassembly_api.EmptyMessage
-	1,  // 15: blockassembly_api.BlockAssemblyAPI.HealthGRPC:output_type -> blockassembly_api.HealthResponse
-	7,  // 16: blockassembly_api.BlockAssemblyAPI.AddTx:output_type -> blockassembly_api.AddTxResponse
-	0,  // 17: blockassembly_api.BlockAssemblyAPI.RemoveTx:output_type -> blockassembly_api.EmptyMessage
-	8,  // 18: blockassembly_api.BlockAssemblyAPI.AddTxBatch:output_type -> blockassembly_api.AddTxBatchResponse
-	17, // 19: blockassembly_api.BlockAssemblyAPI.GetMiningCandidate:output_type -> model.MiningCandidate
-	12, // 20: blockassembly_api.BlockAssemblyAPI.GetCurrentDifficulty:output_type -> blockassembly_api.GetCurrentDifficultyResponse
-	10, // 21: blockassembly_api.BlockAssemblyAPI.SubmitMiningSolution:output_type -> blockassembly_api.OKResponse
-	0,  // 22: blockassembly_api.BlockAssemblyAPI.ResetBlockAssembly:output_type -> blockassembly_api.EmptyMessage
-	11, // 23: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyState:output_type -> blockassembly_api.StateMessage
-	0,  // 24: blockassembly_api.BlockAssemblyAPI.GenerateBlocks:output_type -> blockassembly_api.EmptyMessage
-	10, // 25: blockassembly_api.BlockAssemblyAPI.CheckBlockAssembly:output_type -> blockassembly_api.OKResponse
-	14, // 26: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyBlockCandidate:output_type -> blockassembly_api.GetBlockAssemblyBlockCandidateResponse
-	15, // 27: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyTxs:output_type -> blockassembly_api.GetBlockAssemblyTxsResponse
-	15, // [15:28] is the sub-list for method output_type
-	2,  // [2:15] is the sub-list for method input_type
+	0,  // 10: blockassembly_api.BlockAssemblyAPI.ResetBlockAssemblyFully:input_type -> blockassembly_api.EmptyMessage
+	0,  // 11: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyState:input_type -> blockassembly_api.EmptyMessage
+	13, // 12: blockassembly_api.BlockAssemblyAPI.GenerateBlocks:input_type -> blockassembly_api.GenerateBlocksRequest
+	0,  // 13: blockassembly_api.BlockAssemblyAPI.CheckBlockAssembly:input_type -> blockassembly_api.EmptyMessage
+	0,  // 14: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyBlockCandidate:input_type -> blockassembly_api.EmptyMessage
+	0,  // 15: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyTxs:input_type -> blockassembly_api.EmptyMessage
+	1,  // 16: blockassembly_api.BlockAssemblyAPI.HealthGRPC:output_type -> blockassembly_api.HealthResponse
+	7,  // 17: blockassembly_api.BlockAssemblyAPI.AddTx:output_type -> blockassembly_api.AddTxResponse
+	0,  // 18: blockassembly_api.BlockAssemblyAPI.RemoveTx:output_type -> blockassembly_api.EmptyMessage
+	8,  // 19: blockassembly_api.BlockAssemblyAPI.AddTxBatch:output_type -> blockassembly_api.AddTxBatchResponse
+	17, // 20: blockassembly_api.BlockAssemblyAPI.GetMiningCandidate:output_type -> model.MiningCandidate
+	12, // 21: blockassembly_api.BlockAssemblyAPI.GetCurrentDifficulty:output_type -> blockassembly_api.GetCurrentDifficultyResponse
+	10, // 22: blockassembly_api.BlockAssemblyAPI.SubmitMiningSolution:output_type -> blockassembly_api.OKResponse
+	0,  // 23: blockassembly_api.BlockAssemblyAPI.ResetBlockAssembly:output_type -> blockassembly_api.EmptyMessage
+	0,  // 24: blockassembly_api.BlockAssemblyAPI.ResetBlockAssemblyFully:output_type -> blockassembly_api.EmptyMessage
+	11, // 25: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyState:output_type -> blockassembly_api.StateMessage
+	0,  // 26: blockassembly_api.BlockAssemblyAPI.GenerateBlocks:output_type -> blockassembly_api.EmptyMessage
+	10, // 27: blockassembly_api.BlockAssemblyAPI.CheckBlockAssembly:output_type -> blockassembly_api.OKResponse
+	14, // 28: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyBlockCandidate:output_type -> blockassembly_api.GetBlockAssemblyBlockCandidateResponse
+	15, // 29: blockassembly_api.BlockAssemblyAPI.GetBlockAssemblyTxs:output_type -> blockassembly_api.GetBlockAssemblyTxsResponse
+	16, // [16:30] is the sub-list for method output_type
+	2,  // [2:16] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name

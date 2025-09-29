@@ -1029,7 +1029,7 @@ func (m *MockUTXOStore) Unspend(ctx context.Context, spends []*utxo.Spend, flagA
 func (m *MockUTXOStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	return nil, nil
 }
-func (m *MockUTXOStore) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) { return nil, nil }
+func (m *MockUTXOStore) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) { return nil, nil }
 func (m *MockUTXOStore) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error) {
 	return nil, nil
 }

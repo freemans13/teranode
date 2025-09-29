@@ -100,7 +100,7 @@ func (m *MockUtxostore) SetMinedMulti(ctx context.Context, hashes []*chainhash.H
 
 // GetUnminedTxIterator mocks the creation of an iterator for unmined transactions.
 // Returns the configured mock response for unmined transaction iteration.
-func (m *MockUtxostore) GetUnminedTxIterator() (UnminedTxIterator, error) {
+func (m *MockUtxostore) GetUnminedTxIterator(bool) (UnminedTxIterator, error) {
 	args := m.Called()
 	return args.Get(0).(UnminedTxIterator), args.Error(1)
 }

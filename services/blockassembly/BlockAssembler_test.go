@@ -171,6 +171,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, &model.BlockHeaderMeta{Height: 0}, nil)
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -208,6 +209,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, &model.BlockHeaderMeta{Height: 0}, nil)
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -263,6 +265,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return(stateBytes, nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1}, nil)
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		nextBits := model.NBit{0xff, 0xff, 0x7f, 0x20}
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, bestBlockHeader.Hash(), mock.Anything).Return(&nextBits, nil)
@@ -305,6 +308,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, &model.BlockHeaderMeta{Height: 0}, nil)
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -1721,6 +1725,7 @@ func TestBlockAssembly_Start_InitStateFailures(t *testing.T) {
 		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return([]byte{}, errors.NewProcessingError("blockchain db connection failed"))
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(nil, nil, errors.NewProcessingError("failed to get best block header"))
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -1770,6 +1775,7 @@ func TestBlockAssembly_Start_InitStateFailures(t *testing.T) {
 		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, &model.BlockHeaderMeta{Height: 0}, nil)
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -1999,7 +2005,7 @@ func TestBlockAssembly_LoadUnminedTransactions_ReseedsMinedTx_WhenUnminedSinceNo
 	require.NoError(t, items.utxoStore.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*txHash}, false))
 
 	// Now force the assembler to reload unmined transactions
-	err = items.blockAssembler.loadUnminedTransactions(ctx)
+	err = items.blockAssembler.loadUnminedTransactions(ctx, false)
 	require.NoError(t, err)
 
 	// Verify the transaction was (incorrectly) re-added to the assembler
@@ -2043,7 +2049,7 @@ func TestBlockAssembly_LoadUnminedTransactions_ReorgCornerCase_MisUnsetMinedStat
 	}
 
 	// Reload unmined transactions as would happen after reset/reorg
-	err = items.blockAssembler.loadUnminedTransactions(ctx)
+	err = items.blockAssembler.loadUnminedTransactions(ctx, false)
 	require.NoError(t, err)
 
 	// The mined tx should now be present in the assembler due to the incorrect flip
@@ -2111,7 +2117,7 @@ func TestBlockAssembly_LoadUnminedTransactions_SkipsTransactionsOnCurrentChain(t
 	items.blockAssembler.setBestBlockHeader(blockHeader1, 1)
 
 	// Load unmined transactions
-	err = items.blockAssembler.loadUnminedTransactions(ctx)
+	err = items.blockAssembler.loadUnminedTransactions(ctx, false)
 	require.NoError(t, err)
 
 	// Verify results
