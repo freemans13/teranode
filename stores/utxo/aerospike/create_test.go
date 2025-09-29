@@ -388,11 +388,25 @@ func TestStore_TwoPhaseCommit(t *testing.T) {
 	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{11})
 	require.NoError(t, err)
 
-	block11, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 11)
-	require.NoError(t, err)
+	// Wait for blocks to be persisted to the blockchain store
+	// Poll for block 11 to be available with timeout
+	maxAttempts := 50 // 50 attempts * 200ms = 10 seconds timeout
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		block11, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 11)
+		if err == nil {
+			// Block found, wait for block assembly to get to block 11
+			td.WaitForBlockHeight(t, block11, 10*time.Second)
+			break
+		}
 
-	// Wait for block assembly to get to block 11
-	td.WaitForBlockHeight(t, block11, 10*time.Second)
+		if attempt == maxAttempts-1 {
+			// Last attempt failed, this will cause test to fail
+			require.NoError(t, err, "Block not found after %d attempts", maxAttempts)
+		}
+
+		// Wait before retrying
+		time.Sleep(200 * time.Millisecond)
+	}
 
 	block1, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 1)
 	require.NoError(t, err)
