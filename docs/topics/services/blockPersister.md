@@ -41,6 +41,13 @@ The Block Persister files are optionally post-processed by the UTXO Persister, w
 
 - The Blockchain client is directly accessed to wait for the node State Management to change to `RUNNING` state before beginning block processing operations. For more information on this, please refer to the [State Management](../architecture/stateManagement.md) documentation.
 
+### Detailed Component View
+
+The following diagram provides a deeper level of detail into the Block Persister Service's internal components and their interactions:
+
+![block_persister_detailed_component.svg](img/plantuml/blockpersister/block_persister_detailed_component.svg)
+
+
 ## 2. Functionality
 
 ### 2.1 Service Initialization
