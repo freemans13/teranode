@@ -12,6 +12,8 @@ import (
 )
 
 func TestSyncCoordinator_FSMTransitionBansPeerAndUpdatesRegistry(t *testing.T) {
+	t.Skip("State transition banning temporarily disabled")
+
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()

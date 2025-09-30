@@ -321,16 +321,18 @@ func (sc *SyncCoordinator) handleFSMTransition(currentState *blockchain_api.FSMS
 					currentPeer, localHeight, peerInfo.Height)
 
 				// Add ban score for catchup failure
-				if sc.banManager != nil {
-					score, banned := sc.banManager.AddScore(string(currentPeer), ReasonCatchupFailure)
-					if banned {
-						sc.logger.Warnf("[SyncCoordinator] Peer %s banned after catchup failure (score: %d)", currentPeer, score)
-					} else {
-						sc.logger.Infof("[SyncCoordinator] Added ban score to peer %s for catchup failure (score: %d)", currentPeer, score)
-					}
-					// Update the ban status in the registry so the peer selector knows about it
-					sc.registry.UpdateBanStatus(currentPeer, score, banned)
-				}
+				// Disabled for now, there are many situations where this can happen, we should ban based on actual
+				// errors happening in the sync, not during FSM transitions
+				//if sc.banManager != nil {
+				//	score, banned := sc.banManager.AddScore(string(currentPeer), ReasonCatchupFailure)
+				//	if banned {
+				//		sc.logger.Warnf("[SyncCoordinator] Peer %s banned after catchup failure (score: %d)", currentPeer, score)
+				//	} else {
+				//		sc.logger.Infof("[SyncCoordinator] Added ban score to peer %s for catchup failure (score: %d)", currentPeer, score)
+				//	}
+				//	// Update the ban status in the registry so the peer selector knows about it
+				//	sc.registry.UpdateBanStatus(currentPeer, score, banned)
+				//}
 
 				sc.ClearSyncPeer()
 				_ = sc.TriggerSync()

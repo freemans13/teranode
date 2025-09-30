@@ -1483,6 +1483,8 @@ func TestSyncCoordinator_MonitorFSM_AdaptiveIntervals(t *testing.T) {
 }
 
 func TestSyncCoordinator_HandleFSMTransition_Simplified(t *testing.T) {
+	t.Skip("State transition banning temporarily disabled")
+
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
