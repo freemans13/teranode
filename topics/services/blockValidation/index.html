@@ -2546,15 +2546,6 @@
   
 </li>
         
-          <li class="md-nav__item">
-  <a href="#missing-retry-and-backoff-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      Missing Retry and Backoff Settings
-    </span>
-  </a>
-  
-</li>
-        
       </ul>
     </nav>
   
@@ -2601,6 +2592,15 @@
   <a href="#synchronization-strategy" class="md-nav__link">
     <span class="md-ellipsis">
       Synchronization Strategy
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dependency-injection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Dependency Injection
     </span>
   </a>
   
@@ -4876,15 +4876,6 @@
   
 </li>
         
-          <li class="md-nav__item">
-  <a href="#missing-retry-and-backoff-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      Missing Retry and Backoff Settings
-    </span>
-  </a>
-  
-</li>
-        
       </ul>
     </nav>
   
@@ -4931,6 +4922,15 @@
   <a href="#synchronization-strategy" class="md-nav__link">
     <span class="md-ellipsis">
       Synchronization Strategy
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dependency-injection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Dependency Injection
     </span>
   </a>
   
@@ -5808,34 +5808,6 @@ The <code>BlockValidation</code> proceeds to mark all transactions within the bl
 </tr>
 </tbody>
 </table>
-<h3 id="missing-retry-and-backoff-settings">Missing Retry and Backoff Settings</h3>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Description</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>blockvalidation_arePreviousBlocksProcessed_max_retry</code></td>
-<td>int</td>
-<td>20</td>
-<td>Maximum retries for previous block processing checks</td>
-<td>Controls retry behavior when verifying previous block processing status</td>
-</tr>
-<tr>
-<td><code>blockvalidation_arePreviousBlocksProcessed_retry_backoff_multiplier</code></td>
-<td>int</td>
-<td>30</td>
-<td>Backoff multiplier for previous block processing retries</td>
-<td>Controls exponential backoff timing for previous block processing verification</td>
-</tr>
-</tbody>
-</table>
 <h2 id="configuration-interactions-and-dependencies">Configuration Interactions and Dependencies</h2>
 <p>Many configuration settings interact with each other to affect overall system behavior. Understanding these interactions is crucial for optimal tuning.</p>
 <h3 id="optimistic-mining">Optimistic Mining</h3>
@@ -5888,6 +5860,19 @@ The <code>BlockValidation</code> proceeds to mark all transactions within the bl
 <li><code>blockvalidation_catchupCh_buffer_size</code> - Affects buffer capacity for catchup operations</li>
 </ul>
 <p>Optimal settings depend on hardware capabilities and network conditions.</p>
+<h3 id="dependency-injection">Dependency Injection</h3>
+<p>The Block Validation service receives several critical dependencies through dependency injection during initialization:</p>
+<ul>
+<li><strong>SubtreeStore</strong> - Blob store for subtree data storage and retrieval (configured via daemon)</li>
+<li><strong>TxStore</strong> - Blob store for transaction data storage (configured via daemon)</li>
+<li><strong>UtxoStore</strong> - UTXO store for transaction metadata and validation (configured via daemon)</li>
+<li><strong>BlockchainClient</strong> - Client for blockchain operations and state management (configured via daemon)</li>
+<li><strong>SubtreeValidationClient</strong> - Client for subtree validation operations (configured via daemon)</li>
+<li><strong>ValidatorClient</strong> - Client for transaction validation services (configured via daemon)</li>
+<li><strong>BlockAssemblyClient</strong> - Client for block assembly coordination (configured via daemon)</li>
+<li><strong>KafkaConsumerClient</strong> - Kafka consumer for block notifications and events (configured via daemon)</li>
+</ul>
+<p>These dependencies are configured and injected by the daemon during service initialization, ensuring proper integration with the overall Teranode system architecture.</p>
 <h2 id="9-other-resources">9. Other Resources</h2>
 <p><a href="../../../references/services/blockvalidation_reference/">Block Validation Reference</a></p>
 

@@ -2396,6 +2396,21 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="1. Description">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#detailed-component-view" class="md-nav__link">
+    <span class="md-ellipsis">
+      Detailed Component View
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2634,6 +2649,15 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#additional-block-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Additional Block Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#configuration-interactions-and-dependencies" class="md-nav__link">
     <span class="md-ellipsis">
       Configuration Interactions and Dependencies
@@ -2654,6 +2678,15 @@
         
       </ul>
     </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dependency-injection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Dependency Injection
+    </span>
+  </a>
   
 </li>
         
@@ -4435,6 +4468,21 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="1. Description">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#detailed-component-view" class="md-nav__link">
+    <span class="md-ellipsis">
+      Detailed Component View
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -4673,6 +4721,15 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#additional-block-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Additional Block Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#configuration-interactions-and-dependencies" class="md-nav__link">
     <span class="md-ellipsis">
       Configuration Interactions and Dependencies
@@ -4693,6 +4750,15 @@
         
       </ul>
     </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dependency-injection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Dependency Injection
+    </span>
+  </a>
   
 </li>
         
@@ -4770,6 +4836,9 @@
 <p>The Blockchain client is directly accessed to wait for the node State Management to change to <code>RUNNING</code> state before beginning block processing operations. For more information on this, please refer to the <a href="../../architecture/stateManagement/">State Management</a> documentation.</p>
 </li>
 </ul>
+<h3 id="detailed-component-view">Detailed Component View</h3>
+<p>The following diagram provides a deeper level of detail into the Block Persister Service's internal components and their interactions:</p>
+<p><img alt="block_persister_detailed_component.svg" src="../img/plantuml/blockpersister/block_persister_detailed_component.svg" /></p>
 <h2 id="2-functionality">2. Functionality</h2>
 <h3 id="21-service-initialization">2.1 Service Initialization</h3>
 <p><img alt="block_persister_init.svg" src="../img/plantuml/blockpersister/block_persister_init.svg" /></p>
@@ -4980,7 +5049,7 @@
 <h4 id="block-storage">Block Storage</h4>
 <ul>
 <li>
-<p><strong>Block Store URL (<code>blockstore</code>)</strong></p>
+<p><strong>Block Store URL (<code>blockPersisterStore</code>)</strong></p>
 <ul>
 <li>Type: <code>*url.URL</code></li>
 <li>Default Value: <code>"file://./data/blockstore"</code></li>
@@ -5012,10 +5081,10 @@
 <h4 id="block-selection-and-timing">Block Selection and Timing</h4>
 <ul>
 <li>
-<p><strong>Persist Age (<code>blockpersister_persistAge</code>)</strong></p>
+<p><strong>Persist Age (<code>BlockPersisterPersistAge</code>)</strong></p>
 <ul>
 <li>Type: <code>uint32</code></li>
-<li>Default Value: <code>100</code></li>
+<li>Default Value: Not specified in settings (varies by configuration)</li>
 <li>Purpose: Determines how many blocks behind the tip the persister stays</li>
 <li>Impact: Critical for avoiding reorgs by ensuring blocks are sufficiently confirmed</li>
 <li>Example: If set to 100, only blocks that are at least 100 blocks deep are processed</li>
@@ -5029,10 +5098,10 @@
 </ul>
 </li>
 <li>
-<p><strong>Persist Sleep (<code>blockPersister_persistSleep</code>)</strong></p>
+<p><strong>Persist Sleep (<code>BlockPersisterPersistSleep</code>)</strong></p>
 <ul>
 <li>Type: <code>time.Duration</code></li>
-<li>Default Value: <code>1 minute</code></li>
+<li>Default Value: Not specified in settings (varies by configuration)</li>
 <li>Purpose: Sleep duration between polling attempts when no blocks are available to process</li>
 <li>Impact: Controls polling frequency and system load during idle periods</li>
 <li>
@@ -5088,7 +5157,7 @@
 <h4 id="utxo-management">UTXO Management</h4>
 <ul>
 <li>
-<p><strong>Skip UTXO Delete (<code>blockpersister_skipUTXODelete</code>)</strong></p>
+<p><strong>Skip UTXO Delete (<code>SkipUTXODelete</code>)</strong></p>
 <ul>
 <li>Type: <code>bool</code></li>
 <li>Default Value: <code>false</code></li>
@@ -5104,30 +5173,30 @@
 </ul>
 </li>
 <li>
-<p><strong>UTXO Store URL (<code>txmeta_store</code>)</strong></p>
+<p><strong>UTXO Store URL (<code>UtxoStore</code>)</strong></p>
 <ul>
 <li>Type: <code>*url.URL</code></li>
-<li>Default Value: <code>""</code> (empty)</li>
+<li>Default Value: <code>nil</code> (not configured by default)</li>
 <li>Purpose: UTXO store URL for transaction metadata access</li>
 <li>Impact: Provides transaction metadata storage for UTXO processing operations</li>
 <li>Usage: Required when UTXO processing features are enabled</li>
 </ul>
 </li>
 <li>
-<p><strong>UTXO Persister Buffer Size (<code>utxoPersister_buffer_size</code>)</strong></p>
+<p><strong>UTXO Persister Buffer Size (<code>UTXOPersisterBufferSize</code>)</strong></p>
 <ul>
 <li>Type: <code>string</code></li>
-<li>Default Value: <code>"4KB"</code></li>
+<li>Default Value: Not specified in settings</li>
 <li>Purpose: Buffer size for UTXO persister operations</li>
 <li>Impact: Controls memory allocation for UTXO processing operations</li>
 <li>Supported Formats: Standard size units (KB, MB, GB)</li>
 </ul>
 </li>
 <li>
-<p><strong>UTXO Persister Direct Mode (<code>direct</code>)</strong></p>
+<p><strong>UTXO Persister Direct Mode (<code>UTXOPersisterDirect</code>)</strong></p>
 <ul>
 <li>Type: <code>bool</code></li>
-<li>Default Value: <code>true</code></li>
+<li>Default Value: <code>false</code></li>
 <li>Purpose: Enable direct UTXO persister mode (bypasses intermediate buffering)</li>
 <li>Impact: Controls UTXO processing mode for performance optimization</li>
 <li>
@@ -5137,6 +5206,30 @@
 <li>Buffered mode: May be useful for specific memory-constrained environments</li>
 </ul>
 </li>
+</ul>
+</li>
+</ul>
+<h3 id="additional-block-settings">Additional Block Settings</h3>
+<p>The Block Persister service also uses several additional settings from the BlockSettings struct that affect its operation:</p>
+<ul>
+<li>
+<p><strong>Transaction Store URL (<code>TxStore</code>)</strong></p>
+<ul>
+<li>Type: <code>*url.URL</code></li>
+<li>Default Value: <code>nil</code> (not configured by default)</li>
+<li>Purpose: Transaction store URL for accessing transaction data</li>
+<li>Impact: Provides transaction data storage for block processing operations</li>
+<li>Usage: Required when transaction processing features are enabled</li>
+</ul>
+</li>
+<li>
+<p><strong>Block Store (<code>BlockStore</code>)</strong></p>
+<ul>
+<li>Type: <code>*url.URL</code></li>
+<li>Default Value: <code>nil</code> (not configured by default)</li>
+<li>Purpose: Block store URL for storing complete block data</li>
+<li>Impact: Determines where block files are persisted</li>
+<li>Usage: Required for block persistence operations</li>
 </ul>
 </li>
 </ul>
@@ -5167,6 +5260,16 @@
 </ul>
 </li>
 </ol>
+<h3 id="dependency-injection">Dependency Injection</h3>
+<p>The Block Persister service receives several dependencies through dependency injection:</p>
+<ul>
+<li><strong>Block Store</strong> - Injected blob store for block persistence (configured via daemon)</li>
+<li><strong>Subtree Store</strong> - Injected blob store for subtree storage (configured via daemon)</li>
+<li><strong>UTXO Store</strong> - Injected UTXO store for transaction processing (configured via daemon)</li>
+<li><strong>Blockchain Client</strong> - Injected client for block retrieval and coordination (configured via daemon)</li>
+<li><strong>Context</strong> - Service context for listener management and lifecycle control</li>
+</ul>
+<p>These dependencies are configured and injected by the daemon during service initialization, ensuring proper integration with the overall Teranode system.</p>
 <h2 id="8-other-resources">8. Other Resources</h2>
 <p><a href="../../../references/services/blockpersister_reference/">Block Persister Reference</a></p>
 

@@ -2523,26 +2523,29 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#86-network-communication-settings" class="md-nav__link">
+  <a href="#86-storage-data-settings" class="md-nav__link">
     <span class="md-ellipsis">
-      8.6 Network &amp; Communication Settings
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="8.6 Network &amp; Communication Settings">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#network-communication-interactions-and-dependencies" class="md-nav__link">
-    <span class="md-ellipsis">
-      Network &amp; Communication Interactions and Dependencies
+      8.6 Storage &amp; Data Settings
     </span>
   </a>
   
 </li>
         
-      </ul>
-    </nav>
+          <li class="md-nav__item">
+  <a href="#87-kafka-integration-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.7 Kafka Integration Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#88-network-communication-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.8 Network &amp; Communication Settings
+    </span>
+  </a>
   
 </li>
         
@@ -4655,26 +4658,29 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#86-network-communication-settings" class="md-nav__link">
+  <a href="#86-storage-data-settings" class="md-nav__link">
     <span class="md-ellipsis">
-      8.6 Network &amp; Communication Settings
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="8.6 Network &amp; Communication Settings">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#network-communication-interactions-and-dependencies" class="md-nav__link">
-    <span class="md-ellipsis">
-      Network &amp; Communication Interactions and Dependencies
+      8.6 Storage &amp; Data Settings
     </span>
   </a>
   
 </li>
         
-      </ul>
-    </nav>
+          <li class="md-nav__item">
+  <a href="#87-kafka-integration-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.7 Kafka Integration Settings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#88-network-communication-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      8.8 Network &amp; Communication Settings
+    </span>
+  </a>
   
 </li>
         
@@ -4971,6 +4977,13 @@ Teranode microservices make use of the Lustre file system in order to share subt
 <td>Controls resilience and retry behavior for validation errors</td>
 </tr>
 <tr>
+<td><code>subtreevalidation_failfast_validation</code></td>
+<td>bool</td>
+<td><code>true</code></td>
+<td>Controls whether validation stops at the first error or continues</td>
+<td>Affects validation performance and error reporting behavior</td>
+</tr>
+<tr>
 <td><code>subtreevalidation_orphanageTimeout</code></td>
 <td>time.Duration</td>
 <td><code>15m</code></td>
@@ -5094,13 +5107,6 @@ Teranode microservices make use of the Lustre file system in order to share subt
 <td>Controls parallelism for transaction retrieval operations</td>
 </tr>
 <tr>
-<td><code>subtreevalidation_subtreeFoundChConcurrency</code></td>
-<td>int</td>
-<td><code>1</code></td>
-<td>Number of concurrent workers for processing found subtrees</td>
-<td>Controls throughput for subtree discovery and processing</td>
-</tr>
-<tr>
 <td><code>subtreevalidation_subtreeDAHConcurrency</code></td>
 <td>int</td>
 <td><code>8</code></td>
@@ -5141,6 +5147,13 @@ Teranode microservices make use of the Lustre file system in order to share subt
 <td><code>1024</code></td>
 <td>Batch size for processing transaction metadata using cache</td>
 <td>Affects memory usage and throughput for cached metadata processing</td>
+</tr>
+<tr>
+<td><code>subtreevalidation_check_block_subtrees_concurrency</code></td>
+<td>int</td>
+<td><code>32</code></td>
+<td>Number of concurrent workers for processing block subtrees</td>
+<td>Controls parallelism for block subtree validation operations</td>
 </tr>
 </tbody>
 </table>
@@ -5210,7 +5223,72 @@ Teranode microservices make use of the Lustre file system in order to share subt
 <li>The missing transaction thresholds control when the service switches from metadata validation to full transaction validation, which is more resource-intensive but necessary in some cases</li>
 <li>Separate thresholds for cache and store operations allow optimizing each path independently</li>
 </ul>
-<h3 id="86-network-communication-settings">8.6 Network &amp; Communication Settings</h3>
+<h3 id="86-storage-data-settings">8.6 Storage &amp; Data Settings</h3>
+<p>These settings control data storage and retention for subtree validation.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>subtreestore</code></td>
+<td>string</td>
+<td><code>""</code> (empty)</td>
+<td><strong>REQUIRED</strong> - URL for subtree blob storage backend</td>
+<td>Determines where subtrees are stored and retrieved</td>
+</tr>
+<tr>
+<td><code>utxostore</code></td>
+<td>string</td>
+<td><code>""</code> (empty)</td>
+<td><strong>REQUIRED</strong> - UTXO store URL for validation operations</td>
+<td>Critical for transaction validation and UTXO state access</td>
+</tr>
+</tbody>
+</table>
+<h3 id="87-kafka-integration-settings">8.7 Kafka Integration Settings</h3>
+<p>These settings control Kafka message queue integration for system-wide communication.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kafka_invalidSubtrees</code></td>
+<td>string</td>
+<td><code>"invalid-subtrees"</code></td>
+<td>Kafka topic name for publishing invalid subtree notifications</td>
+<td>Enables system-wide error notification and monitoring</td>
+</tr>
+<tr>
+<td><code>kafka_invalidSubtreesConfig</code></td>
+<td>string</td>
+<td><code>""</code> (empty)</td>
+<td>Kafka URL configuration for invalid subtrees topic</td>
+<td>Overrides default Kafka configuration for invalid subtrees</td>
+</tr>
+<tr>
+<td><code>kafka_invalidBlocksConfig</code></td>
+<td>string</td>
+<td><code>""</code> (empty)</td>
+<td>Kafka URL configuration for invalid blocks notifications</td>
+<td>Enables integration with block validation error handling</td>
+</tr>
+</tbody>
+</table>
+<h3 id="88-network-communication-settings">8.8 Network &amp; Communication Settings</h3>
 <p>These settings control how the service communicates with other components in the system.</p>
 <table>
 <thead>
@@ -5253,13 +5331,6 @@ Teranode microservices make use of the Lustre file system in order to share subt
 </tr>
 </tbody>
 </table>
-<h4 id="network-communication-interactions-and-dependencies">Network &amp; Communication Interactions and Dependencies</h4>
-<p>These settings determine how the service integrates with the broader system:</p>
-<ul>
-<li>The gRPC address settings control how the service exposes its API and how other services connect to it</li>
-<li>The validation timeout prevents operations from hanging indefinitely, ensuring system resilience</li>
-<li>The validator deployment model (<code>useLocalValidator</code>) affects performance and system architecture, with local validation typically offering better performance but requiring more resources</li>
-</ul>
 <h2 id="9-other-resources">9. Other Resources</h2>
 <ul>
 <li><a href="../../../references/services/subtreevalidation_reference/">Subtree Validation Reference</a></li>

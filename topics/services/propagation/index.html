@@ -2407,9 +2407,9 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#validator-integration-settings" class="md-nav__link">
+  <a href="#transport-and-behavior-settings" class="md-nav__link">
     <span class="md-ellipsis">
-      Validator Integration Settings
+      Transport and Behavior Settings
     </span>
   </a>
   
@@ -2452,9 +2452,9 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#batch-processing-optimization" class="md-nav__link">
+  <a href="#client-side-batch-processing-optimization" class="md-nav__link">
     <span class="md-ellipsis">
-      Batch Processing Optimization
+      Client-Side Batch Processing Optimization
     </span>
   </a>
   
@@ -4499,9 +4499,9 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#validator-integration-settings" class="md-nav__link">
+  <a href="#transport-and-behavior-settings" class="md-nav__link">
     <span class="md-ellipsis">
-      Validator Integration Settings
+      Transport and Behavior Settings
     </span>
   </a>
   
@@ -4544,9 +4544,9 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#batch-processing-optimization" class="md-nav__link">
+  <a href="#client-side-batch-processing-optimization" class="md-nav__link">
     <span class="md-ellipsis">
-      Batch Processing Optimization
+      Client-Side Batch Processing Optimization
     </span>
   </a>
   
@@ -4790,7 +4790,7 @@
 <tr>
 <td><code>ipv6_interface</code></td>
 <td>string</td>
-<td>"" (falls back to "en0")</td>
+<td>""</td>
 <td>Network interface name for IPv6 multicast</td>
 <td>Determines which network interface is used for multicast communication</td>
 </tr>
@@ -4838,7 +4838,7 @@
 </tr>
 </tbody>
 </table>
-<h3 id="validator-integration-settings">Validator Integration Settings</h3>
+<h3 id="transport-and-behavior-settings">Transport and Behavior Settings</h3>
 <table>
 <thead>
 <tr>
@@ -4854,7 +4854,7 @@
 <td><code>propagation_alwaysUseHTTP</code></td>
 <td>bool</td>
 <td>false</td>
-<td>Forces using HTTP instead of Kafka for transaction validation</td>
+<td>Forces using HTTP instead of gRPC for transaction validation</td>
 <td>Affects performance and reliability of transaction validation</td>
 </tr>
 </tbody>
@@ -4918,16 +4918,20 @@
 <p><strong>Remote Validator Mode</strong> (<code>useLocalValidator=false</code>):</p>
 <ul>
 <li>Propagation service communicates with a separate Validator service</li>
-<li>Transactions are sent via Kafka or HTTP, controlled by <code>propagation_alwaysUseHTTP</code></li>
-<li>Large transactions exceeding <code>validator_kafkaMaxMessageBytes</code> are automatically sent via HTTP using <code>validator_httpAddress</code></li>
-<li>Fallback mechanism ensures reliability for transactions of any size</li>
+<li><strong>Transaction Size-Based Routing</strong>: Transactions are automatically routed based on size:<ul>
+<li>Normal transactions (≤ <code>validator_kafka_maxMessageBytes</code>): Sent via Kafka for async validation</li>
+<li>Large transactions (&gt; <code>validator_kafka_maxMessageBytes</code>): Automatically sent via HTTP to <code>validator_httpAddress</code></li>
+</ul>
+</li>
+<li><strong>Transport Override</strong>: <code>propagation_alwaysUseHTTP=true</code> forces all transactions to use HTTP regardless of size</li>
+<li><strong>Automatic Fallback</strong>: HTTP fallback ensures reliability for transactions of any size</li>
 </ul>
 </li>
 </ul>
-<h3 id="batch-processing-optimization">Batch Processing Optimization</h3>
-<p>The transaction processing pipeline uses batching to optimize throughput, controlled by:</p>
+<h3 id="client-side-batch-processing-optimization">Client-Side Batch Processing Optimization</h3>
+<p>The propagation client uses batching to optimize throughput, controlled by:</p>
 <ul>
-<li><code>propagation_sendBatchSize</code>: Determines maximum batch size for transaction processing (default: 100)</li>
+<li><code>propagation_sendBatchSize</code>: Determines maximum batch size for client transaction processing (default: 100)</li>
 <li><code>propagation_sendBatchTimeout</code>: Controls how long to wait in milliseconds for a batch to fill before processing (default: 5ms)</li>
 </ul>
 <p>These settings should be tuned together based on expected transaction volume and size characteristics:</p>

@@ -4821,6 +4821,8 @@ The service also receives blocks from the Teranode network and converts them bac
 </code></pre></div>
 <p>In addition to the block database, the service maintains an in-memory peer database, tracking peers it receives / sends messages from /to.</p>
 <p>Also, note how the Blockchain client is used in order to wait for the node State to change to <code>RUNNING</code> state. For more information on this, please refer to the <a href="../../architecture/stateManagement/">State Management</a>  documentation.</p>
+<p>The following diagram provides a deeper level of detail into the Legacy Service's internal components and their interactions:</p>
+<p><img alt="legacy_detailed_component.svg" src="../img/plantuml/legacyp2p/legacy_detailed_component.svg" /></p>
 <h3 id="21-validator-integration">2.1 Validator Integration</h3>
 <p>The Legacy service interacts with the Validator service to validate incoming transactions from the BSV network. This interaction can happen in two different configurations:</p>
 <ol>
@@ -4864,10 +4866,11 @@ The service also receives blocks from the Teranode network and converts them bac
 <p>1) An inventory (inv) notification is received, indicating that a new block or transaction is available from a BSV node. The Legacy Service processes this notification and requests the block or transaction data from the BSV node.</p>
 <p>2) When a new block is received from the BSV node, it is transformed into a Teranode subtree and block propagation format. The block hash is then sent to the Teranode network for further processing.</p>
 <p>3) The Teranode network processes the block hash and requests the full block data from the Legacy Service.</p>
-<div class="highlight"><pre><span></span><code>- Upon receipt of the full block data, Teranode will notice that it contains subtrees it is not aware of, and request them from the Legacy Service.
-- Upon receipt of the full subtree data, the list of transactions will be known, and will be requested from the Legacy Service.
-- With all the information now available, the block is then added to the Teranode blockchain.
-</code></pre></div>
+<ul>
+<li>Upon receipt of the full block data, Teranode will notice that it contains subtrees it is not aware of, and request them from the Legacy Service.</li>
+<li>Upon receipt of the full subtree data, the list of transactions will be known, and will be requested from the Legacy Service.</li>
+<li>With all the information now available, the block is then added to the Teranode blockchain.</li>
+</ul>
 <p>In the next sections, we will detail the steps involved.</p>
 <h4 id="411-receiving-inventory-notifications">4.1.1. Receiving Inventory Notifications</h4>
 <p>In the Bitcoin network, an "inv" message is a component of the network's communication protocol, used to indicate inventory. The term "inv" stands for inventory, and these messages are utilized by nodes to inform other nodes about the existence of certain items, such as blocks and transactions, without transmitting the full data of those items. This mechanism is crucial for the efficient propagation of information across the network, helping to minimize bandwidth usage and improve the overall scalability of the system.</p>
@@ -5337,13 +5340,6 @@ The service also receives blocks from the Teranode network and converts them bac
 <td>Number of concurrent outpoint operations</td>
 <td>Controls parallelism for outpoint operations</td>
 </tr>
-<tr>
-<td><code>legacy_config_Upnp</code></td>
-<td>bool</td>
-<td>false</td>
-<td>Use UPnP for automatic port forwarding</td>
-<td>Affects service accessibility from the internet</td>
-</tr>
 </tbody>
 </table>
 <h3 id="peer-management-and-timeouts">Peer Management and Timeouts</h3>
@@ -5414,20 +5410,6 @@ The service also receives blocks from the Teranode network and converts them bac
 <td>Prioritize transactions based on block priority</td>
 <td>Affects transaction selection for block creation</td>
 </tr>
-<tr>
-<td><code>useLocalValidator</code></td>
-<td>bool</td>
-<td>false</td>
-<td>Use a local validator instance embedded in the service</td>
-<td>Improves performance by eliminating network overhead for validation</td>
-</tr>
-<tr>
-<td><code>excessiveblocksize</code></td>
-<td>uint64</td>
-<td>4GB</td>
-<td>Maximum allowed block size</td>
-<td>Limits resource consumption for extremely large blocks</td>
-</tr>
 </tbody>
 </table>
 <h2 id="configuration-interactions-and-dependencies">Configuration Interactions and Dependencies</h2>
@@ -5438,7 +5420,6 @@ The service also receives blocks from the Teranode network and converts them bac
 <li><code>legacy_connect_peers</code> forces outbound connections to specific peers</li>
 <li><code>legacy_savePeers</code> enables storing peer information across restarts</li>
 <li>If no <code>legacy_listen_addresses</code> are specified, the service detects the external IP and uses port 8333</li>
-<li>When <code>legacy_config_Upnp</code> is enabled, the service attempts to configure port forwarding automatically</li>
 </ul>
 <p>These settings should be configured together based on your network architecture and security requirements.</p>
 <h3 id="memory-management-considerations">Memory Management Considerations</h3>
@@ -5451,14 +5432,16 @@ The service also receives blocks from the Teranode network and converts them bac
 <p>For resource-constrained environments, enable <code>legacy_writeMsgBlocksToDisk</code> and use smaller batch sizes.</p>
 <h4 id="disk-based-block-queueing-legacy_writemsgblockstodisk">Disk-Based Block Queueing (<code>legacy_writeMsgBlocksToDisk</code>)</h4>
 <p>The <code>legacy_writeMsgBlocksToDisk</code> setting enables a sophisticated disk-based queueing mechanism that fundamentally changes how the Legacy service handles incoming blocks during synchronization.</p>
-<p><strong>How It Works:</strong>
-- It creates a streaming pipeline that writes blocks directly to disk, employing 4MB buffered readers for optimal disk performance.
-- Blocks are stored with a 10-minute TTL to prevent disk accumulation</p>
-<p><strong>Technical Implementation:</strong>
+<p><strong>How It Works:</strong></p>
+<ul>
+<li>It creates a streaming pipeline that writes blocks directly to disk, employing 4MB buffered readers for optimal disk performance.</li>
+<li>Blocks are stored with a 10-minute TTL to prevent disk accumulation</li>
+</ul>
+<p><strong>Technical Implementation:</strong></p>
 <div class="highlight"><pre><span></span><code>Incoming Block → io.Pipe() → 4MB Buffer → Temporary Disk Storage → Validation Queue
                      ↓
               Background Goroutine
-</code></pre></div></p>
+</code></pre></div>
 <p><strong>Benefits:</strong></p>
 <ul>
 <li><strong>Memory Efficiency</strong>: Prevents memory exhaustion during large-scale synchronization</li>
@@ -5479,16 +5462,16 @@ The service also receives blocks from the Teranode network and converts them bac
 <li>Fast storage (SSD recommended) for optimal I/O performance</li>
 <li>Automatic cleanup prevents long-term storage accumulation</li>
 </ul>
-<p><strong>Configuration Example:</strong>
+<p><strong>Configuration Example:</strong></p>
 <div class="highlight"><pre><span></span><code><span class="c1"># Enable disk-based block queueing</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">legacy_writeMsgBlocksToDisk</span><span class="o">=</span><span class="nb">true</span>
 
 <span class="c1"># Ensure adequate working directory space</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">legacy_workingDir</span><span class="o">=</span><span class="s2">&quot;/path/to/fast/storage&quot;</span>
-</code></pre></div></p>
+</code></pre></div>
 <p><img alt="legacy_disk_block_queueing.svg" src="../img/plantuml/legacyp2p/legacy_disk_block_queueing.svg" /></p>
 <h3 id="batch-processing-pipeline">Batch Processing Pipeline</h3>
-<p>The Legacy service uses a batching system for various operations, controlled by these settings:</p>
+<p>The Legacy service uses a batching system for UTXO operations, controlled by these settings:</p>
 <ul>
 <li>Batch sizes (<code>legacy_storeBatcherSize</code>, <code>legacy_spendBatcherSize</code>, <code>legacy_outpointBatcherSize</code>) determine how many operations are grouped together</li>
 <li>Concurrency settings (<code>legacy_storeBatcherConcurrency</code>, <code>legacy_spendBatcherConcurrency</code>, <code>legacy_outpointBatcherConcurrency</code>) control parallelism</li>

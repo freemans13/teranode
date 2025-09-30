@@ -1,0 +1,153 @@
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam component {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam database {
+  BackgroundColor #f2f2f2
+  BorderColor #999999
+  FontColor black
+  RoundCorner 10
+}
+skinparam shadowing false
+skinparam ArrowColor #666666
+
+@startuml Block_Persister_Component
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title Block Persister Service - Component Diagram
+
+Container_Boundary(block_persister, "Block Persister Service") {
+
+Component(polling_engine, "Polling Engine", "Go", "Continuously polls blockchain for new blocks")
+
+Component(block_processor, "Block Processor", "Go", "Processes and enriches block data")
+
+Component(subtree_processor, "Subtree Processor", "Go", "Processes and decorates subtree transactions")
+
+Component(utxo_processor, "UTXO Processor", "Go", "Generates UTXO additions and deletions")
+
+
+
+Component(blockchain_client, "Blockchain Client", "Go gRPC", "Interface to Blockchain service")
+
+Component(block_store_client, "Block Store Client", "Go", "Interface to block storage")
+
+Component(subtree_store_client, "Subtree Store Client", "Go", "Interface to subtree storage")
+
+Component(utxo_store_client, "UTXO Store Client", "Go", "Interface to UTXO database")
+
+
+
+Component(state_manager, "State Manager", "Go", "Manages processing state persistence")
+
+Component(fsm_monitor, "FSM Monitor", "Go", "Monitors blockchain FSM state")
+
+
+
+Component(metrics_collector, "Metrics Collector", "Prometheus", "Collects persistence performance metrics")
+
+Component(health_monitor, "Health Monitor", "Go", "Monitors service and dependency health")
+
+}
+
+Container_Boundary(external_services, "External Services") {
+
+Container(blockchain, "Blockchain Service", "Go", "Blockchain state management")
+
+ContainerDb(block_store, "Final Block Store", "Blob Storage (S3)", "Block blob storage")
+
+ContainerDb(subtree_store, "Subtree Store", "Blob Storage", "Subtree blob storage")
+
+ContainerDb(utxo_store, "UTXO Store", "Database", "UTXO database")
+
+Container(state_file, "State File", "Filesystem", "Local persistence state")
+
+}
+
+Person(admin, "Administrator", "Node operator")
+
+System_Ext(utxo_persister, "UTXO Persister", "Consumes persisted block data")
+
+' Core processing flow
+
+Rel(polling_engine, fsm_monitor, "Check FSM state")
+
+Rel(fsm_monitor, blockchain_client, "Monitor blockchain FSM")
+
+Rel(polling_engine, blockchain_client, "Poll for new blocks")
+
+Rel(polling_engine, block_processor, "Process new blocks")
+
+Rel(block_processor, subtree_processor, "Process subtrees")
+
+Rel(subtree_processor, utxo_processor, "Generate UTXO changes")
+
+' Data enrichment flow
+
+Rel(subtree_processor, utxo_store_client, "Query UTXO metadata")
+
+Rel(utxo_processor, utxo_store_client, "Query UTXO data")
+
+' Storage operations
+
+Rel(block_processor, block_store_client, "Persist enriched blocks")
+
+Rel(subtree_processor, subtree_store_client, "Persist enriched subtrees")
+
+Rel(utxo_processor, block_store_client, "Persist UTXO changes")
+
+' State management
+
+Rel(polling_engine, state_manager, "Update processing state")
+
+Rel(state_manager, state_file, "Persist state", "Filesystem")
+
+' External service connections
+
+Rel(blockchain_client, blockchain, "gRPC calls", "gRPC")
+
+Rel(block_store_client, block_store, "Blob operations", "Direct")
+
+Rel(subtree_store_client, subtree_store, "Blob operations", "Direct")
+
+Rel(utxo_store_client, utxo_store, "Database queries", "Direct")
+
+' Downstream consumption
+
+Rel(utxo_persister, block_store, "Read persisted blocks", "Direct")
+
+' Administrative monitoring
+
+Rel(admin, metrics_collector, "Monitor processing metrics", "HTTP")
+
+' Health and monitoring
+
+Rel(health_monitor, blockchain_client, "Health checks")
+
+Rel(health_monitor, block_store_client, "Health checks")
+
+Rel(health_monitor, utxo_store_client, "Health checks")
+
+' Metrics collection
+
+Rel(polling_engine, metrics_collector, "Polling metrics")
+
+Rel(block_processor, metrics_collector, "Processing metrics")
+
+Rel(subtree_processor, metrics_collector, "Subtree metrics")
+
+Rel(utxo_processor, metrics_collector, "UTXO metrics")
+
+SHOW_LEGEND()
+
+@enduml

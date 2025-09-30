@@ -3732,21 +3732,6 @@
   
 </li>
         
-      </ul>
-    </nav>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#65-timeout-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      6.5 Timeout Settings
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="6.5 Timeout Settings">
-      <ul class="md-nav__list">
-        
           <li class="md-nav__item">
   <a href="#timeout-configuration-guidelines" class="md-nav__link">
     <span class="md-ellipsis">
@@ -3762,13 +3747,13 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#66-compatibility-settings" class="md-nav__link">
+  <a href="#65-compatibility-settings" class="md-nav__link">
     <span class="md-ellipsis">
-      6.6 Compatibility Settings
+      6.5 Compatibility Settings
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="6.6 Compatibility Settings">
+    <nav class="md-nav" aria-label="6.5 Compatibility Settings">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -3786,13 +3771,13 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#67-dependency-injected-settings" class="md-nav__link">
+  <a href="#66-dependency-injected-settings" class="md-nav__link">
     <span class="md-ellipsis">
-      6.7 Dependency-Injected Settings
+      6.6 Dependency-Injected Settings
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="6.7 Dependency-Injected Settings">
+    <nav class="md-nav" aria-label="6.6 Dependency-Injected Settings">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -3810,13 +3795,13 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#68-configuration-relationships-and-dependencies" class="md-nav__link">
+  <a href="#67-configuration-relationships-and-dependencies" class="md-nav__link">
     <span class="md-ellipsis">
-      6.8 Configuration Relationships and Dependencies
+      6.7 Configuration Relationships and Dependencies
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="6.8 Configuration Relationships and Dependencies">
+    <nav class="md-nav" aria-label="6.7 Configuration Relationships and Dependencies">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -6845,21 +6830,6 @@
   
 </li>
         
-      </ul>
-    </nav>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#65-timeout-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      6.5 Timeout Settings
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="6.5 Timeout Settings">
-      <ul class="md-nav__list">
-        
           <li class="md-nav__item">
   <a href="#timeout-configuration-guidelines" class="md-nav__link">
     <span class="md-ellipsis">
@@ -6875,13 +6845,13 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#66-compatibility-settings" class="md-nav__link">
+  <a href="#65-compatibility-settings" class="md-nav__link">
     <span class="md-ellipsis">
-      6.6 Compatibility Settings
+      6.5 Compatibility Settings
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="6.6 Compatibility Settings">
+    <nav class="md-nav" aria-label="6.5 Compatibility Settings">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -6899,13 +6869,13 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#67-dependency-injected-settings" class="md-nav__link">
+  <a href="#66-dependency-injected-settings" class="md-nav__link">
     <span class="md-ellipsis">
-      6.7 Dependency-Injected Settings
+      6.6 Dependency-Injected Settings
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="6.7 Dependency-Injected Settings">
+    <nav class="md-nav" aria-label="6.6 Dependency-Injected Settings">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -6923,13 +6893,13 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#68-configuration-relationships-and-dependencies" class="md-nav__link">
+  <a href="#67-configuration-relationships-and-dependencies" class="md-nav__link">
     <span class="md-ellipsis">
-      6.8 Configuration Relationships and Dependencies
+      6.7 Configuration Relationships and Dependencies
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="6.8 Configuration Relationships and Dependencies">
+    <nav class="md-nav" aria-label="6.7 Configuration Relationships and Dependencies">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -8976,7 +8946,7 @@
 <li><strong>Full Access</strong>: Authenticated using <code>rpc_user</code> and <code>rpc_pass</code>, grants access to all RPC commands including sensitive operations like <code>stop</code> and administrative functions</li>
 <li><strong>Limited Access</strong>: Authenticated using <code>rpc_limit_user</code> and <code>rpc_limit_pass</code>, grants access to a subset of commands, restricting sensitive operations</li>
 </ul>
-<p>For security, credentials must be set explicitly as they default to empty strings. The service will not start if no authentication is configured, as this would leave the RPC interface unsecured.</p>
+<p>For security, credentials should be set explicitly as they default to empty strings.</p>
 <h3 id="63-network-configuration-settings">6.3 Network Configuration Settings</h3>
 <p>These settings control how the RPC service binds to network interfaces and accepts connections.</p>
 <table>
@@ -9064,59 +9034,28 @@
 <li>Complexity of RPC requests (some operations are more resource-intensive)</li>
 </ul>
 <p>The default values are conservative to prevent resource exhaustion in default configurations.</p>
-<h3 id="65-timeout-settings">6.5 Timeout Settings</h3>
-<p>These settings control request timeouts to prevent resource exhaustion and improve reliability.</p>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Description</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>rpc_timeout</code></td>
-<td>time.Duration</td>
-<td><code>30s</code></td>
-<td>Maximum time allowed for an RPC call to complete</td>
-<td>Prevents long-running operations from blocking resources; returns error code -30 on timeout</td>
-</tr>
-<tr>
-<td><code>rpc_client_call_timeout</code></td>
-<td>time.Duration</td>
-<td><code>5s</code></td>
-<td>Timeout for internal calls to other services (P2P, blockchain, etc.)</td>
-<td>Prevents RPC handlers from hanging when dependent services are unresponsive</td>
-</tr>
-</tbody>
-</table>
 <h4 id="timeout-configuration-guidelines">Timeout Configuration Guidelines</h4>
 <p>The timeout settings interact with service dependencies and operation complexity:</p>
 <ul>
 <li>
 <p><strong><code>rpc_timeout</code></strong> should be set higher than the longest expected operation:</p>
-</li>
-<li>
-<p>Mining operations: 30-60s recommended</p>
-</li>
+<ul>
+<li>Mining operations: 30-60s recommended</li>
 <li>Large block retrievals: 20-30s recommended</li>
-<li>
-<p>Simple queries: 10-15s sufficient</p>
+<li>Simple queries: 10-15s sufficient</li>
+</ul>
 </li>
 <li>
 <p><strong><code>rpc_client_call_timeout</code></strong> should be short enough to fail fast:</p>
-</li>
-<li>
-<p>Network operations: 5-10s recommended</p>
-</li>
+<ul>
+<li>Network operations: 5-10s recommended</li>
 <li>Local service calls: 3-5s recommended</li>
 <li>Critical paths: Keep as low as practical</li>
 </ul>
+</li>
+</ul>
 <p>Monitor timeout errors (code -30) to identify operations requiring adjustment.</p>
-<h3 id="66-compatibility-settings">6.6 Compatibility Settings</h3>
+<h3 id="65-compatibility-settings">6.5 Compatibility Settings</h3>
 <p>These settings control the service's behavior when dealing with legacy Bitcoin clients.</p>
 <table>
 <thead>
@@ -9145,7 +9084,7 @@
 <li>When disabled, responses strictly follow current Bitcoin RPC standards</li>
 </ul>
 <p>This setting should be left enabled unless all clients are confirmed to support modern Bitcoin RPC conventions.</p>
-<h3 id="67-dependency-injected-settings">6.7 Dependency-Injected Settings</h3>
+<h3 id="66-dependency-injected-settings">6.6 Dependency-Injected Settings</h3>
 <p>These settings are not directly part of the RPC configuration but are required dependencies that the RPC service uses from other services.</p>
 <table>
 <thead>
@@ -9174,7 +9113,7 @@
 <li><strong>Service Context</strong>: The <code>Context</code> setting is used for HTTP listener setup and management</li>
 <li><strong>Client Dependencies</strong>: The service requires active connections to Blockchain, UTXO Store, Block Assembly, Peer, and P2P services</li>
 </ul>
-<h3 id="68-configuration-relationships-and-dependencies">6.8 Configuration Relationships and Dependencies</h3>
+<h3 id="67-configuration-relationships-and-dependencies">6.7 Configuration Relationships and Dependencies</h3>
 <p>The RPC service configuration settings have several important relationships:</p>
 <h4 id="authentication-flow">Authentication Flow</h4>
 <ul>

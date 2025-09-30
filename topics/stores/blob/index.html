@@ -2871,46 +2871,19 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#87-configuration-interactions" class="md-nav__link">
+  <a href="#87-delete-at-height-requirements" class="md-nav__link">
     <span class="md-ellipsis">
-      8.7. Configuration Interactions
+      8.7. Delete-At-Height Requirements
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="8.7. Configuration Interactions">
+    <nav class="md-nav" aria-label="8.7. Delete-At-Height Requirements">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#storage-backend-selection" class="md-nav__link">
+  <a href="#hash-based-directory-organization" class="md-nav__link">
     <span class="md-ellipsis">
-      Storage Backend Selection
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#batching-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      Batching Configuration
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#delete-at-height-functionality" class="md-nav__link">
-    <span class="md-ellipsis">
-      Delete-At-Height Functionality
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#block-height-retention" class="md-nav__link">
-    <span class="md-ellipsis">
-      Block Height Retention
+      Hash-Based Directory Organization
     </span>
   </a>
   
@@ -4832,46 +4805,19 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#87-configuration-interactions" class="md-nav__link">
+  <a href="#87-delete-at-height-requirements" class="md-nav__link">
     <span class="md-ellipsis">
-      8.7. Configuration Interactions
+      8.7. Delete-At-Height Requirements
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="8.7. Configuration Interactions">
+    <nav class="md-nav" aria-label="8.7. Delete-At-Height Requirements">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#storage-backend-selection" class="md-nav__link">
+  <a href="#hash-based-directory-organization" class="md-nav__link">
     <span class="md-ellipsis">
-      Storage Backend Selection
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#batching-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      Batching Configuration
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#delete-at-height-functionality" class="md-nav__link">
-    <span class="md-ellipsis">
-      Delete-At-Height Functionality
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#block-height-retention" class="md-nav__link">
-    <span class="md-ellipsis">
-      Block Height Retention
+      Hash-Based Directory Organization
     </span>
   </a>
   
@@ -4948,7 +4894,7 @@
 <li><a href="#84-file-operation-options-functional-options">8.4. File Operation Options</a></li>
 <li><a href="#85-tx-store-configuration-examples">8.5. TX Store Configuration Examples</a></li>
 <li><a href="#86-subtree-store-configuration-examples">8.6. SubTree Store Configuration Examples</a></li>
-<li><a href="#87-configuration-interactions">8.7. Configuration Interactions</a></li>
+<li><a href="#87-delete-at-height-requirements">8.7. Delete-At-Height Requirements</a></li>
 </ul>
 </li>
 <li><a href="#9-other-resources">9. Other Resources</a></li>
@@ -5221,78 +5167,57 @@
 <td><code>hashPrefix</code></td>
 <td>Integer</td>
 <td>2</td>
-<td>Number of characters from hash to use for directory organization</td>
-<td>Improves file organization and lookup performance; affects directory structure</td>
+<td>Number of characters from start of hash for directory organization</td>
+<td>Improves file organization and lookup performance</td>
+</tr>
+<tr>
+<td><code>hashSuffix</code></td>
+<td>Integer</td>
+<td>-</td>
+<td>Number of characters from end of hash for directory organization</td>
+<td>Alternative to hashPrefix; uses end of hash</td>
 </tr>
 <tr>
 <td><code>batch</code></td>
 <td>Boolean</td>
 <td>false</td>
-<td>Enables batch operations</td>
-<td>Improves performance by batching operations</td>
+<td>Enables batch wrapper for improved performance</td>
+<td>Aggregates operations into larger batches</td>
 </tr>
 <tr>
 <td><code>sizeInBytes</code></td>
 <td>Integer</td>
 <td>4194304</td>
-<td>Maximum batch size in bytes (4MB default)</td>
-<td>Controls batch size; larger values increase throughput but use more memory</td>
+<td>Maximum batch size in bytes when batching enabled</td>
+<td>Controls memory usage and batch efficiency</td>
 </tr>
 <tr>
 <td><code>writeKeys</code></td>
 <td>Boolean</td>
 <td>false</td>
-<td>Whether to write keys along with blob data</td>
-<td>Enables key storage alongside blob content</td>
-</tr>
-<tr>
-<td><code>batch_size</code></td>
-<td>Integer</td>
-<td>1000</td>
-<td>Maximum items in a batch</td>
-<td>Controls batch size; larger values increase throughput but use more memory</td>
-</tr>
-<tr>
-<td><code>batch_duration</code></td>
-<td>Integer (ms)</td>
-<td>50</td>
-<td>Maximum time before processing a batch</td>
-<td>Balances throughput vs. latency</td>
+<td>Store key index alongside batch data</td>
+<td>Enables key-based retrieval from batches</td>
 </tr>
 <tr>
 <td><code>localDAHStore</code></td>
 <td>String</td>
 <td>""</td>
-<td>Local Delete-At-Height store backend type</td>
-<td>Enables automatic expiry of data based on blockchain height</td>
+<td>Enable Delete-At-Height functionality</td>
+<td>Requires value like "memory://" to enable DAH</td>
 </tr>
 <tr>
 <td><code>localDAHStorePath</code></td>
 <td>String</td>
 <td>"/tmp/localDAH"</td>
-<td>Path for local DAH store metadata</td>
-<td>Directory for DAH metadata storage</td>
-</tr>
-<tr>
-<td><code>localTTLStore</code></td>
-<td>String</td>
-<td>""</td>
-<td>Local TTL store type for time-based expiration</td>
-<td>Enables time-based data expiration</td>
-</tr>
-<tr>
-<td><code>localTTLStorePath</code></td>
-<td>String</td>
-<td>""</td>
-<td>Local TTL store path for metadata</td>
-<td>Directory for TTL metadata storage</td>
+<td>Path for DAH metadata storage</td>
+<td>Directory for blockchain height tracking</td>
 </tr>
 <tr>
 <td><code>logger</code></td>
 <td>Boolean</td>
 <td>false</td>
-<td>Enables debug logging for all blob operations</td>
-<td>Adds detailed logging for troubleshooting</td>
+<td>Enable debug logging wrapper</td>
+<td>Adds detailed operation logging</td>
 </tr>
 </tbody>
 </table>
@@ -5314,22 +5239,22 @@
 <td>Base directory for file storage</td>
 </tr>
 <tr>
-<td><code>dahCleanerInterval</code></td>
-<td>Duration</td>
-<td>"1m"</td>
-<td>Frequency of expired blob cleanup operations</td>
+<td><code>checksum</code></td>
+<td>Boolean</td>
+<td>false</td>
+<td>Enable SHA256 checksumming of stored blobs</td>
 </tr>
 <tr>
 <td><code>header</code></td>
 <td>String</td>
 <td><code>(empty)</code></td>
-<td>Custom header prepended to all stored blobs</td>
+<td>Custom header prepended to stored blobs (hex or plain text)</td>
 </tr>
 <tr>
 <td><code>eofmarker</code></td>
 <td>String</td>
 <td><code>(empty)</code></td>
-<td>Custom footer appended to all stored blobs</td>
+<td>Custom footer appended to stored blobs (hex or plain text)</td>
 </tr>
 </tbody>
 </table>
@@ -5353,7 +5278,7 @@
 <tr>
 <td><code>region</code></td>
 <td>String</td>
-<td>"us-east-1"</td>
+<td>None (required)</td>
 <td>AWS region for S3 bucket</td>
 </tr>
 <tr>
@@ -5424,10 +5349,10 @@
 <td>Remote HTTP blob server endpoint</td>
 </tr>
 <tr>
-<td><code>timeout</code></td>
-<td>Integer (ms)</td>
-<td>30000</td>
-<td>HTTP request timeout</td>
+<td>Timeout</td>
+<td>Duration</td>
+<td>30s</td>
+<td>HTTP client timeout (hardcoded, not configurable via URL)</td>
 </tr>
 </tbody>
 </table>
@@ -5599,12 +5524,12 @@
 <ul>
 <li><strong>Amazon S3</strong></li>
 </ul>
-<div class="highlight"><pre><span></span><code>txstore.${YOUR_USERNAME}=s3:///mytxstore?region=eu-west-1&amp;batch=true&amp;batch_size=2000&amp;batch_duration=100
+<div class="highlight"><pre><span></span><code>txstore.${YOUR_USERNAME}=s3://mytxstore?region=eu-west-1&amp;batch=true&amp;sizeInBytes=8388608
 </code></pre></div>
 <ul>
 <li><strong>File System with DAH</strong></li>
 </ul>
-<div class="highlight"><pre><span></span><code>txstore.${YOUR_USERNAME}=file:///data/txstore?batch=true&amp;localDAHStore=true&amp;localDAHStorePath=/data/txstore-dah
+<div class="highlight"><pre><span></span><code>txstore.${YOUR_USERNAME}=file:///data/txstore?batch=true&amp;localDAHStore=memory://&amp;localDAHStorePath=/data/txstore-dah
 </code></pre></div>
 <ul>
 <li><strong>Memory Store</strong></li>
@@ -5620,27 +5545,27 @@
 <ul>
 <li><strong>Amazon S3 with Local DAH Store</strong></li>
 </ul>
-<div class="highlight"><pre><span></span><code>subtreestore.${YOUR_USERNAME}=s3:///subtreestore?region=eu-west-1&amp;localDAHStore=true&amp;localDAHStorePath=/data/subtreestore-dah
+<div class="highlight"><pre><span></span><code>subtreestore.${YOUR_USERNAME}=s3://subtreestore?region=eu-west-1&amp;localDAHStore=memory://&amp;localDAHStorePath=/data/subtreestore-dah
 </code></pre></div>
 <ul>
 <li><strong>File System with Local DAH Store</strong></li>
 </ul>
-<div class="highlight"><pre><span></span><code>subtreestore.${YOUR_USERNAME}=file:///data/subtreestore?localDAHStore=true&amp;localDAHStorePath=./data/subtreestore-dah
+<div class="highlight"><pre><span></span><code>subtreestore.${YOUR_USERNAME}=file:///data/subtreestore?localDAHStore=memory://&amp;localDAHStorePath=./data/subtreestore-dah
 </code></pre></div>
 <ul>
 <li><strong>Memory Store</strong></li>
 </ul>
 <div class="highlight"><pre><span></span><code>subtreestore.${YOUR_USERNAME}=memory:///
 </code></pre></div>
-<h3 id="87-configuration-interactions">8.7. Configuration Interactions</h3>
-<h4 id="storage-backend-selection">Storage Backend Selection</h4>
-<p>The URL scheme determines which backend is used, which in turn determines which parameters are relevant. For example, <code>region</code> is only relevant for S3 storage, while <code>hashPrefix</code> applies to all backends that support directory organization.</p>
-<h4 id="batching-configuration">Batching Configuration</h4>
-<p>When batching is enabled (<code>batch=true</code>), the <code>sizeInBytes</code> parameter controls batch behavior. Operations are batched until the size limit is reached, then the batch is written to the underlying store.</p>
-<h4 id="delete-at-height-functionality">Delete-At-Height Functionality</h4>
-<p>When <code>localDAHStore</code> is enabled, the store maintains metadata about when items should be deleted based on blockchain height. This metadata is stored at the path specified by <code>localDAHStorePath</code>. Individual files can set their own DAH values using the <code>WithDAH</code> option.</p>
-<h4 id="block-height-retention">Block Height Retention</h4>
-<p>The <code>BlockHeightRetention</code> setting (via <code>WithDefaultBlockHeightRetention</code>) interacts with the <code>DAH</code> setting (via <code>WithDAH</code>). The store-level setting provides a default, while the file-level setting allows per-file control.</p>
+<h3 id="87-delete-at-height-requirements">8.7. Delete-At-Height Requirements</h3>
+<p>DAH functionality requires:</p>
+<ul>
+<li><code>localDAHStore</code> parameter with valid store URL (e.g., "memory://")</li>
+<li><code>BlockHeightCh</code> channel for blockchain height tracking (subtree stores only)</li>
+<li>Cannot be used with null stores (validation prevents this)</li>
+</ul>
+<h4 id="hash-based-directory-organization">Hash-Based Directory Organization</h4>
+<p><code>hashPrefix</code> (positive) uses start of hash, <code>hashSuffix</code> (negative value) uses end of hash for directory structure. Only one should be specified.</p>
 <h2 id="9-other-resources">9. Other Resources</h2>
 <p><a href="../../../references/stores/blob_reference/">Blob Server Reference</a></p>
 

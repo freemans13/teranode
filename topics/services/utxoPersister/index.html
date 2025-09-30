@@ -2539,6 +2539,84 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="3. Data Model">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-basic-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.1 Basic Structure
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-utxo-components" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.2 UTXO Components
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-binary-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.3 Binary Encoding
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#34-utxo-set-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.4 UTXO Set File
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#35-utxo-diff" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.5 UTXO Diff
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#36-utxo-deletion-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.6 UTXO Deletion Model
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#37-set-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.7 Set Operations
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#38-persistence" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.8 Persistence
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -4429,6 +4507,84 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="3. Data Model">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-basic-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.1 Basic Structure
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-utxo-components" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.2 UTXO Components
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-binary-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.3 Binary Encoding
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#34-utxo-set-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.4 UTXO Set File
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#35-utxo-diff" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.5 UTXO Diff
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#36-utxo-deletion-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.6 UTXO Deletion Model
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#37-set-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.7 Set Operations
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#38-persistence" class="md-nav__link">
+    <span class="md-ellipsis">
+      3.8 Persistence
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -4712,81 +4868,86 @@
 <h3 id="23-processing-blocks-and-creating-utxo-sets">2.3 Processing Blocks and Creating UTXO Sets</h3>
 <p>The UTXO Persister processes blocks and creates UTXO sets as follows:</p>
 <p>1) <strong>Trigger and Block Height Check</strong>:</p>
-<div class="highlight"><pre><span></span><code>- The service is triggered to process the next block (via notification, timer, or startup).
-- It checks if the next block to process is at least 100 blocks behind the current best block height.
-</code></pre></div>
+<ul>
+<li>The service is triggered to process the next block (via notification, timer, or startup).</li>
+<li>It checks if the next block to process is at least 100 blocks behind the current best block height.</li>
+</ul>
 <p>2) <strong>Block Headers Retrieval</strong>:</p>
-<div class="highlight"><pre><span></span><code>- If processing is needed, the service retrieves block headers from either the Blockchain Store or Blockchain Client.
-- It verifies the chain continuity using these headers.
-</code></pre></div>
+<ul>
+<li>If processing is needed, the service retrieves block headers from either the Blockchain Store or Blockchain Client.</li>
+<li>It verifies the chain continuity using these headers.</li>
+</ul>
 <p>3) <strong>Last Set Verification</strong>:</p>
-<div class="highlight"><pre><span></span><code>- The service verifies the last UTXO set using `verifyLastSet()` to ensure data integrity.
-</code></pre></div>
+<ul>
+<li>The service verifies the last UTXO set using <code>verifyLastSet()</code> to ensure data integrity.</li>
+</ul>
 <p>4) <strong>Block Range Consolidation</strong>:</p>
-<div class="highlight"><pre><span></span><code>- A new Consolidator is created to process a range of blocks efficiently.
-- The `ConsolidateBlockRange()` method is called to handle multiple blocks at once if needed.
-</code></pre></div>
+<ul>
+<li>A new Consolidator is created to process a range of blocks efficiently.</li>
+<li>The <code>ConsolidateBlockRange()</code> method is called to handle multiple blocks at once if needed.</li>
+</ul>
 <p>5) <strong>UTXO Set Preparation</strong>:</p>
-<div class="highlight"><pre><span></span><code>- The service calls `GetUTXOSetWithDeletionsMap()` to prepare the UTXO set for the new block.
-- This retrieves the UTXO deletions from the Block Store and creates a deletions map.
-</code></pre></div>
+<ul>
+<li>The service calls <code>GetUTXOSetWithDeletionsMap()</code> to prepare the UTXO set for the new block.</li>
+<li>This retrieves the UTXO deletions from the Block Store and creates a deletions map.</li>
+</ul>
 <p>6) <strong>UTXO Set Creation</strong>:</p>
-<div class="highlight"><pre><span></span><code>- The `CreateUTXOSet()` method is called on the UTXOSet object.
-- This method:
-
-  - Retrieves the previous block&#39;s UTXO set from the Block Store.
-  - Applies the deletions from the deletions map.
-  - Incorporates new UTXOs from the block&#39;s transactions.
-  - Writes the new UTXO set to the Block Store.
-</code></pre></div>
+<ul>
+<li>The <code>CreateUTXOSet()</code> method is called on the UTXOSet object.</li>
+<li>
+<p>This method:</p>
+<ul>
+<li>Retrieves the previous block's UTXO set from the Block Store.</li>
+<li>Applies the deletions from the deletions map.</li>
+<li>Incorporates new UTXOs from the block's transactions.</li>
+<li>Writes the new UTXO set to the Block Store.</li>
+</ul>
+</li>
+</ul>
 <p>7) <strong>Cleanup</strong>:</p>
-<div class="highlight"><pre><span></span><code>- If not skipped (based on configuration), the service deletes the previous block&#39;s UTXO set to save space.
-</code></pre></div>
+<ul>
+<li>If not skipped (based on configuration), the service deletes the previous block's UTXO set to save space.</li>
+</ul>
 <p>8) <strong>Update Last Processed Height</strong>:</p>
-<div class="highlight"><pre><span></span><code>- The service calls `writeLastHeight()` to update its record of the last processed block height.
-</code></pre></div>
+<ul>
+<li>The service calls <code>writeLastHeight()</code> to update its record of the last processed block height.</li>
+</ul>
 <p>9) <strong>Trigger Next Block Processing</strong>:</p>
-<div class="highlight"><pre><span></span><code>- The service initiates the processing of the next block, continuing the cycle.
-</code></pre></div>
+<ul>
+<li>The service initiates the processing of the next block, continuing the cycle.</li>
+</ul>
 <p>If the current height is less than 100 blocks behind the best block height, the service waits for more confirmations before processing.</p>
 <h2 id="3-data-model">3. Data Model</h2>
-<ol>
-<li>
-<p><strong>Basic Structure:</strong>
-   The UTXO set is essentially a collection of all unspent transaction outputs in the blockchain up to a specific block height. Each UTXO represents a piece of cryptocurrency that can be spent in future transactions.</p>
-</li>
-<li>
-<p><strong>UTXO Components:</strong>
-   The UTXOs are stored in a hierarchical structure, with the following components:</p>
-</li>
-</ol>
-<p><strong>UTXOWrapper</strong>:
-   <div class="highlight"><pre><span></span><code><span class="kd">type</span><span class="w"> </span><span class="nx">UTXOWrapper</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<h3 id="31-basic-structure">3.1 Basic Structure</h3>
+<p>The UTXO set is essentially a collection of all unspent transaction outputs in the blockchain up to a specific block height. Each UTXO represents a piece of cryptocurrency that can be spent in future transactions.</p>
+<h3 id="32-utxo-components">3.2 UTXO Components</h3>
+<p>The UTXOs are stored in a hierarchical structure, with the following components:</p>
+<p><strong>UTXOWrapper:</strong>
+<div class="highlight"><pre><span></span><code><span class="kd">type</span><span class="w"> </span><span class="nx">UTXOWrapper</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
 <span class="w">    </span><span class="nx">TxID</span><span class="w">     </span><span class="nx">chainhash</span><span class="p">.</span><span class="nx">Hash</span>
 <span class="w">    </span><span class="nx">Height</span><span class="w">   </span><span class="kt">uint32</span>
 <span class="w">    </span><span class="nx">Coinbase</span><span class="w"> </span><span class="kt">bool</span>
 <span class="w">    </span><span class="nx">UTXOs</span><span class="w">    </span><span class="p">[]</span><span class="o">*</span><span class="nx">UTXO</span>
 <span class="p">}</span>
-</code></pre></div>
-<strong>UTXO</strong>:
-   <div class="highlight"><pre><span></span><code><span class="kd">type</span><span class="w"> </span><span class="nx">UTXO</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+</code></pre></div></p>
+<p><strong>UTXO:</strong>
+<div class="highlight"><pre><span></span><code><span class="kd">type</span><span class="w"> </span><span class="nx">UTXO</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
 <span class="w">    </span><span class="nx">Index</span><span class="w">  </span><span class="kt">uint32</span>
 <span class="w">    </span><span class="nx">Value</span><span class="w">  </span><span class="kt">uint64</span>
 <span class="w">    </span><span class="nx">Script</span><span class="w"> </span><span class="p">[]</span><span class="kt">byte</span>
 <span class="p">}</span>
 </code></pre></div></p>
+<p><strong>Field descriptions:</strong></p>
 <ul>
 <li><strong>TxID</strong>: The transaction ID where this UTXO was created (32 bytes)</li>
 <li><strong>Index</strong>: The output index in the transaction (4 bytes)</li>
 <li><strong>Value</strong>: The amount of cryptocurrency in this UTXO (8 bytes)</li>
 <li><strong>Height</strong>: The block height where this UTXO was created (4 bytes)</li>
 <li><strong>Script</strong>: The locking script that must be satisfied to spend this UTXO (variable length)</li>
-<li>
-<p><strong>Coinbase</strong>: A flag indicating whether this UTXO is from a coinbase transaction (1 bit, packed with Height)</p>
-</li>
-<li>
-<p><strong>Binary Encoding:</strong>
-   The UTXO is encoded into a binary format for efficient storage and retrieval:</p>
+<li><strong>Coinbase</strong>: A flag indicating whether this UTXO is from a coinbase transaction (1 bit, packed with Height)</li>
+</ul>
+<h3 id="33-binary-encoding">3.3 Binary Encoding</h3>
+<p>The UTXO is encoded into a binary format for efficient storage and retrieval:</p>
 <ul>
 <li>32 bytes: TxID</li>
 <li>4 bytes: Index (little-endian)</li>
@@ -4795,41 +4956,29 @@
 <li>4 bytes: Script length (little-endian)</li>
 <li>Variable bytes: Script</li>
 </ul>
-</li>
-<li>
-<p><strong>UTXO Set File</strong>:
-   The UTXO set for each block is stored in a file with the extension <code>utxo-set</code>. This file contains a series of encoded UTXOs representing all unspent outputs up to that block.</p>
-</li>
-<li>
-<p><strong>UTXO Diff</strong>:
-   The UTXO Persister uses a diff-based approach to update the UTXO set:</p>
+<h3 id="34-utxo-set-file">3.4 UTXO Set File</h3>
+<p>The UTXO set for each block is stored in a file with the extension <code>utxo-set</code>. This file contains a series of encoded UTXOs representing all unspent outputs up to that block.</p>
+<h3 id="35-utxo-diff">3.5 UTXO Diff</h3>
+<p>The UTXO Persister uses a diff-based approach to update the UTXO set:</p>
 <ul>
 <li><code>utxo-additions</code>: New UTXOs created in a block</li>
 <li><code>utxo-deletions</code>: UTXOs spent in a block</li>
 </ul>
-</li>
-<li>
-<p><strong>UTXO Deletion Model</strong>:
-   When a UTXO is spent, it's recorded in the <code>utxo-deletions</code> file. The deletion record contains:</p>
+<h3 id="36-utxo-deletion-model">3.6 UTXO Deletion Model</h3>
+<p>When a UTXO is spent, it's recorded in the <code>utxo-deletions</code> file. The deletion record contains:</p>
 <ul>
 <li>TxID (32 bytes)</li>
 <li>Index (4 bytes)</li>
 </ul>
-</li>
-<li>
-<p><strong>Set Operations</strong>:</p>
-<ul>
-<li>Creating a new UTXO set involves:</li>
+<h3 id="37-set-operations">3.7 Set Operations</h3>
+<p>Creating a new UTXO set involves:</p>
+<ol>
 <li>Starting with the previous block's UTXO set</li>
 <li>Removing UTXOs listed in the current block's <code>utxo-deletions</code></li>
 <li>Adding UTXOs listed in the current block's <code>utxo-additions</code></li>
-</ul>
-</li>
-<li>
-<p><strong>Persistence:</strong>
-   The UTXO set is persisted using a <em>FileStorer</em>, which writes the data to a blob store.</p>
-</li>
-</ul>
+</ol>
+<h3 id="38-persistence">3.8 Persistence</h3>
+<p>The UTXO set is persisted using a <em>FileStorer</em>, which writes the data to a blob store.</p>
 <h2 id="4-technology">4. Technology</h2>
 <ol>
 <li>
@@ -5021,28 +5170,20 @@
 </thead>
 <tbody>
 <tr>
-<td><code>fsm_state_restore</code></td>
-<td>bool</td>
-<td><code>false</code></td>
-<td>When true, the service restores state from a previously saved state file</td>
-<td>Controls recovery behavior after restarts or failures</td>
-</tr>
-<tr>
 <td><code>network</code></td>
 <td>string</td>
-<td>Varies by deployment</td>
-<td>Specifies the blockchain network (mainnet, testnet, etc.)</td>
-<td>Determines which network's rules and parameters are used</td>
+<td><code>"mainnet"</code></td>
+<td>Specifies the blockchain network (mainnet, testnet, regtest)</td>
+<td>Determines genesis hash and chain parameters used for validation</td>
 </tr>
 </tbody>
 </table>
 <h4 id="operational-controls-interactions-and-dependencies">Operational Controls Interactions and Dependencies</h4>
-<p>These settings affect how the service operates and recovers from failures:</p>
 <ul>
-<li>The <code>fsm_state_restore</code> setting enables recovery from a previously saved state, which can be crucial for maintaining data continuity after unexpected shutdowns</li>
-<li>The <code>network</code> setting ensures the service applies the correct rules and parameters for the target blockchain network</li>
+<li>The <code>network</code> setting determines the genesis hash and chain parameters via chaincfg.GetChainParams(), which is critical for genesis block detection and UTXO set validation</li>
+<li>Genesis hash validation is used throughout the service to determine when to skip certain operations like UTXO deletion</li>
 </ul>
-<p>These settings typically interact with broader system configuration and are often shared across multiple services.</p>
+<p>This setting is fundamental to the service's operation and must match the target blockchain network.</p>
 <h3 id="76-configuration-best-practices">7.6 Configuration Best Practices</h3>
 <ol>
 <li>
@@ -5055,7 +5196,7 @@
 <p><strong>Deployment Architecture</strong>: Choose direct access (<code>direct=true</code>) whenever possible for best performance, unless your system architecture specifically requires distributed deployment.</p>
 </li>
 <li>
-<p><strong>Recovery Testing</strong>: Regularly test the recovery process with <code>fsm_state_restore=true</code> to ensure continuity after failures or planned restarts.</p>
+<p><strong>Network Configuration</strong>: Ensure the <code>network</code> setting matches your target blockchain environment. Incorrect network configuration can lead to validation failures and data corruption.</p>
 </li>
 <li>
 <p><strong>Storage Location</strong>: Use persistent, reliable storage locations for the <code>blockstore</code> setting in production environments, ideally on dedicated, high-performance storage systems.</p>

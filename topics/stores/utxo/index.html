@@ -5557,7 +5557,7 @@ The primary language used for implementing the service's logic.</p>
 <td><code>BlockHeightRetention</code></td>
 <td>uint32</td>
 <td>Number of blocks to retain data for</td>
-<td>288 blocks (~2 days)</td>
+<td>globalBlockHeightRetention</td>
 </tr>
 <tr>
 <td><code>BlockHeightRetentionAdjustment</code></td>
@@ -5757,8 +5757,9 @@ The primary language used for implementing the service's logic.</p>
 </tbody>
 </table>
 <h3 id="83-important-notes">8.3 Important Notes</h3>
-<p><strong>Critical Setting Warning:</strong> The <code>UtxoBatchSize</code> setting must not be changed after the UTXO store has been running. It is used to calculate the offset for transaction outputs, and changing it would break the store's integrity.</p>
-<p><strong>Block Height Retention:</strong> The effective block height retention for the UTXO store is calculated as <code>GlobalBlockHeightRetention + BlockHeightRetentionAdjustment</code>. The global value defaults to 288 blocks (~2 days), and the adjustment can be positive or negative to fine-tune retention per store.</p>
+<p><strong>Critical Setting Warning:</strong> The <code>UtxoBatchSize</code> setting must not be changed after the UTXO store has been running with Aerospike backend. It determines record organization and changing it would break store integrity.</p>
+<p><strong>Block Height Retention:</strong> The effective retention is calculated as <code>GlobalBlockHeightRetention + BlockHeightRetentionAdjustment</code>. The global value varies by deployment, and the adjustment can be positive or negative to fine-tune retention per store.</p>
+<p><strong>URL Query Parameters:</strong> The UTXO store URL supports a <code>logging=true</code> query parameter to enable detailed operation logging for debugging purposes.</p>
 <h3 id="84-configuration-interactions-and-best-practices">8.4 Configuration Interactions and Best Practices</h3>
 <h4 id="841-batch-processing">8.4.1 Batch Processing</h4>
 <p>Batch processing significantly improves performance by reducing the number of database operations. However, it introduces a trade-off between latency and throughput:</p>
