@@ -1558,3 +1558,66 @@ func (u *Server) isPrioritySubtreeCheckActive(subtreeHash string) bool {
 
 	return ok && active
 }
+
+// setPauseProcessing acquires the distributed pause lock and sets the local atomic flag.
+//
+// This method coordinates pausing of subtree processing across all pods in the cluster.
+// It first acquires a distributed lock via the quorum system, then sets the local atomic
+// flag for fast local checks. The distributed lock is kept alive with periodic heartbeat
+// updates and is automatically released on context cancellation or if the pod crashes.
+//
+// Parameters:
+//   - ctx: Context for cancellation and request-scoped values
+//
+// Returns:
+//   - func(): Release function to explicitly release the pause lock
+//   - error: Error if the distributed lock cannot be acquired
+func (u *Server) setPauseProcessing(ctx context.Context) (func(), error) {
+	if q == nil {
+		u.logger.Warnf("[setPauseProcessing] Quorum not initialized - falling back to local-only pause")
+		u.pauseSubtreeProcessing.Store(true)
+		return func() {
+			u.pauseSubtreeProcessing.Store(false)
+			u.logger.Infof("[setPauseProcessing] Subtree processing resumed (local-only)")
+		}, nil
+	}
+
+	releaseLock, err := q.AcquirePauseLock(ctx)
+	if err != nil {
+		return noopFunc, err
+	}
+
+	u.pauseSubtreeProcessing.Store(true)
+	u.logger.Infof("[setPauseProcessing] Subtree processing paused across all pods")
+
+	return func() {
+		u.pauseSubtreeProcessing.Store(false)
+		releaseLock()
+		u.logger.Infof("[setPauseProcessing] Subtree processing resumed across all pods")
+	}, nil
+}
+
+// isPauseActive checks if subtree processing is currently paused.
+//
+// This method uses a two-level checking approach for both performance and reliability:
+// 1. Fast path: Checks the local atomic bool first (no I/O overhead)
+// 2. Distributed path: If local flag is false, checks the distributed quorum lock
+//
+// This ensures that:
+// - The local pod can quickly determine if it initiated the pause
+// - All pods can detect if any other pod has initiated a pause
+// - Stale locks from crashed pods are automatically cleaned up
+//
+// Returns:
+//   - bool: true if subtree processing is paused, false otherwise
+func (u *Server) isPauseActive() bool {
+	if u.pauseSubtreeProcessing.Load() {
+		return true
+	}
+
+	if q == nil {
+		return false
+	}
+
+	return q.IsPauseActive()
+}

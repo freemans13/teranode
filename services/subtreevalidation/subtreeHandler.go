@@ -32,12 +32,11 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 				u.logger.Warnf("[consumerMessageHandler] Context done, stopping processing: %v", ctx.Err())
 				return ctx.Err()
 			default:
-				// continue processing
-				if !u.pauseSubtreeProcessing.Load() {
+				if !u.isPauseActive() {
 					break WAITFORPAUSE
 				}
 
-				u.logger.Warnf("[consumerMessageHandler] Subtree processing is paused, waiting to resume...")
+				u.logger.Warnf("[consumerMessageHandler] Subtree processing is paused (distributed lock active), waiting to resume...")
 				time.Sleep(1 * time.Second)
 			}
 		}

@@ -598,3 +598,299 @@ func Test_releaseLock(t *testing.T) {
 		assert.Contains(t, mLogger.WarnBuf.String(), fmt.Sprintf("failed to remove lock file %q", lockDir), "Warning message should contain expected format")
 	})
 }
+
+func TestAcquirePauseLock(t *testing.T) {
+	var logger ulogger.Logger = ulogger.TestLogger{}
+
+	t.Run("AcquirePauseLockSuccessfully", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+		release, err := q.AcquirePauseLock(ctx)
+
+		require.NoError(t, err)
+		require.NotNil(t, release)
+
+		pauseLockPath := filepath.Join(q.path, "__SUBTREE_PAUSE__.lock")
+		_, statErr := os.Stat(pauseLockPath)
+		assert.NoError(t, statErr, "Pause lock file should be created")
+
+		assert.True(t, q.IsPauseActive(), "Pause should be active after acquiring lock")
+
+		release()
+
+		time.Sleep(50 * time.Millisecond)
+
+		_, statErr = os.Stat(pauseLockPath)
+		assert.True(t, os.IsNotExist(statErr), "Pause lock file should be removed after release")
+
+		assert.False(t, q.IsPauseActive(), "Pause should not be active after release")
+	})
+
+	t.Run("AcquirePauseLockTwiceFails", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+		release1, err1 := q.AcquirePauseLock(ctx)
+		require.NoError(t, err1)
+		require.NotNil(t, release1)
+		defer release1()
+
+		release2, err2 := q.AcquirePauseLock(ctx)
+		assert.Error(t, err2, "Second lock acquisition should fail")
+		assert.Contains(t, err2.Error(), "pause lock already held", "Error message should indicate lock is held")
+		assert.NotNil(t, release2, "Release function should be returned even on error")
+	})
+
+	t.Run("AcquirePauseLockAfterRelease", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+
+		release1, err1 := q.AcquirePauseLock(ctx)
+		require.NoError(t, err1)
+		require.NotNil(t, release1)
+
+		release1()
+		time.Sleep(50 * time.Millisecond)
+
+		release2, err2 := q.AcquirePauseLock(ctx)
+		require.NoError(t, err2, "Should be able to acquire lock after release")
+		require.NotNil(t, release2)
+		defer release2()
+
+		assert.True(t, q.IsPauseActive(), "Pause should be active after second acquisition")
+	})
+
+	t.Run("PauseLockWithContextCancellation", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		release, err := q.AcquirePauseLock(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, release)
+
+		assert.True(t, q.IsPauseActive(), "Pause should be active")
+
+		cancel()
+		time.Sleep(150 * time.Millisecond)
+
+		assert.False(t, q.IsPauseActive(), "Pause should be inactive after context cancellation")
+	})
+
+	t.Run("PauseLockWithAbsoluteTimeout", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir,
+			WithTimeout(100*time.Millisecond),
+			WithAbsoluteTimeout(200*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+		release, err := q.AcquirePauseLock(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, release)
+		defer release()
+
+		assert.True(t, q.IsPauseActive(), "Pause should be active")
+
+		time.Sleep(250 * time.Millisecond)
+
+		assert.False(t, q.IsPauseActive(), "Pause should expire after absolute timeout")
+	})
+}
+
+func TestIsPauseActive(t *testing.T) {
+	var logger ulogger.Logger = ulogger.TestLogger{}
+
+	t.Run("NoPauseLock", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		assert.False(t, q.IsPauseActive(), "Should return false when no pause lock exists")
+	})
+
+	t.Run("ActivePauseLock", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+		release, err := q.AcquirePauseLock(ctx)
+		require.NoError(t, err)
+		defer release()
+
+		assert.True(t, q.IsPauseActive(), "Should return true when pause lock is active")
+	})
+
+	t.Run("StalePauseLockIsCleanedUp", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir, WithTimeout(50*time.Millisecond))
+		require.NoError(t, err)
+
+		pauseLockPath := filepath.Join(q.path, "__SUBTREE_PAUSE__.lock")
+
+		file, err := os.Create(pauseLockPath)
+		require.NoError(t, err)
+		file.Close()
+
+		oldTime := time.Now().Add(-100 * time.Millisecond)
+		err = os.Chtimes(pauseLockPath, oldTime, oldTime)
+		require.NoError(t, err)
+
+		assert.False(t, q.IsPauseActive(), "Should return false and clean up stale lock")
+
+		_, statErr := os.Stat(pauseLockPath)
+		assert.True(t, os.IsNotExist(statErr), "Stale lock file should be removed")
+	})
+}
+
+func TestPauseLockHeartbeat(t *testing.T) {
+	var logger ulogger.Logger = ulogger.TestLogger{}
+
+	t.Run("LockFileIsKeptFreshWithHeartbeat", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+		q, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+		release, err := q.AcquirePauseLock(ctx)
+		require.NoError(t, err)
+		defer release()
+
+		pauseLockPath := filepath.Join(q.path, "__SUBTREE_PAUSE__.lock")
+
+		info1, err := os.Stat(pauseLockPath)
+		require.NoError(t, err)
+		mtime1 := info1.ModTime()
+
+		time.Sleep(80 * time.Millisecond)
+
+		info2, err := os.Stat(pauseLockPath)
+		require.NoError(t, err)
+		mtime2 := info2.ModTime()
+
+		assert.True(t, mtime2.After(mtime1), "Lock file should be updated by heartbeat")
+		assert.True(t, q.IsPauseActive(), "Pause should still be active after heartbeat update")
+	})
+}
+
+func TestMultiplePodsPauseCoordination(t *testing.T) {
+	var logger ulogger.Logger = ulogger.TestLogger{}
+
+	t.Run("TwoPodsCannotAcquirePauseLockSimultaneously", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+
+		q1, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		q2, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+
+		release1, err1 := q1.AcquirePauseLock(ctx)
+		require.NoError(t, err1)
+		require.NotNil(t, release1)
+		defer release1()
+
+		assert.True(t, q1.IsPauseActive(), "Pod 1 should see pause as active")
+		assert.True(t, q2.IsPauseActive(), "Pod 2 should see pause as active")
+
+		release2, err2 := q2.AcquirePauseLock(ctx)
+		assert.Error(t, err2, "Pod 2 should fail to acquire lock")
+		assert.NotNil(t, release2)
+
+		assert.True(t, q1.IsPauseActive(), "Pod 1 should still see pause as active")
+		assert.True(t, q2.IsPauseActive(), "Pod 2 should still see pause as active")
+	})
+
+	t.Run("SecondPodCanAcquireLockAfterFirstReleases", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+
+		q1, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		q2, err := NewQuorum(logger, exister, tempDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+
+		release1, err1 := q1.AcquirePauseLock(ctx)
+		require.NoError(t, err1)
+		defer release1()
+
+		assert.True(t, q1.IsPauseActive())
+		assert.True(t, q2.IsPauseActive())
+
+		release1()
+		time.Sleep(50 * time.Millisecond)
+
+		assert.False(t, q1.IsPauseActive(), "Pod 1 should see pause as inactive")
+		assert.False(t, q2.IsPauseActive(), "Pod 2 should see pause as inactive")
+
+		release2, err2 := q2.AcquirePauseLock(ctx)
+		require.NoError(t, err2, "Pod 2 should be able to acquire lock")
+		defer release2()
+
+		assert.True(t, q1.IsPauseActive(), "Pod 1 should see pause as active again")
+		assert.True(t, q2.IsPauseActive(), "Pod 2 should see pause as active")
+	})
+
+	t.Run("PodCrashScenario", func(t *testing.T) {
+		tempDir := t.TempDir()
+		exister := newMockExister(false)
+
+		q1, err := NewQuorum(logger, exister, tempDir, WithTimeout(50*time.Millisecond))
+		require.NoError(t, err)
+
+		q2, err := NewQuorum(logger, exister, tempDir, WithTimeout(50*time.Millisecond))
+		require.NoError(t, err)
+
+		ctx := context.Background()
+
+		release1, err1 := q1.AcquirePauseLock(ctx)
+		require.NoError(t, err1)
+
+		assert.True(t, q1.IsPauseActive())
+		assert.True(t, q2.IsPauseActive())
+
+		release1()
+
+		pauseLockPath := filepath.Join(q1.path, "__SUBTREE_PAUSE__.lock")
+		file, err := os.Create(pauseLockPath)
+		require.NoError(t, err)
+		file.Close()
+
+		oldTime := time.Now().Add(-200 * time.Millisecond)
+		err = os.Chtimes(pauseLockPath, oldTime, oldTime)
+		require.NoError(t, err)
+
+		assert.False(t, q2.IsPauseActive(), "Pod 2 should detect stale lock and clean it up")
+
+		release2, err2 := q2.AcquirePauseLock(ctx)
+		require.NoError(t, err2, "Pod 2 should be able to acquire lock after cleaning up stale lock")
+		defer release2()
+
+		assert.True(t, q2.IsPauseActive())
+	})
+}

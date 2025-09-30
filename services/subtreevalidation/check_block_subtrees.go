@@ -88,19 +88,21 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}
 
-	// This only works on single instances, not in clustered environments
+	var releasePause func()
 	if shouldPauseProcessing {
-		u.logger.Infof("[CheckBlockSubtrees] Block %s is on our chain or extending it - pausing subtree processing", block.Hash().String())
-		u.pauseSubtreeProcessing.Store(true)
+		u.logger.Infof("[CheckBlockSubtrees] Block %s is on our chain or extending it - pausing subtree processing across all pods", block.Hash().String())
+		var err error
+		releasePause, err = u.setPauseProcessing(ctx)
+		if err != nil {
+			u.logger.Warnf("[CheckBlockSubtrees] Failed to acquire distributed pause lock: %v - continuing without pause", err)
+		}
 	} else {
 		u.logger.Infof("[CheckBlockSubtrees] Block %s is on a different fork - not pausing subtree processing", block.Hash().String())
 	}
 
-	defer func() {
-		if u.pauseSubtreeProcessing.Load() {
-			u.pauseSubtreeProcessing.Store(false)
-		}
-	}()
+	if releasePause != nil {
+		defer releasePause()
+	}
 
 	// validate all the subtrees in the block
 	missingSubtrees := make([]chainhash.Hash, 0, len(block.Subtrees))

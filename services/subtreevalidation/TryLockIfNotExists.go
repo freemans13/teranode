@@ -368,3 +368,86 @@ func (q *Quorum) TryLockIfNotExistsWithTimeout(ctx context.Context, hash *chainh
 		}
 	}
 }
+
+// AcquirePauseLock acquires a distributed pause lock for subtree processing.
+//
+// This method creates a lock file in the quorum path that signals all subtree validation
+// pods to pause their processing. The lock is automatically kept alive through periodic
+// heartbeat updates (via autoReleaseLock) and is automatically released when:
+// - The context is cancelled
+// - The absolute timeout expires (if configured)
+// - The calling pod crashes (lock becomes stale and is cleaned up by other pods)
+//
+// This enables coordinated pausing across multiple pods during operations like block
+// validation that require exclusive access to the UTXO state.
+//
+// Parameters:
+//   - ctx: Context for cancellation and request-scoped values
+//
+// Returns:
+//   - release: Function to call to explicitly release the pause lock
+//   - error: Error if the lock cannot be acquired
+func (q *Quorum) AcquirePauseLock(ctx context.Context) (release func(), err error) {
+	pauseLockFile := path.Join(q.path, "__SUBTREE_PAUSE__.lock")
+
+	q.expireLockIfOld(pauseLockFile)
+
+	// Attempt to acquire lock by atomically creating the lock file
+	file, err := os.OpenFile(pauseLockFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			q.logger.Debugf("[AcquirePauseLock] pause lock file already exists - another pod holds the lock")
+			return noopFunc, errors.NewStorageError("pause lock already held by another pod")
+		}
+
+		q.logger.Errorf("[AcquirePauseLock] error creating pause lock file %s: %v", pauseLockFile, err)
+		return noopFunc, err
+	}
+
+	if err = file.Close(); err != nil {
+		q.logger.Warnf("failed to close pause lock file %q: %v", pauseLockFile, err)
+	}
+
+	// Set up automatic lock release with heartbeat updates
+	lockCtx, cancel := context.WithCancel(ctx)
+	go q.autoReleaseLock(lockCtx, cancel, pauseLockFile)
+
+	q.logger.Infof("[AcquirePauseLock] Successfully acquired distributed pause lock")
+
+	return func() {
+		cancel()
+		releaseLock(q.logger, pauseLockFile)
+		q.logger.Infof("[AcquirePauseLock] Released distributed pause lock")
+	}, nil
+}
+
+// IsPauseActive checks if any pod currently holds a valid pause lock.
+//
+// This method checks for the existence of the pause lock file and verifies that
+// it is not stale (i.e., the holding pod is still actively updating the heartbeat).
+// If a stale lock is found, it is automatically cleaned up.
+//
+// This enables all pods to coordinate their pausing behavior by checking a shared
+// lock file in the quorum path, ensuring that when one pod initiates a pause
+// (e.g., during block validation), all other pods honor that pause.
+//
+// Returns:
+//   - bool: true if a valid pause lock exists, false otherwise
+func (q *Quorum) IsPauseActive() bool {
+	pauseLockFile := path.Join(q.path, "__SUBTREE_PAUSE__.lock")
+
+	// First clean up any stale locks
+	q.expireLockIfOld(pauseLockFile)
+
+	// Check if lock file still exists after cleanup
+	_, err := os.Stat(pauseLockFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		q.logger.Warnf("[IsPauseActive] error checking pause lock file: %v", err)
+		return false
+	}
+
+	return true
+}
