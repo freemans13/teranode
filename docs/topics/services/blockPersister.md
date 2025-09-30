@@ -248,7 +248,7 @@ The Block Persister service configuration is organized into several categories t
 
 #### Block Storage
 
-- **Block Store URL (`blockstore`)**
+- **Block Store URL (`blockPersisterStore`)**
     - Type: `*url.URL`
     - Default Value: `"file://./data/blockstore"`
     - Purpose: Defines where block data files are stored
@@ -270,9 +270,9 @@ The Block Persister service configuration is organized into several categories t
 
 #### Block Selection and Timing
 
-- **Persist Age (`blockpersister_persistAge`)**
+- **Persist Age (`BlockPersisterPersistAge`)**
     - Type: `uint32`
-    - Default Value: `100`
+    - Default Value: Not specified in settings (varies by configuration)
     - Purpose: Determines how many blocks behind the tip the persister stays
     - Impact: Critical for avoiding reorgs by ensuring blocks are sufficiently confirmed
     - Example: If set to 100, only blocks that are at least 100 blocks deep are processed
@@ -281,9 +281,9 @@ The Block Persister service configuration is organized into several categories t
         - Lower values: More immediate processing but higher risk of reprocessing due to reorgs
         - Higher values: More conservative approach with minimal reorg risk
 
-- **Persist Sleep (`blockPersister_persistSleep`)**
+- **Persist Sleep (`BlockPersisterPersistSleep`)**
     - Type: `time.Duration`
-    - Default Value: `1 minute`
+    - Default Value: Not specified in settings (varies by configuration)
     - Purpose: Sleep duration between polling attempts when no blocks are available to process
     - Impact: Controls polling frequency and system load during idle periods
     - Tuning Advice:
@@ -320,7 +320,7 @@ The Block Persister service configuration is organized into several categories t
 
 #### UTXO Management
 
-- **Skip UTXO Delete (`blockpersister_skipUTXODelete`)**
+- **Skip UTXO Delete (`SkipUTXODelete`)**
     - Type: `bool`
     - Default Value: `false`
     - Purpose: Controls whether UTXO deletions are skipped during processing
@@ -330,29 +330,47 @@ The Block Persister service configuration is organized into several categories t
         - Enable during initial sync or recovery to improve performance
         - Disable for normal operation to maintain complete UTXO tracking
 
-- **UTXO Store URL (`txmeta_store`)**
+- **UTXO Store URL (`UtxoStore`)**
     - Type: `*url.URL`
-    - Default Value: `""` (empty)
+    - Default Value: `nil` (not configured by default)
     - Purpose: UTXO store URL for transaction metadata access
     - Impact: Provides transaction metadata storage for UTXO processing operations
     - Usage: Required when UTXO processing features are enabled
 
-- **UTXO Persister Buffer Size (`utxoPersister_buffer_size`)**
+- **UTXO Persister Buffer Size (`UTXOPersisterBufferSize`)**
     - Type: `string`
-    - Default Value: `"4KB"`
+    - Default Value: Not specified in settings
     - Purpose: Buffer size for UTXO persister operations
     - Impact: Controls memory allocation for UTXO processing operations
     - Supported Formats: Standard size units (KB, MB, GB)
 
-- **UTXO Persister Direct Mode (`direct`)**
+- **UTXO Persister Direct Mode (`UTXOPersisterDirect`)**
     - Type: `bool`
-    - Default Value: `true`
+    - Default Value: `false`
     - Purpose: Enable direct UTXO persister mode (bypasses intermediate buffering)
     - Impact: Controls UTXO processing mode for performance optimization
     - Tuning Advice:
 
         - Direct mode: Better performance for most scenarios
         - Buffered mode: May be useful for specific memory-constrained environments
+
+### Additional Block Settings
+
+The Block Persister service also uses several additional settings from the BlockSettings struct that affect its operation:
+
+- **Transaction Store URL (`TxStore`)**
+    - Type: `*url.URL`
+    - Default Value: `nil` (not configured by default)
+    - Purpose: Transaction store URL for accessing transaction data
+    - Impact: Provides transaction data storage for block processing operations
+    - Usage: Required when transaction processing features are enabled
+
+- **Block Store (`BlockStore`)**
+    - Type: `*url.URL`
+    - Default Value: `nil` (not configured by default)
+    - Purpose: Block store URL for storing complete block data
+    - Impact: Determines where block files are persisted
+    - Usage: Required for block persistence operations
 
 ### Configuration Interactions and Dependencies
 
@@ -372,6 +390,18 @@ The Block Persister's processing behavior is controlled by multiple interacting 
 3. **Wait Behavior**
     - `BlockPersisterPersistSleep` controls polling frequency when no blocks are available
     - On errors, the service applies a fixed 1-minute backoff regardless of this setting
+
+### Dependency Injection
+
+The Block Persister service receives several dependencies through dependency injection:
+
+- **Block Store** - Injected blob store for block persistence (configured via daemon)
+- **Subtree Store** - Injected blob store for subtree storage (configured via daemon)
+- **UTXO Store** - Injected UTXO store for transaction processing (configured via daemon)
+- **Blockchain Client** - Injected client for block retrieval and coordination (configured via daemon)
+- **Context** - Service context for listener management and lifecycle control
+
+These dependencies are configured and injected by the daemon during service initialization, ensuring proper integration with the overall Teranode system.
 
 ## 8. Other Resources
 

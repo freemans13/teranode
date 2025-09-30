@@ -92,81 +92,83 @@ The UTXO Persister processes blocks and creates UTXO sets as follows:
 
 1) **Trigger and Block Height Check**:
 
-    - The service is triggered to process the next block (via notification, timer, or startup).
-    - It checks if the next block to process is at least 100 blocks behind the current best block height.
+  - The service is triggered to process the next block (via notification, timer, or startup).
+  - It checks if the next block to process is at least 100 blocks behind the current best block height.
 
 2) **Block Headers Retrieval**:
 
-    - If processing is needed, the service retrieves block headers from either the Blockchain Store or Blockchain Client.
-    - It verifies the chain continuity using these headers.
+  - If processing is needed, the service retrieves block headers from either the Blockchain Store or Blockchain Client.
+  - It verifies the chain continuity using these headers.
 
 3) **Last Set Verification**:
 
-    - The service verifies the last UTXO set using `verifyLastSet()` to ensure data integrity.
+  - The service verifies the last UTXO set using `verifyLastSet()` to ensure data integrity.
 
 4) **Block Range Consolidation**:
 
-    - A new Consolidator is created to process a range of blocks efficiently.
-    - The `ConsolidateBlockRange()` method is called to handle multiple blocks at once if needed.
+  - A new Consolidator is created to process a range of blocks efficiently.
+  - The `ConsolidateBlockRange()` method is called to handle multiple blocks at once if needed.
 
 5) **UTXO Set Preparation**:
 
-    - The service calls `GetUTXOSetWithDeletionsMap()` to prepare the UTXO set for the new block.
-    - This retrieves the UTXO deletions from the Block Store and creates a deletions map.
+  - The service calls `GetUTXOSetWithDeletionsMap()` to prepare the UTXO set for the new block.
+  - This retrieves the UTXO deletions from the Block Store and creates a deletions map.
 
 6) **UTXO Set Creation**:
 
-    - The `CreateUTXOSet()` method is called on the UTXOSet object.
-    - This method:
+  - The `CreateUTXOSet()` method is called on the UTXOSet object.
+  - This method:
 
-      - Retrieves the previous block's UTXO set from the Block Store.
-      - Applies the deletions from the deletions map.
-      - Incorporates new UTXOs from the block's transactions.
-      - Writes the new UTXO set to the Block Store.
+    - Retrieves the previous block's UTXO set from the Block Store.
+    - Applies the deletions from the deletions map.
+    - Incorporates new UTXOs from the block's transactions.
+    - Writes the new UTXO set to the Block Store.
 
 7) **Cleanup**:
 
-    - If not skipped (based on configuration), the service deletes the previous block's UTXO set to save space.
+  - If not skipped (based on configuration), the service deletes the previous block's UTXO set to save space.
 
 8) **Update Last Processed Height**:
 
-    - The service calls `writeLastHeight()` to update its record of the last processed block height.
+  - The service calls `writeLastHeight()` to update its record of the last processed block height.
 
 9) **Trigger Next Block Processing**:
 
-    - The service initiates the processing of the next block, continuing the cycle.
+  - The service initiates the processing of the next block, continuing the cycle.
 
 If the current height is less than 100 blocks behind the best block height, the service waits for more confirmations before processing.
 
 
 ## 3. Data Model
 
+### 3.1 Basic Structure
 
-1. **Basic Structure:**
-   The UTXO set is essentially a collection of all unspent transaction outputs in the blockchain up to a specific block height. Each UTXO represents a piece of cryptocurrency that can be spent in future transactions.
+The UTXO set is essentially a collection of all unspent transaction outputs in the blockchain up to a specific block height. Each UTXO represents a piece of cryptocurrency that can be spent in future transactions.
 
+### 3.2 UTXO Components
 
-2. **UTXO Components:**
-   The UTXOs are stored in a hierarchical structure, with the following components:
+The UTXOs are stored in a hierarchical structure, with the following components:
 
-**UTXOWrapper**:
-   ```go
-   type UTXOWrapper struct {
-       TxID     chainhash.Hash
-       Height   uint32
-       Coinbase bool
-       UTXOs    []*UTXO
-   }
-   ```
-**UTXO**:
-   ```go
-   type UTXO struct {
-       Index  uint32
-       Value  uint64
-       Script []byte
-   }
-   ```
+**UTXOWrapper:**
+```go
+type UTXOWrapper struct {
+    TxID     chainhash.Hash
+    Height   uint32
+    Coinbase bool
+    UTXOs    []*UTXO
+}
+```
 
+**UTXO:**
+```go
+type UTXO struct {
+    Index  uint32
+    Value  uint64
+    Script []byte
+}
+```
+
+**Field descriptions:**
 
 - **TxID**: The transaction ID where this UTXO was created (32 bytes)
 - **Index**: The output index in the transaction (4 bytes)
@@ -175,48 +177,46 @@ If the current height is less than 100 blocks behind the best block height, the 
 - **Script**: The locking script that must be satisfied to spend this UTXO (variable length)
 - **Coinbase**: A flag indicating whether this UTXO is from a coinbase transaction (1 bit, packed with Height)
 
+### 3.3 Binary Encoding
 
+The UTXO is encoded into a binary format for efficient storage and retrieval:
 
-3. **Binary Encoding:**
-   The UTXO is encoded into a binary format for efficient storage and retrieval:
+- 32 bytes: TxID
+- 4 bytes: Index (little-endian)
+- 8 bytes: Value (little-endian)
+- 4 bytes: Height and Coinbase flag (Height << 1 | CoinbaseFlag)
+- 4 bytes: Script length (little-endian)
+- Variable bytes: Script
 
-    - 32 bytes: TxID
-    - 4 bytes: Index (little-endian)
-    - 8 bytes: Value (little-endian)
-    - 4 bytes: Height and Coinbase flag (Height << 1 | CoinbaseFlag)
-    - 4 bytes: Script length (little-endian)
-    - Variable bytes: Script
+### 3.4 UTXO Set File
 
+The UTXO set for each block is stored in a file with the extension `utxo-set`. This file contains a series of encoded UTXOs representing all unspent outputs up to that block.
 
-4. **UTXO Set File**:
-   The UTXO set for each block is stored in a file with the extension `utxo-set`. This file contains a series of encoded UTXOs representing all unspent outputs up to that block.
+### 3.5 UTXO Diff
 
+The UTXO Persister uses a diff-based approach to update the UTXO set:
 
-5. **UTXO Diff**:
-   The UTXO Persister uses a diff-based approach to update the UTXO set:
+- `utxo-additions`: New UTXOs created in a block
+- `utxo-deletions`: UTXOs spent in a block
 
-    - `utxo-additions`: New UTXOs created in a block
-    - `utxo-deletions`: UTXOs spent in a block
+### 3.6 UTXO Deletion Model
 
+When a UTXO is spent, it's recorded in the `utxo-deletions` file. The deletion record contains:
 
-6. **UTXO Deletion Model**:
-   When a UTXO is spent, it's recorded in the `utxo-deletions` file. The deletion record contains:
+- TxID (32 bytes)
+- Index (4 bytes)
 
-    - TxID (32 bytes)
-    - Index (4 bytes)
+### 3.7 Set Operations
 
+Creating a new UTXO set involves:
 
-7. **Set Operations**:
+1. Starting with the previous block's UTXO set
+2. Removing UTXOs listed in the current block's `utxo-deletions`
+3. Adding UTXOs listed in the current block's `utxo-additions`
 
-    - Creating a new UTXO set involves:
-      1. Starting with the previous block's UTXO set
-      2. Removing UTXOs listed in the current block's `utxo-deletions`
-      3. Adding UTXOs listed in the current block's `utxo-additions`
+### 3.8 Persistence
 
-
-8. **Persistence:**
-   The UTXO set is persisted using a _FileStorer_, which writes the data to a blob store.
-
+The UTXO set is persisted using a _FileStorer_, which writes the data to a blob store.
 
 
 
@@ -356,17 +356,14 @@ These settings control general operational aspects of the service.
 
 | Setting | Type | Default | Description | Impact |
 |---------|------|---------|-------------|--------|
-| `fsm_state_restore` | bool | `false` | When true, the service restores state from a previously saved state file | Controls recovery behavior after restarts or failures |
-| `network` | string | Varies by deployment | Specifies the blockchain network (mainnet, testnet, etc.) | Determines which network's rules and parameters are used |
+| `network` | string | `"mainnet"` | Specifies the blockchain network (mainnet, testnet, regtest) | Determines genesis hash and chain parameters used for validation |
 
 #### Operational Controls Interactions and Dependencies
 
-These settings affect how the service operates and recovers from failures:
+- The `network` setting determines the genesis hash and chain parameters via chaincfg.GetChainParams(), which is critical for genesis block detection and UTXO set validation
+- Genesis hash validation is used throughout the service to determine when to skip certain operations like UTXO deletion
 
-- The `fsm_state_restore` setting enables recovery from a previously saved state, which can be crucial for maintaining data continuity after unexpected shutdowns
-- The `network` setting ensures the service applies the correct rules and parameters for the target blockchain network
-
-These settings typically interact with broader system configuration and are often shared across multiple services.
+This setting is fundamental to the service's operation and must match the target blockchain network.
 
 ### 7.6 Configuration Best Practices
 
@@ -376,7 +373,7 @@ These settings typically interact with broader system configuration and are ofte
 
 3. **Deployment Architecture**: Choose direct access (`direct=true`) whenever possible for best performance, unless your system architecture specifically requires distributed deployment.
 
-4. **Recovery Testing**: Regularly test the recovery process with `fsm_state_restore=true` to ensure continuity after failures or planned restarts.
+4. **Network Configuration**: Ensure the `network` setting matches your target blockchain environment. Incorrect network configuration can lead to validation failures and data corruption.
 
 5. **Storage Location**: Use persistent, reliable storage locations for the `blockstore` setting in production environments, ideally on dedicated, high-performance storage systems.
 

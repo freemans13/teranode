@@ -33,9 +33,9 @@ The Subtree Validator is responsible for ensuring the integrity and consistency 
 
 The Subtree Validation Service:
 
-* Receives new subtrees from the P2P Service. The P2P Service has received them from other nodes on the network.
-* Validates the subtrees, after fetching them from the remote asset server.
-* Decorates the subtrees with additional metadata, and stores them in the Subtree Store.
+- Receives new subtrees from the P2P Service. The P2P Service has received them from other nodes on the network.
+- Validates the subtrees, after fetching them from the remote asset server.
+- Decorates the subtrees with additional metadata, and stores them in the Subtree Store.
 
 The P2P Service communicates with the Block Validation over either gRPC protocols.
 
@@ -48,16 +48,16 @@ The Subtree Validation service interacts with the Validator service to validate 
 1. **Local Validator**:
 
     - When `validator.useLocalValidator=true` (recommended for production)
-   - The Validator is instantiated directly within the Subtree Validation service
-   - Direct method calls are used without network overhead
-   - This provides the best performance and lowest latency
+    - The Validator is instantiated directly within the Subtree Validation service
+    - Direct method calls are used without network overhead
+    - This provides the best performance and lowest latency
 
 2. **Remote Validator Service**:
 
     - When `validator.useLocalValidator=false`
-   - The Subtree Validation service connects to a separate Validator service via gRPC
-   - Useful for development, testing, or specialized deployment scenarios
-   - Has higher latency due to additional network calls
+    - The Subtree Validation service connects to a separate Validator service via gRPC
+    - Useful for development, testing, or specialized deployment scenarios
+    - Has higher latency due to additional network calls
 
 This configuration is controlled by the settings passed to `GetValidatorClient()` in daemon.go.
 
@@ -245,6 +245,7 @@ These settings control how subtree validation is coordinated to prevent duplicat
 | `subtree_quorum_path` | string | `""` (empty) | **REQUIRED** - Directory path where quorum data is stored for subtree validation | Critical - service will not initialize without this path configured |
 | `subtree_quorum_absolute_timeout` | time.Duration | `30s` | Maximum time to wait for quorum operations to complete | Controls deadlock prevention and failure recovery during validation |
 | `subtreevalidation_subtree_validation_abandon_threshold` | int | `1` | Number of sequential validation failures before abandoning validation attempts | Controls resilience and retry behavior for validation errors |
+| `subtreevalidation_failfast_validation` | bool | `true` | Controls whether validation stops at the first error or continues | Affects validation performance and error reporting behavior |
 | `subtreevalidation_orphanageTimeout` | time.Duration | `15m` | Timeout for orphaned transactions in the orphanage cache | Controls memory usage and cleanup of orphaned transaction data |
 | `subtreevalidation_subtreeBlockHeightRetention` | uint32 | `globalBlockHeightRetention` | Block height retention for subtree data | Controls how long subtree data is retained based on block height |
 | `subtreevalidation_blockHeightRetentionAdjustment` | int32 | `0` | Adjustment to global block height retention (can be positive or negative) | Fine-tunes retention period for subtree-specific requirements |
@@ -289,13 +290,13 @@ These settings control concurrency, parallelism, and batch sizes to optimize per
 | Setting | Type | Default | Description | Impact |
 |---------|------|---------|-------------|--------|
 | `subtreevalidation_getMissingTransactions` | int | max(4, numCPU/2) | Number of concurrent workers for fetching missing transactions | Controls parallelism for transaction retrieval operations |
-| `subtreevalidation_subtreeFoundChConcurrency` | int | `1` | Number of concurrent workers for processing found subtrees | Controls throughput for subtree discovery and processing |
 | `subtreevalidation_subtreeDAHConcurrency` | int | `8` | Number of concurrent workers for processing Direct Acyclic Hash operations | Controls parallelism for DAH computations during validation |
 | `subtreevalidation_processTxMetaUsingStoreConcurrency` | int | `32` | Number of concurrent workers for store-based metadata processing | Controls parallelism and I/O load during validation |
 | `subtreevalidation_processTxMetaUsingCacheConcurrency` | int | `32` | Number of concurrent workers for cached metadata processing | Controls parallelism and CPU utilization during validation |
 | `subtreevalidation_spendBatcherSize` | int | `1024` | Batch size for processing spend operations | Controls I/O patterns and throughput for UTXO spend operations |
 | `subtreevalidation_processTxMetaUsingStoreBatchSize` | int | `1024` | Batch size for processing transaction metadata from store | Affects I/O patterns and throughput for store-based metadata processing |
 | `subtreevalidation_processTxMetaUsingCacheBatchSize` | int | `1024` | Batch size for processing transaction metadata using cache | Affects memory usage and throughput for cached metadata processing |
+| `subtreevalidation_check_block_subtrees_concurrency` | int | `32` | Number of concurrent workers for processing block subtrees | Controls parallelism for block subtree validation operations |
 
 #### Performance & Scaling Interactions and Dependencies
 
@@ -327,7 +328,26 @@ The caching system is critical for high-performance validation:
 - The missing transaction thresholds control when the service switches from metadata validation to full transaction validation, which is more resource-intensive but necessary in some cases
 - Separate thresholds for cache and store operations allow optimizing each path independently
 
-### 8.6 Network & Communication Settings
+### 8.6 Storage & Data Settings
+
+These settings control data storage and retention for subtree validation.
+
+| Setting | Type | Default | Description | Impact |
+|---------|------|---------|-------------|--------|
+| `subtreestore` | string | `""` (empty) | **REQUIRED** - URL for subtree blob storage backend | Determines where subtrees are stored and retrieved |
+| `utxostore` | string | `""` (empty) | **REQUIRED** - UTXO store URL for validation operations | Critical for transaction validation and UTXO state access |
+
+### 8.7 Kafka Integration Settings
+
+These settings control Kafka message queue integration for system-wide communication.
+
+| Setting | Type | Default | Description | Impact |
+|---------|------|---------|-------------|--------|
+| `kafka_invalidSubtrees` | string | `"invalid-subtrees"` | Kafka topic name for publishing invalid subtree notifications | Enables system-wide error notification and monitoring |
+| `kafka_invalidSubtreesConfig` | string | `""` (empty) | Kafka URL configuration for invalid subtrees topic | Overrides default Kafka configuration for invalid subtrees |
+| `kafka_invalidBlocksConfig` | string | `""` (empty) | Kafka URL configuration for invalid blocks notifications | Enables integration with block validation error handling |
+
+### 8.8 Network & Communication Settings
 
 These settings control how the service communicates with other components in the system.
 
@@ -337,16 +357,6 @@ These settings control how the service communicates with other components in the
 | `subtreevalidation_grpcListenAddress` | string | `":8089"` | Address where the service listens for gRPC connections | Controls network binding for service communication |
 | `subtreevalidation_subtreeValidationTimeout` | int | `1000` | Timeout (ms) for subtree validation operations | Controls error recovery and prevents hanging validation processes |
 | `validator.useLocalValidator` | bool | `false` | Controls whether to use a local or remote validator | Affects system architecture and validation performance |
-
-#### Network & Communication Interactions and Dependencies
-
-These settings determine how the service integrates with the broader system:
-
-- The gRPC address settings control how the service exposes its API and how other services connect to it
-- The validation timeout prevents operations from hanging indefinitely, ensuring system resilience
-- The validator deployment model (`useLocalValidator`) affects performance and system architecture, with local validation typically offering better performance but requiring more resources
-
-
 
 ## 9. Other Resources
 

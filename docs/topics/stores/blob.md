@@ -29,7 +29,7 @@
     - [8.4. File Operation Options](#84-file-operation-options-functional-options)
     - [8.5. TX Store Configuration Examples](#85-tx-store-configuration-examples)
     - [8.6. SubTree Store Configuration Examples](#86-subtree-store-configuration-examples)
-    - [8.7. Configuration Interactions](#87-configuration-interactions)
+    - [8.7. Delete-At-Height Requirements](#87-delete-at-height-requirements)
 - [9. Other Resources](#9-other-resources)
 
 ## 1. Description
@@ -305,33 +305,30 @@ Components:
 
 | Parameter | Type | Default | Description | Impact |
 |-----------|------|---------|-------------|--------|
-| `hashPrefix` | Integer | 2 | Number of characters from hash to use for directory organization | Improves file organization and lookup performance; affects directory structure |
-| `batch` | Boolean | false | Enables batch operations | Improves performance by batching operations |
-| `sizeInBytes` | Integer | 4194304 | Maximum batch size in bytes (4MB default) | Controls batch size; larger values increase throughput but use more memory |
-| `writeKeys` | Boolean | false | Whether to write keys along with blob data | Enables key storage alongside blob content |
-| `batch_size` | Integer | 1000 | Maximum items in a batch | Controls batch size; larger values increase throughput but use more memory |
-| `batch_duration` | Integer (ms) | 50 | Maximum time before processing a batch | Balances throughput vs. latency |
-| `localDAHStore` | String | "" | Local Delete-At-Height store backend type | Enables automatic expiry of data based on blockchain height |
-| `localDAHStorePath` | String | "/tmp/localDAH" | Path for local DAH store metadata | Directory for DAH metadata storage |
-| `localTTLStore` | String | "" | Local TTL store type for time-based expiration | Enables time-based data expiration |
-| `localTTLStorePath` | String | "" | Local TTL store path for metadata | Directory for TTL metadata storage |
-| `logger` | Boolean | false | Enables debug logging for all blob operations | Adds detailed logging for troubleshooting |
+| `hashPrefix` | Integer | 2 | Number of characters from start of hash for directory organization | Improves file organization and lookup performance |
+| `hashSuffix` | Integer | - | Number of characters from end of hash for directory organization | Alternative to hashPrefix; uses end of hash |
+| `batch` | Boolean | false | Enables batch wrapper for improved performance | Aggregates operations into larger batches |
+| `sizeInBytes` | Integer | 4194304 | Maximum batch size in bytes when batching enabled | Controls memory usage and batch efficiency |
+| `writeKeys` | Boolean | false | Store key index alongside batch data | Enables key-based retrieval from batches |
+| `localDAHStore` | String | "" | Enable Delete-At-Height functionality | Requires value like "memory://" to enable DAH |
+| `localDAHStorePath` | String | "/tmp/localDAH" | Path for DAH metadata storage | Directory for blockchain height tracking |
+| `logger` | Boolean | false | Enable debug logging wrapper | Adds detailed operation logging |
 
 #### 8.2.2. File Backend Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | Path component | String | None (required) | Base directory for file storage |
-| `dahCleanerInterval` | Duration | "1m" | Frequency of expired blob cleanup operations |
-| `header` | String | `(empty)` | Custom header prepended to all stored blobs |
-| `eofmarker` | String | `(empty)` | Custom footer appended to all stored blobs |
+| `checksum` | Boolean | false | Enable SHA256 checksumming of stored blobs |
+| `header` | String | `(empty)` | Custom header prepended to stored blobs (hex or plain text) |
+| `eofmarker` | String | `(empty)` | Custom footer appended to stored blobs (hex or plain text) |
 
 #### 8.2.3. S3 Backend Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | Path component | String | None (required) | S3 bucket name |
-| `region` | String | "us-east-1" | AWS region for S3 bucket |
+| `region` | String | None (required) | AWS region for S3 bucket |
 | `endpoint` | String | AWS S3 endpoint | Custom endpoint for S3-compatible storage |
 | `forcePathStyle` | Boolean | false | Force path-style addressing |
 | `subDirectory` | String | `(none)` | S3 object key prefix for organization |
@@ -346,7 +343,7 @@ Components:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | Host+Path | String | None (required) | Remote HTTP blob server endpoint |
-| `timeout` | Integer (ms) | 30000 | HTTP request timeout |
+| Timeout | Duration | 30s | HTTP client timeout (hardcoded, not configurable via URL) |
 
 ### 8.3. Store Options (options.Options)
 
@@ -393,13 +390,13 @@ These options can be specified per operation using functional option pattern:
 - **Amazon S3**
 
   ```plaintext
-  txstore.${YOUR_USERNAME}=s3:///mytxstore?region=eu-west-1&batch=true&batch_size=2000&batch_duration=100
+  txstore.${YOUR_USERNAME}=s3://mytxstore?region=eu-west-1&batch=true&sizeInBytes=8388608
   ```
 
 - **File System with DAH**
 
   ```plaintext
-  txstore.${YOUR_USERNAME}=file:///data/txstore?batch=true&localDAHStore=true&localDAHStorePath=/data/txstore-dah
+  txstore.${YOUR_USERNAME}=file:///data/txstore?batch=true&localDAHStore=memory://&localDAHStorePath=/data/txstore-dah
   ```
 
 - **Memory Store**
@@ -419,13 +416,13 @@ These options can be specified per operation using functional option pattern:
 - **Amazon S3 with Local DAH Store**
 
   ```plaintext
-  subtreestore.${YOUR_USERNAME}=s3:///subtreestore?region=eu-west-1&localDAHStore=true&localDAHStorePath=/data/subtreestore-dah
+  subtreestore.${YOUR_USERNAME}=s3://subtreestore?region=eu-west-1&localDAHStore=memory://&localDAHStorePath=/data/subtreestore-dah
   ```
 
 - **File System with Local DAH Store**
 
   ```plaintext
-  subtreestore.${YOUR_USERNAME}=file:///data/subtreestore?localDAHStore=true&localDAHStorePath=./data/subtreestore-dah
+  subtreestore.${YOUR_USERNAME}=file:///data/subtreestore?localDAHStore=memory://&localDAHStorePath=./data/subtreestore-dah
   ```
 
 - **Memory Store**
@@ -434,23 +431,17 @@ These options can be specified per operation using functional option pattern:
   subtreestore.${YOUR_USERNAME}=memory:///
   ```
 
-### 8.7. Configuration Interactions
+### 8.7. Delete-At-Height Requirements
 
-#### Storage Backend Selection
+DAH functionality requires:
 
-The URL scheme determines which backend is used, which in turn determines which parameters are relevant. For example, `region` is only relevant for S3 storage, while `hashPrefix` applies to all backends that support directory organization.
+- `localDAHStore` parameter with valid store URL (e.g., "memory://")
+- `BlockHeightCh` channel for blockchain height tracking (subtree stores only)
+- Cannot be used with null stores (validation prevents this)
 
-#### Batching Configuration
+#### Hash-Based Directory Organization
 
-When batching is enabled (`batch=true`), the `sizeInBytes` parameter controls batch behavior. Operations are batched until the size limit is reached, then the batch is written to the underlying store.
-
-#### Delete-At-Height Functionality
-
-When `localDAHStore` is enabled, the store maintains metadata about when items should be deleted based on blockchain height. This metadata is stored at the path specified by `localDAHStorePath`. Individual files can set their own DAH values using the `WithDAH` option.
-
-#### Block Height Retention
-
-The `BlockHeightRetention` setting (via `WithDefaultBlockHeightRetention`) interacts with the `DAH` setting (via `WithDAH`). The store-level setting provides a default, while the file-level setting allows per-file control.
+`hashPrefix` (positive) uses start of hash, `hashSuffix` (negative value) uses end of hash for directory structure. Only one should be specified.
 
 ## 9. Other Resources
 

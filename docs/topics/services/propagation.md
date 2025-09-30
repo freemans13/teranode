@@ -180,7 +180,7 @@ The Propagation service serves as the transaction intake and distribution system
 | `propagation_httpListenAddress` | string | "" | Address for HTTP server to listen on | Controls if and where the HTTP transaction API is exposed |
 | `propagation_httpAddresses` | []string | [] | List of HTTP addresses for other services to connect to | Affects how other services discover this service's HTTP API |
 | `ipv6_addresses` | string | "" | Comma-separated list of IPv6 multicast addresses | Controls which IPv6 multicast addresses are used for transaction reception |
-| `ipv6_interface` | string | "" (falls back to "en0") | Network interface name for IPv6 multicast | Determines which network interface is used for multicast communication |
+| `ipv6_interface` | string | "" | Network interface name for IPv6 multicast | Determines which network interface is used for multicast communication |
 
 ### Performance and Throttling Settings
 
@@ -191,11 +191,11 @@ The Propagation service serves as the transaction intake and distribution system
 | `propagation_sendBatchSize` | int | 100 | Maximum number of transactions to send in a batch | Affects efficiency and throughput of transaction processing |
 | `propagation_sendBatchTimeout` | int | 5 | Timeout in milliseconds for batch sending operations | Controls how long the service waits to collect a full batch before processing |
 
-### Validator Integration Settings
+### Transport and Behavior Settings
 
 | Setting | Type | Default | Description | Impact |
 |---------|------|---------|-------------|--------|
-| `propagation_alwaysUseHTTP` | bool | false | Forces using HTTP instead of Kafka for transaction validation | Affects performance and reliability of transaction validation |
+| `propagation_alwaysUseHTTP` | bool | false | Forces using HTTP instead of gRPC for transaction validation | Affects performance and reliability of transaction validation |
 
 ### Dependency-Injected Settings (from other services)
 
@@ -230,15 +230,17 @@ The Propagation service interacts with the Validator service using one of two ar
 - **Remote Validator Mode** (`useLocalValidator=false`):
 
     - Propagation service communicates with a separate Validator service
-    - Transactions are sent via Kafka or HTTP, controlled by `propagation_alwaysUseHTTP`
-    - Large transactions exceeding `validator_kafkaMaxMessageBytes` are automatically sent via HTTP using `validator_httpAddress`
-    - Fallback mechanism ensures reliability for transactions of any size
+    - **Transaction Size-Based Routing**: Transactions are automatically routed based on size:
+        - Normal transactions (≤ `validator_kafka_maxMessageBytes`): Sent via Kafka for async validation
+        - Large transactions (> `validator_kafka_maxMessageBytes`): Automatically sent via HTTP to `validator_httpAddress`
+    - **Transport Override**: `propagation_alwaysUseHTTP=true` forces all transactions to use HTTP regardless of size
+    - **Automatic Fallback**: HTTP fallback ensures reliability for transactions of any size
 
-### Batch Processing Optimization
+### Client-Side Batch Processing Optimization
 
-The transaction processing pipeline uses batching to optimize throughput, controlled by:
+The propagation client uses batching to optimize throughput, controlled by:
 
-- `propagation_sendBatchSize`: Determines maximum batch size for transaction processing (default: 100)
+- `propagation_sendBatchSize`: Determines maximum batch size for client transaction processing (default: 100)
 - `propagation_sendBatchTimeout`: Controls how long to wait in milliseconds for a batch to fill before processing (default: 5ms)
 
 These settings should be tuned together based on expected transaction volume and size characteristics:

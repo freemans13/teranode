@@ -118,9 +118,9 @@ The overall cycle is:
 
 3) The Teranode network processes the block hash and requests the full block data from the Legacy Service.
 
-    - Upon receipt of the full block data, Teranode will notice that it contains subtrees it is not aware of, and request them from the Legacy Service.
-    - Upon receipt of the full subtree data, the list of transactions will be known, and will be requested from the Legacy Service.
-    - With all the information now available, the block is then added to the Teranode blockchain.
+   - Upon receipt of the full block data, Teranode will notice that it contains subtrees it is not aware of, and request them from the Legacy Service.
+   - Upon receipt of the full subtree data, the list of transactions will be known, and will be requested from the Legacy Service.
+   - With all the information now available, the block is then added to the Teranode blockchain.
 
 In the next sections, we will detail the steps involved.
 
@@ -401,7 +401,6 @@ The Legacy service bridges traditional Bitcoin nodes with the Teranode architect
 | `legacy_storeBatcherConcurrency` | int | 32 | Number of concurrent store operations | Controls parallelism for storage operations |
 | `legacy_spendBatcherConcurrency` | int | 32 | Number of concurrent spend operations | Controls parallelism for spend operations |
 | `legacy_outpointBatcherConcurrency` | int | 32 | Number of concurrent outpoint operations | Controls parallelism for outpoint operations |
-| `legacy_config_Upnp` | bool | false | Use UPnP for automatic port forwarding | Affects service accessibility from the internet |
 
 ### Peer Management and Timeouts
 
@@ -418,8 +417,6 @@ The Legacy service bridges traditional Bitcoin nodes with the Teranode architect
 | Setting | Type | Default | Description | Impact |
 |---------|------|---------|-------------|--------|
 | `legacy_allowBlockPriority` | bool | false | Prioritize transactions based on block priority | Affects transaction selection for block creation |
-| `useLocalValidator` | bool | false | Use a local validator instance embedded in the service | Improves performance by eliminating network overhead for validation |
-| `excessiveblocksize` | uint64 | 4GB | Maximum allowed block size | Limits resource consumption for extremely large blocks |
 
 ## Configuration Interactions and Dependencies
 
@@ -431,7 +428,6 @@ The Legacy service's peer connection behavior is controlled by several interrela
 - `legacy_connect_peers` forces outbound connections to specific peers
 - `legacy_savePeers` enables storing peer information across restarts
 - If no `legacy_listen_addresses` are specified, the service detects the external IP and uses port 8333
-- When `legacy_config_Upnp` is enabled, the service attempts to configure port forwarding automatically
 
 These settings should be configured together based on your network architecture and security requirements.
 
@@ -450,11 +446,13 @@ For resource-constrained environments, enable `legacy_writeMsgBlocksToDisk` and 
 The `legacy_writeMsgBlocksToDisk` setting enables a sophisticated disk-based queueing mechanism that fundamentally changes how the Legacy service handles incoming blocks during synchronization.
 
 **How It Works:**
+
 - It creates a streaming pipeline that writes blocks directly to disk, employing 4MB buffered readers for optimal disk performance.
 - Blocks are stored with a 10-minute TTL to prevent disk accumulation
 
 **Technical Implementation:**
-```
+
+```text
 Incoming Block → io.Pipe() → 4MB Buffer → Temporary Disk Storage → Validation Queue
                      ↓
               Background Goroutine
@@ -481,6 +479,7 @@ Incoming Block → io.Pipe() → 4MB Buffer → Temporary Disk Storage → Valid
 - Automatic cleanup prevents long-term storage accumulation
 
 **Configuration Example:**
+
 ```bash
 # Enable disk-based block queueing
 export legacy_writeMsgBlocksToDisk=true
@@ -493,12 +492,13 @@ export legacy_workingDir="/path/to/fast/storage"
 
 ### Batch Processing Pipeline
 
-The Legacy service uses a batching system for various operations, controlled by these settings:
+The Legacy service uses a batching system for UTXO operations, controlled by these settings:
 
 - Batch sizes (`legacy_storeBatcherSize`, `legacy_spendBatcherSize`, `legacy_outpointBatcherSize`) determine how many operations are grouped together
 - Concurrency settings (`legacy_storeBatcherConcurrency`, `legacy_spendBatcherConcurrency`, `legacy_outpointBatcherConcurrency`) control parallelism
 
 Larger batch sizes improve throughput but use more memory, while higher concurrency improves performance but increases CPU utilization.
+
 
 ## 8. Other Resources
 

@@ -441,13 +441,6 @@ The Block Validation service configuration can be adjusted through environment v
 | `excessiveblocksize` | int | 4GB | Maximum allowed block size (Policy.ExcessiveBlockSize) | Controls block size validation limits in ValidateBlock() - blocks exceeding this size are rejected |
 | `network` | string | "mainnet" | Network type (mainnet/testnet/regtest) affecting ChainCfgParams | Controls chain-specific parameters including MaxCoinbaseScriptSigSize for coinbase validation |
 
-### Missing Retry and Backoff Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockvalidation_arePreviousBlocksProcessed_max_retry` | int | 20 | Maximum retries for previous block processing checks | Controls retry behavior when verifying previous block processing status |
-| `blockvalidation_arePreviousBlocksProcessed_retry_backoff_multiplier` | int | 30 | Backoff multiplier for previous block processing retries | Controls exponential backoff timing for previous block processing verification |
-
 ## Configuration Interactions and Dependencies
 
 Many configuration settings interact with each other to affect overall system behavior. Understanding these interactions is crucial for optimal tuning.
@@ -508,6 +501,21 @@ When a node falls behind the blockchain tip, its synchronization strategy is con
 - `blockvalidation_catchupCh_buffer_size` - Affects buffer capacity for catchup operations
 
 Optimal settings depend on hardware capabilities and network conditions.
+
+### Dependency Injection
+
+The Block Validation service receives several critical dependencies through dependency injection during initialization:
+
+- **SubtreeStore** - Blob store for subtree data storage and retrieval (configured via daemon)
+- **TxStore** - Blob store for transaction data storage (configured via daemon)
+- **UtxoStore** - UTXO store for transaction metadata and validation (configured via daemon)
+- **BlockchainClient** - Client for blockchain operations and state management (configured via daemon)
+- **SubtreeValidationClient** - Client for subtree validation operations (configured via daemon)
+- **ValidatorClient** - Client for transaction validation services (configured via daemon)
+- **BlockAssemblyClient** - Client for block assembly coordination (configured via daemon)
+- **KafkaConsumerClient** - Kafka consumer for block notifications and events (configured via daemon)
+
+These dependencies are configured and injected by the daemon during service initialization, ensuring proper integration with the overall Teranode system architecture.
 
 ## 9. Other Resources
 

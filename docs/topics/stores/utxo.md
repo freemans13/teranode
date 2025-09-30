@@ -617,7 +617,7 @@ The UTXO Store can be configured through the `UtxoStoreSettings` struct which co
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|--------|
 | `UtxoStore` | *url.URL | Connection URL for the UTXO store | "" (must be configured) |
-| `BlockHeightRetention` | uint32 | Number of blocks to retain data for | 288 blocks (~2 days) |
+| `BlockHeightRetention` | uint32 | Number of blocks to retain data for | globalBlockHeightRetention |
 | `BlockHeightRetentionAdjustment` | int32 | Adjustment to global block height retention (can be positive or negative) | 0 |
 | `UnminedTxRetention` | uint32 | Retention period for unmined transactions in blocks | 1008 blocks (~7 days) |
 | `ParentPreservationBlocks` | uint32 | Parent transaction preservation period in blocks | 1440 blocks (~10 days) |
@@ -661,9 +661,11 @@ The UTXO Store uses batch processing to improve performance. The following setti
 
 ### 8.3 Important Notes
 
-**Critical Setting Warning:** The `UtxoBatchSize` setting must not be changed after the UTXO store has been running. It is used to calculate the offset for transaction outputs, and changing it would break the store's integrity.
+**Critical Setting Warning:** The `UtxoBatchSize` setting must not be changed after the UTXO store has been running with Aerospike backend. It determines record organization and changing it would break store integrity.
 
-**Block Height Retention:** The effective block height retention for the UTXO store is calculated as `GlobalBlockHeightRetention + BlockHeightRetentionAdjustment`. The global value defaults to 288 blocks (~2 days), and the adjustment can be positive or negative to fine-tune retention per store.
+**Block Height Retention:** The effective retention is calculated as `GlobalBlockHeightRetention + BlockHeightRetentionAdjustment`. The global value varies by deployment, and the adjustment can be positive or negative to fine-tune retention per store.
+
+**URL Query Parameters:** The UTXO store URL supports a `logging=true` query parameter to enable detailed operation logging for debugging purposes.
 
 ### 8.4 Configuration Interactions and Best Practices
 

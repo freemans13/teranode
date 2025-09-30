@@ -1450,7 +1450,7 @@ The RPC service implements a two-tier authentication system:
 - **Full Access**: Authenticated using `rpc_user` and `rpc_pass`, grants access to all RPC commands including sensitive operations like `stop` and administrative functions
 - **Limited Access**: Authenticated using `rpc_limit_user` and `rpc_limit_pass`, grants access to a subset of commands, restricting sensitive operations
 
-For security, credentials must be set explicitly as they default to empty strings. The service will not start if no authentication is configured, as this would leave the RPC interface unsecured.
+For security, credentials should be set explicitly as they default to empty strings.
 
 ### 6.3 Network Configuration Settings
 
@@ -1497,34 +1497,25 @@ These settings should be adjusted based on:
 
 The default values are conservative to prevent resource exhaustion in default configurations.
 
-### 6.5 Timeout Settings
-
-These settings control request timeouts to prevent resource exhaustion and improve reliability.
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `rpc_timeout` | time.Duration | `30s` | Maximum time allowed for an RPC call to complete | Prevents long-running operations from blocking resources; returns error code -30 on timeout |
-| `rpc_client_call_timeout` | time.Duration | `5s` | Timeout for internal calls to other services (P2P, blockchain, etc.) | Prevents RPC handlers from hanging when dependent services are unresponsive |
-
 #### Timeout Configuration Guidelines
 
 The timeout settings interact with service dependencies and operation complexity:
 
 - **`rpc_timeout`** should be set higher than the longest expected operation:
 
-  - Mining operations: 30-60s recommended
-  - Large block retrievals: 20-30s recommended
-  - Simple queries: 10-15s sufficient
+    - Mining operations: 30-60s recommended
+    - Large block retrievals: 20-30s recommended
+    - Simple queries: 10-15s sufficient
 
 - **`rpc_client_call_timeout`** should be short enough to fail fast:
 
-  - Network operations: 5-10s recommended
-  - Local service calls: 3-5s recommended
-  - Critical paths: Keep as low as practical
+    - Network operations: 5-10s recommended
+    - Local service calls: 3-5s recommended
+    - Critical paths: Keep as low as practical
 
 Monitor timeout errors (code -30) to identify operations requiring adjustment.
 
-### 6.6 Compatibility Settings
+### 6.5 Compatibility Settings
 
 These settings control the service's behavior when dealing with legacy Bitcoin clients.
 
@@ -1541,7 +1532,7 @@ The `rpc_quirks` setting primarily affects response formatting and error handlin
 
 This setting should be left enabled unless all clients are confirmed to support modern Bitcoin RPC conventions.
 
-### 6.7 Dependency-Injected Settings
+### 6.6 Dependency-Injected Settings
 
 These settings are not directly part of the RPC configuration but are required dependencies that the RPC service uses from other services.
 
@@ -1557,7 +1548,7 @@ The RPC service acts as an API gateway and requires several service dependencies
 - **Service Context**: The `Context` setting is used for HTTP listener setup and management
 - **Client Dependencies**: The service requires active connections to Blockchain, UTXO Store, Block Assembly, Peer, and P2P services
 
-### 6.8 Configuration Relationships and Dependencies
+### 6.7 Configuration Relationships and Dependencies
 
 The RPC service configuration settings have several important relationships:
 
