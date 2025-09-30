@@ -71,8 +71,10 @@ jobs:
           docker tag "ghcr.io/${{ github.repository_owner }}/teranode:$tag" teranode:latest
           docker images | grep teranode
 
-      - name: Remove old data
-        run: rm -rf data
+      - name: Remove old data and recreate directories
+        run: |
+          rm -rf data
+          mkdir -p data/postgres
 
       - name: Start Teranode nodes with 3 block generators (docker compose up)
         run: docker compose -f compose/docker-compose-3blasters.yml up -d
