@@ -69,6 +69,10 @@ In addition to the block database, the service maintains an in-memory peer datab
 
 Also, note how the Blockchain client is used in order to wait for the node State to change to `RUNNING` state. For more information on this, please refer to the [State Management](../architecture/stateManagement.md)  documentation.
 
+The following diagram provides a deeper level of detail into the Legacy Service's internal components and their interactions:
+
+![legacy_detailed_component.svg](img/plantuml/legacyp2p/legacy_detailed_component.svg)
+
 ### 2.1 Validator Integration
 
 The Legacy service interacts with the Validator service to validate incoming transactions from the BSV network. This interaction can happen in two different configurations:
