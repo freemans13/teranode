@@ -34,7 +34,7 @@ func init() {
 	TxScriptInterpreterFactory[TxInterpreterGoBDK] = newScriptVerifierGoBDK
 }
 
-// uint2int helper to convert array of []uint32 to []int32
+// uint2int safely converts uint32 slice to int32 slice, checking for overflow.
 func uint2int(arr []uint32) ([]int32, error) {
 	ret := make([]int32, len(arr))
 

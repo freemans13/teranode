@@ -1,3 +1,4 @@
+// This file contains optimized validation routines for blocks below checkpoints.
 package blockvalidation
 
 import (

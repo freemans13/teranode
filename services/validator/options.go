@@ -144,6 +144,7 @@ type TxValidatorOptions struct {
 	skipPolicyChecks bool
 }
 
+// NewTxValidatorOptions creates a new TxValidatorOptions instance with the provided options applied.
 func NewTxValidatorOptions(opts ...TxValidatorOption) *TxValidatorOptions {
 	options := &TxValidatorOptions{}
 	for _, opt := range opts {
@@ -157,6 +158,7 @@ func NewTxValidatorOptions(opts ...TxValidatorOption) *TxValidatorOptions {
 // This follows the functional options pattern for flexible configuration
 type TxValidatorOption func(*TxValidatorOptions)
 
+// WithTxValidatorSkipPolicyChecks creates an option to skip policy checks during validation.
 func WithTxValidatorSkipPolicyChecks(skip bool) TxValidatorOption {
 	return func(o *TxValidatorOptions) {
 		o.skipPolicyChecks = skip

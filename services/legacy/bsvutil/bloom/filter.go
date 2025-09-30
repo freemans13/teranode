@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Package bloom provides Bitcoin bloom filter implementation for Simplified Payment Verification (SPV) clients.
 package bloom
 
 import (

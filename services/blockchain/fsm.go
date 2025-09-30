@@ -12,16 +12,9 @@ import (
 )
 
 // NewFiniteStateMachine creates a new finite state machine for the blockchain service.
-// The finite state machine has the following states:
-// - Idle
-// - Running
-// - CatchingBlocks
-// - LegacySyncing
-// The finite state machine has the following events:
-// - Run
-// - CatchupBlocks
-// - LegacySync
-// - Stop
+//
+// States: Idle, Running, CatchingBlocks, LegacySyncing
+// Events: Run, CatchupBlocks, LegacySync, Stop
 func (b *Blockchain) NewFiniteStateMachine(opts ...func(*fsm.FSM)) *fsm.FSM {
 	// Define callbacks
 	callbacks := fsm.Callbacks{

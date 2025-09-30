@@ -1,3 +1,9 @@
+// Package blockassembly provides functionality for assembling Bitcoin blocks in Teranode.
+//
+// This file contains mock implementations of the block assembly interfaces for testing purposes.
+// The mock implementations use the testify/mock framework to provide controllable behavior
+// during unit tests, allowing developers to simulate various scenarios and verify
+// interactions with the block assembly service without requiring actual service dependencies.
 package blockassembly
 
 import (
@@ -12,15 +18,26 @@ import (
 )
 
 // Mock implements a mock version of the ClientI interface for testing.
+// This mock provides controllable implementations of all ClientI methods,
+// allowing tests to define expected behavior, verify method calls, and
+// simulate various success and failure scenarios. It uses the testify/mock
+// framework to track method calls and return predefined values.
+//
+// The mock is particularly useful for:
+//   - Unit testing components that depend on block assembly functionality
+//   - Integration testing without requiring a full block assembly service
+//   - Simulating error conditions and edge cases
+//   - Verifying correct interaction patterns with the block assembly API
 type Mock struct {
 	mock.Mock
 }
 
-// NewMock creates a new mock client.
+// NewMock creates a new mock client instance.
+// This constructor initializes a fresh mock that can be configured
+// with expected method calls and return values for testing scenarios.
 //
 // Returns:
-//   - ClientI: Mock client implementation
-//   - error: Any error encountered during creation
+//   - *Mock: New mock client implementation ready for configuration
 func NewMock() *Mock {
 	return &Mock{}
 }

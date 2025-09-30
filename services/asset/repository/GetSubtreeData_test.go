@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestGetSubtreeDataWithReader tests subtree data retrieval from storage backends.
 func TestGetSubtreeDataWithReader(t *testing.T) {
 	tracing.SetupMockTracer()
 

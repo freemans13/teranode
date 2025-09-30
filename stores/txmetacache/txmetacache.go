@@ -876,6 +876,8 @@ func (t *TxMetaCache) ReAssignUTXO(ctx context.Context, utxo *utxo.Spend, newUtx
 	return t.Delete(ctx, utxo.TxID)
 }
 
+// GetCounterConflicting retrieves a list of transactions that are in conflict with the specified transaction.
+// This method delegates directly to the underlying UTXO store without caching.
 func (t *TxMetaCache) GetCounterConflicting(ctx context.Context, txHash chainhash.Hash) ([]chainhash.Hash, error) {
 	return t.utxoStore.GetCounterConflicting(ctx, txHash)
 }

@@ -409,6 +409,7 @@ func TestHTTPServerHandlers(t *testing.T) {
 	})
 }
 
+// TestMockValidator provides a test double for validator functionality.
 type TestMockValidator struct {
 	validateTxFunc func(ctx context.Context, tx *bt.Tx) (*meta.Data, error)
 }

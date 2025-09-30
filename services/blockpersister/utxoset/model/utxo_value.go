@@ -9,7 +9,10 @@ import (
 	"github.com/bitcoin-sv/teranode/errors"
 )
 
-// UTXOValue represents the value and script data for a UTXO.
+// UTXOValue represents the spendable value and conditions for a UTXO.
+//
+// Contains the monetary value in satoshis and the locking script that must be
+// satisfied to spend the output.
 type UTXOValue struct {
 	// Value represents the amount in satoshis
 	Value uint64

@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// getFreePort finds a free port to use for testing
+// getFreePort finds a free port for testing.
 func getFreePort(t *testing.T) int {
 	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
 	require.NoError(t, err)
@@ -33,6 +33,7 @@ func getFreePort(t *testing.T) int {
 	return port
 }
 
+// testCtx holds test dependencies for asset service testing.
 type testCtx struct {
 	server           *Server
 	logger           ulogger.Logger
@@ -42,6 +43,7 @@ type testCtx struct {
 	blobStore        blob.Store
 }
 
+// testSetup creates a test environment with required dependencies.
 func testSetup(t *testing.T) *testCtx {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)

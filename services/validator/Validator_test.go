@@ -663,6 +663,7 @@ func TestIsFinalb633531280f980108329e3e0b9335b2290892d120916f9e17a9e3033bde1260b
 	require.NoError(t, err)
 }
 
+// txFeeSize represents transaction metadata for block assembly testing.
 type txFeeSize struct {
 	txHash     *chainhash.Hash
 	fee        uint64
@@ -670,6 +671,7 @@ type txFeeSize struct {
 	txInpoints subtree.TxInpoints
 }
 
+// MockBlockAssemblyStore provides a test double for block assembly storage operations.
 type MockBlockAssemblyStore struct {
 	returnError error
 	storedTxs   []txFeeSize
@@ -1053,6 +1055,7 @@ func TestValidator_TwoPhaseCommitTransaction_AlreadySpendable(t *testing.T) {
 	assert.False(t, meta.Locked, "TX should remain spendable after 2-phase commit")
 }
 
+// FailingUtxoStore provides a test double that simulates UTXO store failures.
 type FailingUtxoStore struct {
 	*sql.Store
 }

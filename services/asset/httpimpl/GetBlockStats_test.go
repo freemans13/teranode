@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestGetBlockStats tests the GetBlockStats HTTP endpoint.
 func TestGetBlockStats(t *testing.T) {
 	initPrometheusMetrics()
 

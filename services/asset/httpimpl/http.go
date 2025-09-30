@@ -1,6 +1,4 @@
-// Package httpimpl provides the HTTP server implementation for the Bitcoin SV blockchain service.
-// It implements a comprehensive REST API for accessing blockchain data with support for multiple
-// response formats.
+// Package httpimpl provides HTTP REST API endpoints for blockchain data access.
 package httpimpl
 
 import (
@@ -25,8 +23,7 @@ import (
 
 var AssetStat = gocore.NewStat("Asset")
 
-// HTTP represents the main HTTP server structure for the blockchain service.
-// It handles routing, middleware, and request processing for all blockchain data endpoints.
+// HTTP handles blockchain data API endpoints using the Echo framework.
 type HTTP struct {
 	logger     ulogger.Logger
 	settings   *settings.Settings

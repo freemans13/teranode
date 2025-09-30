@@ -37,6 +37,9 @@ type clientSubscriber struct {
 }
 
 // Client represents a blockchain service client.
+//
+// Client provides a gRPC-based interface for communicating with the blockchain service,
+// enabling remote operations and managing connection lifecycle with subscription support.
 type Client struct {
 	client                blockchain_api.BlockchainAPIClient // gRPC client for blockchain service
 	logger                ulogger.Logger                     // Logger instance

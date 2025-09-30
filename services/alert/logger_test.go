@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestNewLogger verifies that NewLogger correctly creates a Logger instance
+// with the provided ulogger properly wrapped and accessible.
 func TestNewLogger(t *testing.T) {
 	mockLogger := ulogger.TestLogger{}
 
@@ -17,6 +19,8 @@ func TestNewLogger(t *testing.T) {
 	require.Equal(t, mockLogger, logger.ulogger)
 }
 
+// TestLogger_Debug validates that the Debug method correctly forwards
+// debug-level log messages to the underlying ulogger implementation.
 func TestLogger_Debug(t *testing.T) {
 	mockLogger := &MockLogger{}
 	logger := NewLogger(mockLogger)

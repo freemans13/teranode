@@ -31,10 +31,12 @@ func (v *Server) HTTP() *HTTPHandlers {
 	return &HTTPHandlers{server: v}
 }
 
+// HandleSingleTx returns the single transaction HTTP handler for testing.
 func (h *HTTPHandlers) HandleSingleTx(ctx context.Context) echo.HandlerFunc {
 	return h.server.handleSingleTx(ctx)
 }
 
+// HandleMultipleTx returns the batch transaction HTTP handler for testing.
 func (h *HTTPHandlers) HandleMultipleTx(ctx context.Context) echo.HandlerFunc {
 	return h.server.handleMultipleTx(ctx)
 }

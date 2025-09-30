@@ -1,6 +1,4 @@
-// Package repository provides access to blockchain data storage and retrieval operations.
-// It implements the necessary interfaces to interact with various data stores and
-// blockchain clients.
+// Package repository provides blockchain data access across multiple storage backends.
 package repository
 
 import (
@@ -27,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/go-subtree"
 )
 
+// Interface defines blockchain data repository operations.
 type Interface interface {
 	Health(ctx context.Context, checkLiveness bool) (int, string, error)
 	GetTxMeta(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error)
@@ -59,9 +58,7 @@ type Interface interface {
 	GetBlockByID(ctx context.Context, id uint64) (*model.Block, error)
 }
 
-// Repository provides access to blockchain data storage and retrieval operations.
-// It implements the necessary interfaces to interact with various data stores and
-// blockchain clients.
+// Repository implements blockchain data access across multiple storage backends.
 type Repository struct {
 	logger              ulogger.Logger
 	settings            *settings.Settings

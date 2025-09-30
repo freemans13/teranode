@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestNewGormLogger verifies that NewGormLogger correctly creates a GormLogger instance
+// with the provided ulogger properly wrapped for GORM database operations.
 func TestNewGormLogger(t *testing.T) {
 	mockLogger := &MockLogger{}
 
@@ -21,6 +23,8 @@ func TestNewGormLogger(t *testing.T) {
 	require.Equal(t, mockLogger, gormLogger.ulogger)
 }
 
+// TestGormLogger_Error validates that the Error method correctly forwards
+// error-level log messages from GORM to the underlying ulogger implementation.
 func TestGormLogger_Error(t *testing.T) {
 	mockLogger := &MockLogger{}
 	gormLogger := NewGormLogger(mockLogger)

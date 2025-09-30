@@ -16,12 +16,12 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Mock implements the blockchain.ClientI interface for testing purposes
+// Mock implements the blockchain.ClientI interface for testing purposes.
 type Mock struct {
 	mock.Mock
 }
 
-// Health mocks the Health method
+// Health mocks the Health method.
 func (m *Mock) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	args := m.Called(ctx, checkLiveness)
 

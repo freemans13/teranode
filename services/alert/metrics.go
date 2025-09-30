@@ -1,6 +1,9 @@
 // Package alert implements the Bitcoin SV alert system server and related functionality.
 // This file contains the metrics-related code for the alert service, which tracks
 // and exposes operational metrics via Prometheus for monitoring and observability.
+//
+// The metrics system provides thread-safe initialization and registration of Prometheus
+// metrics used throughout the alert service for performance monitoring and debugging.
 package alert
 
 import (

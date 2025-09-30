@@ -22,7 +22,6 @@ import (
 )
 
 // LocalClient implements a blockchain client with direct store access.
-// It is an abstraction for a client that has a stored embedded directly
 type LocalClient struct {
 	logger       ulogger.Logger     // Logger instance
 	settings     *settings.Settings // Configuration settings

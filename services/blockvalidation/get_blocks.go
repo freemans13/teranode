@@ -1,3 +1,4 @@
+// This file contains block fetching utilities for catchup operations.
 package blockvalidation
 
 import (

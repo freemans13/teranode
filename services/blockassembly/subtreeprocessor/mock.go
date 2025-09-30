@@ -1,3 +1,9 @@
+// Package subtreeprocessor provides functionality for processing transaction subtrees in Teranode.
+//
+// This file contains mock implementations of the subtree processor interfaces for testing purposes.
+// The mock implementations use the testify/mock framework to provide controllable behavior
+// during unit tests, allowing developers to simulate various scenarios and verify
+// interactions with the subtree processor without requiring actual processing dependencies.
 package subtreeprocessor
 
 import (
@@ -9,6 +15,19 @@ import (
 	"github.com/stretchr/testify/mock"
 )
 
+// MockSubtreeProcessor implements a mock version of the Interface for testing.
+// This mock provides controllable implementations of all Interface methods,
+// allowing tests to define expected behavior, verify method calls, and
+// simulate various success and failure scenarios. It uses the testify/mock
+// framework to track method calls and return predefined values.
+//
+// The mock is particularly useful for:
+//   - Unit testing components that depend on subtree processor functionality
+//   - Integration testing without requiring a full subtree processor
+//   - Simulating error conditions and edge cases
+//   - Verifying correct interaction patterns with the subtree processor API
+//   - Testing blockchain reorganization scenarios
+//   - Validating transaction processing workflows
 type MockSubtreeProcessor struct {
 	mock.Mock
 }

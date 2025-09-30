@@ -1,3 +1,4 @@
+// This file contains header fetching utilities for catchup operations.
 package blockvalidation
 
 import (

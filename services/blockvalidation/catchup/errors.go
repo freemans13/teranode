@@ -1,3 +1,6 @@
+// Package catchup provides blockchain synchronization utilities.
+//
+// This file defines catchup-specific error types.
 package catchup
 
 import "github.com/bitcoin-sv/teranode/errors"

@@ -1,3 +1,4 @@
+// Package rpc implements the Bitcoin JSON-RPC API service for Teranode.
 package rpc
 
 import (

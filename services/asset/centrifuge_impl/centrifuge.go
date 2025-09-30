@@ -1,6 +1,4 @@
-// Package centrifuge_impl provides a Centrifuge server implementation for broadcasting
-// real-time blockchain events. It handles WebSocket connections, P2P communication,
-// and manages subscriptions for blockchain data updates.
+// Package centrifuge_impl provides real-time blockchain event broadcasting via WebSocket connections.
 package centrifuge_impl
 
 import (
@@ -33,8 +31,7 @@ const (
 	AccessControlAllowCredentials = "Access-Control-Allow-Credentials"
 )
 
-// Centrifuge represents a Centrifuge server instance that manages real-time
-// blockchain data broadcasting and client connections.
+// Centrifuge manages real-time blockchain data broadcasting to WebSocket clients.
 type Centrifuge struct {
 	logger                  ulogger.Logger
 	settings                *settings.Settings

@@ -12,9 +12,13 @@
 // - Processing confiscation transaction whitelists
 // - Interacting with blockchain, UTXO, and P2P services
 // - Maintaining a persistent store of alert-related data
+// - Providing gRPC API endpoints for external alert system integration
+// - Supporting peer-to-peer alert distribution across the network
 //
 // The alert system is designed to be highly reliable, ensuring critical
 // notifications reach network participants even in degraded network conditions.
+// It integrates seamlessly with Teranode's service architecture, providing
+// both internal service communication and external API access.
 package alert
 
 import (

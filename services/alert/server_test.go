@@ -16,6 +16,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
+// TestNew verifies that the New function correctly creates a Server instance
+// with all provided dependencies properly initialized and assigned.
 func TestNew(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
@@ -28,6 +30,8 @@ func TestNew(t *testing.T) {
 	require.NotNil(t, server.stats)
 }
 
+// TestServer_Health validates the HTTP health check functionality for both
+// liveness and readiness checks, ensuring proper status codes and messages are returned.
 func TestServer_Health(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}

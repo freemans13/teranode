@@ -1,3 +1,4 @@
+// This file contains the main catchup logic for blockchain synchronization.
 package blockvalidation
 
 import (

@@ -245,6 +245,7 @@ func (tv *TxValidator) ValidateTransaction(tx *bt.Tx, blockHeight uint32, utxoHe
 	return nil
 }
 
+// ValidateTransactionScripts performs script validation for all transaction inputs.
 func (tv *TxValidator) ValidateTransactionScripts(tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, validationOptions *Options) error {
 	if tv == nil {
 		return errors.NewTxInvalidError("tx validator is nil")
@@ -314,6 +315,7 @@ func isStandardInputScript(script *bscript.Script, blockHeight uint32, uahfHeigh
 	return parsedScript.IsPushOnly()
 }
 
+// checkOutputs validates transaction outputs according to consensus and policy rules.
 func (tv *TxValidator) checkOutputs(tx *bt.Tx, blockHeight uint32, validationOptions *Options) error {
 	total := uint64(0)
 
@@ -343,6 +345,7 @@ func (tv *TxValidator) checkOutputs(tx *bt.Tx, blockHeight uint32, validationOpt
 	return nil
 }
 
+// checkInputs validates transaction inputs according to consensus rules.
 func (tv *TxValidator) checkInputs(tx *bt.Tx, blockHeight uint32) error {
 	total := uint64(0)
 
@@ -402,6 +405,7 @@ func (tv *TxValidator) checkInputs(tx *bt.Tx, blockHeight uint32) error {
 	return nil
 }
 
+// checkTxSize validates that the transaction size complies with policy limits.
 func (tv *TxValidator) checkTxSize(txSize int) error {
 	maxTxSizePolicy := tv.settings.Policy.GetMaxTxSizePolicy()
 	if maxTxSizePolicy == 0 {
@@ -416,6 +420,7 @@ func (tv *TxValidator) checkTxSize(txSize int) error {
 	return nil
 }
 
+// checkFees validates transaction fees according to policy requirements.
 func (tv *TxValidator) checkFees(tx *bt.Tx, blockHeight uint32, utxoHeights []uint32) error {
 	// Check for consolidation transaction with proper UTXO height verification
 	isConsolidation := tv.isConsolidationTx(tx, utxoHeights, blockHeight)
@@ -607,6 +612,7 @@ func (tv *TxValidator) isConsolidationTx(tx *bt.Tx, utxoHeights []uint32, curren
 	return true
 }
 
+// sigOpsCheck validates that the transaction's signature operations count complies with policy limits.
 func (tv *TxValidator) sigOpsCheck(tx *bt.Tx, validationOptions *Options) error {
 	maxSigOps := tv.settings.Policy.GetMaxTxSigopsCountsPolicy()
 
@@ -637,6 +643,7 @@ func (tv *TxValidator) sigOpsCheck(tx *bt.Tx, validationOptions *Options) error 
 	return nil
 }
 
+// pushDataCheck validates that transaction input scripts contain only data pushes.
 func (tv *TxValidator) pushDataCheck(tx *bt.Tx) error {
 	for index, input := range tx.Inputs {
 		if input.UnlockingScript == nil {

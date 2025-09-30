@@ -75,6 +75,8 @@ type Spend struct {
 	Err error `json:"err,omitempty"`
 }
 
+// Clone creates a deep copy of the Spend struct.
+// Returns nil if the receiver is nil.
 func (s *Spend) Clone() *Spend {
 	if s == nil {
 		return nil
@@ -112,6 +114,7 @@ func (s *Spend) Clone() *Spend {
 	return clone
 }
 
+// IgnoreFlags controls which UTXO states should be ignored during spend operations.
 type IgnoreFlags struct {
 	IgnoreConflicting bool
 	IgnoreLocked      bool

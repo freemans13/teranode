@@ -9,8 +9,10 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 )
 
-// UTXODiff tracks changes to the UTXO set within a block
-// UTXODiff is a map of UTXOs.
+// UTXODiff tracks changes to the UTXO set within a block.
+//
+// Maintains separate maps for UTXOs that are created (Added) and spent (Removed)
+// during block processing. Not thread-safe.
 type UTXODiff struct {
 	// logger provides logging functionality
 	logger ulogger.Logger
@@ -22,7 +24,7 @@ type UTXODiff struct {
 	Removed UTXOMap
 }
 
-// NewUTXOMap creates a new UTXODiff.
+// NewUTXODiff creates a new UTXODiff.
 func NewUTXODiff(logger ulogger.Logger, blockHash *chainhash.Hash) *UTXODiff {
 	return &UTXODiff{
 		logger:    logger,

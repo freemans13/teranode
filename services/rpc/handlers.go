@@ -257,6 +257,7 @@ func handleGetBlockHeader(ctx context.Context, s *RPCServer, cmd interface{}, _ 
 	return fmt.Sprintf("%x", b.Bytes()), nil
 }
 
+// blockToJSON converts a block to JSON format based on verbosity level.
 func (s *RPCServer) blockToJSON(ctx context.Context, b *model.Block, verbosity uint32) (interface{}, error) {
 	if b == nil {
 		return nil, &bsvjson.RPCError{
@@ -1188,6 +1189,8 @@ func handleGetpeerinfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-c
 	return infos, nil
 }
 
+// handleGetRawMempool implements the getrawmempool command.
+// Returns transaction IDs currently in the memory pool.
 func handleGetRawMempool(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan struct{}) (interface{}, error) {
 	ctx, _, deferFn := tracing.Tracer("rpc").Start(ctx, "handleGetRawMempool",
 		tracing.WithParentStat(RPCStat),

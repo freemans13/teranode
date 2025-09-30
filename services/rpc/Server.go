@@ -107,6 +107,7 @@ const (
 	// maxProtocolVersion = wire.FeeFilterVersion
 )
 
+// RPCStat provides performance statistics collection for the RPC service.
 var RPCStat = gocore.NewStat("RPC")
 
 var (

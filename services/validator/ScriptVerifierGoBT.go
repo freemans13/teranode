@@ -25,6 +25,7 @@ func init() {
 	TxScriptInterpreterFactory[TxInterpreterGoBT] = newScriptVerifierGoBt
 }
 
+// newScriptVerifierGoBt creates a new Go-BT script verifier instance.
 func newScriptVerifierGoBt(l ulogger.Logger, po *settings.PolicySettings, pa *chaincfg.Params) TxScriptInterpreter {
 	l.Infof("Use Script Verifier with GoBT")
 
@@ -110,6 +111,7 @@ func (v *scriptVerifierGoBt) VerifyScript(tx *bt.Tx, blockHeight uint32, consens
 	return nil
 }
 
+// Interpreter returns the Go-BT interpreter type identifier.
 func (v *scriptVerifierGoBt) Interpreter() TxInterpreter {
 	return TxInterpreterGoBT
 }

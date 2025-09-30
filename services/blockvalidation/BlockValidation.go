@@ -124,11 +124,8 @@ type BlockValidation struct {
 	// recentBlocksBloomFilters maintains bloom filters for recent blocks
 	recentBlocksBloomFilters *txmap.SyncedMap[chainhash.Hash, *model.BlockBloomFilter]
 
-	// bloomFilterRetentionSize defines bloom filter defines the number of blocks to keep the bloom filter for
+	// bloomFilterRetentionSize defines the number of blocks to keep bloom filters for
 	bloomFilterRetentionSize uint32
-
-	// validatorClient handles transaction validation operations
-	// validatorClient validator.Interface
 
 	// subtreeValidationClient manages subtree validation processes
 	subtreeValidationClient subtreevalidation.Interface

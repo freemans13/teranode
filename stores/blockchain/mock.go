@@ -82,6 +82,7 @@ func (m *MockStore) Health(ctx context.Context, checkLiveness bool) (int, string
 	return http.StatusOK, "OK", nil
 }
 
+// GetDB returns the underlying SQL database instance.
 func (m *MockStore) GetDB() *usql.DB {
 	return nil
 }
@@ -149,6 +150,7 @@ func (m *MockStore) GetBlockByHeight(ctx context.Context, height uint32) (*model
 	return block, nil
 }
 
+// GetBlockInChainByHeightHash retrieves a block at a specific height in a chain determined by the start hash.
 func (m *MockStore) GetBlockInChainByHeightHash(ctx context.Context, height uint32, hash *chainhash.Hash) (*model.Block, bool, error) {
 	block, err := m.GetBlockByHeight(ctx, height)
 	if err != nil {
@@ -166,6 +168,7 @@ func (m *MockStore) GetBlockGraphData(ctx context.Context, periodMillis uint64) 
 	panic(implementMe)
 }
 
+// GetBlockByID retrieves a block from the in-memory store by its unique ID.
 func (m *MockStore) GetBlockByID(_ context.Context, id uint64) (*model.Block, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -179,6 +182,7 @@ func (m *MockStore) GetBlockByID(_ context.Context, id uint64) (*model.Block, er
 	return nil, context.DeadlineExceeded
 }
 
+// GetNextBlockID retrieves the next available block ID by finding the highest existing ID and incrementing it.
 func (m *MockStore) GetNextBlockID(_ context.Context) (uint64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -434,6 +438,7 @@ func (m *MockStore) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader,
 	return m.BestBlock.Header, &model.BlockHeaderMeta{Height: m.BestBlock.Height}, nil
 }
 
+// GetBlockHeader retrieves a block header and its metadata by the block's hash.
 func (m *MockStore) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -446,6 +451,7 @@ func (m *MockStore) GetBlockHeader(ctx context.Context, blockHash *chainhash.Has
 	return block.Header, &model.BlockHeaderMeta{Height: block.Height}, nil
 }
 
+// GetBlockHeaders retrieves multiple block headers starting from a specific block hash.
 func (m *MockStore) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -474,6 +480,7 @@ func (m *MockStore) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Ha
 	return headers, metas, nil
 }
 
+// GetBlockHeadersFromTill retrieves block headers between two specified blocks.
 func (m *MockStore) GetBlockHeadersFromTill(ctx context.Context, blockHashFrom *chainhash.Hash, blockHashTill *chainhash.Hash) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	return []*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil
 }
@@ -498,6 +505,7 @@ func (m *MockStore) RevalidateBlock(ctx context.Context, blockHash *chainhash.Ha
 	panic(implementMe)
 }
 
+// GetBlockHeaderIDs retrieves block header IDs starting from a specific block hash.
 func (m *MockStore) GetBlockHeaderIDs(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]uint32, error) {
 	return []uint32{}, nil
 }
@@ -522,14 +530,17 @@ func (m *MockStore) SetBlockProcessedAt(ctx context.Context, blockHash *chainhas
 	panic(implementMe)
 }
 
+// GetBlocksMinedNotSet retrieves blocks that haven't been marked as mined.
 func (m *MockStore) GetBlocksMinedNotSet(_ context.Context) ([]*model.Block, error) {
 	return []*model.Block{}, nil
 }
 
+// SetBlockSubtreesSet marks a block's subtrees as processed.
 func (m *MockStore) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	return nil
 }
 
+// GetBlocksSubtreesNotSet retrieves blocks whose subtrees haven't been processed.
 func (m *MockStore) GetBlocksSubtreesNotSet(ctx context.Context) ([]*model.Block, error) {
 	return []*model.Block{}, nil
 }

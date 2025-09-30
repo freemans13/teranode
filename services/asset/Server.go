@@ -1,21 +1,4 @@
-// Package asset provides comprehensive functionality for managing and querying blockchain assets within the Teranode Bitcoin SV implementation.
-// It serves as a central access point for blockchain data including blocks, transactions, UTXOs, and subtrees.
-//
-// Key features and capabilities:
-// - HTTP API endpoints for querying blockchain data via REST interfaces
-// - Real-time updates via Centrifuge protocol for subscribing to blockchain events
-// - Flexible query capabilities for blocks, transactions, UTXOs and other blockchain assets
-// - Support for both traditional and novel blockchain data access patterns
-// - Integration with various storage backends (UTXO store, transaction store, etc.)
-//
-// The asset service integrates with other Teranode components like blockchain and validation services
-// to provide a cohesive view of the blockchain state. It follows a layered architecture with:
-// - HTTP/Centrifuge interfaces at the top level for external communication
-// - Repository layer for business logic and data transformation
-// - Storage interfaces for persistent data access
-//
-// The service implements health checks and graceful shutdown procedures to ensure
-// operational reliability in production environments.
+// Package asset provides HTTP and WebSocket APIs for blockchain data access.
 
 package asset
 
@@ -92,10 +75,6 @@ type Server struct {
 //
 // Returns:
 //   - *Server: A fully initialized Server instance ready for use
-//   - error: Any error encountered during server creation
-//
-// Returns:
-//   - *Server: Newly created server instance
 func NewServer(logger ulogger.Logger, tSettings *settings.Settings, utxoStore utxo.Store, txStore blob.Store, subtreeStore blob.Store, blockPersisterStore blob.Store, blockchainClient blockchain.ClientI) *Server {
 	s := &Server{
 		logger:              logger,

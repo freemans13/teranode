@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Test NewLocalClient
+// TestNewLocalClient tests the creation of a new LocalClient instance.
 func TestNewLocalClient(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 
@@ -34,7 +34,7 @@ func TestNewLocalClient(t *testing.T) {
 	assert.Nil(t, localClient.utxoStore)
 }
 
-// Test Health
+// TestLocalClient_Health tests the Health method of LocalClient.
 func TestLocalClient_Health(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
@@ -65,7 +65,7 @@ func TestLocalClient_Health(t *testing.T) {
 	})
 }
 
-// Test SendNotification
+// TestLocalClient_SendNotification tests the SendNotification method of LocalClient.
 func TestLocalClient_SendNotification(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
@@ -80,7 +80,7 @@ func TestLocalClient_SendNotification(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// Test Subscribe
+// TestLocalClient_Subscribe tests the Subscribe method of LocalClient.
 func TestLocalClient_Subscribe(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
@@ -95,7 +95,7 @@ func TestLocalClient_Subscribe(t *testing.T) {
 	assert.Equal(t, 10, cap(ch))
 }
 
-// Test GetNextWorkRequired
+// TestLocalClient_GetNextWorkRequired tests the GetNextWorkRequired method of LocalClient.
 func TestLocalClient_GetNextWorkRequired(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		ctx := context.Background()
@@ -113,7 +113,7 @@ func TestLocalClient_GetNextWorkRequired(t *testing.T) {
 	})
 }
 
-// Test FSM methods
+// TestLocalClient_FSMMethods tests the FSM-related methods of LocalClient.
 func TestLocalClient_FSMMethods(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
