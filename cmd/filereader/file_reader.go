@@ -178,6 +178,9 @@ func readFile(ctx context.Context, filename string, ext fileformat.FileType, log
 	case fileformat.FileTypeSubtree:
 		return handleSubtree(br)
 
+	case fileformat.FileTypeSubtreeToCheck:
+		return handleSubtree(br)
+
 	case fileformat.FileTypeSubtreeData:
 		return handleSubtreeData(br, logger, settings, dir, filename)
 
