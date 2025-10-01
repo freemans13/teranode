@@ -25,10 +25,17 @@
   export let connected = false
   export let page = 1
   export let pageSize = 10
+  export let sortColumn = ''
+  export let sortOrder = ''
 
   function onPage(e) {
     // Forward pagination changes to parent component
     dispatch('pagechange', e.detail)
+  }
+  
+  function onSort(e) {
+    // Forward sort changes to parent component
+    dispatch('sort', e.detail)
   }
 
   let totalPages = 0
@@ -82,6 +89,11 @@
     idField="peer_id"
     {colDefs}
     {data}
+    sort={{
+      sortColumn,
+      sortOrder,
+    }}
+    sortEnabled={true}
     pagination={{
       page: 1,
       pageSize: -1,
@@ -94,6 +106,7 @@
     {getRenderProps}
     getRowIconActions={null}
     on:action={() => {}}
+    on:sort={onSort}
   />
   <div slot="footer">
     <Pager
@@ -156,14 +169,25 @@
   }
   
   /* Column header alignments */
-  /* Version - explicitly left align */
-  :global(th:nth-child(2)),
-  :global(.th:nth-child(2)) {
+  /* State column (1st) - center align */
+  :global(th:nth-child(1)),
+  :global(.th:nth-child(1)) {
+    text-align: center !important;
+  }
+  
+  :global(th:nth-child(1) .table-cell-row),
+  :global(.th:nth-child(1) .table-cell-row) {
+    justify-content: center !important;
+  }
+  
+  /* Version (3rd column now) - explicitly left align */
+  :global(th:nth-child(3)),
+  :global(.th:nth-child(3)) {
     text-align: left !important;
   }
   
-  :global(th:nth-child(2) .table-cell-row),
-  :global(.th:nth-child(2) .table-cell-row) {
+  :global(th:nth-child(3) .table-cell-row),
+  :global(.th:nth-child(3) .table-cell-row) {
     text-align: left !important;
     justify-content: flex-start !important;
   }

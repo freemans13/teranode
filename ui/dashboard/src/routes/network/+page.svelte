@@ -23,8 +23,30 @@
   let currentPage = 1
   let currentPageSize = 10
   
-  // Local storage key for pageSize persistence
+  // Persistent sort state
+  let sortColumn = ''
+  let sortOrder = ''
+  
+  // Load sort from localStorage on mount
+  if (browser) {
+    const savedSort = loadSortFromStorage()
+    if (savedSort) {
+      sortColumn = savedSort.sortColumn
+      sortOrder = savedSort.sortOrder
+    }
+  }
+  
+  // Cache for chainwork calculations to avoid recalculation
+  let chainworkCache = new Map<string, { scores: Map<string, number>, maxScore: number }>()
+  
+  // Force update of paginatedNodes when tick changes to update relative time displays
+  $: if (tickCounter >= 0 && allNodes.length > 0) {
+    updatePaginatedNodes()
+  }
+  
+  // Local storage keys for persistence
   const NETWORK_PAGE_SIZE_KEY = 'teranode-network-pagesize'
+  const NETWORK_SORT_KEY = 'teranode-network-sort'
 
   // Load pageSize from localStorage
   function loadPageSizeFromStorage(): number {
@@ -43,6 +65,21 @@
     }
     return 10 // Default value
   }
+  
+  // Load sort preferences from localStorage
+  function loadSortFromStorage(): { sortColumn: string; sortOrder: string } | null {
+    if (browser) {
+      try {
+        const stored = localStorage.getItem(NETWORK_SORT_KEY)
+        if (stored) {
+          return JSON.parse(stored)
+        }
+      } catch (error) {
+        console.warn('Failed to load sort from localStorage:', error)
+      }
+    }
+    return null
+  }
 
   // Save pageSize to localStorage
   function savePageSizeToStorage(size: number) {
@@ -51,6 +88,17 @@
         localStorage.setItem(NETWORK_PAGE_SIZE_KEY, size.toString())
       } catch (error) {
         console.warn('Failed to save pageSize to localStorage:', error)
+      }
+    }
+  }
+  
+  // Save sort to localStorage
+  function saveSortToStorage(sortColumn: string, sortOrder: string) {
+    if (browser) {
+      try {
+        localStorage.setItem(NETWORK_SORT_KEY, JSON.stringify({ sortColumn, sortOrder }))
+      } catch (error) {
+        console.warn('Failed to save sort to localStorage:', error)
       }
     }
   }
@@ -112,22 +160,72 @@
     updatePaginatedNodes()
     updateURL(newPage, newPageSize)
   }
+  
+  function onSort(e) {
+    const { colId, value } = e.detail
+    sortColumn = colId
+    sortOrder = value
+    
+    // Save sort to localStorage
+    saveSortToStorage(colId, value)
+  }
 
   function updatePaginatedNodes() {
     const startIndex = (currentPage - 1) * currentPageSize
     const endIndex = startIndex + currentPageSize
     paginatedNodes = allNodes.slice(startIndex, endIndex)
   }
+  
+  // Deep equality check for node objects (ignoring receivedAt)
+  function nodesEqual(a: any, b: any): boolean {
+    if (a.peer_id !== b.peer_id) return false
+    if (a.base_url !== b.base_url) return false
+    if (a.chain_work !== b.chain_work) return false
+    if (a.best_height !== b.best_height) return false
+    if (a.best_block_hash !== b.best_block_hash) return false
+    if (a.version !== b.version) return false
+    if (a.fsm_state !== b.fsm_state) return false
+    if (a.tx_count_in_assembly !== b.tx_count_in_assembly) return false
+    if (a.uptime !== b.uptime) return false
+    if (a.listen_mode !== b.listen_mode) return false
+    if (a.client_name !== b.client_name) return false
+    if (a.miner_name !== b.miner_name) return false
+    if (a.start_time !== b.start_time) return false
+    return true
+  }
 
   function updateData() {
     const mNodes: any[] = []
     Object.values($miningNodes).forEach((node) => {
-      mNodes.push(node)
+      // Filter out nodes without version or height information
+      if (node.version || node.best_height || node.height) {
+        mNodes.push(node)
+      }
     })
 
-    // Calculate chainwork scores
-    const chainworkScores = calculateChainworkScores(mNodes)
-    const maxScore = Math.max(...Array.from(chainworkScores.values()))
+    // Build cache key from chainwork values
+    const chainworkKey = mNodes.map(n => `${n.peer_id}:${n.chain_work || ''}`).sort().join('|')
+    
+    // Use cached chainwork scores if available
+    let chainworkScores: Map<string, number>
+    let maxScore: number
+    
+    if (chainworkCache.has(chainworkKey)) {
+      const cached = chainworkCache.get(chainworkKey)!
+      chainworkScores = cached.scores
+      maxScore = cached.maxScore
+    } else {
+      // Calculate and cache chainwork scores
+      chainworkScores = calculateChainworkScores(mNodes)
+      maxScore = Math.max(...Array.from(chainworkScores.values()))
+      chainworkCache.set(chainworkKey, { scores: chainworkScores, maxScore })
+      
+      // Keep cache size manageable (only last 10 states)
+      if (chainworkCache.size > 10) {
+        const firstKey = chainworkCache.keys().next().value
+        chainworkCache.delete(firstKey)
+      }
+    }
     
     // Get current node peer ID
     const currentPeerID = $currentNodePeerID
@@ -141,29 +239,68 @@
       node.isCurrentNode = node.peer_id === currentPeerID
     })
 
+    // Stable sort: primary by base_url, secondary by peer_id (case-insensitive)
     const sorted = mNodes.sort((a: any, b: any) => {
-      if (a.base_url < b.base_url) {
+      const aUrl = (a.base_url || '').toLowerCase()
+      const bUrl = (b.base_url || '').toLowerCase()
+      const aPeerId = (a.peer_id || '').toLowerCase()
+      const bPeerId = (b.peer_id || '').toLowerCase()
+      
+      if (aUrl < bUrl) {
         return -1
-      } else if (a.base_url > b.base_url) {
+      } else if (aUrl > bUrl) {
         return 1
       } else {
+        // Secondary sort by peer_id for stability
+        if (aPeerId < bPeerId) {
+          return -1
+        } else if (aPeerId > bPeerId) {
+          return 1
+        }
         return 0
       }
     })
 
-    allNodes = sorted
-    nodes = sorted // Keep for backward compatibility
-    updatePaginatedNodes()
+    // Only update if data actually changed (deep equality check)
+    let hasChanges = false
+    if (allNodes.length !== sorted.length) {
+      hasChanges = true
+    } else {
+      // Check if any node has changed
+      for (let i = 0; i < sorted.length; i++) {
+        if (!nodesEqual(sorted[i], allNodes[i])) {
+          hasChanges = true
+          break
+        }
+      }
+    }
+    
+    if (hasChanges) {
+      allNodes = sorted
+      nodes = sorted // Keep for backward compatibility
+      updatePaginatedNodes()
+    }
   }
 
-  onMount(() => {
+  // Subscribe to miningNodes changes from WebSocket
+  $: if ($miningNodes) {
     updateData()
-
-    const interval = setInterval(() => {
-      updateData()
+  }
+  
+  // Also subscribe to currentNodePeerID changes to update isCurrentNode flags
+  $: if ($currentNodePeerID) {
+    updateData()
+  }
+  
+  // Add a ticker ONLY for re-rendering the relative time display
+  // This doesn't recalculate data, just forces component updates
+  let tickCounter = 0
+  onMount(() => {
+    const ticker = setInterval(() => {
+      tickCounter++
     }, 1000)
-
-    return () => clearInterval(interval)
+    
+    return () => clearInterval(ticker)
   })
 </script>
 
@@ -174,6 +311,9 @@
     {connected} 
     page={currentPage}
     pageSize={currentPageSize}
+    {sortColumn}
+    {sortOrder}
     on:pagechange={onPageChange}
+    on:sort={onSort}
   />
 </PageWithMenu>

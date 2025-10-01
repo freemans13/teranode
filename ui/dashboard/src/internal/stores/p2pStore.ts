@@ -8,6 +8,8 @@ export const wsUrl: Writable<URL | string> = writable('')
 export const error: Writable<any> = writable(null)
 export const sock: Writable<any> = writable(null)
 export const connectionAttempts: Writable<number> = writable(0)
+// Hashmap to store block hash -> miner name mapping
+export const blockHashToMiner: Writable<Map<string, string>> = writable(new Map())
 // Create a simple store for current node peer ID (no localStorage)
 function createCurrentNodePeerIDStore() {
   const { subscribe, set, update } = writable<string | null>(null)
@@ -28,7 +30,8 @@ export const currentNodePeerID = createCurrentNodePeerIDStore() // Track our own
 const maxMessages = 500
 const MAX_RECONNECT_ATTEMPTS = 5
 const BASE_RECONNECT_DELAY = 2000 // Start with 2 seconds
-const PEER_EXPIRY_TIME = 30000 // 30 seconds in milliseconds
+const PEER_EXPIRY_TIME = 60000 // 60 seconds in milliseconds
+const MAX_BLOCK_HASH_CACHE = 1000 // Maximum entries in block hash -> miner cache
 
 // Track if we've received the first node_status message for this session
 let firstNodeStatusReceived = false
@@ -173,14 +176,46 @@ export async function connectToP2PServer() {
             if (jsonData.type === 'mining_on') {
               const nodeKey = jsonData.peer_id
               const currentPeerID = get(currentNodePeerID)
-              miningNodeSet[nodeKey] = {
+              const existingNode = miningNodeSet[nodeKey]
+              const newNode = {
                 ...miningNodeSet[nodeKey],
                 ...jsonData,
                 base_url: baseUrl,
                 receivedAt: new Date(),
                 isCurrentNode: jsonData.peer_id === currentPeerID,
               }
-              miningNodes.set(miningNodeSet)
+              
+              // Update block hash -> miner mapping if available
+              if (jsonData.hash && jsonData.miner) {
+                blockHashToMiner.update(map => {
+                  map.set(jsonData.hash, jsonData.miner)
+                  // Keep cache size manageable
+                  if (map.size > MAX_BLOCK_HASH_CACHE) {
+                    const firstKey = map.keys().next().value
+                    map.delete(firstKey)
+                  }
+                  return map
+                })
+              }
+              
+              // Only update if data actually changed (excluding receivedAt)
+              const hasChanges = !existingNode || 
+                existingNode.hash !== newNode.hash ||
+                existingNode.height !== newNode.height ||
+                existingNode.miner !== newNode.miner ||
+                existingNode.base_url !== newNode.base_url ||
+                existingNode.peer_id !== newNode.peer_id ||
+                existingNode.isCurrentNode !== newNode.isCurrentNode
+              
+              if (hasChanges || !existingNode) {
+                miningNodeSet[nodeKey] = newNode
+                miningNodes.set(miningNodeSet)
+              } else {
+                // Just update timestamp without triggering store update
+                if (existingNode) {
+                  existingNode.receivedAt = new Date()
+                }
+              }
             } else if (jsonData.type === 'node_status') {
               // Debug logging for node_status messages
               console.log('=== NODE_STATUS MESSAGE RECEIVED ===')
@@ -215,8 +250,8 @@ export async function connectToP2PServer() {
               // Extract txCount from the new block_assembly_details structure
               // for backward compatibility with the table display
               const txCountInAssembly = jsonData.block_assembly_details?.txCount || 0
-              
-              miningNodeSet[nodeKey] = {
+              const existingNode = miningNodeSet[nodeKey]
+              const newNode = {
                 ...miningNodeSet[nodeKey],
                 ...jsonData,
                 tx_count_in_assembly: txCountInAssembly, // Map for backward compatibility
@@ -225,28 +260,99 @@ export async function connectToP2PServer() {
                 receivedAt: new Date(),
                 isCurrentNode: isCurrentNode,
               }
-              miningNodes.set(miningNodeSet)
+              
+              // Update block hash -> miner mapping if available
+              if (jsonData.best_block_hash && jsonData.miner_name) {
+                blockHashToMiner.update(map => {
+                  map.set(jsonData.best_block_hash, jsonData.miner_name)
+                  // Keep cache size manageable
+                  if (map.size > MAX_BLOCK_HASH_CACHE) {
+                    const firstKey = map.keys().next().value
+                    map.delete(firstKey)
+                  }
+                  return map
+                })
+              }
+              
+              // Only update if significant data changed (excluding receivedAt)
+              const hasChanges = !existingNode ||
+                existingNode.best_height !== newNode.best_height ||
+                existingNode.best_block_hash !== newNode.best_block_hash ||
+                existingNode.chain_work !== newNode.chain_work ||
+                existingNode.version !== newNode.version ||
+                existingNode.fsm_state !== newNode.fsm_state ||
+                existingNode.tx_count_in_assembly !== newNode.tx_count_in_assembly ||
+                existingNode.uptime !== newNode.uptime ||
+                existingNode.listen_mode !== newNode.listen_mode ||
+                existingNode.client_name !== newNode.client_name ||
+                existingNode.miner_name !== newNode.miner_name ||
+                existingNode.start_time !== newNode.start_time ||
+                existingNode.isCurrentNode !== newNode.isCurrentNode ||
+                JSON.stringify(existingNode.block_assembly) !== JSON.stringify(newNode.block_assembly)
+              
+              if (hasChanges || !existingNode) {
+                miningNodeSet[nodeKey] = newNode
+                miningNodes.set(miningNodeSet)
+              } else {
+                // Just update timestamp without triggering store update
+                if (existingNode) {
+                  existingNode.receivedAt = new Date()
+                }
+              }
               // Don't return here - let it fall through to add to messages array
             } else if (jsonData.type === 'block') {
               const nodeKey = jsonData.peer_id
               const currentPeerID = get(currentNodePeerID)
-              if (!miningNodeSet[nodeKey]) {
+              const existingNode = miningNodeSet[nodeKey]
+              
+              // Update block hash -> miner mapping if available
+              if (jsonData.hash && jsonData.miner) {
+                blockHashToMiner.update(map => {
+                  map.set(jsonData.hash, jsonData.miner)
+                  // Keep cache size manageable
+                  if (map.size > MAX_BLOCK_HASH_CACHE) {
+                    const firstKey = map.keys().next().value
+                    map.delete(firstKey)
+                  }
+                  return map
+                })
+              }
+              
+              if (!existingNode) {
                 miningNodeSet[nodeKey] = { 
                   base_url: baseUrl, 
                   peer_id: jsonData.peer_id,
                   isCurrentNode: jsonData.peer_id === currentPeerID,
+                  hash: jsonData.hash,
+                  height: jsonData.height,
+                  timestamp: jsonData.timestamp,
+                  miner: jsonData.miner,
+                  receivedAt: new Date(),
+                }
+                miningNodes.set(miningNodeSet)
+              } else {
+                // Only update if block data changed
+                const hasChanges = 
+                  existingNode.hash !== jsonData.hash ||
+                  existingNode.height !== jsonData.height ||
+                  existingNode.timestamp !== jsonData.timestamp ||
+                  existingNode.miner !== jsonData.miner
+                
+                if (hasChanges) {
+                  miningNodeSet[nodeKey] = {
+                    ...existingNode,
+                    hash: jsonData.hash,
+                    height: jsonData.height,
+                    timestamp: jsonData.timestamp,
+                    miner: jsonData.miner,
+                    receivedAt: new Date(),
+                  }
+                  miningNodes.set(miningNodeSet)
+                } else {
+                  // Just update timestamp
+                  existingNode.receivedAt = new Date()
                 }
               }
-              // Update only the specific block fields, preserving existing mining_on data
-              miningNodeSet[nodeKey] = {
-                ...miningNodeSet[nodeKey],
-                hash: jsonData.hash,
-                height: jsonData.height,
-                timestamp: jsonData.timestamp,
-                miner: jsonData.miner,
-                receivedAt: new Date(),
-              }
-              miningNodes.set(miningNodeSet)
             } else if (baseUrl && jsonData.peer_id) {
               const nodeKey = jsonData.peer_id
               const currentPeerID = get(currentNodePeerID)
@@ -259,8 +365,8 @@ export async function connectToP2PServer() {
                 }
                 miningNodes.set(miningNodeSet)
               } else {
+                // Just update timestamp without triggering store update
                 miningNodeSet[nodeKey].receivedAt = new Date()
-                miningNodes.set(miningNodeSet)
               }
             }
 

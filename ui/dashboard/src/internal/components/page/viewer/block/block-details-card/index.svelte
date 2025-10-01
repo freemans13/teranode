@@ -14,6 +14,7 @@
   import Card from '$internal/components/card/index.svelte'
   import i18n from '$internal/i18n'
   import { getItemApiUrl, ItemType } from '$internal/api'
+  import { blockHashToMiner } from '$internal/stores/p2pStore'
 
   const dispatch = createEventDispatcher()
 
@@ -30,6 +31,19 @@
   $: expandedHeader = data?.expandedHeader
   $: isOverview = display === DetailTab.overview
   $: isJson = display === DetailTab.json
+  
+  // Populate the block hash -> miner cache when block data is loaded
+  $: if (expandedHeader?.hash && expandedHeader?.miner) {
+    blockHashToMiner.update(map => {
+      map.set(expandedHeader.hash, expandedHeader.miner)
+      // Keep cache size manageable (same limit as in p2pStore)
+      if (map.size > 1000) {
+        const firstKey = map.keys().next().value
+        map.delete(firstKey)
+      }
+      return map
+    })
+  }
 
   function onDisplay(value) {
     dispatch('display', { value })
@@ -170,7 +184,7 @@
           </div> -->
           <div class="entry">
             <div class="label">{t(`${fieldKey}.miner`)}</div>
-            <div class="value">{expandedHeader.miner}</div>
+            <div class="value">{expandedHeader.miner || '-'}</div>
           </div>
         </div>
       </div>

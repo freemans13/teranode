@@ -1,6 +1,6 @@
 import { formatNum, shortHash } from '$lib/utils/format'
 import { getDetailsUrl, DetailType } from '$internal/utils/urls'
-import { humanTime } from '$internal/utils/format'
+import { humanTime, humanTimeNoSeconds } from '$internal/utils/format'
 import { valueSet } from '$lib/utils/types'
 // eslint-ignore-next-line
 import RenderLink from '$lib/components/table/renderers/render-link/index.svelte'
@@ -9,6 +9,8 @@ import RenderSpanWithTooltip from '$lib/components/table/renderers/render-span-w
 import RenderHashWithMiner from '$lib/components/table/renderers/render-hash-with-miner/index.svelte'
 import RenderClickableSpan from '$lib/components/table/renderers/render-clickable-span/index.svelte'
 import { blockAssemblyModalStore } from '$internal/stores/blockAssemblyModalStore'
+import { blockHashToMiner } from '$internal/stores/p2pStore'
+import { get } from 'svelte/store'
 
 const pageKey = 'page.network.nodes'
 const fieldKey = `${pageKey}.fields`
@@ -56,6 +58,14 @@ export function calculateChainworkScores(nodes: any[]): Map<string, number> {
 export const getColDefs = (t) => {
   return [
     {
+      id: 'fsm_state',
+      name: '',
+      type: 'string',
+      props: {
+        width: '3%',
+      },
+    },
+    {
       id: 'client_name',
       name: t(`${fieldKey}.client_name`),
       type: 'string',
@@ -69,14 +79,6 @@ export const getColDefs = (t) => {
       type: 'string',
       props: {
         width: '12%',
-      },
-    },
-    {
-      id: 'fsm_state',
-      name: t(`${fieldKey}.fsm_state`),
-      type: 'string',
-      props: {
-        width: '10%',
       },
     },
     {
@@ -192,20 +194,30 @@ export const renderCells = {
   },
   fsm_state: (idField, item, colId) => {
     const state = item[colId] || '-'
-    let className = ''
-    // Color code based on actual FSM states
+    let emoji = ''
+    let tooltip = state
+    
+    // Add colorful emojis based on actual FSM states
     if (state === 'RUNNING') {
-      className = 'status-success'
-    } else if (state === 'CATCHINGBLOCKS' || state === 'LEGACYSYNCING') {
-      className = 'status-warning'
+      emoji = '✅'
+      tooltip = 'RUNNING'
+    } else if (state === 'CATCHINGBLOCKS') {
+      emoji = '🟠'
+      tooltip = 'CATCHINGBLOCKS'
+    } else if (state === 'LEGACYSYNC') {
+      emoji = '🟡'
+      tooltip = 'LEGACYSYNC'
     } else if (state === 'IDLE') {
-      className = 'status-info'
+      emoji = '⏸️'
+      tooltip = 'IDLE'
     }
+    
     return {
-      component: RenderSpan,
+      component: RenderSpanWithTooltip,
       props: {
-        value: state,
-        className: className,
+        value: emoji,
+        className: '',
+        tooltip: tooltip,
       },
       value: '',
     }
@@ -289,9 +301,9 @@ export const renderCells = {
         value: '',
       }
     }
-    // Use humanTime function to calculate uptime from start time
+    // Use humanTimeNoSeconds function to calculate uptime from start time
     const startTime = item.start_time * 1000 // Convert to milliseconds
-    const uptimeStr = humanTime(startTime)
+    const uptimeStr = humanTimeNoSeconds(startTime)
 
     return {
       component: RenderSpan,
@@ -340,7 +352,13 @@ export const renderCells = {
   best_block_hash: (idField, item, colId) => {
     // Support both best_block_hash (from node_status) and hash (from mining_on)
     const hash = item[colId] || item.hash
-    const miner = item.miner_name || item.miner || ''
+    let miner = item.miner_name || item.miner || ''
+    
+    // If miner is not available, lookup from block hash -> miner cache
+    if (!miner && hash) {
+      const minerCache = get(blockHashToMiner)
+      miner = minerCache.get(hash) || ''
+    }
     
     return {
       component: hash ? RenderHashWithMiner : null,

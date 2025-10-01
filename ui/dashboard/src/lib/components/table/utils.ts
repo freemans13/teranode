@@ -48,8 +48,8 @@ export const getSortFunction = (colType, sortColumn, sortOrder) => {
       }
     default:
       return (a, b) => {
-        const value1 = (a[sortColumn] || '').toString()
-        const value2 = (b[sortColumn] || '').toString()
+        const value1 = (a[sortColumn] || '').toString().toLowerCase()
+        const value2 = (b[sortColumn] || '').toString().toLowerCase()
         return sortOrder === SortOrder.asc
           ? value1.localeCompare(value2)
           : value2.localeCompare(value1)

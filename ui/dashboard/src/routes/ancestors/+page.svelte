@@ -7,12 +7,13 @@
   import Typo from '$internal/components/typo/index.svelte'
   import Icon from '$lib/components/icon/index.svelte'
   import { Button } from '$lib/components'
-  import { miningNodes, sock, currentNodePeerID } from '$internal/stores/p2pStore'
+  import { miningNodes, sock, currentNodePeerID, blockHashToMiner } from '$internal/stores/p2pStore'
   import { calculateChainworkScores } from '$internal/components/page/network/connected-nodes-card/data'
   import i18n from '$internal/i18n'
   import RenderSpan from '$lib/components/table/renderers/render-span/index.svelte'
   import RenderSpanWithTooltip from '$lib/components/table/renderers/render-span-with-tooltip/index.svelte'
   import RenderHashWithMiner from '$lib/components/table/renderers/render-hash-with-miner/index.svelte'
+  import { get } from 'svelte/store'
   
   $: t = $i18n.t
   
@@ -429,7 +430,14 @@
     best_block_hash: (idField, item, colId) => {
       const value = item[colId]
       const shortHash = value ? (value.length > 16 ? `${value.slice(0, 8)}...${value.slice(-8)}` : value) : ''
-      const miner = item.miner_name || ''
+      let miner = item.miner_name || ''
+      
+      // Fallback to miner cache if not available
+      if (!miner && value) {
+        const minerCache = get(blockHashToMiner)
+        miner = minerCache.get(value) || ''
+      }
+      
       return {
         component: value ? RenderHashWithMiner : null,
         props: {
@@ -484,7 +492,14 @@
       
       // Handle normal hash display
       const shortHash = value ? (value.length > 16 ? `${value.slice(0, 8)}...${value.slice(-8)}` : value) : ''
-      const miner = item.common_block_miner || ''
+      let miner = item.common_block_miner || ''
+      
+      // Fallback to miner cache if not available
+      if (!miner && value) {
+        const minerCache = get(blockHashToMiner)
+        miner = minerCache.get(value) || ''
+      }
+      
       return {
         component: value ? RenderHashWithMiner : null,
         props: {
