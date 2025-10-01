@@ -286,13 +286,7 @@ The UTXO Persister service relies on a set of configuration settings that contro
 
 ### 7.1 Configuration Categories
 
-UTXO Persister service settings can be organized into the following functional categories:
-
-1. **Performance Tuning**: Settings that control I/O performance and memory usage
-2. **Storage Management**: Settings that manage file storage and retention policies
-3. **Deployment Architecture**: Settings that determine how the service interacts with other components
-4. **Operational Controls**: Settings that affect general service behavior
-
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [utxo Persister Settings Reference](../../references/settings/services/utxoPersister_settings.md).
 ### 7.2 Performance Tuning Settings
 
 These settings control the I/O performance and memory usage patterns of the UTXO Persister service.

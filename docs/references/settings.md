@@ -135,3 +135,32 @@ maxRetries, _ := gocore.Config().GetInt("blockchain_maxRetries")
 3. Use the type system to your advantage - settings are strongly typed within their respective groups.
 
 **Note**: The old `gocore.Config()` approach with direct key access is deprecated. Always use the new Settings object for accessing configuration values.
+
+## Detailed Settings Reference
+
+For comprehensive documentation of all available settings, see the following references organized by component:
+
+### Services
+
+- [Alert Service Settings](settings/services/alert_settings.md)
+- [Asset Server Settings](settings/services/asset_settings.md)
+- [Block Assembly Settings](settings/services/blockassembly_settings.md)
+- [Blockchain Settings](settings/services/blockchain_settings.md)
+- [Block Persister Settings](settings/services/blockpersister_settings.md)
+- [Block Validation Settings](settings/services/blockvalidation_settings.md)
+- [Legacy Settings](settings/services/legacy_settings.md)
+- [P2P Settings](settings/services/p2p_settings.md)
+- [Propagation Settings](settings/services/propagation_settings.md)
+- [RPC Settings](settings/services/rpc_settings.md)
+- [Subtree Validation Settings](settings/services/subtreevalidation_settings.md)
+- [UTXO Persister Settings](settings/services/utxopersister_settings.md)
+- [Validator Settings](settings/services/validator_settings.md)
+
+### Stores
+
+- [UTXO Store Settings](settings/stores/utxo_settings.md)
+- [Blob Store Settings](settings/stores/blob_settings.md)
+
+### Messaging
+
+- [Kafka Settings](settings/kafka_settings.md)

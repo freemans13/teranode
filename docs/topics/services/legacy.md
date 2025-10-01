@@ -17,7 +17,6 @@
 6. [How to run](#6-how-to-run)
 7. [Configuration options (settings flags)](#7-configuration-options-settings-flags)
 
-
 ## 1. Introduction
 
 ### 1.1. Summary
@@ -28,9 +27,7 @@ The core functionality of the Legacy Service revolves around managing and transl
 
 - **Receiving Blocks and Transactions:** The service accepts blocks and transactions from legacy BSV nodes, ensuring that these can be efficiently propagated to Teranode nodes within the network.
 
-
 - **Disseminating Newly Mined Blocks:** It also sends newly mined blocks from Teranode nodes back to the legacy nodes, maintaining the continuity and integrity of the blockchain across different node versions.
-
 
 ### 1.2. Data Transformation for Compatibility
 
@@ -41,7 +38,6 @@ Legacy blocks and their transactions are encapsulated into subtrees, aligning wi
 ### 1.3. Phased Migration Towards Teranode
 
 The Legacy Service allows for BSV and Teranode BSV nodes to operate side by side. This is intended as a temporary solution until all historical BSV nodes are phased out. As transaction volumes on the BSV network continue to grow, the demand for more scalable and feature-rich infrastructure will necessitate a complete migration to Teranode. The Legacy Service is a critical enabler of this transition, ensuring that the migration can occur gradually and without disrupting the network's ongoing operations.
-
 
 ## 2. Architecture
 
@@ -59,10 +55,10 @@ When the service receives a block message from the network, the service will pro
 Both the Block Validation and the Subtree validation will query the Legacy Service (using the same endpoints the Asset Server offers) for the block and subtree data, respectively. The Legacy Service will respond with the requested data in the same format the Asset Server uses. The following endpoints are offered by the Legacy Service:
 
 ```go
-	e.GET("/block/:hash", tb.BlockHandler)
-	e.GET("/subtree/:hash", tb.SubtreeHandler)
-	e.GET("/tx/:hash", tb.TxHandler)
-	e.POST("/txs", tb.TxBatchHandler())
+ e.GET("/block/:hash", tb.BlockHandler)
+ e.GET("/subtree/:hash", tb.SubtreeHandler)
+ e.GET("/tx/:hash", tb.TxHandler)
+ e.POST("/txs", tb.TxBatchHandler())
 ```
 
 In addition to the block database, the service maintains an in-memory peer database, tracking peers it receives / sends messages from /to.
@@ -97,12 +93,12 @@ This configuration is controlled by the settings passed to `GetValidatorClient()
 
 When we announce a teranode block, the format is:
 
-* Blockheader
-* Block meta data (size, tx count etc etc)
-* Coinbase TX (the actual payload / bytes of the coinbase TX itself)
-* A slice of subtrees.
+- Blockheader
+- Block meta data (size, tx count etc etc)
+- Coinbase TX (the actual payload / bytes of the coinbase TX itself)
+- A slice of subtrees.
 
-* Each subtree has a list of txid's, and to calculate the merkle root, you replace the coinbase placeholder with the txid of the coinbase transaction and then do the merkle tree calculation as normal.  The result should match the merkle root in the block header.
+- Each subtree has a list of txid's, and to calculate the merkle root, you replace the coinbase placeholder with the txid of the coinbase transaction and then do the merkle tree calculation as normal.  The result should match the merkle root in the block header.
 
 ## 4. Functionality
 
@@ -150,7 +146,6 @@ Inv messages are critical in the data dissemination process within the Bitcoin n
 In the context of the Legacy Service, the reception of inv messages is a crucial step in the communication process between BSV nodes and Teranode nodes. These messages serve as the initial trigger for data exchange, allowing the service to identify new blocks or transactions and initiate the necessary actions to retrieve and process this data.
 
 ![legacy_p2p_bsv_to_teranode_inv_message.svg](img/plantuml/legacyp2p/legacy_p2p_bsv_to_teranode_inv_message.svg)
-
 
 1. **Connection Establishment:** The Legacy Overlay Service establishes a connection with the MainNet, setting the stage for data exchange.
 
@@ -242,7 +237,6 @@ Process flow:
 7. **Finalization:**
     - Upon successful validation, the Block Validator coordinates with other Teranode microservices and stores, and adds the block to the blockchain, completing the process.
 
-
 **Block to Subtree Conversion Process (detail):**
 
 The Legacy Service converts standard BSV blocks (which don't have subtrees) into the Teranode format (which uses blocks + subtrees) through the following process:
@@ -270,7 +264,6 @@ The Legacy Service converts standard BSV blocks (which don't have subtrees) into
 5. **Storage:**
     - The subtree, its data, and metadata are stored in the Subtree Store
     - The subtree hash is then ready to be included in the Teranode block structure
-
 
 ### 4.2. Teranode to BSV Communication
 
@@ -307,7 +300,6 @@ When new subtrees are created within the Teranode environment, the Legacy Servic
 
 This bidirectional communication ensures that both networks remain synchronized, with transactions and blocks being properly reflected in both environments. The Legacy Service acts as a critical bridge, enabling seamless interoperability between the legacy BSV protocol and the more scalable Teranode architecture.
 
-
 **Subtree to Transaction Conversion Process:**
 
 The Legacy Service converts Teranode subtree container abstractions back to "flat" BSV transactions through the following process:
@@ -335,7 +327,6 @@ The Legacy Service converts Teranode subtree container abstractions back to "fla
 
 This process effectively bridges the gap between Teranode's subtree-based architecture and the BSV network's traditional transaction model, ensuring that data originating in Teranode can be properly propagated to the BSV network.
 
-
 ## 5. Technology
 
 The entire codebase is written in Go (Golang), a statically typed, compiled programming language designed for simplicity and efficiency.
@@ -352,10 +343,9 @@ Technology highlights:
 
 - **Database Technologies** (ffldb, leveldb, sqlite): Used as block data stores. Each has its use cases:
 
-    - **ffldb**: Optimized for blockchain data storage and retrieval. Default and recommended choice.
-    - **leveldb**: A fast key-value storage library suitable for indexing blockchain data.
-    - **sqlite**: An embedded SQL database engine for simpler deployment and structured data queries.
-
+  - **ffldb**: Optimized for blockchain data storage and retrieval. Default and recommended choice.
+  - **leveldb**: A fast key-value storage library suitable for indexing blockchain data.
+  - **sqlite**: An embedded SQL database engine for simpler deployment and structured data queries.
 
 ## 6. How to run
 
@@ -367,138 +357,9 @@ SETTINGS_CONTEXT=dev.[YOUR_USERNAME] go run -Legacy=1
 
 Please refer to the [Locally Running Services Documentation](../../howto/locallyRunningServices.md) document for more information on running the Legacy Service locally.
 
-
 ## 7. Configuration options (settings flags)
 
-The Legacy service bridges traditional Bitcoin nodes with the Teranode architecture, making its configuration particularly important for network integration. This section provides a comprehensive overview of all configuration options, organized by functional category.
-
-### Network and Communication Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `legacy_listen_addresses` | []string | [] (falls back to external IP:8333) | Network addresses for the service to listen on for peer connections | Controls which interfaces and ports accept connections from other nodes |
-| `legacy_connect_peers` | []string | [] | Peer addresses to connect to on startup | Forces connections to specific peers rather than using automatic peer discovery |
-| `legacy_grpcAddress` | string | "" | Address for other services to connect to the Legacy service | Enables service-to-service communication |
-| `legacy_grpcListenAddress` | string | "" | Interface and port to listen on for gRPC connections | Controls network binding for the gRPC server |
-| `network` | string | "mainnet" | Specifies which blockchain network to connect to | Determines network rules, consensus parameters, and compatibility |
-
-### Memory and Storage Management
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `legacy_orphanEvictionDuration` | duration | 10m | How long orphan transactions are kept before eviction | Affects memory usage and ability to process delayed transactions |
-| `legacy_writeMsgBlocksToDisk` | bool | false | **Enable disk-based block queueing during synchronization** | **Significantly reduces memory usage** by writing incoming blocks to temporary disk storage with 4MB buffered I/O and automatic 10-minute cleanup. Essential for resource-constrained environments and high-volume sync operations. |
-| `legacy_storeBatcherSize` | int | 1024 | Batch size for store operations | Affects efficiency of storage operations and memory usage |
-| `legacy_spendBatcherSize` | int | 1024 | Batch size for spend operations | Affects efficiency of spend operations and memory usage |
-| `legacy_outpointBatcherSize` | int | 1024 | Batch size for outpoint operations | Affects efficiency of outpoint processing |
-| `legacy_workingDir` | string | "../../data" | Directory where service stores data files | Controls where peer information and other data is stored |
-| `temp_store` | string | "file://./data/tempstore" | Temporary storage URL for Legacy Service operations | Controls temporary file storage location for block processing and peer data |
-
-### Concurrency and Performance
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `legacy_storeBatcherConcurrency` | int | 32 | Number of concurrent store operations | Controls parallelism for storage operations |
-| `legacy_spendBatcherConcurrency` | int | 32 | Number of concurrent spend operations | Controls parallelism for spend operations |
-| `legacy_outpointBatcherConcurrency` | int | 32 | Number of concurrent outpoint operations | Controls parallelism for outpoint operations |
-
-### Peer Management and Timeouts
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `legacy_savePeers` | bool | false | Save peer information to disk for reuse on restart | Enables persistent peer connections across service restarts |
-| `legacy_allowSyncCandidateFromLocalPeers` | bool | false | Allow local peers as sync candidates | Affects peer selection for blockchain synchronization |
-| `legacy_printInvMessages` | bool | false | Print inventory messages to logs | Increases log verbosity for debugging |
-| `legacy_peerIdleTimeout` | duration | 125s | Timeout for idle peer connections | Controls when peers are disconnected due to inactivity. Set to 125s to accommodate 2-minute ping/pong intervals |
-| `legacy_peerProcessingTimeout` | duration | 3m | Timeout for peer message processing | Maximum time allowed for processing messages from peers. Block processing is typically the largest operation |
-
-### Feature Flags
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `legacy_allowBlockPriority` | bool | false | Prioritize transactions based on block priority | Affects transaction selection for block creation |
-
-## Configuration Interactions and Dependencies
-
-### Peer Discovery and Connection Management
-
-The Legacy service's peer connection behavior is controlled by several interrelated settings:
-
-- `legacy_listen_addresses` determines where the service listens for incoming connections
-- `legacy_connect_peers` forces outbound connections to specific peers
-- `legacy_savePeers` enables storing peer information across restarts
-- If no `legacy_listen_addresses` are specified, the service detects the external IP and uses port 8333
-
-These settings should be configured together based on your network architecture and security requirements.
-
-### Memory Management Considerations
-
-Several settings affect the memory usage patterns of the Legacy service:
-
-- `legacy_writeMsgBlocksToDisk` significantly reduces memory usage during blockchain synchronization by writing blocks to disk rather than keeping them in memory
-- `legacy_orphanEvictionDuration` controls how aggressively orphan transactions are removed from memory
-- The various batcher size settings control memory usage during batch operations
-
-For resource-constrained environments, enable `legacy_writeMsgBlocksToDisk` and use smaller batch sizes.
-
-#### Disk-Based Block Queueing (`legacy_writeMsgBlocksToDisk`)
-
-The `legacy_writeMsgBlocksToDisk` setting enables a sophisticated disk-based queueing mechanism that fundamentally changes how the Legacy service handles incoming blocks during synchronization.
-
-**How It Works:**
-
-- It creates a streaming pipeline that writes blocks directly to disk, employing 4MB buffered readers for optimal disk performance.
-- Blocks are stored with a 10-minute TTL to prevent disk accumulation
-
-**Technical Implementation:**
-
-```text
-Incoming Block → io.Pipe() → 4MB Buffer → Temporary Disk Storage → Validation Queue
-                     ↓
-              Background Goroutine
-```
-
-**Benefits:**
-
-- **Memory Efficiency**: Prevents memory exhaustion during large-scale synchronization
-- **Scalability**: Handles high-volume block arrivals without resource constraints
-- **Reliability**: Reduces risk of out-of-memory errors during initial sync
-- **Performance**: Maintains processing throughput while using minimal memory
-
-**When to Enable:**
-
-- ✅ **Initial blockchain synchronization** - Essential for syncing from genesis
-- ✅ **Resource-constrained environments** - Servers with limited RAM
-- ✅ **High-throughput scenarios** - Networks with frequent block arrivals
-- ✅ **Production deployments** - Recommended for stability
-
-**Storage Requirements:**
-
-- Temporary disk space for concurrent blocks (typically < 1GB)
-- Fast storage (SSD recommended) for optimal I/O performance
-- Automatic cleanup prevents long-term storage accumulation
-
-**Configuration Example:**
-
-```bash
-# Enable disk-based block queueing
-export legacy_writeMsgBlocksToDisk=true
-
-# Ensure adequate working directory space
-export legacy_workingDir="/path/to/fast/storage"
-```
-
-![legacy_disk_block_queueing.svg](img/plantuml/legacyp2p/legacy_disk_block_queueing.svg)
-
-### Batch Processing Pipeline
-
-The Legacy service uses a batching system for UTXO operations, controlled by these settings:
-
-- Batch sizes (`legacy_storeBatcherSize`, `legacy_spendBatcherSize`, `legacy_outpointBatcherSize`) determine how many operations are grouped together
-- Concurrency settings (`legacy_storeBatcherConcurrency`, `legacy_spendBatcherConcurrency`, `legacy_outpointBatcherConcurrency`) control parallelism
-
-Larger batch sizes improve throughput but use more memory, while higher concurrency improves performance but increases CPU utilization.
-
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [legacy Settings Reference](../../references/settings/services/legacy_settings.md).
 
 ## 8. Other Resources
 

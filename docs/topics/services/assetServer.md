@@ -586,38 +586,7 @@ export TERANODE_SERVER_CERTFILE=/path/to/cert.pem
 
 ### 7.3 Configuration Examples
 
-**HTTP/HTTPS Mode:**
-The `securityLevelHTTP` setting determines whether the server runs in HTTP or HTTPS mode:
-
-- When set to `0`, the server runs in HTTP mode using `asset_httpListenAddress`
-- When set to a non-zero value, the server runs in HTTPS mode and requires valid certificate and key files
-
-**Centrifuge Dependencies:**
-When Centrifuge is enabled (`asset_centrifugeDisable=false`):
-
-- `asset_centrifugeListenAddress` must be set to specify the WebSocket listen address
-- `asset_httpAddress` must be set to serve as the base URL for client connections
-
-**Response Signing Dependencies:**
-When response signing is enabled (`asset_signHTTPResponses=true`):
-
-- `p2p_private_key` must be set with a valid Ed25519 private key in hexadecimal format
-
-```bash
-asset_httpListenAddress=:8443
-securityLevelHTTP=1
-server_certFile=/path/to/cert.pem
-server_keyFile=/path/to/key.pem
-```
-
-#### Centrifuge Configuration Example
-
-```bash
-asset_centrifugeDisable=false
-asset_centrifugeListenAddress=:8101
-asset_httpAddress=http://localhost:8090
-```
-
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [asset Server Settings Reference](../../references/settings/services/assetServer_settings.md).
 ### 7.4 FSM Configuration
 
 - **fsm_state_restore**: Enables or disables the restore state for the Finite State Machine.
