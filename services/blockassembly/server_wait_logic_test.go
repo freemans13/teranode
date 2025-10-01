@@ -177,6 +177,9 @@ func TestWaitForBestBlockHeaderUpdate(t *testing.T) {
 			Bits:           *bits,
 			Nonce:          0,
 		}
+
+		// Calculate hash before storing to avoid concurrent access to Hash() method
+		headerHash := header.Hash()
 		server.blockAssembler.bestBlockHeader.Store(header)
 
 		// Create already cancelled context
@@ -185,7 +188,7 @@ func TestWaitForBestBlockHeaderUpdate(t *testing.T) {
 
 		// Should return immediately due to cancelled context
 		start := time.Now()
-		err := server.waitForBestBlockHeaderUpdate(ctx, header.Hash())
+		err := server.waitForBestBlockHeaderUpdate(ctx, headerHash)
 		elapsed := time.Since(start)
 
 		assert.NoError(t, err) // Returns nil on timeout/cancellation

@@ -1,6 +1,7 @@
 package blockassembly
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -637,10 +638,27 @@ func TestRetryFunctionsCoverage(t *testing.T) {
 	})
 
 	t.Run("handleRetryLogic", func(t *testing.T) {
+		// Create a context that we can cancel to prevent goroutine from outliving test
+		testCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
 		// Test retry logic
-		server.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "test-item")
+		server.handleRetryLogic(testCtx, subtreeRetry, subtreeRetryChan, "test-item")
 		// Function returns void, just ensure no panic
 		assert.Equal(t, 1, subtreeRetry.retries, "Retry count should be incremented")
+
+		// Use ticker to wait for goroutine to start, then cancel to prevent race
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+
+		// Wait for a couple ticks to ensure goroutine has started
+		<-ticker.C
+		<-ticker.C
+		cancel() // This will cause the goroutine to exit cleanly
+
+		// Wait for another couple ticks to ensure goroutine has time to process cancellation
+		<-ticker.C
+		<-ticker.C
 	})
 
 	t.Run("storeSubtreeMetaWithRetry", func(t *testing.T) {
