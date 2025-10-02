@@ -44,6 +44,7 @@ type CatchupContext struct {
 	headersFetchResult      *catchup.Result
 	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
 	highestCheckpointHeight uint32 // Highest checkpoint height for validation checks
+	catchupError            error  // Any error encountered during catchup
 }
 
 // catchup orchestrates the complete blockchain synchronization process.
@@ -585,7 +586,13 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 			return err
 		}
 
-		defer u.restoreFSMState(ctx, catchupCtx)
+		defer func() {
+			if catchupCtx.catchupError != nil {
+				u.logger.Errorf("[catchup][%s] Catchup failed with error, not setting FSM state back to RUNNING: %v", catchupCtx.blockUpTo.Hash().String(), catchupCtx.catchupError)
+			} else {
+				u.restoreFSMState(ctx, catchupCtx)
+			}
+		}()
 	}
 
 	// Create error group for concurrent operations
@@ -602,7 +609,12 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	})
 
 	// Wait for both operations to complete
-	return errorGroup.Wait()
+	err = errorGroup.Wait()
+	if err != nil {
+		catchupCtx.catchupError = err
+	}
+
+	return err
 }
 
 // cleanup cleans up resources after catchup.
