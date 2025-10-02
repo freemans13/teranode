@@ -40,7 +40,8 @@ type Interface interface {
 
 	// ValidateBlock validates a block using the provided request, but does not update any state or database tables.
 	// This is useful for validating blocks without committing them to the database.
-	ValidateBlock(ctx context.Context, block *model.Block) error
+	// The options parameter allows control over validation behavior, including revalidation of invalid blocks.
+	ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error
 }
 
 var _ Interface = &MockBlockValidation{}
@@ -59,6 +60,6 @@ func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Bl
 	return nil
 }
 
-func (mv *MockBlockValidation) ValidateBlock(ctx context.Context, block *model.Block) error {
+func (mv *MockBlockValidation) ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error {
 	return nil
 }

@@ -1033,13 +1033,13 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, ba
 	// validate the block
 	u.logger.Infof("[processBlockFound][%s] validate block from %s", hash.String(), baseURL)
 
-	// this is a bit of a hack, but we need to turn off optimistic mining when in legacy mode
-	if baseURL == "legacy" {
-		err = u.blockValidation.ValidateBlock(ctx, block, baseURL, u.blockValidation.bloomFilterStats, true)
-	} else {
-		err = u.blockValidation.ValidateBlock(ctx, block, baseURL, u.blockValidation.bloomFilterStats)
+	// Create validation options
+	opts := &ValidateBlockOptions{
+		DisableOptimisticMining: baseURL == "legacy",
+		IsRevalidation:          false, // processBlockFound is for new blocks, not revalidation
 	}
 
+	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, baseURL, u.blockValidation.bloomFilterStats, opts)
 	if err != nil {
 		return errors.NewServiceError("failed block validation BlockFound [%s]", block.String(), err)
 	}

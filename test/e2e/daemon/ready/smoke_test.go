@@ -963,7 +963,7 @@ func TestShouldRejectOversizedScript(t *testing.T) {
 
 	// now try add a block with the transaction
 	_, block3 := td.CreateTestBlock(t, block2, 10101, newTx)
-	err = td.BlockValidationClient.ValidateBlock(td.Ctx, block3)
+	err = td.BlockValidationClient.ValidateBlock(td.Ctx, block3, nil)
 	require.Error(t, err)
 }
 

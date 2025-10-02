@@ -44,6 +44,7 @@ message ProcessBlockRequest {
 message ValidateBlockRequest {
   bytes block = 1;
   uint32 height = 2;
+  bool is_revalidation = 3; // Indicates this is a revalidation of an invalid block
 }
 
 // swagger:model ValidateBlockResponse

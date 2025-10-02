@@ -431,10 +431,18 @@ func (d *Daemon) startRPCService(ctx context.Context, appSettings *settings.Sett
 		return err
 	}
 
+	// Create block validation client for RPC service
+	var blockValidationClient blockvalidation.Interface
+
+	blockValidationClient, err = d.daemonStores.GetBlockValidationClient(ctx, createLogger("blockvalidation"), appSettings)
+	if err != nil {
+		return err
+	}
+
 	// Create the RPC server with the necessary parts
 	var rpcServer *rpc.RPCServer
 
-	rpcServer, err = rpc.NewServer(createLogger(loggerRPC), appSettings, blockchainClient, utxoStore, blockAssemblyClient, peerClient, p2pClient)
+	rpcServer, err = rpc.NewServer(createLogger(loggerRPC), appSettings, blockchainClient, blockValidationClient, utxoStore, blockAssemblyClient, peerClient, p2pClient)
 	if err != nil {
 		return err
 	}

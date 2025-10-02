@@ -72,7 +72,7 @@ func ValidateBlockTemplate(logger ulogger.Logger, settings *settings.Settings) (
 	}
 
 	// validate the block template
-	err = blockValidationClient.ValidateBlock(ctx, blockTemplate)
+	err = blockValidationClient.ValidateBlock(ctx, blockTemplate, nil)
 	if err != nil {
 		return blockTemplate, err
 	}

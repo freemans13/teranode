@@ -18,6 +18,7 @@ import (
 	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bitcoin-sv/teranode/services/blockchain"
 	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
+	"github.com/bitcoin-sv/teranode/services/blockvalidation"
 	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bitcoin-sv/teranode/services/legacy/peer_api"
 	"github.com/bitcoin-sv/teranode/services/p2p/p2p_api"
@@ -2440,18 +2441,34 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 	logger := mocklogger.NewTestLogger()
 
 	t.Run("successful block revalidation", func(t *testing.T) {
+		expectedHash, _ := chainhash.NewHashFromStr("00000000000000000007878ec04bb2b2e12317804810f4c26033585b3f81ffaa")
+
 		mockClient := &mockBlockchainClient{
-			revalidateBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) error {
+			getBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) (*model.Block, error) {
 				// Verify the block hash matches expected value
-				expectedHash, _ := chainhash.NewHashFromStr("00000000000000000007878ec04bb2b2e12317804810f4c26033585b3f81ffaa")
 				assert.Equal(t, expectedHash, blockHash)
+				// Return a mock block
+				return &model.Block{
+					Header: &model.BlockHeader{
+						HashPrevBlock: &chainhash.Hash{},
+					},
+				}, nil
+			},
+		}
+
+		mockBlockValidationClient := &mockBlockValidationClient{
+			validateBlockFunc: func(ctx context.Context, block *model.Block, options *blockvalidation.ValidateBlockOptions) error {
+				// Verify revalidation flag is set
+				assert.NotNil(t, options)
+				assert.True(t, options.IsRevalidation)
 				return nil
 			},
 		}
 
 		s := &RPCServer{
-			logger:           logger,
-			blockchainClient: mockClient,
+			logger:                logger,
+			blockchainClient:      mockClient,
+			blockValidationClient: mockBlockValidationClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -2496,8 +2513,8 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 	t.Run("blockchain client error", func(t *testing.T) {
 		expectedError := errors.New(errors.ERR_ERROR, "blockchain service unavailable")
 		mockClient := &mockBlockchainClient{
-			revalidateBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) error {
-				return expectedError
+			getBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) (*model.Block, error) {
+				return nil, expectedError
 			},
 		}
 
@@ -2517,7 +2534,11 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 
 		require.Error(t, err)
 		assert.Nil(t, result)
-		assert.Equal(t, expectedError, err)
+		// The handler converts GetBlock errors to "Block not found" RPC error
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCBlockNotFound, rpcErr.Code)
+		assert.Equal(t, "Block not found", rpcErr.Message)
 	})
 
 	t.Run("nil blockchain client", func(t *testing.T) {
@@ -2541,12 +2562,12 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 
 	t.Run("context cancellation", func(t *testing.T) {
 		mockClient := &mockBlockchainClient{
-			revalidateBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) error {
+			getBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) (*model.Block, error) {
 				select {
 				case <-ctx.Done():
-					return ctx.Err()
+					return nil, ctx.Err()
 				default:
-					return nil
+					return nil, errors.New(errors.ERR_ERROR, "should be cancelled")
 				}
 			},
 		}
@@ -2571,20 +2592,41 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 
 		require.Error(t, err)
 		assert.Nil(t, result)
-		assert.Equal(t, context.Canceled, err)
+		// The handler converts the context.Canceled error to "Block not found" RPC error
+		rpcErr, ok := err.(*bsvjson.RPCError)
+		require.True(t, ok)
+		assert.Equal(t, bsvjson.ErrRPCBlockNotFound, rpcErr.Code)
+		assert.Equal(t, "Block not found", rpcErr.Message)
 	})
 
 	t.Run("short block hash succeeds with padding", func(t *testing.T) {
 		mockClient := &mockBlockchainClient{
-			revalidateBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) error {
+			getBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) (*model.Block, error) {
 				// Verify the hash is padded correctly - "cafe" becomes padded with zeros
+				// When "cafe" is parsed by NewHashFromStr, it is byte-reversed and zero-padded
+				// So the internal representation will be feca000000...
+				// We just verify it matches what NewHashFromStr("cafe") produces
+				expectedHash, _ := chainhash.NewHashFromStr("cafe")
+				assert.Equal(t, expectedHash, blockHash)
+				return &model.Block{
+					Header: &model.BlockHeader{
+						HashPrevBlock: &chainhash.Hash{},
+					},
+				}, nil
+			},
+		}
+
+		mockBlockValidationClient := &mockBlockValidationClient{
+			validateBlockFunc: func(ctx context.Context, block *model.Block, options *blockvalidation.ValidateBlockOptions) error {
+				assert.True(t, options.IsRevalidation)
 				return nil
 			},
 		}
 
 		s := &RPCServer{
-			logger:           logger,
-			blockchainClient: mockClient,
+			logger:                logger,
+			blockchainClient:      mockClient,
+			blockValidationClient: mockBlockValidationClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -2602,17 +2644,29 @@ func TestHandleReconsiderBlockComprehensive(t *testing.T) {
 
 	t.Run("zero block hash", func(t *testing.T) {
 		mockClient := &mockBlockchainClient{
-			revalidateBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) error {
+			getBlockFunc: func(ctx context.Context, blockHash *chainhash.Hash) (*model.Block, error) {
 				// Verify zero hash is passed correctly
 				zeroHash := &chainhash.Hash{}
 				assert.Equal(t, zeroHash, blockHash)
+				return &model.Block{
+					Header: &model.BlockHeader{
+						HashPrevBlock: &chainhash.Hash{},
+					},
+				}, nil
+			},
+		}
+
+		mockBlockValidationClient := &mockBlockValidationClient{
+			validateBlockFunc: func(ctx context.Context, block *model.Block, options *blockvalidation.ValidateBlockOptions) error {
+				assert.True(t, options.IsRevalidation)
 				return nil
 			},
 		}
 
 		s := &RPCServer{
-			logger:           logger,
-			blockchainClient: mockClient,
+			logger:                logger,
+			blockchainClient:      mockClient,
+			blockValidationClient: mockBlockValidationClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -4266,6 +4320,42 @@ func (m *mockBlockchainClient) GetFSMCurrentStateForE2ETestMode() blockchain.FSM
 	return blockchain.FSMStateType(0)
 }
 func (m *mockBlockchainClient) WaitUntilFSMTransitionFromIdleState(ctx context.Context) error {
+	return nil
+}
+
+// mockBlockValidationClient is a mock implementation of blockvalidation.Interface for testing
+type mockBlockValidationClient struct {
+	validateBlockFunc func(context.Context, *model.Block, *blockvalidation.ValidateBlockOptions) error
+	processBlockFunc  func(context.Context, *model.Block, uint32) error
+	blockFoundFunc    func(context.Context, *chainhash.Hash, string, bool) error
+	healthFunc        func(context.Context, bool) (int, string, error)
+}
+
+func (m *mockBlockValidationClient) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
+	if m.healthFunc != nil {
+		return m.healthFunc(ctx, checkLiveness)
+	}
+	return 200, "OK", nil
+}
+
+func (m *mockBlockValidationClient) BlockFound(ctx context.Context, blockHash *chainhash.Hash, baseURL string, waitToComplete bool) error {
+	if m.blockFoundFunc != nil {
+		return m.blockFoundFunc(ctx, blockHash, baseURL, waitToComplete)
+	}
+	return nil
+}
+
+func (m *mockBlockValidationClient) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, baseURL, peerID string) error {
+	if m.processBlockFunc != nil {
+		return m.processBlockFunc(ctx, block, blockHeight)
+	}
+	return nil
+}
+
+func (m *mockBlockValidationClient) ValidateBlock(ctx context.Context, block *model.Block, options *blockvalidation.ValidateBlockOptions) error {
+	if m.validateBlockFunc != nil {
+		return m.validateBlockFunc(ctx, block, options)
+	}
 	return nil
 }
 func (m *mockBlockchainClient) IsFullyReady(ctx context.Context) (bool, error) { return false, nil }

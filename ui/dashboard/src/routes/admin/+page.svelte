@@ -34,9 +34,9 @@
   let invalidBlocksError: string | null = null
   let lastInvalidBlocksRefresh: Date | null = null
 
-  // Reconsider block state
-  let reconsideringBlock = false
-  let reconsideringBlockHash = ''
+  // Re-validate block state
+  let revalidatingBlock = false
+  let revalidatingBlockHash = ''
 
   // Subscribe to the API base URL
   const unsubscribe = api.assetHTTPAddress.subscribe((value) => {
@@ -359,20 +359,20 @@
     }
   }
 
-  async function reconsiderBlock(hash: string) {
-    if (reconsideringBlock) return
+  async function revalidateBlock(hash: string) {
+    if (revalidatingBlock) return
 
-    reconsideringBlock = true
-    reconsideringBlockHash = hash
+    revalidatingBlock = true
+    revalidatingBlockHash = hash
 
     try {
-      console.log(`Reconsidering block hash: ${hash}`)
+      console.log(`Re-validating block hash: ${hash}`)
 
-      // Call the API to reconsider the block
+      // Call the API to re-validate the block
       const result = await api.revalidateBlock(hash)
 
       if (!result.ok) {
-        const errorMsg = result.error?.message || 'Failed to reconsider block'
+        const errorMsg = result.error?.message || 'Failed to re-validate block'
         const errorStatus = result.error?.status
 
         // Handle 404 errors specifically
@@ -392,7 +392,7 @@
       }
 
       success(
-        `Block reconsidered successfully: ${hash.substring(0, 8)}...${hash.substring(hash.length - 8)}`,
+        `Block re-validated successfully: ${hash.substring(0, 8)}...${hash.substring(hash.length - 8)}`,
       )
 
       // Refresh the invalid blocks list after a successful action
@@ -400,8 +400,8 @@
     } catch (error: unknown) {
       failure(`${getErrorMessage(error)}`)
     } finally {
-      reconsideringBlock = false
-      reconsideringBlockHash = ''
+      revalidatingBlock = false
+      revalidatingBlockHash = ''
     }
   }
 
@@ -759,16 +759,16 @@
                       </td>
                       <td class="actions-cell">
                         <button
-                          class="reconsider-button"
-                          on:click={() => reconsiderBlock(block.hash)}
-                          disabled={reconsideringBlock}
+                          class="revalidate-button"
+                          on:click={() => revalidateBlock(block.hash)}
+                          disabled={revalidatingBlock}
                         >
-                          {#if reconsideringBlock && reconsideringBlockHash === block.hash}
+                          {#if revalidatingBlock && revalidatingBlockHash === block.hash}
                             <div class="button-spinner"></div>
-                            <span>Reconsidering...</span>
+                            <span>Re-validating...</span>
                           {:else}
                             <i class="fas fa-sync-alt"></i>
-                            <span>Reconsider</span>
+                            <span>Re-validate</span>
                           {/if}
                         </button>
                       </td>
@@ -1430,7 +1430,7 @@
     font-weight: bold;
   }
 
-  .reconsider-button {
+  .revalidate-button {
     background-color: #3b82f6;
     color: white;
     border: none;
@@ -1444,11 +1444,11 @@
     gap: 0.5rem;
   }
 
-  .reconsider-button:hover {
+  .revalidate-button:hover {
     background-color: #2563eb;
   }
 
-  .reconsider-button:disabled {
+  .revalidate-button:disabled {
     background-color: #6b7280;
     cursor: not-allowed;
   }

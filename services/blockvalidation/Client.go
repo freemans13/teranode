@@ -177,9 +177,10 @@ func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeig
 // Parameters:
 //   - ctx: Context for the validation operation
 //   - block: Complete block data to validate including header and transactions
+//   - options: Optional validation options to control behavior (e.g., revalidation)
 //
 // Returns an error if block validation fails or service communication errors occur
-func (s *Client) ValidateBlock(ctx context.Context, block *model.Block) error {
+func (s *Client) ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error {
 	blockBytes, err := block.Bytes()
 	if err != nil {
 		return err
@@ -188,6 +189,11 @@ func (s *Client) ValidateBlock(ctx context.Context, block *model.Block) error {
 	req := &blockvalidation_api.ValidateBlockRequest{
 		Block:  blockBytes,
 		Height: block.Height,
+	}
+
+	// Add revalidation flag if options are provided
+	if options != nil && options.IsRevalidation {
+		req.IsRevalidation = true
 	}
 
 	_, err = s.apiClient.ValidateBlock(ctx, req)

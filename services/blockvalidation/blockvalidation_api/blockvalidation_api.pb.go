@@ -260,11 +260,12 @@ func (x *ProcessBlockRequest) GetPeerId() string {
 
 // swagger:model ValidateBlockRequest
 type ValidateBlockRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Block         []byte                 `protobuf:"bytes,1,opt,name=block,proto3" json:"block,omitempty"`
-	Height        uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Block          []byte                 `protobuf:"bytes,1,opt,name=block,proto3" json:"block,omitempty"`
+	Height         uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
+	IsRevalidation bool                   `protobuf:"varint,3,opt,name=is_revalidation,json=isRevalidation,proto3" json:"is_revalidation,omitempty"` // Indicates this is a revalidation of an invalid block
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ValidateBlockRequest) Reset() {
@@ -309,6 +310,13 @@ func (x *ValidateBlockRequest) GetHeight() uint32 {
 		return x.Height
 	}
 	return 0
+}
+
+func (x *ValidateBlockRequest) GetIsRevalidation() bool {
+	if x != nil {
+		return x.IsRevalidation
+	}
+	return false
 }
 
 // swagger:model ValidateBlockResponse
@@ -383,10 +391,11 @@ const file_services_blockvalidation_blockvalidation_api_blockvalidation_api_prot
 	"\x05block\x18\x01 \x01(\fR\x05block\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\x12\x19\n" +
 	"\bbase_url\x18\x03 \x01(\tR\abaseUrl\x12\x17\n" +
-	"\apeer_id\x18\x04 \x01(\tR\x06peerId\"D\n" +
+	"\apeer_id\x18\x04 \x01(\tR\x06peerId\"m\n" +
 	"\x14ValidateBlockRequest\x12\x14\n" +
 	"\x05block\x18\x01 \x01(\fR\x05block\x12\x16\n" +
-	"\x06height\x18\x02 \x01(\rR\x06height\"A\n" +
+	"\x06height\x18\x02 \x01(\rR\x06height\x12'\n" +
+	"\x0fis_revalidation\x18\x03 \x01(\bR\x0eisRevalidation\"A\n" +
 	"\x15ValidateBlockResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage2\x90\x03\n" +

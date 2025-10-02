@@ -77,8 +77,8 @@ func (m *mockBlockValidationInterface) ProcessBlock(ctx context.Context, block *
 	return args.Error(0)
 }
 
-func (m *mockBlockValidationInterface) ValidateBlock(ctx context.Context, block *model.Block) error {
-	args := m.Called(ctx, block)
+func (m *mockBlockValidationInterface) ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error {
+	args := m.Called(ctx, block, options)
 	return args.Error(0)
 }
 

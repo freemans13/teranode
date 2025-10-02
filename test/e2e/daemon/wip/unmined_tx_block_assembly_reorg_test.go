@@ -146,7 +146,7 @@ func testUnminedTransactionInBlockAssemblyAfterReorg(t *testing.T, utxoStore str
 	err = td.BlockValidationClient.ProcessBlock(td.Ctx, block3A, block3A.Height, "legacy", "")
 	require.NoError(t, err, "Failed to process block3A")
 
-	err = td.BlockValidationClient.ValidateBlock(td.Ctx, block3A)
+	err = td.BlockValidationClient.ValidateBlock(td.Ctx, block3A, nil)
 	require.NoError(t, err, "Failed to validate block3A")
 
 	// Wait for block3A to be at the right height
@@ -167,7 +167,7 @@ func testUnminedTransactionInBlockAssemblyAfterReorg(t *testing.T, utxoStore str
 	err = td.BlockValidationClient.ProcessBlock(td.Ctx, block3B, block3B.Height, "legacy", "")
 	require.NoError(t, err, "Failed to process block3B")
 
-	err = td.BlockValidationClient.ValidateBlock(td.Ctx, block3B)
+	err = td.BlockValidationClient.ValidateBlock(td.Ctx, block3B, nil)
 	require.NoError(t, err, "Failed to validate block3B")
 
 	// Create a block block4B on block3B to make chainB longer
@@ -180,7 +180,7 @@ func testUnminedTransactionInBlockAssemblyAfterReorg(t *testing.T, utxoStore str
 	err = td.BlockValidationClient.ProcessBlock(td.Ctx, block4B, block4B.Height, "legacy", "")
 	require.NoError(t, err, "Failed to process block4B")
 
-	err = td.BlockValidationClient.ValidateBlock(td.Ctx, block4B)
+	err = td.BlockValidationClient.ValidateBlock(td.Ctx, block4B, nil)
 	require.NoError(t, err, "Failed to validate block4B")
 
 	// Wait for the reorg to complete

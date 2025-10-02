@@ -61,6 +61,7 @@ import (
 	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bitcoin-sv/teranode/services/blockassembly"
 	"github.com/bitcoin-sv/teranode/services/blockchain"
+	"github.com/bitcoin-sv/teranode/services/blockvalidation"
 	"github.com/bitcoin-sv/teranode/services/legacy/peer"
 	"github.com/bitcoin-sv/teranode/services/p2p"
 	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
@@ -656,6 +657,10 @@ type RPCServer struct {
 	// blockchainClient provides access to blockchain data and operations
 	// Used for retrieving block information, chain state, and blockchain operations
 	blockchainClient blockchain.ClientI
+
+	// blockValidationClient provides access to block validation services
+	// Used for validating blocks and triggering revalidation of invalid blocks
+	blockValidationClient blockvalidation.Interface
 
 	// blockAssemblyClient provides access to block assembly and mining services
 	// Used for mining-related RPC commands like getminingcandidate and generate
@@ -1367,7 +1372,7 @@ func (s *RPCServer) Start(ctx context.Context, readyCh chan<- struct{}) error {
 // Returns:
 //   - *RPCServer: Configured server instance ready for initialization
 //   - error: Any error encountered during configuration
-func NewServer(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, utxoStore utxo.Store, blockAssemblyClient blockassembly.ClientI, peerClient peer.ClientI, p2pClient p2p.ClientI) (*RPCServer, error) {
+func NewServer(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, blockValidationClient blockvalidation.Interface, utxoStore utxo.Store, blockAssemblyClient blockassembly.ClientI, peerClient peer.ClientI, p2pClient p2p.ClientI) (*RPCServer, error) {
 	initPrometheusMetrics()
 
 	assetHTTPAddress := tSettings.Asset.HTTPAddress
@@ -1387,6 +1392,7 @@ func NewServer(logger ulogger.Logger, tSettings *settings.Settings, blockchainCl
 		settings:               tSettings,
 		quit:                   make(chan int),
 		blockchainClient:       blockchainClient,
+		blockValidationClient:  blockValidationClient,
 		assetHTTPURL:           parsedURL,
 		helpCacher:             newHelpCacher(),
 		utxoStore:              utxoStore,

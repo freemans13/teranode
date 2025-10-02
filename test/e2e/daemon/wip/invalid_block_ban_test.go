@@ -70,8 +70,9 @@ func TestInvalidBlockBanScore(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	err = node1.BlockValidation.ValidateBlock(node1.Ctx, invalidBlock, "invalid_block", nil)
-	require.NoError(t, err, "Block with duplicate tx should be rejected")
+	// Submit the invalid block to node1
+	err = node1.BlockValidationClient.ValidateBlock(node1.Ctx, invalidBlock, nil)
+	require.Error(t, err, "Block with duplicate tx should be rejected")
 
 	bestHeight, _, err := node1.BlockchainClient.GetBestHeightAndTime(node1.Ctx)
 	require.NoError(t, err)

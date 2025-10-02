@@ -360,7 +360,7 @@ func TestClient_ValidateBlock(t *testing.T) {
 			return req.Height == 100 && len(req.Block) > 0
 		}), mock.Anything).Return(&blockvalidation_api.ValidateBlockResponse{}, nil)
 
-		err := client.ValidateBlock(ctx, block)
+		err := client.ValidateBlock(ctx, block, nil)
 		assert.NoError(t, err)
 		mockClient.AssertExpectations(t)
 	})
@@ -370,7 +370,7 @@ func TestClient_ValidateBlock(t *testing.T) {
 		mockClient.On("ValidateBlock", ctx, mock.Anything, mock.Anything).Return(
 			nil, status.Error(codes.InvalidArgument, "validation error"))
 
-		err := client.ValidateBlock(ctx, block)
+		err := client.ValidateBlock(ctx, block, nil)
 		assert.Error(t, err)
 		mockClient.AssertExpectations(t)
 	})
@@ -384,7 +384,7 @@ func TestClient_ValidateBlock(t *testing.T) {
 			Header: nil, // This should cause serialization to fail
 		}
 
-		err := client.ValidateBlock(ctx, invalidBlock)
+		err := client.ValidateBlock(ctx, invalidBlock, nil)
 		assert.Error(t, err)
 		mockClient.AssertExpectations(t)
 	})

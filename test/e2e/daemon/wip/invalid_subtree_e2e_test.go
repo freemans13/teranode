@@ -78,7 +78,7 @@ func TestInvalidSubtree_BanScoreConfiguration(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Node1 should reject the invalid block
-	err = node1.BlockValidationClient.ValidateBlock(node1.Ctx, invalidBlock)
+	err = node1.BlockValidationClient.ValidateBlock(node1.Ctx, invalidBlock, nil)
 	require.Error(t, err, "Block with duplicate tx should be rejected")
 
 	// Wait for ban score to be updated

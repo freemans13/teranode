@@ -66,6 +66,10 @@ type ValidateBlockOptions struct {
 	// DisableOptimisticMining overrides the global optimistic mining setting.
 	// This is typically set to true during catchup for better performance.
 	DisableOptimisticMining bool
+
+	// IsRevalidation indicates this is a revalidation of an invalid block.
+	// When true, skips existence check and clears invalid flag after successful validation.
+	IsRevalidation bool
 }
 
 // validationResult holds the result of a block validation for sharing between goroutines
@@ -996,11 +1000,32 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 	// Use helper to ensure block is validated only once
 	blockHash := block.Hash()
 	return u.runOncePerBlock(blockHash, func() error {
-		// first check if the block already exists in the blockchain
-		blockExists, err := u.GetBlockExists(ctx, block.Header.Hash())
-		if err == nil && blockExists {
-			u.logger.Warnf("[ValidateBlock][%s] tried to validate existing block", block.Header.Hash().String())
-			return nil
+		var err error
+
+		// Check if block already exists to prevent duplicate validation (unless revalidating)
+		if !opts.IsRevalidation {
+			blockExists, err := u.GetBlockExists(ctx, block.Header.Hash())
+			if err != nil {
+				// If there's an error checking existence, proceed with validation
+				u.logger.Warnf("[ValidateBlock][%s] error checking block existence: %v, proceeding with validation", block.Header.Hash().String(), err)
+			} else if blockExists {
+				u.logger.Warnf("[ValidateBlock][%s] tried to validate existing block", block.Header.Hash().String())
+				return nil
+			}
+		} else {
+			// If this is a revalidation, verify the block is actually marked as invalid
+			_, blockMeta, err := u.blockchainClient.GetBlockHeader(ctx, block.Header.Hash())
+			if err != nil {
+				u.logger.Warnf("[ValidateBlock][%s] revalidation requested but couldn't get block metadata: %v", block.Header.Hash().String(), err)
+				return errors.NewServiceError("[ValidateBlock][%s] failed to get block metadata for revalidation", block.Header.Hash().String(), err)
+			}
+
+			if !blockMeta.Invalid {
+				u.logger.Warnf("[ValidateBlock][%s] revalidation requested but block is not marked as invalid", block.Header.Hash().String())
+				return errors.NewProcessingError("[ValidateBlock][%s] cannot revalidate block that is not marked as invalid", block.Header.Hash().String())
+			}
+
+			u.logger.Infof("[ValidateBlock][%s] revalidating invalid block", block.Header.Hash().String())
 		}
 
 		// check the size of the block
@@ -1278,11 +1303,21 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				}
 			}
 
-			// if valid, store the block
+			// if valid, store the block (or update it if revalidating)
 			u.logger.Infof("[ValidateBlock][%s] adding block to blockchain", block.Hash().String())
 
-			if err = u.blockchainClient.AddBlock(ctx, block, baseURL); err != nil {
-				return errors.NewServiceError("[ValidateBlock][%s] failed to store block", block.Hash().String(), err)
+			if opts.IsRevalidation {
+				// For reconsidered blocks, we need to clear the invalid flag
+				// The block data already exists, so we just update its status
+				u.logger.Infof("[ValidateBlock][%s] clearing invalid flag for successfully revalidated block", block.Hash().String())
+				if err = u.blockchainClient.RevalidateBlock(ctx, block.Header.Hash()); err != nil {
+					return errors.NewServiceError("[ValidateBlock][%s] failed to clear invalid flag after successful revalidation", block.Hash().String(), err)
+				}
+			} else {
+				// Normal case - add new block
+				if err = u.blockchainClient.AddBlock(ctx, block, baseURL); err != nil {
+					return errors.NewServiceError("[ValidateBlock][%s] failed to store block", block.Hash().String(), err)
+				}
 			}
 
 			if err = u.SetBlockExists(block.Header.Hash()); err != nil {

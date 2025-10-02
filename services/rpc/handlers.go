@@ -42,6 +42,7 @@ import (
 	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bitcoin-sv/teranode/services/blockvalidation"
 	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bitcoin-sv/teranode/services/legacy/peer_api"
 	"github.com/bitcoin-sv/teranode/services/legacy/txscript"
@@ -1633,11 +1634,44 @@ func handleReconsiderBlock(ctx context.Context, s *RPCServer, cmd interface{}, _
 		return nil, rpcDecodeHexError(c.BlockHash)
 	}
 
-	// Load the raw block bytes from the database.
-	err = s.blockchainClient.RevalidateBlock(ctx, ch)
+	// Get the block data from blockchain store to revalidate it
+	block, err := s.blockchainClient.GetBlock(ctx, ch)
 	if err != nil {
-		return nil, err
+		s.logger.Errorf("[handleReconsiderBlock] failed to get block %s: %v", ch, err)
+		return nil, &bsvjson.RPCError{
+			Code:    bsvjson.ErrRPCBlockNotFound,
+			Message: "Block not found",
+		}
 	}
+
+	// Submit the block to block validation service for full revalidation
+	// This will ensure all consensus rules are checked, including difficulty
+	s.logger.Infof("[handleReconsiderBlock] submitting block %s for revalidation", ch)
+
+	if s.blockValidationClient == nil {
+		s.logger.Errorf("[handleReconsiderBlock] block validation client not available")
+		return nil, &bsvjson.RPCError{
+			Code:    bsvjson.ErrRPCInternal.Code,
+			Message: "Block validation service not available",
+		}
+	}
+
+	// ValidateBlock will check if the block is marked as invalid and proceed with full validation
+	// If validation succeeds, it will call blockchain.RevalidateBlock to clear the invalid flag
+	// Pass IsRevalidation flag to indicate this is a reconsideration of an invalid block
+	options := &blockvalidation.ValidateBlockOptions{
+		IsRevalidation: true,
+	}
+	err = s.blockValidationClient.ValidateBlock(ctx, block, options)
+	if err != nil {
+		s.logger.Errorf("[handleReconsiderBlock] block validation failed for %s: %v", ch, err)
+		return nil, &bsvjson.RPCError{
+			Code:    bsvjson.ErrRPCVerify,
+			Message: "Block failed validation: " + err.Error(),
+		}
+	}
+
+	s.logger.Infof("[handleReconsiderBlock] block %s successfully reconsidered and validated", ch)
 
 	return nil, nil
 }
