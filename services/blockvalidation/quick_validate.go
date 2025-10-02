@@ -273,8 +273,6 @@ func (u *BlockValidation) getBlockTransactions(ctx context.Context, block *model
 				return errors.NewProcessingError("[getBlockTransactions][%s] failed to deserialize subtree %s", block.Hash().String(), subtreeHash.String(), err)
 			}
 
-			block.SubtreeSlices[subtreeIdx] = subtree
-
 			// get the subtree data from disk
 			subtreeDataReader, err := u.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 			if err != nil {
@@ -361,6 +359,8 @@ func (u *BlockValidation) getBlockTransactions(ctx context.Context, block *model
 					}
 				}
 
+				block.SubtreeSlices[subtreeIdx] = fullSubtree
+
 				fullSubtreeBytes, err := fullSubtree.Serialize()
 				if err != nil {
 					return errors.NewProcessingError("[getBlockTransactions][%s] failed to serialize full subtree %s", block.Hash().String(), subtreeHash.String(), err)
@@ -376,6 +376,19 @@ func (u *BlockValidation) getBlockTransactions(ctx context.Context, block *model
 					return errors.NewProcessingError("[getBlockTransactions][%s] failed to store full subtree %s", block.Hash().String(), subtreeHash.String(), err)
 				}
 			} else {
+				// get the full subtree and set it on the block for validation later
+				fullSubtreeBytes, err := u.subtreeStore.Get(gCtx, subtreeHash[:], fileformat.FileTypeSubtree)
+				if err != nil {
+					return errors.NewNotFoundError("[getBlockTransactions][%s] failed to get full subtree %s", block.Hash().String(), subtreeHash.String(), err)
+				}
+
+				fullSubtree, err := subtreepkg.NewSubtreeFromBytes(fullSubtreeBytes)
+				if err != nil {
+					return errors.NewProcessingError("[getBlockTransactions][%s] failed to deserialize full subtree %s", block.Hash().String(), subtreeHash.String(), err)
+				}
+
+				block.SubtreeSlices[subtreeIdx] = fullSubtree
+
 				// make sure the subtree is not marked for deletion
 				if err = u.subtreeStore.SetDAH(gCtx, subtreeHash[:], fileformat.FileTypeSubtree, 0); err != nil {
 					return errors.NewProcessingError("[getBlockTransactions][%s] failed to unset DAH for full subtree %s", block.Hash().String(), subtreeHash.String(), err)
