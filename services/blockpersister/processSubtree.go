@@ -36,13 +36,14 @@ import (
 //   - pCtx: Parent context for the operation, used for cancellation and tracing
 //   - subtreeHash: Hash identifier of the subtree to process
 //   - coinbaseTx: The coinbase transaction for the block containing this subtree
+//   - utxoDiff: UTXO set difference tracker to record all changes resulting from processing
 //
 // Returns an error if any part of the subtree processing fails. Errors are wrapped with
 // appropriate context to identify the specific failure point (storage, processing, etc.).
 //
 // Note: Processing is not atomic across multiple subtrees - each subtree is processed individually,
 // allowing partial block processing to succeed even if some subtrees fail.
-func (u *Server) ProcessSubtree(pCtx context.Context, subtreeHash chainhash.Hash, coinbaseTx *bt.Tx) error {
+func (u *Server) ProcessSubtree(pCtx context.Context, subtreeHash chainhash.Hash, coinbaseTx *bt.Tx, utxoDiff *utxopersister.UTXOSet) error {
 	ctx, _, deferFn := tracing.Tracer("blockpersister").Start(pCtx, "ProcessSubtree",
 		tracing.WithHistogram(prometheusBlockPersisterValidateSubtree),
 		tracing.WithDebugLogMessage(u.logger, "[ProcessSubtree] called for subtree %s", subtreeHash.String()),
@@ -50,50 +51,69 @@ func (u *Server) ProcessSubtree(pCtx context.Context, subtreeHash chainhash.Hash
 	defer deferFn()
 
 	// check whether the subtreeData already exists in the store
-	// If it does, then persist the file
 	subtreeDataExists, err := u.subtreeStore.Exists(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData)
 	if err != nil {
 		return errors.NewStorageError("[BlockPersister] error checking if subtree data exists for %s", subtreeHash.String(), err)
 	}
 
+	var subtreeData *subtreepkg.SubtreeData
+
 	if subtreeDataExists {
-		u.logger.Debugf("[BlockPersister] Subtree data for %s already exists, skipping processing, but persisting", subtreeHash.String())
+		// Subtree data already exists, load it to process UTXOs
+		u.logger.Debugf("[BlockPersister] Subtree data for %s already exists, loading for UTXO processing", subtreeHash.String())
+
+		subtreeData, err = u.readSubtreeData(ctx, subtreeHash)
+		if err != nil {
+			return err
+		}
+
+		// Update DAH (Delete-At-Height) to persist the file
 		err = u.subtreeStore.SetDAH(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, 0)
 		if err != nil {
 			return errors.NewStorageError("[BlockPersister] error setting subtree data DAH for %s", subtreeHash.String(), err)
 		}
+	} else {
+		// Subtree data doesn't exist, create it
+		u.logger.Debugf("[BlockPersister] Subtree data for %s does not exist, creating", subtreeHash.String())
 
-		// no more processing needed, just return
-		return nil
-	}
+		// 1. get the subtree from the subtree store
+		subtree, err := u.readSubtree(ctx, subtreeHash)
+		if err != nil {
+			return err
+		}
 
-	// 1. get the subtree from the subtree store
-	subtree, err := u.readSubtree(ctx, subtreeHash)
-	if err != nil {
-		return err
-	}
+		subtreeData = subtreepkg.NewSubtreeData(subtree)
+		if subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			if err = subtreeData.AddTx(coinbaseTx, 0); err != nil {
+				return errors.NewProcessingError("[BlockPersister] error adding coinbase tx to subtree data", err)
+			}
+		}
 
-	subtreeData := subtreepkg.NewSubtreeData(subtree)
-	if subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-		if err = subtreeData.AddTx(coinbaseTx, 0); err != nil {
-			return errors.NewProcessingError("[BlockPersister] error adding coinbase tx to subtree data", err)
+		// 2. ...then attempt to load the txMeta from the store (i.e - aerospike in production)
+		if err = u.processTxMetaUsingStore(ctx, subtree, subtreeData); err != nil {
+			return errors.NewServiceError("[ValidateSubtreeInternal][%s] failed to get tx meta from store", subtreeHash.String(), err)
+		}
+
+		// add support for writing the subtree data from a reader
+		subtreeDataBytes, err := subtreeData.Serialize()
+		if err != nil {
+			return errors.NewProcessingError("[BlockPersister] error serializing subtree data for %s", subtreeHash.String(), err)
+		}
+
+		err = u.subtreeStore.Set(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, subtreeDataBytes)
+		if err != nil {
+			return errors.NewStorageError("[BlockPersister] error storing subtree data for %s", subtreeHash.String(), err)
 		}
 	}
 
-	// 2. ...then attempt to load the txMeta from the store (i.e - aerospike in production)
-	if err = u.processTxMetaUsingStore(ctx, subtree, subtreeData); err != nil {
-		return errors.NewServiceError("[ValidateSubtreeInternal][%s] failed to get tx meta from store", subtreeHash.String(), err)
-	}
-
-	// add support for writing the subtree data from a reader
-	subtreeDataBytes, err := subtreeData.Serialize()
-	if err != nil {
-		return errors.NewProcessingError("[BlockPersister] error serializing subtree data for %s", subtreeHash.String(), err)
-	}
-
-	err = u.subtreeStore.Set(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, subtreeDataBytes)
-	if err != nil {
-		return errors.NewStorageError("[BlockPersister] error storing subtree data for %s", subtreeHash.String(), err)
+	// 3. Process all transactions through UTXO diff to track additions and deletions
+	// This always happens regardless of whether subtreeData already existed
+	for _, tx := range subtreeData.Txs {
+		if tx != nil {
+			if err := utxoDiff.ProcessTx(tx); err != nil {
+				return errors.NewProcessingError("error processing tx for UTXO", err)
+			}
+		}
 	}
 
 	return nil

@@ -296,7 +296,7 @@ func (d *Stores) GetBlockStore(ctx context.Context, logger ulogger.Logger, appSe
 
 	var err error
 
-	hashPrefix := 2
+	hashPrefix := -2
 	if blockStoreURL.Query().Get("hashPrefix") != "" {
 		hashPrefix, err = strconv.Atoi(blockStoreURL.Query().Get("hashPrefix"))
 		if err != nil {

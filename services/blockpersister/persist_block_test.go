@@ -238,6 +238,17 @@ func TestBlock(t *testing.T) {
 	subtreeData, err := subtreepkg.NewSubtreeDataFromBytes(subtree, subtreeDataBytes)
 	require.NoError(t, err)
 	assert.Len(t, subtreeData.Txs, 4)
+
+	// Verify UTXO additions file exists and contains data
+	blockHash := block.Header.Hash()
+	utxoAdditionsBytes, err := blockStore.Get(t.Context(), blockHash[:], fileformat.FileTypeUtxoAdditions)
+	require.NoError(t, err)
+	assert.Greater(t, len(utxoAdditionsBytes), 36, "UTXO additions file should contain header (32 byte hash + 4 byte height) and data")
+
+	// Verify UTXO deletions file exists and contains data
+	utxoDeletionsBytes, err := blockStore.Get(t.Context(), blockHash[:], fileformat.FileTypeUtxoDeletions)
+	require.NoError(t, err)
+	assert.Greater(t, len(utxoDeletionsBytes), 36, "UTXO deletions file should contain header (32 byte hash + 4 byte height) and data")
 }
 
 func TestFileStorer(t *testing.T) {
