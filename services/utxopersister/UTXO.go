@@ -42,6 +42,22 @@ type UTXOWrapper struct {
 
 	// UTXOs contains the unspent transaction outputs
 	UTXOs []*UTXO
+
+	// UTXOTotalValue is the total value of all UTXOs in this wrapper
+	// This field is not serialized but can be used for quick access to the total value
+	// without needing to sum the individual UTXOs each time.
+	UTXOTotalValue uint64
+
+	// UTXOCount is the number of UTXOs in this wrapper
+	// This field is not serialized but can be used for quick access to the count
+	// without needing to compute len(UTXOs) each time.
+	UTXOCount int
+
+	// Reusable buffer for reading fixed-size fields
+	// not concurrently accessed
+	b8             [8]byte
+	b16            [16]byte
+	reusableScript []byte
 }
 
 // UTXO represents an Unspent Transaction Output.
@@ -171,40 +187,79 @@ func (uw *UTXOWrapper) DeletionBytes(index uint32) [36]byte {
 func NewUTXOWrapperFromReader(ctx context.Context, r io.Reader) (*UTXOWrapper, error) {
 	uw := &UTXOWrapper{}
 
+	if err := uw.FromReader(ctx, r); err != nil {
+		if err == io.EOF && uw.TxID.IsEqual(&chainhash.Hash{}) {
+			// EOF marker encountered - return empty wrapper with EOF error
+			return nil, io.EOF
+		}
+
+		return nil, err
+	}
+
+	return uw, nil
+}
+
+func (uw *UTXOWrapper) FromReader(ctx context.Context, r io.Reader, readUtxos ...bool) error {
+	useReadUtxos := true
+	if len(readUtxos) > 0 {
+		useReadUtxos = readUtxos[0]
+	}
+
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ctx.Err()
 	default:
 		n, err := io.ReadFull(r, uw.TxID[:])
 		if err != nil {
 			if err == io.EOF {
-				return nil, io.EOF
+				return io.EOF
 			}
 
-			return nil, errors.NewStorageError("failed to read txid, expected 32 bytes got %d", n, err)
+			return errors.NewStorageError("failed to read txid, expected 32 bytes got %d", n, err)
 		}
 
 		// Read the encoded height/coinbase + number of UTXOs
-		var b [8]byte
-		if n, err := io.ReadFull(r, b[:]); err != nil || n != 8 {
-			return nil, errors.NewStorageError("failed to read height and number of utxos, expected 8 bytes got %d", n, err)
+		if n, err = io.ReadFull(r, uw.b8[:]); err != nil || n != 8 {
+			return errors.NewStorageError("failed to read height and number of utxos, expected 8 bytes got %d", n, err)
 		}
 
-		encodedHeight := uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-		numUTXOs := uint32(b[4]) | uint32(b[5])<<8 | uint32(b[6])<<16 | uint32(b[7])<<24
+		encodedHeight := uint32(uw.b8[0]) | uint32(uw.b8[1])<<8 | uint32(uw.b8[2])<<16 | uint32(uw.b8[3])<<24
+		numUTXOs := uint32(uw.b8[4]) | uint32(uw.b8[5])<<8 | uint32(uw.b8[6])<<16 | uint32(uw.b8[7])<<24
 
 		uw.Height = encodedHeight >> 1
 		uw.Coinbase = (encodedHeight & 1) == 1
-		uw.UTXOs = make([]*UTXO, numUTXOs)
 
-		for i := uint32(0); i < numUTXOs; i++ {
-			if uw.UTXOs[i], err = NewUTXOFromReader(r); err != nil {
-				return nil, err
+		if useReadUtxos {
+			uw.UTXOs = make([]*UTXO, numUTXOs)
+
+			for i := uint32(0); i < numUTXOs; i++ {
+				uw.UTXOs[i] = &UTXO{}
+				if err = uw.NewUTXOFromReader(r, uw.UTXOs[i]); err != nil {
+					return err
+				}
+			}
+		} else {
+			var (
+				utxoValue uint64
+			)
+
+			// we don't need to read the UTXOs, just sum the totals
+			// so we use the reusable utxo variable to avoid allocations
+			uw.UTXOTotalValue = 0
+			uw.UTXOCount = 0
+
+			for i := uint32(0); i < numUTXOs; i++ {
+				if utxoValue, err = uw.NewUTXOValueFromReader(r); err != nil {
+					return err
+				}
+
+				uw.UTXOTotalValue += utxoValue
+				uw.UTXOCount++
 			}
 		}
 	}
 
-	return uw, nil
+	return nil
 }
 
 // NewUTXOWrapperFromBytes creates a new UTXOWrapper from the provided bytes.
@@ -265,9 +320,9 @@ func (uw *UTXOWrapper) String() string {
 //
 // Parameters:
 // - r: io.Reader from which to read the serialized UTXO data
+// - *UTXO: Pointer to the UTXO struct to populate with deserialized data
 //
 // Returns:
-// - *UTXO: Deserialized UTXO instance
 // - error: Any error encountered during deserialization
 //
 // The deserialization format is as follows:
@@ -278,30 +333,51 @@ func (uw *UTXOWrapper) String() string {
 //
 // This method implements the inverse of the UTXO.Bytes() serialization method.
 // All integers are decoded using little-endian byte order.
-func NewUTXOFromReader(r io.Reader) (*UTXO, error) {
-	// Read all the fixed size fields
-	var b [16]byte // index + value + length of script
-
-	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return nil, err
+func (uw *UTXOWrapper) NewUTXOFromReader(r io.Reader, utxo *UTXO) error {
+	if _, err := io.ReadFull(r, uw.b16[:]); err != nil {
+		return err
 	}
 
-	u := &UTXO{
-		Index: uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24,
-		Value: uint64(b[4]) | uint64(b[5])<<8 | uint64(b[6])<<16 | uint64(b[7])<<24 | uint64(b[8])<<32 | uint64(b[9])<<40 | uint64(b[10])<<48 | uint64(b[11])<<56,
-	}
+	utxo.Index = uint32(uw.b16[0]) | uint32(uw.b16[1])<<8 | uint32(uw.b16[2])<<16 | uint32(uw.b16[3])<<24
+	utxo.Value = uint64(uw.b16[4]) | uint64(uw.b16[5])<<8 | uint64(uw.b16[6])<<16 | uint64(uw.b16[7])<<24 | uint64(uw.b16[8])<<32 | uint64(uw.b16[9])<<40 | uint64(uw.b16[10])<<48 | uint64(uw.b16[11])<<56
 
 	// Read the script length
-	l := uint32(b[12]) | uint32(b[13])<<8 | uint32(b[14])<<16 | uint32(b[15])<<24
+	l := uint32(uw.b16[12]) | uint32(uw.b16[13])<<8 | uint32(uw.b16[14])<<16 | uint32(uw.b16[15])<<24
 
 	// Read the script
-	u.Script = make([]byte, l)
+	utxo.Script = make([]byte, l)
 
-	if _, err := io.ReadFull(r, u.Script); err != nil {
-		return nil, err
+	if _, err := io.ReadFull(r, utxo.Script); err != nil {
+		return err
 	}
 
-	return u, nil
+	return nil
+}
+
+func (uw *UTXOWrapper) NewUTXOValueFromReader(r io.Reader) (uint64, error) {
+	if _, err := io.ReadFull(r, uw.b16[:]); err != nil {
+		return 0, err
+	}
+
+	value := uint64(uw.b16[4]) | uint64(uw.b16[5])<<8 | uint64(uw.b16[6])<<16 | uint64(uw.b16[7])<<24 | uint64(uw.b16[8])<<32 | uint64(uw.b16[9])<<40 | uint64(uw.b16[10])<<48 | uint64(uw.b16[11])<<56
+
+	// Read the script length
+	l := uint32(uw.b16[12]) | uint32(uw.b16[13])<<8 | uint32(uw.b16[14])<<16 | uint32(uw.b16[15])<<24
+
+	// Read the script into reusable buffer
+	var script []byte
+	if cap(uw.reusableScript) < int(l) {
+		script = make([]byte, l)
+		uw.reusableScript = script
+	} else {
+		script = uw.reusableScript[:l]
+	}
+
+	if _, err := io.ReadFull(r, script); err != nil {
+		return 0, err
+	}
+
+	return value, nil
 }
 
 // func NewUTXOFromBytes(b []byte) (*UTXO, error) {

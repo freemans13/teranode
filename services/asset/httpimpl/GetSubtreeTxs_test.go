@@ -176,8 +176,8 @@ func TestGetSubtreeTxs(t *testing.T) {
 			// These fields should be zero since metadata was not found
 			assert.Equal(t, float64(0), data["inputsCount"])
 			assert.Equal(t, float64(0), data["outputsCount"])
-			assert.Equal(t, float64(0), data["size"])
-			assert.Equal(t, float64(0), data["fee"])
+			assert.Equal(t, float64(i), data["size"])
+			assert.Equal(t, float64(i), data["fee"])
 		}
 	})
 

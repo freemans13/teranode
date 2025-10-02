@@ -17,6 +17,7 @@ import (
 	"github.com/bitcoin-sv/teranode/cmd/setfsmstate"
 	cmdSettings "github.com/bitcoin-sv/teranode/cmd/settings"
 	"github.com/bitcoin-sv/teranode/cmd/utxopersister"
+	"github.com/bitcoin-sv/teranode/cmd/utxovalidator"
 	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bitcoin-sv/teranode/settings"
 	"github.com/bitcoin-sv/teranode/stores/blockchain/sql"
@@ -37,6 +38,7 @@ var commandHelp = map[string]string{
 	"checkblocktemplate": "Check block template",
 	"checkblock":         "Check block - fetches a block and validates it using the block validation service",
 	"fix-chainwork":      "Fix incorrect chainwork values in blockchain database",
+	"validate-utxo-set":  "Validate UTXO set file",
 }
 
 var dangerousCommands = map[string]bool{}
@@ -318,6 +320,53 @@ func Start(args []string, version, commit string) {
 
 			return fixChainwork(*dbURL, *dryRun, *batchSize, uint32(*startHeight), uint32(*endHeight))
 		}
+	case "validate-utxo-set":
+		verbose := cmd.FlagSet.Bool("verbose", false, "verbose output showing individual UTXOs")
+
+		cmd.Execute = func(args []string) error {
+			if len(args) != 1 {
+				return errors.NewProcessingError("Usage: validate-utxo-set [--verbose] <utxo-set-file-path>")
+			}
+
+			utxoFilePath := args[0]
+
+			// Validate the UTXO file
+			result, err := utxovalidator.ValidateUTXOFile(context.Background(), utxoFilePath, logger, tSettings, *verbose)
+			if err != nil {
+				return errors.NewProcessingError("Failed to validate UTXO-set file", err)
+			}
+
+			// Print results
+			fmt.Printf("\n")
+			fmt.Printf("UTXO Set Validation Results:\n")
+			fmt.Printf("============================\n")
+			fmt.Printf("Block Height:      %d\n", result.BlockHeight)
+			fmt.Printf("Block Hash:        %s\n", result.BlockHash.String())
+			fmt.Printf("Previous Hash:     %s\n", result.PreviousHash.String())
+			fmt.Printf("UTXO Count:        %d\n", result.UTXOCount)
+			fmt.Printf("Actual Satoshis:   %s\n", formatSatoshis(result.ActualSatoshis))
+			fmt.Printf("Expected Satoshis: %s\n", formatSatoshis(result.ExpectedSatoshis))
+
+			if result.IsValid {
+				fmt.Printf("Status:            ✓ VALID - Satoshi amounts match\n")
+			} else {
+				fmt.Printf("Status:            ✗ INVALID - Satoshi mismatch!\n")
+				diff := int64(result.ActualSatoshis) - int64(result.ExpectedSatoshis)
+				if diff > 0 {
+					fmt.Printf("Difference:        +%s satoshis (excess)\n", formatSatoshis(uint64(diff)))
+				} else {
+					fmt.Printf("Difference:        -%s satoshis (deficit)\n", formatSatoshis(uint64(-diff)))
+				}
+			}
+			fmt.Printf("\n")
+
+			// Exit with non-zero code if validation failed
+			if !result.IsValid {
+				os.Exit(1)
+			}
+
+			return nil
+		}
 	default:
 		fmt.Printf("Unknown command: %s\n\n", command)
 		printUsage()
@@ -342,4 +391,39 @@ func Start(args []string, version, commit string) {
 		fmt.Printf("Error executing command: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// formatSatoshis formats a satoshi amount with thousand separators for better readability.
+func formatSatoshis(satoshis uint64) string {
+	str := fmt.Sprintf("%d", satoshis)
+
+	// Add thousand separators
+	n := len(str)
+	if n <= 3 {
+		return str
+	}
+
+	// Calculate how many commas we need
+	commas := (n - 1) / 3
+	result := make([]byte, n+commas)
+
+	// Fill from right to left
+	resultPos := len(result) - 1
+	strPos := n - 1
+	digitCount := 0
+
+	for strPos >= 0 {
+		if digitCount == 3 {
+			result[resultPos] = ','
+			resultPos--
+			digitCount = 0
+		}
+
+		result[resultPos] = str[strPos]
+		resultPos--
+		strPos--
+		digitCount++
+	}
+
+	return string(result)
 }
