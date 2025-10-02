@@ -993,8 +993,8 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 	var (
 		errorsFound      = atomic.Uint64{}
 		addedToOrphanage = atomic.Uint64{}
-		lastError        error
-		lastErrorMu      sync.Mutex
+		firstError       error
+		firstErrorOnce   sync.Once
 	)
 
 	for level := uint32(0); level <= maxLevel; level++ {
@@ -1019,11 +1019,9 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 					u.logger.Debugf("[validateSubtree][%s] failed to bless missing transaction: %s: %v", subtreeHash.String(), tx.TxIDChainHash().String(), err)
 					errorsFound.Add(1)
 
-					lastErrorMu.Lock()
-					lastError = errors.NewProcessingError("[validateSubtree][%s] failed to bless missing transaction: %s", subtreeHash.String(), tx.TxIDChainHash().String(), err)
-					lastErrorMu.Unlock()
-
-					// TODO handle storage and service errors differently
+					firstErrorOnce.Do(func() {
+						firstError = errors.NewProcessingError("[validateSubtree][%s] failed to bless missing transaction: %s", subtreeHash.String(), tx.TxIDChainHash().String(), err)
+					})
 
 					// Check if this is a truly invalid transaction (not just policy error)
 					if errors.Is(err, errors.ErrTxMissingParent) {
@@ -1061,9 +1059,9 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 						u.logger.Debugf("[validateSubtree][%s] tx meta already exists in txMetaSlice at index %d: %s", subtreeHash.String(), txIdx, tx.TxIDChainHash().String())
 						errorsFound.Add(1)
 
-						lastErrorMu.Lock()
-						lastError = errors.NewProcessingError("[validateSubtree][%s] tx meta already exists in txMetaSlice at index %d: %s", subtreeHash.String(), txIdx, tx.TxIDChainHash().String())
-						lastErrorMu.Unlock()
+						firstErrorOnce.Do(func() {
+							firstError = errors.NewProcessingError("[validateSubtree][%s] tx meta already exists in txMetaSlice at index %d: %s", subtreeHash.String(), txIdx, tx.TxIDChainHash().String())
+						})
 
 						return nil
 					}
@@ -1083,7 +1081,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 
 	if errorsFound.Load() > 0 {
 		// If there are errors found, we return here, so that the caller can handle it
-		return errors.NewProcessingError("[validateSubtree][%s] found %d errors while processing subtree, added %d to orphanage", subtreeHash.String(), errorsFound.Load(), addedToOrphanage.Load(), lastError)
+		return errors.NewProcessingError("[validateSubtree][%s] found %d errors while processing subtree, added %d to orphanage", subtreeHash.String(), errorsFound.Load(), addedToOrphanage.Load(), firstError)
 	}
 
 	if missingCount.Load() > 0 {
