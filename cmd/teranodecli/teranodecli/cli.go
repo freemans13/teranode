@@ -9,6 +9,7 @@ import (
 
 	"github.com/bitcoin-sv/teranode/cmd/aerospikereader"
 	"github.com/bitcoin-sv/teranode/cmd/bitcointoutxoset"
+	"github.com/bitcoin-sv/teranode/cmd/checkblock"
 	"github.com/bitcoin-sv/teranode/cmd/checkblocktemplate"
 	"github.com/bitcoin-sv/teranode/cmd/filereader"
 	"github.com/bitcoin-sv/teranode/cmd/getfsmstate"
@@ -34,6 +35,7 @@ var commandHelp = map[string]string{
 	"export-blocks":      "Export blockchain to CSV",
 	"import-blocks":      "Import blockchain from CSV",
 	"checkblocktemplate": "Check block template",
+	"checkblock":         "Check block - fetches a block and validates it using the block validation service",
 	"fix-chainwork":      "Fix incorrect chainwork values in blockchain database",
 }
 
@@ -288,6 +290,17 @@ func Start(args []string, version, commit string) {
 			}
 
 			fmt.Printf("Checked block template successfully: %s\n", blockTemplate.String())
+
+			return nil
+		}
+	case "checkblock":
+		cmd.Execute = func(args []string) error {
+			blockTemplate, err := checkblock.CheckBlock(logger, tSettings, args[0])
+			if err != nil {
+				return errors.NewProcessingError("Failed to check block", err)
+			}
+
+			fmt.Printf("Checked block successfully: %s\n", blockTemplate.String())
 
 			return nil
 		}
