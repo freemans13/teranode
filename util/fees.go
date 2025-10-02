@@ -1,6 +1,7 @@
 package util
 
 import (
+	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2"
 )
 
@@ -8,9 +9,9 @@ import (
 // For coinbase transactions, returns the sum of all output values.
 // For regular transactions, returns input_sum - output_sum.
 func GetFees(btTx *bt.Tx) (uint64, error) {
-	fees := uint64(0)
-
 	if btTx.IsCoinbase() {
+		fees := uint64(0)
+
 		// fmt.Printf("coinbase tx: %s\n", btTx.String())
 		for _, output := range btTx.Outputs {
 			if output.Satoshis > 0 {
@@ -31,15 +32,22 @@ func GetFees(btTx *bt.Tx) (uint64, error) {
 		return 0, nil
 	}
 
+	inputFees := uint64(0)
+	outputFees := uint64(0)
+
 	for _, input := range btTx.Inputs {
-		fees += input.PreviousTxSatoshis
+		inputFees += input.PreviousTxSatoshis
 	}
 
 	for _, output := range btTx.Outputs {
 		if output.Satoshis > 0 {
-			fees -= output.Satoshis
+			outputFees += output.Satoshis
 		}
 	}
 
-	return fees, nil
+	if inputFees < outputFees {
+		return 0, errors.NewProcessingError("input fees (%d) less than output fees (%d) for tx %s", inputFees, outputFees, btTx.TxID())
+	}
+
+	return inputFees - outputFees, nil
 }

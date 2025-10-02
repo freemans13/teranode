@@ -168,6 +168,8 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 				subtreeTx := SubtreeTx{
 					Index: i,
 					TxID:  node.Hash.String(),
+					Fee:   int(node.Fee),
+					Size:  int(node.SizeInBytes),
 				}
 
 				if subtreepkg.CoinbasePlaceholderHash.Equal(node.Hash) {
@@ -182,6 +184,12 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 						txMeta, err = util.TxMetaDataFromTx(subtreeData.Txs[i])
 						if err != nil {
 							h.logger.Warnf("[GetSubtreeTxs][%s] error getting transaction meta from subtreeData: %s", node.Hash.String(), err.Error())
+						}
+
+						// Ensure Fee and SizeInBytes are set from the subtree node, the subtreeData.Txs[i] may not be extended
+						if txMeta != nil {
+							txMeta.Fee = node.Fee
+							txMeta.SizeInBytes = node.SizeInBytes
 						}
 					}
 
@@ -198,6 +206,8 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 							}
 						}
 					}
+
+					h.logger.Debugf("[GetSubtreeTxs][%s] txMeta: %+v", node.Hash.String(), txMeta)
 
 					if txMeta == nil || txMeta.Tx == nil {
 						h.logger.Warnf("[GetSubtreeTxs][%s] txMeta is nil", node.Hash.String())

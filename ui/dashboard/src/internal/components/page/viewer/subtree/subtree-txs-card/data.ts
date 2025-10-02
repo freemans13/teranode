@@ -1,5 +1,5 @@
 import { DetailType, getHashLinkProps } from '$internal/utils/urls'
-import { formatSatoshi } from '$lib/utils/format'
+import { formatNum } from '$lib/utils/format'
 import { valueSet } from '$lib/utils/types'
 
 import LinkHashCopy from '$internal/components/item-renderers/link-hash-copy/index.svelte'
@@ -92,7 +92,7 @@ export const getRenderCells = (t, blockHash = '', coinbaseTxId = '') => {
       return {
         component: valueSet(item[colId]) ? RenderSpan : null,
         props: {
-          value: formatSatoshi(item[colId]) + ' BSV',
+          value: formatNum(item[colId]) + ' sats',
           className: 'num',
         },
         value: '',
