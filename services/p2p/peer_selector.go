@@ -94,6 +94,10 @@ func (ps *PeerSelector) SelectSyncPeer(peers []*PeerInfo, criteria SelectionCrit
 		if candidates[i].Height != candidates[j].Height {
 			return candidates[i].Height > candidates[j].Height
 		}
+		// Third priority: Sort by peer health duration (lower is better)
+		if candidates[i].HealthDuration != candidates[j].HealthDuration {
+			return candidates[i].HealthDuration < candidates[j].HealthDuration
+		}
 		// Third priority: Sort by peer ID for deterministic ordering
 		// This ensures consistent selection when peers have identical scores and heights
 		return candidates[i].ID < candidates[j].ID

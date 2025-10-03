@@ -461,6 +461,11 @@ func (u *Server) Init(ctx context.Context) (err error) {
 						}
 
 						u.logger.Errorf("[Init] failed to process catchup signal for block [%s], peer reputation: %.2f, malicious attempts: %d, [%v]", c.block.Hash().String(), reputationScore, maliciousAttempts, err)
+
+						// Report peer failure to blockchain service (which notifies P2P to switch peers)
+						if reportErr := u.blockchainClient.ReportPeerFailure(ctx, c.block.Hash(), c.peerID, "catchup", err.Error()); reportErr != nil {
+							u.logger.Errorf("[Init] failed to report peer failure: %v", reportErr)
+						}
 					}
 				}
 
@@ -490,9 +495,19 @@ func (u *Server) Init(ctx context.Context) (err error) {
 
 func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
 	return func(msg *kafka.KafkaMessage) error {
+		if msg == nil {
+			return nil
+		}
+
+		var kafkaMsg kafkamessage.KafkaBlockTopicMessage
+		if err := proto.Unmarshal(msg.Value, &kafkaMsg); err != nil {
+			u.logger.Errorf("Failed to unmarshal kafka message: %v", err)
+			return nil
+		}
+
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- u.blockHandler(msg)
+			errCh <- u.blockHandler(&kafkaMsg)
 		}()
 
 		select {
@@ -514,6 +529,12 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 			// kafka message should be committed, so return nil to mark message.
 			u.logger.Errorf("Unrecoverable error (%v) processing kafka message %v for handling block, marking Kafka message as completed.\n", msg, err)
 
+			// mark peer failure
+			blockHash, _ := chainhash.NewHashFromStr(kafkaMsg.Hash)
+			if err = u.blockchainClient.ReportPeerFailure(ctx, blockHash, kafkaMsg.GetPeerId(), "block", err.Error()); err != nil {
+				u.logger.Errorf("Failed to report peer failure: %v", err)
+			}
+
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -521,17 +542,7 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 	}
 }
 
-func (u *Server) blockHandler(msg *kafka.KafkaMessage) error {
-	if msg == nil {
-		return nil
-	}
-
-	var kafkaMsg kafkamessage.KafkaBlockTopicMessage
-	if err := proto.Unmarshal(msg.Value, &kafkaMsg); err != nil {
-		u.logger.Errorf("Failed to unmarshal kafka message: %v", err)
-		return err
-	}
-
+func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) error {
 	hash, err := chainhash.NewHashFromStr(kafkaMsg.Hash)
 	if err != nil {
 		u.logger.Errorf("Failed to parse block hash from message: %v", err)

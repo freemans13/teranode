@@ -459,6 +459,12 @@ func (m *Mock) CatchUpBlocks(ctx context.Context) error {
 	return args.Error(0)
 }
 
+// ReportPeerFailure mocks the ReportPeerFailure method
+func (m *Mock) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
+	args := m.Called(ctx, hash, peerID, failureType, reason)
+	return args.Error(0)
+}
+
 // LegacySync mocks the LegacySync method
 func (m *Mock) LegacySync(ctx context.Context) error {
 	args := m.Called(ctx)

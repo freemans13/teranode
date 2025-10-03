@@ -365,10 +365,7 @@ type UtxoStoreSettings struct {
 }
 
 type P2PSettings struct {
-	BestBlockTopic      string
-	BlockTopic          string
-	BootstrapAddresses  []string
-	BootstrapPersistent bool
+	BootstrapAddresses []string
 
 	GRPCAddress       string
 	GRPCListenAddress string
@@ -379,59 +376,28 @@ type P2PSettings struct {
 	ListenAddresses    []string
 	AdvertiseAddresses []string
 	ListenMode         string // "full" (default) or "listen_only"
-	MiningOnTopic      string
 
 	PeerID string
 	Port   int
 
-	PrivateKey      string
+	PrivateKey string
+
+	BlockTopic      string
+	NodeStatusTopic string // pubsub topic for node status messages
 	RejectedTxTopic string
+	SubtreeTopic    string
 
-	SharedKey   string
 	StaticPeers []string
-
-	SubtreeTopic          string
-	HandshakeTopic        string // new pubsub topic for version/verack handshake
-	HandshakeTopicSize    int
-	HandshakeTopicTimeout time.Duration
-	NodeStatusTopic       string // pubsub topic for node status messages
-
-	DHTProtocolID   string
-	DHTUsePrivate   bool
-	OptimiseRetries bool
-
-	// libp2p feature toggles
-	EnableNATService   bool
-	EnableHolePunching bool
-	EnableRelay        bool
-	EnableNATPortMap   bool
-
-	// Enhanced NAT traversal features (from go-p2p improvements)
-	EnableAutoNATv2    bool   // Enable AutoNAT v2 for better address discovery
-	ForceReachability  string // Force reachability: "public", "private", or "" (auto-detect)
-	EnableRelayService bool   // Whether to act as a relay for other nodes
-
-	// Connection management (from go-p2p improvements)
-	EnableConnManager bool          // Enable connection manager with high/low water marks
-	ConnLowWater      int           // Minimum number of connections to maintain
-	ConnHighWater     int           // Maximum number of connections before pruning
-	ConnGracePeriod   time.Duration // Grace period before pruning new connections
-	EnableConnGater   bool          // Enable connection gater for fine-grained control
-	MaxConnsPerPeer   int           // Maximum connections allowed per peer
+	RelayPeers  []string // Relay peers for NAT traversal (multiaddr strings)
 
 	// Peer persistence (from go-p2p improvements)
-	EnablePeerCache bool          // Enable peer caching for persistence across restarts
-	PeerCacheDir    string        // Directory for peer cache file (empty = binary directory)
-	MaxCachedPeers  int           // Maximum number of peers to cache
-	PeerCacheTTL    time.Duration // How long to keep cached peers
+	PeerCacheDir string // Directory for peer cache file (empty = binary directory)
 
 	BanThreshold int
 	BanDuration  time.Duration
 
 	// Sync manager configuration
-	MinPeersForSync    int           // Minimum number of peers needed before selecting sync peer
-	MaxWaitForMinPeers time.Duration // Maximum time to wait for minimum peers
-	ForceSyncPeer      string        // Force sync from specific peer ID, overrides automatic selection
+	ForceSyncPeer string // Force sync from specific peer ID, overrides automatic selection
 
 	// Address sharing configuration
 	// SharePrivateAddresses controls whether to advertise private/local IP addresses to peers.

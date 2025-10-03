@@ -350,10 +350,6 @@ func TestDaemon_Start_AllServices(t *testing.T) {
 	appSettings.Coinbase.GRPCListenAddress = fmt.Sprintf(":%d", coinbaseGRPCPort)
 	appSettings.Coinbase.GRPCAddress = fmt.Sprintf("localhost:%d", coinbaseGRPCPort)
 
-	// Disable both NAT services to avoid libp2p "multiple NATManagers" error
-	appSettings.P2P.EnableNATService = false
-	appSettings.P2P.EnableNATPortMap = false
-
 	// Manually set BlockChain and UTXO StoreURL to SQLite memory
 	appSettings.BlockChain.StoreURL = sqlStoreURL
 	appSettings.UtxoStore.UtxoStore = sqlStoreURL

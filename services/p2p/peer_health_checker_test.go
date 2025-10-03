@@ -68,8 +68,9 @@ func TestPeerHealthChecker_isDataHubReachable_Success(t *testing.T) {
 	hc := NewPeerHealthChecker(logger, registry, settings)
 
 	// Test successful connection
-	reachable := hc.isDataHubReachable(server.URL)
+	duration, reachable := hc.isDataHubReachable(server.URL)
 	assert.True(t, reachable, "DataHub should be reachable")
+	assert.Greater(t, duration, time.Duration(0), "Duration should be greater than zero")
 }
 
 func TestPeerHealthChecker_isDataHubReachable_Failure(t *testing.T) {
@@ -80,8 +81,9 @@ func TestPeerHealthChecker_isDataHubReachable_Failure(t *testing.T) {
 	hc := NewPeerHealthChecker(logger, registry, settings)
 
 	// Test unreachable URL
-	reachable := hc.isDataHubReachable("http://localhost:99999")
+	duration, reachable := hc.isDataHubReachable("http://localhost:99999")
 	assert.False(t, reachable, "DataHub should not be reachable")
+	assert.Equal(t, time.Duration(0), duration, "Duration should be zero on failure")
 }
 
 func TestPeerHealthChecker_isDataHubReachable_EmptyURL(t *testing.T) {
@@ -92,8 +94,9 @@ func TestPeerHealthChecker_isDataHubReachable_EmptyURL(t *testing.T) {
 	hc := NewPeerHealthChecker(logger, registry, settings)
 
 	// Empty URL should be considered healthy
-	reachable := hc.isDataHubReachable("")
+	duration, reachable := hc.isDataHubReachable("")
 	assert.True(t, reachable, "Empty URL should be considered healthy")
+	assert.Equal(t, time.Duration(0), duration, "Duration should be zero for empty URL")
 }
 
 func TestPeerHealthChecker_isDataHubReachable_404Offline(t *testing.T) {
@@ -111,8 +114,9 @@ func TestPeerHealthChecker_isDataHubReachable_404Offline(t *testing.T) {
 	hc := NewPeerHealthChecker(logger, registry, settings)
 
 	// Should detect offline status
-	reachable := hc.isDataHubReachable(server.URL)
+	duration, reachable := hc.isDataHubReachable(server.URL)
 	assert.False(t, reachable, "DataHub should be detected as offline")
+	assert.Equal(t, duration, time.Duration(0), "Duration should be zero for offline")
 }
 
 func TestPeerHealthChecker_isDataHubReachable_404Normal(t *testing.T) {
@@ -130,8 +134,9 @@ func TestPeerHealthChecker_isDataHubReachable_404Normal(t *testing.T) {
 	hc := NewPeerHealthChecker(logger, registry, settings)
 
 	// Normal 404 should still be considered reachable
-	reachable := hc.isDataHubReachable(server.URL)
+	duration, reachable := hc.isDataHubReachable(server.URL)
 	assert.True(t, reachable, "Normal 404 should still be considered reachable")
+	assert.Greater(t, duration, time.Duration(0), "Duration should be greater than zero")
 }
 
 func TestPeerHealthChecker_isDataHubReachable_500Error(t *testing.T) {
@@ -149,8 +154,9 @@ func TestPeerHealthChecker_isDataHubReachable_500Error(t *testing.T) {
 	hc := NewPeerHealthChecker(logger, registry, settings)
 
 	// 500 errors should be considered unreachable
-	reachable := hc.isDataHubReachable(server.URL)
+	duration, reachable := hc.isDataHubReachable(server.URL)
 	assert.False(t, reachable, "500 errors should be considered unreachable")
+	assert.Greater(t, duration, time.Duration(0), "Duration should be greater than zero")
 }
 
 func TestPeerHealthChecker_checkPeerHealth(t *testing.T) {
@@ -465,8 +471,9 @@ func TestPeerHealthChecker_HTTPTimeout(t *testing.T) {
 
 	hc := NewPeerHealthChecker(logger, registry, settings)
 
-	reachable := hc.isDataHubReachable(srv.URL)
+	duration, reachable := hc.isDataHubReachable(srv.URL)
 	assert.False(t, reachable, "request should time out and be considered unreachable")
+	assert.Equal(t, time.Duration(0), duration, "duration should be zero on timeout")
 }
 
 func TestPeerHealthChecker_RedirectHandling(t *testing.T) {
@@ -486,7 +493,9 @@ func TestPeerHealthChecker_RedirectHandling(t *testing.T) {
 	settings := CreateTestSettings()
 	hc := NewPeerHealthChecker(logger, registry, settings)
 
-	assert.True(t, hc.isDataHubReachable(redirectSrv.URL), "single redirect should be reachable")
+	duration, healthy := hc.isDataHubReachable(redirectSrv.URL)
+	assert.True(t, healthy, "single redirect should be reachable")
+	assert.Greater(t, duration, time.Duration(0), "duration should be greater than zero")
 
 	// Too many redirects (loop) should be considered unreachable
 	// Create two servers that redirect to each other to form a loop
@@ -502,5 +511,7 @@ func TestPeerHealthChecker_RedirectHandling(t *testing.T) {
 
 	// Our http.Client stops after 3 redirects and returns the last 3xx response.
 	// Since isDataHubReachable treats <500 as reachable, this should be true.
-	assert.True(t, hc.isDataHubReachable(srvA.URL), "redirect loop should still be considered reachable (3xx)")
+	duration, healthy = hc.isDataHubReachable(srvA.URL)
+	assert.True(t, healthy, "redirect loop should still be considered reachable (3xx)")
+	assert.Greater(t, duration, time.Duration(0), "duration should be greater than zero")
 }

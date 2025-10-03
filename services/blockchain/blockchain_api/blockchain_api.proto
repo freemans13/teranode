@@ -158,6 +158,9 @@ service BlockchainAPI {
   // Idle marks the service as idle.
   rpc Idle(google.protobuf.Empty) returns (google.protobuf.Empty) {}
 
+  // ReportPeerFailure notifies about peer download failures (catchup, subtree, block, etc).
+  rpc ReportPeerFailure(ReportPeerFailureRequest) returns (google.protobuf.Empty) {}
+
   // Legacy sync methods
 
   // GetBlockLocator retrieves a block locator for chain synchronization.
@@ -579,4 +582,12 @@ message GetBestHeightAndTimeResponse {
 // GetChainTipsResponse contains information about all known tips in the block tree.
 message GetChainTipsResponse {
   repeated model.ChainTip tips = 1;  // List of chain tips
+}
+
+// ReportPeerFailureRequest reports a peer download failure to the blockchain service.
+message ReportPeerFailureRequest {
+  bytes hash = 1;            // Hash of the block/subtree being processed
+  string peer_id = 2;        // Identifier of the failing peer
+  string failure_type = 3;   // Type of failure (e.g., "catchup", "subtree", "block")
+  string reason = 4;         // Description of the failure
 }

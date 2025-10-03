@@ -886,7 +886,7 @@ func TestError_As(t *testing.T) {
 			expect: false,
 			verify: func(t *testing.T, ok bool, tgt interface{}, _ *Error) {
 				require.False(t, ok)
-				require.Nil(t, *(tgt.(**Error)))
+				require.Nil(t, *tgt.(**Error))
 			},
 		},
 		{
@@ -899,7 +899,7 @@ func TestError_As(t *testing.T) {
 			expect: true,
 			verify: func(t *testing.T, ok bool, tgt interface{}, src *Error) {
 				require.True(t, ok)
-				require.Same(t, src, *(tgt.(**Error)))
+				require.Same(t, src, *tgt.(**Error))
 			},
 		},
 		{
@@ -913,7 +913,7 @@ func TestError_As(t *testing.T) {
 			expect: true,
 			verify: func(t *testing.T, ok bool, tgt interface{}, src *Error) {
 				require.True(t, ok)
-				require.IsType(t, &asErr{}, *(tgt.(**asErr)))
+				require.IsType(t, &asErr{}, *tgt.(**asErr))
 			},
 		},
 		{
@@ -927,7 +927,7 @@ func TestError_As(t *testing.T) {
 			expect: true,
 			verify: func(t *testing.T, ok bool, tgt interface{}, _ *Error) {
 				require.True(t, ok)
-				require.IsType(t, &asErr{}, *(tgt.(**asErr)))
+				require.IsType(t, &asErr{}, *tgt.(**asErr))
 			},
 		},
 		{
@@ -941,7 +941,7 @@ func TestError_As(t *testing.T) {
 			expect: false,
 			verify: func(t *testing.T, ok bool, tgt interface{}, _ *Error) {
 				require.False(t, ok)
-				require.Nil(t, *(tgt.(**asErr)))
+				require.Nil(t, *tgt.(**asErr))
 			},
 		},
 	}

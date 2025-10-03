@@ -2306,6 +2306,31 @@ func (b *Blockchain) CatchUpBlocks(ctx context.Context, _ *emptypb.Empty) (*empt
 	return nil, nil
 }
 
+// ReportPeerFailure handles reports of peer download failures and broadcasts to subscribers.
+func (b *Blockchain) ReportPeerFailure(ctx context.Context, req *blockchain_api.ReportPeerFailureRequest) (*emptypb.Empty, error) {
+	b.logger.Warnf("[ReportPeerFailure] Peer %s failed: type=%s, reason=%s", req.PeerId, req.FailureType, req.Reason)
+
+	// Send notification to all subscribers (including P2P)
+	notification := &blockchain_api.Notification{
+		Type: model.NotificationType_PeerFailure,
+		Hash: req.Hash,
+		Metadata: &blockchain_api.NotificationMetadata{
+			Metadata: map[string]string{
+				"peer_id":      req.PeerId,
+				"failure_type": req.FailureType,
+				"reason":       req.Reason,
+			},
+		},
+	}
+
+	if _, err := b.SendNotification(ctx, notification); err != nil {
+		b.logger.Errorf("[ReportPeerFailure] Failed to send notification: %v", err)
+		return nil, err
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
 // LegacySync transitions the service to legacy sync mode.
 func (b *Blockchain) LegacySync(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
 	// check whether the FSM is already in the LEGACYSYNC state

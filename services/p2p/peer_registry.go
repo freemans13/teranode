@@ -14,6 +14,7 @@ type PeerInfo struct {
 	BlockHash       string
 	DataHubURL      string
 	IsHealthy       bool
+	HealthDuration  time.Duration
 	LastHealthCheck time.Time
 	BanScore        int
 	IsBanned        bool
@@ -130,6 +131,16 @@ func (pr *PeerRegistry) UpdateHealth(id peer.ID, healthy bool) {
 	if info, exists := pr.peers[id]; exists {
 		info.IsHealthy = healthy
 		info.LastHealthCheck = time.Now()
+	}
+}
+
+// UpdateHealthDuration updates a peer's health duration
+func (pr *PeerRegistry) UpdateHealthDuration(id peer.ID, duration time.Duration) {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+
+	if info, exists := pr.peers[id]; exists {
+		info.HealthDuration = duration
 	}
 }
 

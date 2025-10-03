@@ -299,6 +299,7 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 				m := &kafkamessage.KafkaRejectedTxTopicMessage{
 					TxHash: tx.TxIDChainHash().String(),
 					Reason: err.Error(),
+					PeerId: "", // Empty peer_id indicates internal rejection
 				}
 
 				value, err := proto.Marshal(m)

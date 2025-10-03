@@ -5,14 +5,13 @@ import (
 	"time"
 
 	"github.com/bitcoin-sv/teranode/util/kafka"
-	"github.com/bsv-blockchain/go-p2p"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	p2pMessageBus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/mock"
 )
 
-// MockServerP2PNode is a mock implementation of P2PNodeI interface for testing purposes.
+// MockServerP2PClient is a mock implementation of P2PNodeI interface for testing purposes.
 // This mock provides a testable substitute for the real P2P node implementation, allowing
 // unit tests to verify P2P service behavior without requiring actual network connections
 // or peer discovery. The mock uses testify/mock framework to record method calls and
@@ -26,135 +25,48 @@ import (
 //
 // Usage in tests:
 //
-//	mockNode := &MockServerP2PNode{}
+//	mockNode := &MockServerP2PClient{}
 //	mockNode.On("Start", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 //	// Use mockNode in place of real P2PNodeI implementation
-type MockServerP2PNode struct {
+type MockServerP2PClient struct {
 	mock.Mock         // Embedded mock for method call recording and expectations
 	peerID    peer.ID // Configurable peer ID for testing scenarios
 }
 
-func (m *MockServerP2PNode) Start(ctx context.Context, streamHandler func(network.Stream), topicNames ...string) error {
+func (m *MockServerP2PClient) Start(ctx context.Context, streamHandler func(network.Stream), topicNames ...string) error {
 	args := m.Called(ctx, streamHandler, topicNames)
 	return args.Error(0)
 }
 
-func (m *MockServerP2PNode) Stop(ctx context.Context) error {
-	args := m.Called(ctx)
+func (m *MockServerP2PClient) Close() error {
+	args := m.Called()
 	return args.Error(0)
 }
 
-func (m *MockServerP2PNode) SetTopicHandler(ctx context.Context, topicName string, handler p2p.Handler) error {
-	args := m.Called(ctx, topicName, handler)
-	return args.Error(0)
-}
-
-func (m *MockServerP2PNode) GetTopic(topicName string) *pubsub.Topic {
-	args := m.Called(topicName)
-	if result := args.Get(0); result != nil {
-		return result.(*pubsub.Topic)
-	}
-
-	return nil
-}
-
-func (m *MockServerP2PNode) Publish(ctx context.Context, topicName string, msgBytes []byte) error {
+func (m *MockServerP2PClient) Publish(ctx context.Context, topicName string, msgBytes []byte) error {
 	args := m.Called(ctx, topicName, msgBytes)
 	return args.Error(0)
 }
 
-func (m *MockServerP2PNode) HostID() peer.ID {
+func (m *MockServerP2PClient) Subscribe(topicName string) <-chan p2pMessageBus.Message {
+	args := m.Called(topicName)
+	return args.Get(0).(<-chan p2pMessageBus.Message)
+}
+
+func (m *MockServerP2PClient) GetID() string {
 	if m.peerID != "" {
-		return m.peerID
+		return m.peerID.String()
 	}
 
 	args := m.Called()
-
-	return args.Get(0).(peer.ID)
+	return args.Get(0).(peer.ID).String()
 }
 
-func (m *MockServerP2PNode) ConnectedPeers() []p2p.PeerInfo {
-	args := m.Called()
-	return args.Get(0).([]p2p.PeerInfo)
-}
-
-func (m *MockServerP2PNode) CurrentlyConnectedPeers() []p2p.PeerInfo {
-	// args := m.Called()
-	// return args.Get(0).([]PeerInfo)
-	peers := []p2p.PeerInfo{}
-	peers = append(peers, p2p.PeerInfo{})
+func (m *MockServerP2PClient) GetPeers() []p2pMessageBus.PeerInfo {
+	peers := []p2pMessageBus.PeerInfo{}
+	peers = append(peers, p2pMessageBus.PeerInfo{})
 
 	return peers
-}
-
-func (m *MockServerP2PNode) DisconnectPeer(ctx context.Context, peerID peer.ID) error {
-	args := m.Called(ctx, peerID)
-	return args.Error(0)
-}
-
-func (m *MockServerP2PNode) SendToPeer(ctx context.Context, pid peer.ID, msg []byte) error {
-	args := m.Called(ctx, pid, msg)
-	return args.Error(0)
-}
-
-func (m *MockServerP2PNode) LastSend() time.Time {
-	args := m.Called()
-	return args.Get(0).(time.Time)
-}
-
-func (m *MockServerP2PNode) LastRecv() time.Time {
-	args := m.Called()
-	return args.Get(0).(time.Time)
-}
-
-func (m *MockServerP2PNode) BytesSent() uint64 {
-	args := m.Called()
-	return args.Get(0).(uint64)
-}
-
-func (m *MockServerP2PNode) BytesReceived() uint64 {
-	args := m.Called()
-	return args.Get(0).(uint64)
-}
-
-func (m *MockServerP2PNode) GetProcessName() string {
-	args := m.Called()
-	return args.String(0)
-}
-
-func (m *MockServerP2PNode) UpdateBytesReceived(bytesCount uint64) {
-	m.Called(bytesCount)
-}
-
-func (m *MockServerP2PNode) UpdateLastReceived() {
-	m.Called()
-}
-
-func (m *MockServerP2PNode) GetPeerIPs(pid peer.ID) []string {
-	args := m.Called(pid)
-	return args.Get(0).([]string)
-}
-
-func (m *MockServerP2PNode) UpdatePeerHeight(pid peer.ID, height int32) {
-	m.Called(pid, height)
-}
-
-func (m *MockServerP2PNode) SetPeerStartingHeight(peerID peer.ID, height int32) {
-	m.Called(peerID, height)
-}
-
-func (m *MockServerP2PNode) GetPeerStartingHeight(peerID peer.ID) (int32, bool) {
-	args := m.Called(peerID)
-	return args.Get(0).(int32), args.Bool(1)
-}
-
-func (m *MockServerP2PNode) SetPeerConnectedCallback(callback func(context.Context, peer.ID)) {
-	m.Called(callback)
-}
-
-func (m *MockServerP2PNode) ConnectToPeer(ctx context.Context, peerAddr string) error {
-	args := m.Called(ctx, peerAddr)
-	return args.Error(0)
 }
 
 // MockBanList is a mock implementation of BanListI interface for testing purposes.

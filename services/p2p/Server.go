@@ -21,7 +21,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -50,11 +49,10 @@ import (
 	"github.com/bitcoin-sv/teranode/util/servicemanager"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-p2p"
+	p2pMessageBus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -70,6 +68,7 @@ const (
 	defaultPeerMapMaxSize         = 100000           // Maximum entries in peer maps
 	defaultPeerMapTTL             = 30 * time.Minute // Time-to-live for peer map entries
 	defaultPeerMapCleanupInterval = 5 * time.Minute  // Cleanup interval
+	protocolIDVersion             = "1.0.0"          // Protocol version identifier
 )
 
 // peerMapEntry stores peer information with timestamp for TTL tracking
@@ -92,11 +91,11 @@ type peerMapEntry struct {
 // - Ban management is thread-safe across connections
 type Server struct {
 	p2p_api.UnimplementedPeerServiceServer
-	P2PNode                           p2p.NodeI          // The P2P network node instance - using interface instead of concrete type
-	logger                            ulogger.Logger     // Logger instance for the server
-	settings                          *settings.Settings // Configuration settings
-	bitcoinProtocolID                 string             // Bitcoin protocol identifier
-	blockchainClient                  blockchain.ClientI // Client for blockchain interactions
+	P2PClient                         p2pMessageBus.P2PClient // The P2P network client
+	logger                            ulogger.Logger          // Logger instance for the server
+	settings                          *settings.Settings      // Configuration settings
+	bitcoinProtocolVersion            string                  // Bitcoin protocol identifier
+	blockchainClient                  blockchain.ClientI      // Client for blockchain interactions
 	blockValidationClient             blockvalidation.Interface
 	blockAssemblyClient               blockassembly.ClientI     // Client for block assembly operations
 	AssetHTTPAddressURL               string                    // HTTP address URL for assets
@@ -113,11 +112,9 @@ type Server struct {
 	gCtx                              context.Context
 	blockTopicName                    string
 	subtreeTopicName                  string
-	miningOnTopicName                 string
 	rejectedTxTopicName               string
 	invalidBlocksTopicName            string             // Kafka topic for invalid blocks
 	invalidSubtreeTopicName           string             // Kafka topic for invalid subtrees
-	handshakeTopicName                string             // pubsub topic for version/verack
 	nodeStatusTopicName               string             // pubsub topic for node status messages
 	topicPrefix                       string             // Chain identifier prefix for topic validation
 	blockPeerMap                      sync.Map           // Map to track which peer sent each block (hash -> peerMapEntry)
@@ -191,44 +188,29 @@ func NewServer(
 		return nil, errors.NewConfigurationError("p2p_port not set in config")
 	}
 
-	topicPrefix := tSettings.ChainCfgParams.TopicPrefix
-	if topicPrefix == "" {
+	if tSettings.ChainCfgParams.TopicPrefix == "" {
 		return nil, errors.NewConfigurationError("missing config ChainCfgParams.TopicPrefix")
 	}
+	topicPrefix := tSettings.ChainCfgParams.TopicPrefix
 
-	btn := tSettings.P2P.BlockTopic
-	if btn == "" {
+	blockTopic := tSettings.P2P.BlockTopic
+	if blockTopic == "" {
 		return nil, errors.NewConfigurationError("p2p_block_topic not set in config")
 	}
 
-	stn := tSettings.P2P.SubtreeTopic
-	if stn == "" {
+	subtreeTopic := tSettings.P2P.SubtreeTopic
+	if subtreeTopic == "" {
 		return nil, errors.NewConfigurationError("p2p_subtree_topic not set in config")
 	}
 
-	htn := tSettings.P2P.HandshakeTopic
-	if htn == "" {
-		return nil, errors.NewConfigurationError("p2p_handshake_topic not set in config")
-	}
-
-	miningOntn := tSettings.P2P.MiningOnTopic
-	if miningOntn == "" {
-		return nil, errors.NewConfigurationError("p2p_mining_on_topic not set in config")
-	}
-
-	rtn := tSettings.P2P.RejectedTxTopic
-	if rtn == "" {
+	rejectedTxTopic := tSettings.P2P.RejectedTxTopic
+	if rejectedTxTopic == "" {
 		return nil, errors.NewConfigurationError("p2p_rejected_tx_topic not set in config")
 	}
 
-	nstn := tSettings.P2P.NodeStatusTopic
-	if nstn == "" {
-		nstn = "node_status" // Default value for backward compatibility
-	}
-
-	sharedKey := tSettings.P2P.SharedKey
-	if sharedKey == "" {
-		return nil, errors.NewConfigurationError("error getting p2p_shared_key")
+	nodeStatusTopic := tSettings.P2P.NodeStatusTopic
+	if nodeStatusTopic == "" {
+		nodeStatusTopic = "node_status" // Default value for backward compatibility
 	}
 
 	listenMode := tSettings.P2P.ListenMode
@@ -241,16 +223,7 @@ func NewServer(
 		return nil, errors.NewServiceError("error getting banlist", err)
 	}
 
-	usePrivateDht := tSettings.P2P.DHTUsePrivate
-	optimiseRetries := tSettings.P2P.OptimiseRetries
-
 	staticPeers := tSettings.P2P.StaticPeers
-
-	// Merge bootstrap addresses into static peers if persistent bootstrap is enabled
-	if tSettings.P2P.BootstrapPersistent {
-		logger.Infof("Bootstrap persistent mode enabled - adding %d bootstrap addresses to static peers", len(tSettings.P2P.BootstrapAddresses))
-		staticPeers = append(staticPeers, tSettings.P2P.BootstrapAddresses...)
-	}
 
 	privateKey := tSettings.P2P.PrivateKey
 
@@ -332,85 +305,55 @@ func NewServer(
 		logger.Infof("Private address sharing disabled - go-p2p will auto-detect public addresses only")
 	}
 
-	// Log NAT configuration
-	if tSettings.P2P.EnableNATService {
-		logger.Infof("AutoNAT service enabled for address detection")
-	}
-	if tSettings.P2P.EnableNATPortMap {
-		logger.Infof("NAT port mapping enabled (UPnP/NAT-PMP)")
-	}
-	if tSettings.P2P.EnableHolePunching {
-		logger.Infof("NAT hole punching enabled (DCUtR)")
-	}
-	if tSettings.P2P.EnableRelay {
-		logger.Infof("Relay service enabled (Circuit Relay v2)")
-	}
+	// Construct the full Bitcoin protocol ID with version and network topic prefix
+	// This ensures we only connect to peers on the same network (e.g. mainnet/testnet)
+	// The format results in "teranode/bitcoin/<network>/<protocolIDVersion>"
+	bitcoinProtocolVersion := fmt.Sprintf("/teranode/bitcoin/%s/%s", tSettings.ChainCfgParams.Name, protocolIDVersion)
 
-	// Important: When behind NAT, enabling NAT features helps with connectivity
-	if len(advertiseAddresses) == 0 && !tSettings.P2P.EnableNATService {
-		logger.Infof("NAT service disabled - node will rely on go-p2p's automatic public IP detection")
-	}
-
-	config := p2p.Config{
-		ProcessName:        "peer",
-		ListenAddresses:    listenAddresses,
-		AdvertiseAddresses: advertiseAddresses,
-		Port:               p2pPort,
-		PrivateKey:         privateKey,
-		SharedKey:          sharedKey,
-		UsePrivateDHT:      usePrivateDht,
-		OptimiseRetries:    optimiseRetries,
-		Advertise:          true,
-		StaticPeers:        staticPeers,
-		BootstrapAddresses: tSettings.P2P.BootstrapAddresses,
-		DHTProtocolID:      tSettings.P2P.DHTProtocolID,
-		// libp2p feature toggles
-		EnableNATService:   tSettings.P2P.EnableNATService,
-		EnableHolePunching: tSettings.P2P.EnableHolePunching,
-		EnableRelay:        tSettings.P2P.EnableRelay,
-		EnableNATPortMap:   tSettings.P2P.EnableNATPortMap,
-		// Enhanced NAT traversal features
-		EnableAutoNATv2:    tSettings.P2P.EnableAutoNATv2,
-		ForceReachability:  tSettings.P2P.ForceReachability,
-		EnableRelayService: tSettings.P2P.EnableRelayService,
-		// Connection management
-		EnableConnManager: tSettings.P2P.EnableConnManager,
-		ConnLowWater:      tSettings.P2P.ConnLowWater,
-		ConnHighWater:     tSettings.P2P.ConnHighWater,
-		ConnGracePeriod:   tSettings.P2P.ConnGracePeriod,
-		EnableConnGater:   tSettings.P2P.EnableConnGater,
-		MaxConnsPerPeer:   tSettings.P2P.MaxConnsPerPeer,
-		// Peer persistence
-		EnablePeerCache: tSettings.P2P.EnablePeerCache,
-		PeerCacheFile:   getPeerCacheFilePath(tSettings.P2P.PeerCacheDir),
-		MaxCachedPeers:  tSettings.P2P.MaxCachedPeers,
-		PeerCacheTTL:    tSettings.P2P.PeerCacheTTL,
-	}
-
-	// Log peer cache configuration for debugging
-	logger.Infof("P2P Peer Cache Config - Enabled: %v, File: %s, MaxCached: %d, TTL: %v",
-		config.EnablePeerCache, config.PeerCacheFile, config.MaxCachedPeers, config.PeerCacheTTL)
-
-	p2pNode, err := p2p.NewNode(ctx, logger, config)
+	// Decode the hex-encoded private key into standard crypto library privkey
+	privDecoded, err := hex.DecodeString(privateKey)
 	if err != nil {
-		return nil, errors.NewServiceError("Error creating P2PNode", err)
+		return nil, errors.NewServiceError("failed to decode key", err)
+	}
+	privKey, err := crypto.UnmarshalEd25519PrivateKey(privDecoded)
+	if err != nil {
+		return nil, errors.NewServiceError("failed to unmarshal key", err)
+	}
+	conf := p2pMessageBus.Config{
+		PrivateKey:      privKey,
+		Name:            tSettings.ClientName,
+		Logger:          logger,
+		PeerCacheFile:   getPeerCacheFilePath(tSettings.P2P.PeerCacheDir),
+		BootstrapPeers:  staticPeers,
+		RelayPeers:      tSettings.P2P.RelayPeers,
+		ProtocolVersion: bitcoinProtocolVersion,
 	}
 
+	if len(advertiseAddresses) > 0 {
+		conf.AnnounceAddrs = advertiseAddresses
+		conf.Port = tSettings.P2P.Port
+	}
+
+	p2pClient, err := p2pMessageBus.NewClient(conf)
+	if err != nil {
+		return nil, errors.NewServiceError("failed to create p2p client", err)
+	}
 	// Log P2P node creation
 	logger.Infof("P2P node created successfully")
 	// The node will learn its external address via libp2p's Identify protocol
 	// when peers connect and tell us what address they see us from
 
 	p2pServer := &Server{
-		P2PNode:             p2pNode,
-		logger:              logger,
-		settings:            tSettings,
-		bitcoinProtocolID:   fmt.Sprintf("teranode/bitcoin/%s", tSettings.Version),
-		notificationCh:      make(chan *notificationMsg, 1_000),
-		blockchainClient:    blockchainClient,
-		blockAssemblyClient: blockAssemblyClient,
-		banList:             banlist,
-		banChan:             banChan,
+		P2PClient:              p2pClient,
+		logger:                 logger,
+		settings:               tSettings,
+		bitcoinProtocolVersion: bitcoinProtocolVersion,
+		notificationCh:         make(chan *notificationMsg, 1_000),
+		blockchainClient:       blockchainClient,
+		blockAssemblyClient:    blockAssemblyClient,
+
+		banChan: banChan,
+		banList: banlist,
 
 		rejectedTxKafkaConsumerClient:     rejectedTxKafkaConsumerClient,
 		invalidBlocksKafkaConsumerClient:  invalidBlocksKafkaConsumerClient,
@@ -418,14 +361,12 @@ func NewServer(
 		subtreeKafkaProducerClient:        subtreeKafkaProducerClient,
 		blocksKafkaProducerClient:         blocksKafkaProducerClient,
 		gCtx:                              ctx,
-		blockTopicName:                    fmt.Sprintf("%s-%s", topicPrefix, btn),
-		subtreeTopicName:                  fmt.Sprintf("%s-%s", topicPrefix, stn),
-		miningOnTopicName:                 fmt.Sprintf("%s-%s", topicPrefix, miningOntn),
-		rejectedTxTopicName:               fmt.Sprintf("%s-%s", topicPrefix, rtn),
+		blockTopicName:                    fmt.Sprintf("%s-%s", topicPrefix, blockTopic),
+		subtreeTopicName:                  fmt.Sprintf("%s-%s", topicPrefix, subtreeTopic),
+		rejectedTxTopicName:               fmt.Sprintf("%s-%s", topicPrefix, rejectedTxTopic),
 		invalidBlocksTopicName:            tSettings.Kafka.InvalidBlocks,
 		invalidSubtreeTopicName:           tSettings.Kafka.InvalidSubtrees,
-		handshakeTopicName:                fmt.Sprintf("%s-%s", topicPrefix, htn),
-		nodeStatusTopicName:               fmt.Sprintf("%s-%s", topicPrefix, nstn),
+		nodeStatusTopicName:               fmt.Sprintf("%s-%s", topicPrefix, nodeStatusTopic),
 		topicPrefix:                       topicPrefix,
 		startTime:                         time.Now(),
 
@@ -534,7 +475,7 @@ func (s *Server) Init(ctx context.Context) (err error) {
 // This method is the main entry point for activating the P2P network functionality.
 // It performs several key operations:
 // - Waits for the blockchain FSM to transition from idle state
-// - Sets up topic handlers for blocks, subtrees, mining notifications, and peer handshakes
+// - Sets up topic handlers for blocks, and subtrees
 // - Initializes the P2P node and starts listening on configured addresses
 // - Starts Kafka consumers for rejected transactions
 // - Launches the HTTP server for external API access
@@ -586,7 +527,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// For TxMeta, we are using autocommit, as we want to consume every message as fast as possible, and it is okay if some of the messages are not properly processed.
 	// We don't need manual kafka commit and error handling here, as it is not necessary to retry the message, we have the message in stores.
 	// Therefore, autocommit is set to true.
-	s.rejectedTxKafkaConsumerClient.Start(ctx, s.rejectedHandler(ctx), kafka.WithLogErrorAndMoveOn())
+	s.rejectedTxKafkaConsumerClient.Start(ctx, s.rejectedTxHandler(ctx), kafka.WithLogErrorAndMoveOn())
 
 	// Handler for invalid blocks Kafka messages
 	if s.invalidBlocksKafkaConsumerClient != nil {
@@ -612,7 +553,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	go func() {
 		if err := s.StartHTTP(ctx); err != nil {
-			if err == http.ErrServerClosed {
+			if errors.Is(err, http.ErrServerClosed) {
 				s.logger.Infof("http server shutdown")
 			} else {
 				s.logger.Errorf("failed to start http server: %v", err)
@@ -632,9 +573,9 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if s.P2PNode != nil {
+				if s.P2PClient != nil {
 					// Get current peer addresses from the P2P node
-					peers := s.P2PNode.ConnectedPeers()
+					peers := s.P2PClient.GetPeers()
 					s.logger.Debugf("P2P node currently connected to %d peers", len(peers))
 
 					// Log our advertised addresses (these should include observed addresses)
@@ -649,33 +590,11 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		}
 	}()
 
-	// Set up the peer connected callback to announce our best block when a new peer connects
-	s.P2PNode.SetPeerConnectedCallback(s.P2PNodeConnected)
-
-	err = s.P2PNode.Start(
-		ctx,
-		s.receiveHandshakeStreamHandler,
-		s.handshakeTopicName,
-		s.blockTopicName,
-		s.subtreeTopicName,
-		s.miningOnTopicName,
-		s.rejectedTxTopicName,
-		s.nodeStatusTopicName,
-	)
-	if err != nil {
-		return errors.NewServiceError("error starting p2p node", err)
-	}
-
-	// wait for P2P node to be ready for handler registration using a polling mechanism
-	if err := s.waitForP2PNodeReadiness(ctx); err != nil {
-		return err
-	}
-
-	// register remaining handlers
-	if err := s.registerRemainingHandlers(ctx); err != nil {
-		// continue despite errors, but log the issue
-		s.logger.Warnf("[Server] Some P2P topic handlers failed to register: %v", err)
-	}
+	// Subscribe to all topics
+	s.subscribeToTopic(ctx, s.blockTopicName, s.handleBlockTopic)
+	s.subscribeToTopic(ctx, s.subtreeTopicName, s.handleSubtreeTopic)
+	s.subscribeToTopic(ctx, s.nodeStatusTopicName, s.handleNodeStatusTopic)
+	s.subscribeToTopic(ctx, s.rejectedTxTopicName, s.handleRejectedTxTopic)
 
 	// Start blockchain subscription before marking service as ready
 	// This ensures we don't miss any block notifications
@@ -704,9 +623,6 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	if s.syncCoordinator != nil {
 		s.syncCoordinator.Start(ctx)
 	}
-
-	// Send initial handshake (version)
-	s.sendHandshake(ctx)
 
 	// Start node status publisher
 	go s.publishNodeStatus(ctx)
@@ -743,6 +659,24 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	<-ctx.Done()
 
 	return nil
+}
+
+func (s *Server) subscribeToTopic(ctx context.Context, topicName string, handler func(context.Context, []byte, string)) {
+	topicChannel := s.P2PClient.Subscribe(topicName)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-topicChannel:
+				if !ok {
+					s.logger.Warnf("%s topic channel closed", topicName)
+					return
+				}
+				handler(ctx, msg.Data, msg.From)
+			}
+		}
+	}()
 }
 
 func (s *Server) invalidSubtreeHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
@@ -814,8 +748,12 @@ func (s *Server) invalidBlockHandler(ctx context.Context) func(msg *kafka.KafkaM
 	}
 }
 
-func (s *Server) rejectedHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
+func (s *Server) rejectedTxHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
 	return func(msg *kafka.KafkaMessage) error {
+		if s.settings.P2P.ListenMode == settings.ListenModeListenOnly {
+			return nil
+		}
+
 		var (
 			syncing bool
 			err     error
@@ -831,35 +769,45 @@ func (s *Server) rejectedHandler(ctx context.Context) func(msg *kafka.KafkaMessa
 
 		var m kafkamessage.KafkaRejectedTxTopicMessage
 		if err := proto.Unmarshal(msg.Value, &m); err != nil {
-			s.logger.Errorf("[rejectedHandler] error unmarshalling rejectedTxMessage: %v", err)
+			s.logger.Errorf("[rejectedTxHandler] error unmarshalling rejectedTxMessage: %v", err)
 			return err
 		}
 
 		hash, err := chainhash.NewHashFromStr(m.TxHash)
 		if err != nil {
-			s.logger.Errorf("[rejectedHandler] error getting chainhash from string %s: %v", m.TxHash, err)
+			s.logger.Errorf("[rejectedTxHandler] error getting chainhash from string %s: %v", m.TxHash, err)
 			return err
 		}
 
-		s.logger.Debugf("[rejectedHandler] Received %s rejected tx notification: %s", hash.String(), m.Reason)
+		// Check if this is an internal rejection (empty peer_id) or external (non-empty peer_id)
+		if m.PeerId != "" {
+			// External rejection from another peer - already broadcast by that peer
+			s.logger.Debugf("[rejectedTxHandler] Received external rejected tx notification for %s from peer %s: %s (not re-broadcasting)",
+				hash.String(), m.PeerId, m.Reason)
+			return nil
+		}
+
+		// Internal rejection from our Validator - broadcast to p2p network
+		s.logger.Debugf("[rejectedTxHandler] Received internal rejected tx notification for %s: %s (broadcasting to p2p network)",
+			hash.String(), m.Reason)
 
 		rejectedTxMessage := p2p.RejectedTxMessage{
 			TxID:   hash.String(),
 			Reason: m.Reason,
-			PeerID: s.P2PNode.HostID().String(),
+			PeerID: s.P2PClient.GetID(),
 		}
 
 		msgBytes, err := json.Marshal(rejectedTxMessage)
 		if err != nil {
-			s.logger.Errorf("[rejectedHandler] json marshal error: %v", err)
+			s.logger.Errorf("[rejectedTxHandler] json marshal error: %v", err)
 
 			return err
 		}
 
-		s.logger.Debugf("[rejectedHandler] publishing rejectedTxMessage")
+		s.logger.Debugf("[rejectedTxHandler] publishing rejectedTxMessage to p2p network")
 
-		if err := s.P2PNode.Publish(ctx, s.rejectedTxTopicName, msgBytes); err != nil {
-			s.logger.Errorf("[rejectedHandler] publish error: %v", err)
+		if err = s.P2PClient.Publish(ctx, s.rejectedTxTopicName, msgBytes); err != nil {
+			s.logger.Errorf("[rejectedTxHandler] publish error: %v", err)
 		}
 
 		return nil
@@ -881,121 +829,6 @@ func generateRandomKey() (string, error) {
 	apiKey := hex.EncodeToString(key)
 
 	return apiKey, nil
-}
-
-func (s *Server) sendHandshake(ctx context.Context) {
-	localHeight := uint32(0)
-	bestHash := ""
-
-	if header, bhMeta, err := s.blockchainClient.GetBestBlockHeader(ctx); err == nil && bhMeta != nil {
-		localHeight = bhMeta.Height
-		bestHash = header.Hash().String()
-	}
-
-	msg := p2p.HandshakeMessage{
-		Type:        "version",
-		PeerID:      s.P2PNode.HostID().String(),
-		BestHeight:  localHeight,
-		BestHash:    bestHash,
-		DataHubURL:  s.AssetHTTPAddressURL,
-		UserAgent:   s.bitcoinProtocolID,
-		Services:    0,
-		TopicPrefix: s.topicPrefix,
-	}
-
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		s.logger.Errorf("[sendHandshake][p2p-handshake] json marshal error: %v", err)
-		return
-	}
-
-	s.logger.Infof("[sendHandshake] Sending version handshake: PeerID=%s, URL=%s, BestHeight=%d, Topic=%s", msg.PeerID, msg.DataHubURL, msg.BestHeight, s.handshakeTopicName)
-
-	go func() {
-		var err error
-
-		// should we wait for the topic to have enough subscribers before publishing?
-		if s.settings != nil && s.settings.P2P.HandshakeTopicSize > 0 {
-			ctx, cancel := context.WithTimeout(ctx, s.settings.P2P.HandshakeTopicTimeout)
-			defer cancel()
-
-			err = s.P2PNode.GetTopic(s.handshakeTopicName).Publish(ctx, msgBytes, pubsub.WithReadiness(pubsub.MinTopicSize(s.settings.P2P.HandshakeTopicSize)))
-		} else {
-			err = s.P2PNode.Publish(ctx, s.handshakeTopicName, msgBytes)
-		}
-
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				s.logger.Warnf("[sendHandshake][p2p-handshake] (handshake topic size: %d), publish timeout - no subscribers yet", s.settings.P2P.HandshakeTopicSize)
-				return
-			}
-
-			// Don't log errors if context was canceled (during shutdown)
-			if errors.Is(err, context.Canceled) {
-				s.logger.Debugf("[sendHandshake][p2p-handshake] context canceled during shutdown")
-				return
-			}
-
-			s.logger.Errorf("[sendHandshake][p2p-handshake] (handshake topic size: %d), publish error: %v", s.settings.P2P.HandshakeTopicSize, err)
-			return
-		}
-
-		s.logger.Infof("[sendHandshake] Successfully published handshake to topic %s", s.handshakeTopicName)
-	}()
-}
-
-func (s *Server) sendDirectHandshake(ctx context.Context, peerID peer.ID) {
-	localHeight := uint32(0)
-	bestHash := ""
-
-	if header, bhMeta, err := s.blockchainClient.GetBestBlockHeader(ctx); err == nil && bhMeta != nil {
-		localHeight = bhMeta.Height
-		bestHash = header.Hash().String()
-	}
-
-	msg := p2p.HandshakeMessage{
-		Type:        "version",
-		PeerID:      s.P2PNode.HostID().String(),
-		BestHeight:  localHeight,
-		BestHash:    bestHash,
-		DataHubURL:  s.AssetHTTPAddressURL,
-		UserAgent:   s.bitcoinProtocolID,
-		Services:    0,
-		TopicPrefix: s.topicPrefix,
-	}
-
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		s.logger.Errorf("[sendDirectHandshake] json marshal error: %v", err)
-		return
-	}
-
-	s.logger.Infof("[sendDirectHandshake] Sending direct handshake to peer %s: BestHeight=%d", peerID.String(), localHeight)
-
-	// try to send handshake directly to the peer via stream
-	if err := s.sendHandshakeToPeer(ctx, peerID, msgBytes); err != nil {
-		// if stream-based handshake fails (e.g., protocol not supported), fall back to pubsub
-		s.logger.Warnf("[sendDirectHandshake] Stream handshake failed for peer %s: %v, falling back to pubsub", peerID.String(), err)
-
-		// send via pubsub topic with a small delay to ensure peer is subscribed
-		go func() {
-			time.Sleep(2 * time.Second)
-			if err := s.P2PNode.Publish(ctx, s.handshakeTopicName, msgBytes); err != nil {
-				s.logger.Errorf("[sendDirectHandshake] Fallback pubsub handshake also failed: %v", err)
-			} else {
-				s.logger.Infof("[sendDirectHandshake] Successfully sent handshake via pubsub fallback to peer %s", peerID.String())
-			}
-		}()
-	} else {
-		s.logger.Infof("[sendDirectHandshake] Successfully sent direct handshake to peer %s", peerID.String())
-	}
-}
-
-func (s *Server) sendHandshakeToPeer(ctx context.Context, peerID peer.ID, msgBytes []byte) error {
-	// check listen mode - allow handshakes even in listen_only mode
-	// note: SendToPeer has its own listen mode check, but we want handshakes to work
-	// so we temporarily bypass it or modify SendToPeer to allow handshakes
-	return s.P2PNode.SendToPeer(ctx, peerID, msgBytes)
 }
 
 // updatePeerLastMessageTime updates the last message time for both the sender and originator.
@@ -1050,7 +883,7 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 	}
 
 	// Check if this is our own message
-	isSelf := from == s.P2PNode.HostID().String()
+	isSelf := from == s.P2PClient.GetID()
 
 	// Log all received node_status messages for debugging
 	s.logger.Debugf("[handleNodeStatusTopic] Received node_status from %s (peer_id: %s, is_self: %v, version: %s, height: %d)",
@@ -1097,8 +930,6 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 			// Ensure this peer is in the registry
 			s.addPeer(peerID)
 
-			s.P2PNode.UpdatePeerHeight(peerID, int32(nodeStatusMessage.BestHeight)) //nolint:gosec
-
 			// Update sync manager with peer height from node status
 			// Update peer height in registry
 			s.updatePeerHeight(peerID, int32(nodeStatusMessage.BestHeight))
@@ -1131,210 +962,11 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 	}
 }
 
-func (s *Server) handleHandshakeTopic(ctx context.Context, m []byte, from string) {
-	s.logger.Debugf("[handleHandshakeTopic] Received handshake from %s, message: %s", from, string(m))
-
-	var hs p2p.HandshakeMessage
-	if err := json.Unmarshal(m, &hs); err != nil {
-		s.logger.Errorf("[handleHandshakeTopic][p2p-handshake] json unmarshal error: %v", err)
-		return
-	}
-
-	s.logger.Debugf("[handleHandshakeTopic] Parsed handshake: Type=%s, PeerID=%s, BestHeight=%d, TopicPrefix=%s", hs.Type, hs.PeerID, hs.BestHeight, hs.TopicPrefix)
-	s.logger.Debugf("[handleHandshakeTopic] Our HostID=%s, Message from=%s, Message PeerID=%s", s.P2PNode.HostID().String(), from, hs.PeerID)
-
-	if hs.PeerID == s.P2PNode.HostID().String() {
-		s.logger.Debugf("[handleHandshakeTopic] Ignoring self handshake (PeerID matches our HostID)")
-		return // ignore self
-	}
-
-	// Update last message time for the sender and originator
-	s.updatePeerLastMessageTime(from, hs.PeerID)
-
-	// Validate topic prefix to ensure we're on the same chain
-	if hs.TopicPrefix != s.topicPrefix {
-		s.logger.Warnf("[handleHandshakeTopic] Ignoring peer %s with incompatible topic prefix: got %s, expected %s", hs.PeerID, hs.TopicPrefix, s.topicPrefix)
-		return // ignore peers on different chains
-	}
-	s.logger.Debugf("[handleHandshakeTopic] Topic prefix validation passed for peer %s", hs.PeerID)
-	// update peer height and store starting height if first time seeing this peer
-	if peerID, err := peer.Decode(hs.PeerID); err == nil {
-		// store starting height if we haven't seen this peer before
-		if _, exists := s.P2PNode.GetPeerStartingHeight(peerID); !exists {
-			s.logger.Infof("[handleHandshakeTopic] Setting starting height for peer %s to %d", peerID.String(), hs.BestHeight)
-			s.P2PNode.SetPeerStartingHeight(peerID, int32(hs.BestHeight)) //nolint:gosec
-		} else {
-			s.logger.Debugf("[handleHandshakeTopic] Peer %s already has starting height set", peerID.String())
-		}
-		s.P2PNode.UpdatePeerHeight(peerID, int32(hs.BestHeight)) //nolint:gosec
-
-		// Ensure peer exists in registry before updating
-		s.addPeer(peerID)
-
-		// Store the peer's best block hash and DataHub URL for sync purposes
-		if hs.BestHash != "" {
-			s.updateBlockHash(peerID, hs.BestHash)
-			s.logger.Debugf("[handleHandshakeTopic] Stored best hash %s for peer %s", hs.BestHash, peerID.String())
-		}
-		if hs.DataHubURL != "" {
-			s.updateDataHubURL(peerID, hs.DataHubURL)
-			s.logger.Debugf("[handleHandshakeTopic] Stored DataHub URL %s for peer %s", hs.DataHubURL, peerID.String())
-		} else {
-			s.logger.Warnf("[handleHandshakeTopic] Peer %s has no DataHub URL - cannot be used as sync peer", peerID.String())
-		}
-
-		s.updatePeerHeight(peerID, int32(hs.BestHeight))
-	}
-
-	s.logger.Debugf("[handleHandshakeTopic] Message type: %s, from peer: %s, height: %d", hs.Type, hs.PeerID, hs.BestHeight)
-
-	switch hs.Type {
-	case "version":
-		if err := s.sendVerack(ctx, from, hs); err != nil {
-			s.logger.Errorf("[handleHandshakeTopic][p2p-handshake] error sending verack: %v", err)
-		}
-	case "verack":
-		s.logger.Infof("[handleHandshakeTopic][p2p-handshake] received verack from %s url=%s height=%d hash=%s agent=%s services=%d", hs.PeerID, hs.DataHubURL, hs.BestHeight, hs.BestHash, hs.UserAgent, hs.Services)
-
-		// Get our best block for comparison
-		localHeight := uint32(0)
-
-		var localMeta *model.BlockHeaderMeta
-
-		_, localMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
-		if err == nil && localMeta != nil {
-			localHeight = localMeta.Height
-
-			// If we have a higher block than the peer who just connected
-			if localHeight > hs.BestHeight {
-				s.logger.Debugf("[handleHandshakeTopic][p2p-handshake] our height (%d) is higher than peer %s (%d)", localHeight, hs.PeerID, hs.BestHeight)
-			} else if hs.BestHeight > localHeight && s.syncCoordinator != nil {
-				// If peer is ahead and we don't have a bootstrap, so no other peers are going
-				// to become available therefore we can trigger immediate sync
-				if len(s.settings.P2P.BootstrapAddresses) == 0 {
-					s.logger.Infof("[handleHandshakeTopic][p2p-handshake] no bootstrap detected, peer %s is ahead (height %d > %d), triggering immediate sync",
-						hs.PeerID, hs.BestHeight, localHeight)
-					if err := s.syncCoordinator.TriggerSync(); err != nil {
-						s.logger.Warnf("[handleHandshakeTopic] Failed to trigger sync: %v", err)
-					}
-				}
-			}
-		}
-	}
-}
-
-func (s *Server) sendVerack(ctx context.Context, from string, hs p2p.HandshakeMessage) error {
-	localHeight := uint32(0)
-	bestHash := ""
-
-	if header, bhMeta, err := s.blockchainClient.GetBestBlockHeader(ctx); err == nil && bhMeta != nil {
-		localHeight = bhMeta.Height
-		bestHash = header.Hash().String()
-	}
-
-	ack := p2p.HandshakeMessage{
-		Type:        "verack",
-		PeerID:      s.P2PNode.HostID().String(),
-		BestHeight:  localHeight,
-		BestHash:    bestHash,
-		DataHubURL:  s.AssetHTTPAddressURL,
-		UserAgent:   s.bitcoinProtocolID,
-		Services:    0,
-		TopicPrefix: s.topicPrefix,
-	}
-
-	ackBytes, err := json.Marshal(ack)
-	if err != nil {
-		s.logger.Errorf("[sendVerack][p2p-handshake] json marshal error: %v", err)
-		return err
-	}
-	// Decode the 'from' peer ID string just before sending the response
-	requesterPID, err := peer.Decode(from)
-	if err != nil {
-		s.logger.Errorf("[handleBestBlockTopic][p2p-handshake] error decoding requester peerId '%s': %v", from, err)
-		return err
-	}
-
-	// send best block to the requester using the decoded peer.ID
-	err = s.P2PNode.SendToPeer(ctx, requesterPID, ackBytes)
-	if err != nil {
-		s.logger.Errorf("[handleBestBlockTopic][p2p-handshake] error sending peer message: %v", err)
-		return err
-	}
-	return nil
-}
-
-func (s *Server) receiveHandshakeStreamHandler(ns network.Stream) {
-	defer ns.Close()
-	s.logger.Debugf("[streamHandler][%s][p2p-handshake]", s.P2PNode.GetProcessName())
-
-	var (
-		buf []byte
-		err error
-	)
-
-	for {
-		buf, err = io.ReadAll(ns)
-		if err != nil {
-			_ = ns.Reset()
-
-			s.logger.Errorf("[streamHandler][%s][p2p-handshake] failed to read network stream: %+v", s.P2PNode.GetProcessName(), err)
-
-			return
-		}
-
-		_ = ns.Close()
-
-		if len(buf) > 0 {
-			s.logger.Debugf("[streamHandler][%s][p2p-handshake] Received message: %s", s.P2PNode.GetProcessName(), string(buf))
-
-			break
-		}
-
-		s.logger.Debugf("[streamHandler][%s][p2p-handshake] No message received, waiting...", s.P2PNode.GetProcessName())
-
-		time.Sleep(1 * time.Second)
-	}
-
-	s.P2PNode.UpdateBytesReceived(uint64(len(buf)))
-	s.P2PNode.UpdateLastReceived()
-	s.handleHandshakeTopic(s.gCtx, buf, ns.Conn().RemotePeer().String())
-}
-
-func (s *Server) P2PNodeConnected(ctx context.Context, peerID peer.ID) {
-	s.logger.Infof("[P2PNodeConnected] Peer connected: %s", peerID.String())
-	s.logger.Debugf("[P2PNodeConnected] Total connected peers: %d", len(s.P2PNode.ConnectedPeers()))
-
-	// Add peer to SyncCoordinator
-	// Add peer to registry
-	s.addPeer(peerID)
-
-	// try to get the peer's current height from the first message/block data we have
-	// and use it as starting height since handshake protocol isn't used by other peers
-	go func() {
-		// give some time for the peer to potentially send initial data
-		time.Sleep(500 * time.Millisecond)
-
-		// check if we already have height info for this peer from other sources (block messages, etc)
-		peerInfos := s.P2PNode.ConnectedPeers()
-		for _, peerInfo := range peerInfos {
-			if peerInfo.ID == peerID {
-				// if we don't have a starting height yet, use current height as starting height
-				if _, exists := s.P2PNode.GetPeerStartingHeight(peerID); !exists && peerInfo.CurrentHeight > 0 {
-					s.logger.Debugf("[P2PNodeConnected] Setting starting height for peer %s to %d (from initial connection data)", peerID.String(), peerInfo.CurrentHeight)
-					s.P2PNode.SetPeerStartingHeight(peerID, peerInfo.CurrentHeight)
-				}
-				break
-			}
-		}
-	}()
-
-	// send handshake (version) when a new peer connects using direct stream (no timing issues)
-	s.logger.Debugf("[P2PNodeConnected] Sending direct handshake in response to new peer connection")
-	go s.sendDirectHandshake(ctx, peerID)
-}
-
 func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Hash) error {
+	if s.settings.P2P.ListenMode == settings.ListenModeListenOnly {
+		return nil
+	}
+
 	var msgBytes []byte
 
 	h, meta, err := s.blockchainClient.GetBlockHeader(ctx, hash)
@@ -1346,7 +978,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 		Hash:       hash.String(),
 		Height:     meta.Height,
 		DataHubURL: s.AssetHTTPAddressURL,
-		PeerID:     s.P2PNode.HostID().String(),
+		PeerID:     s.P2PClient.GetID(),
 		Header:     hex.EncodeToString(h.Bytes()),
 	}
 
@@ -1355,7 +987,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 		return errors.NewError("blockMessage - json marshal error: %w", err)
 	}
 
-	if err = s.P2PNode.Publish(ctx, s.blockTopicName, msgBytes); err != nil {
+	if err = s.P2PClient.Publish(ctx, s.blockTopicName, msgBytes); err != nil {
 		return errors.NewError("blockMessage - publish error: %w", err)
 	}
 
@@ -1363,59 +995,6 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 	if err = s.handleNodeStatusNotification(ctx); err != nil {
 		// Log the error but don't fail the block notification
 		s.logger.Warnf("[handleBlockNotification] error sending node status update: %v", err)
-	}
-
-	return nil
-}
-
-func (s *Server) handleMiningOnNotification(ctx context.Context) error {
-	var msgBytes []byte
-
-	header, meta, err := s.blockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		return errors.NewError("error getting block header for MiningOnMessage: %w", err)
-	}
-
-	miningOnMessage := p2p.MiningOnMessage{
-		Hash:         header.Hash().String(),
-		PreviousHash: header.HashPrevBlock.String(),
-		DataHubURL:   s.AssetHTTPAddressURL,
-		PeerID:       s.P2PNode.HostID().String(),
-		Height:       meta.Height,
-		Miner:        meta.Miner,
-		SizeInBytes:  meta.SizeInBytes,
-		TxCount:      meta.TxCount,
-	}
-
-	msgBytes, err = json.Marshal(miningOnMessage)
-	if err != nil {
-		return errors.NewError("miningOnMessage - json marshal error: %w", err)
-	}
-
-	s.logger.Debugf("P2P publishing miningOnMessage")
-
-	if err = s.P2PNode.Publish(ctx, s.miningOnTopicName, msgBytes); err != nil {
-		return errors.NewError("miningOnMessage - publish error: %w", err)
-	}
-
-	// Also send to local WebSocket clients
-	s.notificationCh <- &notificationMsg{
-		Timestamp:    time.Now().UTC().Format(isoFormat),
-		Type:         "mining_on",
-		Hash:         miningOnMessage.Hash,
-		BaseURL:      miningOnMessage.DataHubURL,
-		PeerID:       miningOnMessage.PeerID,
-		PreviousHash: miningOnMessage.PreviousHash,
-		Height:       miningOnMessage.Height,
-		Miner:        miningOnMessage.Miner,
-		SizeInBytes:  miningOnMessage.SizeInBytes,
-		TxCount:      miningOnMessage.TxCount,
-	}
-
-	// Also send a node_status update when mining starts on a new block
-	if err := s.handleNodeStatusNotification(ctx); err != nil {
-		// Log the error but don't fail the mining notification
-		s.logger.Warnf("[handleMiningOnNotification] error sending node status update: %v", err)
 	}
 
 	return nil
@@ -1541,13 +1120,12 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 			}
 
 			// Get sync peer's height and block hash
-			for _, peerInfo := range s.P2PNode.ConnectedPeers() {
-				if peerInfo.ID == syncPeer {
-					syncPeerHeight = peerInfo.CurrentHeight
-
+			for _, peerInfo := range s.P2PClient.GetPeers() {
+				if peerInfo.ID == syncPeer.String() {
 					// Get the peer's best block hash from registry
 					if pInfo, exists := s.getPeer(syncPeer); exists {
 						syncPeerBlockHash = pInfo.BlockHash
+						syncPeerHeight = pInfo.Height
 					}
 					break
 				}
@@ -1563,8 +1141,8 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 
 	// Get peer ID safely
 	peerID := ""
-	if s.P2PNode != nil {
-		peerID = s.P2PNode.HostID().String()
+	if s.P2PClient != nil {
+		peerID = s.P2PClient.GetID()
 	}
 
 	// Get version, commit, and listen mode safely
@@ -1584,11 +1162,17 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		startTime = s.startTime.Unix()
 	}
 
+	// Set empty baseURL if in listen only mode
+	baseURL := s.AssetHTTPAddressURL
+	if s.settings.P2P.ListenMode == settings.ListenModeListenOnly {
+		baseURL = ""
+	}
+
 	// Return the notification message
 	return &notificationMsg{
 		Timestamp:            time.Now().UTC().Format(isoFormat),
 		Type:                 "node_status",
-		BaseURL:              s.AssetHTTPAddressURL,
+		BaseURL:              baseURL,
 		PeerID:               peerID,
 		Version:              version,
 		CommitHash:           commit,
@@ -1646,7 +1230,7 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 
 	s.logger.Debugf("[handleNodeStatusNotification] P2P publishing nodeStatusMessage to topic %s (height: %d, version: %s)", s.nodeStatusTopicName, nodeStatusMessage.BestHeight, nodeStatusMessage.Version)
 
-	if err = s.P2PNode.Publish(ctx, s.nodeStatusTopicName, msgBytes); err != nil {
+	if err = s.P2PClient.Publish(ctx, s.nodeStatusTopicName, msgBytes); err != nil {
 		return errors.NewError("nodeStatusMessage - publish error: %w", err)
 	}
 
@@ -1659,12 +1243,16 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 }
 
 func (s *Server) handleSubtreeNotification(ctx context.Context, hash *chainhash.Hash) error {
+	if s.settings.P2P.ListenMode == settings.ListenModeListenOnly {
+		return nil
+	}
+
 	var msgBytes []byte
 
 	subtreeMessage := p2p.SubtreeMessage{
 		Hash:       hash.String(),
 		DataHubURL: s.AssetHTTPAddressURL,
-		PeerID:     s.P2PNode.HostID().String(),
+		PeerID:     s.P2PClient.GetID(),
 	}
 
 	msgBytes, err := json.Marshal(subtreeMessage)
@@ -1672,8 +1260,29 @@ func (s *Server) handleSubtreeNotification(ctx context.Context, hash *chainhash.
 		return errors.NewError("subtreeMessage - json marshal error: %w", err)
 	}
 
-	if err := s.P2PNode.Publish(ctx, s.subtreeTopicName, msgBytes); err != nil {
+	if err := s.P2PClient.Publish(ctx, s.subtreeTopicName, msgBytes); err != nil {
 		return errors.NewError("subtreeMessage - publish error: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Server) handlePeerFailureNotification(ctx context.Context, notification *blockchain.Notification) error {
+	// Extract failure details from metadata
+	if notification.Metadata == nil || notification.Metadata.Metadata == nil {
+		s.logger.Warnf("[handlePeerFailureNotification] Received PeerFailure notification with no metadata")
+		return nil
+	}
+
+	peerID := notification.Metadata.Metadata["peer_id"]
+	failureType := notification.Metadata.Metadata["failure_type"]
+	reason := notification.Metadata.Metadata["reason"]
+
+	s.logger.Infof("[handlePeerFailureNotification] Peer %s failed: type=%s, reason=%s", peerID, failureType, reason)
+
+	// For catchup failures, trigger peer switch via sync coordinator
+	if failureType == "catchup" && s.syncCoordinator != nil {
+		s.syncCoordinator.HandleCatchupFailure(reason)
 	}
 
 	return nil
@@ -1691,10 +1300,10 @@ func (s *Server) processBlockchainNotification(ctx context.Context, notification
 	switch notification.Type {
 	case model.NotificationType_Block:
 		return s.handleBlockNotification(ctx, hash) // These handlers return wrapped errors
-	case model.NotificationType_MiningOn:
-		return s.handleMiningOnNotification(ctx)
 	case model.NotificationType_Subtree:
 		return s.handleSubtreeNotification(ctx, hash)
+	case model.NotificationType_PeerFailure:
+		return s.handlePeerFailureNotification(ctx, notification)
 	default:
 		s.logger.Warnf("[processBlockchainNotification] Received unhandled notification type: %s for hash %s", notification.Type, hash.String())
 	}
@@ -1728,7 +1337,8 @@ func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainS
 				continue
 			}
 
-			if syncing {
+			// Process PeerFailure notifications even during sync (needed to switch peers on catchup failure)
+			if syncing && notification.Type != model.NotificationType_PeerFailure {
 				continue
 			}
 
@@ -1817,8 +1427,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	var errs []error
 
 	// Stop the underlying P2P node
-	if s.P2PNode != nil {
-		if err := s.P2PNode.Stop(ctx); err != nil {
+	if s.P2PClient != nil {
+		if err := s.P2PClient.Close(); err != nil {
 			s.logger.Errorf("[Stop] failed to stop P2P node: %v", err)
 			errs = append(errs, err)
 		}
@@ -1938,7 +1548,6 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 
 	// Update peer height if provided
 	if blockMessage.Height > 0 {
-		s.P2PNode.UpdatePeerHeight(peer.ID(blockMessage.PeerID), int32(blockMessage.Height))
 		// Update peer height in registry
 		if peerID, err := peer.Decode(blockMessage.PeerID); err == nil {
 			s.updatePeerHeight(peerID, int32(blockMessage.Height))
@@ -2031,8 +1640,9 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, from string) {
 
 	if s.subtreeKafkaProducerClient != nil { // tests may not set this
 		msg := &kafkamessage.KafkaSubtreeTopicMessage{
-			Hash: hash.String(),
-			URL:  subtreeMessage.DataHubURL,
+			Hash:   hash.String(),
+			URL:    subtreeMessage.DataHubURL,
+			PeerId: subtreeMessage.PeerID,
 		}
 
 		value, err := proto.Marshal(msg)
@@ -2097,102 +1707,49 @@ func (s *Server) extractHost(urlStr string) string {
 	return strings.ToLower(host)
 }
 
-func (s *Server) handleMiningOnTopic(ctx context.Context, m []byte, from string) {
+func (s *Server) handleRejectedTxTopic(_ context.Context, m []byte, from string) {
 	var (
-		miningOnMessage p2p.MiningOnMessage
-		err             error
+		rejectedTxMessage p2p.RejectedTxMessage
+		err               error
 	)
 
-	// decode request
-	miningOnMessage = p2p.MiningOnMessage{}
+	rejectedTxMessage = p2p.RejectedTxMessage{}
 
-	err = json.Unmarshal(m, &miningOnMessage)
+	err = json.Unmarshal(m, &rejectedTxMessage)
 	if err != nil {
-		s.logger.Errorf("[handleMiningOnTopic] json unmarshal error: %v", err)
+		s.logger.Errorf("[handleRejectedTxTopic] json unmarshal error: %v", err)
 		return
 	}
 
-	s.logger.Debugf("[handleMiningOnTopic] got p2p mining on notification for %s from %s (originator: %s)", miningOnMessage.Hash, from, miningOnMessage.PeerID)
+	s.logger.Debugf("[handleRejectedTxTopic] got p2p rejected tx notification for %s from %s (originator: %s, reason: %s)",
+		rejectedTxMessage.TxID, from, rejectedTxMessage.PeerID, rejectedTxMessage.Reason)
 
-	// Send to notification channel first (including our own messages for WebSocket clients)
-	s.logger.Debugf("[handleMiningOnTopic] sending mining_on message to notificationCh for WebSocket clients")
-	s.notificationCh <- &notificationMsg{
-		Timestamp:    time.Now().UTC().Format(isoFormat),
-		Type:         "mining_on",
-		Hash:         miningOnMessage.Hash,
-		BaseURL:      miningOnMessage.DataHubURL,
-		PeerID:       miningOnMessage.PeerID,
-		PreviousHash: miningOnMessage.PreviousHash,
-		Height:       miningOnMessage.Height,
-		Miner:        miningOnMessage.Miner,
-		SizeInBytes:  miningOnMessage.SizeInBytes,
-		TxCount:      miningOnMessage.TxCount,
-	}
-
-	// Skip further processing for our own messages - check both the immediate sender and the original peer
-	if s.isOwnMessage(from, miningOnMessage.PeerID) {
-		s.logger.Debugf("[handleMiningOnTopic] ignoring own mining_on message for %s", miningOnMessage.Hash)
+	if s.isOwnMessage(from, rejectedTxMessage.PeerID) {
+		s.logger.Debugf("[handleRejectedTxTopic] ignoring own rejected tx message for %s", rejectedTxMessage.TxID)
 		return
 	}
 
-	// Update last message time for the sender and originator
-	s.updatePeerLastMessageTime(from, miningOnMessage.PeerID)
+	s.updatePeerLastMessageTime(from, rejectedTxMessage.PeerID)
 
-	// add height to peer info
-	s.P2PNode.UpdatePeerHeight(peer.ID(miningOnMessage.PeerID), int32(miningOnMessage.Height)) //nolint:gosec
-
-	// Update peer height from mining message
-	if peerID, err := peer.Decode(miningOnMessage.PeerID); err == nil {
-		s.updatePeerHeight(peerID, int32(miningOnMessage.Height))
-
-		// Update DataHubURL if provided in the mining-on message
-		// Mining-on messages are gossiped across the network when peers mine new blocks.
-		// Peers we're not directly connected to will have their information forwarded
-		// through the gossip network. We store their DataHubURL here so if we later
-		// establish a direct connection, we already know their API endpoint for syncing.
-		if miningOnMessage.DataHubURL != "" {
-			s.updateDataHubURL(peerID, miningOnMessage.DataHubURL)
-			s.logger.Debugf("[handleMiningOnTopic] Updated DataHub URL %s for peer %s", miningOnMessage.DataHubURL, peerID)
-		}
-	}
-
-	// Store the peer's latest block hash from mining-on message
-	if miningOnMessage.Hash != "" {
-		// Store using the originator's peer ID
-		if peerID, err := peer.Decode(miningOnMessage.PeerID); err == nil {
-			s.updateBlockHash(peerID, miningOnMessage.Hash)
-			s.logger.Debugf("[handleMiningOnTopic] Stored latest block hash %s for peer %s", miningOnMessage.Hash, peerID)
-		}
-		// Also store using the immediate sender for redundancy
-		s.updateBlockHash(peer.ID(from), miningOnMessage.Hash)
-		s.logger.Debugf("[handleMiningOnTopic] Stored latest block hash %s for sender %s", miningOnMessage.Hash, from)
-	}
-
-	// Skip notifications from banned peers
-	if s.shouldSkipBannedPeer(from, "handleMiningOnTopic") {
+	if s.shouldSkipBannedPeer(from, "handleRejectedTxTopic") {
 		return
 	}
 
-	// Check if we should skip during sync
-	if s.shouldSkipDuringSync(from, miningOnMessage.PeerID, miningOnMessage.Height, "handleMiningOnTopic") {
-		return
-	}
-
-	// Mining-on messages should NOT trigger Kafka messages to blockvalidation.
-	// They are only used to store peer URL associations and block hashes.
-	// Block processing should only be triggered by sync messages or block announcements.
+	// Rejected TX messages from other peers are informational only.
+	// They help us understand network state but don't trigger re-broadcasting.
+	// If we wanted to take action (e.g., remove from our mempool), we would do it here.
 }
 
 // GetPeers returns a list of connected peers.
 func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPeersResponse, error) {
 	s.logger.Debugf("GetPeers called")
 
-	if s.P2PNode == nil {
-		return nil, errors.NewError("[GetPeers] P2PNode is not initialised")
+	if s.P2PClient == nil {
+		return nil, errors.NewError("[GetPeers] P2PClient is not initialised")
 	}
 
 	s.logger.Debugf("Creating reply channel")
-	serverPeers := s.P2PNode.ConnectedPeers()
+	serverPeers := s.P2PClient.GetPeers()
 
 	resp := &p2p_api.GetPeersResponse{}
 
@@ -2202,22 +1759,16 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 		}
 
 		// ignore localhost
-		if sp.ID == s.P2PNode.HostID() {
+		if sp.ID == s.P2PClient.GetID() {
 			continue
 		}
 
 		// ignore bootstrap server
-		if contains(s.settings.P2P.BootstrapAddresses, sp.ID.String()) {
+		if contains(s.settings.P2P.BootstrapAddresses, sp.ID) {
 			continue
 		}
 
-		banScore, _, _ := s.banManager.GetBanScore(sp.ID.String())
-
-		// convert connection time to unix timestamp
-		var connTime int64
-		if sp.ConnTime != nil {
-			connTime = sp.ConnTime.Unix()
-		}
+		banScore, _, _ := s.banManager.GetBanScore(sp.ID)
 
 		var addr string
 
@@ -2225,18 +1776,15 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 			// For GetPeers API, we always return connected peers regardless of address type
 			// The SharePrivateAddresses setting only controls what we advertise to other peers,
 			// not what we report in our own peer list
-			addr = sp.Addrs[0].String()
+			addr = sp.Addrs[0]
 		}
 
 		// Include all connected peers
 		if addr != "" {
 			resp.Peers = append(resp.Peers, &p2p_api.Peer{
-				Id:             sp.ID.String(),
-				Addr:           addr,
-				StartingHeight: sp.StartingHeight,
-				CurrentHeight:  sp.CurrentHeight,
-				Banscore:       int32(banScore), //nolint:gosec
-				ConnTime:       connTime,
+				Id:       sp.ID,
+				Addr:     addr,
+				Banscore: int32(banScore), //nolint:gosec
 			})
 		}
 	}
@@ -2307,165 +1855,6 @@ func (s *Server) AddBanScore(ctx context.Context, req *p2p_api.AddBanScoreReques
 	return &p2p_api.AddBanScoreResponse{Ok: true}, nil
 }
 
-// ConnectPeer connects to a specific peer using the provided multiaddr
-func (s *Server) ConnectPeer(ctx context.Context, req *p2p_api.ConnectPeerRequest) (*p2p_api.ConnectPeerResponse, error) {
-	s.logger.Infof("[ConnectPeer] Attempting to connect to peer: %s", req.PeerAddress)
-
-	// Check if P2P node is available
-	if s.P2PNode == nil {
-		return &p2p_api.ConnectPeerResponse{
-			Success: false,
-			Error:   "P2P node not available",
-		}, nil
-	}
-
-	// Use the P2PNode's ConnectToPeer method
-	if err := s.P2PNode.ConnectToPeer(ctx, req.PeerAddress); err != nil {
-		s.logger.Errorf("[ConnectPeer] Failed to connect to peer %s: %v", req.PeerAddress, err)
-		return &p2p_api.ConnectPeerResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
-	}
-
-	s.logger.Infof("[ConnectPeer] Successfully connected to peer: %s", req.PeerAddress)
-	return &p2p_api.ConnectPeerResponse{
-		Success: true,
-	}, nil
-}
-
-// DisconnectPeer disconnects from a specific peer
-func (s *Server) DisconnectPeer(ctx context.Context, req *p2p_api.DisconnectPeerRequest) (*p2p_api.DisconnectPeerResponse, error) {
-	s.logger.Infof("[DisconnectPeer] Attempting to disconnect from peer: %s", req.PeerId)
-
-	// Check if P2P node is available
-	if s.P2PNode == nil {
-		return &p2p_api.DisconnectPeerResponse{
-			Success: false,
-			Error:   "P2P node not available",
-		}, nil
-	}
-
-	// Parse the peer ID
-	peerID, err := peer.Decode(req.PeerId)
-	if err != nil {
-		s.logger.Errorf("[DisconnectPeer] Invalid peer ID %s: %v", req.PeerId, err)
-		return &p2p_api.DisconnectPeerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("invalid peer ID: %v", err),
-		}, nil
-	}
-
-	// Remove peer from SyncCoordinator
-	// Remove peer from registry
-	s.removePeer(peerID)
-
-	// Clean up stored peer data (handled by removePeer which removes from registry)
-
-	// Use the P2PNode's DisconnectPeer method
-	if err := s.P2PNode.DisconnectPeer(ctx, peerID); err != nil {
-		s.logger.Errorf("[DisconnectPeer] Failed to disconnect from peer %s: %v", req.PeerId, err)
-		return &p2p_api.DisconnectPeerResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
-	}
-
-	s.logger.Infof("[DisconnectPeer] Successfully disconnected from peer: %s", req.PeerId)
-	return &p2p_api.DisconnectPeerResponse{
-		Success: true,
-	}, nil
-}
-
-// registerRemainingHandlers registers all topic handlers except the block handler (which is registered during readiness check)
-func (s *Server) registerRemainingHandlers(ctx context.Context) error {
-	var registerErrors []string
-
-	// register subtree topic handler
-	if err := s.P2PNode.SetTopicHandler(ctx, s.subtreeTopicName, s.handleSubtreeTopic); err != nil {
-		s.logger.Errorf("[Server] Error setting subtree topic handler: %v", err)
-		registerErrors = append(registerErrors, fmt.Sprintf("subtree:%v", err))
-	} else {
-		s.logger.Debugf("[Server] Successfully registered subtree topic handler")
-	}
-
-	// register mining-on topic handler
-	if err := s.P2PNode.SetTopicHandler(ctx, s.miningOnTopicName, s.handleMiningOnTopic); err != nil {
-		s.logger.Errorf("[Server] Error setting mining-on topic handler: %v", err)
-		registerErrors = append(registerErrors, fmt.Sprintf("mining-on:%v", err))
-	} else {
-		s.logger.Debugf("[Server] Successfully registered mining-on topic handler")
-	}
-
-	// register handshake topic handler
-	if err := s.P2PNode.SetTopicHandler(ctx, s.handshakeTopicName, s.handleHandshakeTopic); err != nil {
-		s.logger.Errorf("[Server] Error setting handshake topic handler: %v", err)
-		registerErrors = append(registerErrors, fmt.Sprintf("handshake:%v", err))
-	} else {
-		s.logger.Debugf("[Server] Successfully registered handshake topic handler")
-	}
-	// register node-status topic handler
-	if err := s.P2PNode.SetTopicHandler(ctx, s.nodeStatusTopicName, s.handleNodeStatusTopic); err != nil {
-		s.logger.Errorf("[Server] Error setting node-status topic handler: %v", err)
-		registerErrors = append(registerErrors, fmt.Sprintf("node-status:%v", err))
-	} else {
-		s.logger.Debugf("[Server] Successfully registered node-status topic handler")
-	}
-
-	// if any errors occurred, return them as a combined error
-	if len(registerErrors) > 0 {
-		return errors.NewServiceError("failed to register handlers: %s", strings.Join(registerErrors, "; "))
-	}
-
-	return nil
-}
-
-// waitForP2PNodeReadiness polls until the P2P node is ready to register handlers or times out
-func (s *Server) waitForP2PNodeReadiness(ctx context.Context) error {
-	const (
-		maxWaitTime     = 10 * time.Second
-		initialInterval = 100 * time.Millisecond
-		maxInterval     = 500 * time.Millisecond
-		factor          = 1.5 // backoff multiplier
-	)
-
-	startTime := time.Now()
-	timeout := time.After(maxWaitTime)
-	interval := initialInterval
-	attempts := 0
-
-	for {
-		attempts++
-		s.logger.Debugf("[Server] Attempt %d: Checking if P2P node is ready for handler registration", attempts)
-
-		// check if topics are ready by attempting to register the block topic handler
-		err := s.P2PNode.SetTopicHandler(ctx, s.blockTopicName, s.handleBlockTopic)
-		if err == nil {
-			s.logger.Infof("[Server] P2P node ready for handler registration after %d attempts (%.2f seconds)",
-				attempts, time.Since(startTime).Seconds())
-			return nil
-		}
-
-		s.logger.Debugf("[Server] P2P node not ready yet (attempt %d): %v", attempts, err)
-
-		// use select to handle timeout and context cancellation
-		select {
-		case <-time.After(interval):
-			// increase the interval for next attempt (with exponential backoff)
-			interval = time.Duration(float64(interval) * factor)
-			if interval > maxInterval {
-				interval = maxInterval
-			}
-		case <-timeout:
-			// fallback to ensure we don't hang forever
-			s.logger.Warnf("[Server] Timeout after %d attempts waiting for P2P node to be ready, proceeding anyway", attempts)
-			return nil // continue despite timeout
-		case <-ctx.Done():
-			return errors.NewServiceError("context canceled while waiting for P2P node to be ready", ctx.Err())
-		}
-	}
-}
-
 func (s *Server) listenForBanEvents(ctx context.Context) {
 	for {
 		select {
@@ -2504,23 +1893,15 @@ func (s *Server) handleBanEvent(ctx context.Context, event BanEvent) {
 // disconnectBannedPeerByID disconnects a specific peer by their PeerID
 func (s *Server) disconnectBannedPeerByID(ctx context.Context, peerID peer.ID, reason string) {
 	// Check if we're connected to this peer
-	peers := s.P2PNode.ConnectedPeers()
+	peers := s.P2PClient.GetPeers()
 
 	for _, peer := range peers {
-		if peer.ID == peerID {
+		if peer.ID == peerID.String() {
 			s.logger.Infof("[disconnectBannedPeerByID] Disconnecting banned peer: %s (reason: %s)", peerID, reason)
 
 			// Remove peer from SyncCoordinator before disconnecting
 			// Remove peer from registry
 			s.removePeer(peerID)
-
-			// Block hash is cleared when peer is removed from registry
-
-			// Disconnect the peer
-			err := s.P2PNode.DisconnectPeer(ctx, peerID)
-			if err != nil {
-				s.logger.Errorf("[disconnectBannedPeerByID] Error disconnecting peer %s: %v", peerID, err)
-			}
 
 			return
 		}
@@ -2686,7 +2067,15 @@ func (h *myBanEventHandler) OnPeerBanned(peerID string, until time.Time, reason 
 		return
 	}
 
-	ids := h.server.P2PNode.GetPeerIPs(pid)
+	var ids []string
+	allPeers := h.server.P2PClient.GetPeers()
+	for _, p := range allPeers {
+		if p.ID == pid.String() {
+			h.server.logger.Infof("Found connected peer %s for banning", peerID)
+			ids = append(ids, p.Addrs...)
+			break
+		}
+	}
 
 	// add to ban list
 	for _, id := range ids {
@@ -2700,14 +2089,6 @@ func (h *myBanEventHandler) OnPeerBanned(peerID string, until time.Time, reason 
 	// Remove peer from SyncCoordinator before disconnecting
 	// Remove peer from registry
 	h.server.removePeer(pid)
-
-	// Clean up stored peer data (handled by removePeer which removes from registry)
-
-	if h.server.P2PNode != nil {
-		if err := h.server.P2PNode.DisconnectPeer(context.Background(), pid); err != nil {
-			h.server.logger.Warnf("Failed to disconnect banned peer %s: %v", peerID, err)
-		}
-	}
 }
 
 // contains checks if a slice of strings contains a specific string.
@@ -3106,7 +2487,7 @@ func (s *Server) enforceMapSizeLimit(m *sync.Map, maxSize int, mapType string) {
 
 // isOwnMessage checks if a message is from this node
 func (s *Server) isOwnMessage(from string, peerID string) bool {
-	return from == s.P2PNode.HostID().String() || peerID == s.P2PNode.HostID().String()
+	return from == s.P2PClient.GetID() || peerID == s.P2PClient.GetID()
 }
 
 // shouldSkipBannedPeer checks if we should skip a message from a banned peer

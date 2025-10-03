@@ -778,6 +778,23 @@ type ClientI interface {
 	// - Error if the catch-up process fails
 	CatchUpBlocks(ctx context.Context) error
 
+	// ReportPeerFailure notifies the blockchain service about peer download failures.
+	//
+	// This method allows other services (like block validation, subtree validation) to report
+	// when a peer fails to provide data correctly. The blockchain service broadcasts this to
+	// subscribers (like P2P) who can take action such as switching to a different peer.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - hash: Hash of the block/subtree/tx being processed when the failure occurred
+	// - peerID: Identifier of the failing peer
+	// - failureType: Type of failure (e.g., "catchup", "subtree", "block")
+	// - reason: Description of the failure
+	//
+	// Returns:
+	// - Error if the notification fails
+	ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error
+
 	// LegacySync performs a legacy synchronization process.
 	//
 	// This method initiates a blockchain synchronization using the legacy synchronization

@@ -893,28 +893,6 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 		MiningCandidate: miningCandidate,
 	}, jobTTL) // create a new job with a TTL, will be cleaned up automatically
 
-	go func() {
-		// decouple the tracing context to not cancel the context when the subtree DAH is being saved in the background
-		decoupledCtx, _, endSpan := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleMiningOn")
-		defer endSpan()
-
-		previousHash, err := chainhash.NewHash(miningCandidate.PreviousHash)
-		if err != nil {
-			ba.logger.Errorf("failed to convert previous hash: %s", err)
-		}
-
-		if err = ba.blockchainClient.SendNotification(decoupledCtx, &blockchain.Notification{
-			Type:     model.NotificationType_MiningOn,
-			Hash:     previousHash[:],
-			Base_URL: "",
-			Metadata: &blockchain.NotificationMetadata{
-				Metadata: nil,
-			},
-		}); err != nil {
-			ba.logger.Errorf("failed to send mining on notification: %s", err)
-		}
-	}()
-
 	if includeSubtreeHashes {
 		miningCandidate.SubtreeHashes = make([][]byte, len(subtrees))
 		for i, subtree := range subtrees {

@@ -4372,6 +4372,9 @@ func (m *mockBlockchainClient) GetBlockLocator(ctx context.Context, blockHeaderH
 func (m *mockBlockchainClient) LocateBlockHeaders(ctx context.Context, locator []*chainhash.Hash, hashStop *chainhash.Hash, maxHashes uint32) ([]*model.BlockHeader, error) {
 	return nil, nil
 }
+func (m *mockBlockchainClient) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
+	return nil
+}
 
 // TestHandleFreezeComprehensive tests the handleFreeze handler
 func TestHandleFreezeComprehensive(t *testing.T) {

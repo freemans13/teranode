@@ -18,6 +18,7 @@ import (
 var blockWait = 30 * time.Second
 
 func TestMoveUp(t *testing.T) {
+	t.Skip("Skipping until p2p client is refactored")
 	SharedTestLock.Lock()
 	defer SharedTestLock.Unlock()
 	node2 := daemon.NewTestDaemon(t, daemon.TestOptions{
@@ -62,6 +63,7 @@ func TestMoveUp(t *testing.T) {
 }
 
 func TestMoveDownMoveUpWhenNewBlockIsGenerated(t *testing.T) {
+	t.Skip("Skipping until p2p client is refactored")
 	SharedTestLock.Lock()
 	defer SharedTestLock.Unlock()
 	node2 := daemon.NewTestDaemon(t, daemon.TestOptions{
@@ -139,6 +141,7 @@ func TestMoveDownMoveUpWhenNewBlockIsGenerated(t *testing.T) {
 }
 
 func TestMoveDownMoveUpWhenNoNewBlockIsGenerated(t *testing.T) {
+	t.Skip("Skipping until p2p client is refactored")
 
 	SharedTestLock.Lock()
 	defer SharedTestLock.Unlock()

@@ -37,9 +37,10 @@ enum NotificationType {
   PING = 0;
   Subtree = 1;
   Block = 2;
-  MiningOn = 3;
+  NotUsed = 3; // Deprecated, was previously used for MiningOn
   FSMState = 4;
   BlockSubtreesSet = 5;
+  PeerFailure = 6;  // Peer failed to provide data (catchup, subtree, block, etc)
 }
 
 // swagger:model NotificationMetadata

@@ -166,9 +166,9 @@ func (s *Server) createPingMessage(baseURL string) (*notificationMsg, error) {
 		BaseURL:   baseURL,
 	}
 
-	// Add PeerID if P2PNode is available
-	if s.P2PNode != nil {
-		msg.PeerID = s.P2PNode.HostID().String()
+	// Add PeerID if P2PClient is available
+	if s.P2PClient != nil {
+		msg.PeerID = s.P2PClient.GetID()
 	}
 
 	return msg, nil

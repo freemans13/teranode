@@ -919,6 +919,9 @@ func (m *MockBlockchainClient) GetBlockLocator(ctx context.Context, blockHeaderH
 func (m *MockBlockchainClient) LocateBlockHeaders(ctx context.Context, locator []*chainhash.Hash, hashStop *chainhash.Hash, maxHashes uint32) ([]*model.BlockHeader, error) {
 	return nil, nil
 }
+func (m *MockBlockchainClient) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
+	return nil
+}
 
 // MockStore implements basic store interfaces for testing
 type MockBlobStore struct {

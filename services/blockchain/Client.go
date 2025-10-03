@@ -1664,6 +1664,23 @@ func (c *Client) CatchUpBlocks(ctx context.Context) error {
 	return nil
 }
 
+// ReportPeerFailure reports a peer download failure to the blockchain service.
+func (c *Client) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
+	req := &blockchain_api.ReportPeerFailureRequest{
+		Hash:        hash[:],
+		PeerId:      peerID,
+		FailureType: failureType,
+		Reason:      reason,
+	}
+
+	_, err := c.client.ReportPeerFailure(ctx, req)
+	if err != nil {
+		return errors.UnwrapGRPC(err)
+	}
+
+	return nil
+}
+
 // LegacySync sends a legacy sync FSM event to the blockchain service.
 // This method initiates a legacy synchronization process by transitioning the
 // blockchain service's finite state machine to the LEGACY_SYNCING state, which

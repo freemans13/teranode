@@ -424,6 +424,10 @@ func (c *LocalClient) CatchUpBlocks(ctx context.Context) error {
 	return nil
 }
 
+func (c *LocalClient) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
+	return nil
+}
+
 func (c *LocalClient) LegacySync(ctx context.Context) error {
 	return nil
 }

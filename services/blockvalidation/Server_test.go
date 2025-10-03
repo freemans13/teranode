@@ -742,15 +742,6 @@ func TestServer_blockHandler_processBlockFound_happyPath(t *testing.T) {
 		URL:  url,
 	}
 
-	msgBytes, err := proto.Marshal(kafkaMsg)
-	require.NoError(t, err)
-
-	msg := &kafka.KafkaMessage{
-		ConsumerMessage: sarama.ConsumerMessage{
-			Value: msgBytes,
-		},
-	}
-
 	go func() {
 		found := <-blockFoundCh
 		hash, err := chainhash.NewHashFromStr(hashStr)
@@ -761,7 +752,7 @@ func TestServer_blockHandler_processBlockFound_happyPath(t *testing.T) {
 		found.errCh <- nil
 	}()
 
-	err = server.blockHandler(msg)
+	err := server.blockHandler(kafkaMsg)
 	assert.NoError(t, err)
 }
 

@@ -23,14 +23,14 @@ import (
 func TestP2PWebSocketIntegration(t *testing.T) {
 	t.SkipNow()
 
-	// Create a mock P2PNode for testing
-	mockP2PNode := new(MockServerP2PNode)
+	// Create a mock P2PClient for testing
+	mockP2PNode := new(MockServerP2PClient)
 	testPeerID, _ := peer.Decode("12D3KooWBPqTBhshqRZMKZtqb5sfgckM9JYkWDR7eW5kSPEKwKCW")
-	mockP2PNode.On("HostID").Return(testPeerID)
+	mockP2PNode.On("GetID").Return(testPeerID)
 
-	// Create server with the mock P2PNode
+	// Create server with the mock P2PClient
 	server := &Server{
-		P2PNode:             mockP2PNode,
+		P2PClient:           mockP2PNode,
 		logger:              ulogger.New("test-server"),
 		AssetHTTPAddressURL: "http://current-node.test",
 		settings: &settings.Settings{
@@ -177,14 +177,14 @@ func TestP2PWebSocketIntegration(t *testing.T) {
 
 // TestP2PWebSocketCurrentNodeFirst specifically tests that the current node's status is always sent first
 func TestP2PWebSocketCurrentNodeFirst(t *testing.T) {
-	// Create a mock P2PNode
-	mockP2PNode := new(MockServerP2PNode)
+	// Create a mock P2PClient
+	mockP2PNode := new(MockServerP2PClient)
 	currentNodePeerID, err := peer.Decode("12D3KooWL8qb3L8nKPjDtQmJU8jge5Qspsn6YLSBei9MsbTjJDr8")
 	require.NoError(t, err, "Should decode peer ID without error")
-	mockP2PNode.On("HostID").Return(currentNodePeerID)
+	mockP2PNode.On("GetID").Return(currentNodePeerID)
 
 	server := &Server{
-		P2PNode:             mockP2PNode,
+		P2PClient:           mockP2PNode,
 		logger:              ulogger.New("test-server"),
 		AssetHTTPAddressURL: "http://current.test",
 		settings: &settings.Settings{
@@ -248,24 +248,24 @@ func TestP2PWebSocketCurrentNodeFirst(t *testing.T) {
 
 // TestP2PWebSocketMessageStructure tests that the message structure is correct
 func TestP2PWebSocketMessageStructure(t *testing.T) {
-	// Create a mock P2PNode
-	mockP2PNode := new(MockServerP2PNode)
+	// Create a mock P2PClient
+	mockP2PNode := new(MockServerP2PClient)
 	testPeerID, err := peer.Decode("12D3KooWBPqTBhshqRZMKZtqb5sfgckM9JYkWDR7eW5kSPEKwKCW")
 	require.NoError(t, err, "Should decode peer ID without error")
 	require.NotEmpty(t, testPeerID.String(), "Test peer ID should not be empty")
 
 	// Since peerID field is private, we must rely on the mock return value
-	mockP2PNode.On("HostID").Return(testPeerID)
+	mockP2PNode.On("GetID").Return(testPeerID)
 
 	// Verify the mock is working
-	actualPeerID := mockP2PNode.HostID()
-	t.Logf("Mock returned peer ID: %v (string: %s)", actualPeerID, actualPeerID.String())
-	require.Equal(t, testPeerID, actualPeerID, "Mock should return the test peer ID")
-	require.Equal(t, "12D3KooWBPqTBhshqRZMKZtqb5sfgckM9JYkWDR7eW5kSPEKwKCW", actualPeerID.String(), "Peer ID string should match")
+	actualPeerID := mockP2PNode.GetID()
+	t.Logf("Mock returned peer ID: %v (string: %s)", actualPeerID, actualPeerID)
+	require.Equal(t, testPeerID.String(), actualPeerID, "Mock should return the test peer ID")
+	require.Equal(t, "12D3KooWBPqTBhshqRZMKZtqb5sfgckM9JYkWDR7eW5kSPEKwKCW", actualPeerID, "Peer ID string should match")
 
 	// Create server
 	server := &Server{
-		P2PNode:             mockP2PNode,
+		P2PClient:           mockP2PNode,
 		logger:              ulogger.New("test-server"),
 		AssetHTTPAddressURL: "http://structure-test.com",
 		settings: &settings.Settings{
