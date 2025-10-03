@@ -156,8 +156,6 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 
 			data := make([]SubtreeTx, 0, limit)
 
-			var txMeta *meta.Data
-
 			for i := offset; i < offset+limit; i++ {
 				if i >= subtree.Length() {
 					break
@@ -171,6 +169,8 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 					Fee:   int(node.Fee),
 					Size:  int(node.SizeInBytes),
 				}
+
+				var txMeta *meta.Data
 
 				if subtreepkg.CoinbasePlaceholderHash.Equal(node.Hash) {
 					txMeta = &meta.Data{

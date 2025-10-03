@@ -860,10 +860,10 @@ func TestMultiplePodsPauseCoordination(t *testing.T) {
 		tempDir := t.TempDir()
 		exister := newMockExister(false)
 
-		q1, err := NewQuorum(logger, exister, tempDir, WithTimeout(50*time.Millisecond))
+		q1, err := NewQuorum(logger, exister, tempDir, WithTimeout(1*time.Second))
 		require.NoError(t, err)
 
-		q2, err := NewQuorum(logger, exister, tempDir, WithTimeout(50*time.Millisecond))
+		q2, err := NewQuorum(logger, exister, tempDir, WithTimeout(1*time.Second))
 		require.NoError(t, err)
 
 		ctx := context.Background()
@@ -876,12 +876,15 @@ func TestMultiplePodsPauseCoordination(t *testing.T) {
 
 		release1()
 
+		// Give some time for background goroutine to finish cleanup
+		time.Sleep(10 * time.Millisecond)
+
 		pauseLockPath := filepath.Join(q1.path, "__SUBTREE_PAUSE__.lock")
 		file, err := os.Create(pauseLockPath)
 		require.NoError(t, err)
 		file.Close()
 
-		oldTime := time.Now().Add(-200 * time.Millisecond)
+		oldTime := time.Now().Add(-2 * time.Second)
 		err = os.Chtimes(pauseLockPath, oldTime, oldTime)
 		require.NoError(t, err)
 

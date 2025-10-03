@@ -64,7 +64,7 @@ func (l *VerboseTestLogger) Errorf(format string, args ...interface{}) {
 	defer l.mutex.RUnlock()
 
 	if l.t != nil {
-		l.t.Logf("[ERROR] "+format, args...)
+		l.t.Logf("ERR_LEVEL "+format, args...)
 	}
 }
 
@@ -73,6 +73,6 @@ func (l *VerboseTestLogger) Fatalf(format string, args ...interface{}) {
 	defer l.mutex.RUnlock()
 
 	if l.t != nil {
-		l.t.Fatalf("[FATAL] "+format, args...)
+		l.t.Fatalf("FATAL_LEVEL "+format, args...)
 	}
 }
