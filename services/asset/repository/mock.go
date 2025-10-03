@@ -288,8 +288,18 @@ func (m *Mock) GetBlockHeader(_ context.Context, hash *chainhash.Hash) (*model.B
 	return args.Get(0).(*model.BlockHeader), args.Get(1).(*model.BlockHeaderMeta), args.Error(2)
 }
 
-func (m *Mock) GetBlockLocator(_ context.Context, _ *chainhash.Hash, _ uint32) ([]*chainhash.Hash, error) {
-	return nil, nil
+func (m *Mock) GetBlockLocator(_ context.Context, hash *chainhash.Hash, height uint32) ([]*chainhash.Hash, error) {
+	args := m.Called(hash, height)
+
+	if args.Error(1) != nil {
+		return nil, args.Error(1)
+	}
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*chainhash.Hash), args.Error(1)
 }
 
 func (m *Mock) GetBlockByID(_ context.Context, id uint64) (*model.Block, error) {
