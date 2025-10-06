@@ -2548,80 +2548,11 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#8-configuration-options-settings-flags" class="md-nav__link">
+  <a href="#8-configuration" class="md-nav__link">
     <span class="md-ellipsis">
-      8. Configuration options (settings flags)
+      8. Configuration
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="8. Configuration options (settings flags)">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#81-configuration-categories" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.1 Configuration Categories
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#82-deployment-architecture-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.2 Deployment Architecture Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#83-network-communication-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.3 Network &amp; Communication Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#84-performance-throughput-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.4 Performance &amp; Throughput Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#85-kafka-integration-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.5 Kafka Integration Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#86-validation-rules-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.6 Validation Rules Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#87-monitoring-debugging-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.7 Monitoring &amp; Debugging Settings
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -4708,80 +4639,11 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#8-configuration-options-settings-flags" class="md-nav__link">
+  <a href="#8-configuration" class="md-nav__link">
     <span class="md-ellipsis">
-      8. Configuration options (settings flags)
+      8. Configuration
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="8. Configuration options (settings flags)">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#81-configuration-categories" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.1 Configuration Categories
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#82-deployment-architecture-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.2 Deployment Architecture Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#83-network-communication-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.3 Network &amp; Communication Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#84-performance-throughput-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.4 Performance &amp; Throughput Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#85-kafka-integration-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.5 Kafka Integration Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#86-validation-rules-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.6 Validation Rules Settings
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#87-monitoring-debugging-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      8.7 Monitoring &amp; Debugging Settings
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -4985,10 +4847,8 @@ However, the Validator can also be started as a service, allowing to interact wi
 <h3 id="23-validating-the-transaction">2.3. Validating the Transaction</h3>
 <p>For every transaction received, Teranode must validate:</p>
 <ul>
-<li>All inputs against the existing UTXO-set, verifying if the input(s) can be spent,<ul>
+<li>All inputs against the existing UTXO-set, verifying if the input(s) can be spent,</li>
 <li>Notice that if Teranode detects a double-spend, the transaction that was received first must be considered the valid transaction.</li>
-</ul>
-</li>
 <li>Bitcoin consensus rules,</li>
 <li>Local policies (if any),</li>
 <li>Whether the script execution returns <code>true</code>.</li>
@@ -5113,7 +4973,7 @@ However, the Validator can also be started as a service, allowing to interact wi
 </li>
 <li>
 <p>A transaction must be final, meaning that either of the following conditions is met:</p>
-<ul>
+</li>
 <li>
 <p>The sequence number in all inputs is equal to 0xffffffff, or</p>
 </li>
@@ -5143,8 +5003,6 @@ However, the Validator can also be started as a service, allowing to interact wi
 </li>
 <li>
 <p>A node must not be able to spend a confiscated (re-assigned) transaction until 1,000 blocks after the transaction was re-assigned (confiscation maturity). The difference between block height and height at which the transaction was re-assigned must not be less than one thousand.</p>
-</li>
-</ul>
 </li>
 </ul>
 <h4 id="231-consensus-rules-vs-policy-checks">2.3.1. Consensus Rules vs Policy Checks</h4>
@@ -5308,21 +5166,23 @@ However, the Validator can also be started as a service, allowing to interact wi
 <li>The Server receives a validation request and calls the <code>Validate</code> method on the Validator struct.</li>
 <li>
 <p>If the transaction is valid:</p>
-<ul>
-<li>The Validator marks the transaction's input UTXOs as spent in the UTXO Store.</li>
+</li>
+<li>
+<p>The Validator marks the transaction's input UTXOs as spent in the UTXO Store.</p>
+</li>
 <li>The Validator registers the new transaction in the UTXO Store.</li>
 <li>The Validator sends transaction metadata to the Subtree Validation Service via Kafka topic (<code>txmeta</code>).</li>
 <li>The Validator sends the transaction to the Block Assembly Service via direct gRPC calls.</li>
-<li>The Validator stores the new UTXOs generated by the transaction in the UTXO Store.</li>
-</ul>
+<li>
+<p>The Validator stores the new UTXOs generated by the transaction in the UTXO Store.</p>
 </li>
 <li>
 <p>If the transaction is invalid:</p>
-<ul>
-<li>The Server sends invalid transaction notifications to all P2P Service subscribers.</li>
-<li>The rejected Tx is not stored or tracked in any store, and it is simply discarded.</li>
-</ul>
 </li>
+<li>
+<p>The Server sends invalid transaction notifications to all P2P Service subscribers.</p>
+</li>
+<li>The rejected Tx is not stored or tracked in any store, and it is simply discarded.</li>
 </ul>
 <p>We can see the submission to the Subtree Validation Service here:</p>
 <p><img alt="tx_validation_subtree_validation.svg" src="../img/plantuml/validator/tx_validation_subtree_validation.svg" /></p>
@@ -5484,260 +5344,8 @@ However, the Validator can also be started as a service, allowing to interact wi
 <div class="highlight"><pre><span></span><code><span class="nv">SETTINGS_CONTEXT</span><span class="o">=</span>dev.<span class="o">[</span>YOUR_USERNAME<span class="o">]</span><span class="w"> </span>go<span class="w"> </span>run<span class="w"> </span>-Validator<span class="o">=</span><span class="m">1</span>
 </code></pre></div>
 <p>Please refer to the <a href="../../../howto/locallyRunningServices/">Locally Running Services Documentation</a> document for more information on running the Validator locally.</p>
-<h2 id="8-configuration-options-settings-flags">8. Configuration options (settings flags)</h2>
-<p>The TX Validator service relies on a set of configuration settings that control its behavior, performance, and integration with other services. This section provides a comprehensive overview of these settings, organized by functional category, along with their impacts, dependencies, and recommended configurations for different deployment scenarios.</p>
-<h3 id="81-configuration-categories">8.1 Configuration Categories</h3>
-<p>TX Validator service settings can be organized into the following functional categories:</p>
-<ol>
-<li><strong>Deployment Architecture</strong>: Settings that determine how the validator is deployed and integrated</li>
-<li><strong>Network &amp; Communication</strong>: Settings that control network binding and API endpoints</li>
-<li><strong>Performance &amp; Throughput</strong>: Settings that affect transaction processing performance</li>
-<li><strong>Kafka Integration</strong>: Settings for message-based communication</li>
-<li><strong>Validation Rules</strong>: Settings that control transaction validation policies</li>
-<li><strong>Monitoring &amp; Debugging</strong>: Settings for observability and troubleshooting</li>
-</ol>
-<h3 id="82-deployment-architecture-settings">8.2 Deployment Architecture Settings</h3>
-<p>These settings fundamentally change how the validator operates within the system architecture.</p>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Description</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>useLocalValidator</code></td>
-<td>bool</td>
-<td><code>false</code></td>
-<td>Controls whether validation is performed locally or via remote service</td>
-<td>Significantly affects system architecture, latency, and deployment model</td>
-</tr>
-<tr>
-<td><code>blockassembly_disabled</code></td>
-<td>bool</td>
-<td><code>false</code></td>
-<td>Controls whether validator integrates with block assembly service</td>
-<td>Critical for mining operations - when disabled, validated transactions are not sent to block assembly</td>
-</tr>
-</tbody>
-</table>
-<h3 id="83-network-communication-settings">8.3 Network &amp; Communication Settings</h3>
-<p>These settings control how the validator communicates over the network.</p>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Description</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>validator_grpcAddress</code></td>
-<td>string</td>
-<td><code>"localhost:8081"</code></td>
-<td>Address for connecting to the validator gRPC service</td>
-<td>Determines how other services connect to the validator</td>
-</tr>
-<tr>
-<td><code>validator_grpcListenAddress</code></td>
-<td>string</td>
-<td><code>":8081"</code></td>
-<td>Address on which the validator gRPC server listens</td>
-<td>Controls network binding for incoming validation requests</td>
-</tr>
-<tr>
-<td><code>validator_httpListenAddress</code></td>
-<td>string</td>
-<td><code>""</code></td>
-<td>Address on which the HTTP API server listens</td>
-<td>Enables HTTP-based validation requests when set</td>
-</tr>
-<tr>
-<td><code>validator_httpAddress</code></td>
-<td>*url.URL</td>
-<td><code>nil</code></td>
-<td>URL for connecting to the validator HTTP API</td>
-<td>Determines how other services connect to the HTTP interface</td>
-</tr>
-<tr>
-<td><code>validator_httpRateLimit</code></td>
-<td>int</td>
-<td><code>1024</code></td>
-<td>Maximum number of HTTP requests per second</td>
-<td>Prevents resource exhaustion from excessive requests</td>
-</tr>
-</tbody>
-</table>
-<h3 id="84-performance-throughput-settings">8.4 Performance &amp; Throughput Settings</h3>
-<p>These settings control how efficiently transactions are processed.</p>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Description</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>validator_sendBatchSize</code></td>
-<td>int</td>
-<td><code>100</code></td>
-<td>Number of transactions to accumulate before batch processing</td>
-<td>Balances throughput against latency for transaction processing</td>
-</tr>
-<tr>
-<td><code>validator_sendBatchTimeout</code></td>
-<td>int</td>
-<td><code>2</code></td>
-<td>Maximum time (milliseconds) to wait before processing a partial batch</td>
-<td>Ensures timely processing of transactions even when volume is low</td>
-</tr>
-<tr>
-<td><code>validator_sendBatchWorkers</code></td>
-<td>int</td>
-<td><code>10</code></td>
-<td>Number of worker goroutines for batch send operations</td>
-<td>Controls parallelism for outbound transaction processing</td>
-</tr>
-<tr>
-<td><code>validator_blockvalidation_delay</code></td>
-<td>int</td>
-<td><code>0</code></td>
-<td>Artificial delay (milliseconds) introduced before block validation</td>
-<td>Can be used for testing or throttling validation operations</td>
-</tr>
-<tr>
-<td><code>validator_blockvalidation_maxRetries</code></td>
-<td>int</td>
-<td><code>5</code></td>
-<td>Maximum number of retries for failed block validations</td>
-<td>Affects resilience against transient failures</td>
-</tr>
-<tr>
-<td><code>validator_blockvalidation_retrySleep</code></td>
-<td>string</td>
-<td><code>"2s"</code></td>
-<td>Time to wait between block validation retry attempts</td>
-<td>Controls backoff strategy for failed validations</td>
-</tr>
-</tbody>
-</table>
-<h3 id="85-kafka-integration-settings">8.5 Kafka Integration Settings</h3>
-<p>These settings control message-based communication via Kafka.</p>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Description</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>validator_kafkaWorkers</code></td>
-<td>int</td>
-<td><code>0</code></td>
-<td>Number of worker goroutines for Kafka message processing</td>
-<td>Affects concurrency and throughput for Kafka-based transaction handling</td>
-</tr>
-<tr>
-<td><code>kafka_txmetaConfig</code></td>
-<td>URL</td>
-<td><code>""</code></td>
-<td>URL for the Kafka configuration for transaction metadata</td>
-<td>Configures how transaction metadata is published to Kafka for subtree validation</td>
-</tr>
-<tr>
-<td><code>kafka_rejectedTxConfig</code></td>
-<td>URL</td>
-<td><code>""</code></td>
-<td>URL for the Kafka configuration for rejected transactions</td>
-<td>Configures how rejected transaction information is published to P2P notification</td>
-</tr>
-<tr>
-<td><code>validator_kafka_maxMessageBytes</code></td>
-<td>int</td>
-<td><code>1048576</code></td>
-<td>Maximum size of Kafka messages in bytes</td>
-<td>Limits the size of transactions that can be processed via Kafka</td>
-</tr>
-</tbody>
-</table>
-<p><strong>Critical Configuration Requirements:</strong></p>
-<ul>
-<li><code>kafka_txmetaConfig</code> must be configured for the validator service to function - without it, transaction metadata cannot be published to the Subtree Validation service</li>
-<li><code>validator_kafka_maxMessageBytes</code> must be coordinated with Kafka broker's <code>message.max.bytes</code> setting to prevent message rejection</li>
-</ul>
-<h3 id="86-validation-rules-settings">8.6 Validation Rules Settings</h3>
-<p>These settings control the rules and policies applied during transaction validation.</p>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Description</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>maxtxsizepolicy</code></td>
-<td>int</td>
-<td>Varies</td>
-<td>Maximum allowed transaction size in bytes</td>
-<td>Restricts oversized transactions from entering the mempool</td>
-</tr>
-<tr>
-<td><code>minminingtxfee</code></td>
-<td>float64</td>
-<td>Varies</td>
-<td>Minimum fee required for transaction acceptance</td>
-<td>Sets economic barrier for transaction inclusion</td>
-</tr>
-</tbody>
-</table>
-<h3 id="87-monitoring-debugging-settings">8.7 Monitoring &amp; Debugging Settings</h3>
-<p>These settings control observability and diagnostics.</p>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Description</th>
-<th>Impact</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>validator_verbose_debug</code></td>
-<td>bool</td>
-<td><code>false</code></td>
-<td>Enables detailed debug logging for validator operations</td>
-<td>Provides additional diagnostic information at the cost of log verbosity</td>
-</tr>
-<tr>
-<td><code>fsm_state_restore</code></td>
-<td>bool</td>
-<td><code>false</code></td>
-<td>Controls whether the service restores from a previously saved state</td>
-<td>Affects recovery behavior after restarts or failures</td>
-</tr>
-</tbody>
-</table>
+<h2 id="8-configuration">8. Configuration</h2>
+<p>For comprehensive configuration documentation including all settings, defaults, and interactions, see the <a href="../../../references/settings/services/validator_settings/">Validator Settings Reference</a>.</p>
 <h2 id="9-other-resources">9. Other Resources</h2>
 <p><a href="../../../references/services/validator_reference/">Validator Reference</a></p>
 

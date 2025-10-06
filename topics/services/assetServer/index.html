@@ -2489,21 +2489,6 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="7.3 Configuration Examples">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#centrifuge-configuration-example" class="md-nav__link">
-    <span class="md-ellipsis">
-      Centrifuge Configuration Example
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
 </li>
         
           <li class="md-nav__item">
@@ -4847,21 +4832,6 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="7.3 Configuration Examples">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#centrifuge-configuration-example" class="md-nav__link">
-    <span class="md-ellipsis">
-      Centrifuge Configuration Example
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
 </li>
         
           <li class="md-nav__item">
@@ -5537,33 +5507,7 @@ Cause: Missing server_keyFile when securityLevelHTTP is non-zero
 <span class="nb">export</span><span class="w"> </span><span class="nv">TERANODE_SERVER_CERTFILE</span><span class="o">=</span>/path/to/cert.pem
 </code></pre></div>
 <h3 id="73-configuration-examples">7.3 Configuration Examples</h3>
-<p><strong>HTTP/HTTPS Mode:</strong>
-The <code>securityLevelHTTP</code> setting determines whether the server runs in HTTP or HTTPS mode:</p>
-<ul>
-<li>When set to <code>0</code>, the server runs in HTTP mode using <code>asset_httpListenAddress</code></li>
-<li>When set to a non-zero value, the server runs in HTTPS mode and requires valid certificate and key files</li>
-</ul>
-<p><strong>Centrifuge Dependencies:</strong>
-When Centrifuge is enabled (<code>asset_centrifugeDisable=false</code>):</p>
-<ul>
-<li><code>asset_centrifugeListenAddress</code> must be set to specify the WebSocket listen address</li>
-<li><code>asset_httpAddress</code> must be set to serve as the base URL for client connections</li>
-</ul>
-<p><strong>Response Signing Dependencies:</strong>
-When response signing is enabled (<code>asset_signHTTPResponses=true</code>):</p>
-<ul>
-<li><code>p2p_private_key</code> must be set with a valid Ed25519 private key in hexadecimal format</li>
-</ul>
-<div class="highlight"><pre><span></span><code><span class="nv">asset_httpListenAddress</span><span class="o">=</span>:8443
-<span class="nv">securityLevelHTTP</span><span class="o">=</span><span class="m">1</span>
-<span class="nv">server_certFile</span><span class="o">=</span>/path/to/cert.pem
-<span class="nv">server_keyFile</span><span class="o">=</span>/path/to/key.pem
-</code></pre></div>
-<h4 id="centrifuge-configuration-example">Centrifuge Configuration Example</h4>
-<div class="highlight"><pre><span></span><code><span class="nv">asset_centrifugeDisable</span><span class="o">=</span><span class="nb">false</span>
-<span class="nv">asset_centrifugeListenAddress</span><span class="o">=</span>:8101
-<span class="nv">asset_httpAddress</span><span class="o">=</span>http://localhost:8090
-</code></pre></div>
+<p>For comprehensive configuration documentation including all settings, defaults, and interactions, see the <a href="../../references/settings/services/assetServer_settings.md">asset Server Settings Reference</a>.</p>
 <h3 id="74-fsm-configuration">7.4 FSM Configuration</h3>
 <ul>
 <li><strong>fsm_state_restore</strong>: Enables or disables the restore state for the Finite State Machine.<ul>
