@@ -1167,6 +1167,7 @@ func (b *Blockchain) GetLatestBlockHeaderFromBlockLocatorRequest(ctx context.Con
 		TxCount:     meta.TxCount,
 		SizeInBytes: meta.SizeInBytes,
 		Miner:       meta.Miner,
+		ChainWork:   meta.ChainWork,
 		BlockTime:   meta.BlockTime,
 		Timestamp:   meta.Timestamp,
 	}, nil
@@ -1324,6 +1325,7 @@ func (b *Blockchain) GetBlockHeader(ctx context.Context, req *blockchain_api.Get
 		BlockTime:   meta.BlockTime,
 		Timestamp:   meta.Timestamp,
 		MinedSet:    meta.MinedSet,
+		ChainWork:   meta.ChainWork,
 		SubtreesSet: meta.SubtreesSet,
 		Invalid:     meta.Invalid,
 	}, nil
