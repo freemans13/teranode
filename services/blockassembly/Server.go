@@ -1004,6 +1004,11 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 			return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to convert coinbaseTx", jobID, err)
 		}
 
+		// Validate coinbase has exactly one input before accessing Inputs[0]
+		if len(coinbaseTx.Inputs) != 1 {
+			return nil, errors.NewProcessingError("[BlockAssembly][%s] coinbase transaction must have exactly one input, got %d", jobID, len(coinbaseTx.Inputs))
+		}
+
 		if len(coinbaseTx.Inputs[0].UnlockingScript.Bytes()) < 2 || len(coinbaseTx.Inputs[0].UnlockingScript.Bytes()) > int(ba.blockAssembler.settings.ChainCfgParams.MaxCoinbaseScriptSigSize) {
 			return nil, errors.NewProcessingError("[BlockAssembly][%s] bad coinbase length", jobID)
 		}
@@ -1026,6 +1031,11 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		if req.Nonce != 0 {
 			coinbaseTx.Inputs[0].SequenceNumber = req.Nonce
 		}
+	}
+
+	// Final validation: ensure coinbase is valid (defense-in-depth)
+	if len(coinbaseTx.Inputs) != 1 {
+		return nil, errors.NewProcessingError("[BlockAssembly][%s] coinbase transaction must have exactly one input after processing, got %d", jobID, len(coinbaseTx.Inputs))
 	}
 
 	coinbaseTxIDHash := coinbaseTx.TxIDChainHash()
