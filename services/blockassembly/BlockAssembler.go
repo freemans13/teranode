@@ -856,12 +856,25 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	b.cachedCandidate.generationChan = make(chan struct{})
 	b.cachedCandidate.mu.Unlock()
 
+	// Ensure cache state is always cleaned up, even on early returns
+	defer func() {
+		b.cachedCandidate.mu.Lock()
+		b.cachedCandidate.generating = false
+		if b.cachedCandidate.generationChan != nil {
+			close(b.cachedCandidate.generationChan)
+			b.cachedCandidate.generationChan = nil
+		}
+		b.cachedCandidate.mu.Unlock()
+	}()
+
 	// Generate new candidate
 	responseCh := make(chan *miningCandidateResponse)
 
 	select {
 	case <-ctx.Done():
+		close(responseCh)
 		// context cancelled, do not send
+		return nil, nil, ctx.Err()
 	case <-time.After(1 * time.Second):
 		return nil, nil, errors.NewServiceError("timeout sending mining candidate request")
 	case b.miningCandidateCh <- responseCh:
@@ -878,6 +891,8 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	select {
 	case <-ctx.Done():
 		// context cancelled, do not send
+		close(responseCh)
+		err = ctx.Err()
 	case <-time.After(10 * time.Second):
 		// make sure to close the channel, otherwise the for select will hang, because no one is reading from it
 		close(responseCh)
@@ -889,26 +904,18 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 		err = response.err
 	}
 
-	// Update cache
-	b.cachedCandidate.mu.Lock()
+	// Update cache on success
 	if err == nil {
+		b.cachedCandidate.mu.Lock()
 		b.cachedCandidate.candidate = candidate
 		b.cachedCandidate.subtrees = subtrees
 		b.cachedCandidate.lastHeight = currentHeight
 		b.cachedCandidate.lastUpdate = time.Now()
+		b.cachedCandidate.mu.Unlock()
 
 		// Record cache miss metrics
 		prometheusBlockAssemblerCacheMisses.Inc()
 	}
-
-	b.cachedCandidate.generating = false
-
-	// Only close the channel if it's not nil
-	if b.cachedCandidate.generationChan != nil {
-		close(b.cachedCandidate.generationChan)
-		b.cachedCandidate.generationChan = nil
-	}
-	b.cachedCandidate.mu.Unlock()
 
 	return candidate, subtrees, err
 }

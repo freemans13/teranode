@@ -2439,3 +2439,60 @@ func TestProcessNewBlockAnnouncementCoverage(t *testing.T) {
 		assert.True(t, true, "processNewBlockAnnouncement should complete successfully")
 	})
 }
+
+// TestGetMiningCandidate_SendTimeoutResetsGenerationFlag tests that the generation flag
+// and channel are properly cleaned up when the send timeout occurs, preventing deadlocks
+// on subsequent calls.
+func TestGetMiningCandidate_SendTimeoutResetsGenerationFlag(t *testing.T) {
+	initPrometheusMetrics()
+
+	testItems := setupBlockAssemblyTest(t)
+	require.NotNil(t, testItems)
+	ba := testItems.blockAssembler
+
+	// Set up the block assembler with a valid height
+	ba.bestBlockHeight.Store(1)
+
+	// Don't start the listeners, so the channel send will timeout
+
+	ctx := context.Background()
+
+	// First call - should timeout after 1 second on send
+	start := time.Now()
+	candidate1, subtrees1, err1 := ba.GetMiningCandidate(ctx)
+	duration1 := time.Since(start)
+
+	// Verify first call timed out
+	assert.Nil(t, candidate1)
+	assert.Nil(t, subtrees1)
+	assert.Error(t, err1)
+	assert.Contains(t, err1.Error(), "timeout sending mining candidate request")
+	assert.GreaterOrEqual(t, duration1, 1*time.Second)
+	assert.Less(t, duration1, 2*time.Second)
+
+	// Verify cache state was cleaned up
+	ba.cachedCandidate.mu.RLock()
+	assert.False(t, ba.cachedCandidate.generating, "generating flag should be reset")
+	assert.Nil(t, ba.cachedCandidate.generationChan, "generation channel should be nil")
+	ba.cachedCandidate.mu.RUnlock()
+
+	// Second call - should also timeout (not deadlock)
+	// This verifies the fix: without proper cleanup, this would deadlock
+	start = time.Now()
+	candidate2, subtrees2, err2 := ba.GetMiningCandidate(ctx)
+	duration2 := time.Since(start)
+
+	// Verify second call also timed out (didn't deadlock)
+	assert.Nil(t, candidate2)
+	assert.Nil(t, subtrees2)
+	assert.Error(t, err2)
+	assert.Contains(t, err2.Error(), "timeout sending mining candidate request")
+	assert.GreaterOrEqual(t, duration2, 1*time.Second)
+	assert.Less(t, duration2, 2*time.Second, "second call should timeout, not deadlock")
+
+	// Verify cache state is still clean
+	ba.cachedCandidate.mu.RLock()
+	assert.False(t, ba.cachedCandidate.generating, "generating flag should still be reset")
+	assert.Nil(t, ba.cachedCandidate.generationChan, "generation channel should still be nil")
+	ba.cachedCandidate.mu.RUnlock()
+}
