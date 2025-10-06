@@ -101,7 +101,10 @@ func (s *SQL) GetSuitableBlock(ctx context.Context, hash *chainhash.Hash) (*mode
 		block_time,
 		chain_work
 	FROM
-		block_chain`
+		block_chain
+	ORDER BY
+		depth DESC
+	`
 
 	rows, err := s.db.QueryContext(ctx, q, hash[:])
 	if err != nil {
