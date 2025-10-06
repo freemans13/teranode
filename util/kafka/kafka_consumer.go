@@ -48,9 +48,7 @@ type KafkaConsumerConfig struct {
 	BrokersURL        []string       // List of Kafka broker URLs
 	Topic             string         // Kafka topic to consume from
 	Partitions        int            // Number of partitions
-	ConsumerRatio     int            // Ratio of consumers to partitions
 	ConsumerGroupID   string         // Consumer group identifier
-	ConsumerCount     int            // Number of consumers
 	AutoCommitEnabled bool           // Whether to auto-commit offsets
 	Replay            bool           // Whether to replay messages from the beginning
 }
@@ -69,20 +67,6 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 	}
 
 	partitions := util.GetQueryParamInt(url, "partitions", 1)
-	consumerRatio := util.GetQueryParamInt(url, "consumer_ratio", 1)
-
-	if consumerRatio < 1 {
-		logger.Warnf("consumer_ratio is less than 1, setting it to 1")
-
-		consumerRatio = 1
-	}
-
-	consumerCount := partitions / consumerRatio
-	if consumerCount < 1 {
-		logger.Warnf("consumer count is less than 0, setting it to 1")
-
-		consumerCount = 1
-	}
 
 	// Generate a unique group ID for the txmeta Kafka listener, to ensure that each instance of this service will process all txmeta messages.
 	// This is necessary because the txmeta messages are used to populate the txmeta cache, which is shared across all instances of this service.
@@ -101,9 +85,7 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 		BrokersURL:        strings.Split(url.Host, ","),
 		Topic:             strings.TrimPrefix(url.Path, "/"),
 		Partitions:        partitions,
-		ConsumerRatio:     consumerRatio,
 		ConsumerGroupID:   consumerGroupID,
-		ConsumerCount:     consumerCount,
 		AutoCommitEnabled: autoCommit,
 		// default is start from beginning
 		// do not ignore everything that is already queued, this is the case where we start a new consumer group for the first time
@@ -149,10 +131,6 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig, kafkaSettings ...*settings.K
 		return nil, errors.NewConfigurationError("kafka URL is not set", nil)
 	}
 
-	if cfg.ConsumerCount <= 0 {
-		return nil, errors.NewConfigurationError("consumer count must be greater than 0", nil)
-	}
-
 	if cfg.Logger == nil {
 		return nil, errors.NewConfigurationError("logger is not set", nil)
 	}
@@ -161,7 +139,7 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig, kafkaSettings ...*settings.K
 		return nil, errors.NewConfigurationError("group ID is not set", nil)
 	}
 
-	cfg.Logger.Infof("Starting %d Kafka consumer(s) for topic %s in group %s", cfg.ConsumerCount, cfg.Topic, cfg.ConsumerGroupID)
+	cfg.Logger.Infof("Starting Kafka consumer for topic %s in group %s (concurrency based on partition count)", cfg.Topic, cfg.ConsumerGroupID)
 
 	var consumerGroup sarama.ConsumerGroup
 
@@ -171,9 +149,7 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig, kafkaSettings ...*settings.K
 		// Create the InMemoryConsumerGroup which implements sarama.ConsumerGroup
 		consumerGroup = inmemorykafka.NewInMemoryConsumerGroup(broker, cfg.Topic, cfg.ConsumerGroupID)
 		cfg.Logger.Infof("Using in-memory Kafka consumer group")
-		// No error expected from mock creation here, unless topic/group were invalid (checked above)
-
-		cfg.ConsumerCount = 1 // in-memory implementation only supports 1 consumer
+		// No error expected from creation here, unless topic/group were invalid (checked above)
 
 		return &KafkaConsumerGroup{
 			Config:        cfg,
@@ -380,9 +356,6 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 		}
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(k.Config.ConsumerCount)
-
 	go func() {
 		internalCtx, cancel := context.WithCancel(ctx)
 		k.cancel.Store(cancel)
@@ -408,34 +381,31 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 
 		topics := []string{k.Config.Topic}
 
-		for i := 0; i < k.Config.ConsumerCount; i++ {
-			go func(consumerIndex int) {
-				// defer consumer.Close() // Ensure cleanup, if necessary
-				k.Config.Logger.Debugf("[kafka] starting consumer [%d] for group %s on topic %s", consumerIndex, k.Config.ConsumerGroupID, topics[0])
-				wg.Done()
+		// Only spawn one consumer goroutine - Sarama handles partition concurrency internally
+		go func() {
+			k.Config.Logger.Debugf("[kafka] starting consumer for group %s on topic %s (partition-based concurrency)", k.Config.ConsumerGroupID, topics[0])
 
-				for {
-					select {
-					case <-internalCtx.Done():
-						// Context cancelled, exit goroutine
-						return
-					default:
-						if err := k.ConsumerGroup.Consume(internalCtx, topics, NewKafkaConsumer(k.Config, consumerFn)); err != nil {
-							switch {
-							case errors.Is(err, sarama.ErrClosedConsumerGroup):
-								k.Config.Logger.Infof("[kafka] Consumer [%d] for group %s closed", consumerIndex, k.Config.ConsumerGroupID)
-								return
-							case errors.Is(err, context.Canceled):
-								k.Config.Logger.Infof("[kafka] Consumer [%d] for group %s cancelled", consumerIndex, k.Config.ConsumerGroupID)
-							default:
-								// Consider delay before retry or exit based on error type
-								k.Config.Logger.Errorf("Error from consumer [%d]: %v", consumerIndex, err)
-							}
+			for {
+				select {
+				case <-internalCtx.Done():
+					// Context cancelled, exit goroutine
+					return
+				default:
+					if err := k.ConsumerGroup.Consume(internalCtx, topics, NewKafkaConsumer(k.Config, consumerFn)); err != nil {
+						switch {
+						case errors.Is(err, sarama.ErrClosedConsumerGroup):
+							k.Config.Logger.Infof("[kafka] Consumer for group %s closed", k.Config.ConsumerGroupID)
+							return
+						case errors.Is(err, context.Canceled):
+							k.Config.Logger.Infof("[kafka] Consumer for group %s cancelled", k.Config.ConsumerGroupID)
+						default:
+							// Consider delay before retry or exit based on error type
+							k.Config.Logger.Errorf("Error from consumer: %v", err)
 						}
 					}
 				}
-			}(i)
-		}
+			}
+		}()
 
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
@@ -459,8 +429,6 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 			}
 		}
 	}()
-
-	wg.Wait()
 }
 
 func (k *KafkaConsumerGroup) BrokersURL() []string {

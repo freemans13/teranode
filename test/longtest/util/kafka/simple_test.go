@@ -137,7 +137,7 @@ func TestKafkaProduceConsumeDirect(t *testing.T) {
 
 func TestKafkaURLOverride(t *testing.T) {
 	t.Run("with replay set", func(t *testing.T) {
-		kafkaURLStr := "kafka://localhost:9092/meta?partitions=2&replication=3&retention=60000&flush_bytes=1024&flush_messages=10000&flush_frequency=1s&consumer_ratio=4&replay=1"
+		kafkaURLStr := "kafka://localhost:9092/meta?partitions=2&replication=3&retention=60000&flush_bytes=1024&flush_messages=10000&flush_frequency=1s&replay=1"
 
 		kafkaURL, err := url.Parse(kafkaURLStr)
 		require.NoError(t, err)
@@ -153,7 +153,7 @@ func TestKafkaURLOverride(t *testing.T) {
 	})
 
 	t.Run("with replay not set", func(t *testing.T) {
-		kafkaURLStr := "kafka://localhost:9092/meta?partitions=2&replication=3&retention=60000&flush_bytes=1024&flush_messages=10000&flush_frequency=1s&consumer_ratio=4"
+		kafkaURLStr := "kafka://localhost:9092/meta?partitions=2&replication=3&retention=60000&flush_bytes=1024&flush_messages=10000&flush_frequency=1s"
 
 		kafkaURL, err := url.Parse(kafkaURLStr)
 		require.NoError(t, err)

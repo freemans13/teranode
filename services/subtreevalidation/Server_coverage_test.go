@@ -38,7 +38,6 @@ func setupMemoryKafkaConsumer(t *testing.T, topic string) kafka.KafkaConsumerGro
 		BrokersURL:      []string{"localhost:9092"},
 		Topic:           topic,
 		ConsumerGroupID: "test-group",
-		ConsumerCount:   1,
 		Logger:          ulogger.TestLogger{},
 	}
 

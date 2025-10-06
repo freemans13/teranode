@@ -2220,7 +2220,6 @@ func (s *Server) startInvalidBlockConsumer(ctx context.Context) error {
 		ConsumerGroupID:   s.settings.Kafka.InvalidBlocks + "-consumer",
 		AutoCommitEnabled: true,
 		Replay:            false,
-		ConsumerCount:     1, // We only need one consumer for invalid blocks
 	}
 
 	// Create the Kafka consumer group - this will handle the memory scheme correctly

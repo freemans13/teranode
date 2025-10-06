@@ -157,7 +157,7 @@ func TestNewKafkaConsumerGroupFromURLInvalidURL(t *testing.T) {
 
 func TestNewKafkaConsumerGroupFromURLMemoryScheme(t *testing.T) {
 	logger := &mockLogger{}
-	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=4&consumer_ratio=2&replay=1")
+	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=4&replay=1")
 	require.NoError(t, err)
 
 	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", true)
@@ -167,58 +167,8 @@ func TestNewKafkaConsumerGroupFromURLMemoryScheme(t *testing.T) {
 	assert.Equal(t, "test-topic", consumer.Config.Topic)
 	assert.Equal(t, "test-group", consumer.Config.ConsumerGroupID)
 	assert.Equal(t, 4, consumer.Config.Partitions)
-	assert.Equal(t, 2, consumer.Config.ConsumerRatio)
-	assert.Equal(t, 1, consumer.Config.ConsumerCount) // Memory scheme forces consumer count to 1
 	assert.True(t, consumer.Config.AutoCommitEnabled)
 	assert.True(t, consumer.Config.Replay)
-}
-
-func TestNewKafkaConsumerGroupFromURLConsumerRatioValidation(t *testing.T) {
-	tests := []struct {
-		name             string
-		urlParams        string
-		expectedRatio    int
-		expectedCount    int
-		expectedWarnings int
-	}{
-		{
-			name:             "Valid consumer ratio",
-			urlParams:        "partitions=6&consumer_ratio=2",
-			expectedRatio:    2,
-			expectedCount:    1, // Memory scheme forces consumer count to 1
-			expectedWarnings: 0,
-		},
-		{
-			name:             "Consumer ratio less than 1",
-			urlParams:        "partitions=4&consumer_ratio=0",
-			expectedRatio:    1, // Should be corrected to 1
-			expectedCount:    1, // Memory scheme forces consumer count to 1
-			expectedWarnings: 1,
-		},
-		{
-			name:             "Consumer count less than 1",
-			urlParams:        "partitions=1&consumer_ratio=2",
-			expectedRatio:    2,
-			expectedCount:    1, // Should be corrected to 1
-			expectedWarnings: 1,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logger := &mockLogger{}
-			kafkaURL, err := url.Parse("memory://localhost/test-topic?" + tt.urlParams)
-			require.NoError(t, err)
-
-			consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", true)
-
-			assert.NoError(t, err)
-			assert.NotNil(t, consumer)
-			assert.Equal(t, tt.expectedRatio, consumer.Config.ConsumerRatio)
-			assert.Equal(t, tt.expectedCount, consumer.Config.ConsumerCount)
-			assert.Equal(t, tt.expectedWarnings, logger.warnCount)
-		})
-	}
 }
 
 func TestNewKafkaConsumerGroupFromURLDefaultValues(t *testing.T) {
@@ -230,9 +180,7 @@ func TestNewKafkaConsumerGroupFromURLDefaultValues(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, consumer)
-	assert.Equal(t, 1, consumer.Config.Partitions)    // default partitions
-	assert.Equal(t, 1, consumer.Config.ConsumerRatio) // default consumer_ratio
-	assert.Equal(t, 1, consumer.Config.ConsumerCount) // 1/1 = 1
+	assert.Equal(t, 1, consumer.Config.Partitions) // default partitions
 	assert.False(t, consumer.Config.AutoCommitEnabled)
 	assert.True(t, consumer.Config.Replay) // default replay=1
 }
@@ -281,26 +229,14 @@ func TestNewKafkaConsumerGroupValidationErrors(t *testing.T) {
 			name: "Missing URL",
 			config: KafkaConsumerConfig{
 				Logger:          logger,
-				ConsumerCount:   1,
 				ConsumerGroupID: "test-group",
 			},
 			errMsg: "kafka URL is not set",
 		},
 		{
-			name: "Invalid consumer count",
-			config: KafkaConsumerConfig{
-				URL:             &url.URL{Scheme: "memory"},
-				Logger:          logger,
-				ConsumerCount:   0,
-				ConsumerGroupID: "test-group",
-			},
-			errMsg: "consumer count must be greater than 0",
-		},
-		{
 			name: "Missing logger",
 			config: KafkaConsumerConfig{
 				URL:             &url.URL{Scheme: "memory"},
-				ConsumerCount:   1,
 				ConsumerGroupID: "test-group",
 			},
 			errMsg: "logger is not set",
@@ -308,9 +244,8 @@ func TestNewKafkaConsumerGroupValidationErrors(t *testing.T) {
 		{
 			name: "Missing group ID",
 			config: KafkaConsumerConfig{
-				URL:           &url.URL{Scheme: "memory"},
-				Logger:        logger,
-				ConsumerCount: 1,
+				URL:    &url.URL{Scheme: "memory"},
+				Logger: logger,
 			},
 			errMsg: "group ID is not set",
 		},
