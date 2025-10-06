@@ -110,7 +110,23 @@ export const getColDefs = (t) => {
       name: t(`${fieldKey}.tx_assembly`),
       type: 'number',
       props: {
-        width: '8%',
+        width: '7%',
+      },
+    },
+    {
+      id: 'min_mining_tx_fee',
+      name: t(`${fieldKey}.min_mining_fee`),
+      type: 'number',
+      props: {
+        width: '7%',
+      },
+    },
+    {
+      id: 'connected_peers_count',
+      name: t(`${fieldKey}.connected_peers`),
+      type: 'number',
+      props: {
+        width: '7%',
       },
     },
     {
@@ -118,7 +134,7 @@ export const getColDefs = (t) => {
       name: t(`${fieldKey}.uptime`),
       type: 'number',
       props: {
-        width: '8%',
+        width: '7%',
       },
     },
     {
@@ -291,6 +307,83 @@ export const renderCells = {
         },
         value: '',
       }
+    }
+  },
+  min_mining_tx_fee: (idField, item, colId) => {
+    // Use nullish coalescing to properly handle 0 as a valid value
+    const fee = item[colId] ?? item.min_mining_tx_fee
+
+    // Check if fee is truly undefined/null (0 is a valid value meaning "no minimum")
+    if (fee === undefined || fee === null) {
+      return {
+        component: RenderSpan,
+        props: { value: '-', className: 'num' },
+        value: '',
+      }
+    }
+
+    // Handle 0 as a special case - it means "no minimum fee"
+    if (fee === 0) {
+      return {
+        component: RenderSpanWithTooltip,
+        props: {
+          value: '0 sat/kB',
+          className: 'num',
+          tooltip: 'No minimum fee required',
+        },
+        value: '',
+      }
+    }
+
+    // The minminingtxfee setting is in BSV per byte
+    // Convert from BSV/byte to satoshis per kilobyte
+    // 1 BSV = 100,000,000 satoshis
+    // 1 kB = 1000 bytes
+    const satoshisPerByte = fee * 100000000
+    const satoshisPerKB = satoshisPerByte * 1000
+
+    // Format the display
+    let displayValue = ''
+    if (satoshisPerKB < 0.01) {
+      // For very small values, show with more decimal places
+      displayValue = `${satoshisPerKB.toFixed(4)} sat/kB`
+    } else if (satoshisPerKB < 1) {
+      // For values less than 1, show with 2 decimal places
+      displayValue = `${satoshisPerKB.toFixed(2)} sat/kB`
+    } else if (satoshisPerKB === Math.floor(satoshisPerKB)) {
+      // For whole numbers, don't show decimal places
+      displayValue = `${Math.floor(satoshisPerKB)} sat/kB`
+    } else {
+      // For other fractional values, show up to 2 decimal places
+      displayValue = `${satoshisPerKB.toFixed(2)} sat/kB`
+    }
+
+    // Create a tooltip with both formats
+    const bsvValue = fee.toFixed(8)
+    const satPerByteStr = satoshisPerByte.toFixed(4)
+    const tooltip = `${displayValue}\n(${satPerByteStr} sat/B)\n(${bsvValue} BSV/byte)`
+
+    return {
+      component: RenderSpanWithTooltip,
+      props: {
+        value: displayValue,
+        className: 'num',
+        tooltip: tooltip,
+      },
+      value: '',
+    }
+  },
+  connected_peers_count: (idField, item, colId) => {
+    // Get the peer count value
+    const peersCount = item[colId] ?? item.connected_peers_count ?? 0
+
+    return {
+      component: RenderSpan,
+      props: {
+        value: peersCount.toString(),
+        className: 'num'
+      },
+      value: '',
     }
   },
   uptime: (idField, item, colId) => {

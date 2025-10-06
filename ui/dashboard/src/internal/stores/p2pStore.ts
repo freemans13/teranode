@@ -220,6 +220,8 @@ export async function connectToP2PServer() {
               // Debug logging for node_status messages
               console.log('=== NODE_STATUS MESSAGE RECEIVED ===')
               console.log('Full message:', jsonData)
+              console.log('min_mining_tx_fee:', jsonData.min_mining_tx_fee)
+              console.log('connected_peers_count:', jsonData.connected_peers_count)
               console.log('block_assembly_details:', jsonData.block_assembly_details)
               if (jsonData.block_assembly_details) {
                 console.log('  - txCount:', jsonData.block_assembly_details.txCount)
@@ -288,6 +290,8 @@ export async function connectToP2PServer() {
                 existingNode.miner_name !== newNode.miner_name ||
                 existingNode.start_time !== newNode.start_time ||
                 existingNode.isCurrentNode !== newNode.isCurrentNode ||
+                existingNode.min_mining_tx_fee !== newNode.min_mining_tx_fee ||
+                existingNode.connected_peers_count !== newNode.connected_peers_count ||
                 JSON.stringify(existingNode.block_assembly) !== JSON.stringify(newNode.block_assembly)
               
               if (hasChanges || !existingNode) {

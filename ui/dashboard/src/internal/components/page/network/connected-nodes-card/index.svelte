@@ -198,13 +198,17 @@
   :global(.th:nth-child(6)),
   :global(th:nth-child(7)), /* TX Assembly - right align */
   :global(.th:nth-child(7)),
-  :global(th:nth-child(8)), /* Uptime - right align */
+  :global(th:nth-child(8)), /* Min Mining Fee - right align */
   :global(.th:nth-child(8)),
-  :global(th:nth-child(10)), /* Last Update - right align */
-  :global(.th:nth-child(10)) {
+  :global(th:nth-child(9)), /* Connected Peers - right align */
+  :global(.th:nth-child(9)),
+  :global(th:nth-child(10)), /* Uptime - right align */
+  :global(.th:nth-child(10)),
+  :global(th:nth-child(12)), /* Last Update - right align */
+  :global(.th:nth-child(12)) {
     text-align: right !important;
   }
-  
+
   :global(th:nth-child(4) .table-cell-row),
   :global(.th:nth-child(4) .table-cell-row),
   :global(th:nth-child(6) .table-cell-row),
@@ -213,8 +217,12 @@
   :global(.th:nth-child(7) .table-cell-row),
   :global(th:nth-child(8) .table-cell-row),
   :global(.th:nth-child(8) .table-cell-row),
+  :global(th:nth-child(9) .table-cell-row),
+  :global(.th:nth-child(9) .table-cell-row),
   :global(th:nth-child(10) .table-cell-row),
-  :global(.th:nth-child(10) .table-cell-row) {
+  :global(.th:nth-child(10) .table-cell-row),
+  :global(th:nth-child(12) .table-cell-row),
+  :global(.th:nth-child(12) .table-cell-row) {
     justify-content: flex-end !important;
   }
   

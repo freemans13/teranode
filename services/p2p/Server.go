@@ -870,9 +870,11 @@ type NodeStatusMessage struct {
 	ListenMode           string                          `json:"listen_mode"`
 	ChainWork            string                          `json:"chain_work"`                     // Chain work as hex string
 	SyncPeerID           string                          `json:"sync_peer_id,omitempty"`         // ID of the peer we're syncing from
-	SyncPeerHeight       int32                           `json:"sync_peer_height,omitempty"`     // Height of the sync peer
-	SyncPeerBlockHash    string                          `json:"sync_peer_block_hash,omitempty"` // Best block hash of the sync peer
-	SyncConnectedAt      int64                           `json:"sync_connected_at,omitempty"`    // Unix timestamp when we first connected to this sync peer
+	SyncPeerHeight       int32    `json:"sync_peer_height,omitempty"`     // Height of the sync peer
+	SyncPeerBlockHash    string   `json:"sync_peer_block_hash,omitempty"` // Best block hash of the sync peer
+	SyncConnectedAt      int64    `json:"sync_connected_at,omitempty"`    // Unix timestamp when we first connected to this sync peer
+	MinMiningTxFee       *float64 `json:"min_mining_tx_fee,omitempty"`    // Minimum mining transaction fee configured for this node (nil = unknown, 0 = no fee)
+	ConnectedPeersCount  int      `json:"connected_peers_count,omitempty"` // Number of connected peers
 }
 
 func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string) {
@@ -922,6 +924,8 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 		SyncPeerHeight:       nodeStatusMessage.SyncPeerHeight,
 		SyncPeerBlockHash:    nodeStatusMessage.SyncPeerBlockHash,
 		SyncConnectedAt:      nodeStatusMessage.SyncConnectedAt,
+		MinMiningTxFee:       nodeStatusMessage.MinMiningTxFee,
+		ConnectedPeersCount:  nodeStatusMessage.ConnectedPeersCount,
 	}
 
 	// Update peer height if provided (but not for our own messages)
@@ -1168,6 +1172,28 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		baseURL = ""
 	}
 
+	// Get minimum mining transaction fee from settings
+	// Use a pointer to distinguish between nil (unknown) and 0 (no fee)
+	var minMiningTxFee *float64
+	if s.settings != nil && s.settings.Policy != nil {
+		fee := s.settings.Policy.GetMinMiningTxFee()
+		minMiningTxFee = &fee
+		s.logger.Debugf("[getNodeStatusMessage] MinMiningTxFee from settings: %f", fee)
+	} else {
+		// For our own node, we always know the fee (even if it's 0)
+		// Only leave nil for messages from other peers
+		defaultFee := float64(0)
+		minMiningTxFee = &defaultFee
+		s.logger.Debugf("[getNodeStatusMessage] Policy settings not available, using default MinMiningTxFee: %f", defaultFee)
+	}
+
+	// Get connected peers count from the registry
+	connectedPeersCount := 0
+	if s.peerRegistry != nil {
+		allPeers := s.peerRegistry.GetAllPeers()
+		connectedPeersCount = len(allPeers)
+	}
+
 	// Return the notification message
 	return &notificationMsg{
 		Timestamp:            time.Now().UTC().Format(isoFormat),
@@ -1190,6 +1216,8 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		SyncPeerHeight:       syncPeerHeight,
 		SyncPeerBlockHash:    syncPeerBlockHash,
 		SyncConnectedAt:      syncConnectedAt,
+		MinMiningTxFee:       minMiningTxFee,
+		ConnectedPeersCount:  connectedPeersCount,
 	}
 }
 
@@ -1221,6 +1249,8 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 		SyncPeerHeight:       msg.SyncPeerHeight,
 		SyncPeerBlockHash:    msg.SyncPeerBlockHash,
 		SyncConnectedAt:      msg.SyncConnectedAt,
+		MinMiningTxFee:       msg.MinMiningTxFee,
+		ConnectedPeersCount:  msg.ConnectedPeersCount,
 	}
 
 	msgBytes, err := json.Marshal(nodeStatusMessage)

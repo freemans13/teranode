@@ -370,6 +370,8 @@
           "height": "Height",
           "chainwork_score": "Chainwork",
           "tx_assembly": "TX Assembly",
+          "min_mining_fee": "Min Fee",
+          "connected_peers": "Peers",
           "uptime": "Uptime",
           "tx_count": "TX Count",
           "size_in_bytes": "Size",

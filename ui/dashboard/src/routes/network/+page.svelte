@@ -191,6 +191,8 @@
     if (a.client_name !== b.client_name) return false
     if (a.miner_name !== b.miner_name) return false
     if (a.start_time !== b.start_time) return false
+    if (a.min_mining_tx_fee !== b.min_mining_tx_fee) return false
+    if (a.connected_peers_count !== b.connected_peers_count) return false
     return true
   }
 
