@@ -76,9 +76,9 @@ func NewFileStorer(ctx context.Context, logger ulogger.Logger, tSettings *settin
 
 	bufferSize, err := bytesize.Parse(utxopersisterBufferSize)
 	if err != nil {
-		logger.Errorf("error parsing utxoPersister_buffer_size %q: %v§", utxopersisterBufferSize, err)
+		logger.Errorf("error parsing utxoPersister_buffer_size %q: %v", utxopersisterBufferSize, err)
 
-		bufferSize = 4096
+		bufferSize = 1024 * 128 // default to 128KB
 	}
 
 	logger.Infof("Using %s buffer for file storer", bufferSize)

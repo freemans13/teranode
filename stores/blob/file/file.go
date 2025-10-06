@@ -655,19 +655,19 @@ func (s *File) SetFromReader(_ context.Context, key []byte, fileType fileformat.
 	}
 	defer file.Close()
 
-	// Set up the writer and hasher
-	writer, hasher := s.createWriter(file)
+	// Set up the hasher; keep destination as the raw *os.File so io.Copy can use the ReadFrom fast path
+	hasher := sha256.New()
 
-	// Write header unless SkipHeader option is set
+	// Write header unless SkipHeader option is set. Write it to both the file and the hasher.
 	if !merged.SkipHeader {
 		header := fileformat.NewHeader(fileType)
-
-		if err := header.Write(writer); err != nil {
+		if err := header.Write(io.MultiWriter(file, hasher)); err != nil {
 			return errors.NewStorageError("[File][SetFromReader] [%s] failed to write header to file", filename, err)
 		}
 	}
 
-	if _, err = io.Copy(writer, reader); err != nil {
+	// Stream the body using io.Copy with io.TeeReader so the file can use ReadFrom fast path while also hashing.
+	if _, err = io.Copy(file, io.TeeReader(reader, hasher)); err != nil {
 		return errors.NewStorageError("[File][SetFromReader] [%s] failed to write data to file", filename, err)
 	}
 
@@ -687,19 +687,6 @@ func (s *File) SetFromReader(_ context.Context, key []byte, fileType fileformat.
 	}
 
 	return nil
-}
-
-func (s *File) createWriter(file *os.File) (io.Writer, hash.Hash) {
-	// Then set up the writer and hasher
-	var (
-		writer io.Writer
-		hasher hash.Hash
-	)
-
-	hasher = sha256.New()
-	writer = io.MultiWriter(file, hasher)
-
-	return writer, hasher
 }
 
 func (s *File) writeHashFile(hasher hash.Hash, filename string) error {
