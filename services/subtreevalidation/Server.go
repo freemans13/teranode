@@ -279,14 +279,7 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			if subscribeCancel != nil {
-				u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] cancelling blockchain subscription")
-
-				subscribeCancel()
-			}
-
 			u.logger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] exiting setMined goroutine: %s", ctx.Err())
-
 			return
 		default:
 			u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] subscribing to blockchain for setTxMined signal")
@@ -297,35 +290,52 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 			if err != nil {
 				u.logger.Errorf("[SubtreeValidation:blockchainSubscriptionListener] failed to subscribe to blockchain: %s", err)
 
+				// Cancel context before retrying to prevent leak
+				subscribeCancel()
+
 				// backoff for 5 seconds and try again
 				time.Sleep(5 * time.Second)
 
 				continue
 			}
 
-			for notification := range blockchainSubscription {
-				if notification == nil {
-					continue
-				}
+		subscriptionLoop:
+			for {
+				select {
+				case <-ctx.Done():
+					subscribeCancel()
+					return
 
-				if notification.Type == model.NotificationType_Block {
-					cHash := chainhash.Hash(notification.Hash)
-					u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] received Block notification: %s", cHash.String())
+				case notification, ok := <-blockchainSubscription:
+					if !ok {
+						// Channel closed, reconnect
+						u.logger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] subscription channel closed, reconnecting")
+						subscribeCancel()
+						time.Sleep(1 * time.Second)
+						break subscriptionLoop
+					}
 
-					// get the best block header, we might have just added an invalid block that we do not want to count
-					if err = u.updateBestBlock(ctx); err != nil {
-						// Check if context was cancelled - if so, exit gracefully
-						if ctx.Err() != nil {
-							u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] context cancelled, stopping listener")
-							subscribeCancel()
-							return
+					if notification == nil {
+						continue
+					}
+
+					if notification.Type == model.NotificationType_Block {
+						cHash := chainhash.Hash(notification.Hash)
+						u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] received Block notification: %s", cHash.String())
+
+						// get the best block header, we might have just added an invalid block that we do not want to count
+						if err = u.updateBestBlock(ctx); err != nil {
+							// Check if context was cancelled - if so, exit gracefully
+							if ctx.Err() != nil {
+								u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] context cancelled, stopping listener")
+								subscribeCancel()
+								return
+							}
+							u.logger.Errorf("[SubtreeValidation:blockchainSubscriptionListener] failed to update best block: %s", err)
 						}
-						u.logger.Errorf("[SubtreeValidation:blockchainSubscriptionListener] failed to update best block: %s", err)
 					}
 				}
 			}
-
-			subscribeCancel()
 		}
 	}
 }

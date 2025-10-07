@@ -272,14 +272,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 			for {
 				select {
 				case <-ctx.Done():
-					if subscribeCancel != nil {
-						bv.logger.Infof("[BlockValidation:setMined] cancelling blockchain subscription")
-
-						subscribeCancel()
-					}
-
 					bv.logger.Warnf("[BlockValidation:setMined] exiting setMined goroutine: %s", ctx.Err())
-
 					return
 				default:
 					bv.logger.Infof("[BlockValidation:setMined] subscribing to blockchain for setTxMined signal")
@@ -297,26 +290,43 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 
 						bv.logger.Errorf("[BlockValidation:setMined] failed to subscribe to blockchain: %s", err)
 
+						// Cancel context before retrying to prevent leak
+						subscribeCancel()
+
 						// backoff for 5 seconds and try again
 						time.Sleep(5 * time.Second)
 
 						continue
 					}
 
-					for notification := range blockchainSubscription {
-						if notification == nil {
-							continue
-						}
+				subscriptionLoop:
+					for {
+						select {
+						case <-ctx.Done():
+							subscribeCancel()
+							return
 
-						if notification.Type == model.NotificationType_Block {
-							cHash := chainhash.Hash(notification.Hash)
-							bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
-							// push block hash to the setMinedChan
-							bv.setMinedChan <- &cHash
+						case notification, ok := <-blockchainSubscription:
+							if !ok {
+								// Channel closed, reconnect
+								bv.logger.Warnf("[BlockValidation:setMined] subscription channel closed, reconnecting")
+								subscribeCancel()
+								time.Sleep(1 * time.Second)
+								break subscriptionLoop
+							}
+
+							if notification == nil {
+								continue
+							}
+
+							if notification.Type == model.NotificationType_Block {
+								cHash := chainhash.Hash(notification.Hash)
+								bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
+								// push block hash to the setMinedChan
+								bv.setMinedChan <- &cHash
+							}
 						}
 					}
-
-					subscribeCancel()
 				}
 			}
 		}()
