@@ -188,6 +188,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockPersisterPersistAge:              uint32(getInt("blockpersister_persistAge", 100, alternativeContext...)), //nolint:gosec // G115: integer overflow conversion int -> uint32 (gosec)
 			BlockPersisterPersistSleep:            getDuration("blockPersister_persistSleep", time.Minute, alternativeContext...),
 			UtxoStore:                             getURL("txmeta_store", "", alternativeContext...),
+			FileStoreReadConcurrency:              getInt("filestore_read_concurrency", 768, alternativeContext...),
+			FileStoreWriteConcurrency:             getInt("filestore_write_concurrency", 256, alternativeContext...),
 		},
 		BlockAssembly: BlockAssemblySettings{
 			Disabled:                            getBool("blockassembly_disabled", false, alternativeContext...),

@@ -101,11 +101,165 @@ type longtermStore interface {
 	Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (bool, error)
 }
 
-// fileSemaphore is a global limiting semaphore for file operations to prevent excessive
-// concurrent file operations that could impact system performance. It limits the maximum
-// number of concurrent file operations to 1024, which helps prevent resource exhaustion
-// while still allowing enough parallelism for high-throughput scenarios.
-var fileSemaphore = make(chan struct{}, 1024)
+// Semaphore configuration constants
+const (
+	defaultReadLimit  = 768 // 75% of original 1024 total
+	defaultWriteLimit = 256 // 25% of original 1024 total
+	minSemaphoreLimit = 1
+	maxSemaphoreLimit = 10000
+)
+
+// GLOBAL SEMAPHORE DESIGN - ULIMIT PROTECTION AND RACE CONDITION MITIGATION:
+//
+// These global semaphore variables control concurrency for ALL file store instances to
+// protect against Linux ulimit (open file descriptor) exhaustion. Each file operation
+// (os.Open, os.Create, os.Stat, etc.) consumes a file descriptor, and exceeding the
+// system limit causes "too many open files" errors that can crash the node.
+//
+// This design choice has important implications:
+//
+// 1. ULIMIT PROTECTION:
+//    The semaphores limit concurrent file operations to prevent exceeding the system's
+//    open file descriptor limit (ulimit -n). Total capacity (readLimit + writeLimit)
+//    should be well under the system limit to account for other file descriptors
+//    (network sockets, log files, etc.). Default: 768 + 256 = 1024.
+//    ALL file operations MUST be protected by semaphores, including those in background
+//    goroutines (loadDAHs, cleanup), to ensure ulimit protection is comprehensive.
+//
+// 2. INITIALIZATION REQUIREMENT:
+//    InitSemaphores() MUST be called in main() before ANY file store operations begin.
+//    The function uses sync.Once to ensure one-time initialization. Calling it after
+//    file operations have started may result in some operations using stale channel
+//    references due to Go's memory model not guaranteeing atomicity of channel variable
+//    replacement.
+//
+// 3. RACE CONDITION RISK:
+//    Replacing global channel variables (as InitSemaphores does) while other goroutines
+//    read them creates a data race. This is mitigated by:
+//    - Calling InitSemaphores exactly once during startup (sync.Once protection)
+//    - Calling it before any file operations that use the semaphores
+//    - Not testing the initialization function in the same suite as code using it
+//
+// 4. INTERNAL VARIANTS PATTERN:
+//    To avoid nested semaphore acquisition (which reduces effective capacity and wastes
+//    ulimit protection), helper functions have two variants:
+//    - Public versions (e.g., readDAHFromFile): acquire semaphore for standalone/background use
+//    - Internal versions (e.g., readDAHFromFile_internal): no semaphore, for use within
+//      already-protected contexts (API operations like SetFromReader that hold semaphores)
+//    This ensures every file operation is protected exactly once, maximizing ulimit protection.
+//
+// 5. SEPARATE READ/WRITE SEMAPHORES:
+//    Using separate semaphores prevents deadlocks where write operations holding the
+//    write semaphore are blocked waiting for pipe data, while the operations that
+//    would provide that data (ProcessSubtree reads) cannot acquire read slots because
+//    they're exhausted. The 768/256 split maintains the original 1024 total capacity
+//    while providing independent resource pools for reads vs writes.
+
+// readSemaphore limits concurrent read operations (Get, Exists, etc.) to protect against
+// Linux ulimit (file descriptor) exhaustion. Each read operation opens a file descriptor
+// which counts toward the system's open file limit (ulimit -n). Default: 768 slots.
+var readSemaphore chan struct{}
+
+// writeSemaphore limits concurrent write operations (Set, Del, etc.) to protect against
+// Linux ulimit (file descriptor) exhaustion. Each write operation opens a file descriptor
+// which counts toward the system's open file limit. Default: 256 slots.
+// Separate from readSemaphore to prevent read/write deadlocks where writes block on pipe
+// data while reads (that would provide that data) wait for semaphore slots.
+var writeSemaphore chan struct{}
+
+// semaphoreInitOnce ensures InitSemaphores is called exactly once in production.
+var semaphoreInitOnce sync.Once
+
+func init() {
+	// Initialize with default values. These will only be replaced by InitSemaphores
+	// if it's called, and sync.Once ensures thread-safe one-time initialization.
+	// Total capacity (768 + 256 = 1024) matches the original single semaphore limit
+	// to maintain the same system performance characteristics.
+	readSemaphore = make(chan struct{}, defaultReadLimit)
+	writeSemaphore = make(chan struct{}, defaultWriteLimit)
+}
+
+// InitSemaphores initializes the read and write semaphores with configured limits.
+//
+// PURPOSE: ULIMIT PROTECTION
+// These semaphores protect against Linux ulimit (open file descriptor) exhaustion by
+// limiting concurrent file operations. Each file operation consumes a file descriptor,
+// and exceeding the system limit (ulimit -n) causes "too many open files" errors that
+// can crash the node. The semaphores ensure total concurrent file operations never
+// exceed the configured limits.
+//
+// CRITICAL USAGE REQUIREMENTS:
+//  1. MUST be called in main() before creating any file store instances
+//  2. MUST be called before any goroutines that perform file operations are started
+//  3. Uses sync.Once to ensure one-time execution (subsequent calls are no-ops)
+//  4. Replaces global channel variables - NOT safe to call after file operations begin
+//
+// RACE CONDITION WARNING:
+// This function replaces global channel variables. Due to Go's memory model, there is no
+// way to atomically replace a channel variable that other goroutines are reading without
+// using atomic.Value (which requires changing all semaphore access patterns). Therefore,
+// this function MUST be called during startup before any file operations begin. Calling
+// it after file operations have started creates a data race where goroutines may read the
+// variable while it's being written.
+//
+// CAPACITY PLANNING:
+// Set readLimit + writeLimit well under your system's ulimit to account for other file
+// descriptors (network sockets, log files, database connections). Check your ulimit with:
+//
+//	ulimit -n           # soft limit
+//	ulimit -Hn          # hard limit
+//
+// Monitor actual usage: lsof -p <pid> | wc -l
+// Default: 768 + 256 = 1024 (safe for systems with ulimit >= 4096)
+//
+// VALIDATION:
+// The function validates limits and returns an error if they're out of acceptable bounds.
+// Valid range: 1 to 10,000 for both read and write limits.
+//
+// Parameters:
+//   - readLimit: Maximum concurrent read operations (must be 1-10000)
+//   - writeLimit: Maximum concurrent write operations (must be 1-10000)
+//
+// Returns:
+//   - error: Configuration error if limits are invalid, nil otherwise
+//
+// Example usage in main():
+//
+//	func main() {
+//	    settings := settings.NewSettings()
+//	    if err := file.InitSemaphores(
+//	        settings.Block.FileStoreReadConcurrency,
+//	        settings.Block.FileStoreWriteConcurrency,
+//	    ); err != nil {
+//	        panic(fmt.Sprintf("Failed to initialize file store semaphores: %v", err))
+//	    }
+//	    // ... continue with service initialization
+//	}
+func InitSemaphores(readLimit, writeLimit int) error {
+	var initErr error
+
+	semaphoreInitOnce.Do(func() {
+		// Validate read limit
+		if readLimit < minSemaphoreLimit || readLimit > maxSemaphoreLimit {
+			initErr = errors.NewConfigurationError("invalid read limit %d: must be between %d and %d",
+				readLimit, minSemaphoreLimit, maxSemaphoreLimit)
+			return
+		}
+
+		// Validate write limit
+		if writeLimit < minSemaphoreLimit || writeLimit > maxSemaphoreLimit {
+			initErr = errors.NewConfigurationError("invalid write limit %d: must be between %d and %d",
+				writeLimit, minSemaphoreLimit, maxSemaphoreLimit)
+			return
+		}
+
+		// Create new semaphores with validated limits
+		readSemaphore = make(chan struct{}, readLimit)
+		writeSemaphore = make(chan struct{}, writeLimit)
+	})
+
+	return initErr
+}
 
 // New creates a new filesystem-based blob store with the specified configuration.
 // The store is configured via URL parameters in the storeURL, which can specify options
@@ -262,14 +416,23 @@ func (s *File) loadDAHs() error {
 		var cleaned int
 
 		for _, tmpFile := range tmpFiles {
+			// Protect file stat operation
+			readSemaphore <- struct{}{}
 			info, err := os.Stat(tmpFile)
+			<-readSemaphore
+
 			if err != nil {
 				continue
 			}
 
 			// Check if file is older than the threshold
 			if now.Sub(info.ModTime()) > cleanupThreshold {
-				if err := os.Remove(tmpFile); err != nil && !os.IsNotExist(err) {
+				// Protect file removal operation
+				writeSemaphore <- struct{}{}
+				err := os.Remove(tmpFile)
+				<-writeSemaphore
+
+				if err != nil && !os.IsNotExist(err) {
 					s.logger.Warnf("[File] failed to remove leftover tmp file: %s", tmpFile)
 				} else {
 					cleaned++
@@ -304,7 +467,12 @@ func (s *File) loadDAHs() error {
 			var terr *errors.Error
 			if errors.As(err, &terr) && terr.Code() == errors.ERR_PROCESSING {
 				s.logger.Warnf("[File] removing invalid DAH file during initialization: %s", fileName)
-				if removeErr := os.Remove(fileName); removeErr != nil && !os.IsNotExist(removeErr) {
+				// Protect file removal operation
+				writeSemaphore <- struct{}{}
+				removeErr := os.Remove(fileName)
+				<-writeSemaphore
+
+				if removeErr != nil && !os.IsNotExist(removeErr) {
 					s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName)
 				}
 			}
@@ -325,12 +493,9 @@ func (s *File) loadDAHs() error {
 	return nil
 }
 
-func (s *File) readDAHFromFile(fileName string) (uint32, error) {
-	fileSemaphore <- struct{}{}
-	defer func() {
-		<-fileSemaphore
-	}()
-
+// readDAHFromFile_internal reads a DAH value from file WITHOUT semaphore protection.
+// Caller must hold appropriate semaphore or be in a context where protection isn't needed.
+func (s *File) readDAHFromFile_internal(fileName string) (uint32, error) {
 	// read the dah
 	dahBytes, err := os.ReadFile(fileName)
 	if err != nil {
@@ -360,8 +525,20 @@ func (s *File) readDAHFromFile(fileName string) (uint32, error) {
 	return uint32(dah), nil
 }
 
-// writeDAHToFile writes a DAH value to a file with proper hardening
-func (s *File) writeDAHToFile(dahFilename string, dah uint32) error {
+// readDAHFromFile reads a DAH value from file WITH semaphore protection.
+// Use this for background operations or when caller doesn't hold a semaphore.
+func (s *File) readDAHFromFile(fileName string) (uint32, error) {
+	readSemaphore <- struct{}{}
+	defer func() {
+		<-readSemaphore
+	}()
+
+	return s.readDAHFromFile_internal(fileName)
+}
+
+// writeDAHToFile_internal writes a DAH value to file WITHOUT semaphore protection.
+// Caller must hold appropriate semaphore.
+func (s *File) writeDAHToFile_internal(dahFilename string, dah uint32) error {
 	// Validate DAH value before writing
 	if dah == 0 {
 		return errors.NewProcessingError("[File] attempted to write invalid DAH value 0 to file %s", dahFilename)
@@ -376,6 +553,17 @@ func (s *File) writeDAHToFile(dahFilename string, dah uint32) error {
 	}
 
 	return nil
+}
+
+// writeDAHToFile writes a DAH value to file WITH semaphore protection.
+// Use this when caller doesn't already hold a semaphore.
+func (s *File) writeDAHToFile(dahFilename string, dah uint32) error {
+	writeSemaphore <- struct{}{}
+	defer func() {
+		<-writeSemaphore
+	}()
+
+	return s.writeDAHToFile_internal(dahFilename, dah)
 }
 
 func (s *File) dahCleaner(ctx context.Context) {
@@ -427,7 +615,12 @@ func (s *File) cleanupExpiredFile(fileName string) {
 			s.removeDAHFromMap(fileName)
 
 			// Remove the invalid DAH file, but keep the blob files
-			if removeErr := os.Remove(fileName + ".dah"); removeErr != nil && !os.IsNotExist(removeErr) {
+			// Protect file removal operation
+			writeSemaphore <- struct{}{}
+			removeErr := os.Remove(fileName + ".dah")
+			<-writeSemaphore
+
+			if removeErr != nil && !os.IsNotExist(removeErr) {
 				s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName+".dah")
 			}
 		} else if errors.Is(err, errors.ErrNotFound) {
@@ -445,7 +638,12 @@ func (s *File) cleanupExpiredFile(fileName string) {
 		s.logger.Warnf("[File] unexpected DAH value 0, removing: %s", fileName+".dah")
 
 		// Remove the invalid DAH file, but keep the blob files
-		if err := os.Remove(fileName + ".dah"); err != nil && !os.IsNotExist(err) {
+		// Protect file removal operation
+		writeSemaphore <- struct{}{}
+		err := os.Remove(fileName + ".dah")
+		<-writeSemaphore
+
+		if err != nil && !os.IsNotExist(err) {
 			s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName+".dah")
 		}
 
@@ -482,12 +680,9 @@ func (s *File) shouldRemoveFile(fileName string, fileDAH uint32) bool {
 	return true
 }
 
-func (s *File) removeFiles(fileName string) {
-	fileSemaphore <- struct{}{}
-	defer func() {
-		<-fileSemaphore
-	}()
-
+// removeFiles_internal removes files WITHOUT semaphore protection.
+// Caller must hold appropriate semaphore.
+func (s *File) removeFiles_internal(fileName string) {
 	// Use the Del method to allow logger.go to log the removal to help with troubleshooting
 	// FileTypeUnknown is "", which will remove the file, checksum and dah files
 	// err := s.Del(context.Background(), []byte(fileName), fileformat.FileTypeUnknown)
@@ -503,6 +698,17 @@ func (s *File) removeFiles(fileName string) {
 	if err := os.Remove(fileName + checksumExtension); err != nil && !os.IsNotExist(err) {
 		s.logger.Warnf("[File] failed to remove checksum file: %s", fileName+checksumExtension)
 	}
+}
+
+// removeFiles removes files WITH semaphore protection.
+// Use this when caller doesn't already hold a semaphore.
+func (s *File) removeFiles(fileName string) {
+	writeSemaphore <- struct{}{}
+	defer func() {
+		<-writeSemaphore
+	}()
+
+	s.removeFiles_internal(fileName)
 }
 
 func (s *File) removeDAHFromMap(fileName string) {
@@ -525,9 +731,11 @@ func (s *File) removeDAHFromMap(fileName string) {
 //   - string: Description of the health status ("OK" or an error message)
 //   - error: Any error that occurred during the health check
 func (s *File) Health(_ context.Context, _ bool) (int, string, error) {
-	fileSemaphore <- struct{}{}
+	writeSemaphore <- struct{}{}
+	readSemaphore <- struct{}{}
 	defer func() {
-		<-fileSemaphore
+		<-writeSemaphore
+		<-readSemaphore
 	}()
 
 	// Check if the path exists
@@ -588,11 +796,9 @@ func (s *File) Close(_ context.Context) error {
 
 func (s *File) errorOnOverwrite(filename string, opts *options.Options) error {
 	if !opts.AllowOverwrite {
-		fileSemaphore <- struct{}{}
-		defer func() {
-			<-fileSemaphore
-		}()
-
+		// Note: No semaphore acquisition here because this is only called from SetFromReader
+		// which already holds the write semaphore. The os.Stat call is safe because we're
+		// within the write operation's semaphore protection.
 		if _, err := os.Stat(filename); err == nil {
 			return errors.NewBlobAlreadyExistsError("[File][allowOverwrite] [%s] already exists in store", filename)
 		}
@@ -624,9 +830,9 @@ func (s *File) errorOnOverwrite(filename string, opts *options.Options) error {
 // Returns:
 //   - error: Any error that occurred during the operation
 func (s *File) SetFromReader(_ context.Context, key []byte, fileType fileformat.FileType, reader io.ReadCloser, opts ...options.FileOption) error {
-	fileSemaphore <- struct{}{}
+	writeSemaphore <- struct{}{}
 	defer func() {
-		<-fileSemaphore
+		<-writeSemaphore
 	}()
 
 	filename, err := s.constructFilename(key, fileType, opts)
@@ -690,11 +896,6 @@ func (s *File) SetFromReader(_ context.Context, key []byte, fileType fileformat.
 }
 
 func (s *File) writeHashFile(hasher hash.Hash, filename string) error {
-	fileSemaphore <- struct{}{}
-	defer func() {
-		<-fileSemaphore
-	}()
-
 	if hasher == nil {
 		return nil
 	}
@@ -749,11 +950,6 @@ func (s *File) Set(ctx context.Context, key []byte, fileType fileformat.FileType
 }
 
 func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts []options.FileOption) (string, error) {
-	fileSemaphore <- struct{}{}
-	defer func() {
-		<-fileSemaphore
-	}()
-
 	merged := options.MergeOptions(s.options, opts)
 
 	if merged.SubDirectory != "" {
@@ -777,7 +973,8 @@ func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts 
 
 	if dah > 0 {
 		dahFilename := fileName + ".dah"
-		if err := s.writeDAHToFile(dahFilename, dah); err != nil {
+		// Use _internal variant since this is called from SetFromReader which holds writeSemaphore
+		if err := s.writeDAHToFile_internal(dahFilename, dah); err != nil {
 			return "", err
 		}
 
@@ -812,9 +1009,9 @@ func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts 
 //   - error: Any error that occurred during the operation, including if the blob doesn't exist
 func (s *File) SetDAH(_ context.Context, key []byte, fileType fileformat.FileType, newDAH uint32, opts ...options.FileOption) error {
 	// limit the number of concurrent file operations
-	fileSemaphore <- struct{}{}
+	writeSemaphore <- struct{}{}
 	defer func() {
-		<-fileSemaphore
+		<-writeSemaphore
 	}()
 
 	merged := options.MergeOptions(s.options, opts)
@@ -851,8 +1048,9 @@ func (s *File) SetDAH(_ context.Context, key []byte, fileType fileformat.FileTyp
 	}
 
 	// write DAH to file
+	// Use _internal variant since we already hold writeSemaphore
 	dahFilename := fileName + ".dah"
-	if err = s.writeDAHToFile(dahFilename, newDAH); err != nil {
+	if err = s.writeDAHToFile_internal(dahFilename, newDAH); err != nil {
 		return err
 	}
 
@@ -924,9 +1122,9 @@ func (s *File) GetDAH(ctx context.Context, key []byte, fileType fileformat.FileT
 //   - io.ReadCloser: Reader for streaming the blob data
 //   - error: Any error that occurred during the operation
 func (s *File) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (io.ReadCloser, error) {
-	fileSemaphore <- struct{}{}
+	readSemaphore <- struct{}{}
 	defer func() {
-		<-fileSemaphore
+		<-readSemaphore
 	}()
 
 	merged := options.MergeOptions(s.options, opts)
@@ -1091,9 +1289,9 @@ func (s *File) Exists(ctx context.Context, key []byte, fileType fileformat.FileT
 //   - error: Any error that occurred during deletion, or nil if the blob was successfully deleted
 //     or didn't exist
 func (s *File) Del(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) error {
-	fileSemaphore <- struct{}{}
+	writeSemaphore <- struct{}{}
 	defer func() {
-		<-fileSemaphore
+		<-writeSemaphore
 	}()
 
 	s.logger.Debugf("[File] Del: %s", utils.ReverseAndHexEncodeSlice(key))
@@ -1123,12 +1321,11 @@ func (s *File) Del(ctx context.Context, key []byte, fileType fileformat.FileType
 	return nil
 }
 
+// findFilesByExtension performs directory traversal to find files by extension.
+// NOTE: This is intentionally not semaphore-protected since it's a bulk scanning
+// operation that doesn't open many file descriptors simultaneously. It's called
+// infrequently (at startup and during background DAH loading).
 func findFilesByExtension(root, ext string) ([]string, error) {
-	fileSemaphore <- struct{}{}
-	defer func() {
-		<-fileSemaphore
-	}()
-
 	var a []string
 
 	useFind := runtime.GOOS == "linux" || runtime.GOOS == "darwin"

@@ -1,11 +1,13 @@
 package teranode
 
 import (
+	"fmt"
 	_ "net/http/pprof" //nolint:gosec // Import for pprof, only enabled via CLI flag
 	"os"
 
 	"github.com/bitcoin-sv/teranode/daemon"
 	"github.com/bitcoin-sv/teranode/settings"
+	"github.com/bitcoin-sv/teranode/stores/blob/file"
 	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bitcoin-sv/teranode/util"
 	"github.com/ordishs/gocore"
@@ -25,6 +27,22 @@ func RunDaemon(progname, version, commit string) {
 
 	// Initialize settings
 	tSettings := settings.NewSettings()
+
+	// CRITICAL: Initialize file store semaphores BEFORE any file operations begin.
+	// This MUST happen before daemon.Start() creates any file stores or starts any
+	// services that use file stores. The InitSemaphores function replaces global
+	// channel variables and is not safe to call after file operations have started.
+	// See file.go for detailed documentation on the race condition risk.
+	if err := file.InitSemaphores(
+		tSettings.Block.FileStoreReadConcurrency,
+		tSettings.Block.FileStoreWriteConcurrency,
+	); err != nil {
+		panic(fmt.Sprintf("Failed to initialize file store semaphores: %v", err))
+	}
+
+	fmt.Printf("File store semaphores initialized: read=%d, write=%d\n",
+		tSettings.Block.FileStoreReadConcurrency,
+		tSettings.Block.FileStoreWriteConcurrency)
 
 	logger := ulogger.InitLogger(progname, tSettings)
 

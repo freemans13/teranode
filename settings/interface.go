@@ -193,6 +193,8 @@ type BlockSettings struct {
 	BlockPersisterPersistAge              uint32
 	BlockPersisterPersistSleep            time.Duration
 	UtxoStore                             *url.URL
+	FileStoreReadConcurrency              int
+	FileStoreWriteConcurrency             int
 }
 
 type BlockChainSettings struct {
