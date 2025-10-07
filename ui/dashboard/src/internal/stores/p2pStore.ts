@@ -166,73 +166,8 @@ export async function connectToP2PServer() {
 
             jsonData.receivedAt = new Date()
 
-            let baseUrl = jsonData.base_url
-            if (!jsonData.base_url.includes('localhost') && jsonData.base_url.includes('http:')) {
-              baseUrl = baseUrl.replace('http:', 'https:')
-            }
-
             const miningNodeSet: any = get(miningNodes)
-
-            if (jsonData.type === 'mining_on') {
-              const nodeKey = jsonData.peer_id
-              const currentPeerID = get(currentNodePeerID)
-              const existingNode = miningNodeSet[nodeKey]
-              const newNode = {
-                ...miningNodeSet[nodeKey],
-                ...jsonData,
-                base_url: baseUrl,
-                receivedAt: new Date(),
-                isCurrentNode: jsonData.peer_id === currentPeerID,
-              }
-              
-              // Update block hash -> miner mapping if available
-              if (jsonData.hash && jsonData.miner) {
-                blockHashToMiner.update(map => {
-                  map.set(jsonData.hash, jsonData.miner)
-                  // Keep cache size manageable
-                  if (map.size > MAX_BLOCK_HASH_CACHE) {
-                    const firstKey = map.keys().next().value
-                    map.delete(firstKey)
-                  }
-                  return map
-                })
-              }
-              
-              // Only update if data actually changed (excluding receivedAt)
-              const hasChanges = !existingNode || 
-                existingNode.hash !== newNode.hash ||
-                existingNode.height !== newNode.height ||
-                existingNode.miner !== newNode.miner ||
-                existingNode.base_url !== newNode.base_url ||
-                existingNode.peer_id !== newNode.peer_id ||
-                existingNode.isCurrentNode !== newNode.isCurrentNode
-              
-              if (hasChanges || !existingNode) {
-                miningNodeSet[nodeKey] = newNode
-                miningNodes.set(miningNodeSet)
-              } else {
-                // Just update timestamp without triggering store update
-                if (existingNode) {
-                  existingNode.receivedAt = new Date()
-                }
-              }
-            } else if (jsonData.type === 'node_status') {
-              // Debug logging for node_status messages
-              console.log('=== NODE_STATUS MESSAGE RECEIVED ===')
-              console.log('Full message:', jsonData)
-              console.log('min_mining_tx_fee:', jsonData.min_mining_tx_fee)
-              console.log('connected_peers_count:', jsonData.connected_peers_count)
-              console.log('block_assembly_details:', jsonData.block_assembly_details)
-              if (jsonData.block_assembly_details) {
-                console.log('  - txCount:', jsonData.block_assembly_details.txCount)
-                console.log('  - blockAssemblyState:', jsonData.block_assembly_details.blockAssemblyState)
-                console.log('  - subtreeCount:', jsonData.block_assembly_details.subtreeCount)
-                console.log('  - currentHeight:', jsonData.block_assembly_details.currentHeight)
-                console.log('  - currentHash:', jsonData.block_assembly_details.currentHash)
-                console.log('  - subtrees:', jsonData.block_assembly_details.subtrees)
-              }
-              console.log('=====================================')
-              
+            if (jsonData.type === 'node_status') {
               // Handle node_status messages - these provide comprehensive node information
               const nodeKey = jsonData.peer_id
               
@@ -258,7 +193,6 @@ export async function connectToP2PServer() {
                 ...jsonData,
                 tx_count_in_assembly: txCountInAssembly, // Map for backward compatibility
                 block_assembly: jsonData.block_assembly_details, // Store full details for future use
-                base_url: baseUrl,
                 receivedAt: new Date(),
                 isCurrentNode: isCurrentNode,
               }
@@ -357,12 +291,11 @@ export async function connectToP2PServer() {
                   existingNode.receivedAt = new Date()
                 }
               }
-            } else if (baseUrl && jsonData.peer_id) {
+            } else if (jsonData.peer_id) {
               const nodeKey = jsonData.peer_id
               const currentPeerID = get(currentNodePeerID)
               if (!miningNodeSet[nodeKey]) {
                 miningNodeSet[nodeKey] = {
-                  base_url: baseUrl,
                   peer_id: jsonData.peer_id,
                   receivedAt: new Date(),
                   isCurrentNode: jsonData.peer_id === currentPeerID,

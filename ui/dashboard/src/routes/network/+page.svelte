@@ -241,13 +241,17 @@
       node.isCurrentNode = node.peer_id === currentPeerID
     })
 
-    // Stable sort: primary by base_url, secondary by peer_id (case-insensitive)
+    // Sort: current node first, then by base_url, then by peer_id (case-insensitive)
     const sorted = mNodes.sort((a: any, b: any) => {
+      // Always put current node at the top
+      if (a.isCurrentNode) return -1
+      if (b.isCurrentNode) return 1
+
       const aUrl = (a.base_url || '').toLowerCase()
       const bUrl = (b.base_url || '').toLowerCase()
       const aPeerId = (a.peer_id || '').toLowerCase()
       const bPeerId = (b.peer_id || '').toLowerCase()
-      
+
       if (aUrl < bUrl) {
         return -1
       } else if (aUrl > bUrl) {
