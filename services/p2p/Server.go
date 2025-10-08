@@ -868,13 +868,13 @@ type NodeStatusMessage struct {
 	ClientName           string                          `json:"client_name"` // Name of this node client
 	MinerName            string                          `json:"miner_name"`  // Name of the miner that mined the best block
 	ListenMode           string                          `json:"listen_mode"`
-	ChainWork            string                          `json:"chain_work"`                     // Chain work as hex string
-	SyncPeerID           string                          `json:"sync_peer_id,omitempty"`         // ID of the peer we're syncing from
-	SyncPeerHeight       int32    `json:"sync_peer_height,omitempty"`     // Height of the sync peer
-	SyncPeerBlockHash    string   `json:"sync_peer_block_hash,omitempty"` // Best block hash of the sync peer
-	SyncConnectedAt      int64    `json:"sync_connected_at,omitempty"`    // Unix timestamp when we first connected to this sync peer
-	MinMiningTxFee       *float64 `json:"min_mining_tx_fee,omitempty"`    // Minimum mining transaction fee configured for this node (nil = unknown, 0 = no fee)
-	ConnectedPeersCount  int      `json:"connected_peers_count,omitempty"` // Number of connected peers
+	ChainWork            string                          `json:"chain_work"`                      // Chain work as hex string
+	SyncPeerID           string                          `json:"sync_peer_id,omitempty"`          // ID of the peer we're syncing from
+	SyncPeerHeight       int32                           `json:"sync_peer_height,omitempty"`      // Height of the sync peer
+	SyncPeerBlockHash    string                          `json:"sync_peer_block_hash,omitempty"`  // Best block hash of the sync peer
+	SyncConnectedAt      int64                           `json:"sync_connected_at,omitempty"`     // Unix timestamp when we first connected to this sync peer
+	MinMiningTxFee       *float64                        `json:"min_mining_tx_fee,omitempty"`     // Minimum mining transaction fee configured for this node (nil = unknown, 0 = no fee)
+	ConnectedPeersCount  int                             `json:"connected_peers_count,omitempty"` // Number of connected peers
 }
 
 func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string) {
@@ -888,8 +888,13 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 	isSelf := from == s.P2PClient.GetID()
 
 	// Log all received node_status messages for debugging
-	s.logger.Debugf("[handleNodeStatusTopic] Received node_status from %s (peer_id: %s, is_self: %v, version: %s, height: %d)",
-		from, nodeStatusMessage.PeerID, isSelf, nodeStatusMessage.Version, nodeStatusMessage.BestHeight)
+	if from == nodeStatusMessage.PeerID {
+		s.logger.Debugf("[handleNodeStatusTopic] DIRECT node_status from %s (is_self: %v, version: %s, height: %d)",
+			nodeStatusMessage.PeerID, isSelf, nodeStatusMessage.Version, nodeStatusMessage.BestHeight)
+	} else {
+		s.logger.Debugf("[handleNodeStatusTopic] RELAY  node_status (originator: %s, via: %s, is_self: %v, version: %s, height: %d)",
+			nodeStatusMessage.PeerID, from, isSelf, nodeStatusMessage.Version, nodeStatusMessage.BestHeight)
+	}
 
 	// Skip further processing for our own messages (peer height updates, etc.)
 	// but still forward to WebSocket
@@ -1528,7 +1533,11 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 		return
 	}
 
-	s.logger.Infof("[handleBlockTopic] got p2p block notification for %s from %s (originator: %s)", blockMessage.Hash, from, blockMessage.PeerID)
+	if from == blockMessage.PeerID {
+		s.logger.Infof("[handleBlockTopic] DIRECT block %s from %s", blockMessage.Hash, blockMessage.PeerID)
+	} else {
+		s.logger.Infof("[handleBlockTopic] RELAY  block %s (originator: %s, via: %s)", blockMessage.Hash, blockMessage.PeerID, from)
+	}
 
 	s.notificationCh <- &notificationMsg{
 		Timestamp: time.Now().UTC().Format(isoFormat),
@@ -1628,7 +1637,11 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, from string) {
 		return
 	}
 
-	s.logger.Debugf("[handleSubtreeTopic] got p2p subtree notification for %s from %s (originator: %s)", subtreeMessage.Hash, from, subtreeMessage.PeerID)
+	if from == subtreeMessage.PeerID {
+		s.logger.Debugf("[handleSubtreeTopic] DIRECT subtree %s from %s", subtreeMessage.Hash, subtreeMessage.PeerID)
+	} else {
+		s.logger.Debugf("[handleSubtreeTopic] RELAY  subtree %s (originator: %s, via: %s)", subtreeMessage.Hash, subtreeMessage.PeerID, from)
+	}
 
 	if s.isBlacklistedBaseURL(subtreeMessage.DataHubURL) {
 		s.logger.Errorf("[handleSubtreeTopic] Blocked subtree notification from blacklisted baseURL: %s", subtreeMessage.DataHubURL)
@@ -1751,8 +1764,13 @@ func (s *Server) handleRejectedTxTopic(_ context.Context, m []byte, from string)
 		return
 	}
 
-	s.logger.Debugf("[handleRejectedTxTopic] got p2p rejected tx notification for %s from %s (originator: %s, reason: %s)",
-		rejectedTxMessage.TxID, from, rejectedTxMessage.PeerID, rejectedTxMessage.Reason)
+	if from == rejectedTxMessage.PeerID {
+		s.logger.Debugf("[handleRejectedTxTopic] DIRECT rejected tx %s from %s (reason: %s)",
+			rejectedTxMessage.TxID, rejectedTxMessage.PeerID, rejectedTxMessage.Reason)
+	} else {
+		s.logger.Debugf("[handleRejectedTxTopic] RELAY  rejected tx %s (originator: %s, via: %s, reason: %s)",
+			rejectedTxMessage.TxID, rejectedTxMessage.PeerID, from, rejectedTxMessage.Reason)
+	}
 
 	if s.isOwnMessage(from, rejectedTxMessage.PeerID) {
 		s.logger.Debugf("[handleRejectedTxTopic] ignoring own rejected tx message for %s", rejectedTxMessage.TxID)
