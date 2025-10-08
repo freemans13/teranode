@@ -2182,6 +2182,17 @@ func TestHandleGetblockchaininfoComprehensive(t *testing.T) {
 			getBestBlockHeaderFunc: func(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
 				return mockHeader, mockMeta, nil
 			},
+			getBlockHeadersFunc: func(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+				// Return the mock header for median time calculation
+				return []*model.BlockHeader{mockHeader}, []*model.BlockHeaderMeta{mockMeta}, nil
+			},
+			getBlockStatsFunc: func(ctx context.Context) (*model.BlockStats, error) {
+				// Return mock block stats for verification progress calculation
+				return &model.BlockStats{
+					TxCount:       1000,
+					LastBlockTime: 1234567890,
+				}, nil
+			},
 		}
 
 		s := &RPCServer{
@@ -4145,6 +4156,8 @@ type mockBlockchainClient struct {
 	revalidateBlockFunc      func(context.Context, *chainhash.Hash) error
 	healthFunc               func(context.Context, bool) (int, string, error)
 	getFSMCurrentStateFunc   func(context.Context) (*blockchain.FSMStateType, error)
+	getBlockHeadersFunc      func(context.Context, *chainhash.Hash, uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
+	getBlockStatsFunc        func(context.Context) (*model.BlockStats, error)
 }
 
 func (m *mockBlockchainClient) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
@@ -4192,6 +4205,9 @@ func (m *mockBlockchainClient) GetNextBlockID(ctx context.Context) (uint64, erro
 	return 1, nil
 }
 func (m *mockBlockchainClient) GetBlockStats(ctx context.Context) (*model.BlockStats, error) {
+	if m.getBlockStatsFunc != nil {
+		return m.getBlockStatsFunc(ctx)
+	}
 	return nil, nil
 }
 func (m *mockBlockchainClient) GetBlockGraphData(ctx context.Context, periodMillis uint64) (*model.BlockDataPoints, error) {
@@ -4222,6 +4238,9 @@ func (m *mockBlockchainClient) GetBestBlockHeader(ctx context.Context) (*model.B
 	return nil, nil, errors.New(errors.ERR_ERROR, "not implemented")
 }
 func (m *mockBlockchainClient) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	if m.getBlockHeadersFunc != nil {
+		return m.getBlockHeadersFunc(ctx, blockHash, numberOfHeaders)
+	}
 	return nil, nil, nil
 }
 func (m *mockBlockchainClient) GetBlockHeadersToCommonAncestor(ctx context.Context, hashTarget *chainhash.Hash, blockLocatorHashes []*chainhash.Hash, maxHeaders uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
