@@ -335,12 +335,10 @@ export const renderCells = {
       }
     }
 
-    // The minminingtxfee setting is in BSV per byte
-    // Convert from BSV/byte to satoshis per kilobyte
+    // The min_mining_tx_fee setting is in BSV per kilobyte
+    // Convert from BSV/kB to satoshis per kilobyte
     // 1 BSV = 100,000,000 satoshis
-    // 1 kB = 1000 bytes
-    const satoshisPerByte = fee * 100000000
-    const satoshisPerKB = satoshisPerByte * 1000
+    const satoshisPerKB = fee * 100000000
 
     // Format the display
     let displayValue = ''
@@ -360,8 +358,8 @@ export const renderCells = {
 
     // Create a tooltip with both formats
     const bsvValue = fee.toFixed(8)
-    const satPerByteStr = satoshisPerByte.toFixed(4)
-    const tooltip = `${displayValue}\n(${satPerByteStr} sat/B)\n(${bsvValue} BSV/byte)`
+    const satPerByteStr = (satoshisPerKB / 1000).toFixed(4)
+    const tooltip = `${displayValue}\n(${satPerByteStr} sat/B)\n(${bsvValue} BSV/kB)`
 
     return {
       component: RenderSpanWithTooltip,
