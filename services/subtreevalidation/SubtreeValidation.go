@@ -1147,37 +1147,62 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "peer_cannot_provide_subtree_data")
 				u.logger.Errorf("[validateSubtree][%s] failed to get subtree data from %s: %v", subtreeHash.String(), url, subtreeDataErr)
 			} else {
-				// load the subtree data, making sure to validate it against the subtree txs
-				// this is less efficient than reading straight to disk with SetFromReader, but we need to validate the
-				// data before storing it on disk
-				subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, body)
-				_ = body.Close()
-				if err != nil {
-					u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
-					// Can't proceed without valid subtree data, skip to next steps
-				} else if subtreeData == nil || len(subtreeData.Txs) == 0 {
-					u.logger.Errorf("[validateSubtree][%s] subtree data is nil or empty", subtreeHash.String())
-					// Invalid subtree data, skip to next steps
-				} else if !subtree.Nodes[len(subtree.Nodes)-1].Hash.Equal(*subtreeData.Txs[len(subtreeData.Txs)-1].TxIDChainHash()) {
-					return nil, errors.NewProcessingError("[validateSubtree][%s] subtree data does not match subtree", subtreeHash.String())
+				// Build subtree structure from allTxs for deserialization
+				// We cannot use the empty 'subtree' parameter as it has no nodes yet
+				subtreeForData, buildErr := subtreepkg.NewIncompleteTreeByLeafCount(len(allTxs))
+				if buildErr != nil {
+					u.logger.Errorf("[validateSubtree][%s] failed to create subtree for data: %v", subtreeHash.String(), buildErr)
+					_ = body.Close()
 				} else {
-					// Valid subtree data - proceed with serialization and storage
-					subtreeDataBytes, err := subtreeData.Serialize()
-					if err != nil {
-						u.logger.Errorf("[validateSubtree][%s] failed to serialize subtree data: %v", subtreeHash.String(), err)
-					} else {
-						dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
-
-						if subtreeDataErr = u.subtreeStore.Set(ctx,
-							subtreeHash[:],
-							fileformat.FileTypeSubtreeData,
-							subtreeDataBytes,
-							options.WithDeleteAt(dah),
-						); subtreeDataErr != nil {
-							u.logger.Errorf("[validateSubtree][%s] failed to store subtree data: %v", subtreeHash.String(), subtreeDataErr)
+					// Add all transaction hashes to the subtree structure
+					for _, txHash := range allTxs {
+						if txHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+							buildErr = subtreeForData.AddCoinbaseNode()
 						} else {
-							u.logger.Infof("[validateSubtree][%s] stored subtree data from %s", subtreeHash.String(), url)
-							subtreeDataExists = true
+							buildErr = subtreeForData.AddNode(txHash, 0, 0)
+						}
+						if buildErr != nil {
+							u.logger.Errorf("[validateSubtree][%s] failed to add node to subtree: %v", subtreeHash.String(), buildErr)
+							break
+						}
+					}
+
+					if buildErr != nil {
+						_ = body.Close()
+					} else {
+						// load the subtree data, making sure to validate it against the subtree txs
+						// this is less efficient than reading straight to disk with SetFromReader, but we need to validate the
+						// data before storing it on disk
+						subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, body)
+						_ = body.Close()
+						if err != nil {
+							u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
+							// Can't proceed without valid subtree data, skip to next steps
+						} else if subtreeData == nil || len(subtreeData.Txs) == 0 {
+							u.logger.Errorf("[validateSubtree][%s] subtree data is nil or empty", subtreeHash.String())
+							// Invalid subtree data, skip to next steps
+						} else if !subtreeForData.Nodes[len(subtreeForData.Nodes)-1].Hash.Equal(*subtreeData.Txs[len(subtreeData.Txs)-1].TxIDChainHash()) {
+							return nil, errors.NewProcessingError("[validateSubtree][%s] subtree data does not match subtree", subtreeHash.String())
+						} else {
+							// Valid subtree data - proceed with serialization and storage
+							subtreeDataBytes, err := subtreeData.Serialize()
+							if err != nil {
+								u.logger.Errorf("[validateSubtree][%s] failed to serialize subtree data: %v", subtreeHash.String(), err)
+							} else {
+								dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
+
+								if subtreeDataErr = u.subtreeStore.Set(ctx,
+									subtreeHash[:],
+									fileformat.FileTypeSubtreeData,
+									subtreeDataBytes,
+									options.WithDeleteAt(dah),
+								); subtreeDataErr != nil {
+									u.logger.Errorf("[validateSubtree][%s] failed to store subtree data: %v", subtreeHash.String(), subtreeDataErr)
+								} else {
+									u.logger.Infof("[validateSubtree][%s] stored subtree data from %s", subtreeHash.String(), url)
+									subtreeDataExists = true
+								}
+							}
 						}
 					}
 				}
