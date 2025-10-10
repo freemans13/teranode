@@ -11,7 +11,7 @@ permissions:
 env:
   REPO: teranode
   SETTINGS_CONTEXT_DEFAULT: test
-  GO_VERSION: "1.25.1"
+  GO_VERSION: "1.25.2"
 
 jobs:
   golangci:
