@@ -66,6 +66,12 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 		return errors.NewProcessingError("error creating utxo diff", err)
 	}
 
+	defer func() {
+		if closeErr := utxoDiff.Close(); closeErr != nil {
+			u.logger.Warnf("[persistBlock] error closing utxoDiff during error cleanup: %v", closeErr)
+		}
+	}()
+
 	if len(block.Subtrees) == 0 {
 		// No subtrees to process, just write the coinbase UTXO to the diff and continue
 		if err := utxoDiff.ProcessTx(block.CoinbaseTx); err != nil {
@@ -94,11 +100,6 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 		}
 	}
 
-	// At this point, we have a complete UTXODiff for this block.
-	if err = utxoDiff.Close(); err != nil {
-		return errors.NewStorageError("error closing utxo diff", err)
-	}
-
 	// Now, write the block file
 	u.logger.Infof("[BlockPersister] Writing block %s to disk", block.Header.Hash().String())
 
@@ -107,12 +108,14 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 		return errors.NewStorageError("error creating block file", err)
 	}
 
+	defer func() {
+		if closeErr := storer.Close(ctx); closeErr != nil {
+			u.logger.Warnf("[persistBlock] error closing storer: %v", closeErr)
+		}
+	}()
+
 	if _, err = storer.Write(blockBytes); err != nil {
 		return errors.NewStorageError("error writing block to disk", err)
-	}
-
-	if err = storer.Close(ctx); err != nil {
-		return errors.NewStorageError("error closing block file", err)
 	}
 
 	return nil
