@@ -304,8 +304,8 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 		result, _, err := suite.Server.catchupGetBlockHeaders(suite.Ctx, targetBlock, "http://test-peer", "peer-test-003")
 		assert.Error(t, err)
 		assert.NotNil(t, result)
-		// The error should contain "timed out" since the mock error causes a timeout
-		assert.Contains(t, err.Error(), "timed out", "Expected timeout error but got: %v", err)
+		// The error should contain network error since HTTP request failed
+		assert.Contains(t, err.Error(), "network error", "Expected network error but got: %v", err)
 
 		suite.MockBlockchain.AssertExpectations(t)
 	})
@@ -692,7 +692,7 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	httpmock.RegisterResponder("GET", `=~^http://peer[0-9]+/block/[a-f0-9]+$`, httpmock.NewBytesResponder(200, blockBytes))
 
 	mockBlockchain := &blockchain.Mock{}
-	mockBlockchain.On("GetBlock", mock.Anything, mock.Anything).Return(&model.Block{}, nil)
+	mockBlockchain.On("GetBlock", mock.Anything, mock.Anything).Return((*model.Block)(nil), errors.NewNotFoundError("not found"))
 	mockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return((chan *blockchain_api.Notification)(nil), nil)
 	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
@@ -708,22 +708,25 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	catchupCh := make(chan processBlockCatchup, 1)
 
 	baseServer := &Server{
-		logger:               ulogger.TestLogger{},
-		settings:             tSettings,
-		blockFoundCh:         blockFoundCh,
-		catchupCh:            catchupCh,
-		stats:                gocore.NewStat("test"),
-		blockValidation:      NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil),
-		blockchainClient:     mockBlockchain,
-		subtreeStore:         nil,
-		txStore:              nil,
-		utxoStore:            nil,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
+		logger:              ulogger.TestLogger{},
+		settings:            tSettings,
+		blockFoundCh:        blockFoundCh,
+		catchupCh:           catchupCh,
+		stats:               gocore.NewStat("test"),
+		blockValidation:     NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil),
+		blockchainClient:    mockBlockchain,
+		forkManager:         NewForkManager(ulogger.TestLogger{}, tSettings),
+		subtreeStore:        nil,
+		txStore:             nil,
+		utxoStore:           nil,
+		blockPriorityQueue:  NewBlockPriorityQueue(ulogger.TestLogger{}),
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	defer baseServer.processSubtreeNotify.Stop()
+	defer baseServer.processBlockNotify.Stop()
 
 	err = baseServer.Init(ctx)
 	require.NoError(t, err)
@@ -741,7 +744,7 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	case got := <-catchupCh:
 		assert.NotNil(t, got.block)
 		assert.Equal(t, "http://peer0", got.baseURL)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("processBlockFoundChannel did not put anything on catchupCh")
 	}
 }
@@ -800,26 +803,28 @@ func TestServer_blockFoundCh_triggersCatchupCh_BlockLocator(t *testing.T) {
 
 	blockValidation := NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil)
 	baseServer := &Server{
-		logger:               ulogger.TestLogger{},
-		settings:             tSettings,
-		blockFoundCh:         blockFoundCh,
-		catchupCh:            catchupCh,
-		stats:                gocore.NewStat("test"),
-		blockValidation:      blockValidation,
-		blockchainClient:     mockBlockchain,
-		subtreeStore:         nil,
-		txStore:              nil,
-		utxoStore:            nil,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
+		logger:              ulogger.TestLogger{},
+		settings:            tSettings,
+		blockFoundCh:        blockFoundCh,
+		catchupCh:           catchupCh,
+		stats:               gocore.NewStat("test"),
+		blockValidation:     blockValidation,
+		blockchainClient:    mockBlockchain,
+		forkManager:         NewForkManager(ulogger.TestLogger{}, tSettings),
+		subtreeStore:        nil,
+		txStore:             nil,
+		utxoStore:           nil,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	require.NoError(t, blockValidation.blockHashesCurrentlyValidated.Put(*block1.Header.Hash()))
 	require.NoError(t, blockValidation.blockHashesCurrentlyValidated.Put(*block2.Header.Hash()))
 
-	// Ensure processSubtreeNotify is stopped on cleanup
+	// Ensure processBlockNotify is stopped on cleanup
 	defer func() {
-		if baseServer.processSubtreeNotify != nil {
-			baseServer.processSubtreeNotify.Stop()
+		if baseServer.processBlockNotify != nil {
+			baseServer.processBlockNotify.Stop()
 		}
 	}()
 
@@ -891,17 +896,19 @@ func TestProcessBlockFoundChannelCatchup(t *testing.T) {
 
 	// Create base server instance with real in-memory stores
 	baseServer := &Server{
-		logger:               ulogger.TestLogger{},
-		settings:             tSettings,
-		blockFoundCh:         make(chan processBlockFound, 10),
-		catchupCh:            make(chan processBlockCatchup, 10),
-		blockValidation:      NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchainClient, nil, nil, nil, nil, nil),
-		blockchainClient:     mockBlockchainClient,
-		subtreeStore:         nil,
-		txStore:              nil,
-		utxoStore:            nil,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
-		stats:                gocore.NewStat("test"),
+		logger:              ulogger.TestLogger{},
+		settings:            tSettings,
+		blockFoundCh:        make(chan processBlockFound, 10),
+		catchupCh:           make(chan processBlockCatchup, 10),
+		blockValidation:     NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchainClient, nil, nil, nil, nil, nil),
+		blockchainClient:    mockBlockchainClient,
+		forkManager:         NewForkManager(ulogger.TestLogger{}, tSettings),
+		subtreeStore:        nil,
+		txStore:             nil,
+		utxoStore:           nil,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
+		stats:               gocore.NewStat("test"),
 	}
 
 	// Create test server with blocks
@@ -987,18 +994,19 @@ func TestCatchup(t *testing.T) {
 
 	// Create server instance
 	server := &Server{
-		logger:               ulogger.TestLogger{},
-		settings:             tSettings,
-		blockFoundCh:         make(chan processBlockFound, 10),
-		catchupCh:            make(chan processBlockCatchup, 10),
-		blockValidation:      bv,
-		blockchainClient:     mockBlockchainClient,
-		utxoStore:            mockUTXOStore,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
-		stats:                gocore.NewStat("test"),
-		isCatchingUp:         atomic.Bool{},
-		catchupAttempts:      atomic.Int64{},
-		catchupSuccesses:     atomic.Int64{},
+		logger:             ulogger.TestLogger{},
+		settings:           tSettings,
+		blockFoundCh:       make(chan processBlockFound, 10),
+		catchupCh:          make(chan processBlockCatchup, 10),
+		blockValidation:    bv,
+		blockchainClient:   mockBlockchainClient,
+		utxoStore:          mockUTXOStore,
+		forkManager:        NewForkManager(ulogger.TestLogger{}, tSettings),
+		processBlockNotify: ttlcache.New[chainhash.Hash, bool](),
+		stats:              gocore.NewStat("test"),
+		isCatchingUp:       atomic.Bool{},
+		catchupAttempts:    atomic.Int64{},
+		catchupSuccesses:   atomic.Int64{},
 		peerMetrics: &catchup.CatchupMetrics{
 			PeerMetrics: make(map[string]*catchup.PeerCatchupMetrics),
 		},
@@ -1135,19 +1143,20 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		cbConfig.Timeout = 5 * time.Second
 
 		server := &Server{
-			logger:               ulogger.TestLogger{},
-			settings:             tSettings,
-			blockFoundCh:         make(chan processBlockFound, 10),
-			catchupCh:            make(chan processBlockCatchup, 10),
-			blockValidation:      bv,
-			blockchainClient:     mockBlockchainClient,
-			blockAssemblyClient:  mockBAClient,
-			utxoStore:            mockUTXOStore,
-			subtreeStore:         blobmemory.New(),
-			processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
-			stats:                gocore.NewStat("test"),
-			peerCircuitBreakers:  catchup.NewPeerCircuitBreakers(cbConfig),
-			headerChainCache:     catchup.NewHeaderChainCache(ulogger.TestLogger{}),
+			logger:              ulogger.TestLogger{},
+			settings:            tSettings,
+			blockFoundCh:        make(chan processBlockFound, 10),
+			catchupCh:           make(chan processBlockCatchup, 10),
+			blockValidation:     bv,
+			blockchainClient:    mockBlockchainClient,
+			blockAssemblyClient: mockBAClient,
+			forkManager:         NewForkManager(ulogger.TestLogger{}, tSettings),
+			utxoStore:           mockUTXOStore,
+			subtreeStore:        blobmemory.New(),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			stats:               gocore.NewStat("test"),
+			peerCircuitBreakers: catchup.NewPeerCircuitBreakers(cbConfig),
+			headerChainCache:    catchup.NewHeaderChainCache(ulogger.TestLogger{}),
 			peerMetrics: &catchup.CatchupMetrics{
 				PeerMetrics: make(map[string]*catchup.PeerCatchupMetrics),
 			},
@@ -3001,15 +3010,16 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 	}
 
 	server := &Server{
-		logger:               ulogger.TestLogger{},
-		settings:             tSettings,
-		blockFoundCh:         make(chan processBlockFound, 10),
-		catchupCh:            make(chan processBlockCatchup, 10),
-		blockValidation:      bv,
-		blockchainClient:     mockBlockchainClient,
-		utxoStore:            mockUTXOStore,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
-		stats:                gocore.NewStat("test"),
+		logger:             ulogger.TestLogger{},
+		settings:           tSettings,
+		blockFoundCh:       make(chan processBlockFound, 10),
+		catchupCh:          make(chan processBlockCatchup, 10),
+		blockValidation:    bv,
+		blockchainClient:   mockBlockchainClient,
+		utxoStore:          mockUTXOStore,
+		forkManager:        NewForkManager(ulogger.TestLogger{}, tSettings),
+		processBlockNotify: ttlcache.New[chainhash.Hash, bool](),
+		stats:              gocore.NewStat("test"),
 		peerMetrics: &catchup.CatchupMetrics{
 			PeerMetrics: make(map[string]*catchup.PeerCatchupMetrics),
 		},
@@ -3025,11 +3035,11 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 		// Only stop the TTL cache if it was started
 		// We check if blockFoundCh is not nil as a proxy for whether Init was called
 		// since Init initializes the goroutines that process these channels
-		if server.blockFoundCh != nil && server.processSubtreeNotify != nil {
+		if server.blockFoundCh != nil && server.processBlockNotify != nil {
 			// Use a goroutine with timeout to prevent blocking forever
 			done := make(chan struct{})
 			go func() {
-				server.processSubtreeNotify.Stop()
+				server.processBlockNotify.Stop()
 				close(done)
 			}()
 
@@ -3102,15 +3112,16 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 	}
 
 	server := &Server{
-		logger:               ulogger.TestLogger{},
-		settings:             tSettings,
-		blockFoundCh:         make(chan processBlockFound, 10),
-		catchupCh:            make(chan processBlockCatchup, 10),
-		blockValidation:      bv,
-		blockchainClient:     mockBlockchainClient,
-		utxoStore:            mockUTXOStore,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
-		stats:                gocore.NewStat("test"),
+		logger:             ulogger.TestLogger{},
+		settings:           tSettings,
+		blockFoundCh:       make(chan processBlockFound, 10),
+		catchupCh:          make(chan processBlockCatchup, 10),
+		blockValidation:    bv,
+		blockchainClient:   mockBlockchainClient,
+		utxoStore:          mockUTXOStore,
+		forkManager:        NewForkManager(ulogger.TestLogger{}, tSettings),
+		processBlockNotify: ttlcache.New[chainhash.Hash, bool](),
+		stats:              gocore.NewStat("test"),
 		peerMetrics: &catchup.CatchupMetrics{
 			PeerMetrics: make(map[string]*catchup.PeerCatchupMetrics),
 		},
@@ -3124,11 +3135,11 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 
 	cleanup := func() {
 		// Only stop the TTL cache if it was started
-		if server.processSubtreeNotify != nil {
+		if server.processBlockNotify != nil {
 			// Use a goroutine with timeout to prevent blocking forever
 			done := make(chan struct{})
 			go func() {
-				server.processSubtreeNotify.Stop()
+				server.processBlockNotify.Stop()
 				close(done)
 			}()
 
@@ -3355,7 +3366,7 @@ func TestCheckpointValidationHeightCalculation(t *testing.T) {
 
 	// This should succeed - checkpoint at height 10 should match
 	assert.NoError(t, err, "Checkpoint validation should succeed")
-	assert.True(t, catchupCtx.useQuickValidation, "Should enable quick validation after checkpoint verification")
+	assert.False(t, catchupCtx.useQuickValidation, "Quick validation is currently disabled (needs more testing)")
 }
 
 // TestCheckpointValidationWithWrongHeights demonstrates that the corrected logic

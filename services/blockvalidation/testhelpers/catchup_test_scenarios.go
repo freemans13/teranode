@@ -2,10 +2,10 @@ package testhelpers
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
 )
@@ -450,15 +450,15 @@ func ValidateScenarioOutcome(t *testing.T, scenario TestScenario, err error, sui
 		// Secret mining should be detected if threshold exceeded
 		if err == nil {
 			t.Log("Warning: Secret mining was not detected")
-		} else if !strings.Contains(err.Error(), "secret mining") && !strings.Contains(err.Error(), "threshold") {
+		} else if !errors.IsMaliciousResponseError(err) && !errors.Is(err, catchup.ErrSecretMining) {
 			t.Error("Secret mining should be detected")
 		}
 
 	case ScenarioTimeWarp:
-		// Time warp should be detected
+		// Time warp should be detected (manifests as invalid response error)
 		if err == nil {
 			t.Log("Warning: Time warp was not detected")
-		} else if !strings.Contains(err.Error(), "time") && !strings.Contains(err.Error(), "timestamp") {
+		} else if !errors.IsMaliciousResponseError(err) {
 			t.Error("Time warp attack should be detected")
 		}
 

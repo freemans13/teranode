@@ -321,7 +321,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 		// Wait for all parallel validations to complete
 		if err = g.Wait(); err != nil {
-			return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed during parallel subtree validation", err)
+			return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed during parallel subtree validation", err))
 		}
 
 		// Now validate the subtrees, in order, which should be much faster since we already validated all transactions
@@ -344,7 +344,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				validator.WithIgnoreLocked(true),
 			)
 			if err != nil {
-				return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err)
+				return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err))
 			}
 
 			// Remove validated transactions from orphanage

@@ -58,9 +58,6 @@ func TestTryQuickValidation(t *testing.T) {
 
 		ctx := context.Background()
 
-		// Mock GetNextBlockID to trigger quickValidateBlock but make it fail
-		suite.MockBlockchain.On("GetNextBlockID", mock.Anything).Return(uint64(1), nil).Once()
-
 		// Create a test block with subtrees
 		subtreeHash1, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
 		subtreeHash2, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000002")
@@ -129,9 +126,6 @@ func TestTryQuickValidation(t *testing.T) {
 		defer suite.Cleanup()
 
 		ctx := context.Background()
-
-		// Mock GetNextBlockID to trigger quickValidateBlock but make it fail
-		suite.MockBlockchain.On("GetNextBlockID", mock.Anything).Return(uint64(1), nil).Once()
 
 		// Create a test block with subtrees that don't exist in store
 		subtreeHash, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")

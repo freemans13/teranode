@@ -21,6 +21,7 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/ordishs/go-utils/expiringmap"
 	"github.com/ordishs/gocore"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,7 +64,6 @@ func NewCatchupTestSuiteWithConfig(t *testing.T, config *testhelpers.CatchupServ
 
 	// Create server
 	suite.createServer(t)
-
 	return suite
 }
 
@@ -73,6 +73,9 @@ func (s *CatchupTestSuite) setupMocks() {
 	s.MockUTXOStore = &utxo.MockUtxostore{}
 	s.MockValidator = &validator.MockValidatorClient{UtxoStore: s.MockUTXOStore}
 	s.HttpMock = testhelpers.NewHTTPMockSetup(s.T)
+
+	// Provide a permissive default for Spend to avoid unexpected calls from concurrent validation goroutines.
+	s.MockUTXOStore.On("Spend", mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, nil).Maybe()
 }
 
 // createServer creates the Server instance with all dependencies
@@ -84,9 +87,13 @@ func (s *CatchupTestSuite) createServer(t *testing.T) {
 	tSettings := testutil.CreateBaseTestSettings(t)
 	if s.Config != nil {
 		tSettings.BlockValidation.SecretMiningThreshold = uint32(s.Config.SecretMiningThreshold)
-		tSettings.BlockValidation.CatchupMaxRetries = s.Config.MaxRetries
-		tSettings.BlockValidation.CatchupIterationTimeout = 5 // Default
-		tSettings.BlockValidation.CatchupOperationTimeout = s.Config.CatchupOperationTimeout
+		// Use CatchupOperationTimeout as iteration timeout if set, otherwise default to 5
+		if s.Config.CatchupOperationTimeout > 0 {
+			tSettings.BlockValidation.CatchupIterationTimeout = s.Config.CatchupOperationTimeout
+		} else {
+			tSettings.BlockValidation.CatchupIterationTimeout = 5
+			tSettings.BlockValidation.CatchupOperationTimeout = s.Config.CatchupOperationTimeout
+		}
 	}
 
 	// Create BlockValidation instance
@@ -116,17 +123,18 @@ func (s *CatchupTestSuite) createServer(t *testing.T) {
 
 	// Create server
 	s.Server = &Server{
-		logger:               s.Logger,
-		settings:             tSettings,
-		blockFoundCh:         make(chan processBlockFound, 10),
-		catchupCh:            make(chan processBlockCatchup, 10),
-		validatorClient:      s.MockValidator,
-		blockValidation:      bv,
-		blockchainClient:     s.MockBlockchain,
-		utxoStore:            s.MockUTXOStore,
-		subtreeStore:         bv.subtreeStore,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
-		stats:                gocore.NewStat("test"),
+		logger:              s.Logger,
+		settings:            tSettings,
+		blockFoundCh:        make(chan processBlockFound, 10),
+		catchupCh:           make(chan processBlockCatchup, 10),
+		validatorClient:     s.MockValidator,
+		blockValidation:     bv,
+		blockchainClient:    s.MockBlockchain,
+		utxoStore:           s.MockUTXOStore,
+		subtreeStore:        bv.subtreeStore,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
+		stats:               gocore.NewStat("test"),
 		peerMetrics: &catchup.CatchupMetrics{
 			PeerMetrics: make(map[string]*catchup.PeerCatchupMetrics),
 		},
@@ -147,13 +155,13 @@ func (s *CatchupTestSuite) createServer(t *testing.T) {
 
 // Cleanup should be called with defer in every test
 func (s *CatchupTestSuite) Cleanup() {
-	// Stop the processSubtreeNotify cache if it was created and started
-	if s.Server != nil && s.Server.processSubtreeNotify != nil {
+	// Stop the processBlockNotify cache if it was created and started
+	if s.Server != nil && s.Server.processBlockNotify != nil {
 		// Use a goroutine with timeout to prevent blocking forever
 		// if the cache was never started
 		done := make(chan struct{})
 		go func() {
-			s.Server.processSubtreeNotify.Stop()
+			s.Server.processBlockNotify.Stop()
 			close(done)
 		}()
 

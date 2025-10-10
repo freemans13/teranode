@@ -22,135 +22,118 @@ import (
 // TestCatchup_PartialNetworkFailure tests catchup behavior with 50% packet loss
 func TestCatchup_PartialNetworkFailure(t *testing.T) {
 	t.Run("RetryWithPacketLoss", func(t *testing.T) {
-		t.Skip("Skipping flaky test that hangs - needs investigation")
-		ctx, cancel := testhelpers.CreateTestContext(t, 30*time.Second)
-		defer cancel()
+		config := &testhelpers.CatchupServerConfig{
+			SecretMiningThreshold:   100,
+			MaxRetries:              5,
+			RetryDelay:              50 * time.Millisecond,
+			CatchupOperationTimeout: 30,
+		}
+		suite := NewCatchupTestSuiteWithConfig(t, config)
+		defer suite.Cleanup()
 
-		config := testhelpers.DefaultTestServerConfig()
-		config.MaxRetries = 5
-		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServerWithConfig(t, config)
-		defer cleanup()
+		suite.MockUTXOStore.On("GetBlockHeight").Return(uint32(1000)).Maybe()
 
-		// Mock UTXO store block height
-		mockUTXOStore.On("GetBlockHeight").Return(uint32(1000))
-
-		// Use consecutive mainnet headers for proper chain linkage
 		testHeaders := testhelpers.GetMainnetHeadersRange(t, 0, 10)
 		targetBlock := &model.Block{
 			Header: testHeaders[9],
 			Height: 1010,
 		}
 
-		// Setup mocks
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
 			Return(false, nil)
 
 		bestBlockHeader := testHeaders[0]
-		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).
+		suite.MockBlockchain.On("GetBestBlockHeader", mock.Anything).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil)
 
-		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1}, nil).Maybe()
+
+		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil)
 
-		// Mock GetBlockHeaders for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{bestBlockHeader}, []*model.BlockHeaderMeta{{Height: 1000, ID: 1}}, nil).Maybe()
 
-		// Mock GetBlockHeader for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeader", mock.Anything, bestBlockHeader.Hash()).
+		suite.MockBlockchain.On("GetBlockHeader", mock.Anything, bestBlockHeader.Hash()).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000, ID: 1}, nil).Maybe()
 
-		// Mock GetBlockExists for best block header (it already exists)
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, bestBlockHeader.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, bestBlockHeader.Hash()).
 			Return(true, nil).Maybe()
 
-		// Mock that headers don't exist locally
 		for _, header := range testHeaders[1:] {
-			mockBlockchainClient.On("GetBlockExists", mock.Anything, header.Hash()).
+			suite.MockBlockchain.On("GetBlockExists", mock.Anything, header.Hash()).
 				Return(false, nil).Maybe()
-			mockBlockchainClient.On("GetBlockHeader", mock.Anything, header.Hash()).
+			suite.MockBlockchain.On("GetBlockHeader", mock.Anything, header.Hash()).
 				Return(header, &model.BlockHeaderMeta{Height: 1001}, nil).Maybe()
 		}
 
-		// Setup HTTP mocks with flaky response
 		httpMock := testhelpers.NewHTTPMockSetup(t)
 		defer httpMock.Deactivate()
 
-		// Register flaky response that fails 50% of the time
 		httpMock.RegisterFlakeyResponse("http://unreliable-peer", 1, testHeaders[1:])
 		httpMock.Activate()
 
-		// Execute catchup
-		result, _, err := server.catchupGetBlockHeaders(ctx, targetBlock, "http://unreliable-peer", "peer-unreliable-001")
+		result, _, err := suite.Server.catchupGetBlockHeaders(suite.Ctx, targetBlock, "http://unreliable-peer", "peer-unreliable-001")
 
-		// Should eventually succeed after retries
-		assert.NoError(t, err)
+		suite.RequireNoError(err)
 		assert.NotNil(t, result)
-
-		// The request should have succeeded eventually
-		// Note: RegisterFlakeyResponse doesn't track counts, so we can't verify retry count directly
 	})
 
 	t.Run("EventualSuccessAfterMultipleFailures", func(t *testing.T) {
-		t.Skip("Skipping flaky test that hangs - needs investigation")
-		ctx, cancel := testhelpers.CreateTestContext(t, 30*time.Second)
-		defer cancel()
+		config := &testhelpers.CatchupServerConfig{
+			SecretMiningThreshold:   100,
+			MaxRetries:              10,
+			RetryDelay:              100 * time.Millisecond,
+			CatchupOperationTimeout: 10, // Increase timeout for retries
+		}
+		suite := NewCatchupTestSuiteWithConfig(t, config)
+		defer suite.Cleanup()
 
-		config := testhelpers.DefaultTestServerConfig()
-		// Increase iteration timeout to allow for retries with exponential backoff
-		// With 3 failures and exponential backoff, we need at least 7-10 seconds
-		config.IterationTimeout = 15
-		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServerWithConfig(t, config)
-		defer cleanup()
+		suite.MockUTXOStore.On("GetBlockHeight").Return(uint32(1000)).Maybe()
 
-		// Mock UTXO store block height
-		mockUTXOStore.On("GetBlockHeight").Return(uint32(1000))
-
-		server.settings.BlockValidation.CatchupMaxRetries = 10
-
-		// Use consecutive mainnet headers for proper chain linkage
 		testHeaders := testhelpers.GetMainnetHeadersRange(t, 0, 5)
 		targetBlock := &model.Block{
 			Header: testHeaders[4],
 			Height: 1005,
 		}
 
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
 			Return(false, nil)
 
+		suite.MockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1}, nil).Maybe()
+
 		bestBlockHeader := testHeaders[0]
-		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).
+		suite.MockBlockchain.On("GetBestBlockHeader", mock.Anything).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil)
 
-		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1}, nil).Maybe()
+
+		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil)
 
-		// Mock GetBlockHeaders for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{bestBlockHeader}, []*model.BlockHeaderMeta{{Height: 1000, ID: 1}}, nil).Maybe()
 
-		// Mock GetBlockHeader for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeader", mock.Anything, bestBlockHeader.Hash()).
+		suite.MockBlockchain.On("GetBlockHeader", mock.Anything, bestBlockHeader.Hash()).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000, ID: 1}, nil).Maybe()
 
-		// Mock GetBlockExists for all headers
 		for _, header := range testHeaders {
-			mockBlockchainClient.On("GetBlockExists", mock.Anything, header.Hash()).
+			suite.MockBlockchain.On("GetBlockExists", mock.Anything, header.Hash()).
 				Return(false, nil).Maybe()
 		}
 
-		// Setup HTTP mocks
 		httpMock := testhelpers.NewHTTPMockSetup(t)
 		defer httpMock.Deactivate()
 
-		// Register flaky response that fails first 3 times
 		httpMock.RegisterFlakeyResponse("http://flaky-peer", 3, testHeaders[1:])
 		httpMock.Activate()
 
-		// Should succeed after retries
-		result, _, err := server.catchupGetBlockHeaders(ctx, targetBlock, "http://flaky-peer", "peer-flaky-001")
+		result, _, err := suite.Server.catchupGetBlockHeaders(suite.Ctx, targetBlock, "http://flaky-peer", "peer-flaky-001")
 
-		assert.NoError(t, err)
+		suite.RequireNoError(err)
 		assert.NotNil(t, result)
 	})
 }
@@ -158,25 +141,23 @@ func TestCatchup_PartialNetworkFailure(t *testing.T) {
 // TestCatchup_ConnectionDropMidTransfer tests behavior when connection drops during transfer
 func TestCatchup_ConnectionDropMidTransfer(t *testing.T) {
 	t.Run("RecoverFromPartialTransfer", func(t *testing.T) {
-		t.Skip("Skipping flaky test that hangs - needs investigation")
-		ctx, cancel := testhelpers.CreateTestContext(t, 30*time.Second)
-		defer cancel()
+		config := &testhelpers.CatchupServerConfig{
+			SecretMiningThreshold:   100,
+			MaxRetries:              3,
+			RetryDelay:              50 * time.Millisecond,
+			CatchupOperationTimeout: 30,
+			CircuitBreakerConfig: &catchup.CircuitBreakerConfig{
+				FailureThreshold:    3,
+				SuccessThreshold:    2,
+				Timeout:             time.Minute,
+				MaxHalfOpenRequests: 1,
+			},
+		}
+		suite := NewCatchupTestSuiteWithConfig(t, config)
+		defer suite.Cleanup()
 
-		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
-		defer cleanup()
+		suite.MockUTXOStore.On("GetBlockHeight").Return(uint32(1000)).Maybe()
 
-		// Mock UTXO store block height
-		mockUTXOStore.On("GetBlockHeight").Return(uint32(1000))
-
-		// Initialize circuit breaker
-		server.peerCircuitBreakers = catchup.NewPeerCircuitBreakers(catchup.CircuitBreakerConfig{
-			FailureThreshold:    3,
-			SuccessThreshold:    2,
-			Timeout:             time.Minute,
-			MaxHalfOpenRequests: 1,
-		})
-
-		// Use consecutive mainnet headers for proper chain linkage
 		testHeaders := testhelpers.GetMainnetHeadersRange(t, 0, 100)
 		targetBlock := &model.Block{
 			Header: testHeaders[99],
@@ -185,152 +166,126 @@ func TestCatchup_ConnectionDropMidTransfer(t *testing.T) {
 
 		bestBlockHeader := testHeaders[0]
 
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
 			Return(false, nil)
 
-		// Mock GetBlockExists - best block header exists, others don't
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, bestBlockHeader.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, bestBlockHeader.Hash()).
 			Return(true, nil).Maybe()
 
 		for _, header := range testHeaders[1:] {
-			mockBlockchainClient.On("GetBlockExists", mock.Anything, header.Hash()).
+			suite.MockBlockchain.On("GetBlockExists", mock.Anything, header.Hash()).
 				Return(false, nil).Maybe()
 		}
-		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).
+		suite.MockBlockchain.On("GetBestBlockHeader", mock.Anything).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil)
 
-		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1}, nil).Maybe()
+
+		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil)
 
-		// Mock GetBlockHeaders for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{bestBlockHeader}, []*model.BlockHeaderMeta{{Height: 1000, ID: 1}}, nil).Maybe()
 
-		// Mock GetBlockHeader for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeader", mock.Anything, bestBlockHeader.Hash()).
+		suite.MockBlockchain.On("GetBlockHeader", mock.Anything, bestBlockHeader.Hash()).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000, ID: 1}, nil).Maybe()
 
-		// Mock GetBlockExists for best block header (it already exists)
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, bestBlockHeader.Hash()).
-			Return(true, nil).Maybe()
-
-		// Mock GetBlockExists for all other headers
-		for _, header := range testHeaders[1:] {
-			mockBlockchainClient.On("GetBlockExists", mock.Anything, header.Hash()).
-				Return(false, nil).Maybe()
-		}
-
-		// Setup HTTP mocks
 		httpMock := testhelpers.NewHTTPMockSetup(t)
 		defer httpMock.Deactivate()
 
-		// Simulate partial transfer on first attempt
-		fullHeaders := testHeaders[1:100] // All headers
+		fullHeaders := testHeaders[1:100]
 
-		// Register flaky response that fails first, then succeeds
 		httpMock.RegisterFlakeyResponse("http://dropping-peer", 1, fullHeaders)
 		httpMock.Activate()
 
-		// First attempt should fail, circuit breaker records failure
-		_, _, err := server.catchupGetBlockHeaders(ctx, targetBlock, "http://dropping-peer", "peer-dropping-002")
+		_, _, err := suite.Server.catchupGetBlockHeaders(suite.Ctx, targetBlock, "http://dropping-peer", "peer-dropping-002")
 
-		// Should eventually succeed (either through retry or would try alternate peer)
 		if err != nil {
-			// Circuit breaker should have recorded the failure
-			breaker := server.peerCircuitBreakers.GetBreaker("peer-dropping-002")
+			breaker := suite.Server.peerCircuitBreakers.GetBreaker("peer-dropping-002")
 			assert.NotNil(t, breaker)
 			state, _, _, _ := breaker.GetStats()
 			assert.NotEqual(t, catchup.StateClosed, state, "Circuit breaker should not be closed after failure")
-			// Check circuit breaker state using helper
-			AssertCircuitBreakerState(t, server, "peer-dropping-002", catchup.StateOpen)
+			AssertCircuitBreakerState(t, suite.Server, "peer-dropping-002", catchup.StateOpen)
 		}
 	})
 
 	t.Run("CircuitBreakerOpensAfterRepeatedDrops", func(t *testing.T) {
-		t.Skip("Skipping flaky test that hangs - needs investigation")
-		ctx, cancel := testhelpers.CreateTestContext(t, 30*time.Second)
-		defer cancel()
+		config := &testhelpers.CatchupServerConfig{
+			SecretMiningThreshold:   100,
+			MaxRetries:              0,
+			RetryDelay:              50 * time.Millisecond,
+			CatchupOperationTimeout: 30,
+			CircuitBreakerConfig: &catchup.CircuitBreakerConfig{
+				FailureThreshold:    2,
+				SuccessThreshold:    2,
+				Timeout:             time.Second,
+				MaxHalfOpenRequests: 1,
+			},
+		}
+		suite := NewCatchupTestSuiteWithConfig(t, config)
+		defer suite.Cleanup()
 
-		config := testhelpers.DefaultTestServerConfig()
-		config.MaxRetries = 0 // No retries for this test
-		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServerWithConfig(t, config)
-		defer cleanup()
+		suite.MockUTXOStore.On("GetBlockHeight").Return(uint32(1000)).Maybe()
 
-		// Mock UTXO store block height
-		mockUTXOStore.On("GetBlockHeight").Return(uint32(1000))
-
-		// Initialize circuit breaker with low threshold
-		server.peerCircuitBreakers = catchup.NewPeerCircuitBreakers(catchup.CircuitBreakerConfig{
-			FailureThreshold:    2,
-			SuccessThreshold:    2,
-			Timeout:             time.Second,
-			MaxHalfOpenRequests: 1,
-		})
-
-		// Use consecutive mainnet headers for proper chain linkage
 		testHeaders := testhelpers.GetMainnetHeadersRange(t, 0, 10)
 		targetBlock := &model.Block{
 			Header: testHeaders[9],
 			Height: 1010,
 		}
 
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
 			Return(false, nil)
 
 		bestBlockHeader := testHeaders[0]
-		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).
-			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil).Times(3)
+		suite.MockBlockchain.On("GetBestBlockHeader", mock.Anything).
+			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil)
 
-		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
-			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil).Times(3)
+		suite.MockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1}, nil).Maybe()
 
-		// Mock GetBlockHeaders for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil)
+
+		suite.MockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{bestBlockHeader}, []*model.BlockHeaderMeta{{Height: 1000, ID: 1}}, nil).Maybe()
 
-		// Mock GetBlockHeader for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeader", mock.Anything, bestBlockHeader.Hash()).
+		suite.MockBlockchain.On("GetBlockHeader", mock.Anything, bestBlockHeader.Hash()).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000, ID: 1}, nil).Maybe()
 
-		// Mock GetBlockExists for best block header (it already exists)
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, bestBlockHeader.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, bestBlockHeader.Hash()).
 			Return(true, nil).Maybe()
 
-		// Mock GetBlockExists for all other headers
 		for _, header := range testHeaders[1:] {
-			mockBlockchainClient.On("GetBlockExists", mock.Anything, header.Hash()).
+			suite.MockBlockchain.On("GetBlockExists", mock.Anything, header.Hash()).
 				Return(false, nil).Maybe()
 		}
 
-		// Setup HTTP mocks
 		httpMock := testhelpers.NewHTTPMockSetup(t)
 		defer httpMock.Deactivate()
 
-		// Always fail to simulate persistent connection drops
 		httpMock.RegisterErrorResponse("http://bad-peer", errors.NewError("connection reset by peer"))
 		httpMock.Activate()
 
-		// First failure with timeout
-		ctx1, cancel1 := context.WithTimeout(ctx, 2*time.Second)
-		_, _, err1 := server.catchupGetBlockHeaders(ctx1, targetBlock, "http://bad-peer", "peer-bad-002")
+		peerID := "peer-bad-001"
+
+		ctx1, cancel1 := context.WithTimeout(suite.Ctx, 2*time.Second)
+		_, _, err1 := suite.Server.catchupGetBlockHeaders(ctx1, targetBlock, "http://bad-peer", peerID)
 		cancel1()
 		assert.Error(t, err1)
 
-		// Second failure should open circuit breaker
-		ctx2, cancel2 := context.WithTimeout(ctx, 2*time.Second)
-		_, _, err2 := server.catchupGetBlockHeaders(ctx2, targetBlock, "http://bad-peer", "peer-bad-003")
+		ctx2, cancel2 := context.WithTimeout(suite.Ctx, 2*time.Second)
+		_, _, err2 := suite.Server.catchupGetBlockHeaders(ctx2, targetBlock, "http://bad-peer", peerID)
 		cancel2()
 		assert.Error(t, err2)
 
-		// Third attempt should be blocked by circuit breaker
-		ctx3, cancel3 := context.WithTimeout(ctx, 2*time.Second)
-		_, _, err3 := server.catchupGetBlockHeaders(ctx3, targetBlock, "http://bad-peer", "peer-bad-004")
+		ctx3, cancel3 := context.WithTimeout(suite.Ctx, 2*time.Second)
+		_, _, err3 := suite.Server.catchupGetBlockHeaders(ctx3, targetBlock, "http://bad-peer", peerID)
 		cancel3()
 		assert.Error(t, err3)
 		assert.Contains(t, err3.Error(), "circuit breaker open")
 
-		// Verify circuit breaker is open
-		breaker := server.peerCircuitBreakers.GetBreaker("peer-bad-001")
+		breaker := suite.Server.peerCircuitBreakers.GetBreaker(peerID)
 		state, _, _, _ := breaker.GetStats()
 		assert.Equal(t, catchup.StateOpen, state)
 	})
@@ -339,56 +294,54 @@ func TestCatchup_ConnectionDropMidTransfer(t *testing.T) {
 // TestCatchup_FlappingPeer tests behavior with peers that alternate between success and failure
 func TestCatchup_FlappingPeer(t *testing.T) {
 	t.Run("CircuitBreakerStabilizes", func(t *testing.T) {
-		t.Skip("Skipping flaky test that hangs - needs investigation")
-		ctx, cancel := testhelpers.CreateTestContext(t, 30*time.Second)
-		defer cancel()
-
-		config := testhelpers.DefaultTestServerConfig()
-		config.CircuitBreakerConfig = &catchup.CircuitBreakerConfig{
-			FailureThreshold:    3,
-			SuccessThreshold:    2,
-			Timeout:             time.Second * 5,
-			MaxHalfOpenRequests: 1,
+		config := &testhelpers.CatchupServerConfig{
+			SecretMiningThreshold:   100,
+			MaxRetries:              3,
+			RetryDelay:              50 * time.Millisecond,
+			CatchupOperationTimeout: 30,
+			CircuitBreakerConfig: &catchup.CircuitBreakerConfig{
+				FailureThreshold:    3,
+				SuccessThreshold:    2,
+				Timeout:             time.Second * 5,
+				MaxHalfOpenRequests: 1,
+			},
 		}
-		server, mockBlockchainClient, _, cleanup := setupTestCatchupServerWithConfig(t, config)
-		defer cleanup()
+		suite := NewCatchupTestSuiteWithConfig(t, config)
+		defer suite.Cleanup()
 
-		// Use consecutive mainnet headers for proper chain linkage
 		testHeaders := testhelpers.GetMainnetHeadersRange(t, 0, 10)
 		targetBlock := &model.Block{
 			Header: testHeaders[9],
 			Height: 1010,
 		}
 
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
 			Return(false, nil)
 
 		bestBlockHeader := testHeaders[0]
-		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).
+		suite.MockBlockchain.On("GetBestBlockHeader", mock.Anything).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil)
 
-		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1}, nil).Maybe()
+
+		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil)
 
-		// Mock GetBlockHeaders for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{bestBlockHeader}, []*model.BlockHeaderMeta{{Height: 1000, ID: 1}}, nil).Maybe()
 
-		// Mock GetBlockHeader for common ancestor - use mock.Anything for hash
-		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeader", mock.Anything, mock.Anything).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil).Maybe()
 
-		// Mock GetBlockExists for all headers
 		for _, header := range testHeaders {
-			mockBlockchainClient.On("GetBlockExists", mock.Anything, header.Hash()).
+			suite.MockBlockchain.On("GetBlockExists", mock.Anything, header.Hash()).
 				Return(false, nil).Maybe()
 		}
 
-		// Setup HTTP mocks
 		httpMock := testhelpers.NewHTTPMockSetup(t)
 		defer httpMock.Deactivate()
 
-		// Alternate between success and failure
 		requestCount := int32(0)
 		httpMock.RegisterResponse(
 			`=~^http://flapping-peer/headers_from_common_ancestor/.*`,
@@ -396,7 +349,6 @@ func TestCatchup_FlappingPeer(t *testing.T) {
 				StatusCode: 200,
 				Validator: func(req *http.Request) error {
 					count := atomic.AddInt32(&requestCount, 1)
-					// Alternate: fail, succeed, fail, succeed...
 					if count%2 == 1 {
 						return errors.NewError("connection timeout")
 					}
@@ -407,98 +359,87 @@ func TestCatchup_FlappingPeer(t *testing.T) {
 		)
 		httpMock.Activate()
 
-		// Make multiple requests to test reputation system
 		successCount := 0
 		failCount := 0
 
 		for i := 0; i < 6; i++ {
-			_, _, err := server.catchupGetBlockHeaders(ctx, targetBlock, "http://flapping-peer", "peer-flapping-002")
+			_, _, err := suite.Server.catchupGetBlockHeaders(suite.Ctx, targetBlock, "http://flapping-peer", "peer-flapping-002")
 			if err != nil {
 				failCount++
 			} else {
 				successCount++
 			}
 
-			// Small delay between attempts
 			time.Sleep(100 * time.Millisecond)
 		}
 
-		// Should have mix of successes and failures (or all successes if retries worked)
 		assert.Greater(t, successCount, 0, "Should have some successes")
-		// Note: With retries, we might not see failures at the catchup level
 
-		// Check peer metrics exist
-		peerMetric := server.peerMetrics.PeerMetrics["http://flapping-peer"]
+		peerMetric := suite.Server.peerMetrics.PeerMetrics["http://flapping-peer"]
 		if peerMetric != nil {
-			// If we have metrics, reputation might be affected
 			if failCount > 0 {
 				assert.LessOrEqual(t, peerMetric.ReputationScore, float64(100), "Reputation should be affected by failures")
 			}
+			breaker := suite.Server.peerCircuitBreakers.GetBreaker("peer-flapping-001")
+			finalState, _, _, _ := breaker.GetStats()
+			t.Logf("Final circuit breaker state: %v, reputation: %.2f", finalState, peerMetric.ReputationScore)
 		}
-
-		// Circuit breaker should eventually stabilize
-		breaker := server.peerCircuitBreakers.GetBreaker("peer-flapping-001")
-		finalState, _, _, _ := breaker.GetStats()
-		t.Logf("Final circuit breaker state: %v, reputation: %.2f", finalState, peerMetric.ReputationScore)
 	})
 
 	t.Run("PeerEventuallyMarkedUnreliable", func(t *testing.T) {
-		t.Skip("Skipping flaky test that hangs - needs investigation")
-		ctx, cancel := testhelpers.CreateTestContext(t, 30*time.Second)
-		defer cancel()
-
-		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
-		defer cleanup()
-
-		// Mock UTXO store block height
-		mockUTXOStore.On("GetBlockHeight").Return(uint32(1000))
-
-		server.peerCircuitBreakers = catchup.NewPeerCircuitBreakers(catchup.CircuitBreakerConfig{
-			FailureThreshold:    5,
-			SuccessThreshold:    2,
-			Timeout:             time.Second * 10,
-			MaxHalfOpenRequests: 1,
-		})
-		server.peerMetrics = &catchup.CatchupMetrics{
-			PeerMetrics: make(map[string]*catchup.PeerCatchupMetrics),
+		config := &testhelpers.CatchupServerConfig{
+			SecretMiningThreshold:   100,
+			MaxRetries:              3,
+			RetryDelay:              50 * time.Millisecond,
+			CatchupOperationTimeout: 30,
+			CircuitBreakerConfig: &catchup.CircuitBreakerConfig{
+				FailureThreshold:    5,
+				SuccessThreshold:    2,
+				Timeout:             time.Second * 10,
+				MaxHalfOpenRequests: 1,
+			},
 		}
+		suite := NewCatchupTestSuiteWithConfig(t, config)
+		defer suite.Cleanup()
 
-		// Use consecutive mainnet headers for proper chain linkage
+		suite.MockUTXOStore.On("GetBlockHeight").Return(uint32(1000)).Maybe()
+
 		testHeaders := testhelpers.GetMainnetHeadersRange(t, 0, 5)
 		targetBlock := &model.Block{
 			Header: testHeaders[4],
 			Height: 1005,
 		}
 
-		mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, targetBlock.Hash()).
 			Return(false, nil)
 
 		bestBlockHeader := testHeaders[0]
-		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).
+		suite.MockBlockchain.On("GetBestBlockHeader", mock.Anything).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil)
 
-		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1}, nil).Maybe()
+
+		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil)
 
-		// Mock GetBlockHeaders for common ancestor finding
-		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{bestBlockHeader}, []*model.BlockHeaderMeta{{Height: 1000, ID: 1}}, nil).Maybe()
 
-		// Mock GetBlockHeader for common ancestor - use mock.Anything for hash
-		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		suite.MockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1}, nil).Maybe()
+
+		suite.MockBlockchain.On("GetBlockHeader", mock.Anything, mock.Anything).
 			Return(bestBlockHeader, &model.BlockHeaderMeta{Height: 1000}, nil).Maybe()
 
-		// Mock GetBlockExists for all headers
 		for _, header := range testHeaders {
-			mockBlockchainClient.On("GetBlockExists", mock.Anything, header.Hash()).
+			suite.MockBlockchain.On("GetBlockExists", mock.Anything, header.Hash()).
 				Return(false, nil).Maybe()
 		}
 
-		// Setup HTTP mocks
 		httpMock := testhelpers.NewHTTPMockSetup(t)
 		defer httpMock.Deactivate()
 
-		// Start with success, then increasingly fail
 		requestCount := int32(0)
 		httpMock.RegisterResponse(
 			`=~^http://degrading-peer/headers_from_common_ancestor/.*`,
@@ -506,9 +447,7 @@ func TestCatchup_FlappingPeer(t *testing.T) {
 				StatusCode: 200,
 				Validator: func(req *http.Request) error {
 					count := atomic.AddInt32(&requestCount, 1)
-					// Progressive degradation: success rate decreases over time
-					// First 2 succeed, then increasingly fail
-					if count > 2 && count%5 != 0 { // 20% success rate after initial period
+					if count > 2 && count%5 != 0 {
 						return errors.NewError("service unavailable")
 					}
 					return nil
@@ -518,27 +457,20 @@ func TestCatchup_FlappingPeer(t *testing.T) {
 		)
 		httpMock.Activate()
 
-		// Make multiple attempts with individual timeouts
 		for i := 0; i < 10; i++ {
-			// Create a timeout for each individual request to prevent hanging
-			reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
-			_, _, _ = server.catchupGetBlockHeaders(reqCtx, targetBlock, "http://degrading-peer", "peer-degrading-001")
+			reqCtx, reqCancel := context.WithTimeout(suite.Ctx, 2*time.Second)
+			_, _, _ = suite.Server.catchupGetBlockHeaders(reqCtx, targetBlock, "http://degrading-peer", "peer-degrading-001")
 			reqCancel()
 			time.Sleep(50 * time.Millisecond)
 		}
 
-		// Check peer is marked as unreliable
-		peerMetric := server.peerMetrics.PeerMetrics["http://degrading-peer"]
-		require.NotNil(t, peerMetric)
+		peerMetric := suite.Server.peerMetrics.PeerMetrics["peer-degrading-001"]
+		require.NotNil(t, peerMetric, "Expected peer metrics for peer-degrading-001")
 
-		// Log the actual metrics for debugging
 		t.Logf("Peer metrics - Reputation: %.2f, Failed: %d, Successful: %d, Total: %d",
 			peerMetric.ReputationScore, peerMetric.FailedRequests, peerMetric.SuccessfulRequests, peerMetric.TotalRequests)
 
-		// With the retry logic, the peer might still maintain a decent reputation
-		// but should have recorded failures
 		assert.Greater(t, peerMetric.FailedRequests, int64(0), "Should have recorded some failures")
-		// Total requests should be at least the number of attempts
 		assert.GreaterOrEqual(t, peerMetric.TotalRequests, int64(10), "Should have made at least 10 requests")
 	})
 }

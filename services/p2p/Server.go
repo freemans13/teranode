@@ -1593,11 +1593,7 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 		}
 	}
 
-	// Check if we should skip during sync
-	if s.shouldSkipDuringSync(from, blockMessage.PeerID, blockMessage.Height, "handleBlockTopic") {
-		return
-	}
-
+	// Always send block to kafka - let block validation service decide what to do based on sync state
 	// send block to kafka, if configured
 	if s.blocksKafkaProducerClient != nil {
 		msg := &kafkamessage.KafkaBlockTopicMessage{

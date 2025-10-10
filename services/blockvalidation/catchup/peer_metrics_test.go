@@ -245,10 +245,6 @@ func TestPeerMetrics_GetStats(t *testing.T) {
 }
 
 func TestPeerMetrics_Reset(t *testing.T) {
-	// Note: Reset method has a known issue where it replaces the entire struct including mutex
-	// This test is skipped to avoid the panic, but documents the expected behavior
-	t.Skip("Reset method has mutex issue - replacing entire struct including mutex")
-
 	metrics := NewPeerMetrics()
 
 	// Add some data

@@ -510,7 +510,7 @@ func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) erro
 
 	if checkpointsChecked > 0 {
 		u.logger.Infof("[catchup][%s] Successfully verified %d checkpoint(s) in header chain", catchupCtx.blockUpTo.Hash().String(), checkpointsChecked)
-		catchupCtx.useQuickValidation = true
+		catchupCtx.useQuickValidation = false // quick validation is turned off for now, need more testing
 	} else {
 		catchupCtx.useQuickValidation = false
 	}

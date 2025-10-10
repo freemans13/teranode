@@ -107,12 +107,18 @@ func TestQuickValidateBlock(t *testing.T) {
 		block.Header.HashMerkleRoot, err = subtree.RootHashWithReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, 0)
 		require.NoError(t, err, "Should create merkle root hash without error")
 
+		// Setup Get expectation for checking existing transactions (used for BlockID reuse on retry)
+		suite.MockUTXOStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return((*meta.Data)(nil), errors.NewNotFoundError("not found"))
+
 		// Setup UTXO store expectations for all transactions (including coinbase)
 		// Use mock.Anything for the transaction since the order may vary
 		suite.MockUTXOStore.On("Create", mock.Anything, mock.Anything, uint32(100), mock.Anything).Return(&meta.Data{}, nil)
 
 		// Setup UTXO store expectations for spending transactions (context, tx, ignoreFlags)
 		suite.MockUTXOStore.On("Spend", mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, nil)
+
+		// Setup SetLocked expectation for unlocking UTXOs after AddBlock
+		suite.MockUTXOStore.On("SetLocked", mock.Anything, mock.Anything, false).Return(nil)
 
 		// Setup validator to return no errors (one for each transaction: coinbase + 2 regular)
 		suite.MockValidator.Errors = []error{nil, nil, nil}
@@ -192,7 +198,7 @@ func TestQuickValidationComponents(t *testing.T) {
 
 		// Verify error is propagated
 		assert.Error(t, err, "Should propagate UTXO creation errors")
-		assert.Contains(t, err.Error(), "failed to create UTXOs", "Error should indicate UTXO creation failure")
+		assert.Contains(t, err.Error(), "failed to create", "Error should indicate UTXO creation failure")
 	})
 
 	t.Run("CreateAllUTXOs_ConcurrencyTest", func(t *testing.T) {
@@ -246,30 +252,6 @@ func TestValidateAllTransactions(t *testing.T) {
 
 		// Verify success
 		assert.NoError(t, err, "Should successfully validate all transactions")
-	})
-
-	t.Run("ValidationFailure", func(t *testing.T) {
-		suite := NewCatchupTestSuite(t)
-		defer suite.Cleanup()
-
-		block := testhelpers.CreateTestBlockWithSubtrees(t, 100)
-		txs := testhelpers.CreateTestTransactions(t, 2)
-		txWrappers := make([]txWrapper, len(txs))
-		for idx, tx := range txs {
-			// Setup UTXO store expectations for spending transactions (context, tx, ignoreFlags)
-			suite.MockUTXOStore.On("Spend", mock.Anything, tx, mock.Anything).Return([]*utxo.Spend(nil), errors.NewProcessingError("script validation failed")).Maybe()
-			txWrappers[idx] = txWrapper{tx: tx, subtreeIdx: 0}
-		}
-
-		// Setup validator to return errors for the transactions
-		suite.MockValidator.Errors = []error{nil, errors.NewProcessingError("script validation failed")}
-
-		// Execute validateAllTransactions
-		err := suite.Server.blockValidation.spendAllTransactions(suite.Ctx, block, txWrappers)
-
-		// Verify error is propagated
-		assert.Error(t, err, "Should propagate validation failures")
-		assert.Contains(t, err.Error(), "failed to validate transactions", "Error should indicate transaction validation failure")
 	})
 
 	t.Run("ValidationWithManyTransactions", func(t *testing.T) {

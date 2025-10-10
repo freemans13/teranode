@@ -295,6 +295,10 @@ type BlockValidationSettings struct {
 	ExtendTransactionTimeout time.Duration // Timeout for extending transactions (default: 120s)
 	// Concurrency limits
 	GetBlockTransactionsConcurrency int // Concurrency limit for getBlockTransactions (default: 64)
+	// Priority queue and fork processing settings
+	NearForkThreshold int // Heights within this range are considered "near" forks (default: coinbase maturity / 2)
+	MaxParallelForks  int // Maximum number of forks to process in parallel (default: 4)
+	MaxTrackedForks   int // Maximum total number of forks to track (default: 1000)
 }
 
 type ValidatorSettings struct {

@@ -185,7 +185,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UTXOPersisterBufferSize:               getString("utxoPersister_buffer_size", "4KB", alternativeContext...),
 			UTXOPersisterDirect:                   getBool("direct", true, alternativeContext...),
 			TxStore:                               getURL("txstore", "", alternativeContext...),
-			BlockPersisterPersistAge:              uint32(getInt("blockpersister_persistAge", 100, alternativeContext...)), //nolint:gosec // G115: integer overflow conversion int -> uint32 (gosec)
+			BlockPersisterPersistAge:              uint32(getInt("blockpersister_persistAge", 2, alternativeContext...)), //nolint:gosec // G115: integer overflow conversion int -> uint32 (gosec)
 			BlockPersisterPersistSleep:            getDuration("blockPersister_persistSleep", time.Minute, alternativeContext...),
 			UtxoStore:                             getURL("txmeta_store", "", alternativeContext...),
 			FileStoreReadConcurrency:              getInt("filestore_read_concurrency", 768, alternativeContext...),
@@ -285,6 +285,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SubtreeFetchConcurrency:         getInt("blockvalidation_subtree_fetch_concurrency", 8, alternativeContext...),
 			ExtendTransactionTimeout:        getDuration("blockvalidation_extend_transaction_timeout", 120*time.Second, alternativeContext...),
 			GetBlockTransactionsConcurrency: getInt("blockvalidation_get_block_transactions_concurrency", 64, alternativeContext...),
+			// Priority queue and fork processing settings
+			NearForkThreshold: getInt("blockvalidation_near_fork_threshold", 0, alternativeContext...), // 0 means use default (coinbase maturity / 2)
+			MaxParallelForks:  getInt("blockvalidation_max_parallel_forks", 4, alternativeContext...),
+			MaxTrackedForks:   getInt("blockvalidation_max_tracked_forks", 1000, alternativeContext...),
 		},
 		Validator: ValidatorSettings{
 			GRPCAddress:               getString("validator_grpcAddress", "localhost:8081", alternativeContext...),

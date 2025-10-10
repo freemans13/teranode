@@ -37,7 +37,6 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
-	blockoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -1119,13 +1118,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		u.logger.Infof("[ValidateBlock][%s] validating %d subtrees", block.Hash().String(), len(block.Subtrees))
 
 		if err = u.validateBlockSubtrees(ctx, block, baseURL); err != nil {
-			if errors.Is(err, errors.ErrTxInvalid) {
+			if errors.Is(err, errors.ErrTxInvalid) || errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
 				u.logger.Warnf("[ValidateBlock][%s] block contains invalid transactions, marking as invalid: %s", block.Hash().String(), err)
-
-				// the block contained invalid transactions and should be marked as invalid
-				if err = u.blockchainClient.AddBlock(ctx, block, baseURL, blockoptions.WithInvalid(true)); err != nil {
-					return errors.NewProcessingError("[ValidateBlock][%s] failed to store invalid block", block.Hash().String(), err)
-				}
+				return errors.NewBlockInvalidError("[ValidateBlock][%s] block contains invalid transactions: %s", block.Hash().String(), err)
 			}
 
 			return err

@@ -14,7 +14,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/services/validator"
 	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -43,23 +42,41 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 	)
 	defer deferFn()
 
-	// get the next block ID from the blockchain store
-	// we will use this to set the txs as mined and for the block itself
-	id, err := u.blockchainClient.GetNextBlockID(ctx)
-	if err != nil {
-		return errors.NewProcessingError("[quickValidateBlock][%s] failed to get next block ID", block.Hash().String(), err)
-	}
-
-	// why is the id uint64 in the database, but uint32 in the model?
-	block.ID = uint32(id) // nolint:gosec
+	// Get stable block ID - reuse existing BlockID if transactions already exist (retry scenario)
+	var id uint64
+	var err error
+	var txWrappers []txWrapper
 
 	if len(block.Subtrees) > 0 {
-		// Get transaction data from subtrees
-		txWrappers, err := u.getBlockTransactions(ctx, block)
+		// Get transaction data from subtrees first
+		txWrappers, err = u.getBlockTransactions(ctx, block)
 		if err != nil {
-			return errors.NewProcessingError("[createAllUTXOs][%s] failed to get block transactions", block.Hash().String(), err)
+			return errors.NewProcessingError("[quickValidateBlock][%s] failed to get block transactions", block.Hash().String(), err)
 		}
 
+		// Check if first transaction already exists with a BlockID (retry scenario)
+		// We only need to check the first transaction since it's always created first
+		if len(txWrappers) > 0 && txWrappers[0].tx != nil {
+			existingMeta, err := u.utxoStore.Get(ctx, txWrappers[0].tx.TxIDChainHash(), fields.BlockIDs)
+			if err == nil && existingMeta != nil && len(existingMeta.BlockIDs) > 0 {
+				// First transaction exists, reuse its BlockID for consistency
+				id = uint64(existingMeta.BlockIDs[0])
+				block.ID = existingMeta.BlockIDs[0]
+				u.logger.Debugf("[quickValidateBlock][%s] reusing existing BlockID %d from retry", block.Hash().String(), id)
+			}
+		}
+	}
+
+	// If no existing transactions found, get next block ID
+	if id == 0 {
+		id, err = u.blockchainClient.GetNextBlockID(ctx)
+		if err != nil {
+			return errors.NewProcessingError("[quickValidateBlock][%s] failed to get next block ID", block.Hash().String(), err)
+		}
+		block.ID = uint32(id) // nolint:gosec
+	}
+
+	if len(block.Subtrees) > 0 {
 		// For checkpointed blocks, we can skip full validation and just create UTXOs
 		// This is the main optimization - we trust the checkpoint and don't need to
 		// validate every transaction's scripts and signatures
@@ -82,6 +99,21 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		options.WithID(id),
 	); err != nil {
 		return errors.NewProcessingError("[quickValidateBlock][%s] failed to add block to blockchain", block.Hash().String(), err)
+	}
+
+	if len(block.Subtrees) > 0 {
+		// Extract transaction hashes for unlocking
+		txHashes := make([]chainhash.Hash, 0, len(txWrappers))
+		for _, txW := range txWrappers {
+			if txW.tx != nil {
+				txHashes = append(txHashes, *txW.tx.TxIDChainHash())
+			}
+		}
+
+		// Unlock all UTXOs - final commit point
+		if err = u.utxoStore.SetLocked(ctx, txHashes, false); err != nil {
+			return errors.NewProcessingError("[quickValidateBlock][%s] failed to unlock UTXOs", block.Hash().String(), err)
+		}
 	}
 
 	// Mark block as existing in cache
@@ -108,11 +140,27 @@ func (u *BlockValidation) createAllUTXOs(ctx context.Context, block *model.Block
 	)
 	defer deferFn()
 
+	// Create first transaction synchronously to establish BlockID anchor for retries
+	if len(txs) > 0 && txs[0].tx != nil {
+		if _, err := u.utxoStore.Create(ctx, txs[0].tx, block.Height, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+			BlockID:     block.ID,
+			BlockHeight: block.Height,
+			SubtreeIdx:  txs[0].subtreeIdx,
+		}), utxo.WithLocked(true)); err != nil && !errors.Is(err, errors.ErrTxExists) {
+			return errors.NewProcessingError("[createAllUTXOs][%s] failed to create first UTXO for tx %s", block.Hash().String(), txs[0].tx.TxIDChainHash().String(), err)
+		}
+	}
+
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, u.settings.UtxoStore.StoreBatcherSize*2)
 
-	// Create UTXOs in parallel
+	// Create remaining UTXOs in parallel (skip first transaction, already created)
 	for idx, txW := range txs {
+		// Skip first transaction, already created synchronously above
+		if idx == 0 {
+			continue
+		}
+
 		tx := txW.tx // Capture for goroutine
 
 		if tx == nil {
@@ -125,27 +173,8 @@ func (u *BlockValidation) createAllUTXOs(ctx context.Context, block *model.Block
 				BlockID:     block.ID,
 				BlockHeight: block.Height,
 				SubtreeIdx:  txW.subtreeIdx,
-			})); err != nil {
-				if !errors.Is(err, errors.ErrTxExists) {
-					return errors.NewProcessingError("[createAllUTXOs][%s] failed to create UTXO for tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
-				}
-
-				u.logger.Debugf("[createAllUTXOs][%s] UTXO already exists for tx %s, deleting and recreating", block.Hash().String(), tx.TxIDChainHash().String())
-
-				// the utxo already exists, this can happen in recovery scenarios
-				// we should delete the utxo and try again to ensure it has the correct block ID and height
-				if err = u.utxoStore.Delete(gCtx, tx.TxIDChainHash()); err != nil {
-					return errors.NewProcessingError("[createAllUTXOs][%s] failed to delete existing UTXO for tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
-				}
-
-				if _, err = u.utxoStore.Create(gCtx, txW.tx, block.Height, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
-					BlockID:     block.ID,
-					BlockHeight: block.Height,
-					SubtreeIdx:  txW.subtreeIdx,
-				})); err != nil {
-					// this should not have failed
-					return errors.NewProcessingError("[createAllUTXOs][%s] failed to recreate UTXO for tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
-				}
+			}), utxo.WithLocked(true)); err != nil && !errors.Is(err, errors.ErrTxExists) {
+				return errors.NewProcessingError("[createAllUTXOs][%s] failed to create UTXO for tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
 			}
 
 			return nil
@@ -170,9 +199,9 @@ func (u *BlockValidation) createAllUTXOs(ctx context.Context, block *model.Block
 // Returns:
 //   - error: If validation fails
 func (u *BlockValidation) spendAllTransactions(ctx context.Context, block *model.Block, txs []txWrapper) error {
-	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "validateAllTransactions",
+	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "spendAllTransactions",
 		tracing.WithParentStat(u.stats),
-		tracing.WithLogMessage(u.logger, "[validateAllTransactions][%s] validating %d transactions", block.Hash().String(), block.TransactionCount),
+		tracing.WithLogMessage(u.logger, "[spendAllTransactions][%s] spending %d transactions", block.Hash().String(), block.TransactionCount),
 	)
 	defer deferFn()
 
@@ -183,14 +212,6 @@ func (u *BlockValidation) spendAllTransactions(ctx context.Context, block *model
 	g, gCtx := errgroup.WithContext(ctx)                           // we don't want the tracing to be linked to these calls
 	util.SafeSetLimit(g, spendBatcherSize*spendBatcherConcurrency) // we limit the number of concurrent requests, to not overload Aerospike
 
-	validationOptions := validator.NewDefaultOptions()
-	// For checkpointed blocks, we skip UTXO creation, they have already been created
-	validationOptions.SkipUtxoCreation = true
-	// We don't add transactions to block assembly as this is a mined block
-	validationOptions.AddTXToBlockAssembly = false
-	// We skip policy checks as the txs are assumed valid for a mined block
-	validationOptions.SkipPolicyChecks = true
-
 	for idx, txW := range txs {
 		tx := txW.tx // Capture for goroutine
 
@@ -199,8 +220,8 @@ func (u *BlockValidation) spendAllTransactions(ctx context.Context, block *model
 		}
 
 		g.Go(func() error {
-			if _, err := u.utxoStore.Spend(gCtx, tx); err != nil {
-				return errors.NewProcessingError("failed to spend tx %s", tx.TxIDChainHash().String(), err)
+			if _, err := u.utxoStore.Spend(gCtx, tx, utxo.IgnoreFlags{IgnoreLocked: true}); err != nil {
+				return errors.NewProcessingError("[spendAllTransactions][%s] failed to spend tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
 			}
 
 			return nil
@@ -208,7 +229,7 @@ func (u *BlockValidation) spendAllTransactions(ctx context.Context, block *model
 	}
 
 	if err := g.Wait(); err != nil {
-		return errors.NewProcessingError("[validateAllTransactions][%s] failed to validate transactions", block.Hash().String(), err)
+		return errors.NewProcessingError("[spendAllTransactions][%s] failed to spend all transactions", block.Hash().String(), err)
 	}
 
 	return nil

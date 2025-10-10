@@ -46,6 +46,31 @@ var (
 	prometheusCatchupHeadersFetched *prometheus.CounterVec
 	prometheusCatchupErrors         *prometheus.CounterVec
 	prometheusCatchupActive         prometheus.Gauge
+
+	// priority queue metrics
+	prometheusBlockPriorityQueueSize      *prometheus.GaugeVec
+	prometheusBlockPriorityQueueAdded     *prometheus.CounterVec
+	prometheusBlockPriorityQueueProcessed *prometheus.CounterVec
+
+	// fork processing metrics
+	prometheusForkCount             prometheus.Gauge
+	prometheusForkProcessingWorkers prometheus.Gauge
+	prometheusForkBlocksProcessed   *prometheus.CounterVec
+
+	// enhanced fork lifecycle metrics
+	prometheusForkCreated           *prometheus.CounterVec
+	prometheusForkLifetime          prometheus.Histogram
+	prometheusForkDepth             prometheus.Histogram
+	prometheusForkResolved          *prometheus.CounterVec
+	prometheusForkResolutionDepth   prometheus.Histogram
+	prometheusOrphanedForks         prometheus.Counter
+	prometheusProcessingBlocksStuck prometheus.Gauge
+	prometheusForkAverageDepth      prometheus.Gauge
+	prometheusForkLongestDepth      prometheus.Gauge
+	prometheusAverageForkLifetime   prometheus.Gauge
+
+	blockQueueSkipCount prometheus.Histogram
+	blockQueueWaitTime  prometheus.Histogram
 )
 
 var (
@@ -233,6 +258,181 @@ func _initPrometheusMetrics() {
 			Subsystem: "blockvalidation",
 			Name:      "catchup_active",
 			Help:      "Number of active catchup operations (0 or 1)",
+		},
+	)
+
+	// Initialize priority queue metrics
+	prometheusBlockPriorityQueueSize = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "priority_queue_size",
+			Help:      "Current size of the block priority queue by priority level",
+		},
+		[]string{"priority"},
+	)
+
+	prometheusBlockPriorityQueueAdded = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "priority_queue_added_total",
+			Help:      "Total number of blocks added to priority queue by priority level",
+		},
+		[]string{"priority"},
+	)
+
+	prometheusBlockPriorityQueueProcessed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "priority_queue_processed_total",
+			Help:      "Total number of blocks processed from priority queue by priority level",
+		},
+		[]string{"priority", "result"},
+	)
+
+	// Initialize fork processing metrics
+	prometheusForkCount = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_count",
+			Help:      "Current number of active forks being tracked",
+		},
+	)
+
+	prometheusForkProcessingWorkers = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_processing_workers",
+			Help:      "Current number of active fork processing workers",
+		},
+	)
+
+	prometheusForkBlocksProcessed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_blocks_processed_total",
+			Help:      "Total number of blocks processed on forks by fork ID",
+		},
+		[]string{"fork_id", "result"},
+	)
+
+	prometheusForkCreated = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_created_total",
+			Help:      "Total number of forks created",
+		},
+		[]string{"reason"},
+	)
+
+	prometheusForkLifetime = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_lifetime_seconds",
+			Help:      "Lifetime of forks in seconds",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 15),
+		},
+	)
+
+	prometheusForkDepth = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_depth_blocks",
+			Help:      "Depth of forks in blocks",
+			Buckets:   prometheus.LinearBuckets(1, 1, 20),
+		},
+	)
+
+	prometheusForkResolved = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_resolved_total",
+			Help:      "Total number of forks resolved",
+		},
+		[]string{"result"},
+	)
+
+	prometheusForkResolutionDepth = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_resolution_depth_blocks",
+			Help:      "Depth of forks when resolved",
+			Buckets:   prometheus.LinearBuckets(1, 1, 20),
+		},
+	)
+
+	prometheusOrphanedForks = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_orphaned_total",
+			Help:      "Total number of forks marked as orphaned",
+		},
+	)
+
+	prometheusProcessingBlocksStuck = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "processing_blocks_stuck",
+			Help:      "Number of blocks stuck in processing state",
+		},
+	)
+
+	prometheusForkAverageDepth = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_average_depth",
+			Help:      "Average depth of active forks in blocks",
+		},
+	)
+
+	prometheusForkLongestDepth = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_longest_depth",
+			Help:      "Longest active fork depth in blocks",
+		},
+	)
+
+	prometheusAverageForkLifetime = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "fork_average_lifetime_seconds",
+			Help:      "Average lifetime of active forks in seconds",
+		},
+	)
+
+	blockQueueSkipCount = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "queue_skip_count",
+			Help:      "Number of times blocks were skipped before processing",
+			Buckets:   []float64{1, 5, 10, 20, 50},
+		},
+	)
+
+	blockQueueWaitTime = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "queue_wait_seconds",
+			Help:      "Time blocks spend in queue before processing",
+			Buckets:   prometheus.DefBuckets,
 		},
 	)
 }

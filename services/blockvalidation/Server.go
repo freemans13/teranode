@@ -53,6 +53,12 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+const (
+	SourceTypeNormal  = "normal"
+	SourceTypeRetry   = "retry"
+	SourceTypeCatchup = "catchup"
+)
+
 // processBlockFound encapsulates information about a newly discovered block
 // that requires validation. It includes both the block identifier and communication
 // channels for handling validation results.
@@ -127,6 +133,16 @@ type Server struct {
 	// that need validation. This channel buffers requests when high load occurs.
 	blockFoundCh chan processBlockFound
 
+	// blockPriorityQueue manages blocks with priority-based processing
+	// to ensure chain-extending blocks are processed before fork blocks
+	blockPriorityQueue *BlockPriorityQueue
+
+	// blockClassifier determines the priority of blocks for processing
+	blockClassifier *BlockClassifier
+
+	// forkManager manages parallel processing of fork branches
+	forkManager *ForkManager
+
 	// catchupCh handles blocks that need processing during chain catchup operations.
 	// This channel is used when the node falls behind the chain tip.
 	catchupCh chan processBlockCatchup
@@ -141,9 +157,12 @@ type Server struct {
 	// Kafka messages for distributed coordination
 	kafkaConsumerClient kafka.KafkaConsumerGroupI
 
-	// processSubtreeNotify caches subtree processing state to prevent duplicate
+	// processBlockNotify caches subtree processing state to prevent duplicate
 	// processing of the same subtree from multiple miners
-	processSubtreeNotify *ttlcache.Cache[chainhash.Hash, bool]
+	processBlockNotify *ttlcache.Cache[chainhash.Hash, bool]
+
+	// catchupAlternatives tracks alternative peer sources for blocks in catchup
+	catchupAlternatives *ttlcache.Cache[chainhash.Hash, []processBlockCatchup]
 
 	// stats tracks operational metrics for monitoring and troubleshooting
 	stats *gocore.Stat
@@ -227,25 +246,44 @@ func New(
 		MaxHalfOpenRequests: 1,
 	}
 
+	// Determine near fork threshold (default to coinbase maturity / 2)
+	nearForkThreshold := uint32(tSettings.ChainCfgParams.CoinbaseMaturity / 2)
+	if tSettings.BlockValidation.NearForkThreshold > 0 {
+		nearForkThreshold = uint32(tSettings.BlockValidation.NearForkThreshold)
+	}
+
+	pq := NewBlockPriorityQueue(logger)
+	fm := NewForkManager(logger, tSettings)
+	fm.SetPriorityQueue(pq)
+
+	// Register fork resolution callback
+	fm.OnForkResolution(func(resolution *ForkResolution) {
+		logger.Infof("Fork %s resolved to %s at height %d with %d blocks", resolution.ForkID, resolution.ResolvedTo, resolution.FinalHeight, resolution.BlocksInFork)
+	})
+
 	bVal := &Server{
-		logger:               logger,
-		settings:             tSettings,
-		subtreeStore:         subtreeStore,
-		blockchainClient:     blockchainClient,
-		txStore:              txStore,
-		utxoStore:            utxoStore,
-		validatorClient:      validatorClient,
-		blockAssemblyClient:  blockAssemblyClient,
-		blockFoundCh:         make(chan processBlockFound, tSettings.BlockValidation.BlockFoundChBufferSize),
-		catchupCh:            make(chan processBlockCatchup, tSettings.BlockValidation.CatchupChBufferSize),
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
-		stats:                gocore.NewStat("blockvalidation"),
-		kafkaConsumerClient:  kafkaConsumerClient,
-		peerCircuitBreakers:  catchup.NewPeerCircuitBreakers(*cbConfig),
+		logger:              logger,
+		settings:            tSettings,
+		subtreeStore:        subtreeStore,
+		blockchainClient:    blockchainClient,
+		txStore:             txStore,
+		utxoStore:           utxoStore,
+		validatorClient:     validatorClient,
+		blockAssemblyClient: blockAssemblyClient,
+		blockFoundCh:        make(chan processBlockFound, tSettings.BlockValidation.BlockFoundChBufferSize),
+		blockPriorityQueue:  pq,
+		blockClassifier:     NewBlockClassifier(logger, nearForkThreshold, blockchainClient),
+		forkManager:         fm,
+		catchupCh:           make(chan processBlockCatchup, tSettings.BlockValidation.CatchupChBufferSize),
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](ttlcache.WithTTL[chainhash.Hash, []processBlockCatchup](10 * time.Minute)),
+		stats:               gocore.NewStat("blockvalidation"),
+		kafkaConsumerClient: kafkaConsumerClient,
+		peerCircuitBreakers: catchup.NewPeerCircuitBreakers(*cbConfig),
 		peerMetrics: &catchup.CatchupMetrics{
 			PeerMetrics: make(map[string]*catchup.PeerCatchupMetrics),
 		},
-		headerChainCache: catchup.NewHeaderChainCache(logger), // Chain-aware cache for efficient catchup
+		headerChainCache: catchup.NewHeaderChainCache(logger),
 	}
 
 	return bVal
@@ -389,6 +427,8 @@ func (u *Server) HealthGRPC(ctx context.Context, _ *blockvalidation_api.EmptyMes
 //
 // Returns an error if initialization fails due to configuration issues or service unavailability
 func (u *Server) Init(ctx context.Context) (err error) {
+	u.logger.Infof("[Init] Starting block validation initialization")
+
 	subtreeValidationClient, err := subtreevalidation.NewClient(ctx, u.logger, u.settings, "blockvalidation")
 	if err != nil {
 		return errors.NewServiceError("[Init] failed to create subtree validation client", err)
@@ -417,14 +457,56 @@ func (u *Server) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	go u.processSubtreeNotify.Start()
+	go u.processBlockNotify.Start()
+	go u.catchupAlternatives.Start()
 
-	// process blocks found from channel
+	// Start fork manager cleanup routine
+	go u.forkManager.StartCleanupRoutine(ctx)
+
+	// Start the priority-based block processing system
+	u.startBlockProcessingSystem(ctx)
+
+	// Process blocks from the legacy channel (for backward compatibility) with worker pool
+	numLegacyWorkers := 10
+	for i := 0; i < numLegacyWorkers; i++ {
+		workerID := i
+		go func() {
+			u.logger.Debugf("[Init] Started blockFoundCh worker %d", workerID)
+			for {
+				select {
+				case <-ctx.Done():
+					u.logger.Infof("[Init] closing blockFoundCh worker %d", workerID)
+					return
+
+				case blockFound := <-u.blockFoundCh:
+					u.logger.Infof("[Init] Worker %d received block %s from blockFoundCh, processing", workerID, blockFound.hash.String())
+					func(bf processBlockFound) {
+						defer func() {
+							if r := recover(); r != nil {
+								u.logger.Errorf("[Init] PANIC in processBlockFoundChannel for block %s: %v", bf.hash.String(), r)
+								if bf.errCh != nil {
+									bf.errCh <- errors.NewProcessingError("panic in processBlockFoundChannel: %v", r)
+								}
+							}
+						}()
+						u.logger.Debugf("[Init] Worker %d starting processBlockFoundChannel for block %s", workerID, bf.hash.String())
+						if err := u.processBlockFoundChannel(ctx, bf); err != nil {
+							u.logger.Errorf("[Init] processBlockFoundChannel failed for block %s: %v", bf.hash.String(), err)
+						} else {
+							u.logger.Debugf("[Init] processBlockFoundChannel completed successfully for block %s", bf.hash.String())
+						}
+					}(blockFound)
+				}
+			}
+		}()
+	}
+
+	// Process catchup channel separately
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
-				u.logger.Infof("[Init] closing block found channel")
+				u.logger.Infof("[Init] closing catchup channel")
 				return
 
 			case c := <-u.catchupCh:
@@ -466,24 +548,71 @@ func (u *Server) Init(ctx context.Context) (err error) {
 						if reportErr := u.blockchainClient.ReportPeerFailure(ctx, c.block.Hash(), c.peerID, "catchup", err.Error()); reportErr != nil {
 							u.logger.Errorf("[Init] failed to report peer failure: %v", reportErr)
 						}
-					}
-				}
 
-			case blockFound := <-u.blockFoundCh:
-				{
-					if err := u.processBlockFoundChannel(ctx, blockFound); err != nil {
-						if u.peerMetrics != nil && blockFound.peerID != "" {
-							peerMetric := u.peerMetrics.GetOrCreatePeerMetrics(blockFound.peerID)
-							if peerMetric != nil {
-								peerMetric.RecordFailure()
-							}
-
-							if !peerMetric.IsTrusted() {
-								u.logger.Warnf("[catchup][%s] peer %s has low reputation score: %.2f, malicious attempts: %d", blockFound.hash.String(), blockFound.peerID, peerMetric.ReputationScore, peerMetric.MaliciousAttempts)
-							}
+						// If block is invalid, don't try other peers; return early
+						// Block is expected to be added to the block store as invalid somewhere else
+						if errors.Is(err, errors.ErrBlockInvalid) ||
+							errors.Is(err, errors.ErrTxMissingParent) ||
+							errors.Is(err, errors.ErrTxNotFound) ||
+							errors.Is(err, errors.ErrTxInvalid) {
+							u.logger.Warnf("[catchup] Block %s is invalid, not trying alternative sources", c.block.Hash().String())
+							return
 						}
 
-						u.logger.Errorf("[Init] failed to process block found [%s] [%v]", blockFound.hash.String(), err)
+						// Try alternative sources for catchup
+						blockHash := c.block.Hash()
+						defer u.catchupAlternatives.Delete(*blockHash)
+
+						alternatives := u.catchupAlternatives.Get(*blockHash)
+						if alternatives != nil && alternatives.Value() != nil {
+							altList := alternatives.Value()
+							u.logger.Infof("[catchup] Trying %d alternative sources for block %s after primary peer %s failed", len(altList), blockHash.String(), c.peerID)
+
+							// Try each alternative
+							for _, alt := range altList {
+								// Skip the same peer that just failed
+								if alt.peerID == c.peerID {
+									continue
+								}
+
+								// Check if peer is bad or malicious
+								if u.peerMetrics != nil && alt.peerID != "" {
+									altPeerMetric := u.peerMetrics.GetOrCreatePeerMetrics(alt.peerID)
+									if altPeerMetric != nil && (altPeerMetric.IsBad() || altPeerMetric.IsMalicious()) {
+										u.logger.Warnf("[catchup] Skipping alternative peer %s - marked as bad or malicious", alt.peerID)
+										continue
+									}
+								}
+
+								u.logger.Infof("[catchup] Trying alternative peer %s for block %s", alt.peerID, blockHash.String())
+
+								// Try catchup with alternative peer
+								if altErr := u.catchup(ctx, alt.block, alt.baseURL, alt.peerID); altErr == nil {
+									u.logger.Infof("[catchup] Successfully processed block %s from alternative peer %s", blockHash.String(), alt.peerID)
+									break
+								} else {
+									u.logger.Warnf("[catchup] Alternative peer %s also failed for block %s: %v", alt.peerID, blockHash.String(), altErr)
+									// Record failure for alternative peer
+									if u.peerMetrics != nil && alt.peerID != "" {
+										altPeerMetric := u.peerMetrics.GetOrCreatePeerMetrics(alt.peerID)
+										if altPeerMetric != nil {
+											altPeerMetric.RecordFailure()
+										}
+									}
+								}
+							}
+							// Clear processing marker to allow retries
+							u.processBlockNotify.Delete(*blockHash)
+						} else {
+							u.logger.Infof("[catchup] No alternative sources available for block %s", blockHash.String())
+							// Clear processing marker to allow retries
+							u.processBlockNotify.Delete(*blockHash)
+						}
+					} else {
+						// Success - clear alternatives for this block
+						u.catchupAlternatives.Delete(*c.block.Hash())
+						// Clear the processing marker
+						u.processBlockNotify.Delete(*c.block.Hash())
 					}
 				}
 			}
@@ -494,16 +623,23 @@ func (u *Server) Init(ctx context.Context) (err error) {
 }
 
 func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
+	u.logger.Infof("[consumerMessageHandler] Handler created and waiting for messages")
 	return func(msg *kafka.KafkaMessage) error {
 		if msg == nil {
+			u.logger.Warnf("[consumerMessageHandler] Received nil Kafka message")
 			return nil
 		}
+
+		u.logger.Infof("[consumerMessageHandler] Received Kafka message from topic: %s, partition: %d, offset: %d",
+			msg.Topic, msg.Partition, msg.Offset)
 
 		var kafkaMsg kafkamessage.KafkaBlockTopicMessage
 		if err := proto.Unmarshal(msg.Value, &kafkaMsg); err != nil {
 			u.logger.Errorf("Failed to unmarshal kafka message: %v", err)
 			return nil
 		}
+
+		u.logger.Infof("[consumerMessageHandler] Processing block %s from peer %s at %s", kafkaMsg.Hash, kafkaMsg.GetPeerId(), kafkaMsg.URL)
 
 		errCh := make(chan error, 1)
 		go func() {
@@ -543,6 +679,8 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 }
 
 func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) error {
+	u.logger.Debugf("[blockHandler] Starting to process block %s from peer %s", kafkaMsg.Hash, kafkaMsg.GetPeerId())
+
 	hash, err := chainhash.NewHashFromStr(kafkaMsg.Hash)
 	if err != nil {
 		u.logger.Errorf("Failed to parse block hash from message: %v", err)
@@ -559,18 +697,18 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 	// This prevents peer IDs from being incorrectly used as URLs
 	// Special case: "legacy" is allowed for blocks from the legacy service
 	if kafkaMsg.URL != "legacy" && baseURL.Scheme != "http" && baseURL.Scheme != "https" {
-		u.logger.Errorf("[BlockFound] Invalid URL scheme '%s' for URL '%s' from peer %s - expected http or https. Possible peer ID/URL field confusion.",
-			baseURL.Scheme, kafkaMsg.URL, kafkaMsg.GetPeerId())
+		u.logger.Errorf("[BlockFound] Invalid URL scheme '%s' for URL '%s' from peer %s - expected http or https. Possible peer ID/URL field confusion.", baseURL.Scheme, kafkaMsg.URL, kafkaMsg.GetPeerId())
 		return errors.NewProcessingError("[BlockFound] invalid URL scheme '%s' - expected http or https", baseURL.Scheme)
 	}
 
+	// Don't skip blocks from malicious peers entirely - we still want to add them to the queue
+	// in case other peers have the same block. The malicious check will be done when fetching.
 	if u.peerMetrics != nil && kafkaMsg.GetPeerId() != "" {
 		peerMetrics := u.peerMetrics.GetOrCreatePeerMetrics(kafkaMsg.GetPeerId())
 
 		if peerMetrics != nil && peerMetrics.IsMalicious() {
-			u.logger.Warnf("[BlockFound][%s] peer %s is malicious, skipping [%s]", hash.String(), kafkaMsg.GetPeerId(), baseURL.String())
-			// Skip blocks from malicious peers to avoid processing bad data
-			return nil
+			u.logger.Warnf("[BlockFound][%s] peer %s is malicious, but still adding to queue for potential alternative sources [%s]", hash.String(), kafkaMsg.GetPeerId(), baseURL.String())
+			// Continue processing - the block might be available from other peers
 		}
 	}
 
@@ -585,7 +723,13 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 	defer deferFn()
 
 	// first check if the block exists, it is very expensive to do all the checks below
+	u.logger.Debugf("[blockHandler] Checking if block %s exists", hash.String())
+	if u.blockValidation == nil {
+		u.logger.Errorf("[blockHandler] blockValidation is nil! Cannot check if block exists")
+		return errors.NewServiceError("[BlockFound][%s] blockValidation not initialized", hash.String())
+	}
 	exists, err := u.blockValidation.GetBlockExists(ctx, hash)
+	u.logger.Debugf("[blockHandler] Block %s exists check completed: exists=%v, err=%v", hash.String(), exists, err)
 	if err != nil {
 		return errors.NewServiceError("[BlockFound][%s] failed to check if block exists", hash.String(), err)
 	}
@@ -595,29 +739,23 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 		return nil
 	}
 
-	errCh := make(chan error, 1)
-
-	u.logger.Debugf("[BlockFound][%s] add on channel", hash.String())
+	u.logger.Debugf("[blockHandler] Adding block %s to blockFoundCh", hash.String())
 
 	u.blockFoundCh <- processBlockFound{
 		hash:    hash,
 		baseURL: baseURL.String(),
 		peerID:  kafkaMsg.GetPeerId(),
-		errCh:   errCh,
+		errCh:   nil, // Don't block Kafka consumer waiting for validation
 	}
 	prometheusBlockValidationBlockFoundCh.Set(float64(len(u.blockFoundCh)))
 
-	err = <-errCh
-	if err != nil {
-		return errors.NewProcessingError("[BlockFound][%s] failed to process block", hash.String(), err)
-	}
-
+	u.logger.Debugf("[blockHandler] Block %s queued for processing", hash.String())
 	return nil
 }
 
 // processBlockFoundChannel processes newly found blocks from the block found channel.
-// It implements intelligent routing between normal processing and catchup mode based
-// on the current backlog depth to optimize validation performance.
+// This method now adds blocks to the priority queue instead of processing them directly,
+// allowing for better prioritization and parallel processing.
 //
 // Parameters:
 //   - ctx: Context for processing operations and cancellation
@@ -625,94 +763,135 @@ func (u *Server) blockHandler(kafkaMsg *kafkamessage.KafkaBlockTopicMessage) err
 //
 // Returns an error if block processing fails or validation encounters issues
 func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound processBlockFound) error {
+	u.logger.Debugf("[processBlockFoundChannel] Started processing block %s from %s (peer: %s)", blockFound.hash.String(), blockFound.baseURL, blockFound.peerID)
+
 	// Validate baseURL to ensure it's not a peer ID being used as URL
 	// Special case: "legacy" is allowed for blocks from the legacy service
 	if blockFound.baseURL != "legacy" {
 		parsedURL, parseErr := url.Parse(blockFound.baseURL)
 		if parseErr != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
-			u.logger.Errorf("[processBlockFoundChannel][%s] Invalid baseURL '%s' for peer %s - must be valid http/https URL, not peer ID",
-				blockFound.hash.String(), blockFound.baseURL, blockFound.peerID)
-			return errors.NewProcessingError("[processBlockFoundChannel][%s] invalid baseURL - not a valid http/https URL", blockFound.hash.String())
+			u.logger.Errorf("[processBlockFoundChannel][%s] Invalid baseURL '%s' for peer %s - must be valid http/https URL, not peer ID", blockFound.hash.String(), blockFound.baseURL, blockFound.peerID)
+			err := errors.NewProcessingError("[processBlockFoundChannel][%s] invalid baseURL - not a valid http/https URL", blockFound.hash.String())
+
+			if blockFound.errCh != nil {
+				blockFound.errCh <- err
+			}
+
+			return err
 		}
 	}
 
-	// TODO GOKHAN: parameterize this
-	if u.settings.BlockValidation.UseCatchupWhenBehind && len(u.blockFoundCh) > 3 {
-		// we are multiple blocks behind, process all the blocks per peer on the catchup channel
-		u.logger.Infof("[Init] processing block found on channel [%s] - too many blocks behind", blockFound.hash.String())
+	// Check if block already exists to avoid redundant processing
+	exists, err := u.blockValidation.GetBlockExists(ctx, blockFound.hash)
+	if err != nil {
+		u.logger.Errorf("[processBlockFoundChannel] Failed to check if block %s exists: %v", blockFound.hash.String(), err)
 
-		// collect all drained items to acknowledge their errCh channels
-		allDrainedItems := make([]processBlockFound, 0)
-		allDrainedItems = append(allDrainedItems, blockFound)
-
-		peerBlocks := make(map[string]processBlockFound)
-		// Use peerID as the key if available
-		key := blockFound.peerID
-		if key == "" {
-			u.logger.Warnf("[processBlockFoundChannel] Missing peerID for block %s, using baseURL as fallback", blockFound.hash.String())
-			key = blockFound.baseURL
-		}
-		peerBlocks[key] = blockFound
-		// get the newest block per peer, emptying the block found channel
-		for len(u.blockFoundCh) > 0 {
-			pb := <-u.blockFoundCh
-			allDrainedItems = append(allDrainedItems, pb)
-			pbKey := pb.peerID
-			if pbKey == "" {
-				u.logger.Warnf("[processBlockFoundChannel] Missing peerID for block %s, using baseURL as fallback", pb.hash.String())
-				pbKey = pb.baseURL
-			}
-			peerBlocks[pbKey] = pb
+		if blockFound.errCh != nil {
+			blockFound.errCh <- err
 		}
 
-		u.logger.Infof("[Init] peerBlocks: %v", peerBlocks)
-		// add that latest block of each peer to the catchup channel
-		for _, pb := range peerBlocks {
-			block, err := u.fetchSingleBlock(ctx, pb.hash, pb.baseURL)
-			if err != nil {
-				// acknowledge all errCh channels before returning error
-				for _, item := range allDrainedItems {
-					if item.errCh != nil {
-						item.errCh <- err
-					}
-				}
-				return errors.NewProcessingError("[Init] failed to get block [%s]", pb.hash.String(), err)
-			}
+		return errors.NewServiceError("[processBlockFoundChannel] failed to check if block exists", err)
+	}
 
-			u.catchupCh <- processBlockCatchup{
-				block:   block,
-				baseURL: pb.baseURL,
-				peerID:  pb.peerID,
-			}
-		}
+	if exists {
+		u.logger.Infof("[processBlockFoundChannel][%s] already validated, skipping", blockFound.hash.String())
 
-		// acknowledge all errCh channels for all drained items
-		for _, item := range allDrainedItems {
-			if item.errCh != nil {
-				item.errCh <- nil
-			}
+		if blockFound.errCh != nil {
+			blockFound.errCh <- nil
 		}
 
 		return nil
 	}
 
-	_, _, ctx1 := tracing.NewStatFromContext(ctx, "blockFoundCh", u.stats, false)
+	// Check queue depth and determine if we might need catchup mode
+	queueSize := u.blockPriorityQueue.Size()
+	shouldConsiderCatchup := u.settings.BlockValidation.UseCatchupWhenBehind && (queueSize > 10 || len(u.blockFoundCh) > 3)
 
-	err := u.processBlockFound(ctx1, blockFound.hash, blockFound.baseURL, blockFound.peerID)
-	if err != nil {
-		if blockFound.errCh != nil {
-			blockFound.errCh <- err
+	if shouldConsiderCatchup {
+		// Fetch the block to classify it before deciding on catchup
+		block, err := u.fetchSingleBlock(ctx, blockFound.hash, blockFound.baseURL)
+		if err != nil {
+			if blockFound.errCh != nil {
+				blockFound.errCh <- err
+			}
+			return errors.NewProcessingError("[processBlockFoundChannel] failed to get block [%s]", blockFound.hash.String(), err)
 		}
 
-		return errors.NewProcessingError("[Init] failed to process block [%s]", blockFound.hash.String(), err)
+		// Check if parent exists
+		parentExists, err := u.blockValidation.GetBlockExists(ctx, block.Header.HashPrevBlock)
+		if err != nil {
+			u.logger.Errorf("[processBlockFoundChannel] Failed to check if parent block %s exists: %v", block.Header.HashPrevBlock.String(), err)
+			if blockFound.errCh != nil {
+				blockFound.errCh <- err
+			}
+			return err
+		}
+
+		// If parent doesn't exist, always use catchup
+		if !parentExists {
+			u.logger.Infof("[processBlockFoundChannel] Parent block %s doesn't exist for block %s, using catchup",
+				block.Header.HashPrevBlock.String(), blockFound.hash.String())
+
+			// Send to catchup channel (non-blocking)
+			select {
+			case u.catchupCh <- processBlockCatchup{
+				block:   block,
+				baseURL: blockFound.baseURL,
+				peerID:  blockFound.peerID,
+			}:
+				u.logger.Debugf("[processBlockFoundChannel] Sent block %s to catchup channel", block.Hash().String())
+			default:
+				u.logger.Warnf("[processBlockFoundChannel] Catchup channel full, dropping block %s", block.Hash().String())
+			}
+
+			if blockFound.errCh != nil {
+				blockFound.errCh <- nil
+			}
+			return nil
+		}
+
+		// Parent exists, classify the block
+		priority, err := u.blockClassifier.ClassifyBlock(ctx, block)
+		if err != nil {
+			u.logger.Warnf("[processBlockFoundChannel] Failed to classify block %s: %v", blockFound.hash.String(), err)
+			// Continue with normal processing if classification fails
+		} else if priority == PriorityChainExtending {
+			// Chain-extending blocks should NOT go to catchup, process normally
+			u.logger.Debugf("[processBlockFoundChannel] Block %s is chain-extending (queue depth %d), processing normally",
+				blockFound.hash.String(), queueSize)
+		} else {
+			// Non-chain-extending blocks can go to catchup when behind
+			u.logger.Infof("[processBlockFoundChannel] Queue depth %d, channel depth %d - sending non-chain-extending block [%s] to catchup",
+				queueSize, len(u.blockFoundCh), blockFound.hash.String())
+
+			// Send to catchup channel (non-blocking)
+			select {
+			case u.catchupCh <- processBlockCatchup{
+				block:   block,
+				baseURL: blockFound.baseURL,
+				peerID:  blockFound.peerID,
+			}:
+				u.logger.Debugf("[processBlockFoundChannel] Sent block %s to catchup channel", block.Hash().String())
+			default:
+				u.logger.Warnf("[processBlockFoundChannel] Catchup channel full, dropping block %s", block.Hash().String())
+			}
+
+			if blockFound.errCh != nil {
+				blockFound.errCh <- nil
+			}
+			return nil
+		}
 	}
 
-	if blockFound.errCh != nil {
-		blockFound.errCh <- nil
-	}
+	// Add block to priority queue
+	u.addBlockToPriorityQueue(ctx, blockFound)
 
+	// Update metrics
 	prometheusBlockValidationBlockFoundCh.Set(float64(len(u.blockFoundCh)))
 
+	// Send response to error channel if it exists (addBlockToPriorityQueue handles the errCh internally)
+	// but if it doesn't send a response in all cases, we need to ensure we don't leave the caller hanging
+	// The errCh should already be handled by addBlockToPriorityQueue, so we just return
 	return nil
 }
 
@@ -726,6 +905,8 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 //
 // Returns an error if service startup fails due to configuration or dependency issues
 func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
+	u.logger.Infof("[Start] Starting block validation service")
+
 	var closeOnce sync.Once
 	defer closeOnce.Do(func() { close(readyCh) })
 
@@ -737,8 +918,18 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return err
 	}
 
+	u.logger.Infof("[Start] FSM transitioned from IDLE state, starting Kafka consumer")
+
 	// start blocks kafka consumer
+	if u.kafkaConsumerClient == nil {
+		u.logger.Errorf("[Start] kafkaConsumerClient is nil!")
+		return errors.NewServiceError("kafkaConsumerClient is nil")
+	}
+
+	u.logger.Infof("[Start] Starting Kafka consumer with handler")
 	u.kafkaConsumerClient.Start(ctx, u.consumerMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())
+
+	u.logger.Infof("[Start] Kafka consumer started successfully")
 
 	// this will block
 	if err := util.StartGRPCServer(ctx, u.logger, u.settings, "blockvalidation", u.settings.BlockValidation.GRPCListenAddress, func(server *grpc.Server) {
@@ -760,7 +951,8 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 //
 // Returns an error if shutdown encounters issues, though typically returns nil
 func (u *Server) Stop(_ context.Context) error {
-	u.processSubtreeNotify.Stop()
+	u.processBlockNotify.Stop()
+	u.catchupAlternatives.Stop()
 
 	// Wait for all background tasks in BlockValidation to complete
 	if u.blockValidation != nil {
@@ -990,6 +1182,15 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, ba
 	)
 	defer deferFn()
 
+	// Check if the peer is malicious before attempting to fetch
+	if u.peerMetrics != nil && peerID != "" {
+		peerMetrics := u.peerMetrics.GetOrCreatePeerMetrics(peerID)
+		if peerMetrics != nil && peerMetrics.IsMalicious() {
+			u.logger.Warnf("[processBlockFound][%s] peer %s is malicious, not fetching from [%s]", hash.String(), peerID, baseURL)
+			return errors.NewProcessingError("[processBlockFound][%s] peer %s is malicious", hash.String(), peerID)
+		}
+	}
+
 	// first check if the block exists, it might have already been processed
 	exists, err := u.blockValidation.GetBlockExists(ctx, hash)
 	if err != nil {
@@ -1023,10 +1224,15 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, ba
 		// add to catchup channel, which will block processing any new blocks until we have caught up
 		go func() {
 			u.logger.Debugf("[processBlockFound][%s] processBlockFound add to catchup channel", hash.String())
-			u.catchupCh <- processBlockCatchup{
+			select {
+			case u.catchupCh <- processBlockCatchup{
 				block:   block,
 				baseURL: baseURL,
 				peerID:  peerID,
+			}:
+				u.logger.Debugf("[processBlockFound] Sent block %s to catchup channel", hash.String())
+			default:
+				u.logger.Warnf("[processBlockFound] Catchup channel full, dropping block %s from peer %s", hash.String(), peerID)
 			}
 		}()
 
@@ -1128,4 +1334,313 @@ func (u *Server) checkParentProcessingComplete(ctx context.Context, block *model
 			retries++
 		}
 	}
+}
+
+// startBlockProcessingSystem starts the priority-based block processing system
+// with support for parallel fork processing
+func (u *Server) startBlockProcessingSystem(ctx context.Context) {
+	// Skip if priority queue is not initialized (e.g., in some tests)
+	if u.blockPriorityQueue == nil {
+		u.logger.Warnf("[startBlockProcessingSystem] Priority queue not initialized, skipping worker startup")
+		return
+	}
+
+	u.logger.Infof("[startBlockProcessingSystem] Starting block processing system")
+
+	// Start multiple worker goroutines for parallel fork processing
+	numWorkers := 4
+	if u.settings.BlockValidation.MaxParallelForks > 0 {
+		numWorkers = u.settings.BlockValidation.MaxParallelForks
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		workerID := i
+		u.logger.Infof("[startBlockProcessingSystem] Starting worker %d", workerID)
+		go u.blockProcessingWorker(ctx, workerID)
+	}
+
+	// Update worker count metric
+	if prometheusForkProcessingWorkers != nil {
+		prometheusForkProcessingWorkers.Set(float64(numWorkers))
+	}
+
+	// Log queue statistics periodically
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				chainExtending, nearFork, deepFork := u.blockPriorityQueue.GetQueueStats()
+				u.logger.Infof("[BlockProcessing] Queue stats - Chain extending: %d, Near fork: %d, Deep fork: %d, Fork count: %d",
+					chainExtending, nearFork, deepFork, u.forkManager.GetForkCount())
+
+				// Update fork metrics
+				if prometheusForkCount != nil {
+					prometheusForkCount.Set(float64(u.forkManager.GetForkCount()))
+				}
+			}
+		}
+	}()
+}
+
+// blockProcessingWorker is a worker that processes blocks from the priority queue
+func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
+	u.logger.Infof("[BlockProcessing] Worker %d started", workerID)
+
+	for {
+		select {
+		case <-ctx.Done():
+			u.logger.Infof("[BlockProcessing] Worker %d stopping", workerID)
+			return
+		default:
+			blockFound, status := u.blockPriorityQueue.WaitForBlock(ctx, u.forkManager)
+
+			if status != GetOK {
+				continue
+			}
+
+			if !u.forkManager.StartProcessingBlock(blockFound.hash) {
+				continue
+			}
+
+			u.logger.Debugf("[BlockProcessing] Worker %d processing block %s", workerID, blockFound.hash.String())
+
+			err := u.processBlockWithPriority(ctx, blockFound)
+
+			u.forkManager.FinishProcessingBlock(blockFound.hash)
+
+			if err != nil {
+				u.logger.Errorf("[BlockProcessing] Worker %d failed to process block %s: %v", workerID, blockFound.hash.String(), err)
+
+				// Record peer failure if applicable
+				if u.peerMetrics != nil && blockFound.peerID != "" {
+					peerMetric := u.peerMetrics.GetOrCreatePeerMetrics(blockFound.peerID)
+					if peerMetric != nil {
+						peerMetric.RecordFailure()
+					}
+				}
+
+				// Update processed metric with failure
+				if prometheusBlockPriorityQueueProcessed != nil {
+					// We don't have the priority here, so we'll use "unknown"
+					prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "failure").Inc()
+				}
+
+				// If the error indicates the block couldn't be fetched (network error, malicious node, etc),
+				// we should retry the block later rather than dropping it completely
+				// TODO: We might want to limit the number of retries per block to avoid infinite loops
+				// For now, we'll just re-queue it with deepFork priority to ensure it gets retried eventually
+				// Note: This could lead to blocks being retried indefinitely if they are always failing to fetch
+				// A more robust solution would involve tracking retry counts and eventually giving up after a threshold
+				if errors.IsNetworkError(err) || errors.IsMaliciousResponseError(err) {
+					u.logger.Warnf("[BlockProcessing] Block %s fetch failed, will retry later", blockFound.hash.String())
+					// Re-add the block to the queue for retry
+					// We need to get the block metadata (height and priority) for re-queuing
+					// For now, we'll use deepFork priority as a safe default for retries
+					go func() {
+						// Add a small delay to avoid tight loops
+						time.Sleep(5 * time.Second)
+						// Create a new blockFound without specific peer info so any peer can provide it
+						retryBlock := processBlockFound{
+							hash:    blockFound.hash,
+							baseURL: SourceTypeRetry, // Special marker for retry attempts
+							peerID:  "",              // Clear peer ID so any peer can be used
+							errCh:   nil,             // No error channel for async retry
+						}
+						u.blockPriorityQueue.RequeueForRetry(retryBlock, PriorityDeepFork, 0)
+						u.logger.Infof("[BlockProcessing] Re-queued block %s for retry from any available peer", blockFound.hash.String())
+					}()
+				}
+			} else {
+				// Update processed metric with success
+				if prometheusBlockPriorityQueueProcessed != nil {
+					prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "success").Inc()
+				}
+			}
+		}
+	}
+}
+
+// addBlockToPriorityQueue adds a block to the priority queue with appropriate classification
+func (u *Server) addBlockToPriorityQueue(ctx context.Context, blockFound processBlockFound) {
+	u.logger.Debugf("[addBlockToPriorityQueue] Started for block %s from %s", blockFound.hash.String(), blockFound.baseURL)
+
+	// First check if block already exists
+	exists, err := u.blockValidation.GetBlockExists(ctx, blockFound.hash)
+	if err != nil {
+		u.logger.Errorf("[addBlockToPriorityQueue] Failed to check if block exists: %v", err)
+		if blockFound.errCh != nil {
+			blockFound.errCh <- err
+		}
+		return
+	}
+
+	if exists {
+		u.logger.Debugf("[addBlockToPriorityQueue] Block %s already exists, skipping", blockFound.hash.String())
+		if blockFound.errCh != nil {
+			blockFound.errCh <- nil
+		}
+		return
+	}
+
+	// Fetch the block to classify it
+	block, err := u.fetchSingleBlock(ctx, blockFound.hash, blockFound.baseURL)
+	if err != nil {
+		u.logger.Errorf("[addBlockToPriorityQueue] Failed to fetch block %s: %v", blockFound.hash.String(), err)
+		if blockFound.errCh != nil {
+			blockFound.errCh <- err
+		}
+		return
+	}
+
+	// Check if parent exists - if not, send directly to catchup
+	parentExists, err := u.blockValidation.GetBlockExists(ctx, block.Header.HashPrevBlock)
+	if err != nil {
+		u.logger.Errorf("[addBlockToPriorityQueue] Failed to check if parent block %s exists: %v", block.Header.HashPrevBlock.String(), err)
+		if blockFound.errCh != nil {
+			blockFound.errCh <- err
+		}
+		return
+	}
+
+	if !parentExists {
+		u.logger.Infof("[addBlockToPriorityQueue] Parent block %s doesn't exist for block %s, sending to catchup", block.Header.HashPrevBlock.String(), blockFound.hash.String())
+
+		// Check if we're already processing this block in catchup
+		if u.processBlockNotify.Get(*blockFound.hash) != nil {
+			u.logger.Debugf("[addBlockToPriorityQueue] Block %s already being processed in catchup, adding as alternative source", blockFound.hash.String())
+
+			// Add to alternative sources for potential failover
+			catchupBlock := processBlockCatchup{
+				block:   block,
+				baseURL: blockFound.baseURL,
+				peerID:  blockFound.peerID,
+			}
+
+			// Get existing alternatives or create new list
+			alternatives := u.catchupAlternatives.Get(*blockFound.hash)
+			if alternatives == nil || alternatives.Value() == nil {
+				u.catchupAlternatives.Set(*blockFound.hash, []processBlockCatchup{catchupBlock}, ttlcache.DefaultTTL)
+			} else {
+				// Append to existing alternatives
+				altList := alternatives.Value()
+				altList = append(altList, catchupBlock)
+				u.catchupAlternatives.Set(*blockFound.hash, altList, ttlcache.DefaultTTL)
+			}
+
+			if blockFound.errCh != nil {
+				blockFound.errCh <- nil
+			}
+			return
+		}
+
+		// Mark as being processed (use TTL to auto-cleanup)
+		u.processBlockNotify.Set(*blockFound.hash, true, ttlcache.DefaultTTL)
+
+		// Send directly to catchup channel (non-blocking)
+		go func() {
+			select {
+			case u.catchupCh <- processBlockCatchup{
+				block:   block,
+				baseURL: blockFound.baseURL,
+				peerID:  blockFound.peerID,
+			}:
+				u.logger.Debugf("[addBlockToPriorityQueue] Sent block %s to catchup channel", blockFound.hash.String())
+			default:
+				// Channel is full, log warning but don't block
+				u.logger.Warnf("[addBlockToPriorityQueue] Catchup channel full, dropping block %s from peer %s", blockFound.hash.String(), blockFound.peerID)
+				// Clear the processing marker so it can be retried later
+				u.processBlockNotify.Delete(*blockFound.hash)
+			}
+		}()
+
+		if blockFound.errCh != nil {
+			blockFound.errCh <- nil
+		}
+		return
+	}
+
+	// Classify the block
+	priority, err := u.blockClassifier.ClassifyBlock(ctx, block)
+	if err != nil {
+		u.logger.Warnf("[addBlockToPriorityQueue] Failed to classify block %s, using deep fork priority: %v", blockFound.hash.String(), err)
+		priority = PriorityDeepFork
+	}
+
+	// Add block to appropriate fork if it's not chain-extending
+	if priority != PriorityChainExtending {
+		forkID, err := u.forkManager.DetermineForkID(ctx, block, u.blockchainClient)
+		if err != nil {
+			u.logger.Warnf("[addBlockToPriorityQueue] Failed to determine fork ID for block %s: %v", blockFound.hash.String(), err)
+		} else {
+			if err := u.forkManager.AddBlockToFork(block, forkID); err != nil {
+				u.logger.Errorf("[addBlockToPriorityQueue] Failed to add block to fork %s: %v", forkID, err)
+			}
+		}
+	}
+
+	// Add to priority queue
+	u.blockPriorityQueue.Add(blockFound, priority, block.Height)
+
+	u.logger.Infof("[addBlockToPriorityQueue] Added block %s with priority %d at height %d", blockFound.hash.String(), priority, block.Height)
+
+	// Send success signal if someone is waiting
+	if blockFound.errCh != nil {
+		u.logger.Debugf("[addBlockToPriorityQueue] Sending success response to errCh for block %s", blockFound.hash.String())
+		blockFound.errCh <- nil
+	} else {
+		u.logger.Debugf("[addBlockToPriorityQueue] No errCh to respond to for block %s", blockFound.hash.String())
+	}
+}
+
+// processBlockWithPriority processes a block based on its priority
+func (u *Server) processBlockWithPriority(ctx context.Context, blockFound processBlockFound) error {
+	// Check if this is a retry attempt
+	if blockFound.baseURL == "retry" {
+		// For retries, try to get an alternative source first
+		alternative, hasAlternative := u.blockPriorityQueue.GetAlternativeSource(blockFound.hash)
+		if hasAlternative {
+			u.logger.Infof("[processBlockWithPriority] Retry attempt using alternative source for block %s from %s (peer: %s)", blockFound.hash.String(), alternative.baseURL, alternative.peerID)
+			blockFound = alternative
+		} else {
+			// No alternatives available, we'll need to wait for new announcements
+			u.logger.Warnf("[processBlockWithPriority] No alternative sources available for retry of block %s", blockFound.hash.String())
+			return errors.NewProcessingError("[processBlockWithPriority] no sources available for block %s", blockFound.hash.String())
+		}
+	}
+
+	// Try to process with the primary source
+	err := u.processBlockFound(ctx, blockFound.hash, blockFound.baseURL, blockFound.peerID)
+
+	// If fetch failed and it's not a validation error, try alternative sources
+	if err != nil && (errors.IsNetworkError(err) || errors.IsMaliciousResponseError(err)) {
+		u.logger.Warnf("[processBlockWithPriority] Failed to fetch block %s from %s (peer: %s), trying alternative sources: %v", blockFound.hash.String(), blockFound.baseURL, blockFound.peerID, err)
+
+		// Try alternative sources
+		for {
+			alternative, hasAlternative := u.blockPriorityQueue.GetAlternativeSource(blockFound.hash)
+			if !hasAlternative {
+				// No more alternatives, return the original error
+				return err
+			}
+
+			u.logger.Infof("[processBlockWithPriority] Trying alternative source for block %s from %s (peer: %s)", blockFound.hash.String(), alternative.baseURL, alternative.peerID)
+
+			// Try with alternative source
+			altErr := u.processBlockFound(ctx, alternative.hash, alternative.baseURL, alternative.peerID)
+			if altErr == nil {
+				// Success with alternative source
+				return nil
+			}
+
+			// Log the failure but continue trying other alternatives
+			u.logger.Warnf("[processBlockWithPriority] Alternative source also failed for block %s from %s: %v", blockFound.hash.String(), alternative.baseURL, altErr)
+		}
+	}
+
+	return err
 }
