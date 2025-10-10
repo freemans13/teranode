@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
-	"github.com/bitcoin-sv/teranode/test/utils/tconfig"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/test/utils/tconfig"
 	"github.com/docker/go-connections/nat"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/assert"

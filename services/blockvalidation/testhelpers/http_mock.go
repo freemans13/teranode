@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/jarcoal/httpmock"
 )
 

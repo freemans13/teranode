@@ -15,7 +15,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // GetFooter retrieves the transaction and UTXO counts from the footer of a UTXO file.

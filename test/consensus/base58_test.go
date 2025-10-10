@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	base58 "github.com/bitcoin-sv/go-sdk/compat/base58"
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
 

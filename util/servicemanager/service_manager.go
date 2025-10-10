@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"golang.org/x/sync/errgroup"
 )
 

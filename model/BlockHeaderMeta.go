@@ -3,8 +3,8 @@ package model
 import (
 	"encoding/binary"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	safe "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 type BlockHeaderMeta struct {
@@ -134,12 +134,12 @@ func NewBlockHeaderMetaFromBytes(b []byte) (*BlockHeaderMeta, error) {
 		return nil, errors.NewProcessingError("invalid length for peer ID in BlockHeaderMeta: %d", len(b))
 	}
 
-	len32 = binary.LittleEndian.Uint32(b[offset : offset+4])
+	len32 = binary.LittleEndian.Uint32(b[offset : offset+4]) //nolint:gosec // bounds already checked above
 	if len32 > 0 {
 		if len(b) < int(offset+4+len32) {
 			return nil, errors.NewProcessingError("invalid length for peer ID in BlockHeaderMeta: %d", len(b))
 		}
-		m.PeerID = string(b[offset+4 : offset+4+len32])
+		m.PeerID = string(b[offset+4 : offset+4+len32]) //nolint:gosec // bounds checked on line above
 	} else {
 		m.PeerID = ""
 	}

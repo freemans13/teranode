@@ -12,27 +12,27 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/mining"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/subtreeprocessor"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob/memory"
-	blockchainstore "github.com/bitcoin-sv/teranode/stores/blockchain"
-	utxoStore "github.com/bitcoin-sv/teranode/stores/utxo"
-	utxofields "github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	utxostoresql "github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/mining"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
+	utxofields "github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	utxostoresql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/assert"
@@ -343,7 +343,9 @@ func TestBlockAssembly_AddTx(t *testing.T) {
 		_, _, genesisBlock := setupBlockchainClient(t, testItems)
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go testItems.blockAssembler.startChannelListeners(ctx)
+		go func() {
+			_ = testItems.blockAssembler.startChannelListeners(ctx)
+		}()
 
 		// Verify genesis block
 		require.Equal(t, chaincfg.RegressionNetParams.GenesisHash, genesisBlock.Hash())
@@ -683,7 +685,9 @@ func TestBlockAssembly_ShouldNotAllowMoreThanOneCoinbaseTx(t *testing.T) {
 		_, _, _ = setupBlockchainClient(t, testItems)
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go testItems.blockAssembler.startChannelListeners(ctx)
+		go func() {
+			_ = testItems.blockAssembler.startChannelListeners(ctx)
+		}()
 
 		var wg sync.WaitGroup
 
@@ -772,7 +776,9 @@ func TestBlockAssembly_GetMiningCandidate(t *testing.T) {
 		_, _, genesisBlock := setupBlockchainClient(t, testItems)
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go testItems.blockAssembler.startChannelListeners(ctx)
+		go func() {
+			_ = testItems.blockAssembler.startChannelListeners(ctx)
+		}()
 
 		// Verify genesis block
 		require.Equal(t, chaincfg.RegressionNetParams.GenesisHash, genesisBlock.Hash())
@@ -878,7 +884,9 @@ func TestBlockAssembly_GetMiningCandidate_MaxBlockSize(t *testing.T) {
 		_, _, genesisBlock := setupBlockchainClient(t, testItems)
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go testItems.blockAssembler.startChannelListeners(ctx)
+		go func() {
+			_ = testItems.blockAssembler.startChannelListeners(ctx)
+		}()
 
 		// Verify genesis block
 		require.Equal(t, chaincfg.RegressionNetParams.GenesisHash, genesisBlock.Hash())
@@ -988,7 +996,9 @@ func TestBlockAssembly_GetMiningCandidate_MaxBlockSize_LessThanSubtreeSize(t *te
 		_, _, _ = setupBlockchainClient(t, testItems)
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go testItems.blockAssembler.startChannelListeners(ctx)
+		go func() {
+			_ = testItems.blockAssembler.startChannelListeners(ctx)
+		}()
 
 		var wg sync.WaitGroup
 
@@ -1084,7 +1094,9 @@ func TestBlockAssembly_CoinbaseSubsidyBugReproduction(t *testing.T) {
 		_, _, _ = setupBlockchainClient(t, testItems)
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go testItems.blockAssembler.startChannelListeners(ctx)
+		go func() {
+			_ = testItems.blockAssembler.startChannelListeners(ctx)
+		}()
 
 		// Create the exact scenario from the bug report: fees only, no subsidy
 		height := uint32(1) // Height 1 (after genesis)
@@ -1272,7 +1284,9 @@ func TestBlockAssembler_CachingFunctionality(t *testing.T) {
 		ba.bestBlockHeight.Store(1)
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go ba.startChannelListeners(ctx)
+		go func() {
+			_ = ba.startChannelListeners(ctx)
+		}()
 
 		// First call
 		h := ba.bestBlockHeight.Load()
@@ -1317,7 +1331,9 @@ func TestBlockAssembler_CachingFunctionality(t *testing.T) {
 		ba.bestBlockHeight.Store(1)
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go ba.startChannelListeners(ctx)
+		go func() {
+			_ = ba.startChannelListeners(ctx)
+		}()
 
 		// First call
 		candidate1, _, err1 := ba.GetMiningCandidate(ctx)
@@ -1367,7 +1383,9 @@ func TestBlockAssembler_CachingFunctionality(t *testing.T) {
 		ba.cachedCandidate.mu.Unlock()
 
 		// Start listeners in a goroutine since it will wait for readyCh
-		go ba.startChannelListeners(ctx)
+		go func() {
+			_ = ba.startChannelListeners(ctx)
+		}()
 
 		// Mock response with delay to simulate slow generation
 		mockResponse := &miningCandidateResponse{

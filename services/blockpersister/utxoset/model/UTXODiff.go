@@ -3,10 +3,10 @@ package model
 import (
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // UTXODiff tracks changes to the UTXO set within a block.

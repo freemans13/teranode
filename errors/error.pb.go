@@ -445,7 +445,7 @@ const file_errors_error_proto_rawDesc = "" +
 	"\x0fNETWORK_TIMEOUT\x10q\x12\x1e\n" +
 	"\x1aNETWORK_CONNECTION_REFUSED\x10r\x12\x1c\n" +
 	"\x18NETWORK_INVALID_RESPONSE\x10s\x12\x1a\n" +
-	"\x16NETWORK_PEER_MALICIOUS\x10tB'Z%github.com/bitcoin-sv/teranode/errorsb\x06proto3"
+	"\x16NETWORK_PEER_MALICIOUS\x10tB+Z)github.com/bsv-blockchain/teranode/errorsb\x06proto3"
 
 var (
 	file_errors_error_proto_rawDescOnce sync.Once

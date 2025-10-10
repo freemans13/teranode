@@ -5,11 +5,11 @@ import (
 	_ "net/http/pprof" //nolint:gosec // Import for pprof, only enabled via CLI flag
 	"os"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob/file"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/file"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/ordishs/gocore"
 )
 

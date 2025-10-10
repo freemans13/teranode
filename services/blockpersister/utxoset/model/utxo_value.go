@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // UTXOValue represents the spendable value and conditions for a UTXO.

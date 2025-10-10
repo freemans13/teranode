@@ -9,8 +9,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 // mustParseShortForm parses the passed short form script and returns the

@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // UTXOMap provides thread-safe storage for UTXO collections.

@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/retry"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/retry"
 )
 
 // WaitForBlockAssemblyReady waits for the block assembly service to be ready to process

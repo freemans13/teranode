@@ -4,9 +4,9 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/ordishs/go-utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

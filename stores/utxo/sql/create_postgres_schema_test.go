@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/util/usql"
+	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/stretchr/testify/assert"
 )
 

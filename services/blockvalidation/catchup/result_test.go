@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

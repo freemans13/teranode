@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/settings"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/settings"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/stretchr/testify/require"
 )
 

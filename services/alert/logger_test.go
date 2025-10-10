@@ -4,7 +4,7 @@ package alert
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 

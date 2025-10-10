@@ -7,10 +7,10 @@ import (
 	"strings"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/usql"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/usql"
 	pq "github.com/lib/pq"
 	"github.com/stretchr/testify/mock"
 )

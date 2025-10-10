@@ -5,10 +5,10 @@ import (
 	"testing"
 
 	aerospikeclient "github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	aerospikestore "github.com/bitcoin-sv/teranode/stores/utxo/aerospike"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	aerospikestore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
 )
 

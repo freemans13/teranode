@@ -3,9 +3,9 @@ package model
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/settings"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	primitives "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 

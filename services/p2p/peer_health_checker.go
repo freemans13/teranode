@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 

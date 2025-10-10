@@ -10,7 +10,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/stretchr/testify/require"
 )
 

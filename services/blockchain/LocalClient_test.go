@@ -6,12 +6,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

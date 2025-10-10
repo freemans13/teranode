@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package grpctest;
 
-option go_package = "github.com/bitcoin-sv/teranode/errors/grpctest";
+option go_package = "github.com/bsv-blockchain/teranode/errors/grpctest";
 
 service TestService {
   rpc TestMethod(TestRequest) returns (TestResponse);

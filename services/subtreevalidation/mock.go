@@ -3,7 +3,7 @@ package subtreevalidation
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/services/subtreevalidation/subtreevalidation_api"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/stretchr/testify/mock"
 	"google.golang.org/grpc"
 )

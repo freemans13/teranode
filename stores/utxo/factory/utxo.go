@@ -67,13 +67,13 @@ import (
 	"net/url"
 	"strconv"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	storelogger "github.com/bitcoin-sv/teranode/stores/utxo/logger"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	storelogger "github.com/bsv-blockchain/teranode/stores/utxo/logger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 var availableDatabases = map[string]func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error){}

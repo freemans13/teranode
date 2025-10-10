@@ -18,9 +18,9 @@ import (
 	"database/sql"
 	"strconv"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetBlockHeaderIDs retrieves a sequence of block header database IDs starting from a specified block.

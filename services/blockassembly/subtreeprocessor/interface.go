@@ -13,11 +13,11 @@
 package subtreeprocessor
 
 import (
-	"github.com/bitcoin-sv/teranode/model"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/model"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
 // Interface defines the contract for subtree processor implementations.

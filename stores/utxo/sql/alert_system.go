@@ -43,10 +43,10 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 )
 
 // FreezeUTXOs marks UTXOs as frozen, preventing them from being spent.

@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	ukafka "github.com/bitcoin-sv/teranode/util/kafka"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	ukafka "github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

@@ -5,8 +5,8 @@ package catchup
 import (
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // Result captures comprehensive metrics and results from a catchup operation.

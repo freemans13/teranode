@@ -1,8 +1,8 @@
 package catchup
 
 import (
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // CommonAncestorFinder provides methods for finding common ancestors between chains

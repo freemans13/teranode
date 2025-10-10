@@ -5,12 +5,12 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/settings"
-	blockchain_store "github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test/mocklogger"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/settings"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test/mocklogger"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/emptypb"
 )

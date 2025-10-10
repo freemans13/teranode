@@ -30,8 +30,8 @@ import (
 	"encoding/hex"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/assert"
 )
@@ -85,9 +85,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/test/utils/aerospike"
-	"github.com/bitcoin-sv/teranode/test/utils/postgres"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/test/utils/aerospike"
+	"github.com/bsv-blockchain/teranode/test/utils/postgres"
 	"github.com/stretchr/testify/require"
 )
 
@@ -175,7 +175,7 @@ func testScenario1(t *testing.T, utxoStore string) {
 #### PostgreSQL Container Setup
 
 ```go
-import "github.com/bitcoin-sv/teranode/test/utils/postgres"
+import "github.com/bsv-blockchain/teranode/test/utils/postgres"
 
 utxoStore, teardown, err := postgres.SetupTestPostgresContainer()
 require.NoError(t, err)
@@ -187,7 +187,7 @@ defer func() {
 #### Aerospike Container Setup
 
 ```go
-import "github.com/bitcoin-sv/teranode/test/utils/aerospike"
+import "github.com/bsv-blockchain/teranode/test/utils/aerospike"
 
 utxoStore, teardown, err := aerospike.InitAerospikeContainer()
 require.NoError(t, err)
@@ -923,7 +923,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/daemon"
 	"github.com/stretchr/testify/require"
 )
 ```
@@ -936,8 +936,8 @@ import (
 	"testing"
 	"encoding/hex"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/assert"
@@ -954,9 +954,9 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/stretchr/testify/require"
 )
 ```
@@ -971,12 +971,12 @@ import (
 	"database/sql"
 	"net/url"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/util"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/util"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -995,10 +995,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/stretchr/testify/require"
 )
 ```

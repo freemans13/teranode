@@ -4,10 +4,10 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // UTXOSet represents a complete set of UTXOs at a specific block.

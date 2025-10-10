@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/servicemanager"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/servicemanager"
 )
 
 // SampleService is a mock service for demonstration purposes.
@@ -94,9 +94,9 @@ func main() {
 	serviceManager := servicemanager.NewServiceManager(rootCtx, logger)
 
 	// Add services to the service manager
-	serviceManager.AddService("ServiceA", NewService("SvcA"))
-	serviceManager.AddService("ServiceB", NewService("SvcB"))
-	serviceManager.AddService("ServiceC", NewService("SvcC"))
+	_ = serviceManager.AddService("ServiceA", NewService("SvcA"))
+	_ = serviceManager.AddService("ServiceB", NewService("SvcB"))
+	_ = serviceManager.AddService("ServiceC", NewService("SvcC"))
 
 	err := serviceManager.Wait()
 	if err != nil {

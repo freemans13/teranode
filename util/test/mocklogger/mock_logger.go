@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // MockLogger is a mock implementation of ulogger.Logger for testing purposes,

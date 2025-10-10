@@ -11,8 +11,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"golang.org/x/crypto/ripemd160" //nolint:gosec // this is a known safe use of ripemd160
 )
 

@@ -4,7 +4,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // Bitcoin Script Opcodes - Complete mapping from opcode names to byte values

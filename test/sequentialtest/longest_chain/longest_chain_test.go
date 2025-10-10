@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/test/utils/aerospike"
-	"github.com/bitcoin-sv/teranode/test/utils/postgres"
+	"github.com/bsv-blockchain/teranode/test/utils/aerospike"
+	"github.com/bsv-blockchain/teranode/test/utils/postgres"
 	"github.com/stretchr/testify/require"
 )
 

@@ -3,8 +3,8 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) error {

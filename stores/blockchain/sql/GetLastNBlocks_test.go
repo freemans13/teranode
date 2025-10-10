@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	time2 "github.com/bitcoin-sv/teranode/model/time"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
+	time2 "github.com/bsv-blockchain/teranode/model/time"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

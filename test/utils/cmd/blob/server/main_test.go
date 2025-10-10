@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/stores/blob/http"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/stores/blob/http"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

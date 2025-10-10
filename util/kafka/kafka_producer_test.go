@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/IBM/sarama"
-	"github.com/bitcoin-sv/teranode/settings"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

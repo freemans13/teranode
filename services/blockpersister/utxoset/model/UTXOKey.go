@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // UTXOKey represents a unique identifier for a Bitcoin transaction output.

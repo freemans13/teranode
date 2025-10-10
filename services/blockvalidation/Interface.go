@@ -18,8 +18,8 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // Interface defines the contract for block validation functionality in Teranode.

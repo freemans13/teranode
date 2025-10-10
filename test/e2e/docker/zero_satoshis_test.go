@@ -13,12 +13,12 @@ import (
 	"testing"
 	"time"
 
-	helper "github.com/bitcoin-sv/teranode/test/utils"
-	"github.com/bitcoin-sv/teranode/test/utils/stubs"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/test/utils/stubs"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )

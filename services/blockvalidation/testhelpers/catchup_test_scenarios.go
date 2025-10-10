@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/catchup"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
 )
 
 // TestScenario represents a predefined test scenario

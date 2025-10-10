@@ -7,11 +7,11 @@ import (
 	"strings"
 
 	"github.com/IBM/sarama"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/util"
-	imk "github.com/bitcoin-sv/teranode/util/kafka/in_memory_kafka"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/util"
+	imk "github.com/bsv-blockchain/teranode/util/kafka/in_memory_kafka"
 )
 
 /**

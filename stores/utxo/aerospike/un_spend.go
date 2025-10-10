@@ -59,10 +59,10 @@ import (
 	"context"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 )
 
 // Unspend operations handle reverting spent UTXOs back to an unspent state.

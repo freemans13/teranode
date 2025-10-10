@@ -3,7 +3,7 @@ package p2p
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/settings"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/cmd/teranode"
+	"github.com/bsv-blockchain/teranode/cmd/teranode"
 )
 
 // Name used by build script for the binaries. (Please keep on single line)

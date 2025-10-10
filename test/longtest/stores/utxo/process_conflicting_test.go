@@ -5,11 +5,11 @@ import (
 	"net/url"
 	"testing"
 
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

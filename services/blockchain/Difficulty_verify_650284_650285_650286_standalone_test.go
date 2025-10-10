@@ -5,7 +5,7 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/blockchain/work"
+	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 )
 
 // TestVerifyBlocks650284To650286Standalone verifies chainwork calculations with all data hardcoded

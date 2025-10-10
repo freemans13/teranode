@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/cleanup"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

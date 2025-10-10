@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // ForPortsReady polls a list of TCP ports on a given host until they become available

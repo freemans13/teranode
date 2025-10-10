@@ -3,8 +3,8 @@ package sql
 import (
 	"sync"
 
-	"github.com/bitcoin-sv/teranode/stores/cleanup"
-	sqlcleanup "github.com/bitcoin-sv/teranode/stores/utxo/sql/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	sqlcleanup "github.com/bsv-blockchain/teranode/stores/utxo/sql/cleanup"
 )
 
 // Ensure Store implements the cleanup.CleanupProvider interface

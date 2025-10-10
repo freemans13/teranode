@@ -4,8 +4,8 @@ import (
 	"context"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/stretchr/testify/mock"
 )
 

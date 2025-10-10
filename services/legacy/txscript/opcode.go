@@ -13,9 +13,9 @@ import (
 	"fmt"
 	"hash"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvec"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvec"
 	"golang.org/x/crypto/ripemd160" //nolint:gosec // this is a known safe use of ripemd160
 )
 

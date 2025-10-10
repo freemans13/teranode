@@ -7,8 +7,8 @@ package hdkeychain_test
 import (
 	"fmt"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil/hdkeychain"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil/hdkeychain"
 )
 
 // This example demonstrates how to generate a cryptographically random seed

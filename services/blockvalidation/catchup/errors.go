@@ -3,7 +3,7 @@
 // This file defines catchup-specific error types.
 package catchup
 
-import "github.com/bitcoin-sv/teranode/errors"
+import "github.com/bsv-blockchain/teranode/errors"
 
 var (
 	// ErrCircuitOpen is returned when the circuit breaker is open

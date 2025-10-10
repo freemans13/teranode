@@ -7,8 +7,8 @@ import (
 	"context"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"golang.org/x/sync/errgroup"
 )
 

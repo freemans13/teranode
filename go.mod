@@ -1,4 +1,4 @@
-module github.com/bitcoin-sv/teranode
+module github.com/bsv-blockchain/teranode
 
 go 1.25.1
 

@@ -3,7 +3,7 @@ package ulogger
 import (
 	"os"
 
-	"github.com/bitcoin-sv/teranode/settings"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/rs/zerolog"
 	"golang.org/x/term"
 )

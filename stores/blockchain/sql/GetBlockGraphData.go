@@ -15,9 +15,9 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetBlockGraphData retrieves time-series data about blocks for visualization and analytics.

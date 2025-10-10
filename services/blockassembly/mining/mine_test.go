@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/settings"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

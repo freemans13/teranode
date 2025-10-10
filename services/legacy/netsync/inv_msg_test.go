@@ -3,12 +3,12 @@ package netsync
 import (
 	"testing"
 
-	peerpkg "github.com/bitcoin-sv/teranode/services/legacy/peer"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

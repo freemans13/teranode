@@ -5,8 +5,8 @@ import (
 	"context"
 	"net/url"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // StartKafkaControlledListener starts a Kafka listener that can be controlled via a channel.

@@ -9,7 +9,7 @@ This module provides distributed tracing capabilities for Teranode using OpenTel
 To add tracing to a function, follow this pattern:
 
 ```go
-import "github.com/bitcoin-sv/teranode/util/tracing"
+import "github.com/bsv-blockchain/teranode/util/tracing"
 
 func MyFunction(ctx context.Context) error {
     // Create a tracer for your component
@@ -209,7 +209,7 @@ import (
     "context"
     "fmt"
     
-    "github.com/bitcoin-sv/teranode/util/tracing"
+    "github.com/bsv-blockchain/teranode/util/tracing"
     "go.opentelemetry.io/otel/attribute"
 )
 

@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/usql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/usql"
 )
 
 var (

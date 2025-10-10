@@ -15,10 +15,10 @@ import (
 	"io"
 	"sync"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	blob_options "github.com/bitcoin-sv/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	blob_options "github.com/bsv-blockchain/teranode/stores/blob/options"
 )
 
 // ConcurrentBlob provides thread-safe access to blob storage operations with optimized concurrent access patterns.

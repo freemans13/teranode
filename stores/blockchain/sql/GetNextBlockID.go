@@ -3,7 +3,7 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/util"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // GetNextBlockID retrieves the next available block ID from the database.

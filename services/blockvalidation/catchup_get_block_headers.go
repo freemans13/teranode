@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/catchup"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // catchupGetBlockHeaders fetches block headers from a peer for catchup synchronization.

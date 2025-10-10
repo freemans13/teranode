@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/ordishs/gocore"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"

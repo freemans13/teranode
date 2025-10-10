@@ -14,13 +14,13 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	inmemorykafka "github.com/bitcoin-sv/teranode/util/kafka/in_memory_kafka"
-	"github.com/bitcoin-sv/teranode/util/retry"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	inmemorykafka "github.com/bsv-blockchain/teranode/util/kafka/in_memory_kafka"
+	"github.com/bsv-blockchain/teranode/util/retry"
 )
 
 // KafkaAsyncProducerI defines the interface for asynchronous Kafka producer operations.

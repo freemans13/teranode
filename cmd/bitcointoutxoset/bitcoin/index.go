@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"reflect"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/btcsuite/goleveldb/leveldb"
 	"github.com/btcsuite/goleveldb/leveldb/opt"
 )

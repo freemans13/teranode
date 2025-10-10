@@ -10,8 +10,8 @@ import (
 
 	"github.com/bitcoin-sv/alert-system/app/config"
 	"github.com/bitcoin-sv/alert-system/app/models"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/emptypb"
 )

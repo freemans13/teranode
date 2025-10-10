@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/asset/asset_api"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/services/asset/asset_api"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 )

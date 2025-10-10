@@ -6,12 +6,12 @@ import (
 	"context"
 	"runtime"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
 

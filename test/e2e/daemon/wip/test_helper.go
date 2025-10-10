@@ -4,8 +4,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
-	utils "github.com/bitcoin-sv/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
+	utils "github.com/bsv-blockchain/teranode/test/utils"
 )
 
 // SharedTestLock is a mutex that ensures all tests in this package run sequentially

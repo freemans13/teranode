@@ -1,8 +1,8 @@
 package util
 
 import (
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // ValidLockTime checks whether a lock time is valid in the context of a block height and median block time

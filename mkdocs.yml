@@ -166,7 +166,7 @@ extra:
   generator: false  # Hides "Made with Material for MkDocs"
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/bitcoin-sv/teranode
+      link: https://github.com/bsv-blockchain/teranode
 
 plugins:
   - search

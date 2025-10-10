@@ -3,8 +3,8 @@ package smoke
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/util"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

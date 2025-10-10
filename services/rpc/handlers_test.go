@@ -11,11 +11,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
-	"github.com/bitcoin-sv/teranode/settings"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

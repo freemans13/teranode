@@ -12,7 +12,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
 )
 
 // TestChainSvrWsNtfns tests all of the chain server websocket-specific

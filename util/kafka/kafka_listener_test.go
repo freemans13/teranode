@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

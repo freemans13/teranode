@@ -16,9 +16,9 @@ import (
 	"io"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // UTXOWrapper wraps transaction outputs with additional metadata.

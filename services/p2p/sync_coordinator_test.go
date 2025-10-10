@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/kafka"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

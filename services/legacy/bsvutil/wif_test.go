@@ -7,9 +7,9 @@ package bsvutil_test
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvec"
-	. "github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvec"
+	. "github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 func TestEncodeDecodeWIF(t *testing.T) {

@@ -25,9 +25,9 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetBlockExists checks if a block exists in the database by its hash.

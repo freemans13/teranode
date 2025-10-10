@@ -10,10 +10,10 @@ import (
 	"math"
 	"sync"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
-	"github.com/bitcoin-sv/teranode/services/legacy/txscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/legacy/txscript"
 )
 
 // ln2Squared is simply the square of the natural log of 2.

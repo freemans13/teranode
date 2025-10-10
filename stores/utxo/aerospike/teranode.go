@@ -61,10 +61,10 @@ import (
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/aerospike/aerospike-client-go/v8/types"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 )
 
 //go:embed teranode.lua

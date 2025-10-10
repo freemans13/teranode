@@ -13,9 +13,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // BlockIndex represents the index information for a block.

@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/settings"
-	testkafka "github.com/bitcoin-sv/teranode/test/longtest/util/kafka"
-	kafkautil "github.com/bitcoin-sv/teranode/util/kafka"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/settings"
+	testkafka "github.com/bsv-blockchain/teranode/test/longtest/util/kafka"
+	kafkautil "github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

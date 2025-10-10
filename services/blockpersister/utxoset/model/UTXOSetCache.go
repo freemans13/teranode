@@ -4,8 +4,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/ordishs/go-utils/expiringmap"
 )
 

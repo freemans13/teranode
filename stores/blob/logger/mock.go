@@ -4,9 +4,9 @@ import (
 	"context"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // MockBlobStore is a mock implementation of blobStore interface for testing

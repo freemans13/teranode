@@ -7,10 +7,10 @@ import (
 	"context"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"google.golang.org/protobuf/proto"
 )
 

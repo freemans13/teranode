@@ -19,13 +19,13 @@ import (
 	"net/http"
 	_ "net/http/pprof" // nolint:gosec
 
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	utxopersisterservice "github.com/bitcoin-sv/teranode/services/utxopersister"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	blockchainstore "github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	utxopersisterservice "github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/felixge/fgprof"
 	"github.com/ordishs/gocore"
 )

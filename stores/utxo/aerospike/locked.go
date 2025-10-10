@@ -6,10 +6,10 @@ import (
 	"os"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"golang.org/x/sync/errgroup"
 )
 

@@ -68,20 +68,20 @@ import (
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	asl "github.com/aerospike/aerospike-client-go/v8/logger"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/aerospike/cleanup"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 )
 
 // Ensure Store implements the utxo.Store interface
@@ -111,29 +111,29 @@ type batcherIfc[T any] interface {
 // Store implements the UTXO store interface using Aerospike.
 // It is thread-safe for concurrent access.
 type Store struct {
-	ctx              context.Context // store the global context for things that run in the background
-	url              *url.URL
-	client           *uaerospike.Client
-	namespace        string
-	setName          string
-	blockHeight      atomic.Uint32
-	medianBlockTime  atomic.Uint32
-	logger           ulogger.Logger
-	settings         *settings.Settings
-	batchID          atomic.Uint64
-	storeBatcher     batcherIfc[BatchStoreItem]
-	getBatcher       batcherIfc[batchGetItem]
-	spendBatcher     batcherIfc[batchSpend]
-	outpointBatcher  batcherIfc[batchOutpoint]
+	ctx                 context.Context // store the global context for things that run in the background
+	url                 *url.URL
+	client              *uaerospike.Client
+	namespace           string
+	setName             string
+	blockHeight         atomic.Uint32
+	medianBlockTime     atomic.Uint32
+	logger              ulogger.Logger
+	settings            *settings.Settings
+	batchID             atomic.Uint64
+	storeBatcher        batcherIfc[BatchStoreItem]
+	getBatcher          batcherIfc[batchGetItem]
+	spendBatcher        batcherIfc[batchSpend]
+	outpointBatcher     batcherIfc[batchOutpoint]
 	incrementBatcher    batcherIfc[batchIncrement]
 	setDAHBatcher       batcherIfc[batchDAH]
 	lockedBatcher       batcherIfc[batchLocked]
 	longestChainBatcher batcherIfc[batchLongestChain]
 	externalStore       blob.Store
-	utxoBatchSize    int
-	externalTxCache  *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
-	indexMutex       sync.Mutex // Mutex for index creation operations
-	indexOnce        sync.Once  // Ensures index creation/wait is only done once per process
+	utxoBatchSize       int
+	externalTxCache     *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+	indexMutex          sync.Mutex // Mutex for index creation operations
+	indexOnce           sync.Once  // Ensures index creation/wait is only done once per process
 }
 
 // New creates a new Aerospike-based UTXO store.

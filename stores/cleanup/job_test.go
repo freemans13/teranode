@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/assert"
 )
 

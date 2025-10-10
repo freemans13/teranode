@@ -3,7 +3,7 @@ package peer
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/peer_api"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer_api"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 

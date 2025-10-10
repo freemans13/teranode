@@ -61,9 +61,9 @@ import (
 	"context"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // Delete removes a transaction and its associated UTXOs from the store.

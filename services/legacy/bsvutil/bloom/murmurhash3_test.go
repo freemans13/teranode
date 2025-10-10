@@ -7,7 +7,7 @@ package bloom_test
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil/bloom"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil/bloom"
 )
 
 // TestMurmurHash3 ensure the MurmurHash3 function produces the correct hash

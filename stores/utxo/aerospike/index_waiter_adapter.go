@@ -3,7 +3,7 @@ package aerospike
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo/aerospike/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike/cleanup"
 )
 
 // Ensure Store implements the IndexWaiter interface

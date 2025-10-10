@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/test/testcontainers"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/test/testcontainers"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/stretchr/testify/require"
 )
 
@@ -280,7 +280,7 @@ func TestSendTxToLegacy(t *testing.T) {
 	// TODO
 	// Currently get an error
 	// PROCESSING (4): RPC returned error -> UNKNOWN (0): code: -26, message: 16: mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)
-	// 	            	- utils.callRPC() /Users/freemans/github/bitcoin-sv/teranode/test/utils/helper.go:133 [4] RPC returned error
+	// 	            	- utils.callRPC() /Users/freemans/github/bsv-blockchain/teranode/test/utils/helper.go:133 [4] RPC returned error
 	// 	            	- UNKNOWN (0): code: -26, message: 16: mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)
 	resp, err := helper.CallRPC(svNodeRPCURL, "sendrawtransaction", []interface{}{txBytes})
 	require.NoError(t, err)

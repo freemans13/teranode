@@ -5,7 +5,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/mrz1836/go-logger"
 )
 

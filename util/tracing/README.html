@@ -18,7 +18,7 @@
 }
 
 </style>
-            
+
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/markdown.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/highlight.css">
 <style>
@@ -135,7 +135,7 @@
 }
 
 </style>
-        
+
         </head>
         <body class="vscode-body vscode-light">
             <h1 id="tracing-module">Tracing Module</h1>
@@ -143,16 +143,16 @@
 <h2 id="adding-tracing-to-functions">Adding Tracing to Functions</h2>
 <h3 id="basic-usage">Basic Usage</h3>
 <p>To add tracing to a function, follow this pattern:</p>
-<pre><code class="language-go"><span class="hljs-keyword">import</span> <span class="hljs-string">&quot;github.com/bitcoin-sv/teranode/util/tracing&quot;</span>
+<pre><code class="language-go"><span class="hljs-keyword">import</span> <span class="hljs-string">&quot;github.com/bsv-blockchain/teranode/util/tracing&quot;</span>
 
 <span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">MyFunction</span><span class="hljs-params">(ctx context.Context)</span></span> <span class="hljs-type">error</span> {
     <span class="hljs-comment">// Create a tracer for your component</span>
     tracer := tracing.Tracer(<span class="hljs-string">&quot;my-component&quot;</span>)
-    
+
     <span class="hljs-comment">// Start a span</span>
     ctx, span, endSpan := tracer.Start(ctx, <span class="hljs-string">&quot;MyFunction&quot;</span>)
     <span class="hljs-keyword">defer</span> endSpan() <span class="hljs-comment">// IMPORTANT: Always defer endSpan()</span>
-    
+
     <span class="hljs-comment">// Your function logic here</span>
     <span class="hljs-keyword">return</span> <span class="hljs-literal">nil</span>
 }
@@ -161,17 +161,17 @@
 <p>When your function returns an error, pass it to the endSpan function:</p>
 <pre><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">ProcessTransaction</span><span class="hljs-params">(ctx context.Context, txID <span class="hljs-type">string</span>)</span></span> (err <span class="hljs-type">error</span>) {
     tracer := tracing.Tracer(<span class="hljs-string">&quot;transaction-processor&quot;</span>)
-    
+
     ctx, span, endSpan := tracer.Start(ctx, <span class="hljs-string">&quot;ProcessTransaction&quot;</span>,
         tracing.WithTag(<span class="hljs-string">&quot;tx.id&quot;</span>, txID),
     )
     <span class="hljs-keyword">defer</span> endSpan(err) <span class="hljs-comment">// Pass the named return error</span>
-    
+
     <span class="hljs-comment">// Your processing logic</span>
     <span class="hljs-keyword">if</span> err := validate(txID); err != <span class="hljs-literal">nil</span> {
         <span class="hljs-keyword">return</span> err <span class="hljs-comment">// The error will be recorded in the span</span>
     }
-    
+
     <span class="hljs-keyword">return</span> <span class="hljs-literal">nil</span>
 }
 </code></pre>
@@ -181,14 +181,14 @@
     <span class="hljs-comment">// Add searchable tags</span>
     tracing.WithTag(<span class="hljs-string">&quot;user.id&quot;</span>, userID),
     tracing.WithTag(<span class="hljs-string">&quot;request.type&quot;</span>, <span class="hljs-string">&quot;batch&quot;</span>),
-    
+
     <span class="hljs-comment">// Add logging</span>
     tracing.WithLogMessage(logger, <span class="hljs-string">&quot;Processing batch for user %s&quot;</span>, userID),
-    
+
     <span class="hljs-comment">// Add metrics</span>
     tracing.WithHistogram(myHistogram),
     tracing.WithCounter(myCounter),
-    
+
     <span class="hljs-comment">// Link to parent statistics</span>
     tracing.WithParentStat(parentStat),
 )
@@ -200,11 +200,11 @@
 <pre><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">MyOperation</span><span class="hljs-params">(ctx context.Context)</span></span> (err <span class="hljs-type">error</span>) {
     ctx, span, endSpan := tracer.Start(ctx, <span class="hljs-string">&quot;MyOperation&quot;</span>)
     <span class="hljs-keyword">defer</span> endSpan(err) <span class="hljs-comment">// Automatically records the error</span>
-    
+
     <span class="hljs-keyword">if</span> err := doSomething(); err != <span class="hljs-literal">nil</span> {
         <span class="hljs-keyword">return</span> fmt.Errorf(<span class="hljs-string">&quot;failed to do something: %w&quot;</span>, err)
     }
-    
+
     <span class="hljs-keyword">return</span> <span class="hljs-literal">nil</span>
 }
 </code></pre>
@@ -217,7 +217,7 @@
     <span class="hljs-keyword">if</span> err := processItem(item); err != <span class="hljs-literal">nil</span> {
         <span class="hljs-comment">// Record error but continue</span>
         span.RecordError(err)
-        span.AddEvent(<span class="hljs-string">&quot;item_failed&quot;</span>, 
+        span.AddEvent(<span class="hljs-string">&quot;item_failed&quot;</span>,
             attribute.String(<span class="hljs-string">&quot;item.id&quot;</span>, item.ID),
             attribute.String(<span class="hljs-string">&quot;error&quot;</span>, err.Error()),
         )
@@ -229,22 +229,22 @@
 <p>When handling multiple potential errors:</p>
 <pre><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">ComplexOperation</span><span class="hljs-params">(ctx context.Context)</span></span> <span class="hljs-type">error</span> {
     ctx, span, endSpan := tracer.Start(ctx, <span class="hljs-string">&quot;ComplexOperation&quot;</span>)
-    
+
     <span class="hljs-keyword">var</span> finalErr <span class="hljs-type">error</span>
     <span class="hljs-keyword">defer</span> <span class="hljs-function"><span class="hljs-keyword">func</span><span class="hljs-params">()</span></span> {
         endSpan(finalErr) <span class="hljs-comment">// Pass the final error state</span>
     }()
-    
+
     <span class="hljs-keyword">if</span> err := step1(); err != <span class="hljs-literal">nil</span> {
         finalErr = fmt.Errorf(<span class="hljs-string">&quot;step1 failed: %w&quot;</span>, err)
         <span class="hljs-keyword">return</span> finalErr
     }
-    
+
     <span class="hljs-keyword">if</span> err := step2(); err != <span class="hljs-literal">nil</span> {
         finalErr = fmt.Errorf(<span class="hljs-string">&quot;step2 failed: %w&quot;</span>, err)
         <span class="hljs-keyword">return</span> finalErr
     }
-    
+
     <span class="hljs-keyword">return</span> <span class="hljs-literal">nil</span>
 }
 </code></pre>
@@ -291,7 +291,7 @@
 <pre><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">MyFunc</span><span class="hljs-params">()</span></span> (result <span class="hljs-type">string</span>, err <span class="hljs-type">error</span>) {
     ctx, span, endSpan := tracer.Start(ctx, <span class="hljs-string">&quot;MyFunc&quot;</span>)
     <span class="hljs-keyword">defer</span> endSpan(err) <span class="hljs-comment">// Will capture the final error value</span>
-    
+
     <span class="hljs-comment">// Function logic</span>
     <span class="hljs-keyword">return</span> result, err
 }
@@ -304,8 +304,8 @@
 <span class="hljs-keyword">import</span> (
     <span class="hljs-string">&quot;context&quot;</span>
     <span class="hljs-string">&quot;fmt&quot;</span>
-    
-    <span class="hljs-string">&quot;github.com/bitcoin-sv/teranode/util/tracing&quot;</span>
+
+    <span class="hljs-string">&quot;github.com/bsv-blockchain/teranode/util/tracing&quot;</span>
     <span class="hljs-string">&quot;go.opentelemetry.io/otel/attribute&quot;</span>
 )
 
@@ -326,11 +326,11 @@
         tracing.WithLogMessage(logger, <span class="hljs-string">&quot;Processing batch of %d items&quot;</span>, <span class="hljs-built_in">len</span>(items)),
     )
     <span class="hljs-keyword">defer</span> endSpan(err) <span class="hljs-comment">// Ensures span is ended with final error state</span>
-    
+
     <span class="hljs-comment">// Add runtime attributes</span>
     span.SetAttribute(<span class="hljs-string">&quot;service.version&quot;</span>, <span class="hljs-string">&quot;1.0.0&quot;</span>)
     span.AddEvent(<span class="hljs-string">&quot;processing_started&quot;</span>)
-    
+
     <span class="hljs-comment">// Process items</span>
     <span class="hljs-keyword">var</span> processed, failed <span class="hljs-type">int</span>
     <span class="hljs-keyword">for</span> i, item := <span class="hljs-keyword">range</span> items {
@@ -339,7 +339,7 @@
             tracing.WithTag(<span class="hljs-string">&quot;item.id&quot;</span>, item.ID),
             tracing.WithTag(<span class="hljs-string">&quot;item.index&quot;</span>, fmt.Sprintf(<span class="hljs-string">&quot;%d&quot;</span>, i)),
         )
-        
+
         <span class="hljs-keyword">if</span> err := s.processItem(item); err != <span class="hljs-literal">nil</span> {
             <span class="hljs-comment">// Record item error</span>
             itemSpan.RecordError(err)
@@ -347,21 +347,21 @@
             failed++
             <span class="hljs-keyword">continue</span>
         }
-        
+
         endItemSpan() <span class="hljs-comment">// Success - no error</span>
         processed++
     }
-    
+
     <span class="hljs-comment">// Record final metrics</span>
     span.SetAttribute(<span class="hljs-string">&quot;batch.processed&quot;</span>, processed)
     span.SetAttribute(<span class="hljs-string">&quot;batch.failed&quot;</span>, failed)
     span.AddEvent(<span class="hljs-string">&quot;processing_completed&quot;</span>)
-    
+
     <span class="hljs-keyword">if</span> failed &gt; <span class="hljs-number">0</span> {
         err = fmt.Errorf(<span class="hljs-string">&quot;failed to process %d out of %d items&quot;</span>, failed, <span class="hljs-built_in">len</span>(items))
         <span class="hljs-keyword">return</span> err
     }
-    
+
     <span class="hljs-keyword">return</span> <span class="hljs-literal">nil</span>
 }
 </code></pre>
@@ -374,7 +374,7 @@
 <li>Create child spans for sub-operations to maintain trace hierarchy</li>
 </ul>
 
-            
-            
+
+
         </body>
         </html>

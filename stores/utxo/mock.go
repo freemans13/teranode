@@ -6,11 +6,11 @@ package utxo
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/stretchr/testify/mock"
 )
 

@@ -3,18 +3,18 @@ info:
   title: Bitcoin SV, TERANODE - OpenAPI 3.1
   description: |-
     This is the Bitcoin SV, TERANODE OpenAPI 3.1 specification.  You can find out more about
-    the project API at [https://github.com/bitcoin-sv/teranode/docs/api/](https://github.com/bitcoin-sv/teranode/docs/api/).
+    the project API at [https://github.com/bsv-blockchain/teranode/docs/api/](https://github.com/bsv-blockchain/teranode/docs/api/).
 
     Some useful links:
-    - [The source API definition for the Bitcoin SV, TERANODE project](https://github.com/bitcoin-sv/teranode/tree/feature/ui-refresh/ui_v2/dashboard/docs/api/openapi.yaml)
-  termsOfService: https://github.com/bitcoin-sv/teranode/docs/api/terms/
+    - [The source API definition for the Bitcoin SV, TERANODE project](https://github.com/bsv-blockchain/teranode/tree/feature/ui-refresh/ui_v2/dashboard/docs/api/openapi.yaml)
+  termsOfService: https://github.com/bsv-blockchain/teranode/docs/api/terms/
   version: 0.0.1
   license:
     name: Open BSV License
-    url: https://github.com/bitcoin-sv/teranode/blob/master/LICENSE
+    url: https://github.com/bsv-blockchain/teranode/blob/master/LICENSE
 externalDocs:
   description: Find out more about Bitcoin SV, TERANODE
-  url: https://github.com/bitcoin-sv/teranode/tree/feature/ui-refresh/ui_v2/dashboard/docs/api/rest.md
+  url: https://github.com/bsv-blockchain/teranode/tree/feature/ui-refresh/ui_v2/dashboard/docs/api/rest.md
 servers:
   - url: https://m1.scaling.ubsv.dev
   - url: https://m2.scaling.ubsv.dev

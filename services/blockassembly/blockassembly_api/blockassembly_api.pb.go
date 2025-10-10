@@ -7,7 +7,7 @@
 package blockassembly_api
 
 import (
-	model "github.com/bitcoin-sv/teranode/model"
+	model "github.com/bsv-blockchain/teranode/model"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"

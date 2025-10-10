@@ -24,7 +24,7 @@ package alert
 import (
 	"fmt"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // Logger provides a standardized logging interface for the alert service.

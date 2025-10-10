@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
 

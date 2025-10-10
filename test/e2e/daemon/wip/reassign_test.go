@@ -3,13 +3,13 @@ package smoke
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 

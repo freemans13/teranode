@@ -3,8 +3,8 @@ package consensus
 import (
 	"encoding/hex"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 // Test keys from C++ implementation

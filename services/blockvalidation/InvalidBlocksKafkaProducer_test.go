@@ -3,10 +3,10 @@ package blockvalidation
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/util/kafka"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/stretchr/testify/mock"
 )
 

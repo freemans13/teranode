@@ -23,8 +23,8 @@ import (
     "testing"
     "context"
     // Add others as needed: "encoding/hex", "encoding/json", "time"
-    "github.com/bitcoin-sv/teranode/daemon"
-    "github.com/bitcoin-sv/teranode/test/utils/transactions"
+    "github.com/bsv-blockchain/teranode/daemon"
+    "github.com/bsv-blockchain/teranode/test/utils/transactions"
     "github.com/stretchr/testify/require"
     // Add others as needed
 )

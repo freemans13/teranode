@@ -2,7 +2,7 @@
 package alert
 
 import (
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // MockLogger provides a mock implementation of ulogger.Logger for testing.

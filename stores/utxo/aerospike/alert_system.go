@@ -59,12 +59,12 @@ import (
 	"strings"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 )
 
 // FreezeUTXOs marks UTXOs as frozen by setting their spending transaction ID to FF...FF.

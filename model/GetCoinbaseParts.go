@@ -42,8 +42,8 @@ import (
 	"log"
 
 	base58 "github.com/bitcoin-sv/go-sdk/compat/base58" //nolint:depguard
-	"github.com/bitcoin-sv/teranode/errors"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // BuildCoinbase recombines the different parts of the coinbase transaction.

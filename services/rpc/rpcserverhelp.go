@@ -32,8 +32,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
 )
 
 // helpDescsEnUS defines the English descriptions used for the help strings.

@@ -8,7 +8,7 @@ import (
 	"math"
 	"testing"
 
-	. "github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
+	. "github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 func TestAmountCreation(t *testing.T) {

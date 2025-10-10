@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // CheckBlockIsInCurrentChain determines if specified blocks are part of the current main chain.
@@ -82,7 +82,7 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	bestBlockID := bestBlockMeta.ID
 
 	// get the lowest block id
-	lowestBlockID := blockIDs[0]
+	lowestBlockID := blockIDs[0] //nolint:gosec // length is checked on line 52
 	for _, id := range blockIDs {
 		if id < lowestBlockID {
 			lowestBlockID = id

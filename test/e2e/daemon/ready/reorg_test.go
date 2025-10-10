@@ -4,13 +4,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/stretchr/testify/require"
 )
 

@@ -5,11 +5,11 @@
 package netsync
 
 import (
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
-	"github.com/bitcoin-sv/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
 // PeerNotifier exposes methods to notify peers of status changes to

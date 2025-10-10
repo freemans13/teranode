@@ -22,10 +22,10 @@ package blockchain
 import (
 	"net/url"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // NewStore creates a new blockchain store instance based on the provided URL scheme.

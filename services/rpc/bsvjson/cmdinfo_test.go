@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
 )
 
 // TestCmdMethod tests the CmdMethod function to ensure it retunrs the expected

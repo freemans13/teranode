@@ -62,12 +62,12 @@ import (
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/aerospike/aerospike-client-go/v8/types"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // SetMinedMulti updates the block references for multiple transactions in batch.

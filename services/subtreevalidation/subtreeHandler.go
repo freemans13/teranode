@@ -8,13 +8,13 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"google.golang.org/protobuf/proto"
 )
 

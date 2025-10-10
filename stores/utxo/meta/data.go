@@ -18,11 +18,11 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 )
 
 // Data represents transaction metadata including the transaction itself,

@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/test/utils/aerospike"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/test/utils/aerospike"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/stretchr/testify/require"
 )
 
@@ -183,7 +183,7 @@ func TestParentSpentNotMinedonSameChain(t *testing.T) {
 			settings.UtxoStore.UtxoStore = parsedURL
 			settings.BlockValidation.OptimisticMining = true
 		},
-		FSMState: blockchain.FSMStateRUNNING,
+		FSMState:          blockchain.FSMStateRUNNING,
 		EnableFullLogging: true,
 	})
 	defer nodeA.Stop(t)

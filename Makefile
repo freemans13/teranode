@@ -149,7 +149,7 @@ install-tools:
 .PHONY: test
 test:
 	@mkdir -p /tmp/teranode-test-results
-	set -o pipefail && go list ./... | grep -v github.com/bitcoin-sv/teranode/test/ | SETTINGS_CONTEXT=test xargs go test -v -race -tags "testtxmetacache" -count=1 -timeout=10m -coverprofile=coverage.out 2>&1 | tee /tmp/teranode-test-results/test-results.txt | grep -v "ld: warning:"
+	set -o pipefail && go list ./... | grep -v github.com/bsv-blockchain/teranode/test/ | SETTINGS_CONTEXT=test xargs go test -v -race -tags "testtxmetacache" -count=1 -timeout=10m -coverprofile=coverage.out 2>&1 | tee /tmp/teranode-test-results/test-results.txt | grep -v "ld: warning:"
 
 # run tests in the test/longtest directory
 .PHONY: longtest

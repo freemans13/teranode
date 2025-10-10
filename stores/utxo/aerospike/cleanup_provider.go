@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/bitcoin-sv/teranode/stores/cleanup"
-	aerocleanup "github.com/bitcoin-sv/teranode/stores/utxo/aerospike/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	aerocleanup "github.com/bsv-blockchain/teranode/stores/utxo/aerospike/cleanup"
 )
 
 // Ensure Store implements the cleanup.CleanupProvider interface

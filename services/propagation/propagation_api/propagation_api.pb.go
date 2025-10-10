@@ -7,7 +7,7 @@
 package propagation_api
 
 import (
-	errors "github.com/bitcoin-sv/teranode/errors"
+	errors "github.com/bsv-blockchain/teranode/errors"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"

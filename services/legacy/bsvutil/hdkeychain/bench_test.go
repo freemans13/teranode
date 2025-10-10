@@ -7,7 +7,7 @@ package hdkeychain_test
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil/hdkeychain"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil/hdkeychain"
 )
 
 // bip0032MasterPriv1 is the master private extended key from the first set of

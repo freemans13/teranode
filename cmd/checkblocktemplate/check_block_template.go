@@ -18,11 +18,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // ValidateBlockTemplate fetches a block template and validates it using the block validation service.

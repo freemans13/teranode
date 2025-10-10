@@ -8,7 +8,7 @@ package blockassembly_api
 
 import (
 	context "context"
-	model "github.com/bitcoin-sv/teranode/model"
+	model "github.com/bsv-blockchain/teranode/model"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"

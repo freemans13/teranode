@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil/txsort"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil/txsort"
 )
 
 // TestSort ensures the transaction sorting works according to the BIP.

@@ -14,12 +14,12 @@ import (
 
 	gobdk "github.com/bitcoin-sv/bdk/module/gobdk"
 	bdkscript "github.com/bitcoin-sv/bdk/module/gobdk/script"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-chaincfg"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 const (
@@ -205,7 +205,7 @@ func (v *scriptVerifierGoBDK) VerifyScript(tx *bt.Tx, blockHeight uint32, consen
 			errCode == bdkscript.SCRIPT_ERR_STACK_SIZE)
 
 		if !consensus && policyRelatedError {
-			// See https://github.com/bitcoin-sv/teranode/issues/2016
+			// See https://github.com/bsv-blockchain/teranode/issues/2016
 			policyErr := errors.NewTxPolicyError(errMsgPolicy, errVerify)
 			return errors.NewTxInvalidError(errMsgInvalidTx, policyErr)
 		}

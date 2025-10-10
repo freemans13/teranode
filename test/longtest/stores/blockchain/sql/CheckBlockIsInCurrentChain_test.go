@@ -5,13 +5,13 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/settings"
-	storesql "github.com/bitcoin-sv/teranode/stores/blockchain/sql"
-	helper "github.com/bitcoin-sv/teranode/test/utils/postgres"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/settings"
+	storesql "github.com/bsv-blockchain/teranode/stores/blockchain/sql"
+	helper "github.com/bsv-blockchain/teranode/test/utils/postgres"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

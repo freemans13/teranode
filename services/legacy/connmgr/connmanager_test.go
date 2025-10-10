@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 func init() {

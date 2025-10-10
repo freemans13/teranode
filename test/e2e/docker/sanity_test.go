@@ -10,7 +10,7 @@ package smoke
 import (
 	"testing"
 
-	helper "github.com/bitcoin-sv/teranode/test/utils"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )

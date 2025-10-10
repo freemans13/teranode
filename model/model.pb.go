@@ -875,7 +875,7 @@ const file_model_model_proto_rawDesc = "" +
 	"\aNotUsed\x10\x03\x12\f\n" +
 	"\bFSMState\x10\x04\x12\x14\n" +
 	"\x10BlockSubtreesSet\x10\x05\x12\x0f\n" +
-	"\vPeerFailure\x10\x06B&Z$github.com/bitcoin-sv/teranode/modelb\x06proto3"
+	"\vPeerFailure\x10\x06B*Z(github.com/bsv-blockchain/teranode/modelb\x06proto3"
 
 var (
 	file_model_model_proto_rawDescOnce sync.Once

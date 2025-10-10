@@ -8,13 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	blockchain_store "github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	"github.com/bitcoin-sv/teranode/util/servicemanager"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	"github.com/bsv-blockchain/teranode/util/servicemanager"
 )
 
 const memoryScheme = "memory"

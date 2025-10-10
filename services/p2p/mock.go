@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/util/kafka"
 	p2pMessageBus "github.com/bsv-blockchain/go-p2p-message-bus"
+	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/mock"

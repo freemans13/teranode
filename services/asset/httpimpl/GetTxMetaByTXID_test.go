@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	aero "github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

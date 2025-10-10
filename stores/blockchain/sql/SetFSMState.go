@@ -15,7 +15,7 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // SetFSMState persists the current state of the blockchain's Finite State Machine (FSM).

@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
 )
 
 // TestHelpers tests the various helper functions which create pointers to

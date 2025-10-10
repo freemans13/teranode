@@ -16,8 +16,8 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetBlocksMinedNotSet retrieves blocks whose mining status has not been properly recorded.

@@ -9,9 +9,9 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/cespare/xxhash"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"

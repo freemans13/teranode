@@ -28,13 +28,13 @@ different validation scenarios from development to high-volume production enviro
 package validator
 
 import (
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/bscript/interpreter"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // TxInterpreter defines the type of script interpreter to be used
@@ -256,7 +256,7 @@ func (tv *TxValidator) ValidateTransactionScripts(tx *bt.Tx, blockHeight uint32,
 	}
 
 	// SkipPolicy is equivalent to execute the script with consensus = true
-	// https://github.com/bitcoin-sv/teranode/issues/2367
+	// https://github.com/bsv-blockchain/teranode/issues/2367
 	consensus := true
 	if validationOptions != nil {
 		consensus = validationOptions.SkipPolicyChecks

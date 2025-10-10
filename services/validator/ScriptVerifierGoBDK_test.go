@@ -26,11 +26,11 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,7 +42,7 @@ type TestTx struct {
 	UTXOHeights []uint32
 }
 
-// https://github.com/bitcoin-sv/teranode/issues/1326
+// https://github.com/bsv-blockchain/teranode/issues/1326
 var testTxs = []TestTx{
 	{
 		TxID:        "1788b93e9b50d96de72171a28253f583b4f4dea1d32d93275b35a7cfbc3afacc",

@@ -5,7 +5,7 @@ package httpimpl
 import (
 	"encoding/json"
 
-	"github.com/bitcoin-sv/teranode/model"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // blockHeaderResponse represents a formatted block header response that includes

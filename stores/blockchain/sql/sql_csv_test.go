@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	bcsql "github.com/bitcoin-sv/teranode/stores/blockchain/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/settings"
+	bcsql "github.com/bsv-blockchain/teranode/stores/blockchain/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 

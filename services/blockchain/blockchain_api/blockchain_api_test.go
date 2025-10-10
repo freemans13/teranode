@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )

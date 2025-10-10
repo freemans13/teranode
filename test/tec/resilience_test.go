@@ -5,8 +5,8 @@ package tec
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/stretchr/testify/suite"
 )
 

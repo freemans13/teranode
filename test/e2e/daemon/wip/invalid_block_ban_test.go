@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/stretchr/testify/require"
 )
 

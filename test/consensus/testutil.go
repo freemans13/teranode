@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // ScriptTest represents a single script validation test case from script_tests.json

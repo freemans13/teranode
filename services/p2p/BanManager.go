@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/settings"
+	"github.com/bsv-blockchain/teranode/settings"
 )
 
 // BanReason is an enum for ban reasons.

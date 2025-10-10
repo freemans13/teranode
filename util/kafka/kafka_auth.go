@@ -7,8 +7,8 @@ import (
 	"os"
 
 	"github.com/IBM/sarama"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
 )
 
 // configureKafkaAuth applies TLS security settings to a Sarama config

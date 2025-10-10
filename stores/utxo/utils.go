@@ -4,13 +4,13 @@ package utxo
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/utxo/spend"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // CalculateUtxoStatus determines the status of a UTXO based on its spending state

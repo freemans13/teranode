@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/ordishs/gocore"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"

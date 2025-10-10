@@ -4,7 +4,7 @@
 // Uses build tags to select appropriate cache size for unit tests and automated testing.
 package txmetacache
 
-import "github.com/bitcoin-sv/teranode/ulogger"
+import "github.com/bsv-blockchain/teranode/ulogger"
 
 // BucketsCount defines the number of hash buckets (8 for minimal memory usage).
 const BucketsCount = 8

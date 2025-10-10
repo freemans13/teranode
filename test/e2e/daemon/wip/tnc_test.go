@@ -8,11 +8,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/daemon"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/stretchr/testify/require"
 )
 

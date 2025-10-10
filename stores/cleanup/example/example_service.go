@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/stores/cleanup"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // ExampleCleanupService demonstrates how to use the JobManager

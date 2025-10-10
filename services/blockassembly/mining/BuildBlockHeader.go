@@ -15,9 +15,9 @@ package mining
 import (
 	"encoding/binary"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // BuildBlockHeader constructs a block header byte array from the mining candidate and solution.

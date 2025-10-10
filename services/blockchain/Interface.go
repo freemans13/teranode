@@ -9,10 +9,10 @@ package blockchain
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 )
 
 // ClientI defines the interface for blockchain client operations.

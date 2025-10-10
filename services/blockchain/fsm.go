@@ -5,9 +5,9 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/looplab/fsm"
 )
 

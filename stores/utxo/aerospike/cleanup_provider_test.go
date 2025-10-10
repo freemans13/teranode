@@ -4,8 +4,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/cleanup"
 	"github.com/stretchr/testify/assert"
 )
 

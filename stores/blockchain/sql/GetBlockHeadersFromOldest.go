@@ -21,10 +21,10 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetBlockHeadersFromOldest retrieves a sequence of consecutive block headers starting from a specified block hash.

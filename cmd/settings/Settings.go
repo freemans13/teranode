@@ -17,8 +17,8 @@ package settings
 import (
 	"encoding/json"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/ordishs/gocore"
 )
 

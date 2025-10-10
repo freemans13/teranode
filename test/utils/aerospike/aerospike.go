@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo/aerospike"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	aerospike2 "github.com/bitcoin-sv/testcontainers-aerospike-go"
+	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 )
 
 func InitAerospikeContainer() (string, func() error, error) {

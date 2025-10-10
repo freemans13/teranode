@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -535,8 +535,8 @@ func Test_caller(t *testing.T) {
 	t.Run("CallerPathSimplification", func(t *testing.T) {
 		result := caller()
 
-		// Should not contain full paths starting with github.com/bitcoin-sv/teranode
-		assert.NotContains(t, result, "github.com/bitcoin-sv/teranode")
+		// Should not contain full paths starting with github.com/bsv-blockchain/teranode
+		assert.NotContains(t, result, "github.com/bsv-blockchain/teranode")
 
 		// Should contain runtime information when called from test context
 		assert.Contains(t, result, "testing.tRunner")

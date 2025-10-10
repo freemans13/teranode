@@ -7,13 +7,13 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	u "github.com/bitcoin-sv/teranode/test/utils"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	u "github.com/bsv-blockchain/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 

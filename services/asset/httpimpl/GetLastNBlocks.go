@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 )
 

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	helper "github.com/bitcoin-sv/teranode/test/utils"
-	"github.com/bitcoin-sv/teranode/test/utils/tconfig"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
+	"github.com/bsv-blockchain/teranode/test/utils/tconfig"
 	"github.com/stretchr/testify/suite"
 )
 

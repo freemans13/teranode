@@ -109,7 +109,7 @@ const file_stores_utxo_status_proto_rawDesc = "" +
 	"\x06FROZEN\x10\x05\x12\x0f\n" +
 	"\vCONFLICTING\x10\x06\x12\n" +
 	"\n" +
-	"\x06LOCKED\x10\aB,Z*github.com/bitcoin-sv/teranode/stores/utxob\x06proto3"
+	"\x06LOCKED\x10\aB0Z.github.com/bsv-blockchain/teranode/stores/utxob\x06proto3"
 
 var (
 	file_stores_utxo_status_proto_rawDescOnce sync.Once
