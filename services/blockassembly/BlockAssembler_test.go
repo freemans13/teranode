@@ -2133,6 +2133,7 @@ func TestBlockAssembly_LoadUnminedTransactions_SkipsTransactionsOnCurrentChain(t
 
 	// Set the block assembler's best block header to our test block
 	items.blockAssembler.setBestBlockHeader(blockHeader1, 1)
+	items.blockAssembler.subtreeProcessor.SetCurrentBlockHeader(blockHeader1)
 
 	// Load unmined transactions
 	err = items.blockAssembler.loadUnminedTransactions(ctx, false)
@@ -2142,12 +2143,10 @@ func TestBlockAssembly_LoadUnminedTransactions_SkipsTransactionsOnCurrentChain(t
 	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
 
 	// tx1 should NOT be in the assembler (it's on the current chain)
-	assert.False(t, containsHash(hashes, *txHash1),
-		"transaction already on current chain should be skipped during loadUnminedTransactions")
+	assert.False(t, containsHash(hashes, *txHash1), "transaction already on current chain should be skipped during loadUnminedTransactions")
 
 	// tx2 should be in the assembler (it's still unmined)
-	assert.True(t, containsHash(hashes, *txHash2),
-		"unmined transaction not on current chain should be loaded into assembler")
+	assert.True(t, containsHash(hashes, *txHash2), "unmined transaction not on current chain should be loaded into assembler")
 }
 
 // TestStartUnminedTransactionCleanupCoverage tests startUnminedTransactionCleanup method (52.2% coverage)

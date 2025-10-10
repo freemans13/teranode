@@ -64,18 +64,6 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		settings := test.CreateBaseTestSettings(t)
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
-		mockBlockchainClient := &blockchain.Mock{}
-		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
-		require.NoError(t, err)
-
-		// Use the pre-defined coinbase transactions from the test vars
-		// Create a simple block with just a coinbase tx
-		block1 := &model.Block{
-			Height:     1,
-			CoinbaseTx: coinbaseTx,
-			Subtrees:   []*chainhash.Hash{},
-		}
-
 		// Create a target block header
 		targetHeader := &model.BlockHeader{
 			Version:        1,
@@ -85,6 +73,22 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 			Bits:           model.NBit{},
 			Nonce:          1234,
 		}
+
+		// Use the pre-defined coinbase transactions from the test vars
+		// Create a simple block with just a coinbase tx
+		block1 := &model.Block{
+			Header:     targetHeader,
+			Height:     1,
+			CoinbaseTx: coinbaseTx,
+			Subtrees:   []*chainhash.Hash{},
+		}
+
+		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlock", mock.Anything, mock.Anything).Return(block1, nil)
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
 
 		// Store the coinbase UTXO first to avoid errors
 		_, err = utxoStore.Create(context.Background(), coinbaseTx, 1)
@@ -108,6 +112,8 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 
@@ -176,20 +182,6 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		settings := test.CreateBaseTestSettings(t)
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
-		mockBlockchainClient := &blockchain.Mock{}
-		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
-
-		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
-		require.NoError(t, err)
-
-		// Create transactions that will conflict during reset
-		conflictTx1Hash, err := chainhash.NewHashFromStr("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
-		require.NoError(t, err)
-		conflictTx2Hash, err := chainhash.NewHashFromStr("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
-		require.NoError(t, err)
-		uniqueTxHash, err := chainhash.NewHashFromStr("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
-		require.NoError(t, err)
-
 		// Create block headers for reset scenario
 		currentHeader := &model.BlockHeader{
 			Version:        1,
@@ -230,6 +222,21 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 				Nonce:          202,
 			},
 		}
+
+		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlock", mock.Anything, mock.Anything).Return(moveBackBlock1, nil)
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
+
+		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+
+		// Create transactions that will conflict during reset
+		conflictTx1Hash, err := chainhash.NewHashFromStr("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+		require.NoError(t, err)
+		conflictTx2Hash, err := chainhash.NewHashFromStr("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+		require.NoError(t, err)
+		uniqueTxHash, err := chainhash.NewHashFromStr("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+		require.NoError(t, err)
 
 		// Store necessary UTXOs
 		_, err = utxoStore.Create(context.Background(), coinbaseTx, 1)

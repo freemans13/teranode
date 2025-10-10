@@ -472,6 +472,13 @@ func (ba *BlockAssembly) sendSubtreeNotification(ctx context.Context, subtreeHas
 func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtreeprocessor.NewSubtreeRequest, subtreeRetryChan chan *subtreeRetrySend) (err error) {
 	subtree := subtreeRequest.Subtree
 
+	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "storeSubtree",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithCounter(prometheusBlockAssemblerSubtreeCreated),
+		tracing.WithLogMessage(ba.logger, "[BlockAssembly:Init][%s] new subtree notification from assembly: len %d", subtree.RootHash().String(), subtree.Length()),
+	)
+	defer deferFn()
+
 	// start1, stat1, _ := util.NewStatFromContext(ctx, "newSubtreeChan", channelStats)
 	// check whether this subtree already exists in the store, which would mean it has already been announced
 	if ok, _ := ba.subtreeStore.Exists(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree); ok {
@@ -479,9 +486,6 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 		ba.logger.Debugf("[BlockAssembly:Init][%s] subtree already exists", subtree.RootHash().String())
 		return
 	}
-
-	prometheusBlockAssemblerSubtreeCreated.Inc()
-	ba.logger.Infof("[BlockAssembly:Init][%s] new subtree notification from assembly: len %d", subtree.RootHash().String(), subtree.Length())
 
 	var subtreeBytes []byte
 
@@ -527,7 +531,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 				subtree.RootHash()[:],
 				fileformat.FileTypeSubtreeMeta,
 				subtreeMetaBytes,
-				options.WithDeleteAt(dah), // this sets the DAH for the subtree, it must be updated when a block is mined
+				options.WithDeleteAt(dah),
 			); err != nil {
 				if errors.Is(err, errors.ErrBlobAlreadyExists) {
 					ba.logger.Debugf("[BlockAssembly:Init][%s] subtree meta already exists", subtree.RootHash().String())

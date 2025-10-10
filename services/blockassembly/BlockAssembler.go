@@ -1392,6 +1392,12 @@ func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) 
 // Returns:
 //   - error: Any error encountered during transaction loading or processing
 func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan bool) (err error) {
+	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "loadUnminedTransactions",
+		tracing.WithParentStat(b.stats),
+		tracing.WithLogMessage(b.logger, "[loadUnminedTransactions] called with fullScan=%t", fullScan),
+	)
+	defer deferFn()
+
 	// Set flag to indicate unmined transactions are being loaded
 	b.unminedTransactionsLoading.Store(true)
 	defer func() {
@@ -1433,7 +1439,9 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		b.logger.Infof("[BlockAssembler] doing full scan of unmined transactions, scanning last %d headers", scanHeaders)
 	}
 
-	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, b.bestBlockHeader.Load().Hash(), scanHeaders)
+	// Get the best block headers to check if the unmined transactions are already included in a mined block
+	// We get them from the subtreeprocessor directly to ensure we have the latest state after a possible reset
+	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, b.subtreeProcessor.GetCurrentBlockHeader().Hash(), scanHeaders)
 	if err != nil {
 		return errors.NewProcessingError("error getting best block headers", err)
 	}

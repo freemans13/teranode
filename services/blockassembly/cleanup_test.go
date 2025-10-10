@@ -116,6 +116,10 @@ func TestCleanupDuringStartup(t *testing.T) {
 
 		blockchainClient := &blockchain.Mock{}
 		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
+		blockchainClient.On("GetBlock", mock.Anything, mock.Anything).Return([]uint32{0}, nil)
+
+		subtreeProcessor := &subtreeprocessor.MockSubtreeProcessor{}
+		subtreeProcessor.On("GetCurrentBlockHeader").Return(blockHeader1, nil)
 
 		// Create BlockAssembler with mocked dependencies
 		ba := &BlockAssembler{
@@ -123,7 +127,7 @@ func TestCleanupDuringStartup(t *testing.T) {
 			logger:           logger,
 			settings:         settings,
 			bestBlockHeight:  atomic.Uint32{},
-			subtreeProcessor: &subtreeprocessor.MockSubtreeProcessor{}, // Add a mock subtree processor
+			subtreeProcessor: subtreeProcessor,
 			blockchainClient: blockchainClient,
 		}
 
@@ -207,9 +211,8 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 		// Should only be called once for the normal transaction
 		mockSubtreeProcessor.On("AddDirectly", mock.MatchedBy(func(node subtree.SubtreeNode) bool {
 			return node.Hash.String() == normalTx.Hash.String()
-		}), mock.Anything, true).
-			Return(nil).
-			Once()
+		}), mock.Anything, true).Return(nil).Once()
+		mockSubtreeProcessor.On("GetCurrentBlockHeader").Return(blockHeader1, nil)
 
 		blockchainClient := &blockchain.Mock{}
 		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)

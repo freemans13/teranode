@@ -62,6 +62,10 @@ func (m *MockSubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {
 	return args.Get(0).(*model.BlockHeader)
 }
 
+func (m *MockSubtreeProcessor) SetCurrentBlockHeader(blockHeader *model.BlockHeader) {
+	m.Called(blockHeader)
+}
+
 func (m *MockSubtreeProcessor) GetCurrentSubtree() *subtree.Subtree {
 	args := m.Called()
 	if args.Get(0) == nil {

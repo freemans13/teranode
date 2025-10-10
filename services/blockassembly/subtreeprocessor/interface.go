@@ -141,6 +141,13 @@ type Interface interface {
 	//   - *model.BlockHeader: Current block header
 	GetCurrentBlockHeader() *model.BlockHeader
 
+	// SetCurrentBlockHeader sets the current block header in the processor.
+	// This is used to update the processor's view of the blockchain tip.
+	//
+	// Parameters:
+	//   - blockHeader: New block header to set as current
+	SetCurrentBlockHeader(blockHeader *model.BlockHeader)
+
 	// InitCurrentBlockHeader updates the current block header in the processor.
 	// This is used to synchronize the processor with blockchain state changes.
 	//
