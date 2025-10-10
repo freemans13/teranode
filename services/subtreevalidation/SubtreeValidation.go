@@ -1178,7 +1178,7 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 						if err != nil {
 							u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
 							// Can't proceed without valid subtree data, skip to next steps
-						} else if subtreeData == nil || len(subtreeData.Txs) == 0 {
+						} else if subtreeData == nil || len(subtreeData.Txs) == 0 || subtreeData.Txs[len(subtreeData.Txs)-1] == nil {
 							u.logger.Errorf("[validateSubtree][%s] subtree data is nil or empty", subtreeHash.String())
 							// Invalid subtree data, skip to next steps
 						} else if !subtreeForData.Nodes[len(subtreeForData.Nodes)-1].Hash.Equal(*subtreeData.Txs[len(subtreeData.Txs)-1].TxIDChainHash()) {
@@ -1474,6 +1474,11 @@ func (u *Server) getMissingTransactionsFromFile(ctx context.Context, subtreeHash
 	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, subtreeDataReader)
 	if err != nil {
 		return nil, err
+	}
+
+	// Check that subtreeData is not nil or empty
+	if subtreeData == nil || len(subtreeData.Txs) == 0 {
+		return nil, errors.NewProcessingError("[getMissingTransactionsFromFile][%s] subtree data is nil or empty", subtreeHash.String())
 	}
 
 	// check that the last tx is the same, making sure we are not missing any transactions
