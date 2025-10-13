@@ -368,7 +368,7 @@
           "version": "Version",
           "fsm_state": "State",
           "height": "Height",
-          "chainwork_score": "Chainwork",
+          "chainwork_score": "Chain Rank",
           "tx_assembly": "TX Assembly",
           "min_mining_fee": "Min Fee",
           "connected_peers": "Peers",

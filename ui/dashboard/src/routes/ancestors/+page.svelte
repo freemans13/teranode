@@ -45,8 +45,7 @@
     // Calculate chainwork scores if we have data
     if (nodes.length > 0) {
       const chainworkScores = calculateChainworkScores(nodes)
-      const maxScore = Math.max(...Array.from(chainworkScores.values()))
-      
+
       // Get current node peer ID
       const currentPeerID = $currentNodePeerID
 
@@ -54,7 +53,6 @@
       nodes.forEach((node) => {
         const key = node.peer_id
         node.chainwork_score = chainworkScores.get(key) || 0
-        node.maxChainworkScore = maxScore
         node.isCurrentNode = node.peer_id === currentPeerID
         
         // For current node, immediately populate with its best hash
@@ -368,7 +366,7 @@
       },
       {
         id: 'chainwork_score',
-        name: 'Chainwork',
+        name: 'Chain Rank',
         type: 'number',
         props: {
           width: '10%',
@@ -454,18 +452,17 @@
     },
     chainwork_score: (idField, item, colId) => {
       const score = item[colId] || 0
-      const maxScore = item.maxChainworkScore || 0
-      const isTopScore = score > 0 && score === maxScore
-      
+      const isTopScore = score === 1 // Score 1 is now the highest chainwork
+
       let displayValue = '-'
       let className = 'num'
-      
+
       if (score > 0) {
         displayValue = score.toString()
         // Use same CSS classes as network tab for coloring
         className = isTopScore ? 'chainwork-score-top num' : 'chainwork-score-other num'
       }
-      
+
       return {
         component: RenderSpan,
         props: {

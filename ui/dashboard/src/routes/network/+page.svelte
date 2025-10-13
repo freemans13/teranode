@@ -37,7 +37,7 @@
   }
   
   // Cache for chainwork calculations to avoid recalculation
-  let chainworkCache = new Map<string, { scores: Map<string, number>, maxScore: number }>()
+  let chainworkCache = new Map<string, Map<string, number>>()
   
   // Force update of paginatedNodes when tick changes to update relative time displays
   $: if (tickCounter >= 0 && allNodes.length > 0) {
@@ -210,18 +210,14 @@
     
     // Use cached chainwork scores if available
     let chainworkScores: Map<string, number>
-    let maxScore: number
-    
+
     if (chainworkCache.has(chainworkKey)) {
-      const cached = chainworkCache.get(chainworkKey)!
-      chainworkScores = cached.scores
-      maxScore = cached.maxScore
+      chainworkScores = chainworkCache.get(chainworkKey)!
     } else {
       // Calculate and cache chainwork scores
       chainworkScores = calculateChainworkScores(mNodes)
-      maxScore = Math.max(...Array.from(chainworkScores.values()))
-      chainworkCache.set(chainworkKey, { scores: chainworkScores, maxScore })
-      
+      chainworkCache.set(chainworkKey, chainworkScores)
+
       // Keep cache size manageable (only last 10 states)
       if (chainworkCache.size > 10) {
         const firstKey = chainworkCache.keys().next().value
@@ -236,7 +232,6 @@
     mNodes.forEach((node) => {
       const key = node.peer_id
       node.chainwork_score = chainworkScores.get(key) || 0
-      node.maxChainworkScore = maxScore
       // Update isCurrentNode based on reactive store
       node.isCurrentNode = node.peer_id === currentPeerID
     })

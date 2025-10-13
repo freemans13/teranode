@@ -27,16 +27,16 @@ export function calculateChainworkScores(nodes: any[]): Map<string, number> {
     }
   })
   
-  // Convert to array and sort in ascending order (lower chainwork = lower score)
+  // Convert to array and sort in descending order (higher chainwork = lower score number)
   const sortedChainworks = Array.from(chainworkSet).sort((a, b) => {
-    // Compare hex strings as big integers
+    // Compare hex strings as big integers (reversed for descending)
     if (a.length !== b.length) {
-      return a.length - b.length
+      return b.length - a.length
     }
-    return a.localeCompare(b)
+    return b.localeCompare(a)
   })
-  
-  // Assign scores (1 is lowest, n is highest)
+
+  // Assign scores (1 is highest chainwork, n is lowest)
   const chainworkToScore = new Map<string, number>()
   sortedChainworks.forEach((chainwork, index) => {
     chainworkToScore.set(chainwork, index + 1)
@@ -255,18 +255,17 @@ export const renderCells = {
   chainwork_score: (idField, item, colId) => {
     // The score will be calculated and added to items in the parent component
     const score = item[colId] || 0
-    const maxScore = item.maxChainworkScore || 0
-    const isTopScore = score > 0 && score === maxScore
-    
+    const isTopScore = score === 1 // Score 1 is now the highest chainwork
+
     let displayValue = '-'
     let className = 'num'
-    
+
     if (score > 0) {
       displayValue = score.toString()
       // Use CSS classes for coloring
       className = isTopScore ? 'chainwork-score-top num' : 'chainwork-score-other num'
     }
-    
+
     return {
       component: RenderSpan,
       props: {

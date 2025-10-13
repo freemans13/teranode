@@ -194,7 +194,7 @@
   
   :global(th:nth-child(4)), /* Height - right align */
   :global(.th:nth-child(4)),
-  :global(th:nth-child(6)), /* Chainwork - right align */
+  :global(th:nth-child(6)), /* Chain Rank - right align */
   :global(.th:nth-child(6)),
   :global(th:nth-child(7)), /* TX Assembly - right align */
   :global(.th:nth-child(7)),
@@ -224,6 +224,12 @@
   :global(th:nth-child(12) .table-cell-row),
   :global(.th:nth-child(12) .table-cell-row) {
     justify-content: flex-end !important;
+  }
+
+  /* Prevent Chain Rank header from wrapping */
+  :global(th:nth-child(6)),
+  :global(.th:nth-child(6)) {
+    white-space: nowrap !important;
   }
   
   /* Right-align numeric values */
