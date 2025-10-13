@@ -137,7 +137,7 @@ func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendRespo
 
 	key, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 	if aErr != nil {
-		prometheusUtxoMapErrors.WithLabelValues("Get", aErr.Error()).Inc()
+		prometheusUtxoMapErrors.WithLabelValues("GetSpend", aErr.Error()).Inc()
 		s.logger.Errorf("Failed to init new aerospike key: %v\n", aErr)
 
 		return nil, aErr
@@ -150,7 +150,7 @@ func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendRespo
 
 	value, aErr := s.client.Get(policy, key, fields.FieldNamesToStrings(binNames)...)
 	if aErr != nil {
-		prometheusUtxoMapErrors.WithLabelValues("Get", aErr.Error()).Inc()
+		prometheusUtxoMapErrors.WithLabelValues("GetSpend", aErr.Error()).Inc()
 
 		if errors.Is(aErr, aerospike.ErrKeyNotFound) {
 			return &utxo.SpendResponse{
@@ -340,7 +340,11 @@ func (s *Store) get(_ context.Context, hash *chainhash.Hash, bins []fields.Field
 
 	data := <-done
 	if data.Err != nil {
-		prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", data.Err.Error()).Inc()
+		if e, ok := data.Err.(*errors.Error); ok {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", e.Code().Enum().String()).Inc()
+		} else {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", "unknown").Inc()
+		}
 	} else {
 		prometheusTxMetaAerospikeMapGet.Inc()
 	}
