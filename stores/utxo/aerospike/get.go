@@ -137,7 +137,11 @@ func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendRespo
 
 	key, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 	if aErr != nil {
-		prometheusUtxoMapErrors.WithLabelValues("GetSpend", aErr.Error()).Inc()
+		if e, ok := aErr.(*aerospike.AerospikeError); ok {
+			prometheusUtxoMapErrors.WithLabelValues("GetSpend", e.ResultCode.String()).Inc()
+		} else {
+			prometheusUtxoMapErrors.WithLabelValues("GetSpend", "unknown").Inc()
+		}
 		s.logger.Errorf("Failed to init new aerospike key: %v\n", aErr)
 
 		return nil, aErr
@@ -150,7 +154,11 @@ func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendRespo
 
 	value, aErr := s.client.Get(policy, key, fields.FieldNamesToStrings(binNames)...)
 	if aErr != nil {
-		prometheusUtxoMapErrors.WithLabelValues("GetSpend", aErr.Error()).Inc()
+		if e, ok := aErr.(*aerospike.AerospikeError); ok {
+			prometheusUtxoMapErrors.WithLabelValues("GetSpend", e.ResultCode.String()).Inc()
+		} else {
+			prometheusUtxoMapErrors.WithLabelValues("GetSpend", "unknown").Inc()
+		}
 
 		if errors.Is(aErr, aerospike.ErrKeyNotFound) {
 			return &utxo.SpendResponse{

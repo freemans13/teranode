@@ -151,7 +151,11 @@ func (s *Store) unspendLua(spend *utxo.Spend) error {
 
 	key, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 	if aErr != nil {
-		prometheusUtxoMapErrors.WithLabelValues("Reset", aErr.Error()).Inc()
+		if e, ok := aErr.(*aerospike.AerospikeError); ok {
+			prometheusUtxoMapErrors.WithLabelValues("Reset", e.ResultCode.String()).Inc()
+		} else {
+			prometheusUtxoMapErrors.WithLabelValues("Reset", "unknown").Inc()
+		}
 		return errors.NewProcessingError("error in aerospike NewKey", aErr)
 	}
 
@@ -164,7 +168,11 @@ func (s *Store) unspendLua(spend *utxo.Spend) error {
 		aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
 	)
 	if aErr != nil {
-		prometheusUtxoMapErrors.WithLabelValues("Reset", aErr.Error()).Inc()
+		if e, ok := aErr.(*aerospike.AerospikeError); ok {
+			prometheusUtxoMapErrors.WithLabelValues("Reset", e.ResultCode.String()).Inc()
+		} else {
+			prometheusUtxoMapErrors.WithLabelValues("Reset", "unknown").Inc()
+		}
 		return errors.NewStorageError("error in aerospike unspend record", aErr)
 	}
 

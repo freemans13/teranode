@@ -119,7 +119,11 @@ func (s *Store) Delete(_ context.Context, hash *chainhash.Hash) error {
 			return nil
 		}
 
-		prometheusUtxoMapErrors.WithLabelValues("Delete", err.Error()).Inc()
+		if e, ok := err.(*aerospike.AerospikeError); ok {
+			prometheusUtxoMapErrors.WithLabelValues("Delete", e.ResultCode.String()).Inc()
+		} else {
+			prometheusUtxoMapErrors.WithLabelValues("Delete", "unknown").Inc()
+		}
 
 		return errors.NewStorageError("error in aerospike delete key", err)
 	}

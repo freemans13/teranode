@@ -591,7 +591,13 @@ func (s *Store) GetBinsToStore(tx *bt.Tx, blockHeight uint32, blockIDs, blockHei
 	}
 
 	if err != nil {
-		prometheusTxMetaAerospikeMapErrors.WithLabelValues("Store", err.Error()).Inc()
+		if e, ok := err.(*errors.Error); ok {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Store", e.Code().Enum().String()).Inc()
+		} else if e, ok := err.(*aerospike.AerospikeError); ok {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Store", e.ResultCode.String()).Inc()
+		} else {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Store", "unknown").Inc()
+		}
 		return nil, errors.NewProcessingError("failed to get fees and utxo hashes for %s", txHash, err)
 	}
 
