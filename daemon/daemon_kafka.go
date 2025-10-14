@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
+	"github.com/labstack/gommon/random"
 	"github.com/ordishs/gocore"
 )
 
@@ -167,6 +168,10 @@ func getKafkaTxmetaConsumerGroup(logger ulogger.Logger, settings *settings.Setti
 	if kafkaTxmetaConfig == nil {
 		return nil, errors.NewConfigurationError("missing Kafka URL for txmeta consumer - txmetaConfig")
 	}
+
+	// add a random postfix to the consumer group ID to allow multiple instances to run
+	// concurrently and consuming the same messages independently
+	consumerGroupID = consumerGroupID + "." + random.String(16, random.Alphanumeric)
 
 	return getKafkaConsumerGroup(logger, kafkaTxmetaConfig, consumerGroupID, true, &settings.Kafka)
 }
