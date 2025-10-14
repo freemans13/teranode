@@ -903,3 +903,138 @@ func TestConsumerGroupCloseNotRunning(t *testing.T) {
 	err = cg.Close()
 	assert.NoError(t, err)
 }
+
+// PauseTestHandler is a handler specifically for testing pause/resume
+type PauseTestHandler struct {
+	receivedMessages *[]string
+	mu               *sync.Mutex
+}
+
+func (h *PauseTestHandler) Setup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+func (h *PauseTestHandler) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+func (h *PauseTestHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	for {
+		select {
+		case msg := <-claim.Messages():
+			if msg == nil {
+				return nil // Channel closed
+			}
+			h.mu.Lock()
+			*h.receivedMessages = append(*h.receivedMessages, string(msg.Value))
+			h.mu.Unlock()
+		case <-session.Context().Done():
+			return session.Context().Err()
+		}
+	}
+}
+
+// TestConsumerGroupPauseResumeBehavior tests that pause/resume actually stops message delivery
+func TestConsumerGroupPauseResumeBehavior(t *testing.T) {
+	broker := NewInMemoryBroker()
+	topic := "pause-test-topic"
+	cg := NewInMemoryConsumerGroup(broker, topic, "test-group")
+
+	// Create a handler that tracks messages received
+	var receivedMessages []string
+	var mu sync.Mutex
+	handler := &PauseTestHandler{
+		receivedMessages: &receivedMessages,
+		mu:               &mu,
+	}
+
+	// Start consuming in a goroutine
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- cg.Consume(ctx, []string{topic}, handler)
+	}()
+
+	// Give consumer time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Produce some messages while not paused
+	producer := NewInMemorySyncProducer(broker)
+	defer producer.Close()
+
+	msg1 := &sarama.ProducerMessage{Topic: topic, Value: sarama.StringEncoder("message1")}
+	_, _, err := producer.SendMessage(msg1)
+	require.NoError(t, err)
+
+	msg2 := &sarama.ProducerMessage{Topic: topic, Value: sarama.StringEncoder("message2")}
+	_, _, err = producer.SendMessage(msg2)
+	require.NoError(t, err)
+
+	// Wait for messages to be received
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	beforePauseCount := len(receivedMessages)
+	mu.Unlock()
+
+	// Should have received 2 messages
+	assert.Equal(t, 2, beforePauseCount, "Should receive messages when not paused")
+
+	// Now pause consumption
+	cg.PauseAll()
+
+	// Give pause time to take effect
+	time.Sleep(50 * time.Millisecond)
+
+	// Produce messages while paused
+	msg3 := &sarama.ProducerMessage{Topic: topic, Value: sarama.StringEncoder("message3")}
+	_, _, err = producer.SendMessage(msg3)
+	require.NoError(t, err)
+
+	msg4 := &sarama.ProducerMessage{Topic: topic, Value: sarama.StringEncoder("message4")}
+	_, _, err = producer.SendMessage(msg4)
+	require.NoError(t, err)
+
+	// Wait to ensure messages aren't delivered while paused
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	pausedCount := len(receivedMessages)
+	mu.Unlock()
+
+	// Should still be at 2 messages (no new messages received while paused)
+	assert.Equal(t, 2, pausedCount, "Should not receive messages while paused")
+
+	// Now resume consumption
+	cg.ResumeAll()
+
+	// Wait for resumed messages to be delivered
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	afterResumeCount := len(receivedMessages)
+	allMessages := make([]string, len(receivedMessages))
+	copy(allMessages, receivedMessages)
+	mu.Unlock()
+
+	// Should now have received all 4 messages
+	assert.Equal(t, 4, afterResumeCount, "Should receive paused messages after resume")
+	assert.Equal(t, []string{"message1", "message2", "message3", "message4"}, allMessages)
+
+	// Test IsPaused on partition consumer
+	assert.False(t, cg.isPaused, "Consumer group should not be paused after resume")
+
+	// Cancel context to stop consume
+	cancel()
+
+	// Wait for consume to finish
+	select {
+	case err := <-consumeDone:
+		assert.Error(t, err)
+		assert.Equal(t, context.Canceled, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Consume did not exit after context cancel")
+	}
+}

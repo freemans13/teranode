@@ -74,6 +74,16 @@ func (m *MockKafkaConsumerGroup) Close() error {
 	return args.Error(0)
 }
 
+// PauseAll mocks the PauseAll method
+func (m *MockKafkaConsumerGroup) PauseAll() {
+	m.Called()
+}
+
+// ResumeAll mocks the ResumeAll method
+func (m *MockKafkaConsumerGroup) ResumeAll() {
+	m.Called()
+}
+
 // BestBlockResponseMessage type for testing
 type BestBlockResponseMessage struct {
 	PeerID        string      `json:"peerID"`
@@ -570,11 +580,15 @@ func TestHandleBlockTopic(t *testing.T) {
 		// Create logger
 		logger := ulogger.New("test-server")
 
+		// Create peer registry
+		peerRegistry := NewPeerRegistry()
+
 		// Create server with mock P2PClient and BanManager
 		server := &Server{
 			P2PClient:      mockP2PNode,
 			notificationCh: make(chan *notificationMsg, 10),
 			banManager:     mockBanManager,
+			peerRegistry:   peerRegistry,
 			logger:         logger,
 		}
 
@@ -603,12 +617,16 @@ func TestHandleBlockTopic(t *testing.T) {
 		// Create logger
 		logger := ulogger.New("test-server")
 
+		// Create peer registry
+		peerRegistry := NewPeerRegistry()
+
 		// Create server with mock P2PClient
 		server := &Server{
 			P2PClient:      mockP2PNode,
 			notificationCh: make(chan *notificationMsg, 10),
 			logger:         logger,
 			banList:        mockBanList,
+			peerRegistry:   peerRegistry,
 		}
 
 		// Call the real handler method with invalid JSON
@@ -635,11 +653,15 @@ func TestHandleBlockTopic(t *testing.T) {
 		// Create logger
 		logger := ulogger.New("test-server")
 
+		// Create peer registry
+		peerRegistry := NewPeerRegistry()
+
 		// Create server with mock P2PClient and BanManager
 		server := &Server{
 			P2PClient:      mockP2PNode,
 			notificationCh: make(chan *notificationMsg, 10),
 			banManager:     mockBanManager,
+			peerRegistry:   peerRegistry,
 			logger:         logger,
 		}
 
@@ -671,12 +693,16 @@ func TestHandleBlockTopic(t *testing.T) {
 		mockKafkaProducer := new(MockKafkaProducer)
 		mockKafkaProducer.On("Publish", mock.Anything).Return()
 
+		// Create peer registry
+		peerRegistry := NewPeerRegistry()
+
 		// Create server with mocks
 		server := &Server{
 			P2PClient:                 mockP2PNode,
 			notificationCh:            make(chan *notificationMsg, 10),
 			blocksKafkaProducerClient: mockKafkaProducer,
 			banManager:                mockBanManager,
+			peerRegistry:              peerRegistry,
 			logger:                    ulogger.New("test-server"),
 		}
 
@@ -723,6 +749,9 @@ func TestHandleSubtreeTopic(t *testing.T) {
 		mockKafkaProducer := new(MockKafkaProducer)
 		mockKafkaProducer.On("Publish", mock.Anything).Return()
 
+		// Create peer registry
+		peerRegistry := NewPeerRegistry()
+
 		// Create server with mocks
 		// Create settings with blacklisted URLs
 		tSettings := createBaseTestSettings()
@@ -735,6 +764,7 @@ func TestHandleSubtreeTopic(t *testing.T) {
 			notificationCh:             make(chan *notificationMsg, 10),
 			subtreeKafkaProducerClient: mockKafkaProducer,
 			banManager:                 mockBanManager,
+			peerRegistry:               peerRegistry,
 			settings:                   tSettings,
 			logger:                     ulogger.New("test-server"),
 		}

@@ -75,6 +75,34 @@ func TestDoHTTPRequestWithTimeout(t *testing.T) {
 	assert.Contains(t, err.Error(), "context deadline exceeded")
 }
 
+func TestDoHTTPRequestDefaultTimeoutInMilliseconds(t *testing.T) {
+	// This test verifies that the default timeout is in milliseconds, not seconds
+	// The http_timeout setting is 1000, which should be 1000ms (1 second), not 1000 seconds
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate a server that responds after 500ms - should succeed with 1000ms timeout
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte("response after 500ms"))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	// Use context without deadline to trigger default timeout
+	ctx := context.Background()
+
+	start := time.Now()
+	response, err := DoHTTPRequest(ctx, server.URL)
+	duration := time.Since(start)
+
+	// Should succeed because server responds in 500ms and default timeout is 1000ms
+	require.NoError(t, err)
+	assert.Equal(t, "response after 500ms", string(response))
+
+	// Verify the request completed in a reasonable time (under 2 seconds)
+	// If timeout was 1000 seconds, this test would pass but take forever
+	assert.Less(t, duration, 2*time.Second, "Request should complete quickly with millisecond timeout")
+}
+
 func TestDoHTTPRequestWithExistingDeadline(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

@@ -18,32 +18,26 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// consumerMessageHandler returns a Kafka message handler for subtree validation.
+// subtreeMessageHandler returns a Kafka message handler for subtree validation.
 //
-// The handler pauses all subtree processing during execution, skips processing when
-// blockchain FSM is in CATCHINGBLOCKS state, and classifies errors to prevent
-// infinite retry loops on unrecoverable failures.
-func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
+// The handler skips processing when blockchain FSM is in CATCHINGBLOCKS state and classifies
+// errors to prevent infinite retry loops on unrecoverable failures.
+//
+// Note: Pause/resume is now handled by pausing the Kafka consumer itself (via PauseAll/ResumeAll)
+// rather than blocking in this handler. This prevents session timeouts and improves resource usage.
+func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
 	return func(msg *kafka.KafkaMessage) error {
-	WAITFORPAUSE:
-		for {
-			select {
-			case <-ctx.Done():
-				u.logger.Warnf("[consumerMessageHandler] Context done, stopping processing: %v", ctx.Err())
-				return ctx.Err()
-			default:
-				if !u.isPauseActive() {
-					break WAITFORPAUSE
-				}
-
-				u.logger.Warnf("[consumerMessageHandler] Subtree processing is paused (distributed lock active), waiting to resume...")
-				time.Sleep(1 * time.Second)
-			}
+		// Check if context is already cancelled
+		select {
+		case <-ctx.Done():
+			u.logger.Warnf("[subtreeMessageHandler] Context done, stopping processing: %v", ctx.Err())
+			return ctx.Err()
+		default:
 		}
 
 		state, err := u.blockchainClient.GetFSMCurrentState(ctx)
 		if err != nil {
-			return errors.NewProcessingError("[consumerMessageHandler] failed to get FSM current state", err)
+			return errors.NewProcessingError("[subtreeMessageHandler] failed to get FSM current state", err)
 		}
 
 		if *state == blockchain.FSMStateCATCHINGBLOCKS {
@@ -65,18 +59,18 @@ func (u *Server) consumerMessageHandler(ctx context.Context) func(msg *kafka.Kaf
 			if errors.Is(err, errors.ErrSubtreeExists) {
 				// if the error is subtree exists, then return nil, so that the kafka message is marked as committed.
 				// So the message will not be consumed again.
-				u.logger.Infof("[consumerMessageHandler] Subtree already exists - skipping")
+				u.logger.Infof("[subtreeMessageHandler] Subtree already exists - skipping")
 				return nil
 			}
 
 			if errors.Is(err, errors.ErrContextCanceled) {
 				// if the error is context canceled, then return nil, so that the kafka message is marked as committed.
 				// So the message will not be consumed again.
-				u.logger.Infof("[consumerMessageHandler] Context canceled, skipping: %v", err)
+				u.logger.Infof("[subtreeMessageHandler] Context canceled, skipping: %v", err)
 				return nil
 			}
 
-			u.logger.Errorf("[consumerMessageHandler] error processing kafka message, %v", err)
+			u.logger.Errorf("[subtreeMessageHandler] error processing kafka message, %v", err)
 			return err
 		case <-ctx.Done():
 			return ctx.Err()

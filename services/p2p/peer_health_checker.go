@@ -111,17 +111,19 @@ func (hc *PeerHealthChecker) healthCheckLoop(ctx context.Context) {
 	}
 }
 
-// checkAllPeers checks health of all peers
+// checkAllPeers checks health of all directly connected peers
 func (hc *PeerHealthChecker) checkAllPeers() {
-	peers := hc.registry.GetAllPeers()
+	// Only check directly connected peers, not gossiped peers
+	connectedPeers := hc.registry.GetConnectedPeers()
+	allPeers := hc.registry.GetAllPeers()
 
-	hc.logger.Debugf("[HealthChecker] Checking health of %d peers", len(peers))
+	hc.logger.Debugf("[HealthChecker] Checking health of %d connected peers (out of %d total peers)", len(connectedPeers), len(allPeers))
 
 	// Check peers concurrently but limit concurrency
 	Semaphore := make(chan struct{}, 5) // Max 5 concurrent checks
 	var wg sync.WaitGroup
 
-	for _, p := range peers {
+	for _, p := range connectedPeers {
 		// ListenOnly mode nodes will not have a data hub URL set
 		if p.DataHubURL == "" {
 			continue // Skip peers without DataHub URLs

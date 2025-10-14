@@ -942,6 +942,14 @@ func Test_HealthGRPC_Unhealthy(t *testing.T) {
 
 // Mock kafka consumer for testing is now in mock.go
 
+func (m *mockKafkaConsumer) PauseAll() {
+	m.Called()
+}
+
+func (m *mockKafkaConsumer) ResumeAll() {
+	m.Called()
+}
+
 func Test_Start(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)

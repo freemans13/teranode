@@ -452,24 +452,16 @@ type SubtreeValidationSettings struct {
 	QuorumPath                                string
 	QuorumAbsoluteTimeout                     time.Duration
 	SubtreeStore                              *url.URL
-	FailFastValidation                        bool
 	GetMissingTransactions                    int
 	GRPCAddress                               string
 	GRPCListenAddress                         string
 	ProcessTxMetaUsingCacheBatchSize          int
 	ProcessTxMetaUsingCacheConcurrency        int
 	ProcessTxMetaUsingCacheMissingTxThreshold int
-	ProcessTxMetaUsingStoreBatchSize          int
-	ProcessTxMetaUsingStoreConcurrency        int
-	ProcessTxMetaUsingStoreMissingTxThreshold int
 	SubtreeBlockHeightRetention               uint32
 	SubtreeDAHConcurrency                     int
-	SubtreeValidationTimeout                  int
-	SubtreeValidationAbandonThreshold         int
 	TxMetaCacheEnabled                        bool
 	TxMetaCacheMaxMB                          int
-	ValidationMaxRetries                      int
-	ValidationRetrySleep                      string
 	TxChanBufferSize                          int
 	BatchMissingTransactions                  bool
 	SpendBatcherSize                          int
@@ -480,7 +472,8 @@ type SubtreeValidationSettings struct {
 	BlockHeightRetentionAdjustment int32 // Adjustment to GlobalBlockHeightRetention (can be positive or negative)
 	OrphanageTimeout               time.Duration
 	// Concurrency limits
-	CheckBlockSubtreesConcurrency int // Concurrency limit for CheckBlockSubtrees operations (default: 32)
+	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
+	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)
 }
 
 type LegacySettings struct {

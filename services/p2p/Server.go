@@ -664,18 +664,13 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 func (s *Server) subscribeToTopic(ctx context.Context, topicName string, handler func(context.Context, []byte, string)) {
 	topicChannel := s.P2PClient.Subscribe(topicName)
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case msg, ok := <-topicChannel:
-				if !ok {
-					s.logger.Warnf("%s topic channel closed", topicName)
-					return
-				}
-				handler(ctx, msg.Data, msg.From)
-			}
+		// Process messages until the topic channel is closed
+		// DO NOT check ctx.Done() here - context cancellation during operations like Kafka consumer recovery
+		// should not stop P2P message processing. The subscription ends when the topic channel closes.
+		for msg := range topicChannel {
+			handler(ctx, msg.Data, msg.From)
 		}
+		s.logger.Warnf("%s topic channel closed", topicName)
 	}()
 }
 
@@ -841,12 +836,18 @@ func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string)
 		return
 	}
 
-	// Update last message time for the sender
-	s.peerRegistry.UpdateLastMessageTime(peer.ID(from))
+	// Mark sender as connected and update last message time
+	// The sender is the peer we're directly connected to
+	senderID := peer.ID(from)
+	s.addConnectedPeer(senderID)
+	s.peerRegistry.UpdateLastMessageTime(senderID)
 
-	// Also update for the originator if different
+	// Also update for the originator if different (gossiped message)
+	// The originator is not directly connected to us
 	if originatorPeerID != "" {
-		if peerID, err := peer.Decode(originatorPeerID); err == nil && peerID != peer.ID(from) {
+		if peerID, err := peer.Decode(originatorPeerID); err == nil && peerID != senderID {
+			// Add as gossiped peer (not connected)
+			s.addPeer(peerID)
 			s.peerRegistry.UpdateLastMessageTime(peerID)
 		}
 	}
@@ -903,12 +904,20 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 
 		// Update last message time for the sender and originator
 		s.updatePeerLastMessageTime(from, nodeStatusMessage.PeerID)
+
+		// Skip processing from unhealthy peers (but still forward to WebSocket for monitoring)
+		if s.shouldSkipUnhealthyPeer(from, "handleNodeStatusTopic") {
+			s.logger.Debugf("[handleNodeStatusTopic] Skipping peer data processing from unhealthy peer %s, but forwarding to WebSocket", from)
+			// Set isSelf to true to skip peer data updates below while still forwarding to WebSocket
+			isSelf = true
+		}
 	} else {
 		s.logger.Debugf("[handleNodeStatusTopic] forwarding our own node status (peer_id: %s) with is_self=true", nodeStatusMessage.PeerID)
 	}
 
 	// Send to notification channel for WebSocket clients
-	s.notificationCh <- &notificationMsg{
+	select {
+	case s.notificationCh <- &notificationMsg{
 		Timestamp:            time.Now().UTC().Format(isoFormat),
 		Type:                 "node_status",
 		BaseURL:              nodeStatusMessage.BaseURL,
@@ -931,6 +940,9 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 		SyncConnectedAt:      nodeStatusMessage.SyncConnectedAt,
 		MinMiningTxFee:       nodeStatusMessage.MinMiningTxFee,
 		ConnectedPeersCount:  nodeStatusMessage.ConnectedPeersCount,
+	}:
+	default:
+		s.logger.Warnf("[handleNodeStatusTopic] notification channel full, dropped node_status notification for %s", nodeStatusMessage.PeerID)
 	}
 
 	// Update peer height if provided (but not for our own messages)
@@ -1272,7 +1284,11 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 	s.logger.Debugf("[handleNodeStatusNotification] Successfully published node_status message")
 
 	// Send to local WebSocket clients
-	s.notificationCh <- msg
+	select {
+	case s.notificationCh <- msg:
+	default:
+		s.logger.Warnf("[handleNodeStatusNotification] notification channel full, dropped node_status notification for %s", msg.PeerID)
+	}
 
 	return nil
 }
@@ -1539,13 +1555,17 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 		s.logger.Infof("[handleBlockTopic] RELAY  block %s (originator: %s, via: %s)", blockMessage.Hash, blockMessage.PeerID, from)
 	}
 
-	s.notificationCh <- &notificationMsg{
+	select {
+	case s.notificationCh <- &notificationMsg{
 		Timestamp: time.Now().UTC().Format(isoFormat),
 		Type:      "block",
 		Hash:      blockMessage.Hash,
 		Height:    blockMessage.Height,
 		BaseURL:   blockMessage.DataHubURL,
 		PeerID:    blockMessage.PeerID,
+	}:
+	default:
+		s.logger.Warnf("[handleBlockTopic] notification channel full, dropped block notification for %s", blockMessage.Hash)
 	}
 
 	// Ignore our own messages
@@ -1559,6 +1579,11 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 
 	// Skip notifications from banned peers
 	if s.shouldSkipBannedPeer(from, "handleBlockTopic") {
+		return
+	}
+
+	// Skip notifications from unhealthy peers
+	if s.shouldSkipUnhealthyPeer(from, "handleBlockTopic") {
 		return
 	}
 
@@ -1646,12 +1671,16 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, from string) {
 
 	now := time.Now().UTC()
 
-	s.notificationCh <- &notificationMsg{
+	select {
+	case s.notificationCh <- &notificationMsg{
 		Timestamp: now.Format(isoFormat),
 		Type:      "subtree",
 		Hash:      subtreeMessage.Hash,
 		BaseURL:   subtreeMessage.DataHubURL,
 		PeerID:    subtreeMessage.PeerID,
+	}:
+	default:
+		s.logger.Warnf("[handleSubtreeTopic] notification channel full, dropped subtree notification for %s", subtreeMessage.Hash)
 	}
 
 	// Ignore our own messages
@@ -1665,11 +1694,18 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, from string) {
 
 	// Skip notifications from banned peers
 	if s.shouldSkipBannedPeer(from, "handleSubtreeTopic") {
+		s.logger.Debugf("[handleSubtreeTopic] skipping banned peer %s", from)
+		return
+	}
+
+	// Skip notifications from unhealthy peers
+	if s.shouldSkipUnhealthyPeer(from, "handleSubtreeTopic") {
 		return
 	}
 
 	hash, err = s.parseHash(subtreeMessage.Hash, "handleSubtreeTopic")
 	if err != nil {
+		s.logger.Errorf("[handleSubtreeTopic] error parsing hash: %v", err)
 		return
 	}
 
@@ -1776,6 +1812,11 @@ func (s *Server) handleRejectedTxTopic(_ context.Context, m []byte, from string)
 	s.updatePeerLastMessageTime(from, rejectedTxMessage.PeerID)
 
 	if s.shouldSkipBannedPeer(from, "handleRejectedTxTopic") {
+		return
+	}
+
+	// Skip notifications from unhealthy peers
+	if s.shouldSkipUnhealthyPeer(from, "handleRejectedTxTopic") {
 		return
 	}
 
@@ -2299,8 +2340,18 @@ func (s *Server) addPeer(peerID peer.ID) {
 	}
 }
 
+// addConnectedPeer adds a peer and marks it as directly connected
+func (s *Server) addConnectedPeer(peerID peer.ID) {
+	if s.peerRegistry != nil {
+		s.peerRegistry.AddPeer(peerID)
+		s.peerRegistry.UpdateConnectionState(peerID, true)
+	}
+}
+
 func (s *Server) removePeer(peerID peer.ID) {
 	if s.peerRegistry != nil {
+		// Mark as disconnected before removing
+		s.peerRegistry.UpdateConnectionState(peerID, false)
 		s.peerRegistry.RemovePeer(peerID)
 	}
 	if s.syncCoordinator != nil {
@@ -2539,6 +2590,38 @@ func (s *Server) shouldSkipBannedPeer(from string, messageType string) bool {
 		s.logger.Debugf("[%s] ignoring notification from banned peer %s", messageType, from)
 		return true
 	}
+	return false
+}
+
+// shouldSkipUnhealthyPeer checks if we should skip a message from an unhealthy peer
+// Only checks health for directly connected peers (not gossiped peers)
+func (s *Server) shouldSkipUnhealthyPeer(from string, messageType string) bool {
+	// If no peer registry, allow all messages
+	if s.peerRegistry == nil {
+		return false
+	}
+
+	peerID, err := peer.Decode(from)
+	if err != nil {
+		// If we can't decode the peer ID (e.g., from is a hostname/identifier in gossiped messages),
+		// we can't check health status, so allow the message through.
+		// This is normal for gossiped messages where 'from' is the relay peer's identifier, not a valid peer ID.
+		return false
+	}
+
+	peerInfo, exists := s.peerRegistry.GetPeer(peerID)
+	if !exists {
+		// Peer not in registry - allow message (peer might be new)
+		return false
+	}
+
+	// Only filter unhealthy peers if they're directly connected
+	// Gossiped peers aren't health-checked, so we don't filter them
+	if peerInfo.IsConnected && !peerInfo.IsHealthy {
+		s.logger.Debugf("[%s] ignoring notification from unhealthy connected peer %s", messageType, from)
+		return true
+	}
+
 	return false
 }
 

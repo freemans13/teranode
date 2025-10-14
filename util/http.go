@@ -12,7 +12,7 @@ import (
 )
 
 var (
-	// httpRequestTimeout defines the default HTTP request timeout in seconds
+	// httpRequestTimeout defines the default HTTP request timeout in milliseconds
 	// when no deadline is set on the context.
 	httpRequestTimeout, _ = gocore.Config().GetInt("http_timeout", 60)
 )
@@ -76,7 +76,7 @@ func doHTTPRequest(ctx context.Context, url string, requestBody ...[]byte) (io.R
 	}
 
 	if _, ok := ctx.Deadline(); !ok {
-		ctx, cancelFn = context.WithTimeout(ctx, time.Duration(httpRequestTimeout)*time.Second)
+		ctx, cancelFn = context.WithTimeout(ctx, time.Duration(httpRequestTimeout)*time.Millisecond)
 	}
 
 	httpClient := http.DefaultClient

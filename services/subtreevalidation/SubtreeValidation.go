@@ -1001,7 +1001,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
 
-		u.logger.Debugf("[processMissingTransactions][%s] processing level %d with %d transactions", subtreeHash.String(), level, len(txsPerLevel[level]))
+		u.logger.Debugf("[processMissingTransactions][%s] processing level %d/%d with %d transactions", subtreeHash.String(), level+1, maxLevel+1, len(txsPerLevel[level]))
 
 		for _, mTx = range txsPerLevel[level] {
 			tx := mTx.tx
@@ -1587,65 +1587,123 @@ func (u *Server) isPrioritySubtreeCheckActive(subtreeHash string) bool {
 	return ok && active
 }
 
-// setPauseProcessing acquires the distributed pause lock and sets the local atomic flag.
+// setPauseProcessing pauses the Kafka consumer and acquires the distributed pause lock.
 //
-// This method coordinates pausing of subtree processing across all pods in the cluster.
-// It first acquires a distributed lock via the quorum system, then sets the local atomic
-// flag for fast local checks. The distributed lock is kept alive with periodic heartbeat
-// updates and is automatically released on context cancellation or if the pod crashes.
+// This method coordinates pausing of subtree processing across all pods in the cluster by:
+// 1. Pausing the Kafka consumer to stop fetching new subtree messages (prevents handler blocking)
+// 2. Acquiring a distributed lock via the quorum system for cross-pod coordination
+// 3. Setting the local atomic flag for fast local checks
+//
+// The Kafka consumer pause is superior to blocking in the handler because:
+// - Heartbeats continue to be sent (no risk of session timeout)
+// - No messages are held unprocessed
+// - Handler threads are not blocked
+//
+// The distributed lock is kept alive with periodic heartbeat updates and is automatically
+// released on context cancellation or if the pod crashes.
+//
+// To prevent indefinite pauses that could halt cluster-wide subtree processing, this method
+// enforces a maximum pause duration of 5 minutes. If the pause exceeds this duration, the
+// context will be cancelled automatically. The pause duration is tracked via Prometheus metrics
+// to enable monitoring and alerting on abnormally long pauses.
 //
 // Parameters:
 //   - ctx: Context for cancellation and request-scoped values
 //
 // Returns:
-//   - func(): Release function to explicitly release the pause lock
+//   - func(): Release function to explicitly release the pause lock and resume the consumer
 //   - error: Error if the distributed lock cannot be acquired
 func (u *Server) setPauseProcessing(ctx context.Context) (func(), error) {
+	// Create a context with timeout to prevent indefinite pauses
+	// Default to 5 minutes if not configured
+	maxPauseDuration := u.settings.SubtreeValidation.PauseTimeout
+	if maxPauseDuration == 0 {
+		maxPauseDuration = 5 * time.Minute
+	}
+	pauseCtx, cancelPause := context.WithTimeout(ctx, maxPauseDuration)
+
+	// Track when the pause started for metrics
+	pauseStartTime := time.Now()
+	// Pause the Kafka consumer first to stop receiving new messages
+	if u.subtreeConsumerClient != nil {
+		u.subtreeConsumerClient.PauseAll()
+		u.logger.Infof("[setPauseProcessing] Paused Kafka subtree consumer")
+	}
+
+	// If quorum not initialized, just do local pause with consumer paused
 	if q == nil {
 		u.logger.Warnf("[setPauseProcessing] Quorum not initialized - falling back to local-only pause")
 		u.pauseSubtreeProcessing.Store(true)
 		return func() {
+			// Record pause duration when released
+			pauseDuration := time.Since(pauseStartTime).Seconds()
+			prometheusSubtreeValidationPauseDuration.Observe(pauseDuration)
+			u.logger.Infof("[setPauseProcessing] Pause duration: %.2f seconds", pauseDuration)
+
+			cancelPause()
 			u.pauseSubtreeProcessing.Store(false)
-			u.logger.Infof("[setPauseProcessing] Subtree processing resumed (local-only)")
+			if u.subtreeConsumerClient != nil {
+				u.subtreeConsumerClient.ResumeAll()
+				u.logger.Infof("[setPauseProcessing] Resumed Kafka subtree consumer (local-only)")
+			}
 		}, nil
 	}
 
-	releaseLock, err := q.AcquirePauseLock(ctx)
+	// Acquire distributed lock for cross-pod coordination with timeout
+	releaseLock, err := q.AcquirePauseLock(pauseCtx)
 	if err != nil {
+		cancelPause()
+		// If lock acquisition fails, resume the consumer
+		if u.subtreeConsumerClient != nil {
+			u.subtreeConsumerClient.ResumeAll()
+			u.logger.Warnf("[setPauseProcessing] Failed to acquire distributed lock, resumed Kafka consumer")
+		}
 		return noopFunc, err
 	}
 
 	u.pauseSubtreeProcessing.Store(true)
-	u.logger.Infof("[setPauseProcessing] Subtree processing paused across all pods")
+	u.logger.Infof("[setPauseProcessing] Subtree processing paused across all pods (consumer paused, distributed lock acquired)")
+
+	// Track if resume was already called to prevent double-resume
+	resumed := &atomic.Bool{}
+
+	// Monitor for timeout in background and force resume if exceeded
+	go func() {
+		<-pauseCtx.Done()
+		if pauseCtx.Err() == context.DeadlineExceeded {
+			u.logger.Errorf("[setPauseProcessing] Pause exceeded maximum duration of %v - forcing consumer resume to prevent indefinite pause", maxPauseDuration)
+
+			// Force resume the consumer to prevent it being stuck forever
+			if resumed.CompareAndSwap(false, true) {
+				u.pauseSubtreeProcessing.Store(false)
+				releaseLock()
+				if u.subtreeConsumerClient != nil {
+					u.subtreeConsumerClient.ResumeAll()
+					u.logger.Warnf("[setPauseProcessing] TIMEOUT: Force-resumed Kafka subtree consumer after %v timeout", maxPauseDuration)
+				}
+			}
+		}
+	}()
 
 	return func() {
+		// Only resume if not already resumed by timeout goroutine
+		if !resumed.CompareAndSwap(false, true) {
+			u.logger.Debugf("[setPauseProcessing] Consumer already resumed by timeout, skipping normal resume")
+			return
+		}
+
+		// Record pause duration when released
+		pauseDuration := time.Since(pauseStartTime).Seconds()
+		prometheusSubtreeValidationPauseDuration.Observe(pauseDuration)
+		u.logger.Infof("[setPauseProcessing] Pause duration: %.2f seconds", pauseDuration)
+
+		cancelPause()
 		u.pauseSubtreeProcessing.Store(false)
 		releaseLock()
-		u.logger.Infof("[setPauseProcessing] Subtree processing resumed across all pods")
+		if u.subtreeConsumerClient != nil {
+			u.subtreeConsumerClient.ResumeAll()
+			u.logger.Infof("[setPauseProcessing] Resumed Kafka subtree consumer and released distributed lock")
+		}
 	}, nil
 }
 
-// isPauseActive checks if subtree processing is currently paused.
-//
-// This method uses a two-level checking approach for both performance and reliability:
-// 1. Fast path: Checks the local atomic bool first (no I/O overhead)
-// 2. Distributed path: If local flag is false, checks the distributed quorum lock
-//
-// This ensures that:
-// - The local pod can quickly determine if it initiated the pause
-// - All pods can detect if any other pod has initiated a pause
-// - Stale locks from crashed pods are automatically cleaned up
-//
-// Returns:
-//   - bool: true if subtree processing is paused, false otherwise
-func (u *Server) isPauseActive() bool {
-	if u.pauseSubtreeProcessing.Load() {
-		return true
-	}
-
-	if q == nil {
-		return false
-	}
-
-	return q.IsPauseActive()
-}

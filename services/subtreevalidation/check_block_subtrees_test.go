@@ -1465,6 +1465,10 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 	testHeaders := testhelpers.CreateTestHeaders(t, 1)
 
+	// Create test settings once for all subtests
+	testSettings := settings.NewSettings()
+	testSettings.SubtreeValidation.SpendBatcherSize = 10
+
 	tests := []struct {
 		name                  string
 		parentExists          bool
@@ -1561,6 +1565,7 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 
 			// Create server
 			server := &Server{
+				settings:         testSettings,
 				logger:           ulogger.TestLogger{},
 				blockchainClient: mockBlockchainClient,
 				subtreeStore:     mockSubtreeStore,

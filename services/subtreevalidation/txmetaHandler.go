@@ -14,11 +14,20 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// txmetaMessageHandler returns a Kafka message handler for transaction metadata operations.
+//
+// This wrapper provides the context to the actual handler function.
+func (u *Server) txmetaMessageHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
+	return func(msg *kafka.KafkaMessage) error {
+		return u.txmetaHandler(ctx, msg)
+	}
+}
+
 // txmetaHandler processes Kafka messages for transaction metadata cache operations.
 //
 // Processing errors (ErrProcessing) are logged and the message is marked as completed
 // to prevent infinite retry loops on malformed data.
-func (u *Server) txmetaHandler(msg *kafka.KafkaMessage) error {
+func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) error {
 	if msg == nil || len(msg.ConsumerMessage.Value) <= chainhash.HashSize {
 		return nil
 	}
@@ -38,7 +47,7 @@ func (u *Server) txmetaHandler(msg *kafka.KafkaMessage) error {
 	txMetaBytes := m.Content
 
 	if delete {
-		if err := u.DelTxMetaCache(context.Background(), hash); err != nil {
+		if err := u.DelTxMetaCache(ctx, hash); err != nil {
 			prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
 
 			wrappedErr := errors.NewProcessingError("[txmetaHandler][%s] failed to delete tx meta data", hash, err)
@@ -58,7 +67,7 @@ func (u *Server) txmetaHandler(msg *kafka.KafkaMessage) error {
 		return nil
 	}
 
-	if err := u.SetTxMetaCacheFromBytes(context.Background(), hash[:], txMetaBytes); err != nil {
+	if err := u.SetTxMetaCacheFromBytes(ctx, hash[:], txMetaBytes); err != nil {
 		prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
 
 		wrappedErr := errors.NewProcessingError("[txmetaHandler][%s] failed to set tx meta data", hash, err)

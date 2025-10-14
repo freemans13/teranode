@@ -304,7 +304,7 @@ func TestServer_txmetaHandler(t *testing.T) {
 				utxoStore: mockCache,
 			}
 
-			err := server.txmetaHandler(tt.input)
+			err := server.txmetaHandler(context.Background(), tt.input)
 
 			if tt.expectedError {
 				assert.Error(t, err)

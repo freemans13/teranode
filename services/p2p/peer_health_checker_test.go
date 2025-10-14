@@ -247,15 +247,19 @@ func TestPeerHealthChecker_checkAllPeers(t *testing.T) {
 	peerD := peer.ID("peer-d")
 
 	registry.AddPeer(peerA)
+	registry.UpdateConnectionState(peerA, true)
 	registry.UpdateDataHubURL(peerA, successServer.URL)
 
 	registry.AddPeer(peerB)
+	registry.UpdateConnectionState(peerB, true)
 	registry.UpdateDataHubURL(peerB, failServer.URL)
 
 	registry.AddPeer(peerC)
+	registry.UpdateConnectionState(peerC, true)
 	registry.UpdateDataHubURL(peerC, "http://localhost:99999") // Unreachable
 
 	registry.AddPeer(peerD) // No DataHub URL
+	registry.UpdateConnectionState(peerD, true)
 
 	// Check all peers
 	hc.checkAllPeers()
@@ -294,6 +298,7 @@ func TestPeerHealthChecker_ConcurrentHealthChecks(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		peerID := peer.ID(string(rune('A' + i)))
 		registry.AddPeer(peerID)
+		registry.UpdateConnectionState(peerID, true)
 		registry.UpdateDataHubURL(peerID, server.URL)
 	}
 
@@ -334,6 +339,7 @@ func TestPeerHealthChecker_HealthCheckLoop(t *testing.T) {
 	// Add peer
 	peerID := peer.ID("test-peer")
 	registry.AddPeer(peerID)
+	registry.UpdateConnectionState(peerID, true)
 	registry.UpdateDataHubURL(peerID, server.URL)
 
 	// Start health checker

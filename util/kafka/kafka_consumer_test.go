@@ -80,11 +80,13 @@ func TestNewKafkaConsumer(t *testing.T) {
 		return nil
 	}
 
-	consumer := NewKafkaConsumer(cfg, consumerFn)
+	watchdog := &consumeWatchdog{}
+	consumer := NewKafkaConsumer(cfg, consumerFn, watchdog)
 
 	assert.NotNil(t, consumer)
 	assert.Equal(t, cfg, consumer.cfg)
 	assert.NotNil(t, consumer.consumerClosure)
+	assert.NotNil(t, consumer.watchdog)
 }
 
 func TestNewKafkaConsumerNilConsumerFunction(t *testing.T) {
@@ -96,7 +98,8 @@ func TestNewKafkaConsumerNilConsumerFunction(t *testing.T) {
 		AutoCommitEnabled: false,
 	}
 
-	consumer := NewKafkaConsumer(cfg, nil)
+	watchdog := &consumeWatchdog{}
+	consumer := NewKafkaConsumer(cfg, nil, watchdog)
 
 	assert.NotNil(t, consumer)
 	assert.Equal(t, cfg, consumer.cfg)
@@ -118,6 +121,7 @@ func TestKafkaConsumerSetup(t *testing.T) {
 func TestKafkaConsumerCleanupAutoCommitEnabled(t *testing.T) {
 	consumer := &KafkaConsumer{
 		cfg: KafkaConsumerConfig{
+			Logger:            &mockLogger{},
 			Topic:             "test-topic",
 			AutoCommitEnabled: true,
 		},
@@ -133,6 +137,7 @@ func TestKafkaConsumerCleanupAutoCommitEnabled(t *testing.T) {
 func TestKafkaConsumerCleanupManualCommit(t *testing.T) {
 	consumer := &KafkaConsumer{
 		cfg: KafkaConsumerConfig{
+			Logger:            &mockLogger{},
 			Topic:             "test-topic",
 			AutoCommitEnabled: false,
 		},
@@ -331,3 +336,234 @@ func (m *mockSaramaConsumerGroup) PauseAll() {}
 
 // ResumeAll implements sarama.ConsumerGroup interface
 func (m *mockSaramaConsumerGroup) ResumeAll() {}
+
+// Watchdog tests
+
+func TestConsumeWatchdogMarkConsumeStarted(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	watchdog.markConsumeStarted()
+
+	// Verify that the watchdog is attempting to consume
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// Verify that consume start time was set
+	startTime, ok := watchdog.consumeStartTime.Load().(time.Time)
+	assert.True(t, ok)
+	assert.False(t, startTime.IsZero())
+
+	// Verify that setup called time was reset
+	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
+	assert.True(t, ok)
+	assert.True(t, setupTime.IsZero())
+}
+
+func TestConsumeWatchdogMarkSetupCalled(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// First mark consume started
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// Then mark setup called
+	watchdog.markSetupCalled()
+
+	// Verify that the watchdog is no longer attempting to consume
+	assert.False(t, watchdog.isAttemptingConsume.Load())
+
+	// Verify that setup called time was set
+	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
+	assert.True(t, ok)
+	assert.False(t, setupTime.IsZero())
+}
+
+func TestConsumeWatchdogMarkConsumeEnded(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// First mark consume started
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// Then mark consume ended
+	watchdog.markConsumeEnded()
+
+	// Verify that the watchdog is no longer attempting to consume
+	assert.False(t, watchdog.isAttemptingConsume.Load())
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_NotAttempting(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Don't mark consume started - should not be stuck
+	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Second)
+
+	assert.False(t, stuck)
+	assert.Equal(t, time.Duration(0), duration)
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_SetupCalled(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Mark consume started
+	watchdog.markConsumeStarted()
+
+	// Wait a bit then mark setup called
+	time.Sleep(10 * time.Millisecond)
+	watchdog.markSetupCalled()
+
+	// Should not be stuck because setup was called
+	stuck, duration := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
+
+	assert.False(t, stuck)
+	assert.Equal(t, time.Duration(0), duration)
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_BelowThreshold(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Mark consume started
+	watchdog.markConsumeStarted()
+
+	// Wait less than threshold
+	time.Sleep(10 * time.Millisecond)
+
+	// Should not be stuck because duration is below threshold
+	stuck, duration := watchdog.isStuckInRefreshMetadata(100 * time.Millisecond)
+
+	assert.False(t, stuck)
+	assert.Greater(t, duration, time.Duration(0))
+	assert.Less(t, duration, 100*time.Millisecond)
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_AboveThreshold(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Mark consume started
+	watchdog.markConsumeStarted()
+
+	// Wait more than threshold
+	time.Sleep(50 * time.Millisecond)
+
+	// Should be stuck because duration exceeds threshold and setup was not called
+	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
+
+	assert.True(t, stuck)
+	assert.Greater(t, duration, 10*time.Millisecond)
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_ZeroStartTime(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Set isAttemptingConsume to true but don't set start time
+	watchdog.isAttemptingConsume.Store(true)
+
+	// Should not be stuck because start time is not set
+	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
+
+	assert.False(t, stuck)
+	assert.Equal(t, time.Duration(0), duration)
+}
+
+func TestConsumeWatchdogSequence_NormalFlow(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// 1. Consume starts
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// 2. Some time passes (simulating RefreshMetadata)
+	time.Sleep(10 * time.Millisecond)
+
+	// 3. Setup is called successfully
+	watchdog.markSetupCalled()
+	assert.False(t, watchdog.isAttemptingConsume.Load())
+
+	// 4. Should not be stuck
+	stuck, _ := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
+	assert.False(t, stuck)
+}
+
+func TestForceRecovery_ClosesOldConsumer(t *testing.T) {
+	logger := &mockLogger{}
+	mockConsumerGroup := &mockSaramaConsumerGroup{}
+
+	cfg := sarama.NewConfig()
+	cfg.Consumer.Return.Errors = true
+
+	consumer := &KafkaConsumerGroup{
+		Config: KafkaConsumerConfig{
+			Logger:          logger,
+			Topic:           "test-topic",
+			ConsumerGroupID: "test-group",
+			BrokersURL:      []string{"localhost:9092"},
+		},
+		ConsumerGroup: mockConsumerGroup,
+		saramaConfig:  cfg,
+		watchdog:      &consumeWatchdog{},
+	}
+
+	// Force recovery should close the old consumer
+	_ = consumer.forceRecovery()
+
+	// The important thing is that Close() was called on the mock consumer
+	// (New consumer creation will fail with invalid brokers, but that's expected and logged)
+	assert.True(t, mockConsumerGroup.closed, "forceRecovery should close the old consumer group")
+}
+
+func TestForceRecovery_WatchdogIntegration(t *testing.T) {
+	// Create a watchdog that appears stuck
+	watchdog := &consumeWatchdog{}
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// After simulated recovery, watchdog should be reset
+	watchdog.markConsumeEnded()
+	assert.False(t, watchdog.isAttemptingConsume.Load())
+
+	// Verify watchdog correctly detects stuck state
+	watchdog.markConsumeStarted()
+	time.Sleep(10 * time.Millisecond)
+	stuck, duration := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
+	assert.True(t, stuck)
+	assert.Greater(t, duration, 5*time.Millisecond)
+}
+
+func TestForceRecovery_MutexProtectsConcurrentCalls(t *testing.T) {
+	logger := &mockLogger{}
+	mockConsumerGroup := &mockSaramaConsumerGroup{}
+
+	cfg := sarama.NewConfig()
+	cfg.Consumer.Return.Errors = true
+
+	consumer := &KafkaConsumerGroup{
+		Config: KafkaConsumerConfig{
+			Logger:          logger,
+			Topic:           "test-topic",
+			ConsumerGroupID: "test-group",
+			BrokersURL:      []string{"localhost:9092"},
+		},
+		ConsumerGroup: mockConsumerGroup,
+		saramaConfig:  cfg,
+		watchdog:      &consumeWatchdog{},
+	}
+
+	// Launch multiple concurrent force recovery calls
+	// The mutex should ensure they don't interfere with each other
+	const numConcurrent = 5
+	done := make(chan bool, numConcurrent)
+
+	for i := 0; i < numConcurrent; i++ {
+		go func() {
+			_ = consumer.forceRecovery()
+			done <- true
+		}()
+	}
+
+	// Wait for all goroutines to complete
+	for i := 0; i < numConcurrent; i++ {
+		<-done
+	}
+
+	// Should have closed the consumer (at least once)
+	assert.True(t, mockConsumerGroup.closed)
+}

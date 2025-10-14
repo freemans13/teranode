@@ -517,8 +517,8 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	}
 
 	// start kafka consumers
-	u.subtreeConsumerClient.Start(ctx, u.consumerMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())
-	u.txmetaConsumerClient.Start(ctx, u.txmetaHandler, kafka.WithLogErrorAndMoveOn())
+	u.subtreeConsumerClient.Start(ctx, u.subtreeMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())
+	u.txmetaConsumerClient.Start(ctx, u.txmetaMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())
 
 	// this will block
 	if err := util.StartGRPCServer(ctx, u.logger, u.settings, "subtreevalidation", u.settings.SubtreeValidation.GRPCListenAddress, func(server *grpc.Server) {

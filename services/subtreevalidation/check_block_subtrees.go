@@ -550,7 +550,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			continue
 		}
 
-		u.logger.Debugf("[processTransactionsInLevels] Processing level %d with %d transactions", level, len(levelTxs))
+		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions", level+1, maxLevel+1, len(levelTxs))
 
 		// Process all transactions at this level in parallel
 		g, gCtx := errgroup.WithContext(ctx)
@@ -603,10 +603,10 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 		// Fail early if we get an actual tx error thrown
 		if err = g.Wait(); err != nil {
-			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level, err)
+			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level+1, err)
 		}
 
-		u.logger.Debugf("[processTransactionsInLevels] Processing level %d with %d transactions DONE", level, len(levelTxs))
+		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))
 	}
 
 	if errorsFound.Load() > 0 {
