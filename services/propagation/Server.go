@@ -23,7 +23,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -369,6 +368,7 @@ func (ps *PropagationServer) StartUDP6Listeners(ctx context.Context, ipv6Address
 			// Loop forever reading from the socket
 			var (
 				// numBytes int
+				n   int
 				src *net.UDPAddr
 				// oobn int
 				// flags int
@@ -381,17 +381,30 @@ func (ps *PropagationServer) StartUDP6Listeners(ctx context.Context, ipv6Address
 			buffer := make([]byte, maxDatagramSize)
 
 			for {
-				_, _, _, src, err = conn.ReadMsgUDP(buffer, oobB)
+				n, _, _, src, err = conn.ReadMsgUDP(buffer, oobB)
 				if err != nil {
-					log.Fatal("ReadFromUDP failed:", err)
+					ps.logger.Errorf("ReadMsgUDP failed: %v", err)
+					continue
 				}
 				// ps.logger.Infof("read %d bytes from %s, out of bounds data len %d", len(buffer), src.String(), len(oobB))
 
-				reader := bytes.NewReader(buffer)
+				reader := bytes.NewReader(buffer[:n])
 
-				msg, b, err = wire.ReadMessage(reader, wire.ProtocolVersion, wire.MainNet)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							err = errors.NewProcessingError("wire message parsing panic: %v", r)
+							ps.logger.Errorf("Recovered from panic in wire.ReadMessage: %v", r)
+						}
+					}()
+					// reset err before parsing to avoid stale errors
+					err = nil
+					msg, b, err = wire.ReadMessage(reader, wire.ProtocolVersion, wire.MainNet)
+				}()
+
 				if err != nil {
-					ps.logger.Errorf("wire.ReadMessage failed: %v", err)
+					ps.logger.Warnf("wire.ReadMessage failed: %v", err)
+					continue
 				}
 
 				ps.logger.Infof("read %d bytes into wire message from %s", len(b), src.String())
@@ -538,8 +551,19 @@ func (ps *PropagationServer) handleMultipleTx(_ context.Context) echo.HandlerFun
 		for {
 			tx := &bt.Tx{}
 
-			// Read transaction from request body
-			bytesRead, err := tx.ReadFrom(c.Request().Body)
+			// Read transaction from request body with panic recovery
+			var bytesRead int64
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err = errors.NewProcessingError("transaction parsing panic: %v", r)
+						ps.logger.Errorf("Recovered from panic in tx.ReadFrom: %v", r)
+					}
+				}()
+				bytesRead, err = tx.ReadFrom(c.Request().Body)
+			}()
+
 			if err != nil {
 				// End of stream is expected and not an error
 				if err == io.EOF {
@@ -548,6 +572,15 @@ func (ps *PropagationServer) handleMultipleTx(_ context.Context) echo.HandlerFun
 
 				processingErrorWg.Add(1)
 				processErrors <- err
+
+				// if the error came from panic recovery, the stream is likely corrupted
+				if terr, ok := err.(*errors.Error); ok && terr.Code() == errors.ERR_PROCESSING {
+					ps.logger.Errorf("Stream corrupted after panic, stopping transaction processing")
+					break
+				}
+
+				// skip counters and reading this tx if a non-EOF error occurred
+				continue
 			}
 
 			totalNrTransactions++
@@ -821,7 +854,18 @@ func (ps *PropagationServer) processTransaction(ctx context.Context, req *propag
 
 	timeStart := time.Now()
 
-	btTx, err := bt.NewTxFromBytes(req.Tx)
+	var btTx *bt.Tx
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = errors.NewProcessingError("transaction parsing panic: %v", r)
+				ps.logger.Errorf("Recovered from panic in bt.NewTxFromBytes: %v", r)
+			}
+		}()
+		btTx, err = bt.NewTxFromBytes(req.Tx)
+	}()
+
 	if err != nil {
 		prometheusInvalidTransactions.Inc()
 

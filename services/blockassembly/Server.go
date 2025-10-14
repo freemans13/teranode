@@ -986,7 +986,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 
 	jobItem := ba.jobStore.Get(*storeID)
 	if jobItem == nil {
-		return nil, errors.NewProcessingError("[BlockAssembly][%s] job not found", jobID)
+		return nil, errors.NewNotFoundError("[BlockAssembly][%s] job not found", jobID)
 	}
 
 	job := jobItem.Value()

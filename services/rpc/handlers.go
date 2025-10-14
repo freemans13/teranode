@@ -1643,6 +1643,11 @@ func handleSubmitMiningSolution(ctx context.Context, s *RPCServer, cmd interface
 	s.logger.Debugf("in handleSubmitMiningSolution: ms: %s", ms.Stringify(true))
 
 	if err = s.blockAssemblyClient.SubmitMiningSolution(ctx, ms); err != nil {
+		// Handle "job not found" as an expected condition - miners often submit stale solutions
+		if terr, ok := err.(*errors.Error); ok && terr.Code() == errors.ERR_NOT_FOUND {
+			s.logger.Infof("Mining solution rejected: %s (job expired or block already found)", err.Error())
+			return nil, bsvjson.NewRPCError(bsvjson.ErrRPCMisc, err.Error())
+		}
 		return nil, err
 	}
 

@@ -36,9 +36,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+type panicReadCloser struct{}
+
+func (p *panicReadCloser) Read(b []byte) (int, error) { panic("simulated read panic") }
+func (p *panicReadCloser) Close() error               { return nil }
+
 // setupRealValidator creates a real validator with LocalClient blockchain backend
 func setupRealValidator(t *testing.T, ctx context.Context) (validator.Interface, utxo.Store) {
 	logger := ulogger.TestLogger{}
+
 	tSettings := test.CreateBaseTestSettings(t)
 	// Disable block assembly in tests
 	tSettings.BlockAssembly.Disabled = true
@@ -59,6 +65,95 @@ func setupRealValidator(t *testing.T, ctx context.Context) (validator.Interface,
 	require.NoError(t, err)
 
 	return validatorInstance, utxoStore
+}
+
+// Test_handleMultipleTx_PanicDuringRead verifies the handler's panic recovery
+// around tx.ReadFrom by simulating a panic in the request body reader.
+func Test_handleMultipleTx_PanicDuringRead(t *testing.T) {
+	initPrometheusMetrics()
+
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	// clear the default addresses since we're not starting the servers in tests
+	tSettings.Propagation.GRPCListenAddress = ""
+	tSettings.Propagation.HTTPListenAddress = ""
+
+	ps := &PropagationServer{
+		logger:   logger,
+		settings: tSettings,
+	}
+
+	handler := ps.handleMultipleTx(t.Context())
+
+	// a ReadCloser whose Read panics to trigger the recovery path
+	req := httptest.NewRequest(http.MethodPost, "/txs", &panicReadCloser{})
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+	c.SetPath("/txs")
+
+	// handler should not panic. it should recover and aggregate an error
+	err := handler(c)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	body, rbErr := io.ReadAll(rec.Body)
+	require.NoError(t, rbErr)
+	assert.Contains(t, string(body), "Failed to process transactions")
+}
+
+// Test_handleSingleTx_InvalidBody ensures single-tx HTTP path reports 500 for invalid bytes
+func Test_handleSingleTx_InvalidBody(t *testing.T) {
+	initPrometheusMetrics()
+
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Propagation.GRPCListenAddress = ""
+	tSettings.Propagation.HTTPListenAddress = ""
+
+	ps := &PropagationServer{
+		logger:   logger,
+		settings: tSettings,
+	}
+
+	handler := ps.handleSingleTx(t.Context())
+
+	// invalid tx bytes (bt.NewTxFromBytes will error)
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/tx", bytes.NewReader([]byte{0x01, 0x02, 0x03}))
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetPath("/tx")
+
+	err := handler(c)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	body, rbErr := io.ReadAll(rec.Body)
+	require.NoError(t, rbErr)
+	assert.Contains(t, string(body), "Failed to process transaction:")
+}
+
+// TestProcessTransaction_InvalidBytes validates gRPC method error path on invalid bytes
+func TestProcessTransaction_InvalidBytes(t *testing.T) {
+	// Initialize tracing for tests
+	tracing.SetupMockTracer()
+
+	ctx := context.Background()
+	tSettings := test.CreateBaseTestSettings(t)
+
+	// Null tx store is fine; validator not required for parse failure
+	txStore, err := null.New(ulogger.TestLogger{})
+	require.NoError(t, err)
+
+	ps := &PropagationServer{
+		logger:   ulogger.TestLogger{},
+		settings: tSettings,
+		txStore:  txStore,
+	}
+
+	// invalid bytes that cause bt.NewTxFromBytes to return error
+	req := &propagation_api.ProcessTransactionRequest{Tx: []byte{0x00, 0x01, 0x02}}
+	resp, err := ps.ProcessTransaction(ctx, req)
+	assert.Nil(t, resp)
+	assert.Error(t, err)
 }
 
 // TestPropagationServer_HealthLiveness tests the Health function with liveness checks.
