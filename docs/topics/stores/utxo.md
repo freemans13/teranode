@@ -100,6 +100,10 @@ func getUtxoStore(ctx context.Context, logger ulogger.Logger) utxostore.Interfac
 }
 ```
 
+The following diagram provides a deeper level of detail into the UTXO Store's internal components and their interactions:
+
+![utxo_store_detailed_component.svg](../services/img/plantuml/utxo/utxo_store_detailed_component.svg)
+
 The following datastores are supported (either in development / experimental or production mode):
 
 1. **Aerospike**.
