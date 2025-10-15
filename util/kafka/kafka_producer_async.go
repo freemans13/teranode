@@ -51,6 +51,16 @@ type KafkaProducerConfig struct {
 	FlushBytes            int            // Flush threshold in bytes
 	FlushMessages         int            // Number of messages before flush
 	FlushFrequency        time.Duration  // Time between flushes
+
+	// TLS/Authentication configuration
+	EnableTLS     bool   // Enable TLS for Kafka connection
+	TLSSkipVerify bool   // Skip TLS certificate verification (for testing)
+	TLSCAFile     string // Path to CA certificate file
+	TLSCertFile   string // Path to client certificate file
+	TLSKeyFile    string // Path to client key file
+
+	// Debug logging
+	EnableDebugLogging bool // Enable verbose Sarama (Kafka client) debug logging
 }
 
 // MessageStatus represents the status of a produced message.
@@ -76,17 +86,19 @@ type KafkaAsyncProducer struct {
 }
 
 // NewKafkaAsyncProducerFromURL creates a new async producer from a URL configuration.
+// This is a convenience function for production code that extracts settings from kafkaSettings.
+// For tests, use NewKafkaAsyncProducer directly with a manually constructed config.
 //
 // Parameters:
 //   - ctx: Context for producer operations
 //   - logger: Logger instance
 //   - url: URL containing Kafka configuration
-//   - kafkaSettings: Optional Kafka settings for authentication (can be nil for no auth)
+//   - kafkaSettings: Kafka settings for TLS and debug logging (can be nil for defaults)
 //
 // Returns:
 //   - *KafkaAsyncProducer: Configured async producer
 //   - error: Any error encountered during setup
-func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, url *url.URL, kafkaSettings ...*settings.KafkaSettings) (*KafkaAsyncProducer, error) {
+func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, url *url.URL, kafkaSettings *settings.KafkaSettings) (*KafkaAsyncProducer, error) {
 	partitionsInt32, err := safeconversion.IntToInt32(util.GetQueryParamInt(url, "partitions", 1))
 	if err != nil {
 		return nil, err
@@ -95,6 +107,18 @@ func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, ur
 	replicationFactorInt16, err := safeconversion.IntToInt16(util.GetQueryParamInt(url, "replication", 1))
 	if err != nil {
 		return nil, err
+	}
+
+	// Extract TLS and debug logging settings from kafkaSettings (if provided)
+	var enableTLS, tlsSkipVerify, enableDebugLogging bool
+	var tlsCAFile, tlsCertFile, tlsKeyFile string
+	if kafkaSettings != nil {
+		enableTLS = kafkaSettings.EnableTLS
+		tlsSkipVerify = kafkaSettings.TLSSkipVerify
+		tlsCAFile = kafkaSettings.TLSCAFile
+		tlsCertFile = kafkaSettings.TLSCertFile
+		tlsKeyFile = kafkaSettings.TLSKeyFile
+		enableDebugLogging = kafkaSettings.EnableDebugLogging
 	}
 
 	producerConfig := KafkaProducerConfig{
@@ -109,16 +133,17 @@ func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, ur
 		FlushBytes:            util.GetQueryParamInt(url, "flush_bytes", 1024*1024),
 		FlushMessages:         util.GetQueryParamInt(url, "flush_messages", 50_000),
 		FlushFrequency:        util.GetQueryParamDuration(url, "flush_frequency", 10*time.Second),
-	}
-
-	// Get kafkaSettings from variadic parameter
-	var settings *settings.KafkaSettings
-	if len(kafkaSettings) > 0 {
-		settings = kafkaSettings[0]
+		// TLS/Auth configuration
+		EnableTLS:          enableTLS,
+		TLSSkipVerify:      tlsSkipVerify,
+		TLSCAFile:          tlsCAFile,
+		TLSCertFile:        tlsCertFile,
+		TLSKeyFile:         tlsKeyFile,
+		EnableDebugLogging: enableDebugLogging,
 	}
 
 	producer, err := retry.Retry(ctx, logger, func() (*KafkaAsyncProducer, error) {
-		return NewKafkaAsyncProducer(logger, producerConfig, settings)
+		return NewKafkaAsyncProducer(logger, producerConfig)
 	}, retry.WithMessage(fmt.Sprintf("[P2P] error starting kafka async producer for topic %s", producerConfig.Topic)))
 	if err != nil {
 		logger.Fatalf("[P2P] failed to start kafka async producer for topic %s: %v", producerConfig.Topic, err)
@@ -132,13 +157,12 @@ func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, ur
 //
 // Parameters:
 //   - logger: Logger instance
-//   - cfg: Producer configuration
-//   - kafkaSettings: Optional Kafka settings for authentication (can be nil for no auth)
+//   - cfg: Producer configuration (includes TLS and debug logging settings)
 //
 // Returns:
 //   - *KafkaAsyncProducer: Configured async producer
 //   - error: Any error encountered during setup
-func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig, kafkaSettings *settings.KafkaSettings) (*KafkaAsyncProducer, error) {
+func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*KafkaAsyncProducer, error) {
 	logger.Debugf("Starting async kafka producer for %v", cfg.URL)
 
 	if cfg.URL.Scheme == memoryScheme {
@@ -167,15 +191,18 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig, kafka
 	config.Producer.Flush.Frequency = cfg.FlushFrequency
 	// config.Producer.Return.Successes = true
 
-	// Apply authentication settings if provided
-	if kafkaSettings != nil {
-		cfg.Logger.Debugf("Configuring Kafka TLS authentication - EnableTLS: %v, SkipVerify: %v, CA: %s, Cert: %s",
-			kafkaSettings.EnableTLS, kafkaSettings.TLSSkipVerify, kafkaSettings.TLSCAFile, kafkaSettings.TLSCertFile)
+	// Enable Sarama debug logging if configured
+	if cfg.EnableDebugLogging {
+		sarama.Logger = &saramaLoggerAdapter{logger: logger}
+		logger.Infof("Kafka debug logging enabled for async producer topic %s", cfg.Topic)
+	}
 
-		if err := ValidateKafkaAuthSettings(kafkaSettings); err != nil {
-			return nil, errors.NewConfigurationError("invalid Kafka authentication settings", err)
-		}
-		if err := configureKafkaAuth(config, kafkaSettings); err != nil {
+	// Apply authentication settings if TLS is enabled
+	if cfg.EnableTLS {
+		cfg.Logger.Debugf("Configuring Kafka TLS authentication - EnableTLS: %v, SkipVerify: %v, CA: %s, Cert: %s",
+			cfg.EnableTLS, cfg.TLSSkipVerify, cfg.TLSCAFile, cfg.TLSCertFile)
+
+		if err := configureKafkaAuthFromFields(config, cfg.EnableTLS, cfg.TLSSkipVerify, cfg.TLSCAFile, cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
 			return nil, errors.NewConfigurationError("failed to configure Kafka authentication", err)
 		}
 

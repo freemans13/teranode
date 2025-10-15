@@ -167,7 +167,7 @@ func TestStartKafkaListenerSuccess(t *testing.T) {
 	listenerStarted := make(chan bool)
 	go func() {
 		listenerStarted <- true
-		StartKafkaListener(ctx, logger, kafkaURL, "test-group", true, consumerFn)
+		StartKafkaListener(ctx, logger, kafkaURL, "test-group", true, consumerFn, nil)
 	}()
 
 	// Wait for listener to start
@@ -194,7 +194,7 @@ func TestStartKafkaListenerInvalidURL(t *testing.T) {
 	// Test with nil URL - this currently panics, which is a limitation of the current implementation
 	// The function should check for nil URL but currently doesn't
 	assert.Panics(t, func() {
-		StartKafkaListener(ctx, logger, nil, "test-group", true, consumerFn)
+		StartKafkaListener(ctx, logger, nil, "test-group", true, consumerFn, nil)
 	})
 }
 
@@ -247,7 +247,7 @@ func TestStartKafkaListenerContextCancellation(t *testing.T) {
 	listenerStarted := make(chan bool)
 	go func() {
 		listenerStarted <- true
-		StartKafkaListener(ctx, logger, kafkaURL, "test-group", true, consumerFn)
+		StartKafkaListener(ctx, logger, kafkaURL, "test-group", true, consumerFn, nil)
 		listenerFinished <- true
 	}()
 
@@ -275,25 +275,20 @@ func TestStartKafkaListenerMultipleSettings(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic")
 	require.NoError(t, err)
 
-	kafkaSettings1 := &settings.KafkaSettings{
+	kafkaSettings := &settings.KafkaSettings{
 		EnableTLS:     false,
 		TLSSkipVerify: false,
-	}
-
-	kafkaSettings2 := &settings.KafkaSettings{
-		EnableTLS:     true,
-		TLSSkipVerify: true,
 	}
 
 	consumerFn := func(msg *KafkaMessage) error {
 		return nil
 	}
 
-	// Test with multiple settings (should use first one)
+	// Test with kafkaSettings
 	listenerStarted := make(chan bool)
 	go func() {
 		listenerStarted <- true
-		StartKafkaListener(ctx, logger, kafkaURL, "test-group", true, consumerFn, kafkaSettings1, kafkaSettings2)
+		StartKafkaListener(ctx, logger, kafkaURL, "test-group", true, consumerFn, kafkaSettings)
 	}()
 
 	<-listenerStarted

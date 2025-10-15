@@ -13,8 +13,8 @@ import (
 )
 
 // getKafkaAsyncProducer creates a new Kafka async producer from the provided URL.
-func getKafkaAsyncProducer(ctx context.Context, logger ulogger.Logger, url *url.URL, kafkaSettings ...*settings.KafkaSettings) (*kafka.KafkaAsyncProducer, error) {
-	producer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, url, kafkaSettings...)
+func getKafkaAsyncProducer(ctx context.Context, logger ulogger.Logger, url *url.URL, kafkaSettings *settings.KafkaSettings) (*kafka.KafkaAsyncProducer, error) {
+	producer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, url, kafkaSettings)
 	if err != nil {
 		return nil, err
 	}
@@ -101,8 +101,8 @@ func getKafkaTxAsyncProducer(ctx context.Context, logger ulogger.Logger, setting
 
 // getKafkaConsumerGroup creates a new Kafka consumer group from the provided URL and consumer group ID.
 func getKafkaConsumerGroup(logger ulogger.Logger, url *url.URL, consumerGroupID string,
-	autoCommit bool, kafkaSettings ...*settings.KafkaSettings) (*kafka.KafkaConsumerGroup, error) {
-	consumer, err := kafka.NewKafkaConsumerGroupFromURL(logger, url, consumerGroupID, autoCommit, kafkaSettings...)
+	autoCommit bool, kafkaSettings *settings.KafkaSettings) (*kafka.KafkaConsumerGroup, error) {
+	consumer, err := kafka.NewKafkaConsumerGroupFromURL(logger, url, consumerGroupID, autoCommit, kafkaSettings)
 	if err != nil {
 		return nil, errors.NewConfigurationError("missing Kafka URL for "+url.String(), err)
 	}
@@ -191,5 +191,5 @@ func getKafkaInvalidSubtreeConsumerGroup(logger ulogger.Logger, settings *settin
 		return nil, nil // Optional, return nil if not configured
 	}
 
-	return getKafkaConsumerGroup(logger, kafkaInvalidSubtreeConfig, consumerGroupID, true)
+	return getKafkaConsumerGroup(logger, kafkaInvalidSubtreeConfig, consumerGroupID, true, &settings.Kafka)
 }

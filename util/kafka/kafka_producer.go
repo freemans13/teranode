@@ -87,7 +87,7 @@ func (k *SyncKafkaProducer) Send(key []byte, data []byte) error {
 //
 // Parameters:
 //   - kafkaURL: URL containing Kafka configuration including topic and partition settings
-//   - kafkaSettings: Optional Kafka settings for authentication (can be nil for no auth)
+//   - kafkaSettings: Kafka settings for TLS and debug logging (can be nil for defaults)
 //
 // Returns:
 //   - ClusterAdmin: Kafka cluster administrator interface (nil for memory scheme)
@@ -119,12 +119,13 @@ func NewKafkaProducer(kafkaURL *url.URL, kafkaSettings *settings.KafkaSettings) 
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_1_0_0
 
-	// Apply authentication settings if provided
-	if kafkaSettings != nil {
-		if err := ValidateKafkaAuthSettings(kafkaSettings); err != nil {
-			return nil, nil, errors.NewConfigurationError("invalid Kafka authentication settings", err)
-		}
-		if err := configureKafkaAuth(config, kafkaSettings); err != nil {
+	// Note: Debug logging not supported for sync producer as it doesn't have a logger parameter
+	// If needed, add a logger parameter to NewKafkaProducer function
+
+	// Apply authentication settings if kafkaSettings provided and TLS is enabled
+	if kafkaSettings != nil && kafkaSettings.EnableTLS {
+		if err := configureKafkaAuthFromFields(config, kafkaSettings.EnableTLS, kafkaSettings.TLSSkipVerify,
+			kafkaSettings.TLSCAFile, kafkaSettings.TLSCertFile, kafkaSettings.TLSKeyFile); err != nil {
 			return nil, nil, errors.NewConfigurationError("failed to configure Kafka authentication", err)
 		}
 	}
@@ -184,7 +185,7 @@ func NewKafkaProducer(kafkaURL *url.URL, kafkaSettings *settings.KafkaSettings) 
 //   - brokersURL: List of Kafka broker URLs
 //   - topic: Topic to produce messages to
 //   - partitions: Number of partitions for the topic
-//   - kafkaSettings: Optional Kafka settings for authentication (nil for no auth)
+//   - kafkaSettings: Kafka settings for TLS configuration (can be nil for defaults)
 //   - flushBytes: Optional flush size in bytes (defaults to 16KB if not provided)
 //
 // Returns:
@@ -198,9 +199,10 @@ func ConnectProducer(brokersURL []string, topic string, partitions int32, kafkaS
 	config.Producer.Retry.Max = 5
 	config.Producer.Partitioner = sarama.NewManualPartitioner
 
-	// Apply authentication settings if provided
-	if kafkaSettings != nil {
-		if err := configureKafkaAuth(config, kafkaSettings); err != nil {
+	// Apply authentication settings if kafkaSettings provided and TLS is enabled
+	if kafkaSettings != nil && kafkaSettings.EnableTLS {
+		if err := configureKafkaAuthFromFields(config, kafkaSettings.EnableTLS, kafkaSettings.TLSSkipVerify,
+			kafkaSettings.TLSCAFile, kafkaSettings.TLSCertFile, kafkaSettings.TLSKeyFile); err != nil {
 			return nil, errors.NewConfigurationError("failed to configure Kafka authentication", err)
 		}
 	}

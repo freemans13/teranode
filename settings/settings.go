@@ -127,6 +127,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TLSCAFile:     getString("KAFKA_TLS_CA_FILE", "", alternativeContext...),
 			TLSCertFile:   getString("KAFKA_TLS_CERT_FILE", "", alternativeContext...),
 			TLSKeyFile:    getString("KAFKA_TLS_KEY_FILE", "", alternativeContext...),
+			// Debug logging
+			EnableDebugLogging: getBool("kafka_enable_debug_logging", false, alternativeContext...),
 		},
 		Aerospike: AerospikeSettings{
 			Debug:                  getBool("aerospike_debug", false, alternativeContext...),

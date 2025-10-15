@@ -64,10 +64,10 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 			RawQuery: "partitions=1&replicationFactor=1&flush_frequency=1s&replay=1",
 		}
 
-		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 		require.NoError(t, err)
 
-		consumerClient, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test_consumer", true)
+		consumerClient, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test_consumer", true, nil)
 		require.NoError(t, err)
 
 		done := make(chan struct{})
@@ -127,7 +127,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 		require.NoError(t, err)
 
 		producerClient.Start(ctx, make(chan *ukafka.Message, 10000))
@@ -186,7 +186,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 			wg.Add(10)
 
 			t.Run(tCase.name, func(t *testing.T) {
-				client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, tCase.groupID, false)
+				client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, tCase.groupID, false, nil)
 				require.NoError(t, err)
 
 				client.Start(ctx, tCase.consumerClosure, ukafka.WithRetryAndMoveOn(3, 1, time.Millisecond))
@@ -232,7 +232,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 		require.NoError(t, err)
 
 		producerClient.Start(ctx, make(chan *ukafka.Message, 10000))
@@ -250,7 +250,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 			return errors.New(errors.ERR_BLOCK_ERROR, "block error")
 		}
 
-		client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test", false)
+		client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test", false, nil)
 		require.NoError(t, err)
 
 		// WithRetryAndMoveOn(3, 1, time.Millisecond) is the key here - we're testing that the consumer will retry 3 times before moving on
@@ -315,7 +315,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 		require.NoError(t, err)
 
 		producerClient.Start(ctx, make(chan *ukafka.Message, 10000))
@@ -338,7 +338,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 			return errors.New(errors.ERR_BLOCK_ERROR, "block error")
 		}
 
-		client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test_stop", false)
+		client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test_stop", false, nil)
 		require.NoError(t, err)
 
 		var stopped atomic.Bool
@@ -401,7 +401,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+		producerClient, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 		require.NoError(t, err)
 
 		producerClient.Start(ctx, make(chan *ukafka.Message, 10000))
@@ -425,7 +425,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 			return errors.New(errors.ERR_BLOCK_ERROR, "block error")
 		}
 
-		client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test_stop", false)
+		client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test_stop", false, nil)
 		require.NoError(t, err)
 
 		// default Kafka behaviour on message consumption error is to retry forever
@@ -484,7 +484,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		producer, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+		producer, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 		require.NoError(t, err)
 
 		producer.Start(ctx, make(chan *ukafka.Message, 100))
@@ -539,7 +539,7 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		producer, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+		producer, err := ukafka.NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 		require.NoError(t, err)
 
 		producer.Start(ctx, make(chan *ukafka.Message, 100))
@@ -604,7 +604,7 @@ func consumeMessages(t *testing.T, ctx context.Context, logger ulogger.Logger, k
 		messagesMutex    sync.RWMutex
 	)
 
-	consumer, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, groupID, false) // autoCommit = false
+	consumer, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, groupID, false, nil) // autoCommit = false
 	require.NoError(t, err)
 
 	defer func() {

@@ -153,7 +153,7 @@ func TestKafkaConsumerCleanupManualCommit(t *testing.T) {
 func TestNewKafkaConsumerGroupFromURLInvalidURL(t *testing.T) {
 	logger := &mockLogger{}
 
-	consumer, err := NewKafkaConsumerGroupFromURL(logger, nil, "test-group", true)
+	consumer, err := NewKafkaConsumerGroupFromURL(logger, nil, "test-group", true, nil)
 
 	assert.Error(t, err)
 	assert.Nil(t, consumer)
@@ -165,7 +165,7 @@ func TestNewKafkaConsumerGroupFromURLMemoryScheme(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=4&replay=1")
 	require.NoError(t, err)
 
-	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", true)
+	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", true, nil)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, consumer)
@@ -181,7 +181,7 @@ func TestNewKafkaConsumerGroupFromURLDefaultValues(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic")
 	require.NoError(t, err)
 
-	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", false)
+	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", false, nil)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, consumer)

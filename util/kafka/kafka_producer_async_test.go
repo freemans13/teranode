@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -148,7 +147,7 @@ func TestNewKafkaAsyncProducerFromURLMemoryScheme(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=4&replication=2&retention=300000")
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
@@ -164,7 +163,7 @@ func TestNewKafkaAsyncProducerFromURLDefaultValues(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic")
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
@@ -185,7 +184,7 @@ func TestNewKafkaAsyncProducerFromURLInvalidConversion(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=2147483648") // Max int32 + 1
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 
 	assert.Error(t, err)
 	assert.Nil(t, producer)
@@ -199,7 +198,7 @@ func TestNewKafkaAsyncProducerMemoryScheme(t *testing.T) {
 		Topic:  "memory-topic",
 	}
 
-	producer, err := NewKafkaAsyncProducer(logger, cfg, nil)
+	producer, err := NewKafkaAsyncProducer(logger, cfg)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
@@ -210,16 +209,15 @@ func TestNewKafkaAsyncProducerMemoryScheme(t *testing.T) {
 func TestNewKafkaAsyncProducerWithKafkaSettings(t *testing.T) {
 	logger := &mockAsyncLogger{}
 	cfg := KafkaProducerConfig{
-		Logger: logger,
-		URL:    &url.URL{Scheme: memoryScheme},
-		Topic:  "test-topic",
-	}
-	kafkaSettings := &settings.KafkaSettings{
-		EnableTLS:     false,
-		TLSSkipVerify: false,
+		Logger:             logger,
+		URL:                &url.URL{Scheme: memoryScheme},
+		Topic:              "test-topic",
+		EnableTLS:          false,
+		TLSSkipVerify:      false,
+		EnableDebugLogging: false,
 	}
 
-	producer, err := NewKafkaAsyncProducer(logger, cfg, kafkaSettings)
+	producer, err := NewKafkaAsyncProducer(logger, cfg)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
@@ -338,7 +336,7 @@ func TestKafkaAsyncProducerWithCustomFlushSettings(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic?flush_bytes=2048&flush_messages=100&flush_frequency=5s")
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 	require.NoError(t, err)
 
 	// Verify flush settings
@@ -354,7 +352,7 @@ func TestKafkaAsyncProducerBrokersURLParsing(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://broker1:9092,broker2:9092,broker3:9092/test-topic")
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 	require.NoError(t, err)
 
 	brokers := producer.BrokersURL()
@@ -372,7 +370,7 @@ func TestKafkaAsyncProducerWithMultipleBrokers(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://broker1:9092,broker2:9093/test-topic?partitions=3")
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 	require.NoError(t, err)
 
 	assert.Len(t, producer.Config.BrokersURL, 2)
@@ -419,7 +417,7 @@ func TestKafkaAsyncProducerURLQueryParams(t *testing.T) {
 			kafkaURL, err := url.Parse(tt.url)
 			require.NoError(t, err)
 
-			producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+			producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 			require.NoError(t, err)
 			require.NotNil(t, producer)
 
@@ -435,7 +433,7 @@ func TestKafkaAsyncProducerStopBeforeStart(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic-stop-before-start")
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 	require.NoError(t, err)
 
 	// Stop before Start - should handle gracefully

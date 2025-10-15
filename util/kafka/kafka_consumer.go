@@ -88,6 +88,16 @@ type KafkaConsumerConfig struct {
 	// OffsetReset controls what to do when offset is out of range (query param: offsetReset)
 	// Values: "latest" (default, skip to newest), "earliest" (reprocess from oldest), "" (use Replay setting)
 	OffsetReset string // Strategy for handling offset out of range errors
+
+	// TLS/Authentication configuration
+	EnableTLS     bool   // Enable TLS for Kafka connection
+	TLSSkipVerify bool   // Skip TLS certificate verification (for testing)
+	TLSCAFile     string // Path to CA certificate file
+	TLSCertFile   string // Path to client certificate file
+	TLSKeyFile    string // Path to client key file
+
+	// Debug logging
+	EnableDebugLogging bool // Enable verbose Sarama (Kafka client) debug logging
 }
 
 // consumeWatchdog monitors Consume() state to detect when stuck in RefreshMetadata and triggers force recovery.
@@ -191,9 +201,8 @@ type KafkaConsumerGroup struct {
 	watchdog      *consumeWatchdog // Monitors for stuck RefreshMetadata and triggers force recovery
 
 	// For force recovery when consumer is stuck
-	consumerMu    sync.Mutex              // Protects consumer recreation
-	saramaConfig  *sarama.Config          // Stored config for recreating consumer
-	kafkaSettings *settings.KafkaSettings // Stored auth settings for recreating consumer
+	consumerMu   sync.Mutex     // Protects consumer recreation
+	saramaConfig *sarama.Config // Stored config for recreating consumer
 }
 
 // validateTimeoutConfig validates that timeout configuration follows Sarama constraints
@@ -218,7 +227,9 @@ func validateTimeoutConfig(cfg KafkaConsumerConfig) error {
 }
 
 // NewKafkaConsumerGroupFromURL creates a new KafkaConsumerGroup from a URL.
-func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerGroupID string, autoCommit bool, kafkaSettings ...*settings.KafkaSettings) (*KafkaConsumerGroup, error) {
+// This is a convenience function for production code that extracts settings from kafkaSettings.
+// For tests, use NewKafkaConsumerGroup directly with a manually constructed config.
+func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerGroupID string, autoCommit bool, kafkaSettings *settings.KafkaSettings) (*KafkaConsumerGroup, error) {
 	if url == nil {
 		return nil, errors.NewConfigurationError("missing kafka url")
 	}
@@ -249,6 +260,18 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 	// Values: "latest" (default), "earliest", or "" (empty uses Replay setting)
 	offsetReset := url.Query().Get("offsetReset")
 
+	// Extract TLS and debug logging settings from kafkaSettings (if provided)
+	var enableTLS, tlsSkipVerify, enableDebugLogging bool
+	var tlsCAFile, tlsCertFile, tlsKeyFile string
+	if kafkaSettings != nil {
+		enableTLS = kafkaSettings.EnableTLS
+		tlsSkipVerify = kafkaSettings.TLSSkipVerify
+		tlsCAFile = kafkaSettings.TLSCAFile
+		tlsCertFile = kafkaSettings.TLSCertFile
+		tlsKeyFile = kafkaSettings.TLSKeyFile
+		enableDebugLogging = kafkaSettings.EnableDebugLogging
+	}
+
 	consumerConfig := KafkaConsumerConfig{
 		Logger:            logger,
 		URL:               url,
@@ -268,6 +291,13 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 		ChannelBufferSize: channelBufferSize,
 		ConsumerTimeout:   time.Duration(consumerTimeoutMs) * time.Millisecond,
 		OffsetReset:       offsetReset,
+		// TLS/Auth configuration
+		EnableTLS:          enableTLS,
+		TLSSkipVerify:      tlsSkipVerify,
+		TLSCAFile:          tlsCAFile,
+		TLSCertFile:        tlsCertFile,
+		TLSKeyFile:         tlsKeyFile,
+		EnableDebugLogging: enableDebugLogging,
 	}
 
 	// Validate timeout configuration
@@ -275,7 +305,7 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 		return nil, err
 	}
 
-	return NewKafkaConsumerGroup(consumerConfig, kafkaSettings...)
+	return NewKafkaConsumerGroup(consumerConfig)
 }
 
 // Close gracefully shuts down the Kafka consumer group
@@ -345,7 +375,7 @@ func (k *KafkaConsumerGroup) forceRecovery() error {
 
 // NewKafkaConsumerGroup creates a new Kafka consumer group
 // We DO NOT read autocommit parameter from the URL because the handler func has specific error handling logic.
-func NewKafkaConsumerGroup(cfg KafkaConsumerConfig, kafkaSettings ...*settings.KafkaSettings) (*KafkaConsumerGroup, error) {
+func NewKafkaConsumerGroup(cfg KafkaConsumerConfig) (*KafkaConsumerGroup, error) {
 	if cfg.URL == nil {
 		return nil, errors.NewConfigurationError("kafka URL is not set", nil)
 	}
@@ -386,8 +416,12 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig, kafkaSettings ...*settings.K
 	config := sarama.NewConfig()
 	config.Consumer.Return.Errors = true
 
-	// Enable Sarama debug logging for consumer diagnostics
-	sarama.Logger = &saramaLoggerAdapter{logger: cfg.Logger}
+	// Enable Sarama debug logging for consumer diagnostics (only if configured)
+	// By default, SARAMA logs are too verbose and not needed in production
+	if cfg.EnableDebugLogging {
+		sarama.Logger = &saramaLoggerAdapter{logger: cfg.Logger}
+		cfg.Logger.Infof("Kafka debug logging enabled for consumer group %s", cfg.ConsumerGroupID)
+	}
 
 	// Configure consumer group timeouts from URL query parameters to prevent partition abandonment during slow processing
 
@@ -422,16 +456,12 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig, kafkaSettings ...*settings.K
 	config.Metadata.Retry.Max = 3                   // Retry metadata fetch 3 times
 	config.Metadata.Retry.Backoff = 2 * time.Second // Wait 2s between metadata retries
 
-	// Configure authentication if KafkaSettings are provided
-	if len(kafkaSettings) > 0 && kafkaSettings[0] != nil {
+	// Configure authentication if TLS is enabled
+	if cfg.EnableTLS {
 		cfg.Logger.Debugf("Configuring Kafka TLS authentication - EnableTLS: %v, SkipVerify: %v, CA: %s, Cert: %s",
-			kafkaSettings[0].EnableTLS, kafkaSettings[0].TLSSkipVerify, kafkaSettings[0].TLSCAFile, kafkaSettings[0].TLSCertFile)
+			cfg.EnableTLS, cfg.TLSSkipVerify, cfg.TLSCAFile, cfg.TLSCertFile)
 
-		// Validate KafkaSettings before applying them
-		if err := ValidateKafkaAuthSettings(kafkaSettings[0]); err != nil {
-			return nil, errors.NewConfigurationError("invalid Kafka authentication settings", err)
-		}
-		if err := configureKafkaAuth(config, kafkaSettings[0]); err != nil {
+		if err := configureKafkaAuthFromFields(config, cfg.EnableTLS, cfg.TLSSkipVerify, cfg.TLSCAFile, cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
 			return nil, errors.NewConfigurationError("failed to configure Kafka authentication", err)
 		}
 
@@ -488,18 +518,11 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig, kafkaSettings ...*settings.K
 		return nil, errors.NewServiceError("failed to create Kafka consumer group for %s", cfg.Topic, err)
 	}
 
-	// Store kafkaSettings for potential force recovery
-	var storedKafkaSettings *settings.KafkaSettings
-	if len(kafkaSettings) > 0 {
-		storedKafkaSettings = kafkaSettings[0]
-	}
-
 	return &KafkaConsumerGroup{
 		Config:        cfg,
 		ConsumerGroup: consumerGroup,
-		watchdog:      &consumeWatchdog{},  // Initialize watchdog
+		watchdog:      &consumeWatchdog{}, // Initialize watchdog
 		saramaConfig:  config,              // Store config for force recovery
-		kafkaSettings: storedKafkaSettings, // Store auth settings for force recovery
 	}, nil
 }
 

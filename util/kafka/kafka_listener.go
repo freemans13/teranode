@@ -64,9 +64,9 @@ func StartKafkaControlledListener(ctx context.Context, logger ulogger.Logger, gr
 //   - groupID: Consumer group identifier
 //   - autoCommit: Whether to enable auto-commit of offsets
 //   - consumerFn: Function to process received messages
-//   - kafkaSettings: Optional Kafka settings for authentication (can be nil for no auth)
-func StartKafkaListener(ctx context.Context, logger ulogger.Logger, kafkaURL *url.URL, groupID string, autoCommit bool, consumerFn func(msg *KafkaMessage) error, kafkaSettings ...*settings.KafkaSettings) {
-	client, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, groupID, autoCommit, kafkaSettings...)
+//   - kafkaSettings: Kafka settings for TLS and debug logging (can be nil for defaults)
+func StartKafkaListener(ctx context.Context, logger ulogger.Logger, kafkaURL *url.URL, groupID string, autoCommit bool, consumerFn func(msg *KafkaMessage) error, kafkaSettings *settings.KafkaSettings) {
+	client, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, groupID, autoCommit, kafkaSettings)
 	if err != nil {
 		logger.Errorf("failed to start Kafka listener for %s: %v", kafkaURL.String(), err)
 	}

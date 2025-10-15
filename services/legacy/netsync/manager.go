@@ -2262,7 +2262,7 @@ func (sm *SyncManager) kafkaINVListener(ctx context.Context, kafkaURL *url.URL, 
 		go sm.handleInvMsg(invMsg)
 
 		return nil
-	})
+	}, &sm.settings.Kafka)
 }
 
 func (sm *SyncManager) kafkaBlocksFinalListener(ctx context.Context, kafkaURL *url.URL, groupID string) {
@@ -2301,7 +2301,7 @@ func (sm *SyncManager) kafkaBlocksFinalListener(ctx context.Context, kafkaURL *u
 		sm.peerNotifier.RelayInventory(wire.NewInvVect(wire.InvTypeBlock, hash), wireBlockHeader)
 
 		return nil
-	})
+	}, &sm.settings.Kafka)
 }
 
 func (sm *SyncManager) kafkaTXmetaListener(ctx context.Context, kafkaURL *url.URL, groupID string) {
@@ -2336,5 +2336,5 @@ func (sm *SyncManager) kafkaTXmetaListener(ctx context.Context, kafkaURL *url.UR
 		}
 
 		return nil
-	})
+	}, &sm.settings.Kafka)
 }

@@ -2275,6 +2275,13 @@ func (s *Server) startInvalidBlockConsumer(ctx context.Context) error {
 		ConsumerGroupID:   s.settings.Kafka.InvalidBlocks + "-consumer",
 		AutoCommitEnabled: true,
 		Replay:            false,
+		// TLS/Auth configuration
+		EnableTLS:          s.settings.Kafka.EnableTLS,
+		TLSSkipVerify:      s.settings.Kafka.TLSSkipVerify,
+		TLSCAFile:          s.settings.Kafka.TLSCAFile,
+		TLSCertFile:        s.settings.Kafka.TLSCertFile,
+		TLSKeyFile:         s.settings.Kafka.TLSKeyFile,
+		EnableDebugLogging: s.settings.Kafka.EnableDebugLogging,
 	}
 
 	// Create the Kafka consumer group - this will handle the memory scheme correctly
