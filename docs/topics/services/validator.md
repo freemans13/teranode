@@ -8,6 +8,7 @@
     - [2.2. Receiving Transaction Validation Requests](#22-receiving-transaction-validation-requests)
     - [2.3. Validating the Transaction](#23-validating-the-transaction)
     - [2.3.1. Consensus Rules vs Policy Checks](#231-consensus-rules-vs-policy-checks)
+    - [2.3.2. Transaction Format Extension](#232-transaction-format-extension)
     - [2.4. Script Verification](#24-script-verification)
     - [2.5. Error Handling and Transaction Rejection](#25-error-handling-and-transaction-rejection)
     - [2.6. Concurrent Processing](#26-concurrent-processing)
@@ -292,7 +293,7 @@ The above represents an implementation of the core Teranode validation rules:
 
     - <500000000 and smaller than block height, or >=500000000 and SMALLER THAN TIMESTAMP
 
-    - Note: This means that Teranode will deem non-final transactions invalid and REJECT these transactions. It is up to the user to create proper non-final transactions to ensure that Teranode is aware of them. For clarity, if a transaction has a locktime in the future, the Tx Validator will reject it.
+        - Note: This means that Teranode will deem non-final transactions invalid and REJECT these transactions. It is up to the user to create proper non-final transactions to ensure that Teranode is aware of them. For clarity, if a transaction has a locktime in the future, the Tx Validator will reject it.
 
     - No output must be Pay-to-Script-Hash (P2SH)
 
@@ -304,7 +305,7 @@ The above represents an implementation of the core Teranode validation rules:
 
     - A node must not be able to spend a confiscated (re-assigned) transaction until 1,000 blocks after the transaction was re-assigned (confiscation maturity). The difference between block height and height at which the transaction was re-assigned must not be less than one thousand.
 
-#### 2.3.1. Consensus Rules vs Policy Checks
+### 2.3.1. Consensus Rules vs Policy Checks
 
 In Bitcoin transaction validation, there are two distinct types of rules:
 
@@ -324,7 +325,7 @@ In Bitcoin transaction validation, there are two distinct types of rules:
 
 The TX Validator implements both types of rules, but provides the ability to skip policy checks when appropriate through the `SkipPolicyChecks` option.
 
-##### Skip Policy Checks Feature
+#### Skip Policy Checks Feature
 
 The `SkipPolicyChecks` feature allows Teranode to validate transactions while bypassing certain policy-based validations. When enabled, the validator will:
 
@@ -350,13 +351,95 @@ if !validationOptions.SkipPolicyChecks {
 
 When validating transactions from blocks mined by other nodes, policy checks should be skipped because these blocks are already valid due to proof-of-work, and the transactions must be accepted to maintain consensus, even if they don't meet local policy preferences.
 
-##### Skip Policy Checks - Usage
+#### Skip Policy Checks - Usage
 
 To use this feature:
 
 - When directly calling the validator: Use the `WithSkipPolicyChecks(true)` option
 - When using the gRPC API endpoint: Set the `skip_policy_checks` field to `true` in the `ValidateTransactionRequest` message
 - In services like Subtree Validation: The option is applied automatically when validating block transactions
+
+### 2.3.2. Transaction Format Extension
+
+The Validator Service automatically handles transaction format conversion during the validation pipeline, enabling support for both standard Bitcoin format and Extended Format (BIP-239) transactions.
+
+#### Extension Process
+
+When a transaction arrives in standard Bitcoin format (non-extended), the validator automatically extends it before validation:
+
+1. **Detection**: The validator checks `tx.IsExtended()` before validation begins
+2. **Parent Lookup**: Queries the UTXO store for all parent transactions referenced by the transaction's inputs
+3. **Input Decoration**: For each input, the system retrieves and adds:
+
+   ```go
+   tx.Inputs[idx].PreviousTxSatoshis = parentTx.Outputs[vout].Satoshis
+   tx.Inputs[idx].PreviousTxScript = parentTx.Outputs[vout].LockingScript
+   ```
+
+4. **In-Memory Extension**: Transaction is marked as extended (not persisted to storage)
+5. **Validation**: Proceeds with full validation using the extended data
+
+This extension process occurs transparently at multiple checkpoints in the validation pipeline:
+
+- `Validator.Validate()` in `services/validator/Validator.go` - Initial format check before validation
+- `Validator.validateConsensusRules()` in `services/validator/Validator.go` - Before consensus rule checks
+- `Validator.validateScripts()` in `services/validator/Validator.go` - Before script validation
+
+#### Implementation Details
+
+**Key Functions:**
+
+- `getTransactionInputBlockHeightsAndExtendTx()` - Orchestrates the extension process, fetching parent data and decorating inputs
+- `getUtxoBlockHeightsAndExtendTx()` - Retrieves block heights and extends transactions in parallel
+- `PreviousOutputsDecorate()` - UTXO store method that decorates transaction inputs with previous output data
+- `extendTransaction()` - Wrapper function for the extension logic
+
+**Performance Optimization:**
+
+- **Parallel batch queries**: Parent transactions are looked up concurrently using Go's errgroup pattern
+- **Configurable batching**: UTXO store queries are batched based on `UtxoStore.GetBatcherSize` setting
+- **Idempotent operation**: Already-decorated inputs are skipped automatically
+- **In-memory only**: Extension happens entirely in memory with no disk I/O overhead
+- **Sub-millisecond lookups**: Highly optimized UTXO store (Aerospike/SQL) combined with txmeta cache provides extremely fast parent transaction retrieval
+
+**Code Example:**
+
+```go
+// From Validator.Validate() method
+if !tx.IsExtended() {
+    // Get block heights and extend the transaction
+    if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID); err != nil {
+        return nil, errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
+    }
+}
+```
+
+#### Error Handling
+
+If parent transactions cannot be found during the extension process:
+
+- Returns `ErrTxMissingParent` error to the client
+- Transaction validation fails gracefully
+- Provides clear error message indicating which parent transaction is missing
+- Client can retry after ensuring parent transactions are validated/confirmed
+
+**Common scenarios requiring parent transactions:**
+
+- **Child-pays-for-parent (CPFP)**: Transaction chains where child hasn't been validated yet
+- **Concurrent submissions**: Parent and child transactions submitted simultaneously
+- **Block validation**: Transactions referencing outputs from the same block being processed
+
+#### Format Flexibility Benefits
+
+This automatic extension mechanism provides several advantages:
+
+1. **Backward Compatibility**: Existing Bitcoin wallets work without modification
+2. **No Client Changes Required**: Wallets can continue using standard Bitcoin transaction format
+3. **Optimized When Available**: Extended format transactions skip the lookup step for faster processing
+4. **Transparent Operation**: Format handling is invisible to the client
+5. **Storage Efficiency**: All transactions stored in non-extended format regardless of ingress format
+
+For more details on transaction format handling across the system, see the [Transaction Data Model documentation](../datamodel/transaction_data_model.md).
 
 ### 2.4. Script Verification
 
@@ -552,9 +635,9 @@ The Validator, when run as a service, uses gRPC for communication between nodes.
 
 ## 4. Data Model
 
-The Validation Service deals with the extended transaction format, as seen below:
+The Validation Service processes transactions in multiple formats:
 
-- [Extended Transaction Data Model](../datamodel/transaction_data_model.md): Include additional metadata to facilitate processing.
+- [Transaction Data Model](../datamodel/transaction_data_model.md): Comprehensive documentation covering both standard Bitcoin format and Extended Format (BIP-239), including automatic format conversion and storage strategies.
 
 ## 5. Technology
 

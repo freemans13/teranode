@@ -19,13 +19,6 @@
 6. [Directory Structure and Main Files](#6-directory-structure-and-main-files)
 7. [How to run](#7-how-to-run)
 8. [Configuration options (settings flags)](#8-configuration-options-settings-flags)
-    - [Network and Communication Settings](#network-and-communication-settings)
-    - [Kafka and Concurrency Settings](#kafka-and-concurrency-settings)
-    - [Performance and Optimization](#performance-and-optimization)
-    - [Transaction Processing](#transaction-processing)
-    - [Bloom Filter Management](#bloom-filter-management)
-    - [Advanced Settings](#advanced-settings)
-    - [Storage and State Management](#storage-and-state-management)
 9. [Other Resources](#9-other-resources)
 
 ## 1. Description
@@ -86,14 +79,14 @@ The block validator is a service that validates blocks. After validating them, i
 - The server will request the block data from the remote node (`DoHTTPRequest()`).
 - If the parent block is not known, it will be added to the catchupCh channel for processing. We stop at this point, as we can no longer proceed. The catchup process will be explained in the next section (section 2.2.2).
 - If the parent is known, the block will be validated.
-  - First, the service validates all the block subtrees.
-    - For each subtree, we check if it is known. If not, we kick off a subtree validation process (see section 2.2.3 for more details).
-  - The validator retrieves the last 100 block headers, which are used to validate the block data. We can see more about this specific step in the section 2.2.4.
-  - The validator stores the coinbase Tx in the UTXO Store and the Tx Store.
-  - The validator adds the block to the Blockchain.
-  - For each Subtree in the block, the validator updates the TTL (Time To Live) to zero for the subtree. This allows the Store to clear out data the services will no longer use.
-  - For each Tx for each Subtree, we set the Tx as mined in the UTXO Store. This allows the UTXO Store to know which block(s) the Tx is in.
-  - Should an error occur during the validation process, the block will be invalidated and removed from the blockchain.
+    - First, the service validates all the block subtrees.
+        - For each subtree, we check if it is known. If not, we kick off a subtree validation process (see section 2.2.3 for more details).
+    - The validator retrieves the last 100 block headers, which are used to validate the block data. We can see more about this specific step in the section 2.2.4.
+    - The validator stores the coinbase Tx in the UTXO Store and the Tx Store.
+    - The validator adds the block to the Blockchain.
+    - For each Subtree in the block, the validator updates the TTL (Time To Live) to zero for the subtree. This allows the Store to clear out data the services will no longer use.
+    - For each Tx for each Subtree, we set the Tx as mined in the UTXO Store. This allows the UTXO Store to know which block(s) the Tx is in.
+    - Should an error occur during the validation process, the block will be invalidated and removed from the blockchain.
 
 Note - there is a `optimisticMining` setting that allows to reverse the block validation and block addition to the blockchain steps.
 
@@ -159,6 +152,9 @@ During quick validation, the system also:
 - Reconstructs full subtree data (`.subtree`) with proper fee and size information
 - Stores transactions in non-extended format to reduce storage overhead
 - Extends transaction data on-demand only when needed for validation
+    - Transactions received in standard Bitcoin format are automatically extended in-memory
+    - Parent transaction data is retrieved from the UTXO store as needed
+    - Extension is transparent and does not affect storage format
 
 If quick validation encounters any errors, the system automatically falls back to normal validation to ensure correctness.
 
@@ -169,7 +165,6 @@ Should the validation process for a block encounter a subtree it does not know a
 ![block_validation_subtree_validation_request.svg](img/plantuml/subtreevalidation/block_validation_subtree_validation_request.svg)
 
 If any transaction under the subtree is also missing, the subtree validation process will kick off a recovery process for those transactions.
-
 
 #### 2.2.5. Block Data Validation
 
@@ -214,8 +209,8 @@ Teranode maintains bloom filters for recent blocks to efficiently detect re-pres
 - **Storage**: Bloom filters are stored in both memory (for active validation) and in the subtree store (for persistence)
 - **Retention**: Filters are maintained for a configurable number of recent blocks (`blockvalidation_bloom_filter_retention_size`)
 - **TTL Ordering**: The system enforces a strict TTL (Time-To-Live) ordering: txmetacache < utxo store < bloom filter
-  - This ensures that even if a transaction is pruned from txmetacache, the bloom filter can still detect its re-presentation
-  - The longer retention period for bloom filters provides an extended window for detecting re-presented transactions
+    - This ensures that even if a transaction is pruned from txmetacache, the bloom filter can still detect its re-presentation
+    - The longer retention period for bloom filters provides an extended window for detecting re-presented transactions
 
 ##### The validOrderAndBlessed Mechanism
 
@@ -270,13 +265,13 @@ The `BlockValidation` proceeds to mark all transactions within the block as "min
 >
 ## 3. gRPC Protobuf Definitions
 
-The Block Validation Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen [here](../../references/protobuf_docs/blockvalidationProto.md).
+The Block Validation Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen in the [Block Validation protobuf documentation](../../references/protobuf_docs/blockvalidationProto.md).
 
 ## 4. Data Model
 
 - [Block Data Model](../datamodel/block_data_model.md): Contain lists of subtree identifiers.
 - [Subtree Data Model](../datamodel/subtree_data_model.md): Contain lists of transaction IDs and their Merkle root.
-- [Extended Transaction Data Model](../datamodel/transaction_data_model.md): Includes additional metadata to facilitate processing.
+- [Transaction Data Model](../datamodel/transaction_data_model.md): Comprehensive documentation covering both standard Bitcoin format and Extended Format (BIP-239), including automatic format conversion during block validation.
 - [UTXO Data Model](../datamodel/utxo_data_model.md): UTXO and UTXO Metadata data models for managing unspent transaction outputs.
 
 ## 5. Technology
@@ -341,6 +336,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 ## 8. Configuration options (settings flags)
 
 For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Validation Settings Reference](../../references/settings/services/blockValidation_settings.md).
+
 ## 9. Other Resources
 
 [Block Validation Reference](../../references/services/blockvalidation_reference.md)

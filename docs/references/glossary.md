@@ -28,7 +28,7 @@
 
 **Docker Compose**: A tool for defining and running multi-container Docker applications.
 
-**Extended Transaction Format**: A transaction format that includes additional metadata to facilitate processing. Teranode stores transactions in non-extended format for efficiency and extends them on-demand during validation.
+**Extended Transaction Format (BIP-239)**: A transaction format that includes additional metadata (previous output satoshis and locking scripts) in each input to facilitate faster validation. Teranode accepts transactions in both standard Bitcoin format and Extended Format. When standard format transactions are received, Teranode automatically extends them during validation by retrieving input data from the UTXO store. All transactions are stored in non-extended format for storage efficiency, with extension performed in-memory on-demand during validation. This dual-format support ensures backward compatibility with existing Bitcoin wallets while enabling optimized validation when extended format is provided.
 
 **gRPC**: A high-performance, open-source universal RPC framework.
 

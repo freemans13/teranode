@@ -1081,7 +1081,7 @@ func (ps *PropagationServer) validateTransactionViaKafka(btTx *bt.Tx) error {
 // This method implements the transaction storage mechanism with the following workflow:
 //
 // 1. Extracts the transaction chain hash to use as the unique key
-// 2. Obtains the extended transaction bytes for storage
+// 2. Obtains the transaction bytes in received format for storage
 // 3. Attempts to store the transaction in the configured blob store
 // 4. Handles errors with appropriate categorization and context
 // 5. Updates metrics for performance monitoring

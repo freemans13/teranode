@@ -94,6 +94,24 @@ The transaction processing involves several steps to ensure proper validation an
     - **Kafka**: Normal-sized transactions are sent to the validator through Kafka for asynchronous processing.
     - **HTTP Fallback**: Large transactions exceeding Kafka message size limits are sent directly to the validator's HTTP endpoint.
 
+#### Format Handling
+
+The Propagation Service is format-agnostic and handles transaction formats flexibly:
+
+- **Accepts both formats**: Standard Bitcoin format and Extended Format (BIP-239) transactions
+- **No format validation at ingress**: Transactions are not rejected based on their format
+- **Storage preserves received format**: Transactions are initially stored as received in the blob store
+- **Format handling delegation**: The actual format conversion and extension is handled downstream by the Validator Service
+
+This design ensures:
+
+- **Maximum compatibility** with diverse wallet implementations (from legacy to modern)
+- **No format-based rejection** at the network edge
+- **Flexible deployment** supporting both traditional Bitcoin clients and BIP-239 aware applications
+- **Backward compatibility** with the broader Bitcoin ecosystem
+
+The Propagation Service focuses on efficient transaction ingress and distribution, delegating format-specific processing to the appropriate downstream services.
+
 ### 2.4. Error Handling
 
 The Propagation Service implements comprehensive error handling:
@@ -110,9 +128,9 @@ The Propagation Service uses gRPC for communication between nodes. The protobuf 
 
 ## 4. Data Model
 
-The Propagation Service deals with the extended transaction format, as seen below:
+The Propagation Service accepts transactions in multiple formats:
 
-- [Extended Transaction Data Model](../datamodel/transaction_data_model.md): Include additional metadata to facilitate processing.
+- [Transaction Data Model](../datamodel/transaction_data_model.md): Comprehensive guide covering both standard Bitcoin format and Extended Format (BIP-239), including how Teranode handles format conversion and storage.
 
 ## 5. Technology
 
@@ -170,6 +188,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 ## 8. Configuration options (settings flags)
 
 For comprehensive configuration documentation including all settings, defaults, and interactions, see the [Propagation Settings Reference](../../references/settings/services/propagation_settings.md).
+
 ## 9. Other Resources
 
 [Propagation Service Reference](../../references/services/propagation_reference.md)
