@@ -41,6 +41,10 @@ The P2P Service communicates with the Block Validation over either gRPC protocol
 
 ![Subtree_Validation_Service_Component_Diagram.png](img/Subtree_Validation_Service_Component_Diagram.png)
 
+The detailed component diagram below shows the internal architecture of the Subtree Validation Service with code-verified connections:
+
+![Subtree_Validation_Component](img/plantuml/subtreevalidation/Subtree_Validation_Component.svg)
+
 ### 1.1 Validator Integration
 
 The Subtree Validation service interacts with the Validator service to validate transactions that might be missing during subtree processing. This interaction can happen in two different configurations:
@@ -64,7 +68,7 @@ This configuration is controlled by the settings passed to `GetValidatorClient()
 To improve performance, the Subtree Validation Service uses a caching mechanism for UTXO meta data (called `TX Meta Cache` for historical reasons). This prevents repeated fetch calls to the store by retaining recently loaded transactions in memory (for a limited time). This can be enabled or disabled via the `subtreevalidation_txMetaCacheEnabled` setting. The caching mechanism is implemented in the `txmetacache` package, and is used by the Subtree Validation Service:
 
 ```go
-	// create a caching tx meta store
+ // create a caching tx meta store
     if gocore.Config().GetBool("subtreevalidation_txMetaCacheEnabled", true) {
         logger.Infof("Using cached version of tx meta store")
         u.utxoStore = txmetacache.NewTxMetaCache(ctx, ulogger.TestLogger{}, utxoStore)
@@ -81,33 +85,30 @@ Teranode microservices make use of the Lustre file system in order to share subt
 
 ![lustre_fs.svg](img/plantuml/lustre_fs.svg)
 
-
-
 ## 2. Functionality
 
 The subtree validator is a service that validates subtrees. After validating them, it will update the relevant stores accordingly.
 
 ### 2.1. Receiving UTXOs and warming up the TXMeta Cache
 
-* The TX Validator service processes and validates new transactions.
-* After validating transactions, The Tx Validator Service sends them (in UTXO Meta format) to the Subtree Validation Service via Kafka.
-* The Subtree Validation Service stores these UTXO Meta Data in the Tx Meta Cache.
-* At a later stage (next sections), the Subtree Validation Service will receive subtrees, composed of 1 million transactions. By having the Txs preloaded in a warmed up Tx Meta Cache, the Subtree Validation Service can quickly access the data required to validate the subtree.
+- The TX Validator service processes and validates new transactions.
+- After validating transactions, The Tx Validator Service sends them (in UTXO Meta format) to the Subtree Validation Service via Kafka.
+- The Subtree Validation Service stores these UTXO Meta Data in the Tx Meta Cache.
+- At a later stage (next sections), the Subtree Validation Service will receive subtrees, composed of 1 million transactions. By having the Txs preloaded in a warmed up Tx Meta Cache, the Subtree Validation Service can quickly access the data required to validate the subtree.
 
 ![tx_validation_subtree_validation.svg](img/plantuml/validator/tx_validation_subtree_validation.svg)
 
 ### 2.2. Receiving subtrees for validation
 
-* The P2P service is responsible for receiving new subtrees from the network. When a new subtree is found, it will notify the subtree validation service via the Kafka `kafka_subtreesConfig` producer.
+- The P2P service is responsible for receiving new subtrees from the network. When a new subtree is found, it will notify the subtree validation service via the Kafka `kafka_subtreesConfig` producer.
 
-* The subtree validation service will then check if the subtree is already known. If not, it will start the validation process.
-* Before validation, the service will "lock" the subtree, to avoid concurrent (and accidental) changes of the same subtree. To do this, the service will attempt to create a "lock" file in the shared subtree storage. If this succeeds, the subtree validation will then start.
-* Once validated, we add it to the Subtree store, from where it will be retrieved later on (when a block using the subtrees gets validated).
+- The subtree validation service will then check if the subtree is already known. If not, it will start the validation process.
+- Before validation, the service will "lock" the subtree, to avoid concurrent (and accidental) changes of the same subtree. To do this, the service will attempt to create a "lock" file in the shared subtree storage. If this succeeds, the subtree validation will then start.
+- Once validated, we add it to the Subtree store, from where it will be retrieved later on (when a block using the subtrees gets validated).
 
 Receiving subtrees for validation via Kafka:
 
 ![subtree_validation_kafka_subtree_found.svg](img/plantuml/subtreevalidation/subtree_validation_kafka_subtree_found.svg)
-
 
 In addition to the P2P Service, the Block Validation service can also request for subtrees to be validated and added, together with its metadata, to the subtree store. Should the Block Validation service find, as part of the validation of a specific block, a subtree not known by the node, it can request its validation to the Subtree Validation service.
 
@@ -120,7 +121,6 @@ The detail of how the subtree is validated will be described in the next section
 In the previous section, the process of validating a subtree was described. Here, we will go into more detail about the validation process.
 
 ![subtree_validation_detail.svg](img/plantuml/subtreevalidation/subtree_validation_detail.svg)
-
 
 The validation process is as follows:
 
@@ -149,7 +149,6 @@ The locking implementation is designed to be resilient across distributed system
 
 The Subtree Validation Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen [here](../../references/protobuf_docs/subtreevalidationProto.md).
 
-
 ## 4. Data Model
 
 - [Subtree Data Model](../datamodel/subtree_data_model.md): Contain lists of transaction IDs and their Merkle root.
@@ -158,9 +157,7 @@ The Subtree Validation Service uses gRPC for communication between nodes. The pr
 
 ## 5. Technology
 
-
 1. **Go Programming Language (Golang)**.
-
 
 2. **gRPC (Google Remote Procedure Call)**:
 
@@ -185,7 +182,6 @@ The Subtree Validation Service uses gRPC for communication between nodes. The pr
 8. **Synchronization Primitives (sync)**:
 
     - Utilizes Go's `sync` package for synchronization primitives like mutexes, aiding in managing concurrent access to shared resources.
-
 
 ## 6. Directory Structure and Main Files
 
@@ -225,6 +221,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 ## 8. Configuration Settings
 
 For comprehensive configuration documentation including all settings, defaults, and interactions, see the [subtree Validation Settings Reference](../../references/settings/services/subtreeValidation_settings.md).
+
 ## 9. Other Resources
 
 - [Subtree Validation Reference](../../references/services/subtreevalidation_reference.md)
