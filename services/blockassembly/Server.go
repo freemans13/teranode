@@ -490,7 +490,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 	var subtreeBytes []byte
 
 	if subtreeBytes, err = subtree.Serialize(); err != nil {
-		return errors.NewProcessingError("[BlockAssembly:Init][%s] failed to serialize subtree", subtree.RootHash().String(), err)
+		return errors.NewProcessingError("[BlockAssembly:storeSubtree][%s] failed to serialize subtree", subtree.RootHash().String(), err)
 	}
 
 	dah := ba.blockAssembler.utxoStore.GetBlockHeight() + ba.settings.GlobalBlockHeightRetention
@@ -504,7 +504,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 				txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
 				if !found {
-					ba.logger.Errorf("[BlockAssembly:Init][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
 
 					subtreeMetaMissingTxs = true
 
@@ -512,7 +512,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 				}
 
 				if err = subtreeMeta.SetTxInpoints(idx, txInpoints); err != nil {
-					ba.logger.Errorf("[BlockAssembly:Init][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
+					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
 
 					subtreeMetaMissingTxs = true
 
@@ -524,7 +524,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 		if !subtreeMetaMissingTxs {
 			subtreeMetaBytes, err := subtreeMeta.Serialize()
 			if err != nil {
-				return errors.NewStorageError("[writeSubtree][%s] failed to serialize subtree data", subtree.RootHash().String(), err)
+				return errors.NewStorageError("[BlockAssembly:storeSubtree][%s] failed to serialize subtree data", subtree.RootHash().String(), err)
 			}
 
 			if err = ba.subtreeStore.Set(ctx,
@@ -534,9 +534,9 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 				options.WithDeleteAt(dah),
 			); err != nil {
 				if errors.Is(err, errors.ErrBlobAlreadyExists) {
-					ba.logger.Debugf("[BlockAssembly:Init][%s] subtree meta already exists", subtree.RootHash().String())
+					ba.logger.Debugf("[BlockAssembly:storeSubtree][%s] subtree meta already exists", subtree.RootHash().String())
 				} else {
-					ba.logger.Errorf("[BlockAssembly:Init][%s] failed to store subtree meta: %s", subtree.RootHash().String(), err)
+					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to store subtree meta: %s", subtree.RootHash().String(), err)
 
 					// add to retry saving the subtree
 					subtreeRetryChan <- &subtreeRetrySend{
@@ -557,9 +557,9 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 		options.WithDeleteAt(dah), // this sets the DAH for the subtree, it must be updated when a block is mined
 	); err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			ba.logger.Debugf("[BlockAssembly:Init][%s] subtree already exists", subtree.RootHash().String())
+			ba.logger.Debugf("[BlockAssembly:storeSubtree][%s] subtree already exists", subtree.RootHash().String())
 		} else {
-			ba.logger.Errorf("[BlockAssembly:Init][%s] failed to store subtree: %s", subtree.RootHash().String(), err)
+			ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to store subtree: %s", subtree.RootHash().String(), err)
 
 			// add to retry saving the subtree
 			// no need to retry the subtree meta, we have already stored that
@@ -579,7 +579,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 
 	isRunning, err := ba.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
 	if err != nil {
-		return errors.NewProcessingError("[SubtreeProcessor] failed to get current state: %s", err)
+		return errors.NewProcessingError("[BlockAssembly:storeSubtree][%s] failed to get current state", subtree.RootHash().String(), err)
 	}
 
 	// only send notification if the FSM is in the running state
@@ -597,7 +597,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 				Metadata: nil,
 			},
 		}); err != nil {
-			return errors.NewServiceError("[BlockAssembly:Init][%s] failed to send subtree notification", subtree.RootHash().String(), err)
+			return errors.NewServiceError("[BlockAssembly:storeSubtree][%s] failed to send subtree notification", subtree.RootHash().String(), err)
 		}
 	}
 
@@ -626,11 +626,6 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 		// from multiple close attempts during concurrent startup scenarios
 		closeOnce sync.Once
 
-		// grpcClosed channel receives the result of gRPC server operation
-		// This allows the main goroutine to wait for either successful startup
-		// or server termination, enabling proper error handling and cleanup
-		grpcClosed = make(chan error)
-
 		// grpcReady channel signals when the gRPC server is ready to accept requests
 		grpcReady = make(chan struct{})
 	)
@@ -639,12 +634,14 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 	// This prevents callers from waiting indefinitely for service readiness
 	defer closeOnce.Do(func() { close(readyCh) })
 
-	// Start gRPC server in a separate goroutine to avoid blocking the main thread
-	// This allows the service to handle both gRPC requests and internal operations concurrently
-	go func() {
+	// Create errgroup for coordinating goroutines
+	g, gCtx := errgroup.WithContext(ctx)
+
+	// Start gRPC server in errgroup to properly handle shutdown
+	g.Go(func() error {
 		// StartGRPCServer blocks until the server shuts down or encounters an error
 		// The server setup includes registering the BlockAssemblyAPI service
-		grpcClosed <- util.StartGRPCServer(ctx, ba.logger, ba.settings, "blockassembly", ba.settings.BlockAssembly.GRPCListenAddress, func(server *grpc.Server) {
+		return util.StartGRPCServer(gCtx, ba.logger, ba.settings, "blockassembly", ba.settings.BlockAssembly.GRPCListenAddress, func(server *grpc.Server) {
 			// Register the BlockAssembly service with the gRPC server
 			// This makes all BlockAssembly API methods available to clients
 			blockassembly_api.RegisterBlockAssemblyAPIServer(server, ba)
@@ -653,7 +650,7 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 			// This is called once the gRPC server is successfully listening
 			grpcReady <- struct{}{}
 		}, nil)
-	}()
+	})
 
 	// Start the block assembler component which handles the core block creation logic
 	// This must succeed for the service to be functional
@@ -665,17 +662,12 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 	// Signal that the service is ready to accept requests
 	closeOnce.Do(func() { close(readyCh) })
 
-	// Wait for gRPC server completion or error
-	// This blocks until either:
-	// 1. The gRPC server encounters an error and terminates
-	// 2. The context is cancelled, causing graceful shutdown
-	// 3. The server is explicitly stopped from elsewhere
-	//
-	// The function returns the error from gRPC server operation, which could be:
-	// - nil if server shut down gracefully
-	// - context cancellation error if shutdown was requested
-	// - network or configuration errors if startup failed
-	return <-grpcClosed
+	// Wait for all goroutines to complete
+	if err := g.Wait(); err != nil {
+		return errors.NewServiceError("block assembly service ended with error", err)
+	}
+
+	return nil
 }
 
 // Stop gracefully shuts down the BlockAssembly service.

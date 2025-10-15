@@ -172,6 +172,7 @@ func startProfilerAndMetrics(logger ulogger.Logger, appSettings *settings.Settin
 			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 			// fgprof support
+
 			mux.Handle("/debug/fgprof", fgprof.Handler())
 
 			if appSettings.StatsPrefix != "" {
