@@ -1422,6 +1422,7 @@ The RPC service is located in the `services/rpc` directory. The main files and d
 ## 6. Configuration Settings
 
 For comprehensive configuration documentation including all settings, defaults, and interactions, see the [rpc Settings Reference](../../references/settings/services/rpc_settings.md).
+
 ## 7. How to run
 
 To run the RPC Service locally, you can execute the following command:
