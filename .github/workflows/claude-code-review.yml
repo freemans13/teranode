@@ -79,7 +79,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Checkout PR code (for issue_comment trigger)
         if: github.event_name == 'issue_comment'
@@ -88,7 +87,6 @@ jobs:
           repository: ${{ fromJSON(steps.pr.outputs.result).repo_full_name }}
           ref: ${{ fromJSON(steps.pr.outputs.result).sha }}
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Run Claude Code Review
         id: claude-review
