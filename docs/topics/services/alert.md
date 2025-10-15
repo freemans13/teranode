@@ -12,8 +12,7 @@
 3. [Technology](#3-technology)
 4. [Directory Structure and Main Files](#4-directory-structure-and-main-files)
 5. [How to run](#5-how-to-run)
-6. [Configuration options (settings flags)](#6-configuration-options-settings-flags)
-
+6. [Configuration](#6-configuration)
 7. [Other Resources](#7-other-resources)
 
 ## 1. Description
@@ -102,6 +101,7 @@ The Alert Service initializes the necessary components and services to start pro
 1. The P2P Alert library initiates the process by calling `AddToConsensusBlacklist` with a list of funds to freeze.
 
 2. The Alert Service iterates through each fund:
+
     - It retrieves the transaction data from the UTXO Store.
     - Calculates the UTXO hash.
     - Calls the UTXO Store to freeze the UTXO.
@@ -119,16 +119,19 @@ The Alert Service initializes the necessary components and services to start pro
 1. The P2P Alert library initiates the process by calling `AddToConsensusBlacklist` with a list of funds to potentially unfreeze.
 
 2. The Alert Service iterates through each fund:
+
     - It retrieves the transaction data from the UTXO Store.
     - Calculates the UTXO hash.
     - Checks if the fund is eligible for unfreezing by comparing the EnforceAtHeight.Stop with the current block height.
 
 3. If the fund is eligible for unfreezing:
+
     - The Alert Service calls the UTXO Store to unfreeze the UTXO.
     - The UTXO Store interacts with the database to mark the UTXO as unfrozen.
     - Depending on the success of the unfreeze operation, the Alert Service adds the result to either the processed or notProcessed list.
 
 4. If the fund is not eligible for unfreezing:
+
     - The Alert Service adds it to the notProcessed list with a reason.
 
 5. Finally, the Alert Service returns a BlacklistResponse to the P2P network.

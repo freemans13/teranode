@@ -185,7 +185,7 @@ The Subtree Validation Service uses gRPC for communication between nodes. The pr
 
 ## 6. Directory Structure and Main Files
 
-```
+```text
 ./services/subtreevalidation
 ├── Client.go                               # Client-side implementation for gRPC subtree validation service interactions.
 ├── Interface.go                            # Defines interfaces related to subtree validation, facilitating abstraction and testing.
@@ -220,7 +220,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 
 ## 8. Configuration Settings
 
-For comprehensive configuration documentation including all settings, defaults, and interactions, see the [subtree Validation Settings Reference](../../references/settings/services/subtreeValidation_settings.md).
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [subtree Validation Settings Reference](../../references/settings/services/subtreevalidation_settings.md).
 
 ## 9. Other Resources
 

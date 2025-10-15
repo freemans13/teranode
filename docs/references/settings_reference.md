@@ -7,23 +7,6 @@ This document provides a complete reference for all Teranode configuration setti
 1. [Overview](#overview)
 2. [General Configuration](#general-configuration)
 3. [Services](#services)
-   - [Alert Service](#alert-service)
-   - [Asset Server](#asset-server)
-   - [Block Assembly](#block-assembly)
-   - [Blockchain](#blockchain)
-   - [Block Persister](#block-persister)
-   - [Block Validation](#block-validation)
-   - [Legacy](#legacy)
-   - [P2P](#p2p)
-   - [Propagation](#propagation)
-   - [RPC](#rpc)
-   - [Subtree Validation](#subtree-validation)
-   - [UTXO Persister](#utxo-persister)
-   - [Validator](#validator)
-4. [Stores](#stores)
-   - [UTXO Store](#utxo-store)
-   - [Blob Store](#blob-store)
-5. [Kafka](#kafka)
 
 ## Overview
 
@@ -68,8 +51,18 @@ TERANODE_<SERVICE>_<SETTING_NAME>
 
 ## Services
 
-### Alert Service
+For detailed service-specific configuration documentation, see:
 
-**Topic Reference**: [Alert Service](../topics/services/alert.md)
-
-The Alert Service implements Bitcoin SV's alert system for UTXO management and peer control.
+- **[Alert Service](settings/services/alert_settings.md)** - Bitcoin SV alert system configuration
+- **[Asset Server](settings/services/asset_settings.md)** - HTTP/WebSocket interface configuration
+- **[Block Assembly](settings/services/blockassembly_settings.md)** - Block assembly service configuration
+- **[Blockchain](settings/services/blockchain_settings.md)** - Blockchain state management configuration
+- **[Block Persister](settings/services/blockpersister_settings.md)** - Block persistence configuration
+- **[Block Validation](settings/services/blockvalidation_settings.md)** - Block validation configuration
+- **[Legacy](settings/services/legacy_settings.md)** - Legacy Bitcoin protocol compatibility configuration
+- **[P2P](settings/services/p2p_settings.md)** - Peer-to-peer networking configuration
+- **[Propagation](settings/services/propagation_settings.md)** - Transaction propagation configuration
+- **[RPC](settings/services/rpc_settings.md)** - JSON-RPC server configuration
+- **[Subtree Validation](settings/services/subtreevalidation_settings.md)** - Subtree validation configuration
+- **[UTXO Persister](settings/services/utxopersister_settings.md)** - UTXO set persistence configuration
+- **[Validator](settings/services/validator_settings.md)** - Transaction validation configuration

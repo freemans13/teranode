@@ -38,6 +38,7 @@ The Alert Service can be configured using various settings that control its beha
   - **Environment Variable**: `TERANODE_alert_topic_name`
   - **Network Dependency**: Automatically prefixed with network name if not on mainnet
   - **Network-Specific Behavior**:
+
     - **Mainnet**: Uses configured topic name as-is
     - **Testnet**: Prefixed as "bitcoin_alert_system_testnet"
     - **Regtest**: Prefixed as "bitcoin_alert_system_regtest"
@@ -63,6 +64,7 @@ The SQLite database will be stored in the `DataFolder` directory specified in th
 
 - **Parameters**: None
 - **Connection Pool Settings (hardcoded)**:
+
   - Max Idle Connections: 1
   - Max Open Connections: 1
 - **Table Prefix**: Uses the database name as prefix
@@ -75,6 +77,7 @@ sqlitememory:///database_name
 
 - **Parameters**: None
 - **Connection Pool Settings (hardcoded)**:
+
   - Max Idle Connections: 1
   - Max Open Connections: 1
 - **Storage**: In-memory only
@@ -87,8 +90,10 @@ postgres://username:password@host:port/database?param1=value1&param2=value2
 ```
 
 - **Parameters**:
+
   - `sslmode`: SSL mode for the connection (default: `disable`)
 - **Connection Pool Settings (hardcoded)**:
+
   - Max Idle Connections: 2
   - Max Open Connections: 5
   - Max Connection Idle Time: 20 seconds
@@ -103,6 +108,7 @@ mysql://username:password@host:port/database?param1=value1&param2=value2
 ```
 
 - **Parameters**:
+
   - `sslmode`: SSL mode for the connection (default: `disable`)
 - **Connection Pool Settings (hardcoded)**: Same as PostgreSQL
 - **Table Prefix**: "alert_system"

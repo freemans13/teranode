@@ -19,17 +19,6 @@
 - [6. Directory Structure and Main Files](#6-directory-structure-and-main-files)
 - [7. Locally Running the store](#7-locally-running-the-store)
 - [8. Configuration Options](#8-configuration-options)
-    - [8.1. URL Format](#81-url-format)
-    - [8.2. Store URL Settings](#82-store-url-settings)
-        - [8.2.1. Common URL Parameters](#821-common-url-parameters)
-        - [8.2.2. File Backend Parameters](#822-file-backend-parameters)
-        - [8.2.3. S3 Backend Parameters](#823-s3-backend-parameters)
-        - [8.2.4. HTTP Backend Parameters](#824-http-backend-parameters)
-    - [8.3. Store Options](#83-store-options-optionsoptions)
-    - [8.4. File Operation Options](#84-file-operation-options-functional-options)
-    - [8.5. TX Store Configuration Examples](#85-tx-store-configuration-examples)
-    - [8.6. SubTree Store Configuration Examples](#86-subtree-store-configuration-examples)
-    - [8.7. Delete-At-Height Requirements](#87-delete-at-height-requirements)
 - [9. Other Resources](#9-other-resources)
 
 ## 1. Description

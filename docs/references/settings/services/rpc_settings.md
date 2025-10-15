@@ -83,11 +83,13 @@ The default values are conservative to prevent resource exhaustion in default co
 The timeout settings interact with service dependencies and operation complexity:
 
 - **`rpc_timeout`** should be set higher than the longest expected operation:
+
   - Mining operations: 30-60s recommended
   - Large block retrievals: 20-30s recommended
   - Simple queries: 10-15s sufficient
 
 - **`rpc_client_call_timeout`** should be short enough to fail fast:
+
   - Network operations: 5-10s recommended
   - Local service calls: 3-5s recommended
   - Critical paths: Keep as low as practical

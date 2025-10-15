@@ -586,7 +586,7 @@ export TERANODE_SERVER_CERTFILE=/path/to/cert.pem
 
 ### 7.3 Configuration Examples
 
-For comprehensive configuration documentation including all settings, defaults, and interactions, see the [asset Server Settings Reference](../../references/settings/services/assetServer_settings.md).
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [asset Server Settings Reference](../../references/settings/services/asset_settings.md).
 ### 7.4 FSM Configuration
 
 - **fsm_state_restore**: Enables or disables the restore state for the Finite State Machine.

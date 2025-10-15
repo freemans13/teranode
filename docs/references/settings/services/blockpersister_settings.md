@@ -11,9 +11,9 @@ The Block Persister service configuration is organized into several categories t
 - **State File (`blockpersister_stateFile`)**
   - Type: `string`
   - Default Value: `"file://./data/blockpersister_state.txt"`
-  - Purpose: Maintains the persister's processing state (last persisted block height and hash)
+    - Purpose: Maintains the persister's processing state (last persisted block height and hash)
   - Format: Supports both local file paths (`file://./path`) and remote storage URLs
-  - Impact: Critical for recovery after service restart and maintaining processing continuity
+    - Impact: Critical for recovery after service restart and maintaining processing continuity
   - Recovery Implications: If this file is lost, the service will need to reprocess blocks from the beginning
 
 ### Block Storage
@@ -21,17 +21,18 @@ The Block Persister service configuration is organized into several categories t
 - **Block Store URL (`blockPersisterStore`)**
   - Type: `*url.URL`
   - Default Value: `"file://./data/blockstore"`
-  - Purpose: Defines where block data files are stored
+    - Purpose: Defines where block data files are stored
   - Supported Formats:
+
     - S3: `s3://bucket-name/prefix`
     - Local filesystem: `file://./path/to/dir`
-  - Impact: Determines the persistence mechanism and reliability characteristics
+    - Impact: Determines the persistence mechanism and reliability characteristics
 
 - **HTTP Listen Address (`blockPersister_httpListenAddress`)**
   - Type: `string`
   - Default Value: `":8083"`
-  - Purpose: Controls the network interface and port for the HTTP server that serves block data
-  - Usage: If empty, no HTTP server is started; when configured, enables external access to blob store
+    - Purpose: Controls the network interface and port for the HTTP server that serves block data
+    - Usage: If empty, no HTTP server is started; when configured, enables external access to blob store
   - Security Consideration: In production environments, should be configured based on network security requirements
 
 ## Processing Configuration
@@ -41,19 +42,21 @@ The Block Persister service configuration is organized into several categories t
 - **Persist Age (`BlockPersisterPersistAge`)**
   - Type: `uint32`
   - Default Value: Not specified in settings (varies by configuration)
-  - Purpose: Determines how many blocks behind the tip the persister stays
-  - Impact: Critical for avoiding reorgs by ensuring blocks are sufficiently confirmed
-  - Example: If set to 100, only blocks that are at least 100 blocks deep are processed
+    - Purpose: Determines how many blocks behind the tip the persister stays
+    - Impact: Critical for avoiding reorgs by ensuring blocks are sufficiently confirmed
+    - Example: If set to 100, only blocks that are at least 100 blocks deep are processed
   - Tuning Advice:
+
     - Lower values: More immediate processing but higher risk of reprocessing due to reorgs
     - Higher values: More conservative approach with minimal reorg risk
 
 - **Persist Sleep (`BlockPersisterPersistSleep`)**
   - Type: `time.Duration`
   - Default Value: Not specified in settings (varies by configuration)
-  - Purpose: Sleep duration between polling attempts when no blocks are available to process
-  - Impact: Controls polling frequency and system load during idle periods
+    - Purpose: Sleep duration between polling attempts when no blocks are available to process
+    - Impact: Controls polling frequency and system load during idle periods
   - Tuning Advice:
+
     - Shorter durations: More responsive but higher CPU usage
     - Longer durations: More resource-efficient but less responsive
 
@@ -62,9 +65,10 @@ The Block Persister service configuration is organized into several categories t
 - **Processing Concurrency (`blockpersister_concurrency`)**
   - Type: `int`
   - Default Value: `8`
-  - Purpose: Controls the number of concurrent goroutines for processing subtrees
-  - Impact: Directly affects CPU utilization, memory usage, and throughput
+    - Purpose: Controls the number of concurrent goroutines for processing subtrees
+    - Impact: Directly affects CPU utilization, memory usage, and throughput
   - Tuning Advice:
+
     - Optimal value typically depends on available CPU cores
     - For systems with 8+ cores, the default value is usually appropriate
     - For high-performance systems, consider increasing to match available cores
@@ -72,15 +76,15 @@ The Block Persister service configuration is organized into several categories t
 - **Batch Missing Transactions (`blockpersister_batchMissingTransactions`)**
   - Type: `bool`
   - Default Value: `true`
-  - Purpose: Controls whether transactions are fetched in batches from the store
-  - Impact: Can significantly improve performance by reducing the number of individual queries
+    - Purpose: Controls whether transactions are fetched in batches from the store
+    - Impact: Can significantly improve performance by reducing the number of individual queries
   - Tuning Advice: Generally should be kept enabled unless encountering specific issues
 
 - **Process TxMeta Using Store Batch Size (`blockvalidation_processTxMetaUsingStore_BatchSize`)**
   - Type: `int`
   - Default Value: `1024`
-  - Purpose: Controls the batch size when processing transaction metadata from the store
-  - Impact: Affects performance and memory usage when fetching transaction data
+    - Purpose: Controls the batch size when processing transaction metadata from the store
+    - Impact: Affects performance and memory usage when fetching transaction data
   - Tuning Advice: Higher values improve throughput at the cost of increased memory usage
 
 ### UTXO Management
@@ -88,9 +92,10 @@ The Block Persister service configuration is organized into several categories t
 - **Skip UTXO Delete (`SkipUTXODelete`)**
   - Type: `bool`
   - Default Value: `false`
-  - Purpose: Controls whether UTXO deletions are skipped during processing
-  - Impact: When enabled, improves performance but affects UTXO set completeness
+    - Purpose: Controls whether UTXO deletions are skipped during processing
+    - Impact: When enabled, improves performance but affects UTXO set completeness
   - Usage Scenarios:
+
     - Enable during initial sync or recovery to improve performance
     - Disable for normal operation to maintain complete UTXO tracking
 
@@ -101,6 +106,7 @@ The Block Persister service configuration is organized into several categories t
 The Block Persister supports multiple storage backends through the `blockPersisterStore` URL:
 
 **Local Filesystem:**
+
 ```text
 file://./path/to/directory
 ```
@@ -110,6 +116,7 @@ file://./path/to/directory
 - Limitations: Not suitable for distributed deployments
 
 **S3-Compatible Storage:**
+
 ```text
 s3://bucket-name/prefix
 ```

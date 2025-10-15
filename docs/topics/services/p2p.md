@@ -2,11 +2,9 @@
 
 ## Index
 
-- [🌐 P2P Service](#-p2p-service)
-    - [Index](#index)
-    - [1. Description](#1-description)
-    - [2. Functionality](#2-functionality)
-        - [2.1. Creating, initializing and starting a new P2P Server](#21-creating-initializing-and-starting-a-new-p2p-server)
+1. [Description](#1-description)
+2. [Functionality](#2-functionality)
+    - [2.1. Creating, initializing and starting a new P2P Server](#21-creating-initializing-and-starting-a-new-p2p-server)
     - [2.1.1. Creating a New P2P Server](#211-creating-a-new-p2p-server)
     - [2.1.2. Initializing the P2P Server](#212-initializing-the-p2p-server)
     - [2.1.3. Starting the P2P Server](#213-starting-the-p2p-server)
@@ -20,24 +18,12 @@
         - [2.7.2. Ban Operations](#272-ban-operations)
         - [2.7.3. Ban Event Handling](#273-ban-event-handling)
         - [2.7.4. Configuration](#274-configuration)
-    - [3. Technology](#3-technology)
-    - [4. Data Model](#4-data-model)
-    - [5. Directory Structure and Main Files](#5-directory-structure-and-main-files)
-    - [6. How to run](#6-how-to-run)
-
-    - [7. Configuration options (settings flags)](#7-configuration-options-settings-flags)
-        - [Network and Discovery Settings](#network-and-discovery-settings)
-        - [Service Endpoints](#service-endpoints)
-        - [Peer-to-Peer Topics](#peer-to-peer-topics)
-        - [Authentication and Security](#authentication-and-security)
-        - [Ban Management](#ban-management)
-    - [Configuration Validation Rules](#configuration-validation-rules)
-    - [Configuration Dependencies](#configuration-dependencies)
-    - [Configuration Interactions and Dependencies](#configuration-interactions-and-dependencies)
-        - [Network Binding and Discovery](#network-binding-and-discovery)
-        - [Peer Discovery and Connection](#peer-discovery-and-connection)
-        - [Security and Authentication](#security-and-authentication)
-    - [8. Other Resources](#8-other-resources)
+3. [Technology](#3-technology)
+4. [Data Model](#4-data-model)
+5. [Directory Structure and Main Files](#5-directory-structure-and-main-files)
+6. [How to run](#6-how-to-run)
+7. [Configuration options (settings flags)](#7-configuration-options-settings-flags)
+8. [Other Resources](#8-other-resources)
 
 ## 1. Description
 
@@ -317,17 +303,17 @@ All notifications collected from the Block and Validator listeners are sent over
 
 - WebSocket Request Handling:
 
-    - An HTTP request is upgraded to a WebSocket connection. A new client channel is associated to this Websocket client.
-    - Data is sent over the WebSocket, using its dedicated client channel.
-    - If there's an error in sending data, the channel is removed from the `clientChannels`.
+  - An HTTP request is upgraded to a WebSocket connection. A new client channel is associated to this Websocket client.
+  - Data is sent over the WebSocket, using its dedicated client channel.
+  - If there's an error in sending data, the channel is removed from the `clientChannels`.
 
 - The server listens for various types of events in a concurrent process:
 
-    - The server tracks all active client channels (`clientChannels`).
-    - When a new client connects, it is added to the `clientChannels`.
-    - If a client disconnects, it is removed from `clientChannels`.
-    - Periodically, we ping all connected clients. Any error would have the client removed from the list of clients.
-    - When a notification is received (from the block validation or transaction listeners described in the previous sections), it is sent to all connected clients.
+  - The server tracks all active client channels (`clientChannels`).
+  - When a new client connects, it is added to the `clientChannels`.
+  - If a client disconnects, it is removed from `clientChannels`.
+  - Periodically, we ping all connected clients. Any error would have the client removed from the list of clients.
+  - When a notification is received (from the block validation or transaction listeners described in the previous sections), it is sent to all connected clients.
 
 As a sequence:
 
@@ -508,6 +494,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 ## 7. Configuration options (settings flags)
 
 For comprehensive configuration documentation including all settings, defaults, and interactions, see the [p2p Settings Reference](../../references/settings/services/p2p_settings.md).
+
 ## 8. Other Resources
 
 [P2P Reference](../../references/services/p2p_reference.md)

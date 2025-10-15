@@ -101,8 +101,9 @@ When the Transaction Validator Service identifies an invalid transaction, it emp
 2. **Identification of Invalid Transactions**: If the transaction fails any of the validation checks, it is deemed invalid (rejected)
 3. **Notification of Rejected Transactions**: When a transaction is rejected, the Validator publishes information about the rejected transaction to a dedicated Kafka topic (`rejectedTx`)
 4. **Kafka Message Content**: The Kafka message for a rejected transaction typically includes:
-   - The transaction ID (hash)
-   - The reason for rejection (error message)
+
+    - The transaction ID (hash)
+    - The reason for rejection (error message)
 5. **Consumption of Rejected Transaction Notifications**: Other services in the system, such as the P2P Service, can subscribe to this Kafka topic
 
 ## Two-Phase Transaction Commit Process

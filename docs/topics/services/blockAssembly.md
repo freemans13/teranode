@@ -26,16 +26,6 @@
 7. [Directory Structure and Main Files](#7-directory-structure-and-main-files)
 8. [How to run](#8-how-to-run)
 9. [Configuration options (settings flags)](#9-configuration-options-settings-flags)
-    - [Network and Communication Settings](#network-and-communication-settings)
-    - [gRPC Client Settings](#grpc-client-settings)
-    - [Buffer Management and Memory Settings](#buffer-management-and-memory-settings)
-    - [Subtree Size Management](#subtree-size-management)
-    - [Concurrency and Performance Settings](#concurrency-and-performance-settings)
-    - [Double-Spend Detection and Security](#double-spend-detection-and-security)
-    - [Block Assembly Reset and Recovery](#block-assembly-reset-and-recovery)
-    - [Blockchain Reorganization Settings](#blockchain-reorganization-settings)
-    - [Mining Configuration](#mining-configuration)
-    - [Service Control](#service-control)
 10. [Other Resources](#10-other-resources)
 
 ## 1. Description
@@ -317,16 +307,19 @@ The Block Assembly service implements real-time fork detection through the follo
 **Fork Detection Criteria**: The Block Assembly service uses three main criteria to detect and handle forks:
 
 1. **Chain Height Tracking**:
+
     - Maintains current blockchain height through `bestBlockHeight`
     - Compares incoming block heights with current chain tip
     - Used to determine if incoming blocks represent a longer chain
 
 2. **Block Hash Verification**:
+
     - Uses `HashPrevBlock` to verify block connectivity
     - Ensures each block properly references its predecessor
     - Helps identify where chains diverge
 
 3. **Reorganization Size Protection**:
+
     - Monitors the size of potential chain reorganizations
     - If a reorganization would require moving more than 5 blocks either backwards or forwards
     - AND the current chain height is greater than 1000 blocks
@@ -557,7 +550,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 
 ## 9. Configuration options (settings flags)
 
-For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Assembly Settings Reference](../../references/settings/services/blockAssembly_settings.md).
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Assembly Settings Reference](../../references/settings/services/blockassembly_settings.md).
 
 ## 10. Other Resources
 

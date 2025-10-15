@@ -20,10 +20,7 @@
 5. [Technology](#5-technology)
 6. [Directory Structure and Main Files](#6-directory-structure-and-main-files)
 7. [How to run](#7-how-to-run)
-8. [Configuration options (settings flags)](#8-configuration-options-settings-flags)
-    - [Operational Settings](#operational-settings)
-    - [Mining and Difficulty Settings](#mining-and-difficulty-settings)
-    - [FSM Settings](#fsm-settings)
+8. [Configuration](#8-configuration)
 9. [Additional Technical Details](#9-additional-technical-details)
     - [9.1. Complete gRPC Method Coverage](#91-complete-grpc-method-coverage)
     - [9.2. Finite State Machine Implementation](#92-finite-state-machine-implementation)
@@ -152,7 +149,7 @@ There are 2 clients invoking this endpoint:
     - The `Asset Server` service calls the `GetBlock` method on the `Blockchain Service` to retrieve a block from the blockchain.
 
 - **The `Block Assembly` service:**
-    - The `Block Assembly` service calls the `GetBlock` method on the `Blockchain Service` to retrieve a block from the blockchain.
+  - The `Block Assembly` service calls the `GetBlock` method on the `Blockchain Service` to retrieve a block from the blockchain.
 
 ### 2.5. Getting the last N blocks from the blockchain
 
@@ -258,6 +255,7 @@ Each of these methods serves a specific need:
 - `GetBlockHeaderIDs` provides a lighter way to retrieve just the IDs of a range of block headers without the additional metadata.
 
 Multiple services make use of these endpoints, including the `Block Assembly`, `Block Validation`, and `Asset Server` services.
+
 ### 2.9. Invalidating a Block
 
 ![blockchain_invalidate_block.svg](img/plantuml/blockchain/blockchain_invalidate_block.svg)
@@ -310,6 +308,7 @@ For further detail, we show here the sequence for the `SetBlockSubtreesSet` call
 ## 3. gRPC Protobuf Definitions
 
 The Blockchain Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen [here](../../references/protobuf_docs/blockchainProto.md).
+
 ## 4. Data Model
 
 The Blockchain works with the [Block Data Model](../datamodel/block_data_model.md).
@@ -339,7 +338,9 @@ The blockchain database stores the block header, coinbase TX, and block merkle r
 | inserted_at    | TIMESTAMPTZ       | NOT NULL DEFAULT CURRENT_TIMESTAMP   | Timestamp of when the block was inserted in the database. |
 
 The table structure is designed to store comprehensive information about each block in the blockchain, including its relationships with other blocks, its contents, and metadata.
+
 ## 5. Technology
+
 1. **PostgreSQL Database:**
     - The primary store technology for the blockchain service.
     - Used for persisting blockchain data such as blocks, block headers, and state information.
@@ -362,6 +363,7 @@ The table structure is designed to store comprehensive information about each bl
 6. **Prometheus for Metrics:**
     - Client in `metrics.go`.
     - Used for monitoring the performance and health of the service.
+
 ## 6. Directory Structure and Main Files
 
 The Blockchain service is located in the `./services/blockchain` directory. The following is the directory structure of the service:
@@ -469,6 +471,7 @@ SETTINGS_CONTEXT=dev.[YOUR_USERNAME] go run -Blockchain=1
 ```
 
 Please refer to the [Locally Running Services Documentation](../../howto/locallyRunningServices.md) document for more information on running the Blockchain Service locally.
+
 ## 8. Configuration
 
 For comprehensive configuration documentation including all settings, defaults, and interactions, see the [Blockchain Settings Reference](../../references/settings/services/blockchain_settings.md).
@@ -480,6 +483,7 @@ For comprehensive configuration documentation including all settings, defaults, 
 In addition to the core methods described in the Functionality section, the Blockchain Service provides the following API endpoints:
 
 #### FSM Management Methods
+
 - **SendFSMEvent**: Sends an event to the blockchain FSM to trigger state transitions.
 - **GetFSMCurrentState**: Retrieves the current state of the FSM.
 - **WaitFSMToTransitionToGivenState**: Waits for FSM to reach a specific state.
@@ -487,10 +491,12 @@ In addition to the core methods described in the Functionality section, the Bloc
 - **Run, CatchUpBlocks, LegacySync, Idle**: Transitions the service to specific operational modes.
 
 #### State Management
+
 - **GetState**: Retrieves a value from the blockchain state storage by its key.
 - **SetState**: Stores a value in the blockchain state storage with the specified key.
 
 #### Block Mining Status Methods
+
 - **GetBlockIsMined**: Checks if a block has been marked as mined.
 - **SetBlockMinedSet**: Marks a block as mined in the blockchain.
 - **GetBlocksMinedNotSet**: Retrieves blocks that haven't been marked as mined.
@@ -498,6 +504,7 @@ In addition to the core methods described in the Functionality section, the Bloc
 - **GetBlocksSubtreesNotSet**: Retrieves blocks whose subtrees haven't been set.
 
 #### Legacy Synchronization Methods
+
 - **GetBlockLocator**: Creates block locators for chain synchronization.
 - **LocateBlockHeaders**: Finds block headers using a locator.
 - **GetBestHeightAndTime**: Retrieves the current best height and median time.

@@ -55,13 +55,16 @@ At least one ingestion path must be configured for the service to be functional.
 The Propagation service interacts with the Validator service using one of two architectural patterns:
 
 - **Local Validator Mode** (`useLocalValidator=true`):
+
   - Validator runs in-process with the Propagation service
   - Eliminates network overhead for validation operations
   - Recommended for production deployments to minimize latency
 
 - **Remote Validator Mode** (`useLocalValidator=false`):
+
   - Propagation service communicates with a separate Validator service
   - **Transaction Size-Based Routing**: Transactions are automatically routed based on size:
+
     - Normal transactions (≤ `validator_kafka_maxMessageBytes`): Sent via Kafka for async validation
     - Large transactions (> `validator_kafka_maxMessageBytes`): Automatically sent via HTTP to `validator_httpAddress`
   - **Transport Override**: `propagation_alwaysUseHTTP=true` forces all transactions to use HTTP regardless of size

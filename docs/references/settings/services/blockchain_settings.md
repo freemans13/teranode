@@ -9,20 +9,20 @@ The Blockchain service configuration is organized into several categories to man
 - **GRPC Address (`blockchain_grpcAddress`)**: Specifies the address for other services to connect to the Blockchain service's gRPC API. This is how other services will address the blockchain service.
   - Type: string
   - Default Value: `localhost:8087`
-  - Impact: Critical for service discovery and inter-service communication
-  - Security Impact: In production environments, should be configured securely based on network architecture
+    - Impact: Critical for service discovery and inter-service communication
+    - Security Impact: In production environments, should be configured securely based on network architecture
 
 - **GRPC Listen Address (`blockchain_grpcListenAddress`)**: Specifies the network interface and port the Blockchain service's gRPC server binds to for accepting connections.
   - Type: string
   - Default Value: `:8087`
-  - Impact: Controls network interface binding for accepting gRPC connections
-  - Security Impact: Binding to `0.0.0.0` or empty address (`:8087`) exposes the port on all network interfaces
+    - Impact: Controls network interface binding for accepting gRPC connections
+    - Security Impact: Binding to `0.0.0.0` or empty address (`:8087`) exposes the port on all network interfaces
 
 - **HTTP Listen Address (`blockchain_httpListenAddress`)**: Specifies the network interface and port for the HTTP server that exposes REST endpoints (primarily for block invalidation/revalidation).
   - Type: string
   - Default Value: `:8082`
-  - Impact: Controls network interface binding for HTTP API access
-  - Security Impact: Should be configured based on who needs access to these endpoints
+    - Impact: Controls network interface binding for HTTP API access
+    - Security Impact: Should be configured based on who needs access to these endpoints
 
 ## Data Storage Configuration
 
@@ -30,15 +30,16 @@ The Blockchain service configuration is organized into several categories to man
   - Type: URL
   - Default Value: `sqlite:///blockchain`
   - Supported Formats:
+
     - SQLite: `sqlite:///path/to/db`
     - PostgreSQL: `postgres://user:password@host:port/dbname`
-  - Impact: Stores block data and service state
-  - Performance Impact: Choice of database affects scalability and performance
+    - Impact: Stores block data and service state
+    - Performance Impact: Choice of database affects scalability and performance
 
 - **DB Timeout (`blockchain_store_dbTimeoutMillis`)**: The timeout in milliseconds for database operations.
   - Type: integer
   - Default Value: `5000` (5 seconds)
-  - Impact: Not currently implemented
+    - Impact: Not currently implemented
 
 ## State Machine Configuration
 
@@ -46,21 +47,22 @@ The Blockchain service configuration is organized into several categories to man
   - Type: string
   - Default Value: `""` (empty, uses default FSM state)
   - Possible Values:
+
     - `"IDLE"`: Initial inactive state
     - `"RUNNING"`: Normal operating state
     - `"LEGACY_SYNC"`: Legacy synchronization mode
     - `"CATCHUP_BLOCKS"`: Block catch-up mode
-  - Impact: Not currently implemented
+    - Impact: Not currently implemented
 
 - **FSM State Restore (`fsm_state_restore`)**: Controls whether the service restores its previous FSM state from storage on startup.
   - Type: boolean
   - Default Value: `false`
-  - Impact: Not currently implemented
+    - Impact: Not currently implemented
 
 - **FSM State Change Delay (`fsm_state_change_delay`)**: FOR TESTING ONLY - introduces an artificial delay when changing FSM states.
   - Type: integer (milliseconds)
   - Default Value: `0`
-  - Impact: Used only in tests for state transition synchronization
+    - Impact: Used only in tests for state transition synchronization
   - Warning: Should not be used in production environments
 
 ## Operational Settings
@@ -68,12 +70,12 @@ The Blockchain service configuration is organized into several categories to man
 - **Maximum Retries (`blockchain_maxRetries`)**: Maximum number of retry attempts for blockchain operations that encounter transient errors.
   - Type: integer
   - Default Value: `3`
-  - Impact: Not currently implemented
+    - Impact: Not currently implemented
 
 - **Retry Sleep Duration (`blockchain_retrySleep`)**: The wait time in milliseconds between retry attempts, implementing a back-off mechanism.
   - Type: integer
   - Default Value: `1000` (1 second)
-  - Impact: Not currently implemented
+    - Impact: Not currently implemented
   - Tuning Advice: Adjust based on the nature of expected failures (shorter for quick-recovery scenarios)
 
 ## Mining and Difficulty Settings
@@ -81,7 +83,7 @@ The Blockchain service configuration is organized into several categories to man
 - **Difficulty Cache (`blockassembly_difficultyCache`)**: Enables difficulty calculation caching for performance optimization.
   - Type: boolean
   - Default Value: `true`
-  - Impact: Improves performance when enabled
+    - Impact: Improves performance when enabled
 
 ## Configuration Interactions and Dependencies
 

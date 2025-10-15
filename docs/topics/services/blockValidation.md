@@ -335,7 +335,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 
 ## 8. Configuration options (settings flags)
 
-For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Validation Settings Reference](../../references/settings/services/blockValidation_settings.md).
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Validation Settings Reference](../../references/settings/services/blockvalidation_settings.md).
 
 ## 9. Other Resources
 

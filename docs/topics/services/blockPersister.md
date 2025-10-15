@@ -232,7 +232,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 
 ## 7. Configuration options (settings flags)
 
-For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Persister Settings Reference](../../references/settings/services/blockPersister_settings.md).
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Persister Settings Reference](../../references/settings/services/blockpersister_settings.md).
 ## 8. Other Resources
 
 [Block Persister Reference](../../references/services/blockpersister_reference.md)
