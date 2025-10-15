@@ -68,10 +68,13 @@ func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, erro
 	policy.MaxRetries = 1
 	policy.IncludeBinData = true
 
+	store.logger.Infof("[newUnminedTxIterator] Starting Aerospike query for unmined transactions (fullScan=%t)", fullScan)
 	recordset, err := store.client.Query(policy, stmt)
 	if err != nil {
+		store.logger.Errorf("[newUnminedTxIterator] Aerospike query failed: %v", err)
 		return nil, err
 	}
+	store.logger.Infof("[newUnminedTxIterator] Aerospike query completed successfully")
 
 	it.recordset = recordset
 	it.result = recordset.Results()

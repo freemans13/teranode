@@ -1451,10 +1451,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		bestBlockHeaderIDsMap[id] = true
 	}
 
+	b.logger.Infof("[loadUnminedTransactions] requesting unmined tx iterator from UTXO store (fullScan=%t)", fullScan)
 	it, err := b.utxoStore.GetUnminedTxIterator(fullScan)
 	if err != nil {
 		return errors.NewProcessingError("error getting unmined tx iterator", err)
 	}
+	b.logger.Infof("[loadUnminedTransactions] successfully created unmined tx iterator, starting to process transactions")
 
 	unminedTransactions := make([]*utxo.UnminedTransaction, 0, 1024*1024) // preallocate a large slice to avoid reallocations
 	lockedTransactions := make([]chainhash.Hash, 0, 1024)
