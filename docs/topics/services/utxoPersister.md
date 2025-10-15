@@ -64,6 +64,10 @@ The service interacts with the storage system to read and write necessary files 
 ![UTXO_Persister_Service_Component_Diagram.png](img/UTXO_Persister_Service_Component_Diagram.png)
 
 
+The following diagram provides a deeper level of detail into the UTXO Persister Service's internal components and their interactions:
+
+![utxo_persister_detailed_component.svg](img/plantuml/utxopersister/utxo_persister_detailed_component.svg)
+
 ## 2. Functionality
 
 ### 2.1 Service Initialization
