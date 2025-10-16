@@ -8,11 +8,6 @@ x-teranode-base: &teranode-base
   volumes:
     - ../data/test/${TEST_ID:-chainintegrity}:/app/data
 
-x-teranode-commands-base: &teranode-commands-base
-  image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode-commands:latest
-  networks:
-    - teranode-network
-
 x-teranode-coinbase-base: &teranode-coinbase-base
   image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode-coinbase:latest
   networks:
@@ -51,7 +46,7 @@ services:
       - ../data/postgres:/var/lib/postgresql/data
     restart: on-failure
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -140,7 +135,26 @@ services:
       - aerospike-1
       - postgres
       - kafka-shared
-    entrypoint: [ "/app/wait.sh", "aerospike-1", "3100", "2", "--", "/app/wait.sh", "postgres", "5432", "0", "--", "/app/wait.sh", "kafka-shared", "9092", "0", "--", "/app/teranode.run", "-localTestStartFromState=RUNNING" ]
+    entrypoint:
+      [
+        "/app/wait.sh",
+        "aerospike-1",
+        "3100",
+        "2",
+        "--",
+        "/app/wait.sh",
+        "postgres",
+        "5432",
+        "0",
+        "--",
+        "/app/wait.sh",
+        "kafka-shared",
+        "9092",
+        "0",
+        "--",
+        "/app/teranode.run",
+        "-localTestStartFromState=RUNNING",
+      ]
     environment:
       SETTINGS_CONTEXT: ${SETTINGS_CONTEXT_1:-docker.teranode1.test}
       logLevel: "DEBUG"
@@ -176,7 +190,26 @@ services:
       - aerospike-2
       - postgres
       - kafka-shared
-    entrypoint: [ "/app/wait.sh", "aerospike-2", "3200", "2", "--", "/app/wait.sh", "postgres", "5432", "0", "--", "/app/wait.sh", "kafka-shared", "9092", "0", "--", "/app/teranode.run", "-localTestStartFromState=RUNNING" ]
+    entrypoint:
+      [
+        "/app/wait.sh",
+        "aerospike-2",
+        "3200",
+        "2",
+        "--",
+        "/app/wait.sh",
+        "postgres",
+        "5432",
+        "0",
+        "--",
+        "/app/wait.sh",
+        "kafka-shared",
+        "9092",
+        "0",
+        "--",
+        "/app/teranode.run",
+        "-localTestStartFromState=RUNNING",
+      ]
     environment:
       SETTINGS_CONTEXT: ${SETTINGS_CONTEXT_2:-docker.teranode2.test}
       logLevel: "DEBUG"
@@ -212,7 +245,26 @@ services:
       - aerospike-3
       - postgres
       - kafka-shared
-    entrypoint: [ "/app/wait.sh", "aerospike-3", "3300", "2", "--", "/app/wait.sh", "postgres", "5432", "0", "--", "/app/wait.sh", "kafka-shared", "9092", "0", "--", "/app/teranode.run", "-localTestStartFromState=RUNNING" ]
+    entrypoint:
+      [
+        "/app/wait.sh",
+        "aerospike-3",
+        "3300",
+        "2",
+        "--",
+        "/app/wait.sh",
+        "postgres",
+        "5432",
+        "0",
+        "--",
+        "/app/wait.sh",
+        "kafka-shared",
+        "9092",
+        "0",
+        "--",
+        "/app/teranode.run",
+        "-localTestStartFromState=RUNNING",
+      ]
     environment:
       SETTINGS_CONTEXT: ${SETTINGS_CONTEXT_3:-docker.teranode3.test}
       logLevel: "DEBUG"
@@ -250,7 +302,15 @@ services:
       - teranode-network
     volumes:
       - ./scripts/generate-blocks.sh:/generate-blocks.sh
-    entrypoint: ["/generate-blocks.sh", "--host", "teranode1", "--generate", "--numBlocks", "20"]
+    entrypoint:
+      [
+        "/generate-blocks.sh",
+        "--host",
+        "teranode1",
+        "--generate",
+        "--numBlocks",
+        "20",
+      ]
     restart: no
 
   coinbase1:
@@ -258,12 +318,13 @@ services:
     container_name: coinbase1-chainintegrity-${TEST_ID:-default}
     depends_on:
       - teranode1
-    entrypoint: [ "sh", "-c", "sleep 5 && ./coinbase.run -all=0 -coinbase=1 -faucet=1" ]
+    entrypoint:
+      ["sh", "-c", "sleep 5 && ./coinbase.run -all=0 -coinbase=1 -faucet=1"]
     environment:
       SETTINGS_CONTEXT: ${SETTINGS_CONTEXT_1:-docker.teranode1.test}.coinbase
       profilerAddr: "localhost:17092"
     volumes:
-      - ../settings.conf:/app/settings.conf 
+      - ../settings.conf:/app/settings.conf
       - ../settings_local.conf:/app/settings_local.conf
       - ../data/test/${TEST_ID:-chainintegrity}/coinbase1:/app/data
 
@@ -278,8 +339,16 @@ services:
       startCoinbase: "false"
       startFaucet: "false"
     entrypoint: ["./blaster.run"]
-    command: ["-workers=1", "-print=0", "-profile=:7092", "-log=0", "-limit=100", "-iterations=200"]
+    command:
+      [
+        "-workers=1",
+        "-print=0",
+        "-profile=:7092",
+        "-log=0",
+        "-limit=100",
+        "-iterations=200",
+      ]
     volumes:
       - ../settings.conf:/app/settings.conf
       - ../settings_local.conf:/app/settings_local.conf
-      - ../data/test/${TEST_ID:-chainintegrity}/txblaster1:/app/data 
+      - ../data/test/${TEST_ID:-chainintegrity}/txblaster1:/app/data

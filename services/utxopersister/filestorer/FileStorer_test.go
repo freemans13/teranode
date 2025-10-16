@@ -290,16 +290,28 @@ func TestWrite_WithReaderError(t *testing.T) {
 	fs, err := NewFileStorer(ctx, logger, tSettings, mockStore, key, fileType)
 	require.NoError(t, err)
 
-	// Write should succeed initially
+	// First write may succeed or fail depending on race conditions with the background goroutine
+	// On fast systems (CI), the error may be set before the first write
+	// On slow systems, the error may be set after the first write
 	testData := []byte("test data")
-	n, _ := fs.Write(testData)
-	assert.Equal(t, len(testData), n)
+	n, writeErr := fs.Write(testData)
 
-	// Wait for background error to be set
+	// Either the write succeeded (n == len(testData)) or it failed with the reader error (n == 0)
+	// Both are valid outcomes due to the race between write and background error
+	if writeErr == nil {
+		assert.Equal(t, len(testData), n, "If write succeeds, it should write all bytes")
+	} else {
+		assert.Equal(t, 0, n, "If write fails, it should write 0 bytes")
+		assert.True(t, errors.Is(writeErr, expectedError), "Write error should be the reader error")
+	}
+
+	// Wait for background error to be set (if not already set)
 	time.Sleep(100 * time.Millisecond)
 
-	// Subsequent write should return the reader error
-	_, _ = fs.Write([]byte("more data"))
+	// Subsequent write should definitely return the reader error now
+	n2, err2 := fs.Write([]byte("more data"))
+	assert.Equal(t, 0, n2, "Subsequent write should return 0 bytes")
+	assert.True(t, errors.Is(err2, expectedError), "Subsequent write should return the reader error")
 
 	// Clean up
 	fs.Close(ctx)

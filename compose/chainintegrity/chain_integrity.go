@@ -268,16 +268,12 @@ func fetchBlockHeaders(nodeContext string, debug bool, logfile string) ([]*model
 
 	ctx := context.Background()
 
-	var bestBlockHeader *model.BlockHeader
-
-	bestBlockHeader, _, err = blockchainDB.GetBestBlockHeader(ctx)
+	blockAtTestHeight, err := blockchainDB.GetBlockByHeight(ctx, 120)
 	if err != nil {
 		return nil, err
 	}
 
-	var blockHeaders []*model.BlockHeader
-
-	blockHeaders, _, err = blockchainDB.GetBlockHeaders(ctx, bestBlockHeader.Hash(), 100000)
+	blockHeaders, _, err := blockchainDB.GetBlockHeaders(ctx, blockAtTestHeight.Hash(), 100000)
 	if err != nil {
 		return nil, err
 	}

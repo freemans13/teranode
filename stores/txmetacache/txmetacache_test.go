@@ -272,7 +272,8 @@ func Test_txMetaCache_HeightEncoding(t *testing.T) {
 
 	t.Run("test height-based cache invalidation", func(t *testing.T) {
 		ctx := context.Background()
-		c, _ := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
+		tSettings := test.CreateBaseTestSettings(t)
+		c, _ := NewTxMetaCache(ctx, tSettings, ulogger.TestLogger{}, utxoStore, Unallocated)
 		cache := c.(*TxMetaCache)
 
 		// Set initial block height
@@ -303,7 +304,8 @@ func Test_txMetaCache_HeightEncoding(t *testing.T) {
 
 	t.Run("test multiple transactions with different heights", func(t *testing.T) {
 		ctx := context.Background()
-		c, err := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
+		tSettings := test.CreateBaseTestSettings(t)
+		c, err := NewTxMetaCache(ctx, tSettings, ulogger.TestLogger{}, utxoStore, Unallocated)
 		require.NoError(t, err)
 
 		cache := c.(*TxMetaCache)
@@ -407,10 +409,11 @@ func Test_txMetaCache_GetFunctions(t *testing.T) {
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
 
-		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, settings.NewSettings(), utxoStoreURL)
+		tSettings := test.CreateBaseTestSettings(t)
+		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, tSettings, utxoStoreURL)
 		require.NoError(t, err)
 
-		c, err := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
+		c, err := NewTxMetaCache(ctx, tSettings, ulogger.TestLogger{}, utxoStore, Unallocated)
 		require.NoError(t, err)
 
 		cache := c.(*TxMetaCache)
@@ -629,10 +632,11 @@ func Test_txMetaCache_MultiOperations(t *testing.T) {
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
 
-		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, settings.NewSettings(), utxoStoreURL)
+		tSettings := test.CreateBaseTestSettings(t)
+		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, tSettings, utxoStoreURL)
 		require.NoError(t, err)
 
-		c, err := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
+		c, err := NewTxMetaCache(ctx, tSettings, ulogger.TestLogger{}, utxoStore, Unallocated)
 		require.NoError(t, err)
 
 		cache := c.(*TxMetaCache)

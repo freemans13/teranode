@@ -1,4 +1,3 @@
-
 x-teranode-base: &teranode-base
   image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode:latest
   depends_on:
@@ -31,12 +30,8 @@ x-teranode-base-1: &teranode-base-1
     - ./data/teranode1/subtreestore:/app/data/subtreestore
     - ./data/teranode1/blockstore:/app/data/blockstore
 
-x-teranode-commands-base: &teranode-commands-base
-  image : 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode-commands:latest
-  network_mode: "host"
-
 x-teranode-coinbase-base: &teranode-coinbase-base
-  image : 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode-coinbase:latest 
+  image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode-coinbase:latest
   network_mode: "host"
   depends_on:
     - postgres
