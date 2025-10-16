@@ -10,3 +10,9 @@ MD033: false
 
 # Allow long lines (some documentation may have long URLs or code examples)
 MD013: false
+
+# Disable code-block-style check (conflicts with MkDocs admonition syntax)
+MD046: false
+
+# Allow blanks around fences (MkDocs admonitions may have special formatting)
+MD031: false

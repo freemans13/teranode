@@ -1,8 +1,6 @@
 # Syncing the Blockchain
 
-<!-- markdownlint-disable MD046 -->
-
-Last modified: 15-July-2025
+Last modified: 15-October-2025
 
 ## Table of Contents
 
@@ -287,6 +285,7 @@ docker compose stop blockchain asset blockvalidation # Add other services as nee
 **For Kubernetes Deployments:**
 
 You can scale down the Teranode services using the `spec.enabled` option in the CR:
+
 ```yaml
 ---
 apiVersion: teranode.bsvblockchain.org/v1alpha1
@@ -337,7 +336,7 @@ ls -la /mnt/teranode/seed/export/
 # Make sure to add any environment variables you have defined in your docker-compose.yml
 docker run -it \
     -e SETTINGS_CONTEXT=docker.m \
-    -e network=mainnet
+    -e network=mainnet \
     -v ${PWD}/docker/mainnet/data/teranode:/app/data \
     -v /mnt/teranode/seed:/mnt/teranode/seed \
     --network my-teranode-network \
