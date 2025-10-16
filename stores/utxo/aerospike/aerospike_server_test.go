@@ -878,6 +878,137 @@ func TestAerospike(t *testing.T) {
 		assert.Equal(t, tx2.TxIDChainHash().String(), txSpends[0].SpendingData.TxID.String())
 	})
 
+	// New test to validate SetMinedMulti over multiple txids in a single call
+	t.Run("aerospike_setmined_multi_batch_two", func(t *testing.T) {
+		cleanDB(t, client)
+
+		// Create two transactions in the store
+		_, err = store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		_, err = store.Create(ctx, txWithOPReturn, 0)
+		require.NoError(t, err)
+
+		// Call SetMinedMulti for both transactions at once
+		blockID1 := uint32(111)
+		blockHeight1 := uint32(1001)
+		subtreeIdx1 := 1
+
+		blockID2 := uint32(222)
+		blockHeight2 := uint32(1002)
+		subtreeIdx2 := 2
+
+		ids := []*chainhash.Hash{tx.TxIDChainHash(), txWithOPReturn.TxIDChainHash()}
+
+		blockIDsMap, err := store.SetMinedMulti(ctx, ids, utxo.MinedBlockInfo{BlockID: blockID1, BlockHeight: blockHeight1, SubtreeIdx: subtreeIdx1})
+		require.NoError(t, err)
+		require.Equal(t, 2, len(blockIDsMap))
+		require.Equal(t, []uint32{blockID1}, blockIDsMap[*tx.TxIDChainHash()])
+		require.Equal(t, []uint32{blockID1}, blockIDsMap[*txWithOPReturn.TxIDChainHash()])
+
+		// Verify via direct read of bins
+		value, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey)
+		require.NoError(t, err)
+		assert.Equal(t, []interface{}{int(blockID1)}, value.Bins[fields.BlockIDs.String()].([]interface{}))
+
+		value2, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txWithOPReturnKey)
+		require.NoError(t, err)
+		assert.Equal(t, []interface{}{int(blockID1)}, value2.Bins[fields.BlockIDs.String()].([]interface{}))
+
+		// Add another block to both using a single multi call again
+		blockIDsMap, err = store.SetMinedMulti(ctx, ids, utxo.MinedBlockInfo{BlockID: blockID2, BlockHeight: blockHeight2, SubtreeIdx: subtreeIdx2})
+		require.NoError(t, err)
+		require.Equal(t, 2, len(blockIDsMap))
+		require.Equal(t, []uint32{blockID1, blockID2}, blockIDsMap[*tx.TxIDChainHash()])
+		require.Equal(t, []uint32{blockID1, blockID2}, blockIDsMap[*txWithOPReturn.TxIDChainHash()])
+
+		value, err = client.Get(util.GetAerospikeReadPolicy(tSettings), txKey)
+		require.NoError(t, err)
+		assert.Equal(t, []interface{}{int(blockID1), int(blockID2)}, value.Bins[fields.BlockIDs.String()].([]interface{}))
+
+		value2, err = client.Get(util.GetAerospikeReadPolicy(tSettings), txWithOPReturnKey)
+		require.NoError(t, err)
+		assert.Equal(t, []interface{}{int(blockID1), int(blockID2)}, value2.Bins[fields.BlockIDs.String()].([]interface{}))
+	})
+
+	// New test to validate IncrementSpentRecordsMulti coalesces increments and updates the counter
+	t.Run("aerospike_increment_spent_records_multi", func(t *testing.T) {
+		cleanDB(t, client)
+
+		_, err = store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		// Read initial counter
+		rec, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey, "totalExtraRecs")
+		require.NoError(t, err)
+		initial := 0
+		if v, ok := rec.Bins["totalExtraRecs"].(int); ok {
+			initial = v
+		}
+
+		// Increment via multi API
+		require.NoError(t, store.IncrementSpentRecordsMulti([]*chainhash.Hash{tx.TxIDChainHash()}, 1))
+
+		rec2, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey, "totalExtraRecs")
+		require.NoError(t, err)
+		v2, ok := rec2.Bins["totalExtraRecs"].(int)
+		require.True(t, ok)
+		assert.Equal(t, initial+1, v2)
+	})
+
+	// New test: SetMinedMulti with one valid and one invalid hash should partially succeed and return an error
+	t.Run("aerospike_setmined_multi_partial_failure", func(t *testing.T) {
+		cleanDB(t, client)
+
+		_, err = store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		valid := tx.TxIDChainHash()
+		var invalid chainhash.Hash // zero hash not present in DB
+		ids := []*chainhash.Hash{valid, &invalid}
+
+		blockID := uint32(333)
+		blockHeight := uint32(2001)
+		subtreeIdx := 5
+
+		blockIDsMap, err := store.SetMinedMulti(ctx, ids, utxo.MinedBlockInfo{BlockID: blockID, BlockHeight: blockHeight, SubtreeIdx: subtreeIdx})
+		require.Error(t, err)
+		// Valid tx should be present and updated
+		require.Contains(t, blockIDsMap, *valid)
+		require.Equal(t, []uint32{blockID}, blockIDsMap[*valid])
+		// Invalid hash should not be present in successful map
+		_, hasInvalid := blockIDsMap[invalid]
+		require.False(t, hasInvalid)
+	})
+
+	// New test: IncrementSpentRecordsMulti with one invalid key should aggregate errors and still update the valid one
+	t.Run("aerospike_increment_spent_records_multi_with_errors", func(t *testing.T) {
+		cleanDB(t, client)
+
+		_, err = store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		rec, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey, "totalExtraRecs")
+		require.NoError(t, err)
+		base := 0
+		if v, ok := rec.Bins["totalExtraRecs"].(int); ok {
+			base = v
+		}
+
+		valid := tx.TxIDChainHash()
+		var invalid chainhash.Hash // zero hash, not present
+		ids := []*chainhash.Hash{valid, &invalid}
+
+		aggErr := store.IncrementSpentRecordsMulti(ids, 1)
+		require.Error(t, aggErr)
+
+		rec2, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey, "totalExtraRecs")
+		require.NoError(t, err)
+		v2, ok := rec2.Bins["totalExtraRecs"].(int)
+		require.True(t, ok)
+		assert.Equal(t, base+1, v2)
+	})
+
 	t.Run("set mined with locked", func(t *testing.T) {
 		cleanDB(t, client)
 

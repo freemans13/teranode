@@ -11,6 +11,7 @@ import (
 	aeroTest "github.com/bitcoin-sv/testcontainers-aerospike-go"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -101,8 +102,38 @@ func initAerospike(t *testing.T, settings *settings.Settings, logger ulogger.Log
 
 	ctx := context.Background()
 
-	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	var (
+		containerAny any
+		err          error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Convert panic to error so we can skip cleanly
+				err = errors.NewError("container startup panic: %v", r)
+			}
+		}()
+		c, e := aeroTest.RunContainer(ctx)
+		if e != nil {
+			err = e
+			return
+		}
+		containerAny = c
+	}()
+	if err != nil {
+		t.Skipf("Skipping Aerospike integration tests: container not available (%v)", err)
+	}
+
+	// Assert required container interface
+	type containerAPI interface {
+		Terminate(ctx context.Context) error
+		Host(ctx context.Context) (string, error)
+		ServicePort(ctx context.Context) (int, error)
+	}
+	container, ok := containerAny.(containerAPI)
+	if !ok {
+		t.Skip("Skipping Aerospike integration tests: unexpected container type")
+	}
 
 	// go func() {
 	// 	reader, err := container.Logs(ctx)

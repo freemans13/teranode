@@ -194,6 +194,30 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 	nrErrors := 0
 	blockIDs := make(map[chainhash.Hash][]uint32, len(hashes))
 
+	// Collect follow-up actions to execute in batches after the loop
+	extraRecords := make([]*chainhash.Hash, 0, len(hashes))
+	dahSetItems := make([]struct {
+		TxID           *chainhash.Hash
+		ChildCount     int
+		DeleteAtHeight uint32
+	}, 0)
+	dahUnsetItems := make([]struct {
+		TxID           *chainhash.Hash
+		ChildCount     int
+		DeleteAtHeight uint32
+	}, 0)
+	externalDAH := make([]struct {
+		TxID *chainhash.Hash
+		DAH  uint32
+	}, 0)
+	// DAH timing assumption:
+	// - thisBatch operates under a fixed block-processing context.
+	// - thisBlockHeight and retention are immutable for the duration of SetMinedMulti() execution.
+	// Therefore, computing DeleteAtHeight (DAH) once is safe and consistent across all signals in this batch.
+	// If this assumption ever changes (e.g., SetBlockHeight or retention can mutate concurrently),
+	// DAH must be computed per-record at signal time to avoid stale values.
+	dahHeight := thisBlockHeight + s.settings.GetUtxoStoreBlockHeightRetention()
+
 	for idx, batchRecord := range batchRecords {
 		result, res, err := s.processSingleBatchRecord(ctx, batchRecord, hashes[idx], thisBlockHeight, minedBlockInfo)
 		if err != nil {
@@ -223,6 +247,34 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 
 			blockIDs[*hashes[idx]] = blockIDsUint32
 		}
+
+		// Aggregate signals for batched follow-up work
+		if res != nil && res.Signal != "" {
+			switch res.Signal {
+			case LuaSignalAllSpent:
+				extraRecords = append(extraRecords, hashes[idx])
+			case LuaSignalDAHSet:
+				dahSetItems = append(dahSetItems, struct {
+					TxID           *chainhash.Hash
+					ChildCount     int
+					DeleteAtHeight uint32
+				}{TxID: hashes[idx], ChildCount: res.ChildCount, DeleteAtHeight: dahHeight})
+				externalDAH = append(externalDAH, struct {
+					TxID *chainhash.Hash
+					DAH  uint32
+				}{TxID: hashes[idx], DAH: dahHeight})
+			case LuaSignalDAHUnset:
+				dahUnsetItems = append(dahUnsetItems, struct {
+					TxID           *chainhash.Hash
+					ChildCount     int
+					DeleteAtHeight uint32
+				}{TxID: hashes[idx], ChildCount: res.ChildCount, DeleteAtHeight: 0})
+				externalDAH = append(externalDAH, struct {
+					TxID *chainhash.Hash
+					DAH  uint32
+				}{TxID: hashes[idx], DAH: 0})
+			}
+		}
 	}
 
 	prometheusTxMetaAerospikeMapSetMinedBatchN.Add(float64(okUpdates))
@@ -230,6 +282,37 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 	if errs != nil || nrErrors > 0 {
 		prometheusTxMetaAerospikeMapSetMinedBatchErrN.Add(float64(nrErrors))
 		return nil, errors.NewError("aerospike batchRecord errors", errs)
+	}
+
+	// Execute aggregated follow-ups in batches
+	var postErr error
+
+	if len(extraRecords) > 0 {
+		if err := s.IncrementSpentRecordsMulti(extraRecords, 1); err != nil {
+			postErr = errors.Join(postErr, err)
+		}
+	}
+
+	if len(dahSetItems) > 0 {
+		if err := s.SetDAHForChildRecordsMulti(dahSetItems); err != nil {
+			postErr = errors.Join(postErr, err)
+		}
+	}
+
+	if len(dahUnsetItems) > 0 {
+		if err := s.SetDAHForChildRecordsMulti(dahUnsetItems); err != nil {
+			postErr = errors.Join(postErr, err)
+		}
+	}
+
+	if len(externalDAH) > 0 {
+		if err := s.setDAHExternalTransactionMulti(ctx, externalDAH); err != nil {
+			postErr = errors.Join(postErr, err)
+		}
+	}
+
+	if postErr != nil {
+		return blockIDs, errors.NewError("aerospike setMined follow-up batch errors", postErr)
 	}
 
 	return blockIDs, nil
@@ -264,13 +347,6 @@ func (s *Store) processSingleBatchRecord(ctx context.Context, batchRecord aerosp
 		}
 
 		return false, res, errors.NewError("aerospike batchRecord %s error: %s", hash.String(), res.Message)
-	}
-
-	// Handle signal if present
-	if res.Signal != "" {
-		if err := s.handleSetMinedSignal(ctx, res.Signal, hash, res.ChildCount, thisBlockHeight); err != nil {
-			return true, res, err // Still counts as OK update, but with signal handling error
-		}
 	}
 
 	return true, res, nil
