@@ -428,6 +428,11 @@ func (u *BlockValidation) start(ctx context.Context) error {
 					continue
 				}
 
+				if blockHeaderMeta != nil && blockHeaderMeta.Invalid {
+					u.logger.Warnf("[BlockValidation:start][%s] block is marked as invalid, skipping setTxMined", blockHash.String())
+					continue
+				}
+
 				_ = u.blockHashesCurrentlyValidated.Put(*blockHash)
 
 				if err = u.setTxMined(ctx, blockHash); err != nil {
