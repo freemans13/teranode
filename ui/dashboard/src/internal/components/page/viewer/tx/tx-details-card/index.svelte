@@ -24,7 +24,6 @@
   export let data: any = {}
   export let display: DetailTab = DetailTab.overview
 
-  $: d = data
   $: isOverview = display === DetailTab.overview
   $: isJson = display === DetailTab.json
 
@@ -37,14 +36,14 @@
   }
 </script>
 
-<Card title={t(`${baseKey}.title`, { height: d?.height })}>
+<Card title={t(`${baseKey}.title`, { height: data?.height })}>
   <div class="copy-link" slot="subtitle">
-    <div class="hash">{d?.txid}</div>
+    <div class="hash">{data?.txid}</div>
     <div class="icon" use:$tippy={{ content: t('tooltip.copy-hash-to-clipboard') }}>
       <ActionStatusIcon
         icon="icon-duplicate-line"
         action={copyTextToClipboardVanilla}
-        actionData={d?.txid}
+        actionData={data?.txid}
         size={15}
       />
     </div>
@@ -52,13 +51,13 @@
       <ActionStatusIcon
         icon="icon-bracket-line"
         action={copyTextToClipboardVanilla}
-        actionData={getItemApiUrl(ItemType.tx, d?.txid)}
+        actionData={getItemApiUrl(ItemType.tx, data?.txid)}
         size={15}
       />
     </div>
     <button
       class="icon"
-      on:click={() => onReverseHash(d?.txid)}
+      on:click={() => onReverseHash(data?.txid)}
       use:$tippy={{ content: t('tooltip.reverse-hash') }}
       type="button"
     >
@@ -108,27 +107,27 @@
           <div class="entry">
             <div class="label">{t(`${fieldKey}.sizeInBytes`)}</div>
             <div class="value">
-              {dataSize(d?.sizeInBytes)}
+              {dataSize(data?.sizeInBytes)}
             </div>
           </div>
           <div class="entry">
             <div class="label">{t(`${fieldKey}.blockHeight`)}</div>
             <div class="value block-links">
-              {#if d?.blockHeights && d?.blockHeights.length > 0 && d?.blockHashes && d?.blockHashes.length > 0}
-                {#each d.blockHeights as height, i}
-                  {#if d.blockHashes[i]}
-                    <a href={`/viewer/block/?hash=${d.blockHashes[i]}`} class="block-link">
+              {#if data?.blockHeights && data?.blockHeights.length > 0 && data?.blockHashes && data?.blockHashes.length > 0}
+                {#each data.blockHeights as height, i}
+                  {#if data.blockHashes[i]}
+                    <a href={`/viewer/block/?hash=${data.blockHashes[i]}`} class="block-link">
                       {height}
                     </a>
-                    {#if i < d.blockHeights.length - 1}
+                    {#if i < data.blockHeights.length - 1}
                       <span>, </span>
                     {/if}
                   {:else}
-                    {height}{#if i < d.blockHeights.length - 1}, {/if}
+                    {height}{#if i < data.blockHeights.length - 1}, {/if}
                   {/if}
                 {/each}
-              {:else if d?.blockHeights && d?.blockHeights.length > 0}
-                {d.blockHeights.join(', ')}
+              {:else if data?.blockHeights && data?.blockHeights.length > 0}
+                {data.blockHeights.join(', ')}
               {:else}
                 <span class="not-in-block">Not in block</span>
               {/if}
@@ -137,27 +136,27 @@
           <div class="entry">
             <div class="label">{t(`${fieldKey}.subtree`)}</div>
             <div class="value subtree-info">
-              {#if d?.subtreeIdxs && d?.subtreeIdxs.length > 0 && d?.subtreeHashes && d?.subtreeHashes.length > 0 && d?.blockHashes && d?.blockHashes.length > 0}
-                {#each d.subtreeIdxs as subtreeIdx, i}
+              {#if data?.subtreeIdxs && data?.subtreeIdxs.length > 0 && data?.subtreeHashes && data?.subtreeHashes.length > 0 && data?.blockHashes && data?.blockHashes.length > 0}
+                {#each data.subtreeIdxs as subtreeIdx, i}
                   <div class="subtree-item">
-                    {#if d.subtreeHashes[i]}
-                      <a href={`/viewer/subtree/?hash=${d.subtreeHashes[i]}&blockHash=${d.blockHashes[i]}`} class="subtree-link">
+                    {#if data.subtreeHashes[i]}
+                      <a href={`/viewer/subtree/?hash=${data.subtreeHashes[i]}&blockHash=${data.blockHashes[i]}`} class="subtree-link">
                         Subtree #{subtreeIdx}
                       </a>
                     {:else}
                       Subtree #{subtreeIdx}
                     {/if}
-                    {#if d.blockHashes[i]}
+                    {#if data.blockHashes[i]}
                       <span class="in-block">
-                        in <a href={`/viewer/block/?hash=${d.blockHashes[i]}`} class="block-link">
-                          Block #{d.blockHeights[i] || ''}
+                        in <a href={`/viewer/block/?hash=${data.blockHashes[i]}`} class="block-link">
+                          Block #{data.blockHeights[i] || ''}
                         </a>
                       </span>
                     {/if}
                   </div>
                 {/each}
-              {:else if d?.subtreeIdxs && d?.subtreeIdxs.length > 0}
-                {d.subtreeIdxs.map(subtreeIdx => `Subtree #${subtreeIdx}`).join(', ')}
+              {:else if data?.subtreeIdxs && data?.subtreeIdxs.length > 0}
+                {data.subtreeIdxs.map(subtreeIdx => `Subtree #${subtreeIdx}`).join(', ')}
               {:else}
                 <span class="not-in-subtree">Not in a subtree</span>
               {/if}
@@ -181,22 +180,22 @@
             <div class="label">{t(`${fieldKey}.fee_paid`)}</div>
             <div class="value">TBD</div>
           </div> -->
-          {#if d?.fee !== undefined}
+          {#if data?.fee !== undefined}
             <div class="entry">
               <div class="label">{t(`${fieldKey}.fee`)}</div>
-              <div class="value">{addNumCommas(d.fee)} satoshis</div>
+              <div class="value">{addNumCommas(data.fee)} satoshis</div>
             </div>
           {/if}
-          {#if d?.lockTime !== undefined}
+          {#if data?.lockTime !== undefined}
             <div class="entry">
               <div class="label">{t(`${fieldKey}.lockTime`)}</div>
-              <div class="value">{d.lockTime}</div>
+              <div class="value">{data.lockTime}</div>
             </div>
           {/if}
-          {#if d?.isCoinbase !== undefined}
+          {#if data?.isCoinbase !== undefined}
             <div class="entry">
               <div class="label">{t(`${fieldKey}.type`)}</div>
-              <div class="value">{d.isCoinbase ? 'Coinbase' : 'Regular'}</div>
+              <div class="value">{data.isCoinbase ? 'Coinbase' : 'Regular'}</div>
             </div>
           {/if}
         </div>

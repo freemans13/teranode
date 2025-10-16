@@ -42,18 +42,36 @@
   $: inputSlice = data.inputs.slice(0, sliceCount)
   $: outputSlice = data.outputs.slice(0, sliceCount)
 
-  // Extract addresses for outputs when component mounts or data changes
-  $: if (data.outputs) {
-    data.outputs.forEach(async (output, index) => {
+  // Track which outputs we've already processed to avoid re-processing
+  let processedOutputsHash = ''
+
+  // Extract addresses for outputs when data changes
+  $: {
+    const currentHash = data.outputs ? JSON.stringify(data.outputs.map(o => o.lockingScript)) : ''
+    if (currentHash && currentHash !== processedOutputsHash) {
+      processedOutputsHash = currentHash
+      extractOutputAddresses()
+    }
+  }
+
+  async function extractOutputAddresses() {
+    if (!data.outputs) return
+
+    const newAddresses: { [key: number]: string | null } = {}
+
+    for (let index = 0; index < data.outputs.length; index++) {
+      const output = data.outputs[index]
       const scriptType = detectScriptType(output.lockingScript)
       if (scriptType === ScriptType.P2PKH || scriptType === ScriptType.P2SH) {
         const address = await extractAddress(output.lockingScript, scriptType)
         if (address) {
-          outputAddresses[index] = address
-          outputAddresses = { ...outputAddresses } // Trigger reactivity
+          newAddresses[index] = address
         }
       }
-    })
+    }
+
+    // Update all addresses at once to trigger reactivity only once
+    outputAddresses = newAddresses
   }
 </script>
 
