@@ -1,0 +1,155 @@
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam component {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam database {
+  BackgroundColor #f2f2f2
+  BorderColor #999999
+  FontColor black
+  RoundCorner 10
+}
+skinparam shadowing false
+skinparam ArrowColor #666666
+
+@startuml Subtree_Validation_Component
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title Subtree Validation Service - Component Diagram (Code-Verified Connections)
+
+Container_Boundary(subtree_validation, "Subtree Validation Service") {
+
+Component(grpc_server, "gRPC Server", "Go gRPC", "Handles external subtree validation API requests")
+
+Component(kafka_consumer_subtrees, "Subtree Consumer", "Go Kafka", "Consumes subtree notifications from P2P service")
+
+Component(kafka_consumer_txmeta, "TxMeta Consumer", "Go Kafka", "Consumes transaction metadata updates")
+
+Component(kafka_producer_txmeta, "TxMeta Producer", "Go Kafka", "Publishes validated transaction metadata")
+
+Component(subtree_validator, "Subtree Validator", "Go", "Core subtree validation logic")
+
+Component(transaction_fetcher, "Transaction Fetcher", "Go", "Fetches missing transactions from remote sources")
+
+Component(metadata_processor, "Metadata Processor", "Go", "Processes and caches transaction metadata")
+
+Component(quorum_manager, "Quorum Manager", "Go", "Distributed locking for concurrent validation")
+
+Component(http_client, "HTTP Client", "Go HTTP", "HTTP client for asset server communication")
+
+Component(validator_interface, "Validator Interface", "Go", "Local/remote validator integration")
+
+Component(metrics_collector, "Metrics Collector", "Prometheus", "Collects validation performance metrics")
+
+Component(health_monitor, "Health Monitor", "Go", "Monitors service and dependency health")
+
+}
+
+Container_Boundary(external_services, "External Services") {
+
+Container(validator, "Validator Service", "Go", "Transaction validation")
+
+Container(blockchain, "Blockchain Service", "Go", "Blockchain state management")
+
+Container(subtree_store, "Subtree Store", "Blob Store", "Validated subtree storage")
+
+Container(utxo_store, "UTXO Store", "Database", "UTXO and transaction metadata")
+
+ContainerQueue(kafka, "Kafka", "Message Queue", "Message broker")
+
+Container(asset_servers, "Asset Servers", "HTTP", "Remote transaction data")
+
+}
+
+System_Ext(p2p_service, "P2P Service", "P2P network and subtree message publishing")
+
+System_Ext(block_validation, "Block Validation Service", "Block validation")
+
+System_Ext(legacy_service, "Legacy Service", "P2P sync and block processing")
+
+System_Ext(rpc_service, "RPC Service", "External API access")
+
+' External API interactions
+
+Rel(block_validation, grpc_server, "Validate subtrees", "gRPC")
+
+Rel(legacy_service, grpc_server, "Validate subtrees during sync", "gRPC")
+
+Rel(rpc_service, grpc_server, "External subtree validation requests", "gRPC")
+
+Rel(grpc_server, subtree_validator, "Process validation requests")
+
+' CODE-VERIFIED Kafka message flow from P2P
+
+Rel(p2p_service, kafka, "Publish subtree notifications", "Kafka")
+
+Rel(kafka, kafka_consumer_subtrees, "Subtree notifications from P2P", "Kafka")
+
+Rel(kafka, kafka_consumer_txmeta, "Metadata updates", "Kafka")
+
+Rel(kafka_producer_txmeta, kafka, "Publish metadata", "Kafka")
+
+' Internal processing flow
+
+Rel(kafka_consumer_subtrees, quorum_manager, "Check/acquire locks")
+
+Rel(kafka_consumer_subtrees, subtree_validator, "Validate subtrees")
+
+Rel(subtree_validator, transaction_fetcher, "Fetch missing transactions")
+
+Rel(transaction_fetcher, http_client, "HTTP requests")
+
+Rel(subtree_validator, validator_interface, "Validate transactions")
+
+Rel(subtree_validator, metadata_processor, "Process metadata")
+
+' Metadata handling
+
+Rel(kafka_consumer_txmeta, metadata_processor, "Update metadata")
+
+Rel(metadata_processor, kafka_producer_txmeta, "Publish updates")
+
+' External service interactions
+
+Rel(http_client, asset_servers, "Fetch transactions", "HTTP")
+
+Rel(validator_interface, validator, "Transaction validation", "Interface/gRPC")
+
+Rel(subtree_validator, subtree_store, "Store validated subtrees", "gRPC")
+
+Rel(metadata_processor, utxo_store, "Cache metadata", "gRPC")
+
+Rel(quorum_manager, subtree_store, "Check existence", "gRPC")
+
+' State and health monitoring
+
+Rel(blockchain, kafka_consumer_subtrees, "Block notifications", "Subscription")
+
+Rel(health_monitor, blockchain, "Health checks")
+
+Rel(health_monitor, validator, "Health checks")
+
+Rel(health_monitor, subtree_store, "Health checks")
+
+Rel(health_monitor, utxo_store, "Health checks")
+
+' Metrics collection
+
+Rel(subtree_validator, metrics_collector, "Validation metrics")
+
+Rel(transaction_fetcher, metrics_collector, "Fetch metrics")
+
+Rel(metadata_processor, metrics_collector, "Metadata metrics")
+
+SHOW_LEGEND()
+
+@enduml
