@@ -66,7 +66,13 @@ func (g *BlockProcessingGuard) Release() {
 
 	if !g.released {
 		g.fm.mu.Lock()
-		delete(g.fm.processingBlocks, *g.blockHash)
+
+		// Only decrement if the block is still in the map
+		// This prevents double-decrement if CleanupFork already removed it
+		if g.fm.processingBlocks[*g.blockHash] {
+			delete(g.fm.processingBlocks, *g.blockHash)
+			g.fm.processingCount.Add(-1) // Decrement only if we removed it
+		}
 
 		if forkID, exists := g.fm.blockToFork[*g.blockHash]; exists {
 			if fork, forkExists := g.fm.forks[forkID]; forkExists {
@@ -82,7 +88,7 @@ func (g *BlockProcessingGuard) Release() {
 		}
 
 		if g.fm.priorityQueue != nil {
-			g.fm.priorityQueue.Broadcast()
+			g.fm.priorityQueue.Signal()
 		}
 
 		g.fm.mu.Unlock()
@@ -94,6 +100,7 @@ func (g *BlockProcessingGuard) Release() {
 
 type condBroadcaster interface {
 	Broadcast()
+	Signal()
 }
 
 // ForkCleanupConfig holds configuration for fork cleanup behavior
@@ -141,6 +148,7 @@ type ForkManager struct {
 	mainChainTip        *chainhash.Hash
 	mainChainHeight     uint32
 	resolutionCallbacks []ForkResolutionCallback
+	processingCount     atomic.Int32 // Atomic counter for fast-path checking
 }
 
 func NewForkManager(logger ulogger.Logger, tSettings *settings.Settings) *ForkManager {
@@ -247,6 +255,11 @@ func (fm *ForkManager) GetForkForBlock(blockHash *chainhash.Hash) (string, bool)
 }
 
 func (fm *ForkManager) CanProcessBlock(ctx context.Context, blockHash *chainhash.Hash) (bool, error) {
+	// Fast-path: Check if we've reached max parallel forks without acquiring any locks
+	if int(fm.processingCount.Load()) >= fm.maxParallelForks {
+		return false, nil
+	}
+
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
 
@@ -286,6 +299,7 @@ func (fm *ForkManager) MarkBlockProcessing(blockHash *chainhash.Hash) (*BlockPro
 	}
 
 	fm.processingBlocks[*blockHash] = true
+	fm.processingCount.Add(1) // Increment atomic counter
 
 	if forkID, exists := fm.blockToFork[*blockHash]; exists {
 		if fork, forkExists := fm.forks[forkID]; forkExists {
@@ -327,6 +341,7 @@ func (fm *ForkManager) StartProcessingBlock(blockHash *chainhash.Hash) bool {
 	}
 
 	fm.processingBlocks[*blockHash] = true
+	fm.processingCount.Add(1) // Increment atomic counter
 
 	if forkID, exists := fm.blockToFork[*blockHash]; exists {
 		if fork, forkExists := fm.forks[forkID]; forkExists {
@@ -345,7 +360,10 @@ func (fm *ForkManager) FinishProcessingBlock(blockHash *chainhash.Hash) {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	delete(fm.processingBlocks, *blockHash)
+	if fm.processingBlocks[*blockHash] {
+		delete(fm.processingBlocks, *blockHash)
+		fm.processingCount.Add(-1) // Decrement atomic counter
+	}
 
 	if forkID, exists := fm.blockToFork[*blockHash]; exists {
 		if fork, forkExists := fm.forks[forkID]; forkExists {
@@ -361,7 +379,9 @@ func (fm *ForkManager) FinishProcessingBlock(blockHash *chainhash.Hash) {
 	}
 
 	if fm.priorityQueue != nil {
-		fm.priorityQueue.Broadcast()
+		// Use Signal() instead of Broadcast() to wake only one worker
+		// This prevents thundering herd where all workers wake up and race for locks
+		fm.priorityQueue.Signal()
 	}
 
 	fm.logger.Debugf("Finished processing block %s", blockHash)
@@ -392,9 +412,13 @@ func (fm *ForkManager) CleanupFork(forkID string) {
 	}
 
 	// Remove all blocks associated with this fork
+	// Must decrement counter for any blocks that were being processed
 	for _, blockHash := range fork.Blocks {
 		delete(fm.blockToFork, *blockHash)
-		delete(fm.processingBlocks, *blockHash)
+		if fm.processingBlocks[*blockHash] {
+			delete(fm.processingBlocks, *blockHash)
+			fm.processingCount.Add(-1) // Decrement counter to prevent drift
+		}
 	}
 
 	delete(fm.forks, forkID)
@@ -441,9 +465,13 @@ func (fm *ForkManager) CleanupOldForks(heightThreshold uint32) {
 		fork := fm.forks[forkID]
 
 		// Remove all blocks associated with this fork
+		// Must decrement counter for any blocks that were being processed
 		for _, blockHash := range fork.Blocks {
 			delete(fm.blockToFork, *blockHash)
-			delete(fm.processingBlocks, *blockHash)
+			if fm.processingBlocks[*blockHash] {
+				delete(fm.processingBlocks, *blockHash)
+				fm.processingCount.Add(-1) // Decrement counter to prevent drift
+			}
 		}
 
 		delete(fm.forks, forkID)
@@ -660,12 +688,18 @@ func (fm *ForkManager) performCleanup() {
 }
 
 // removeFork removes a fork and all associated data
+// NOTE: Caller must hold fm.mu lock
 func (fm *ForkManager) removeFork(fork *ForkBranch) {
 	delete(fm.forks, fork.ID)
 
 	for blockHash, forkID := range fm.blockToFork {
 		if forkID == fork.ID {
 			delete(fm.blockToFork, blockHash)
+			// Also check if this block was being processed and decrement counter
+			if fm.processingBlocks[blockHash] {
+				delete(fm.processingBlocks, blockHash)
+				fm.processingCount.Add(-1) // Decrement counter to prevent drift
+			}
 		}
 	}
 }

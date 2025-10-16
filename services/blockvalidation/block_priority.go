@@ -134,8 +134,6 @@ func (pq *BlockPriorityQueue) Add(blockFound processBlockFound, priority BlockPr
 		return
 	}
 
-	wasEmpty := len(pq.items) == 0
-
 	item := &PrioritizedBlock{
 		blockFound:        blockFound,
 		priority:          priority,
@@ -151,11 +149,9 @@ func (pq *BlockPriorityQueue) Add(blockFound processBlockFound, priority BlockPr
 	pq.hashIndex[*blockFound.hash] = item
 	pq.needsSort = true
 
-	if wasEmpty {
-		pq.cond.Broadcast()
-	} else {
-		pq.cond.Signal()
-	}
+	// Always use Signal() to wake exactly one worker per block added
+	// This avoids thundering herd where all workers wake and race for one block
+	pq.cond.Signal()
 
 	if prometheusBlockPriorityQueueAdded != nil {
 		prometheusBlockPriorityQueueAdded.WithLabelValues(priorityToString(priority)).Inc()
@@ -185,6 +181,9 @@ func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block
 	itemsCopy := make([]*PrioritizedBlock, len(pq.items))
 	copy(itemsCopy, pq.items)
 	pq.mu.Unlock()
+
+	// Collect skip count updates to apply in batch
+	skipUpdates := make(map[chainhash.Hash]bool)
 
 	for _, item := range itemsCopy {
 		select {
@@ -225,14 +224,19 @@ func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block
 			return pq.Get(ctx, bp)
 		}
 
+		// Mark this item for skip count update (apply later in batch)
+		skipUpdates[*item.blockFound.hash] = true
+	}
+
+	// Batch apply all skip count updates with a single lock
+	if len(skipUpdates) > 0 {
 		pq.mu.Lock()
 		for _, currentItem := range pq.items {
-			if currentItem.blockFound.hash.IsEqual(item.blockFound.hash) {
+			if skipUpdates[*currentItem.blockFound.hash] {
 				currentItem.skipCount++
 				if blockQueueSkipCount != nil {
 					blockQueueSkipCount.Observe(float64(currentItem.skipCount))
 				}
-				break
 			}
 		}
 		pq.mu.Unlock()
@@ -245,15 +249,28 @@ func (pq *BlockPriorityQueue) Broadcast() {
 	pq.cond.Broadcast()
 }
 
+func (pq *BlockPriorityQueue) Signal() {
+	pq.cond.Signal()
+}
+
 func (pq *BlockPriorityQueue) WaitForBlock(ctx context.Context, bp BlockProcessor) (processBlockFound, GetStatus) {
 	for {
 		block, status := pq.Get(ctx, bp)
 
 		switch status {
-		case GetOK, GetEmpty:
+		case GetOK:
 			return block, status
-		case GetAllBlocked:
+		case GetEmpty, GetAllBlocked:
+			// Both empty queue and all-blocked should wait on condition variable
+			// to avoid busy loop burning CPU
 			pq.mu.Lock()
+
+			// Double-check queue status after acquiring lock
+			// Items might have been added between Get() and Lock()
+			if len(pq.items) > 0 {
+				pq.mu.Unlock()
+				continue // Items appeared, try Get() again
+			}
 
 			waitCh := make(chan struct{})
 			go func() {
@@ -424,17 +441,12 @@ func (pq *BlockPriorityQueue) RequeueForRetry(blockFound processBlockFound, prio
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
-	wasEmpty := len(pq.items) == 0
-
 	if existingItem, exists := pq.hashIndex[*blockFound.hash]; exists {
 		existingItem.retryCount++
 		existingItem.lastRetryTime = time.Now()
 		pq.needsSort = true
-		if wasEmpty {
-			pq.cond.Broadcast()
-		} else {
-			pq.cond.Signal()
-		}
+		// Signal one worker that the queue has been updated
+		pq.cond.Signal()
 		return
 	}
 
@@ -453,11 +465,8 @@ func (pq *BlockPriorityQueue) RequeueForRetry(blockFound processBlockFound, prio
 	pq.hashIndex[*item.blockFound.hash] = item
 	pq.needsSort = true
 
-	if wasEmpty {
-		pq.cond.Broadcast()
-	} else {
-		pq.cond.Signal()
-	}
+	// Always use Signal() to wake exactly one worker
+	pq.cond.Signal()
 
 	updateQueueSizeMetrics(pq.items)
 }

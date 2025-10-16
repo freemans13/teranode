@@ -703,6 +703,10 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
 	mockBlockchain.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(true, nil)
 	mockBlockchain.On("Run", mock.Anything, mock.Anything).Return(nil)
+	// Add mocks needed by catchup code path
+	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(dummyBlock.Header, &model.BlockHeaderMeta{Height: 1}, nil)
+	mockBlockchain.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return([]*chainhash.Hash{dummyBlock.Hash()}, nil)
+	mockBlockchain.On("GetBlockHeader", mock.Anything, mock.Anything).Return(dummyBlock.Header, &model.BlockHeaderMeta{Height: 1}, nil)
 
 	blockFoundCh := make(chan processBlockFound, 1)
 	catchupCh := make(chan processBlockCatchup, 1)
