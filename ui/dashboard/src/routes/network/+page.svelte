@@ -165,9 +165,20 @@
     const { colId, value } = e.detail
     sortColumn = colId
     sortOrder = value
-    
-    // Save sort to localStorage
-    saveSortToStorage(colId, value)
+
+    // Save sort to localStorage, or remove if clearing
+    if (colId && value) {
+      saveSortToStorage(colId, value)
+    } else {
+      // Clear sort from localStorage
+      if (browser) {
+        try {
+          localStorage.removeItem(NETWORK_SORT_KEY)
+        } catch (error) {
+          console.warn('Failed to remove sort from localStorage:', error)
+        }
+      }
+    }
   }
 
   function updatePaginatedNodes() {
@@ -236,11 +247,13 @@
       node.isCurrentNode = node.peer_id === currentPeerID
     })
 
-    // Sort: current node first, then by base_url, then by peer_id (case-insensitive)
+    // Sort: current node first (only when no user sorting is active), then by base_url, then by peer_id (case-insensitive)
     const sorted = mNodes.sort((a: any, b: any) => {
-      // Always put current node at the top
-      if (a.isCurrentNode) return -1
-      if (b.isCurrentNode) return 1
+      // Only put current node at the top when there's no active user sorting
+      if (!sortColumn || !sortOrder) {
+        if (a.isCurrentNode) return -1
+        if (b.isCurrentNode) return 1
+      }
 
       const aUrl = (a.base_url || '').toLowerCase()
       const bUrl = (b.base_url || '').toLowerCase()

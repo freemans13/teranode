@@ -9,6 +9,7 @@
   import { logout } from '$internal/stores/authStore'
   import LogoutButton from '../../components/LogoutButton.svelte'
   import { Icon } from '$lib/components'
+  import RenderHashWithMiner from '$lib/components/table/renderers/render-hash-with-miner/index.svelte'
 
   // FSM State Management
   let fsmState: FSMState | null = null
@@ -736,23 +737,14 @@
                     <tr>
                       <td class="height-cell">{block.height}</td>
                       <td class="hash-cell">
-                        <div class="hash-content">
-                          <span title={block.hash}
-                            >{block.hash.substring(0, 10)}...{block.hash.substring(
-                              block.hash.length - 10,
-                            )}</span
-                          >
-                          <button
-                            class="copy-button"
-                            on:click={() => {
-                              navigator.clipboard.writeText(block.hash)
-                              success('Block hash copied to clipboard')
-                            }}
-                            title="Copy hash"
-                          >
-                            <i class="fas fa-copy"></i>
-                          </button>
-                        </div>
+                        <RenderHashWithMiner
+                          hash={block.hash}
+                          hashUrl={`/viewer/block?q=${block.hash}`}
+                          shortHash={`${block.hash.substring(0, 8)}...${block.hash.substring(block.hash.length - 8)}`}
+                          showCopyButton={true}
+                          copyTooltip="Copy hash to clipboard"
+                          tooltip={block.hash}
+                        />
                       </td>
                       <td style="text-align: center;">
                         {block.size ? `${block.size} B` : '-'}
@@ -1324,21 +1316,8 @@
   }
 
   .hash-cell {
-    font-family: monospace;
     width: auto;
     overflow: hidden;
-  }
-
-  .hash-content {
-    display: flex;
-    align-items: center;
-  }
-
-  .hash-content span {
-    margin-right: 0.5rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .actions-cell {
@@ -1403,25 +1382,6 @@
     font-weight: normal !important;
     color: #6b7280 !important;
     font-size: 0.9rem;
-  }
-
-  .copy-button {
-    background: none;
-    border: none;
-    color: #6b7280;
-    cursor: pointer;
-    padding: 0.25rem;
-    font-size: 0.875rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s ease;
-    opacity: 0.7;
-  }
-
-  .copy-button:hover {
-    color: #3b82f6;
-    opacity: 1;
   }
 
   .copy-icon {
@@ -1579,22 +1539,6 @@
     border-radius: 50%;
     border-left-color: #3b82f6;
     animation: spin 1s linear infinite;
-  }
-
-  .copy-button {
-    background-color: transparent;
-    border: none;
-    color: #6b7280;
-    cursor: pointer;
-    padding: 0.25rem 0.5rem;
-    border-radius: 0.25rem;
-    transition: all 0.2s ease;
-    font-size: 0.875rem;
-  }
-
-  .copy-button:hover {
-    color: #3b82f6;
-    background-color: rgba(59, 130, 246, 0.1);
   }
 
   .spinner-container {

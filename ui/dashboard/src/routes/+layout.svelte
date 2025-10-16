@@ -114,12 +114,12 @@
         path: '/network',
         label: $i18n.t('page.network.menu-label'),
       },
-      {
-        icon: 'icon-arrow-transfer-line',
-        iconSelected: 'icon-arrow-transfer-line',
-        path: '/ancestors',
-        label: $i18n.t('page.ancestors.menu-label'),
-      },
+      // {
+      //   icon: 'icon-arrow-transfer-line',
+      //   iconSelected: 'icon-arrow-transfer-line',
+      //   path: '/ancestors',
+      //   label: $i18n.t('page.ancestors.menu-label'),
+      // },
       {
         icon: 'icon-admin-line',
         iconSelected: 'icon-admin-solid',

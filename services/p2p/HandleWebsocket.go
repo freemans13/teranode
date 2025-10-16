@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/services/asset/asset_api"
-	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -35,18 +34,18 @@ type notificationMsg struct {
 	SizeInBytes  uint64 `json:"size_in_bytes,omitempty"`     // Size of the block or data in bytes
 	Miner        string `json:"miner,omitempty"`             // Miner identifier for mining-related notifications
 	// Node status fields
-	Version              string                          `json:"version,omitempty"`         // Node version
-	CommitHash           string                          `json:"commit_hash,omitempty"`     // Git commit hash
-	BestBlockHash        string                          `json:"best_block_hash,omitempty"` // Best block hash
-	BestHeight           uint32                          `json:"best_height"`               // Best block height
-	BlockAssemblyDetails *blockassembly_api.StateMessage `json:"block_assembly_details"`    // Block assembly details
-	FSMState             string                          `json:"fsm_state,omitempty"`       // FSM state
-	StartTime            int64                           `json:"start_time,omitempty"`      // Node start time
-	Uptime               float64                         `json:"uptime,omitempty"`          // Node uptime in seconds
-	ClientName           string                          `json:"client_name,omitempty"`     // Client name of this node
-	MinerName            string                          `json:"miner_name,omitempty"`      // Miner name that mined the best block
-	ListenMode           string                          `json:"listen_mode,omitempty"`     // Listen mode
-	ChainWork            string                          `json:"chain_work,omitempty"`      // Chain work as hex string
+	Version       string  `json:"version,omitempty"`         // Node version
+	CommitHash    string  `json:"commit_hash,omitempty"`     // Git commit hash
+	BestBlockHash string  `json:"best_block_hash,omitempty"` // Best block hash
+	BestHeight    uint32  `json:"best_height"`               // Best block height
+	SubtreeCount  uint32  `json:"subtree_count,omitempty"`   // Number of subtrees
+	FSMState      string  `json:"fsm_state,omitempty"`       // FSM state
+	StartTime     int64   `json:"start_time,omitempty"`      // Node start time
+	Uptime        float64 `json:"uptime,omitempty"`          // Node uptime in seconds
+	ClientName    string  `json:"client_name,omitempty"`     // Client name of this node
+	MinerName     string  `json:"miner_name,omitempty"`      // Miner name that mined the best block
+	ListenMode    string  `json:"listen_mode,omitempty"`     // Listen mode
+	ChainWork     string  `json:"chain_work,omitempty"`      // Chain work as hex string
 	// Sync peer fields
 	SyncPeerID        string `json:"sync_peer_id,omitempty"`         // ID of the peer we're syncing from
 	SyncPeerHeight    int32  `json:"sync_peer_height,omitempty"`     // Height of the sync peer

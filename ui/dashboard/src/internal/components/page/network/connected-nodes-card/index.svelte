@@ -32,11 +32,21 @@
     // Forward pagination changes to parent component
     dispatch('pagechange', e.detail)
   }
-  
+
   function onSort(e) {
     // Forward sort changes to parent component
     dispatch('sort', e.detail)
   }
+
+  function clearSort() {
+    // Dispatch a sort event with empty values to clear sorting
+    dispatch('sort', {
+      colId: '',
+      value: ''
+    })
+  }
+
+  $: hasSorting = sortColumn && sortOrder
 
   let totalPages = 0
 
@@ -76,6 +86,11 @@
       on:total={onTotal}
     />
     <TableToggle value={variant} on:change={onToggle} />
+    {#if hasSorting}
+      <button class="clear-sort-btn" on:click={clearSort} title="Clear sorting">
+        <Icon name="icon-close-line" size={16} />
+      </button>
+    {/if}
     <div class="live">
       <div class="live-icon" class:connected>
         <Icon name="icon-status-light-glow-solid" size={14} />
@@ -129,6 +144,30 @@
 <BlockAssemblyModal />
 
 <style>
+  .clear-sort-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: rgba(255, 255, 255, 0.66);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    border-radius: 4px;
+  }
+
+  .clear-sort-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.9);
+  }
+
+  .clear-sort-btn:active {
+    background: rgba(255, 255, 255, 0.15);
+  }
+
   .live {
     display: flex;
     align-items: center;
