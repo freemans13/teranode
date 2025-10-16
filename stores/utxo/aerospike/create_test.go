@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/daemon"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	teranodeaerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -384,30 +385,11 @@ func TestStore_TwoPhaseCommit(t *testing.T) {
 	err = td.BlockchainClient.Run(td.Ctx, "test")
 	require.NoError(t, err)
 
-	// Generate initial blocks
-	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{11})
+	// Generate 11 blocks directly via BlockAssemblyClient (avoids RPC catchup issues)
+	err = td.BlockAssemblyClient.GenerateBlocks(td.Ctx, &blockassembly_api.GenerateBlocksRequest{Count: 11})
 	require.NoError(t, err)
 
-	// Wait for blocks to be persisted to the blockchain store
-	// Poll for block 11 to be available with timeout
-	maxAttempts := 50 // 50 attempts * 200ms = 10 seconds timeout
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		block11, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 11)
-		if err == nil {
-			// Block found, wait for block assembly to get to block 11
-			td.WaitForBlockHeight(t, block11, 10*time.Second)
-			break
-		}
-
-		if attempt == maxAttempts-1 {
-			// Last attempt failed, this will cause test to fail
-			require.NoError(t, err, "Block not found after %d attempts", maxAttempts)
-		}
-
-		// Wait before retrying
-		time.Sleep(200 * time.Millisecond)
-	}
-
+	// Fetch block 1 for the coinbase transaction
 	block1, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 1)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), block1.Height)

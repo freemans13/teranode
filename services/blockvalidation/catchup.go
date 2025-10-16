@@ -586,13 +586,7 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 			return err
 		}
 
-		defer func() {
-			if catchupCtx.catchupError != nil {
-				u.logger.Errorf("[catchup][%s] Catchup failed with error, not setting FSM state back to RUNNING: %v", catchupCtx.blockUpTo.Hash().String(), catchupCtx.catchupError)
-			} else {
-				u.restoreFSMState(ctx, catchupCtx)
-			}
-		}()
+		defer u.restoreFSMState(ctx, catchupCtx)
 	}
 
 	// Create error group for concurrent operations

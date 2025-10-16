@@ -318,7 +318,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 								continue
 							}
 
-							if notification.Type == model.NotificationType_Block {
+							if notification.Type == model.NotificationType_BlockSubtreesSet {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
 								// push block hash to the setMinedChan
@@ -366,11 +366,11 @@ func (u *BlockValidation) start(ctx context.Context) error {
 	g, gCtx := errgroup.WithContext(ctx)
 
 	if u.blockchainClient != nil {
-		// first check whether all old blocks have their mined_set set
-		u.processBlockMinedNotSet(gCtx, g)
-
-		// then check whether all old blocks have their subtrees_set set
+		// check whether all old blocks have their subtrees_set set
 		u.processSubtreesNotSet(gCtx, g)
+
+		// check whether all old blocks have their mined_set set
+		u.processBlockMinedNotSet(gCtx, g)
 
 		// wait for all blocks to be processed
 		if err := g.Wait(); err != nil {
@@ -379,19 +379,20 @@ func (u *BlockValidation) start(ctx context.Context) error {
 		}
 	}
 
-	// start a ticker that checks every minute whether there are subtrees that need to be set
-	// this is a light routine, since we only remove the dah files from the subtree store
+	// start a ticker that checks every minute whether there are subtrees/mined that need to be set
+	// this is a light routine for periodic cleanup and handling of invalidated blocks
 	go func() {
-		u.logger.Infof("[BlockValidation:start] starting subtree DAH update goroutine")
+		u.logger.Infof("[BlockValidation:start] starting periodic block processing goroutine")
 		ticker := time.NewTicker(1 * time.Minute)
 
 		for {
 			select {
 			case <-ctx.Done():
-				u.logger.Warnf("[BlockValidation:start] exiting subtree DAH update goroutine: %s", ctx.Err())
+				u.logger.Warnf("[BlockValidation:start] exiting periodic block processing goroutine: %s", ctx.Err())
 				return
 			case <-ticker.C:
 				u.processSubtreesNotSet(ctx, g)
+				u.processBlockMinedNotSet(ctx, g)
 			}
 		}
 	}()
@@ -423,7 +424,12 @@ func (u *BlockValidation) start(ctx context.Context) error {
 					continue
 				}
 
-				if blockHeaderMeta != nil && blockHeaderMeta.MinedSet {
+				if blockHeaderMeta == nil {
+					u.logger.Errorf("[BlockValidation:start][%s] blockHeaderMeta is nil", blockHash.String())
+					continue
+				}
+
+				if blockHeaderMeta.MinedSet {
 					u.logger.Infof("[BlockValidation:start][%s] block already has mined_set true, skipping setTxMined", blockHash.String())
 					continue
 				}
@@ -435,7 +441,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 
 				_ = u.blockHashesCurrentlyValidated.Put(*blockHash)
 
-				if err = u.setTxMined(ctx, blockHash); err != nil {
+				if err = u.setTxMinedStatus(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
 					// Check if context is done before logging
 					select {
 					case <-ctx.Done():
@@ -515,6 +521,10 @@ func (u *BlockValidation) start(ctx context.Context) error {
 }
 
 func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgroup.Group) {
+	if u.blockchainClient == nil {
+		return
+	}
+
 	// first check whether all old blocks have been processed properly
 	blocksMinedNotSet, err := u.blockchainClient.GetBlocksMinedNotSet(ctx)
 	if err != nil {
@@ -546,7 +556,7 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgro
 						return nil
 					}
 
-					if err = u.setTxMined(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
+					if err = u.setTxMinedStatus(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
 						if errors.Is(err, context.Canceled) {
 							u.logger.Infof("[BlockValidation:start] failed to set block mined: %s", err)
 						} else {
@@ -742,7 +752,7 @@ func (u *BlockValidation) hasValidSubtrees(block *model.Block) bool {
 	return true
 }
 
-// setTxMined marks all transactions within a block as mined in the blockchain system.
+// setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
 //
 // This function updates the mining status of all transactions contained within the specified
 // block, transitioning them from validated to mined state. This is a critical operation
@@ -760,7 +770,7 @@ func (u *BlockValidation) hasValidSubtrees(block *model.Block) bool {
 //
 // Returns:
 //   - error: Any error encountered during the mining status update process
-func (u *BlockValidation) setTxMined(ctx context.Context, blockHash *chainhash.Hash, unsetMined ...bool) (err error) {
+func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chainhash.Hash, unsetMined ...bool) (err error) {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "setTxMined",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[setTxMined][%s] setting tx mined", blockHash.String()),
@@ -1255,6 +1265,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// Block validation succeeded - now cache it with subtrees loaded
 				u.logger.Debugf("[ValidateBlock][%s] background validation complete, caching block with subtrees", block.Hash().String())
 				u.lastValidatedBlocks.Set(*block.Hash(), block)
+
+				// Update subtrees DAH now that we know the block is valid
+				if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
+					u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
+				}
 			}()
 		} else {
 			// get all 100 previous block headers on the main chain
@@ -1350,18 +1365,14 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// decouple the tracing context to not cancel the context when finalize the block processing in the background
 		decoupledCtx, _, _ := tracing.DecoupleTracingSpan(ctx, "ValidateBlock", "decoupled")
 
-		u.backgroundTasks.Add(1)
-		go func() {
-			defer u.backgroundTasks.Done()
+		// Only update subtrees DAH for non-optimistic mining
+		// (optimistic mining handles this in its background validation goroutine)
+		if !useOptimisticMining {
+			// it's critical that we call updateSubtreesDAH() only when we know the block is valid
 			if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
-				// TODO: what to do here? We have already added the block to the blockchain
 				u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
 			}
-
-			// Block validation succeeded - now cache it with subtrees loaded
-			u.logger.Debugf("[ValidateBlock][%s] background validation complete, caching block with subtrees", block.Hash().String())
-			u.lastValidatedBlocks.Set(*block.Hash(), block)
-		}()
+		}
 
 		// create bloom filter for the block and wait for it
 		if err = u.createAppendBloomFilter(decoupledCtx, block); err != nil {

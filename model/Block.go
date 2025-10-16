@@ -1098,7 +1098,15 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 					readCloser, err := subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtree)
 					if err != nil {
 						if errors.Is(err, errors.ErrNotFound) {
-							return subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtree)
+							// Try fallback to SubtreeToCheck - this file exists when CheckBlockSubtrees downloaded
+							// the subtree but couldn't fully validate it (e.g., due to missing parent transactions)
+							readCloser, err = subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+							if err == nil {
+								logger.Debugf("[BLOCK][%s][ID %d] using FileTypeSubtreeToCheck for subtree %s", blockHash, blockID, subtreeHash)
+								return readCloser, nil
+							}
+							// Still not found, return the original NOT_FOUND error
+							return nil, errors.ErrNotFound
 						}
 
 						return nil, err

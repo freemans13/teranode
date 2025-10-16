@@ -3256,7 +3256,7 @@ func TestBlockValidation_SetMined_UpdatesTxMeta(t *testing.T) {
 	err = blockValidation.ValidateBlock(context.Background(), block, "test", model.NewBloomStats())
 	require.NoError(t, err, "Block should be valid")
 
-	err = blockValidation.setTxMined(context.Background(), block.Hash())
+	err = blockValidation.setTxMinedStatus(context.Background(), block.Hash())
 	require.NoError(t, err, "setTxMined should succeed")
 
 	// Assert that both txs are marked as mined in the txMetaStore

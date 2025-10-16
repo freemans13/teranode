@@ -3,7 +3,6 @@ package model
 import (
 	"context"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
@@ -45,7 +44,7 @@ func TestUpdateTxMinedStatus(t *testing.T) {
 		tSettings.UtxoStore = settings.UtxoStoreSettings{
 			UpdateTxMinedStatus: true,
 			MaxMinedBatchSize:   1024,
-			MaxMinedRoutines:    128,
+			MaxMinedRoutines:    1,                // SQLite only supports one writer at a time
 			DBTimeout:           30 * time.Second, // Increase timeout for SQLite in-memory operations
 		}
 		setWorkerSettings(tSettings)
@@ -338,71 +337,6 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 	})
 }
 
-// TestUpdateTxMinedStatus_RetryLogic tests the retry mechanism for failed SetMinedMulti calls
-func TestUpdateTxMinedStatus_RetryLogic(t *testing.T) {
-	ctx := context.Background()
-	logger := ulogger.NewErrorTestLogger(t)
-	tSettings := test.CreateBaseTestSettings(t)
-
-	tSettings.UtxoStore = settings.UtxoStoreSettings{
-		UpdateTxMinedStatus: true,
-		MaxMinedBatchSize:   10,
-		MaxMinedRoutines:    1,
-	}
-	setWorkerSettings(tSettings)
-
-	mockStore := &utxo.MockUtxostore{}
-
-	testTx := newTx(100)
-	block := &Block{}
-	block.Height = 100
-	block.Subtrees = []*chainhash.Hash{testTx.TxIDChainHash()}
-	block.SubtreeSlices = []*subtree.Subtree{
-		{
-			Nodes: []subtree.SubtreeNode{
-				{Hash: *testTx.TxIDChainHash()},
-			},
-		},
-	}
-
-	t.Run("should retry on failure and eventually succeed", func(t *testing.T) {
-		// First call fails
-		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
-		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Once()
-
-		// Second call succeeds
-		expectedBlockIDsMap := map[chainhash.Hash][]uint32{
-			*testTx.TxIDChainHash(): {15},
-		}
-		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Return(expectedBlockIDsMap, nil).Once()
-
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
-
-		require.NoError(t, err)
-		mockStore.AssertExpectations(t)
-	})
-
-	t.Run("should fail after max retries exceeded", func(t *testing.T) {
-		mockStore = &utxo.MockUtxostore{} // Reset mock
-
-		// Mock failure for all retry attempts (maxRetries = 10)
-		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
-		for i := 0; i <= 10; i++ {
-			mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-				Return(emptyBlockIDsMap, errors.NewStorageError("persistent storage error")).Once()
-		}
-
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "error setting remainder batch mined tx")
-
-		mockStore.AssertExpectations(t)
-	})
-}
-
 // TestUpdateTxMinedStatus_ContextCancellation tests context cancellation scenarios
 func TestUpdateTxMinedStatus_ContextCancellation(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
@@ -445,20 +379,6 @@ func TestUpdateTxMinedStatus_ContextCancellation(t *testing.T) {
 		assert.Contains(t, err.Error(), "context canceled")
 	})
 
-	t.Run("should handle context cancellation during retry backoff", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-
-		// First call fails, triggering retry with backoff
-		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
-		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Maybe()
-
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "context canceled")
-	})
 }
 
 // TestUpdateTxMinedStatus_ConfigurationDisabled tests disabled configuration scenario
@@ -800,42 +720,6 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 		mockStore.AssertExpectations(t)
 	})
 
-	t.Run("should handle context cancellation in retry loop", func(t *testing.T) {
-		mockStore := &utxo.MockUtxostore{}
-
-		testTx := newTx(100)
-		block := &Block{}
-		block.Height = 100
-		block.Subtrees = []*chainhash.Hash{testTx.TxIDChainHash()}
-		block.SubtreeSlices = []*subtree.Subtree{
-			{
-				Nodes: []subtree.SubtreeNode{
-					{Hash: *testTx.TxIDChainHash()},
-				},
-			},
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-
-		// Mock first call to fail, which will trigger retry
-		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
-		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Run(func(args mock.Arguments) {
-				// Cancel context during the first call
-				cancel()
-			}).
-			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Once()
-
-		chainBlockIDsMap := map[uint32]bool{}
-
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "context canceled")
-
-		mockStore.AssertExpectations(t)
-	})
-
 	t.Run("should skip processing when UpdateTxMinedStatus disabled", func(t *testing.T) {
 		mockStore := &utxo.MockUtxostore{}
 
@@ -1085,7 +969,49 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 		mockStore.AssertExpectations(t)
 	})
 
-	t.Run("should handle retry with context deadline exceeded", func(t *testing.T) {
+	t.Run("should continue processing all transactions even when SetMinedMulti errors occur", func(t *testing.T) {
+		mockStore := &utxo.MockUtxostore{}
+
+		// Create block with multiple transactions
+		tx1 := newTx(1)
+		tx2 := newTx(2)
+		tx3 := newTx(3)
+
+		block := &Block{}
+		block.Height = 100
+		block.Subtrees = []*chainhash.Hash{tx1.TxIDChainHash()}
+		block.SubtreeSlices = []*subtree.Subtree{
+			{
+				Nodes: []subtree.SubtreeNode{
+					{Hash: *tx1.TxIDChainHash()},
+					{Hash: *tx2.TxIDChainHash()},
+					{Hash: *tx3.TxIDChainHash()},
+				},
+			},
+		}
+
+		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
+
+		// Mock SetMinedMulti to return an error - simulating a timeout or storage error
+		// The new behavior should log this error but continue processing
+		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
+			Return(emptyBlockIDsMap, errors.NewNetworkTimeoutError("timeout error")).Once()
+
+		chainBlockIDsMap := map[uint32]bool{}
+
+		// Call with unsetMined=false (valid block) - errors should be returned
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
+
+		// Should return error for valid blocks when SetMinedMulti fails
+		require.Error(t, err)
+		// Error message should be generic, not containing the original "timeout error" string
+		assert.Contains(t, err.Error(), "failed to set mined status for")
+		assert.Contains(t, err.Error(), "1 batches") // 1 batch failed
+
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("should not return error for invalid blocks when SetMinedMulti errors occur", func(t *testing.T) {
 		mockStore := &utxo.MockUtxostore{}
 
 		testTx := newTx(100)
@@ -1100,24 +1026,20 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 			},
 		}
 
-		// Create context with very short timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		defer cancel()
-
-		// Mock SetMinedMulti to fail multiple times
 		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
+
+		// Mock SetMinedMulti to return an error
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Return(emptyBlockIDsMap, errors.NewNetworkTimeoutError("timeout error")).Maybe()
+			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Once()
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
+		// Call with unsetMined=true (invalid block) - errors should be logged but not returned
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, true)
 
-		require.Error(t, err)
-		assert.True(t,
-			strings.Contains(err.Error(), "context canceled") ||
-				strings.Contains(err.Error(), "context deadline exceeded") ||
-				strings.Contains(err.Error(), "timeout error"),
-			"Should handle context timeout appropriately")
+		// Should NOT return error for invalid blocks - errors are logged only
+		require.NoError(t, err)
+
+		mockStore.AssertExpectations(t)
 	})
 }

@@ -41,6 +41,15 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	)
 	defer deferFn()
 
+	// Panic recovery to ensure pause lock is always released even on crashes
+	defer func() {
+		if r := recover(); r != nil {
+			u.logger.Errorf("[CheckBlockSubtrees] PANIC recovered for block %s: %v", block.Hash().String(), r)
+			// Panic is re-raised after this defer completes, ensuring all defers execute
+			panic(r)
+		}
+	}()
+
 	// Check if the block is on our chain or will become part of our chain
 	// Only pause subtree processing if this block is on our chain or extending our chain
 	shouldPauseProcessing := false
@@ -88,20 +97,21 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}
 
-	var releasePause func()
+	// Acquire and manage pause lock with immediate defer for guaranteed cleanup
 	if shouldPauseProcessing {
-		u.logger.Infof("[CheckBlockSubtrees] Block %s is on our chain or extending it - pausing subtree processing across all pods", block.Hash().String())
-		var err error
-		releasePause, err = u.setPauseProcessing(ctx)
+		u.logger.Infof("[CheckBlockSubtrees] Block %s is on our chain or extending it - acquiring pause lock across all pods", block.Hash().String())
+
+		releasePause, err := u.setPauseProcessing(ctx)
+		// Always defer - safe to call even on error (returns noopFunc which does nothing)
+		defer releasePause()
+
 		if err != nil {
 			u.logger.Warnf("[CheckBlockSubtrees] Failed to acquire distributed pause lock: %v - continuing without pause", err)
+		} else {
+			u.logger.Infof("[CheckBlockSubtrees] Pause lock acquired successfully for block %s", block.Hash().String())
 		}
 	} else {
 		u.logger.Infof("[CheckBlockSubtrees] Block %s is on a different fork - not pausing subtree processing", block.Hash().String())
-	}
-
-	if releasePause != nil {
-		defer releasePause()
 	}
 
 	// validate all the subtrees in the block
@@ -567,6 +577,14 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 				txMeta, err := u.blessMissingTransaction(gCtx, chainhash.Hash{}, tx, blockHeight, blockIds, processedValidatorOptions)
 				if err != nil {
 					u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
+
+					// TX_EXISTS is not an error - transaction was already validated
+					if errors.Is(err, errors.ErrTxExists) {
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping", tx.TxIDChainHash().String())
+						return nil
+					}
+
+					// Count all other errors
 					errorsFound.Add(1)
 
 					// Handle missing parent transactions by adding to orphanage
@@ -611,9 +629,9 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	if errorsFound.Load() > 0 {
 		u.logger.Warnf("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
-	} else {
-		u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions", len(allTransactions))
+		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
 	}
 
+	u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions", len(allTransactions))
 	return nil
 }

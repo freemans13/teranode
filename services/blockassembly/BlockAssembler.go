@@ -383,15 +383,46 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 		} // for
 	}()
 
-	select {
-	case <-time.After(time.Second * 30):
-		return errors.NewProcessingError("[BlockAssembler] timeout waiting for blockchain subscription to be ready")
-	case <-readyCh:
-	case <-ctx.Done():
-		return nil
-	}
+	// Use a smart polling loop that resets timeout while FSM is catching up
+	checkInterval := 10 * time.Second
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
 
-	return nil
+	timeoutTimer := time.NewTimer(b.settings.BlockAssembly.BlockchainSubscriptionTimeout)
+	defer timeoutTimer.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check if we're catching blocks - if so, reset the timeout
+			isCatching, err := b.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateCATCHINGBLOCKS)
+			if err != nil {
+				b.logger.Errorf("[BlockAssembler] Failed to get current state: %s", err)
+			}
+
+			isLegacySync, err := b.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateLEGACYSYNCING)
+			if err != nil {
+				b.logger.Errorf("[BlockAssembler] Failed to get current state: %s", err)
+			}
+
+			if err == nil && (isCatching || isLegacySync) {
+				b.logger.Infof("[BlockAssembler] FSM is CATCHINGBLOCKS or LEGACYSYNCING, resetting subscription timeout and waiting patiently")
+				if !timeoutTimer.Stop() {
+					<-timeoutTimer.C
+				}
+				timeoutTimer.Reset(b.settings.BlockAssembly.BlockchainSubscriptionTimeout)
+			}
+
+		case <-timeoutTimer.C:
+			return errors.NewProcessingError("[BlockAssembler] timeout waiting for blockchain subscription to be ready")
+
+		case <-readyCh:
+			return nil
+
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
@@ -1491,7 +1522,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 			}
 
 			if skipAlreadyMined {
-				b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
+				// b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
 
 				if unminedTransaction.UnminedSince > 0 {
 					markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, *unminedTransaction.Hash)

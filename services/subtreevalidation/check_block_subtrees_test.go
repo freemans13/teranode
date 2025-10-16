@@ -902,11 +902,12 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			mock.Anything, blockchain.FSMStateRUNNING).
 			Return(true, nil)
 
-		// Should not fail, should add to orphanage
+		// Should fail because transaction has missing parent
 		err = server.processTransactionsInLevels(context.Background(), allTransactions, 100, blockIds)
-		require.NoError(t, err)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "processTransactionsInLevels")
 
-		// Verify transaction was added to orphanage
+		// Verify transaction was added to orphanage even though processing failed
 		assert.Equal(t, 1, server.orphanage.Len())
 	})
 
@@ -931,11 +932,12 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			mock.Anything, blockchain.FSMStateRUNNING).
 			Return(false, nil)
 
-		// Should not fail, but transaction should NOT be added to orphanage
+		// Should fail because transaction has validation errors and blockchain not running
 		err = server.processTransactionsInLevels(context.Background(), allTransactions, 100, blockIds)
-		require.NoError(t, err)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "processTransactionsInLevels")
 
-		// Verify transaction was NOT added to orphanage
+		// Verify transaction was NOT added to orphanage (blockchain not running)
 		assert.Equal(t, 0, server.orphanage.Len())
 	})
 
@@ -960,11 +962,12 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			mock.Anything, blockchain.FSMStateRUNNING).
 			Return(false, errors.NewServiceError("blockchain client error"))
 
-		// Should not fail, but transaction should NOT be added to orphanage due to error
+		// Should fail because transaction has validation errors and blockchain client error
 		err = server.processTransactionsInLevels(context.Background(), allTransactions, 100, blockIds)
-		require.NoError(t, err)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "processTransactionsInLevels")
 
-		// Verify transaction was NOT added to orphanage
+		// Verify transaction was NOT added to orphanage (blockchain client error)
 		assert.Equal(t, 0, server.orphanage.Len())
 	})
 

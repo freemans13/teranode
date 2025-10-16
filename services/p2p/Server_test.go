@@ -2341,7 +2341,10 @@ func TestServerStartFull(t *testing.T) {
 	// Run server
 	go func() {
 		err := server.Start(ctx, readyCh)
-		require.NoError(t, err)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			// Log error but don't use require in goroutine
+			logger.Errorf("server.Start failed: %v", err)
+		}
 	}()
 
 	select {
@@ -2567,8 +2570,10 @@ func TestServerRejectedHandler(t *testing.T) {
 		mockBC.On("GetFSMCurrentState", mock.Anything).Return(&syncFSM, nil)
 
 		mockP2P := new(MockServerP2PClient)
+		testSettings := createBaseTestSettings()
+		testSettings.P2P.ListenMode = settings.ListenModeFull // Ensure not in listen-only mode
 		s := &Server{
-			settings:            createBaseTestSettings(),
+			settings:            testSettings,
 			logger:              logger,
 			blockchainClient:    mockBC,
 			P2PClient:           mockP2P,
@@ -2597,8 +2602,10 @@ func TestServerRejectedHandler(t *testing.T) {
 			On("Publish", mock.Anything, "rejected-topic", mock.Anything).
 			Return(errors.NewConfigurationError("Can't publish P2P topic"))
 
+		testSettings := createBaseTestSettings()
+		testSettings.P2P.ListenMode = settings.ListenModeFull // Ensure not in listen-only mode
 		s := &Server{
-			settings:            createBaseTestSettings(),
+			settings:            testSettings,
 			logger:              logger,
 			blockchainClient:    mockBC,
 			P2PClient:           mockP2P,
@@ -2622,8 +2629,10 @@ func TestServerRejectedHandler(t *testing.T) {
 
 		mockP2P := new(MockServerP2PClient)
 
+		testSettings := createBaseTestSettings()
+		testSettings.P2P.ListenMode = settings.ListenModeFull // Ensure not in listen-only mode
 		s := &Server{
-			settings:         createBaseTestSettings(),
+			settings:         testSettings,
 			logger:           logger,
 			blockchainClient: mockBC,
 			P2PClient:        mockP2P,
@@ -2648,8 +2657,10 @@ func TestServerRejectedHandler(t *testing.T) {
 		mockP2P := new(MockServerP2PClient)
 		mockP2P.On("GetID").Return(peer.ID("peer-123"))
 
+		testSettings := createBaseTestSettings()
+		testSettings.P2P.ListenMode = settings.ListenModeFull // Ensure not in listen-only mode
 		s := &Server{
-			settings:            createBaseTestSettings(),
+			settings:            testSettings,
 			logger:              logger,
 			blockchainClient:    mockBC,
 			P2PClient:           mockP2P,
@@ -2835,12 +2846,13 @@ func TestHandleBlockNotificationSuccess(t *testing.T) {
 	mockP2P.On("Publish", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	mockBlockchain := new(blockchain.Mock)
-	mockBlockchain.On("GetBlockHeader", ctx, testHash).Return(header, meta, nil).Once()
+	mockBlockchain.On("GetBlockHeader", mock.Anything, testHash).Return(header, meta, nil).Once()
 	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(header, &model.BlockHeaderMeta{Height: 100}, nil).Maybe()
-	mockBlockchain.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
+	mockBlockchain.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil).Maybe()
 
 	testSettings := settings.NewSettings()
 	testSettings.Coinbase.ArbitraryText = "MockMiner"
+	testSettings.P2P.ListenMode = settings.ListenModeFull // Ensure not in listen-only mode
 
 	mockServer := &Server{
 		P2PClient:           mockP2P,
@@ -2870,10 +2882,13 @@ func TestHandleSubtreeNotificationSuccess(t *testing.T) {
 
 	mockP2P := new(MockServerP2PClient)
 	mockP2P.On("GetID").Return(peer.ID("peer-123"))
-	mockP2P.On("Publish", ctx, subtreeTopicName, mock.Anything).Return(nil)
+	mockP2P.On("Publish", mock.Anything, subtreeTopicName, mock.Anything).Return(nil)
+
+	testSettings := createBaseTestSettings()
+	testSettings.P2P.ListenMode = settings.ListenModeFull // Ensure not in listen-only mode
 
 	server := &Server{
-		settings:            createBaseTestSettings(),
+		settings:            testSettings,
 		P2PClient:           mockP2P,
 		subtreeTopicName:    subtreeTopicName,
 		AssetHTTPAddressURL: "https://datahub.node",
@@ -2883,7 +2898,7 @@ func TestHandleSubtreeNotificationSuccess(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify that Publish was called
-	mockP2P.AssertCalled(t, "Publish", ctx, subtreeTopicName, mock.Anything)
+	mockP2P.AssertCalled(t, "Publish", mock.Anything, subtreeTopicName, mock.Anything)
 }
 
 func TestProcessBlockchainNotificationSubtree(t *testing.T) {
@@ -2900,10 +2915,13 @@ func TestProcessBlockchainNotificationSubtree(t *testing.T) {
 
 	mockP2P := new(MockServerP2PClient)
 	mockP2P.On("GetID").Return(peer.ID("peer-123"))
-	mockP2P.On("Publish", ctx, subtreeTopicName, mock.Anything).Return(nil)
+	mockP2P.On("Publish", mock.Anything, subtreeTopicName, mock.Anything).Return(nil)
+
+	testSettings := createBaseTestSettings()
+	testSettings.P2P.ListenMode = settings.ListenModeFull // Ensure not in listen-only mode
 
 	server := &Server{
-		settings:            createBaseTestSettings(),
+		settings:            testSettings,
 		P2PClient:           mockP2P,
 		subtreeTopicName:    subtreeTopicName,
 		AssetHTTPAddressURL: "https://datahub.node",
@@ -2912,7 +2930,7 @@ func TestProcessBlockchainNotificationSubtree(t *testing.T) {
 
 	err := server.processBlockchainNotification(ctx, notification)
 	assert.NoError(t, err)
-	mockP2P.AssertCalled(t, "Publish", ctx, subtreeTopicName, mock.Anything)
+	mockP2P.AssertCalled(t, "Publish", mock.Anything, subtreeTopicName, mock.Anything)
 }
 
 func TestProcessBlockchainNotificationUnknownType(t *testing.T) {

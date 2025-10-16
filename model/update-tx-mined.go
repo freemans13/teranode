@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -172,11 +173,10 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, tSettings.UtxoStore.MaxMinedRoutines)
 
-	maxRetries := 10
-
 	var (
 		blockInvalidError   error
 		blockInvalidErrorMu = sync.Mutex{}
+		setMinedErrorCount  = atomic.Uint64{}
 	)
 
 	for subtreeIdx, subtree := range block.SubtreeSlices {
@@ -221,92 +221,18 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 
 					logger.Debugf("[UpdateTxMinedStatus][%s][%s] for %d hashes, batch %d of %d", block.String(), block.Subtrees[subtreeIdx].String(), len(hashes), batchNr, batchTotal)
 
-					retries := 0
-
-					for {
-						// Check if context is canceled before attempting
-						select {
-						case <-gCtx.Done():
-							return errors.NewProcessingError("[UpdateTxMinedStatus][%s] context canceled during retry", block.Hash().String(), gCtx.Err())
-						default:
-						}
-
-						blockIDsMap, err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo)
-						if err != nil {
-							if retries >= maxRetries {
-								return errors.NewProcessingError("[UpdateTxMinedStatus][%s] error setting mined tx", block.Hash().String(), err)
-							} else {
-								backoff := time.Duration(1+(200*retries)) * time.Millisecond
-								logger.Warnf("[UpdateTxMinedStatus][%s] error setting mined tx, retrying in %s: %v", block.Hash().String(), backoff.String(), err)
-
-								// Use a timer with context cancellation check
-								timer := time.NewTimer(backoff)
-								select {
-								case <-gCtx.Done():
-									timer.Stop()
-									return errors.NewProcessingError("[UpdateTxMinedStatus][%s] context canceled during backoff", block.Hash().String(), gCtx.Err())
-								case <-timer.C:
-								}
-							}
-						} else {
-							if !minedBlockInfo.UnsetMined {
-								// check that all blockIDs are not already on our chain
-								if len(chainBlockIDsMap) > 0 {
-									for _, bIDs := range blockIDsMap {
-										for _, bID := range bIDs {
-											if _, exists := chainBlockIDsMap[bID]; exists && bID != blockID {
-												// this transaction is already on our chain, the block is invalid
-												blockInvalidErrorMu.Lock()
-												blockInvalidError = errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain, blockID %d", block.Hash().String(), bID)
-												blockInvalidErrorMu.Unlock()
-											}
-										}
-									}
-								}
-							}
-
-							break
-						}
-
-						retries++
-					}
-
-					hashes = make([]*chainhash.Hash, 0, maxMinedBatchSize)
-				}
-			}
-
-			if len(hashes) > 0 {
-				retries := 0
-
-				for {
 					// Check if context is canceled before attempting
 					select {
 					case <-gCtx.Done():
-						return errors.NewProcessingError("[UpdateTxMinedStatus][%s] context canceled during remainder retry", block.Hash().String(), gCtx.Err())
+						return errors.NewProcessingError("[UpdateTxMinedStatus][%s] context canceled during retry", block.Hash().String(), gCtx.Err())
 					default:
 					}
 
-					logger.Debugf("[UpdateTxMinedStatus][%s][%s] for %d remainder hashes", block.String(), block.Subtrees[subtreeIdx].String(), len(hashes))
-
 					blockIDsMap, err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo)
 					if err != nil {
-						if retries >= maxRetries {
-							return errors.NewProcessingError("[UpdateTxMinedStatus][%s] error setting remainder batch mined tx", block.Hash().String(), err)
-						} else {
-							backoff := time.Duration(1+(200*retries)) * time.Millisecond
-							logger.Warnf("[UpdateTxMinedStatus][%s] error setting remainder batch mined tx, retrying in %s: %v", block.Hash().String(), backoff.String(), err)
-
-							// Use a timer with context cancellation check
-							timer := time.NewTimer(backoff)
-							select {
-							case <-gCtx.Done():
-								timer.Stop()
-								return errors.NewProcessingError("[UpdateTxMinedStatus][%s] context canceled during remainder backoff", block.Hash().String(), gCtx.Err())
-							case <-timer.C:
-							}
-						}
-
-						retries++
+						// Log error, increment counter, and continue processing all transactions
+						logger.Warnf("[UpdateTxMinedStatus][%s] error setting mined tx for batch %d/%d: %v", block.Hash().String(), batchNr, batchTotal, err)
+						setMinedErrorCount.Add(1)
 					} else {
 						if !minedBlockInfo.UnsetMined {
 							// check that all blockIDs are not already on our chain
@@ -323,9 +249,44 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 								}
 							}
 						}
-
-						break
 					}
+
+					hashes = make([]*chainhash.Hash, 0, maxMinedBatchSize)
+				}
+			}
+
+			if len(hashes) > 0 {
+				// Check if context is canceled before attempting
+				select {
+				case <-gCtx.Done():
+					return errors.NewProcessingError("[UpdateTxMinedStatus][%s] context canceled during remainder SetMinedMulti", block.Hash().String(), gCtx.Err())
+				default:
+				}
+
+				logger.Debugf("[UpdateTxMinedStatus][%s][%s] for %d remainder hashes", block.String(), block.Subtrees[subtreeIdx].String(), len(hashes))
+
+				blockIDsMap, err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo)
+				if err != nil {
+					// Log error, increment counter, and continue processing all transactions
+					logger.Warnf("[UpdateTxMinedStatus][%s] error setting mined tx for remainder batch: %v", block.Hash().String(), err)
+					setMinedErrorCount.Add(1)
+				} else {
+					if !minedBlockInfo.UnsetMined {
+						// check that all blockIDs are not already on our chain
+						if len(chainBlockIDsMap) > 0 {
+							for hash, bIDs := range blockIDsMap {
+								for _, bID := range bIDs {
+									if _, exists := chainBlockIDsMap[bID]; exists && bID != blockID {
+										// this transaction is already on our chain, the block is invalid
+										blockInvalidErrorMu.Lock()
+										blockInvalidError = errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain: %s, blockID %d", block.Hash().String(), hash.String(), bID)
+										blockInvalidErrorMu.Unlock()
+									}
+								}
+							}
+						}
+					}
+
 				}
 			}
 
@@ -335,6 +296,17 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 
 	if err = g.Wait(); err != nil {
 		return errors.NewProcessingError("[UpdateTxMinedStatus][%s] error updating tx mined status", block.Hash().String(), err)
+	}
+
+	// Check if there were any SetMinedMulti errors
+	if setMinedErrorCount.Load() > 0 {
+		if unsetMined {
+			// For invalid blocks, we've already logged the errors - continue without error
+			logger.Warnf("[UpdateTxMinedStatus][%s] completed with %d SetMinedMulti errors for invalid block (already logged)", block.Hash().String(), setMinedErrorCount.Load())
+		} else {
+			// For valid blocks, SetMinedMulti errors are critical - return error
+			return errors.NewProcessingError("[UpdateTxMinedStatus][%s] failed to set mined status for %d batches", block.Hash().String(), setMinedErrorCount.Load())
+		}
 	}
 
 	// if the block was found to be invalid, return that error

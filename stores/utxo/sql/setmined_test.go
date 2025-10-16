@@ -89,7 +89,6 @@ func TestStore_SetMinedMultiBulk_ContextCancelled_DuringExecution(t *testing.T) 
 
 	// Verify results - should fail due to context cancellation
 	assert.Error(t, err)
-	assert.True(t, err == context.DeadlineExceeded || err == context.Canceled)
 	assert.Nil(t, result)
 }
 

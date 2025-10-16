@@ -80,11 +80,11 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 			WHERE hash = $1
 			UNION
 			SELECT b.id, b.hash, b.previous_hash
-			FROM blocks b	
-			INNER JOIN children c ON c.hash = b.previous_hash	
+			FROM blocks b
+			INNER JOIN children c ON c.hash = b.previous_hash
 		)
 		UPDATE blocks
-		SET invalid = true
+		SET invalid = true, mined_set = false
 		WHERE id IN (SELECT id FROM children)
 		RETURNING hash
 	`
