@@ -218,6 +218,8 @@ func (h *HTTP) formatResponse(c echo.Context, mode ReadMode, headers []*model.Bl
 				TxCount:     headerMetas[idx].TxCount,
 				SizeInBytes: headerMetas[idx].SizeInBytes,
 				Miner:       headerMetas[idx].Miner,
+				Invalid:     headerMetas[idx].Invalid,
+				ProcessedAt: headerMetas[idx].ProcessedAt,
 			})
 		}
 

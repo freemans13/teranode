@@ -1746,6 +1746,7 @@ type GetBlockHeaderResponse struct {
 	MinedSet      bool                   `protobuf:"varint,11,opt,name=mined_set,json=minedSet,proto3" json:"mined_set,omitempty"`           // Mined status
 	SubtreesSet   bool                   `protobuf:"varint,12,opt,name=subtrees_set,json=subtreesSet,proto3" json:"subtrees_set,omitempty"`  // Subtrees status
 	Invalid       bool                   `protobuf:"varint,13,opt,name=invalid,proto3" json:"invalid,omitempty"`                             // Validity status
+	ProcessedAt   *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=processed_at,json=processedAt,proto3" json:"processed_at,omitempty"`   // Timestamp when block was processed
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1869,6 +1870,13 @@ func (x *GetBlockHeaderResponse) GetInvalid() bool {
 		return x.Invalid
 	}
 	return false
+}
+
+func (x *GetBlockHeaderResponse) GetProcessedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ProcessedAt
+	}
+	return nil
 }
 
 // CheckBlockIsCurrentChainResponse indicates if blocks are in the main chain.
@@ -3753,7 +3761,7 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\x17InvalidateBlockResponse\x12,\n" +
 	"\x11invalidatedBlocks\x18\x01 \x03(\fR\x11invalidatedBlocks\"6\n" +
 	"\x16RevalidateBlockRequest\x12\x1c\n" +
-	"\tblockHash\x18\x01 \x01(\fR\tblockHash\"\x86\x03\n" +
+	"\tblockHash\x18\x01 \x01(\fR\tblockHash\"\xc5\x03\n" +
 	"\x16GetBlockHeaderResponse\x12 \n" +
 	"\vblockHeader\x18\x01 \x01(\fR\vblockHeader\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\rR\x02id\x12\x16\n" +
@@ -3770,7 +3778,8 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	" \x01(\fR\tchainWork\x12\x1b\n" +
 	"\tmined_set\x18\v \x01(\bR\bminedSet\x12!\n" +
 	"\fsubtrees_set\x18\f \x01(\bR\vsubtreesSet\x12\x18\n" +
-	"\ainvalid\x18\r \x01(\bR\ainvalid\"V\n" +
+	"\ainvalid\x18\r \x01(\bR\ainvalid\x12=\n" +
+	"\fprocessed_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\vprocessedAt\"V\n" +
 	" CheckBlockIsCurrentChainResponse\x122\n" +
 	"\x14isPartOfCurrentChain\x18\x01 \x01(\bR\x14isPartOfCurrentChain\"*\n" +
 	"\x10SubscribeRequest\x12\x16\n" +
@@ -4038,125 +4047,126 @@ var file_services_blockchain_blockchain_api_blockchain_api_proto_goTypes = []any
 }
 var file_services_blockchain_blockchain_api_blockchain_api_proto_depIdxs = []int32{
 	70, // 0: blockchain_api.HealthResponse.timestamp:type_name -> google.protobuf.Timestamp
-	71, // 1: blockchain_api.Notification.type:type_name -> model.NotificationType
-	36, // 2: blockchain_api.Notification.metadata:type_name -> blockchain_api.NotificationMetadata
-	69, // 3: blockchain_api.NotificationMetadata.metadata:type_name -> blockchain_api.NotificationMetadata.MetadataEntry
-	72, // 4: blockchain_api.GetLastNBlocksResponse.blocks:type_name -> model.BlockInfo
-	72, // 5: blockchain_api.GetLastNInvalidBlocksResponse.blocks:type_name -> model.BlockInfo
-	73, // 6: blockchain_api.GetSuitableBlockResponse.block:type_name -> model.SuitableBlock
-	1,  // 7: blockchain_api.GetFSMStateResponse.state:type_name -> blockchain_api.FSMStateType
-	1,  // 8: blockchain_api.WaitFSMToTransitionRequest.state:type_name -> blockchain_api.FSMStateType
-	0,  // 9: blockchain_api.SendFSMEventRequest.event:type_name -> blockchain_api.FSMEventType
-	74, // 10: blockchain_api.GetChainTipsResponse.tips:type_name -> model.ChainTip
-	75, // 11: blockchain_api.BlockchainAPI.HealthGRPC:input_type -> google.protobuf.Empty
-	3,  // 12: blockchain_api.BlockchainAPI.AddBlock:input_type -> blockchain_api.AddBlockRequest
-	4,  // 13: blockchain_api.BlockchainAPI.GetBlock:input_type -> blockchain_api.GetBlockRequest
-	5,  // 14: blockchain_api.BlockchainAPI.GetBlocks:input_type -> blockchain_api.GetBlocksRequest
-	7,  // 15: blockchain_api.BlockchainAPI.GetBlockByHeight:input_type -> blockchain_api.GetBlockByHeightRequest
-	8,  // 16: blockchain_api.BlockchainAPI.GetBlockByID:input_type -> blockchain_api.GetBlockByIDRequest
-	75, // 17: blockchain_api.BlockchainAPI.GetNextBlockID:input_type -> google.protobuf.Empty
-	75, // 18: blockchain_api.BlockchainAPI.GetBlockStats:input_type -> google.protobuf.Empty
-	13, // 19: blockchain_api.BlockchainAPI.GetBlockGraphData:input_type -> blockchain_api.GetBlockGraphDataRequest
-	42, // 20: blockchain_api.BlockchainAPI.GetLastNBlocks:input_type -> blockchain_api.GetLastNBlocksRequest
-	44, // 21: blockchain_api.BlockchainAPI.GetLastNInvalidBlocks:input_type -> blockchain_api.GetLastNInvalidBlocksRequest
-	46, // 22: blockchain_api.BlockchainAPI.GetSuitableBlock:input_type -> blockchain_api.GetSuitableBlockRequest
-	48, // 23: blockchain_api.BlockchainAPI.GetHashOfAncestorBlock:input_type -> blockchain_api.GetHashOfAncestorBlockRequest
-	49, // 24: blockchain_api.BlockchainAPI.GetLatestBlockHeaderFromBlockLocator:input_type -> blockchain_api.GetLatestBlockHeaderFromBlockLocatorRequest
-	50, // 25: blockchain_api.BlockchainAPI.GetBlockHeadersFromOldest:input_type -> blockchain_api.GetBlockHeadersFromOldestRequest
-	52, // 26: blockchain_api.BlockchainAPI.GetNextWorkRequired:input_type -> blockchain_api.GetNextWorkRequiredRequest
-	4,  // 27: blockchain_api.BlockchainAPI.GetBlockExists:input_type -> blockchain_api.GetBlockRequest
-	16, // 28: blockchain_api.BlockchainAPI.GetBlockHeaders:input_type -> blockchain_api.GetBlockHeadersRequest
-	17, // 29: blockchain_api.BlockchainAPI.GetBlockHeadersToCommonAncestor:input_type -> blockchain_api.GetBlockHeadersToCommonAncestorRequest
-	18, // 30: blockchain_api.BlockchainAPI.GetBlockHeadersFromCommonAncestor:input_type -> blockchain_api.GetBlockHeadersFromCommonAncestorRequest
-	20, // 31: blockchain_api.BlockchainAPI.GetBlockHeadersFromTill:input_type -> blockchain_api.GetBlockHeadersFromTillRequest
-	21, // 32: blockchain_api.BlockchainAPI.GetBlockHeadersFromHeight:input_type -> blockchain_api.GetBlockHeadersFromHeightRequest
-	23, // 33: blockchain_api.BlockchainAPI.GetBlockHeadersByHeight:input_type -> blockchain_api.GetBlockHeadersByHeightRequest
-	16, // 34: blockchain_api.BlockchainAPI.GetBlockHeaderIDs:input_type -> blockchain_api.GetBlockHeadersRequest
-	75, // 35: blockchain_api.BlockchainAPI.GetBestBlockHeader:input_type -> google.protobuf.Empty
-	28, // 36: blockchain_api.BlockchainAPI.CheckBlockIsInCurrentChain:input_type -> blockchain_api.CheckBlockIsCurrentChainRequest
-	75, // 37: blockchain_api.BlockchainAPI.GetChainTips:input_type -> google.protobuf.Empty
-	27, // 38: blockchain_api.BlockchainAPI.GetBlockHeader:input_type -> blockchain_api.GetBlockHeaderRequest
-	29, // 39: blockchain_api.BlockchainAPI.InvalidateBlock:input_type -> blockchain_api.InvalidateBlockRequest
-	31, // 40: blockchain_api.BlockchainAPI.RevalidateBlock:input_type -> blockchain_api.RevalidateBlockRequest
-	34, // 41: blockchain_api.BlockchainAPI.Subscribe:input_type -> blockchain_api.SubscribeRequest
-	35, // 42: blockchain_api.BlockchainAPI.SendNotification:input_type -> blockchain_api.Notification
-	37, // 43: blockchain_api.BlockchainAPI.GetState:input_type -> blockchain_api.GetStateRequest
-	39, // 44: blockchain_api.BlockchainAPI.SetState:input_type -> blockchain_api.SetStateRequest
-	40, // 45: blockchain_api.BlockchainAPI.GetBlockIsMined:input_type -> blockchain_api.GetBlockIsMinedRequest
-	54, // 46: blockchain_api.BlockchainAPI.SetBlockMinedSet:input_type -> blockchain_api.SetBlockMinedSetRequest
-	75, // 47: blockchain_api.BlockchainAPI.GetBlocksMinedNotSet:input_type -> google.protobuf.Empty
-	56, // 48: blockchain_api.BlockchainAPI.SetBlockSubtreesSet:input_type -> blockchain_api.SetBlockSubtreesSetRequest
-	75, // 49: blockchain_api.BlockchainAPI.GetBlocksSubtreesNotSet:input_type -> google.protobuf.Empty
-	58, // 50: blockchain_api.BlockchainAPI.SetBlockProcessedAt:input_type -> blockchain_api.SetBlockProcessedAtRequest
-	61, // 51: blockchain_api.BlockchainAPI.SendFSMEvent:input_type -> blockchain_api.SendFSMEventRequest
-	75, // 52: blockchain_api.BlockchainAPI.GetFSMCurrentState:input_type -> google.protobuf.Empty
-	60, // 53: blockchain_api.BlockchainAPI.WaitFSMToTransitionToGivenState:input_type -> blockchain_api.WaitFSMToTransitionRequest
-	75, // 54: blockchain_api.BlockchainAPI.WaitUntilFSMTransitionFromIdleState:input_type -> google.protobuf.Empty
-	75, // 55: blockchain_api.BlockchainAPI.Run:input_type -> google.protobuf.Empty
-	75, // 56: blockchain_api.BlockchainAPI.CatchUpBlocks:input_type -> google.protobuf.Empty
-	75, // 57: blockchain_api.BlockchainAPI.LegacySync:input_type -> google.protobuf.Empty
-	75, // 58: blockchain_api.BlockchainAPI.Idle:input_type -> google.protobuf.Empty
-	68, // 59: blockchain_api.BlockchainAPI.ReportPeerFailure:input_type -> blockchain_api.ReportPeerFailureRequest
-	62, // 60: blockchain_api.BlockchainAPI.GetBlockLocator:input_type -> blockchain_api.GetBlockLocatorRequest
-	64, // 61: blockchain_api.BlockchainAPI.LocateBlockHeaders:input_type -> blockchain_api.LocateBlockHeadersRequest
-	75, // 62: blockchain_api.BlockchainAPI.GetBestHeightAndTime:input_type -> google.protobuf.Empty
-	2,  // 63: blockchain_api.BlockchainAPI.HealthGRPC:output_type -> blockchain_api.HealthResponse
-	75, // 64: blockchain_api.BlockchainAPI.AddBlock:output_type -> google.protobuf.Empty
-	11, // 65: blockchain_api.BlockchainAPI.GetBlock:output_type -> blockchain_api.GetBlockResponse
-	6,  // 66: blockchain_api.BlockchainAPI.GetBlocks:output_type -> blockchain_api.GetBlocksResponse
-	11, // 67: blockchain_api.BlockchainAPI.GetBlockByHeight:output_type -> blockchain_api.GetBlockResponse
-	11, // 68: blockchain_api.BlockchainAPI.GetBlockByID:output_type -> blockchain_api.GetBlockResponse
-	9,  // 69: blockchain_api.BlockchainAPI.GetNextBlockID:output_type -> blockchain_api.GetNextBlockIDResponse
-	76, // 70: blockchain_api.BlockchainAPI.GetBlockStats:output_type -> model.BlockStats
-	77, // 71: blockchain_api.BlockchainAPI.GetBlockGraphData:output_type -> model.BlockDataPoints
-	43, // 72: blockchain_api.BlockchainAPI.GetLastNBlocks:output_type -> blockchain_api.GetLastNBlocksResponse
-	45, // 73: blockchain_api.BlockchainAPI.GetLastNInvalidBlocks:output_type -> blockchain_api.GetLastNInvalidBlocksResponse
-	47, // 74: blockchain_api.BlockchainAPI.GetSuitableBlock:output_type -> blockchain_api.GetSuitableBlockResponse
-	51, // 75: blockchain_api.BlockchainAPI.GetHashOfAncestorBlock:output_type -> blockchain_api.GetHashOfAncestorBlockResponse
-	32, // 76: blockchain_api.BlockchainAPI.GetLatestBlockHeaderFromBlockLocator:output_type -> blockchain_api.GetBlockHeaderResponse
-	19, // 77: blockchain_api.BlockchainAPI.GetBlockHeadersFromOldest:output_type -> blockchain_api.GetBlockHeadersResponse
-	53, // 78: blockchain_api.BlockchainAPI.GetNextWorkRequired:output_type -> blockchain_api.GetNextWorkRequiredResponse
-	14, // 79: blockchain_api.BlockchainAPI.GetBlockExists:output_type -> blockchain_api.GetBlockExistsResponse
-	19, // 80: blockchain_api.BlockchainAPI.GetBlockHeaders:output_type -> blockchain_api.GetBlockHeadersResponse
-	19, // 81: blockchain_api.BlockchainAPI.GetBlockHeadersToCommonAncestor:output_type -> blockchain_api.GetBlockHeadersResponse
-	19, // 82: blockchain_api.BlockchainAPI.GetBlockHeadersFromCommonAncestor:output_type -> blockchain_api.GetBlockHeadersResponse
-	19, // 83: blockchain_api.BlockchainAPI.GetBlockHeadersFromTill:output_type -> blockchain_api.GetBlockHeadersResponse
-	22, // 84: blockchain_api.BlockchainAPI.GetBlockHeadersFromHeight:output_type -> blockchain_api.GetBlockHeadersFromHeightResponse
-	24, // 85: blockchain_api.BlockchainAPI.GetBlockHeadersByHeight:output_type -> blockchain_api.GetBlockHeadersByHeightResponse
-	25, // 86: blockchain_api.BlockchainAPI.GetBlockHeaderIDs:output_type -> blockchain_api.GetBlockHeaderIDsResponse
-	32, // 87: blockchain_api.BlockchainAPI.GetBestBlockHeader:output_type -> blockchain_api.GetBlockHeaderResponse
-	33, // 88: blockchain_api.BlockchainAPI.CheckBlockIsInCurrentChain:output_type -> blockchain_api.CheckBlockIsCurrentChainResponse
-	67, // 89: blockchain_api.BlockchainAPI.GetChainTips:output_type -> blockchain_api.GetChainTipsResponse
-	32, // 90: blockchain_api.BlockchainAPI.GetBlockHeader:output_type -> blockchain_api.GetBlockHeaderResponse
-	30, // 91: blockchain_api.BlockchainAPI.InvalidateBlock:output_type -> blockchain_api.InvalidateBlockResponse
-	75, // 92: blockchain_api.BlockchainAPI.RevalidateBlock:output_type -> google.protobuf.Empty
-	35, // 93: blockchain_api.BlockchainAPI.Subscribe:output_type -> blockchain_api.Notification
-	75, // 94: blockchain_api.BlockchainAPI.SendNotification:output_type -> google.protobuf.Empty
-	38, // 95: blockchain_api.BlockchainAPI.GetState:output_type -> blockchain_api.StateResponse
-	75, // 96: blockchain_api.BlockchainAPI.SetState:output_type -> google.protobuf.Empty
-	41, // 97: blockchain_api.BlockchainAPI.GetBlockIsMined:output_type -> blockchain_api.GetBlockIsMinedResponse
-	75, // 98: blockchain_api.BlockchainAPI.SetBlockMinedSet:output_type -> google.protobuf.Empty
-	55, // 99: blockchain_api.BlockchainAPI.GetBlocksMinedNotSet:output_type -> blockchain_api.GetBlocksMinedNotSetResponse
-	75, // 100: blockchain_api.BlockchainAPI.SetBlockSubtreesSet:output_type -> google.protobuf.Empty
-	57, // 101: blockchain_api.BlockchainAPI.GetBlocksSubtreesNotSet:output_type -> blockchain_api.GetBlocksSubtreesNotSetResponse
-	75, // 102: blockchain_api.BlockchainAPI.SetBlockProcessedAt:output_type -> google.protobuf.Empty
-	59, // 103: blockchain_api.BlockchainAPI.SendFSMEvent:output_type -> blockchain_api.GetFSMStateResponse
-	59, // 104: blockchain_api.BlockchainAPI.GetFSMCurrentState:output_type -> blockchain_api.GetFSMStateResponse
-	75, // 105: blockchain_api.BlockchainAPI.WaitFSMToTransitionToGivenState:output_type -> google.protobuf.Empty
-	75, // 106: blockchain_api.BlockchainAPI.WaitUntilFSMTransitionFromIdleState:output_type -> google.protobuf.Empty
-	75, // 107: blockchain_api.BlockchainAPI.Run:output_type -> google.protobuf.Empty
-	75, // 108: blockchain_api.BlockchainAPI.CatchUpBlocks:output_type -> google.protobuf.Empty
-	75, // 109: blockchain_api.BlockchainAPI.LegacySync:output_type -> google.protobuf.Empty
-	75, // 110: blockchain_api.BlockchainAPI.Idle:output_type -> google.protobuf.Empty
-	75, // 111: blockchain_api.BlockchainAPI.ReportPeerFailure:output_type -> google.protobuf.Empty
-	63, // 112: blockchain_api.BlockchainAPI.GetBlockLocator:output_type -> blockchain_api.GetBlockLocatorResponse
-	65, // 113: blockchain_api.BlockchainAPI.LocateBlockHeaders:output_type -> blockchain_api.LocateBlockHeadersResponse
-	66, // 114: blockchain_api.BlockchainAPI.GetBestHeightAndTime:output_type -> blockchain_api.GetBestHeightAndTimeResponse
-	63, // [63:115] is the sub-list for method output_type
-	11, // [11:63] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	70, // 1: blockchain_api.GetBlockHeaderResponse.processed_at:type_name -> google.protobuf.Timestamp
+	71, // 2: blockchain_api.Notification.type:type_name -> model.NotificationType
+	36, // 3: blockchain_api.Notification.metadata:type_name -> blockchain_api.NotificationMetadata
+	69, // 4: blockchain_api.NotificationMetadata.metadata:type_name -> blockchain_api.NotificationMetadata.MetadataEntry
+	72, // 5: blockchain_api.GetLastNBlocksResponse.blocks:type_name -> model.BlockInfo
+	72, // 6: blockchain_api.GetLastNInvalidBlocksResponse.blocks:type_name -> model.BlockInfo
+	73, // 7: blockchain_api.GetSuitableBlockResponse.block:type_name -> model.SuitableBlock
+	1,  // 8: blockchain_api.GetFSMStateResponse.state:type_name -> blockchain_api.FSMStateType
+	1,  // 9: blockchain_api.WaitFSMToTransitionRequest.state:type_name -> blockchain_api.FSMStateType
+	0,  // 10: blockchain_api.SendFSMEventRequest.event:type_name -> blockchain_api.FSMEventType
+	74, // 11: blockchain_api.GetChainTipsResponse.tips:type_name -> model.ChainTip
+	75, // 12: blockchain_api.BlockchainAPI.HealthGRPC:input_type -> google.protobuf.Empty
+	3,  // 13: blockchain_api.BlockchainAPI.AddBlock:input_type -> blockchain_api.AddBlockRequest
+	4,  // 14: blockchain_api.BlockchainAPI.GetBlock:input_type -> blockchain_api.GetBlockRequest
+	5,  // 15: blockchain_api.BlockchainAPI.GetBlocks:input_type -> blockchain_api.GetBlocksRequest
+	7,  // 16: blockchain_api.BlockchainAPI.GetBlockByHeight:input_type -> blockchain_api.GetBlockByHeightRequest
+	8,  // 17: blockchain_api.BlockchainAPI.GetBlockByID:input_type -> blockchain_api.GetBlockByIDRequest
+	75, // 18: blockchain_api.BlockchainAPI.GetNextBlockID:input_type -> google.protobuf.Empty
+	75, // 19: blockchain_api.BlockchainAPI.GetBlockStats:input_type -> google.protobuf.Empty
+	13, // 20: blockchain_api.BlockchainAPI.GetBlockGraphData:input_type -> blockchain_api.GetBlockGraphDataRequest
+	42, // 21: blockchain_api.BlockchainAPI.GetLastNBlocks:input_type -> blockchain_api.GetLastNBlocksRequest
+	44, // 22: blockchain_api.BlockchainAPI.GetLastNInvalidBlocks:input_type -> blockchain_api.GetLastNInvalidBlocksRequest
+	46, // 23: blockchain_api.BlockchainAPI.GetSuitableBlock:input_type -> blockchain_api.GetSuitableBlockRequest
+	48, // 24: blockchain_api.BlockchainAPI.GetHashOfAncestorBlock:input_type -> blockchain_api.GetHashOfAncestorBlockRequest
+	49, // 25: blockchain_api.BlockchainAPI.GetLatestBlockHeaderFromBlockLocator:input_type -> blockchain_api.GetLatestBlockHeaderFromBlockLocatorRequest
+	50, // 26: blockchain_api.BlockchainAPI.GetBlockHeadersFromOldest:input_type -> blockchain_api.GetBlockHeadersFromOldestRequest
+	52, // 27: blockchain_api.BlockchainAPI.GetNextWorkRequired:input_type -> blockchain_api.GetNextWorkRequiredRequest
+	4,  // 28: blockchain_api.BlockchainAPI.GetBlockExists:input_type -> blockchain_api.GetBlockRequest
+	16, // 29: blockchain_api.BlockchainAPI.GetBlockHeaders:input_type -> blockchain_api.GetBlockHeadersRequest
+	17, // 30: blockchain_api.BlockchainAPI.GetBlockHeadersToCommonAncestor:input_type -> blockchain_api.GetBlockHeadersToCommonAncestorRequest
+	18, // 31: blockchain_api.BlockchainAPI.GetBlockHeadersFromCommonAncestor:input_type -> blockchain_api.GetBlockHeadersFromCommonAncestorRequest
+	20, // 32: blockchain_api.BlockchainAPI.GetBlockHeadersFromTill:input_type -> blockchain_api.GetBlockHeadersFromTillRequest
+	21, // 33: blockchain_api.BlockchainAPI.GetBlockHeadersFromHeight:input_type -> blockchain_api.GetBlockHeadersFromHeightRequest
+	23, // 34: blockchain_api.BlockchainAPI.GetBlockHeadersByHeight:input_type -> blockchain_api.GetBlockHeadersByHeightRequest
+	16, // 35: blockchain_api.BlockchainAPI.GetBlockHeaderIDs:input_type -> blockchain_api.GetBlockHeadersRequest
+	75, // 36: blockchain_api.BlockchainAPI.GetBestBlockHeader:input_type -> google.protobuf.Empty
+	28, // 37: blockchain_api.BlockchainAPI.CheckBlockIsInCurrentChain:input_type -> blockchain_api.CheckBlockIsCurrentChainRequest
+	75, // 38: blockchain_api.BlockchainAPI.GetChainTips:input_type -> google.protobuf.Empty
+	27, // 39: blockchain_api.BlockchainAPI.GetBlockHeader:input_type -> blockchain_api.GetBlockHeaderRequest
+	29, // 40: blockchain_api.BlockchainAPI.InvalidateBlock:input_type -> blockchain_api.InvalidateBlockRequest
+	31, // 41: blockchain_api.BlockchainAPI.RevalidateBlock:input_type -> blockchain_api.RevalidateBlockRequest
+	34, // 42: blockchain_api.BlockchainAPI.Subscribe:input_type -> blockchain_api.SubscribeRequest
+	35, // 43: blockchain_api.BlockchainAPI.SendNotification:input_type -> blockchain_api.Notification
+	37, // 44: blockchain_api.BlockchainAPI.GetState:input_type -> blockchain_api.GetStateRequest
+	39, // 45: blockchain_api.BlockchainAPI.SetState:input_type -> blockchain_api.SetStateRequest
+	40, // 46: blockchain_api.BlockchainAPI.GetBlockIsMined:input_type -> blockchain_api.GetBlockIsMinedRequest
+	54, // 47: blockchain_api.BlockchainAPI.SetBlockMinedSet:input_type -> blockchain_api.SetBlockMinedSetRequest
+	75, // 48: blockchain_api.BlockchainAPI.GetBlocksMinedNotSet:input_type -> google.protobuf.Empty
+	56, // 49: blockchain_api.BlockchainAPI.SetBlockSubtreesSet:input_type -> blockchain_api.SetBlockSubtreesSetRequest
+	75, // 50: blockchain_api.BlockchainAPI.GetBlocksSubtreesNotSet:input_type -> google.protobuf.Empty
+	58, // 51: blockchain_api.BlockchainAPI.SetBlockProcessedAt:input_type -> blockchain_api.SetBlockProcessedAtRequest
+	61, // 52: blockchain_api.BlockchainAPI.SendFSMEvent:input_type -> blockchain_api.SendFSMEventRequest
+	75, // 53: blockchain_api.BlockchainAPI.GetFSMCurrentState:input_type -> google.protobuf.Empty
+	60, // 54: blockchain_api.BlockchainAPI.WaitFSMToTransitionToGivenState:input_type -> blockchain_api.WaitFSMToTransitionRequest
+	75, // 55: blockchain_api.BlockchainAPI.WaitUntilFSMTransitionFromIdleState:input_type -> google.protobuf.Empty
+	75, // 56: blockchain_api.BlockchainAPI.Run:input_type -> google.protobuf.Empty
+	75, // 57: blockchain_api.BlockchainAPI.CatchUpBlocks:input_type -> google.protobuf.Empty
+	75, // 58: blockchain_api.BlockchainAPI.LegacySync:input_type -> google.protobuf.Empty
+	75, // 59: blockchain_api.BlockchainAPI.Idle:input_type -> google.protobuf.Empty
+	68, // 60: blockchain_api.BlockchainAPI.ReportPeerFailure:input_type -> blockchain_api.ReportPeerFailureRequest
+	62, // 61: blockchain_api.BlockchainAPI.GetBlockLocator:input_type -> blockchain_api.GetBlockLocatorRequest
+	64, // 62: blockchain_api.BlockchainAPI.LocateBlockHeaders:input_type -> blockchain_api.LocateBlockHeadersRequest
+	75, // 63: blockchain_api.BlockchainAPI.GetBestHeightAndTime:input_type -> google.protobuf.Empty
+	2,  // 64: blockchain_api.BlockchainAPI.HealthGRPC:output_type -> blockchain_api.HealthResponse
+	75, // 65: blockchain_api.BlockchainAPI.AddBlock:output_type -> google.protobuf.Empty
+	11, // 66: blockchain_api.BlockchainAPI.GetBlock:output_type -> blockchain_api.GetBlockResponse
+	6,  // 67: blockchain_api.BlockchainAPI.GetBlocks:output_type -> blockchain_api.GetBlocksResponse
+	11, // 68: blockchain_api.BlockchainAPI.GetBlockByHeight:output_type -> blockchain_api.GetBlockResponse
+	11, // 69: blockchain_api.BlockchainAPI.GetBlockByID:output_type -> blockchain_api.GetBlockResponse
+	9,  // 70: blockchain_api.BlockchainAPI.GetNextBlockID:output_type -> blockchain_api.GetNextBlockIDResponse
+	76, // 71: blockchain_api.BlockchainAPI.GetBlockStats:output_type -> model.BlockStats
+	77, // 72: blockchain_api.BlockchainAPI.GetBlockGraphData:output_type -> model.BlockDataPoints
+	43, // 73: blockchain_api.BlockchainAPI.GetLastNBlocks:output_type -> blockchain_api.GetLastNBlocksResponse
+	45, // 74: blockchain_api.BlockchainAPI.GetLastNInvalidBlocks:output_type -> blockchain_api.GetLastNInvalidBlocksResponse
+	47, // 75: blockchain_api.BlockchainAPI.GetSuitableBlock:output_type -> blockchain_api.GetSuitableBlockResponse
+	51, // 76: blockchain_api.BlockchainAPI.GetHashOfAncestorBlock:output_type -> blockchain_api.GetHashOfAncestorBlockResponse
+	32, // 77: blockchain_api.BlockchainAPI.GetLatestBlockHeaderFromBlockLocator:output_type -> blockchain_api.GetBlockHeaderResponse
+	19, // 78: blockchain_api.BlockchainAPI.GetBlockHeadersFromOldest:output_type -> blockchain_api.GetBlockHeadersResponse
+	53, // 79: blockchain_api.BlockchainAPI.GetNextWorkRequired:output_type -> blockchain_api.GetNextWorkRequiredResponse
+	14, // 80: blockchain_api.BlockchainAPI.GetBlockExists:output_type -> blockchain_api.GetBlockExistsResponse
+	19, // 81: blockchain_api.BlockchainAPI.GetBlockHeaders:output_type -> blockchain_api.GetBlockHeadersResponse
+	19, // 82: blockchain_api.BlockchainAPI.GetBlockHeadersToCommonAncestor:output_type -> blockchain_api.GetBlockHeadersResponse
+	19, // 83: blockchain_api.BlockchainAPI.GetBlockHeadersFromCommonAncestor:output_type -> blockchain_api.GetBlockHeadersResponse
+	19, // 84: blockchain_api.BlockchainAPI.GetBlockHeadersFromTill:output_type -> blockchain_api.GetBlockHeadersResponse
+	22, // 85: blockchain_api.BlockchainAPI.GetBlockHeadersFromHeight:output_type -> blockchain_api.GetBlockHeadersFromHeightResponse
+	24, // 86: blockchain_api.BlockchainAPI.GetBlockHeadersByHeight:output_type -> blockchain_api.GetBlockHeadersByHeightResponse
+	25, // 87: blockchain_api.BlockchainAPI.GetBlockHeaderIDs:output_type -> blockchain_api.GetBlockHeaderIDsResponse
+	32, // 88: blockchain_api.BlockchainAPI.GetBestBlockHeader:output_type -> blockchain_api.GetBlockHeaderResponse
+	33, // 89: blockchain_api.BlockchainAPI.CheckBlockIsInCurrentChain:output_type -> blockchain_api.CheckBlockIsCurrentChainResponse
+	67, // 90: blockchain_api.BlockchainAPI.GetChainTips:output_type -> blockchain_api.GetChainTipsResponse
+	32, // 91: blockchain_api.BlockchainAPI.GetBlockHeader:output_type -> blockchain_api.GetBlockHeaderResponse
+	30, // 92: blockchain_api.BlockchainAPI.InvalidateBlock:output_type -> blockchain_api.InvalidateBlockResponse
+	75, // 93: blockchain_api.BlockchainAPI.RevalidateBlock:output_type -> google.protobuf.Empty
+	35, // 94: blockchain_api.BlockchainAPI.Subscribe:output_type -> blockchain_api.Notification
+	75, // 95: blockchain_api.BlockchainAPI.SendNotification:output_type -> google.protobuf.Empty
+	38, // 96: blockchain_api.BlockchainAPI.GetState:output_type -> blockchain_api.StateResponse
+	75, // 97: blockchain_api.BlockchainAPI.SetState:output_type -> google.protobuf.Empty
+	41, // 98: blockchain_api.BlockchainAPI.GetBlockIsMined:output_type -> blockchain_api.GetBlockIsMinedResponse
+	75, // 99: blockchain_api.BlockchainAPI.SetBlockMinedSet:output_type -> google.protobuf.Empty
+	55, // 100: blockchain_api.BlockchainAPI.GetBlocksMinedNotSet:output_type -> blockchain_api.GetBlocksMinedNotSetResponse
+	75, // 101: blockchain_api.BlockchainAPI.SetBlockSubtreesSet:output_type -> google.protobuf.Empty
+	57, // 102: blockchain_api.BlockchainAPI.GetBlocksSubtreesNotSet:output_type -> blockchain_api.GetBlocksSubtreesNotSetResponse
+	75, // 103: blockchain_api.BlockchainAPI.SetBlockProcessedAt:output_type -> google.protobuf.Empty
+	59, // 104: blockchain_api.BlockchainAPI.SendFSMEvent:output_type -> blockchain_api.GetFSMStateResponse
+	59, // 105: blockchain_api.BlockchainAPI.GetFSMCurrentState:output_type -> blockchain_api.GetFSMStateResponse
+	75, // 106: blockchain_api.BlockchainAPI.WaitFSMToTransitionToGivenState:output_type -> google.protobuf.Empty
+	75, // 107: blockchain_api.BlockchainAPI.WaitUntilFSMTransitionFromIdleState:output_type -> google.protobuf.Empty
+	75, // 108: blockchain_api.BlockchainAPI.Run:output_type -> google.protobuf.Empty
+	75, // 109: blockchain_api.BlockchainAPI.CatchUpBlocks:output_type -> google.protobuf.Empty
+	75, // 110: blockchain_api.BlockchainAPI.LegacySync:output_type -> google.protobuf.Empty
+	75, // 111: blockchain_api.BlockchainAPI.Idle:output_type -> google.protobuf.Empty
+	75, // 112: blockchain_api.BlockchainAPI.ReportPeerFailure:output_type -> google.protobuf.Empty
+	63, // 113: blockchain_api.BlockchainAPI.GetBlockLocator:output_type -> blockchain_api.GetBlockLocatorResponse
+	65, // 114: blockchain_api.BlockchainAPI.LocateBlockHeaders:output_type -> blockchain_api.LocateBlockHeadersResponse
+	66, // 115: blockchain_api.BlockchainAPI.GetBestHeightAndTime:output_type -> blockchain_api.GetBestHeightAndTimeResponse
+	64, // [64:116] is the sub-list for method output_type
+	12, // [12:64] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_services_blockchain_blockchain_api_blockchain_api_proto_init() }

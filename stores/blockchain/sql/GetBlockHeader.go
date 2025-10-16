@@ -34,6 +34,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/model/time"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 )
@@ -118,6 +119,7 @@ func (s *SQL) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*m
 		,b.mined_set
 		,b.subtrees_set
 		,b.invalid
+		,b.processed_at
 		FROM blocks b
 		WHERE b.hash = $1
 	`
@@ -130,6 +132,7 @@ func (s *SQL) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*m
 		hashMerkleRoot []byte
 		nBits          []byte
 		coinbaseBytes  []byte
+		processedAt    *time.CustomTime
 		err            error
 	)
 
@@ -150,6 +153,7 @@ func (s *SQL) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*m
 		&blockHeaderMeta.MinedSet,
 		&blockHeaderMeta.SubtreesSet,
 		&blockHeaderMeta.Invalid,
+		&processedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, errors.NewBlockNotFoundError("error in GetBlockHeader", errors.ErrNotFound)
@@ -169,6 +173,10 @@ func (s *SQL) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*m
 	blockHeader.HashMerkleRoot, err = chainhash.NewHash(hashMerkleRoot)
 	if err != nil {
 		return nil, nil, errors.NewProcessingError("failed to convert hashMerkleRoot", err)
+	}
+
+	if processedAt != nil {
+		blockHeaderMeta.ProcessedAt = &processedAt.Time
 	}
 
 	if len(coinbaseBytes) > 0 {

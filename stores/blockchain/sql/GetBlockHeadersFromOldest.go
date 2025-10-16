@@ -94,6 +94,7 @@ func (s *SQL) GetBlockHeadersFromOldest(ctx context.Context, chainTipHash, targe
 			,b.mined_set
 			,b.subtrees_set
 			,b.invalid
+			,b.processed_at
 			,b.coinbase_tx
 		FROM blocks b
 		WHERE id IN (
@@ -128,5 +129,5 @@ func (s *SQL) GetBlockHeadersFromOldest(ctx context.Context, chainTipHash, targe
 
 	defer rows.Close()
 
-	return s.processBlockHeadersRows(rows, numberOfHeaders)
+	return s.processBlockHeadersRows(rows, numberOfHeaders, true)
 }

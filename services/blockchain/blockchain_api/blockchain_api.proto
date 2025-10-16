@@ -371,6 +371,7 @@ message GetBlockHeaderResponse {
   bool mined_set = 11;        // Mined status
   bool subtrees_set = 12;     // Subtrees status
   bool invalid = 13;          // Validity status
+  google.protobuf.Timestamp processed_at = 14; // Timestamp when block was processed
 }
 
 // CheckBlockIsCurrentChainResponse indicates if blocks are in the main chain.

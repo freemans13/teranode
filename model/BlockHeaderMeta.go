@@ -2,30 +2,36 @@ package model
 
 import (
 	"encoding/binary"
+	"time"
 
 	safe "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
 type BlockHeaderMeta struct {
-	ID          uint32 `json:"id"`            // ID of the block in the internal blockchain DB.
-	Height      uint32 `json:"height"`        // Height of the block in the blockchain.
-	TxCount     uint64 `json:"tx_count"`      // Number of transactions in the block.
-	SizeInBytes uint64 `json:"size_in_bytes"` // Size of the block in bytes.
-	Miner       string `json:"miner"`         // Miner
-	PeerID      string `json:"peer_id"`       // Peer ID of the miner that mined the block.
-	BlockTime   uint32 `json:"block_time"`    // Time of the block.
-	Timestamp   uint32 `json:"timestamp"`     // Timestamp of creation of the block in the db.
-	ChainWork   []byte `json:"chainwork"`     // ChainWork of the block.
-	MinedSet    bool   `json:"mined_set"`     // Whether the block is in the mined set.
-	SubtreesSet bool   `json:"subtrees_set"`  // Whether the block has its subtrees set.
-	Invalid     bool   `json:"invalid"`       // Whether the block is marked as invalid.
+	ID          uint32     `json:"id"`            // ID of the block in the internal blockchain DB.
+	Height      uint32     `json:"height"`        // Height of the block in the blockchain.
+	TxCount     uint64     `json:"tx_count"`      // Number of transactions in the block.
+	SizeInBytes uint64     `json:"size_in_bytes"` // Size of the block in bytes.
+	Miner       string     `json:"miner"`         // Miner
+	PeerID      string     `json:"peer_id"`       // Peer ID of the miner that mined the block.
+	BlockTime   uint32     `json:"block_time"`    // Time of the block.
+	Timestamp   uint32     `json:"timestamp"`     // Timestamp of creation of the block in the db.
+	ChainWork   []byte     `json:"chainwork"`     // ChainWork of the block.
+	MinedSet    bool       `json:"mined_set"`     // Whether the block is in the mined set.
+	SubtreesSet bool       `json:"subtrees_set"`  // Whether the block has its subtrees set.
+	Invalid     bool       `json:"invalid"`       // Whether the block is marked as invalid.
+	ProcessedAt *time.Time `json:"processed_at"`  // Timestamp when the block was processed (nullable).
 }
 
 func (m *BlockHeaderMeta) Bytes() []byte {
-	b := make([]byte, 0, 4+4+4+8+8+len(m.Miner))
+	capacity := 1 + 4 + 4 + 8 + 8 + 4 + 4 + 4 + len(m.ChainWork) + 4 + len(m.Miner) + 4 + len(m.PeerID)
+	if m.ProcessedAt != nil {
+		capacity += 8
+	}
+	b := make([]byte, 0, capacity)
 
-	// write the flags (minedSet, subtreesSet, invalid) as te first byte
+	// write the flags (minedSet, subtreesSet, invalid, processedAt) as the first byte
 	flags := byte(0)
 	if m.MinedSet {
 		flags |= 1 << 0
@@ -35,6 +41,9 @@ func (m *BlockHeaderMeta) Bytes() []byte {
 	}
 	if m.Invalid {
 		flags |= 1 << 2
+	}
+	if m.ProcessedAt != nil {
+		flags |= 1 << 3
 	}
 
 	b = append(b, flags)
@@ -76,6 +85,12 @@ func (m *BlockHeaderMeta) Bytes() []byte {
 	b = append(b, b32...)
 	b = append(b, []byte(m.PeerID)...)
 
+	// append the processed_at timestamp if present
+	if m.ProcessedAt != nil {
+		binary.LittleEndian.PutUint64(b64, uint64(m.ProcessedAt.Unix()))
+		b = append(b, b64...)
+	}
+
 	return b
 }
 
@@ -91,6 +106,7 @@ func NewBlockHeaderMetaFromBytes(b []byte) (*BlockHeaderMeta, error) {
 	m.MinedSet = (flags & (1 << 0)) != 0
 	m.SubtreesSet = (flags & (1 << 1)) != 0
 	m.Invalid = (flags & (1 << 2)) != 0
+	hasProcessedAt := (flags & (1 << 3)) != 0
 
 	// remove the flags byte from the slice
 	b = b[1:]
@@ -140,8 +156,20 @@ func NewBlockHeaderMetaFromBytes(b []byte) (*BlockHeaderMeta, error) {
 			return nil, errors.NewProcessingError("invalid length for peer ID in BlockHeaderMeta: %d", len(b))
 		}
 		m.PeerID = string(b[offset+4 : offset+4+len32]) //nolint:gosec // bounds checked on line above
+		offset += 4 + len32
 	} else {
 		m.PeerID = ""
+		offset += 4
+	}
+
+	// read the processed_at timestamp if present
+	if hasProcessedAt {
+		if len(b) < int(offset+8) {
+			return nil, errors.NewProcessingError("invalid length for processed_at in BlockHeaderMeta: %d", len(b))
+		}
+		processedAt := binary.LittleEndian.Uint64(b[offset : offset+8]) // #nosec G602 - bounds checked above
+		p := time.Unix(int64(processedAt), 0)
+		m.ProcessedAt = &p
 	}
 
 	return m, nil

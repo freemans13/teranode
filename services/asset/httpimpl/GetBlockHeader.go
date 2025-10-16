@@ -136,6 +136,8 @@ func (h *HTTP) GetBlockHeader(mode ReadMode) func(c echo.Context) error {
 				TxCount:     meta.TxCount,
 				SizeInBytes: meta.SizeInBytes,
 				Miner:       meta.Miner,
+				Invalid:     meta.Invalid,
+				ProcessedAt: meta.ProcessedAt,
 			}
 
 			return c.JSONPretty(200, headerResponse, "  ")

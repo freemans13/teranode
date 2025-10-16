@@ -186,6 +186,14 @@
             <div class="label">{t(`${fieldKey}.miner`)}</div>
             <div class="value">{expandedHeader.miner || '-'}</div>
           </div>
+          <div class="entry">
+            <div class="label">{t(`${fieldKey}.invalid`)}</div>
+            <div class="value">{expandedHeader.invalid ? 'Yes' : 'No'}</div>
+          </div>
+          <div class="entry">
+            <div class="label">{t(`${fieldKey}.processed_at`)}</div>
+            <div class="value">{expandedHeader.processed_at ? formatDate(new Date(expandedHeader.processed_at).getTime()) : '-'}</div>
+          </div>
         </div>
       </div>
     {:else if isJson}

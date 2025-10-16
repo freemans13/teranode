@@ -117,6 +117,8 @@ func (s *SQL) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *mode
 	    ,b.peer_id
 		,b.chain_work
 		,b.inserted_at
+		,b.invalid
+		,b.processed_at
 		FROM blocks b
 		WHERE invalid = false
 		ORDER BY chain_work DESC, peer_id ASC, id ASC
@@ -131,6 +133,7 @@ func (s *SQL) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *mode
 		hashMerkleRoot []byte
 		nBits          []byte
 		coinbaseBytes  []byte
+		processedAt    *time.CustomTime
 		err            error
 	)
 
@@ -149,6 +152,8 @@ func (s *SQL) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *mode
 		&blockHeaderMeta.PeerID,
 		&blockHeaderMeta.ChainWork,
 		&insertedAt,
+		&blockHeaderMeta.Invalid,
+		&processedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, errors.NewBlockNotFoundError("error in GetBestBlockHeader", err)
@@ -182,6 +187,10 @@ func (s *SQL) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *mode
 		}
 
 		blockHeaderMeta.Miner = miner
+	}
+
+	if processedAt != nil {
+		blockHeaderMeta.ProcessedAt = &processedAt.Time
 	}
 
 	blockHeaderMeta.Timestamp = uint32(insertedAt.Unix())

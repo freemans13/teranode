@@ -235,7 +235,9 @@
           "confirmations_value": "{{ count }} Confirmations",
           "merkleroot": "Merkle Root",
           "chainwork": "Chainwork",
-          "miner": "Miner"
+          "miner": "Miner",
+          "invalid": "Invalid",
+          "processed_at": "Processed At"
         }
       },
       "coinbase": {

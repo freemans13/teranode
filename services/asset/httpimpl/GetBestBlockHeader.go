@@ -102,6 +102,8 @@ func (h *HTTP) GetBestBlockHeader(mode ReadMode) func(c echo.Context) error {
 			TxCount:     meta.TxCount,
 			SizeInBytes: meta.SizeInBytes,
 			Miner:       meta.Miner,
+			Invalid:     meta.Invalid,
+			ProcessedAt: meta.ProcessedAt,
 		}
 
 		switch mode {

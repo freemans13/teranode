@@ -4,6 +4,7 @@ package httpimpl
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/bsv-blockchain/teranode/model"
 )
@@ -12,12 +13,14 @@ import (
 // additional metadata beyond the basic block header information. It embeds the
 // BlockHeader model and adds fields for presentation purposes.
 type blockHeaderResponse struct {
-	*model.BlockHeader        // Embedded block header model
-	Hash               string `json:"hash"`          // Block hash in hexadecimal format
-	Height             uint32 `json:"height"`        // Block height in the blockchain
-	TxCount            uint64 `json:"tx_count"`      // Number of transactions in the block
-	SizeInBytes        uint64 `json:"size_in_bytes"` // Total size of the block in bytes
-	Miner              string `json:"miner"`         // Miner information if available
+	*model.BlockHeader            // Embedded block header model
+	Hash               string     `json:"hash"`          // Block hash in hexadecimal format
+	Height             uint32     `json:"height"`        // Block height in the blockchain
+	TxCount            uint64     `json:"tx_count"`      // Number of transactions in the block
+	SizeInBytes        uint64     `json:"size_in_bytes"` // Total size of the block in bytes
+	Miner              string     `json:"miner"`         // Miner information if available
+	Invalid            bool       `json:"invalid"`       // Whether the block is marked as invalid
+	ProcessedAt        *time.Time `json:"processed_at"`  // Timestamp when the block was processed (nullable)
 }
 
 // MarshalJSON implements the json.Marshaler interface for blockHeaderResponse.
@@ -58,17 +61,19 @@ type blockHeaderResponse struct {
 //	}
 func (r *blockHeaderResponse) MarshalJSON() ([]byte, error) {
 	type aliasResponse struct {
-		Hash              string `json:"hash"`
-		Version           uint32 `json:"version"`
-		PreviousBlockHash string `json:"previousblockhash"`
-		MerkleRoot        string `json:"merkleroot"`
-		Time              uint32 `json:"time"`
-		Bits              string `json:"bits"`
-		Nonce             uint32 `json:"nonce"`
-		Height            uint32 `json:"height"`
-		TxCount           uint64 `json:"txCount"`
-		SizeInBytes       uint64 `json:"sizeInBytes"`
-		Miner             string `json:"miner"`
+		Hash              string     `json:"hash"`
+		Version           uint32     `json:"version"`
+		PreviousBlockHash string     `json:"previousblockhash"`
+		MerkleRoot        string     `json:"merkleroot"`
+		Time              uint32     `json:"time"`
+		Bits              string     `json:"bits"`
+		Nonce             uint32     `json:"nonce"`
+		Height            uint32     `json:"height"`
+		TxCount           uint64     `json:"txCount"`
+		SizeInBytes       uint64     `json:"sizeInBytes"`
+		Miner             string     `json:"miner"`
+		Invalid           bool       `json:"invalid"`
+		ProcessedAt       *time.Time `json:"processed_at"`
 	}
 
 	a := aliasResponse{
@@ -83,6 +88,8 @@ func (r *blockHeaderResponse) MarshalJSON() ([]byte, error) {
 		TxCount:           r.TxCount,
 		SizeInBytes:       r.SizeInBytes,
 		Miner:             r.Miner,
+		Invalid:           r.Invalid,
+		ProcessedAt:       r.ProcessedAt,
 	}
 	return json.Marshal(a)
 }

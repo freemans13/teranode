@@ -1314,6 +1314,11 @@ func (b *Blockchain) GetBlockHeader(ctx context.Context, req *blockchain_api.Get
 		return nil, errors.WrapGRPC(err)
 	}
 
+	var processedAt *timestamppb.Timestamp
+	if meta.ProcessedAt != nil {
+		processedAt = timestamppb.New(*meta.ProcessedAt)
+	}
+
 	return &blockchain_api.GetBlockHeaderResponse{
 		BlockHeader: blockHeader.Bytes(),
 		Id:          meta.ID,
@@ -1328,6 +1333,7 @@ func (b *Blockchain) GetBlockHeader(ctx context.Context, req *blockchain_api.Get
 		ChainWork:   meta.ChainWork,
 		SubtreesSet: meta.SubtreesSet,
 		Invalid:     meta.Invalid,
+		ProcessedAt: processedAt,
 	}, nil
 }
 

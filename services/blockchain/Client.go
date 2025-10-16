@@ -682,6 +682,11 @@ func (c *Client) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) 
 		Invalid:     resp.Invalid,
 	}
 
+	if resp.ProcessedAt != nil {
+		t := resp.ProcessedAt.AsTime()
+		meta.ProcessedAt = &t
+	}
+
 	return header, meta, nil
 }
 

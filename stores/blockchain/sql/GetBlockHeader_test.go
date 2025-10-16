@@ -86,3 +86,25 @@ func TestGetBlockHeader(t *testing.T) {
 		assert.Equal(t, true, meta.Invalid)
 	})
 }
+
+// func TestGetBlockHeaderProcessedAt(t *testing.T) {
+// 	tSettings := test.CreateBaseTestSettings(t)
+// 	tSettings.ChainCfgParams = &chaincfg.TeraTestNetParams
+
+// 	storeURL, err := url.Parse("postgres://teranode:teranode@localhost:5432/teranode")
+// 	require.NoError(t, err)
+
+// 	s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
+// 	require.NoError(t, err)
+
+// 	h, err := chainhash.NewHashFromStr("00000000a39333317cc1ace0814107cca6caf2fe012f4a096a4846ccefa72616")
+// 	require.NoError(t, err)
+
+// 	header, meta, err := s.GetBlockHeader(t.Context(), h)
+// 	require.NoError(t, err, "should get block header")
+// 	require.NotNil(t, header)
+
+// 	require.NotNil(t, meta)
+
+// 	t.Logf("meta: %#v", meta)
+// }
