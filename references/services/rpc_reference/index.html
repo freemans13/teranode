@@ -6886,13 +6886,15 @@
 </code></pre></div>
 <h3 id="reconsiderblock">reconsiderblock</h3>
 <p>Removes invalidity status of a block and its descendants, reconsidering them for activation.</p>
+<p><strong>Important:</strong> This command performs <strong>full block validation</strong> to ensure the block meets all consensus rules before removing the invalid status. The block must pass complete validation including all transaction validations, merkle root checks, and consensus rules.</p>
 <p><strong>Parameters:</strong></p>
 <ol>
 <li><code>blockhash</code> (string, required) - The hash of the block to reconsider</li>
 </ol>
 <p><strong>Returns:</strong></p>
 <ul>
-<li><code>null</code> on success</li>
+<li><code>null</code> on success (block passed full validation)</li>
+<li>Error if the block fails validation</li>
 </ul>
 <p><strong>Example Request:</strong></p>
 <div class="highlight"><pre><span></span><code><span class="p">{</span>
