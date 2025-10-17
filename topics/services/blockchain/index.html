@@ -2605,11 +2605,35 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#chain-reorganization" class="md-nav__link">
+  <a href="#chain-reorganization-and-longest-chain-tracking" class="md-nav__link">
     <span class="md-ellipsis">
-      Chain Reorganization
+      Chain Reorganization and Longest Chain Tracking
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Chain Reorganization and Longest Chain Tracking">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#automatic-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Automatic Detection
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#optimized-longest-chain-selection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Optimized Longest Chain Selection
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
         
@@ -5460,11 +5484,35 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#chain-reorganization" class="md-nav__link">
+  <a href="#chain-reorganization-and-longest-chain-tracking" class="md-nav__link">
     <span class="md-ellipsis">
-      Chain Reorganization
+      Chain Reorganization and Longest Chain Tracking
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Chain Reorganization and Longest Chain Tracking">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#automatic-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Automatic Detection
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#optimized-longest-chain-selection" class="md-nav__link">
+    <span class="md-ellipsis">
+      Optimized Longest Chain Selection
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
         
@@ -6260,11 +6308,47 @@ Explanation of the sequences:</p>
 <li>Blocks with invalid headers, merkle roots, or proofs are rejected with appropriate error codes.</li>
 <li>Invalid blocks can be explicitly marked using the InvalidateBlock method.</li>
 </ul>
-<h4 id="chain-reorganization">Chain Reorganization</h4>
+<h4 id="chain-reorganization-and-longest-chain-tracking">Chain Reorganization and Longest Chain Tracking</h4>
+<p>The Blockchain Service implements sophisticated chain reorganization handling with optimized longest chain tracking:</p>
+<h5 id="automatic-detection">Automatic Detection</h5>
 <ul>
-<li>Detects chain splits and reorganizations automatically.</li>
-<li>Uses rollback and catch-up operations to handle chain reorganizations.</li>
-<li>Limits reorganization depth for security (configurable).</li>
+<li>Detects chain splits and reorganizations automatically through block header validation</li>
+<li>Uses rollback and catch-up operations to handle chain reorganizations</li>
+<li>Limits reorganization depth for security (configurable via <code>blockchain_maxReorgDepth</code>)</li>
+</ul>
+<h5 id="optimized-longest-chain-selection">Optimized Longest Chain Selection</h5>
+<p>The service employs an optimized algorithm for tracking and selecting the longest valid chain:</p>
+<p><strong>Key Features:</strong></p>
+<ul>
+<li><strong>Efficient Chain Comparison</strong>: Uses cumulative proof-of-work (chainwork) rather than simple block height for chain selection</li>
+<li><strong>Fast Fork Detection</strong>: Maintains indexed fork points to quickly identify competing chains</li>
+<li><strong>Minimal Database Queries</strong>: Caches chain tips and their accumulated work to reduce database load</li>
+<li><strong>Parallel Validation</strong>: Can validate multiple competing chain tips simultaneously</li>
+</ul>
+<p><strong>Implementation Details:</strong></p>
+<ol>
+<li><strong>Chainwork Tracking</strong>: Each block stores cumulative chainwork from genesis, allowing O(1) chain strength comparison</li>
+<li><strong>Fork Point Cache</strong>: Maintains an in-memory cache of recent fork points for rapid reorganization detection</li>
+<li><strong>Tip Management</strong>: Tracks multiple competing chain tips with their associated metadata:<ul>
+<li>Total chainwork</li>
+<li>Block height</li>
+<li>Last validation timestamp</li>
+<li>Fork depth from main chain</li>
+</ul>
+</li>
+</ol>
+<p><strong>Performance Benefits:</strong></p>
+<ul>
+<li>Reduced latency in chain selection during high fork activity</li>
+<li>Lower database load through intelligent caching</li>
+<li>Faster recovery from network partitions</li>
+<li>Improved resilience to chain split scenarios</li>
+</ul>
+<p><strong>Configuration Options:</strong></p>
+<ul>
+<li><code>blockchain_maxReorgDepth</code>: Maximum allowed reorganization depth (default: 6 blocks)</li>
+<li><code>blockchain_chainTipCacheSize</code>: Number of competing tips to track (default: 10)</li>
+<li><code>blockchain_forkPointCacheSize</code>: Size of fork point cache (default: 100)</li>
 </ul>
 <h4 id="storage-errors">Storage Errors</h4>
 <ul>

@@ -2044,6 +2044,21 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="3.3.4. FSM: Catching Blocks State">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#error-handling-in-catching-blocks-state" class="md-nav__link">
+    <span class="md-ellipsis">
+      Error Handling in Catching Blocks State
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
         
       </ul>
@@ -5121,6 +5136,21 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="3.3.4. FSM: Catching Blocks State">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#error-handling-in-catching-blocks-state" class="md-nav__link">
+    <span class="md-ellipsis">
+      Error Handling in Catching Blocks State
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
         
       </ul>
@@ -5302,7 +5332,7 @@
 <li><strong>CatchupBlocks</strong>: Transitions to <em>CatchingBlocks</em> from <em>Running</em></li>
 <li><strong>Stop</strong>: Transitions to <em>Idle</em> from <em>LegacySyncing</em>, <em>Running</em>, or <em>CatchingBlocks</em></li>
 </ul>
-<p>Teranode provides a visualizer tool to generate and visualize the state machine diagram. To run the visualizer, use the command <code>go run services/blockchain/fsm_visualizer/main.go</code>. The generated <code>docs/state-machine.diagram.md</code> can be visualized using https://mermaid.live/.
+<p>Teranode provides a visualizer tool to generate and visualize the state machine diagram. To run the visualizer, use the command <code>go run services/blockchain/fsm_visualizer/main.go</code>. The generated <code>docs/state-machine.diagram.md</code> can be visualized using <a href="https://mermaid.live/">https://mermaid.live/</a>.
 fsm_visualizer main.go.</p>
 <h2 id="3-functionality">3. Functionality</h2>
 <h3 id="31-state-machine-initialization">3.1. State Machine Initialization</h3>
@@ -5409,6 +5439,21 @@ fsm_visualizer main.go.</p>
 <li>❌ Speedy process blocks</li>
 <li>❌ Create subtrees (or propagate them)</li>
 <li>❌ Create blocks (mine candidates)</li>
+</ul>
+<h5 id="error-handling-in-catching-blocks-state">Error Handling in Catching Blocks State</h5>
+<p>When an error occurs during the catchup process, the FSM behavior has been updated to maintain state consistency:</p>
+<p><img alt="fsm_catchup_error_handling.svg" src="../img/plantuml/fsm_catchup_error_handling.svg" /></p>
+<p>Key points about error handling:</p>
+<ul>
+<li><strong>State Persistence</strong>: When an error occurs during catchup (e.g., validation failure, network error), the FSM <strong>remains</strong> in the <code>CatchingBlocks</code> state</li>
+<li><strong>No Automatic Reversion</strong>: The FSM does <strong>not</strong> automatically revert to the <code>Running</code> state on error</li>
+<li><strong>Explicit Recovery Required</strong>: Recovery from errors requires either:<ul>
+<li>Manual retry of the catchup process</li>
+<li>Automatic retry mechanism (if configured)</li>
+<li>Explicit state reset via operator intervention</li>
+</ul>
+</li>
+<li><strong>Consistency</strong>: This behavior prevents inconsistent state transitions and ensures the node doesn't incorrectly resume normal operations while catchup is incomplete</li>
 </ul>
 <h3 id="34-state-machine-events">3.4. State Machine Events</h3>
 <h4 id="341-fsm-event-legacy-sync">3.4.1. FSM Event: Legacy Sync</h4>

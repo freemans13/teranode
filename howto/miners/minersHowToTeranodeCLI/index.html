@@ -1747,6 +1747,15 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#check-block" class="md-nav__link">
+    <span class="md-ellipsis">
+      Check Block
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#file-reader" class="md-nav__link">
     <span class="md-ellipsis">
       File Reader
@@ -1795,6 +1804,15 @@
   <a href="#seeder" class="md-nav__link">
     <span class="md-ellipsis">
       Seeder
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#utxo-validator" class="md-nav__link">
+    <span class="md-ellipsis">
+      UTXO Validator
     </span>
   </a>
   
@@ -5033,6 +5051,15 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#check-block" class="md-nav__link">
+    <span class="md-ellipsis">
+      Check Block
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#file-reader" class="md-nav__link">
     <span class="md-ellipsis">
       File Reader
@@ -5081,6 +5108,15 @@
   <a href="#seeder" class="md-nav__link">
     <span class="md-ellipsis">
       Seeder
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#utxo-validator" class="md-nav__link">
+    <span class="md-ellipsis">
+      UTXO Validator
     </span>
   </a>
   
@@ -5148,6 +5184,7 @@ Usage:<span class="w"> </span>teranode-cli<span class="w"> </span>&lt;command&gt
 <span class="w">    </span>Available<span class="w"> </span>Commands:
 <span class="w">    </span>aerospikereader<span class="w">      </span>Aerospike<span class="w"> </span>Reader
 <span class="w">    </span>bitcointoutxoset<span class="w">     </span>Bitcoin<span class="w"> </span>to<span class="w"> </span>Utxoset
+<span class="w">    </span>checkblock<span class="w">           </span>Validate<span class="w"> </span>an<span class="w"> </span>existing<span class="w"> </span>block
 <span class="w">    </span>checkblocktemplate<span class="w">   </span>Check<span class="w"> </span>block<span class="w"> </span>template
 <span class="w">    </span>export-blocks<span class="w">        </span>Export<span class="w"> </span>blockchain<span class="w"> </span>to<span class="w"> </span>CSV
 <span class="w">    </span>filereader<span class="w">           </span>File<span class="w"> </span>Reader
@@ -5158,6 +5195,7 @@ Usage:<span class="w"> </span>teranode-cli<span class="w"> </span>&lt;command&gt
 <span class="w">    </span>setfsmstate<span class="w">          </span>Set<span class="w"> </span>the<span class="w"> </span>FSM<span class="w"> </span>State
 <span class="w">    </span>settings<span class="w">             </span>Settings
 <span class="w">    </span>utxopersister<span class="w">        </span>Utxo<span class="w"> </span>Persister
+<span class="w">    </span>utxovalidator<span class="w">        </span>Validate<span class="w"> </span>UTXO<span class="w"> </span>sets
 
 <span class="w">    </span>Use<span class="w"> </span><span class="s1">&#39;teranode-cli &lt;command&gt; --help&#39;</span><span class="w"> </span><span class="k">for</span><span class="w"> </span>more<span class="w"> </span>information<span class="w"> </span>about<span class="w"> </span>a<span class="w"> </span><span class="nb">command</span>
 </code></pre></div>
@@ -5262,6 +5300,11 @@ Usage:<span class="w"> </span>teranode-cli<span class="w"> </span>&lt;command&gt
 </thead>
 <tbody>
 <tr>
+<td><code>checkblock</code></td>
+<td>Validate an existing block</td>
+<td><code>&lt;blockhash&gt;</code> - Hash of the block to validate</td>
+</tr>
+<tr>
 <td><code>checkblocktemplate</code></td>
 <td>Check block template validity</td>
 <td>None</td>
@@ -5300,6 +5343,21 @@ Usage:<span class="w"> </span>teranode-cli<span class="w"> </span>&lt;command&gt
 <td></td>
 <td></td>
 <td><code>--useStore</code> - Use store</td>
+</tr>
+<tr>
+<td><code>utxovalidator</code></td>
+<td>Validate UTXO sets</td>
+<td><code>--inputDir</code> - Input directory containing UTXO data</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td><code>--blockHash</code> - Block hash to validate against</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td><code>--verbose</code> - Enable verbose output</td>
 </tr>
 <tr>
 <td><code>getfsmstate</code></td>
@@ -5374,6 +5432,19 @@ Usage:<span class="w"> </span>teranode-cli<span class="w"> </span>&lt;command&gt
 <li><code>--blockHeight</code>: Block height to start from</li>
 <li><code>--dumpRecords</code>: Dump records from index</li>
 </ul>
+<h3 id="check-block">Check Block</h3>
+<div class="highlight"><pre><span></span><code>teranode-cli<span class="w"> </span>checkblock<span class="w"> </span>&lt;blockhash&gt;
+</code></pre></div>
+<p>Validates an existing block by its hash. This command performs comprehensive validation including:</p>
+<ul>
+<li>Transaction validation</li>
+<li>Merkle tree verification</li>
+<li>Proof of work validation</li>
+<li>Consensus rule checks</li>
+</ul>
+<p><strong>Example:</strong></p>
+<div class="highlight"><pre><span></span><code>teranode-cli<span class="w"> </span>checkblock<span class="w"> </span>000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+</code></pre></div>
 <h3 id="file-reader">File Reader</h3>
 <div class="highlight"><pre><span></span><code>teranode-cli<span class="w"> </span>filereader<span class="w"> </span><span class="o">[</span>path<span class="o">]</span><span class="w"> </span><span class="o">[</span>options<span class="o">]</span>
 </code></pre></div>
@@ -5426,6 +5497,20 @@ Usage:<span class="w"> </span>teranode-cli<span class="w"> </span>&lt;command&gt
 <li><code>--skipHeaders</code>: Skip processing headers</li>
 <li><code>--skipUTXOs</code>: Skip processing UTXOs</li>
 </ul>
+<h3 id="utxo-validator">UTXO Validator</h3>
+<div class="highlight"><pre><span></span><code>teranode-cli<span class="w"> </span>utxovalidator<span class="w"> </span>--inputDir<span class="o">=</span>&lt;input-dir&gt;<span class="w"> </span><span class="o">[</span>options<span class="o">]</span>
+</code></pre></div>
+<p>Validates UTXO sets by reading and verifying UTXO data from specified directories. This tool is useful for ensuring UTXO set integrity and detecting any inconsistencies.</p>
+<p>Options:</p>
+<ul>
+<li><code>--inputDir</code>: Input directory containing UTXO data (required)</li>
+<li><code>--blockHash</code>: Specific block hash to validate against</li>
+<li><code>--verbose</code>: Enable verbose output for detailed validation information</li>
+<li><code>--batchSize</code>: Number of UTXOs to process in each batch (default: 10000)</li>
+</ul>
+<p><strong>Example:</strong></p>
+<div class="highlight"><pre><span></span><code>teranode-cli<span class="w"> </span>utxovalidator<span class="w"> </span>--inputDir<span class="o">=</span>/data/utxos<span class="w"> </span>--verbose
+</code></pre></div>
 <h3 id="fix-chainwork">Fix Chainwork</h3>
 <div class="highlight"><pre><span></span><code>teranode-cli<span class="w"> </span>fix-chainwork<span class="w"> </span>--db-url<span class="o">=</span>&lt;database-url&gt;<span class="w"> </span><span class="o">[</span>options<span class="o">]</span>
 </code></pre></div>

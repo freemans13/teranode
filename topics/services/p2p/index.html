@@ -5245,14 +5245,14 @@
 <li><a href="#274-configuration">2.7.4. Configuration</a></li>
 </ul>
 </li>
+<li><a href="#3-technology">3. Technology</a></li>
+<li><a href="#4-data-model">4. Data Model</a></li>
+<li><a href="#5-directory-structure-and-main-files">5. Directory Structure and Main Files</a></li>
+<li><a href="#6-how-to-run">6. How to run</a></li>
+<li><a href="#7-configuration-options-settings-flags">7. Configuration options (settings flags)</a></li>
+<li><a href="#8-other-resources">8. Other Resources</a></li>
 </ul>
 </li>
-<li><a href="#3-technology">Technology</a></li>
-<li><a href="#4-data-model">Data Model</a></li>
-<li><a href="#5-directory-structure-and-main-files">Directory Structure and Main Files</a></li>
-<li><a href="#6-how-to-run">How to run</a></li>
-<li><a href="#7-configuration-options-settings-flags">Configuration options (settings flags)</a></li>
-<li><a href="#8-other-resources">Other Resources</a></li>
 </ol>
 <h2 id="1-description">1. Description</h2>
 <p>The p2p package implements a peer-to-peer (P2P) server using <code>libp2p</code> (<code>github.com/libp2p/go-libp2p</code>, <code>https://libp2p.io</code>), a modular network stack that allows for direct peer-to-peer communication. The implementation follows an interface-based design pattern using the public <code>github.com/bsv-blockchain/go-p2p</code> package, with <code>p2p.NodeI</code> interface abstracting the concrete P2P node implementation to allow for better testability and modularity. This public package enables external developers to create custom P2P implementations that integrate with Teranode.</p>
@@ -5466,19 +5466,19 @@
 </ol>
 <p>Once these steps are completed, the server is ready to accept peer connections, handle messages, and monitor network activity.</p>
 <h3 id="22-peer-discovery-and-connection">2.2. Peer Discovery and Connection</h3>
-<p>In the previous section, the P2P Service created a `P2PNode as part of the initialization phase. This P2PNode is responsible for joining the network. The P2PNode utilizes a libp2p host and a Distributed Hash Table (DHT) for peer discovery and connection based on shared topics. This mechanism enables the node to become part of a decentralized network, facilitating communication and resource sharing among peers.</p>
+<p>In the previous section, the P2P Service created a `P2PClient as part of the initialization phase. This P2PClient is responsible for joining the network. The P2PClient utilizes a libp2p host and a Distributed Hash Table (DHT) for peer discovery and connection based on shared topics. This mechanism enables the client to become part of a decentralized network, facilitating communication and resource sharing among peers.</p>
 <p><img alt="p2p_peer_discovery.svg" src="../img/plantuml/p2p/p2p_peer_discovery.svg" /></p>
 <ol>
 <li>
 <p><strong>Initialization of DHT and libp2p Host</strong>:</p>
 <ul>
-<li>The <code>P2PNode</code> struct, upon invocation of its <code>Start</code> method, initializes the DHT using either <code>initDHT</code> or <code>initPrivateDHT</code> methods depending on the configuration. This step sets up the DHT for the libp2p host (<code>s.host</code>), which allows for peer discovery and content routing within the P2P network. The DHT is bootstrapped with default or configured peers to integrate the node into the existing network.</li>
+<li>The <code>P2PClient</code> struct, upon invocation of its <code>Start</code> method, initializes the DHT using either <code>initDHT</code> or <code>initPrivateDHT</code> methods depending on the configuration. This step sets up the DHT for the libp2p host (<code>s.host</code>), which allows for peer discovery and content routing within the P2P network. The DHT is bootstrapped with default or configured peers to integrate the client into the existing network.</li>
 </ul>
 </li>
 <li>
 <p><strong>Setting Up Routing Discovery</strong>:</p>
 <ul>
-<li>Once the DHT is initialized, <code>P2PNode.Start</code> sets up <code>routingDiscovery</code> with the created DHT instance. This discovery service is responsible for locating peers within the network and advertising the node's own presence.</li>
+<li>Once the DHT is initialized, <code>P2PClient.Start</code> sets up <code>routingDiscovery</code> with the created DHT instance. This discovery service is responsible for locating peers within the network and advertising the client's own presence.</li>
 <li>
 <p>The DHT implementation supports two modes:</p>
 <ul>
