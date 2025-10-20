@@ -373,6 +373,7 @@
           "height": "Height",
           "chainwork_score": "Chain Rank",
           "tx_assembly": "TX Assembly",
+          "subtree_assembly": "Subtree Assembly",
           "min_mining_fee": "Min Fee",
           "connected_peers": "Peers",
           "uptime": "Uptime",
