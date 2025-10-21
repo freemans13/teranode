@@ -2426,6 +2426,15 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#25-distributed-pause-mechanism" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.5. Distributed Pause Mechanism
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -5019,6 +5028,15 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#25-distributed-pause-mechanism" class="md-nav__link">
+    <span class="md-ellipsis">
+      2.5. Distributed Pause Mechanism
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -5111,6 +5129,8 @@
 <li><a href="#21-receiving-utxos-and-warming-up-the-txmeta-cache">2.1. Receiving UTXOs and warming up the TXMeta Cache</a></li>
 <li><a href="#22-receiving-subtrees-for-validation">2.2. Receiving subtrees for validation</a></li>
 <li><a href="#23-validating-the-subtrees">2.3. Validating the Subtrees</a></li>
+<li><a href="#24-subtree-locking-mechanism">2.4. Subtree Locking Mechanism</a></li>
+<li><a href="#25-distributed-pause-mechanism">2.5. Distributed Pause Mechanism</a></li>
 </ul>
 </li>
 <li><a href="#3-grpc-protobuf-definitions">gRPC Protobuf Definitions</a></li>
@@ -5245,6 +5265,44 @@ Teranode microservices make use of the Lustre file system in order to share subt
 <li>This mechanism ensures efficient resource usage and prevents duplicate validation work.</li>
 </ol>
 <p>The locking implementation is designed to be resilient across distributed systems by leveraging the shared filesystem.</p>
+<h3 id="25-distributed-pause-mechanism">2.5. Distributed Pause Mechanism</h3>
+<p>The Subtree Validation service implements a distributed pause mechanism that coordinates pausing across multiple pods in a Kubernetes cluster. This mechanism is essential for preventing UTXO state conflicts during block validation.</p>
+<p><img alt="subtree_validation_distributed_pause.svg" src="../img/plantuml/subtreevalidation/subtree_validation_distributed_pause.svg" /></p>
+<p><strong>Key Features:</strong></p>
+<ol>
+<li><strong>Distributed Lock</strong>: Uses a special lock file <code>__SUBTREE_PAUSE__.lock</code> in shared storage (quorum path)</li>
+<li><strong>Heartbeat Updates</strong>: The lock file timestamp is updated every <code>timeout/2</code> seconds (default: 5 seconds) to indicate the pause is still active</li>
+<li><strong>Automatic Crash Recovery</strong>: Stale locks (older than the configured timeout) are automatically detected and cleaned up</li>
+<li>
+<p><strong>Two-Level Checking</strong>:</p>
+<ul>
+<li>Fast local atomic boolean check (no I/O)</li>
+<li>Reliable distributed lock check when local flag is false</li>
+<li><strong>Graceful Fallback</strong>: Falls back to local-only pause if quorum is not initialized (for tests)</li>
+</ul>
+</li>
+</ol>
+<p><strong>How It Works:</strong></p>
+<ol>
+<li>When block validation starts on any pod, it calls <code>setPauseProcessing(ctx)</code></li>
+<li>A distributed lock is created in the shared storage with automatic heartbeat</li>
+<li>
+<p>All other pods check <code>isPauseActive()</code> before processing subtrees:</p>
+</li>
+<li>
+<p>First checks local atomic flag (fast path)</p>
+</li>
+<li>If local flag is false, checks for distributed lock</li>
+<li>If pause is active, subtree processing is skipped</li>
+<li>When block validation completes, the lock is released</li>
+<li>If a pod crashes during validation, the lock becomes stale after the timeout period and is automatically cleaned up by other pods</li>
+</ol>
+<p><strong>Configuration:</strong></p>
+<p>The distributed pause mechanism uses existing subtree validation settings:</p>
+<ul>
+<li><code>subtree_quorum_path</code>: Path to shared storage for lock files</li>
+<li><code>subtree_quorum_absolute_timeout</code>: Timeout for lock staleness (default: 30 seconds)</li>
+</ul>
 <h2 id="3-grpc-protobuf-definitions">3. gRPC Protobuf Definitions</h2>
 <p>The Subtree Validation Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen <a href="../../../references/protobuf_docs/subtreevalidationProto/">here</a>.</p>
 <h2 id="4-data-model">4. Data Model</h2>
@@ -5323,7 +5381,7 @@ Teranode microservices make use of the Lustre file system in order to share subt
 </code></pre></div>
 <p>Please refer to the <a href="../../../howto/locallyRunningServices/">Locally Running Services Documentation</a> document for more information on running the Subtree Validation Service locally.</p>
 <h2 id="8-configuration-settings">8. Configuration Settings</h2>
-<p>For comprehensive configuration documentation including all settings, defaults, and interactions, see the <a href="../../../references/settings/services/subtreevalidation_settings/">subtree Validation Settings Reference</a>.</p>
+<p>For comprehensive configuration documentation including all settings, defaults, and interactions, see the <a href="../../references/settings/services/subtreeValidation_settings.md">subtree Validation Settings Reference</a>.</p>
 <h2 id="9-other-resources">9. Other Resources</h2>
 <ul>
 <li><a href="../../../references/services/subtreevalidation_reference/">Subtree Validation Reference</a></li>
