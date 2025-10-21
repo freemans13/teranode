@@ -4885,7 +4885,7 @@
 <p>When you encounter issues, please follow these guidelines to report bugs to the Teranode support team:</p>
 <h2 id="before-reporting">Before Reporting</h2>
 <ol>
-<li>Check the documentation and FAQ to ensure the behavior is indeed a bug.</li>
+<li>Check the <a href="../miners/kubernetes/minersHowToTroubleshooting/">troubleshooting documentation</a> (<a href="../miners/docker/minersHowToTroubleshooting/">Docker</a>) to ensure the behavior is indeed a bug.</li>
 <li>Search existing GitHub issues to see if the bug has already been reported.</li>
 </ol>
 <h2 id="collecting-information">Collecting Information</h2>
@@ -4912,8 +4912,12 @@
 </li>
 <li>Memory usage</li>
 <li>Disk space and I/O statistics</li>
-<li><strong>Network Information:</strong></li>
-<li>Firewall configuration</li>
+<li>
+<p><strong>Network Information</strong></p>
+</li>
+<li>
+<p>Firewall configuration</p>
+</li>
 <li>Any relevant network errors</li>
 <li>
 <p><strong>Steps to Reproduce</strong>:</p>
@@ -4943,38 +4947,57 @@
 <li>Click on "Issues" and then "New Issue"</li>
 <li>Select the "Bug Report" template</li>
 <li>Fill out the template with the information you've gathered</li>
-<li>Attach the compressed file from the log collection tool</li>
 <li>Submit the issue</li>
 </ol>
 <h2 id="bug-report-template">Bug Report Template</h2>
-<p>When creating a new issue, use the following template:</p>
-<div class="highlight"><pre><span></span><code><span class="gu">## Bug Description</span>
-[Provide a clear and concise description of the bug]
+<p>When creating a new issue, GitHub will automatically load a template. The template includes the following sections:</p>
+<div class="highlight"><pre><span></span><code><span class="gu">## Describe the bug</span>
+A clear and concise description of what the bug is.
 
-<span class="gu">## Teranode Version</span>
-[e.g., 1.2.3]
+<span class="gu">## To Reproduce</span>
+Steps to reproduce the behavior:
+<span class="k">1.</span> Go to &#39;...&#39;
+<span class="k">2.</span> Click on &#39;...&#39;
+<span class="k">3.</span> Scroll down to &#39;...&#39;
+<span class="k">4.</span> See error
 
-<span class="gu">## Environment</span>
-<span class="k">-</span><span class="w"> </span>OS: [e.g., Ubuntu 20.04]
-<span class="k">-</span><span class="w"> </span>Docker Version: [e.g., 20.10.7]
-<span class="k">-</span><span class="w"> </span>Docker Compose Version: [e.g., 1.29.2]
-<span class="k">-</span><span class="w"> </span>Kubectl version
+<span class="gu">## Expected behavior</span>
+A clear and concise description of what you expected to happen.
 
-<span class="gu">## Steps to Reproduce</span>
-<span class="k">1.</span> [First Step]
-<span class="k">2.</span> [Second Step]
-<span class="k">3.</span> [and so on...]
+<span class="gu">## Screenshots</span>
+If applicable, add screenshots to help explain your problem.
 
-<span class="gu">## Expected Behavior</span>
-[What you expected to happen]
+<span class="gu">## Timeline</span>
+When did the bug first occur, or when did you first notice it?
 
-<span class="gu">## Actual Behavior</span>
-[What actually happened]
+<span class="gu">## Desktop (please complete the following information):</span>
 
-<span class="gu">## Additional Context</span>
-[Any other information that might be relevant]
+<span class="k">-</span><span class="w"> </span>OS: [e.g. iOS]
+<span class="k">-</span><span class="w"> </span>Browser [e.g. chrome, safari]
+<span class="k">-</span><span class="w"> </span>Version [e.g. 22]
 
-<span class="gu">## Logs and Configuration</span>
+<span class="gu">## TERANODE Env</span>
+You can get that at the start of your program and looks something like:
+
+<span class="gu">SETTINGS_CONTEXT</span>
+<span class="gu">----------------</span>
+scaling.m1
+
+<span class="gu">SETTINGS</span>
+<span class="gu">--------</span>
+SERVICE_NAME=validation-service
+advertisingInterval=10s
+advertisingURL=
+clientName=M1
+asset_grpcAddress=blob-service.blob-service.svc.cluster.local:8091
+asset_grpcListenAddress=:8091
+asset_httpAddress=https://m1.scaling.teranode.network
+asset_httpListenAddress=:8090
+...
+
+<span class="gu">## Additional context</span>
+
+Add any other context about the problem here.
 </code></pre></div>
 <h2 id="after-submitting">After Submitting</h2>
 <ul>

@@ -5110,13 +5110,13 @@
 </ul>
 <h2 id="health-checks-and-system-monitoring">Health Checks and System Monitoring</h2>
 <h3 id="service-status">Service Status</h3>
-<p><div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator
+<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator
 </code></pre></div>
-This command lists all pods in the current namespace, showing their status and readiness.</p>
+<p>This command lists all pods in the current namespace, showing their status and readiness.</p>
 <h3 id="detailed-containerpod-health">Detailed Container/Pod Health</h3>
-<p><div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>describe<span class="w"> </span>pod<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>-n<span class="w"> </span>teranode-operator
+<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>describe<span class="w"> </span>pod<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>-n<span class="w"> </span>teranode-operator
 </code></pre></div>
-This provides detailed information about the pod, including its current state, recent events, and readiness probe results.</p>
+<p>This provides detailed information about the pod, including its current state, recent events, and readiness probe results.</p>
 <h3 id="configuring-health-checks">Configuring Health Checks</h3>
 <p>In your Deployment or StatefulSet specification:</p>
 <div class="highlight"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span>
@@ -5144,9 +5144,9 @@ This provides detailed information about the pod, including its current state, r
 </code></pre></div>
 <h3 id="viewing-health-check-logs">Viewing Health Check Logs</h3>
 <p>Health check results are typically logged in the pod events:</p>
-<p><div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>describe<span class="w"> </span>pod<span class="w"> </span>&lt;pod-name&gt;
+<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>describe<span class="w"> </span>pod<span class="w"> </span>&lt;pod-name&gt;
 </code></pre></div>
-Look for events related to readiness and liveness probes.</p>
+<p>Look for events related to readiness and liveness probes.</p>
 <h3 id="monitoring-system-resources">Monitoring System Resources</h3>
 <ul>
 <li>Use <code>kubectl top</code> to view resource usage:</li>
@@ -5169,16 +5169,20 @@ kubectl<span class="w"> </span>logs<span class="w"> </span>-n<span class="w"> </
 </code></pre></div>
 <h3 id="useful-options-for-log-viewing">Useful Options for Log Viewing</h3>
 <ul>
-<li>Show timestamps:
-<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>logs<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>--timestamps<span class="o">=</span><span class="nb">true</span>
-</code></pre></div></li>
-<li>Limit output:
-<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>logs<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>--tail<span class="o">=</span><span class="m">50</span>
-</code></pre></div></li>
-<li>Since time:
-<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>logs<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>--since-time<span class="o">=</span><span class="s2">&quot;2023-07-01T00:00:00Z&quot;</span>
-</code></pre></div></li>
+<li>Show timestamps:</li>
 </ul>
+<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>logs<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>--timestamps<span class="o">=</span><span class="nb">true</span>
+</code></pre></div>
+<ul>
+<li>Limit output:</li>
+</ul>
+<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>logs<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>--tail<span class="o">=</span><span class="m">50</span>
+</code></pre></div>
+<ul>
+<li>Since time:</li>
+</ul>
+<div class="highlight"><pre><span></span><code>kubectl<span class="w"> </span>logs<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>--since-time<span class="o">=</span><span class="s2">&quot;2023-07-01T00:00:00Z&quot;</span>
+</code></pre></div>
 <h3 id="checking-logs-for-specific-teranode-microservices">Checking Logs for Specific Teranode Microservices</h3>
 <p>Replace <code>[service_name]</code> or <code>&lt;pod-name&gt;</code> with the appropriate service or pod name:</p>
 <ul>
@@ -5220,7 +5224,7 @@ kubectl<span class="w"> </span>logs<span class="w"> </span>-n<span class="w"> </
 <p>Teranode is highly dependent on its third party dependencies. Postgres, Kafka and Aerospike are critical for Teranode operations, and the node cannot work without them.</p>
 <p>If a third party service fails, you must restore its functionality. Once it is back, please restart Teranode cleanly following the instructions in the <a href="../minersHowToStopStartKubernetesTeranode/">How to Start and Stop Teranode in Kubernetes</a> guide.</p>
 <hr />
-<p>Should you encounter a bug, please report it following the instructions in the Bug Reporting section.</p>
+<p>Should you encounter a bug, please report it following the instructions in the <a href="../../../bugReporting/">Bug Reporting</a> section.</p>
 
 
 
