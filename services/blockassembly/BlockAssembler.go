@@ -1559,9 +1559,11 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		}
 	}
 
-	// If we are in a full scan, we are doing an exhaustive check of the block assembly
-	// we need to mark transactions that are already mined on the longest chain in the utxo store
-	if fullScan && len(markAsMinedOnLongestChain) > 0 {
+	// Mark transactions that are already mined on the longest chain in the utxo store
+	// This is necessary to clear unmined_since for transactions that moved from side chain to main chain
+	// during reorgs. Previously this was only done during fullScan, but it must happen during all
+	// resets to prevent unmined_since from being incorrectly set on main-chain transactions.
+	if len(markAsMinedOnLongestChain) > 0 {
 		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, markAsMinedOnLongestChain, true); err != nil {
 			return errors.NewProcessingError("error marking transactions as mined on longest chain", err)
 		}
