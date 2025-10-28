@@ -139,11 +139,11 @@ func runReorgScenario(t *testing.T, storeType, scenario string, expectedBefore, 
 	testTxHash := testTx.TxIDChainHash()
 	t.Logf("Created test transaction: %s", testTxHash.String())
 
-	// Send to mempool
+	// Send to mempool and wait for it to be processed
 	testTxBytes := hex.EncodeToString(testTx.ExtendedBytes())
 	_, err = td.CallRPC(ctx, "sendrawtransaction", []any{testTxBytes})
 	require.NoError(t, err)
-	time.Sleep(500 * time.Millisecond)
+	waitForBlockAssemblyToProcessTx(t, td, testTxHash.String())
 
 	// Test Side→Main scenario
 	testSideToMain(t, td, ctx, testTx, testTxHash, forkPointBlock, forkPointHeight, testCoinbaseMaturity)
@@ -181,7 +181,9 @@ func testSideToMain(t *testing.T, td *daemon.TestDaemon, ctx context.Context, te
 
 	_, sideBlock1 := createTestBlockWithCorrectSubsidy(t, td, forkPointBlock, uint32(20000), []*bt.Tx{testTx})
 	require.NoError(t, td.BlockValidationClient.ProcessBlock(ctx, sideBlock1, sideBlock1.Height, "legacy", ""))
-	time.Sleep(2 * time.Second)
+
+	// Wait for mined_set background job to complete
+	td.WaitForBlockBeingMined(t, sideBlock1)
 
 	// Verify BEFORE reorg
 	meta, err := td.UtxoStore.Get(ctx, testTxHash, fields.UnminedSince, fields.BlockIDs)
@@ -202,12 +204,8 @@ func testSideToMain(t *testing.T, td *daemon.TestDaemon, ctx context.Context, te
 		prevBlock = sideBlock
 	}
 
-	finalHeight, _, err := td.BlockchainClient.GetBestHeightAndTime(ctx)
-	require.NoError(t, err)
-	require.Equal(t, forkPointHeight+uint32(testCoinbaseMaturity)+2, finalHeight, "Side chain should be longest")
-
-	// Wait for reorg to complete
-	time.Sleep(10 * time.Second)
+	// Wait for reorg to complete - verify we're at expected height with expected block
+	td.WaitForBlockHeight(t, prevBlock, 30*time.Second)
 
 	// Verify AFTER reorg
 	meta, err = td.UtxoStore.Get(ctx, testTxHash, fields.UnminedSince, fields.BlockIDs)
@@ -244,17 +242,17 @@ func testMainToSideAfterSideToMain(t *testing.T, td *daemon.TestDaemon, ctx cont
 	testTx2Hash := testTx2.TxIDChainHash()
 	t.Logf("Created test transaction for Main→Side: %s", testTx2Hash.String())
 
-	// Send to mempool and mine it on main chain
+	// Send to mempool and wait for processing
 	testTx2Bytes := hex.EncodeToString(testTx2.ExtendedBytes())
 	_, err = td.CallRPC(ctx, "sendrawtransaction", []any{testTx2Bytes})
 	require.NoError(t, err)
-	time.Sleep(500 * time.Millisecond)
-
 	waitForBlockAssemblyToProcessTx(t, td, testTx2Hash.String())
 
 	// Mine block with testTx2 on main chain
 	mainBlock := td.MineAndWait(t, 1)
-	time.Sleep(2 * time.Second)
+
+	// Wait for mined_set to complete
+	td.WaitForBlockBeingMined(t, mainBlock)
 
 	// Verify BEFORE reorg - tx on main chain
 	meta, err := td.UtxoStore.Get(ctx, testTx2Hash, fields.UnminedSince, fields.BlockIDs)
@@ -281,8 +279,8 @@ func testMainToSideAfterSideToMain(t *testing.T, td *daemon.TestDaemon, ctx cont
 		t.Logf("Side chain block %d/%d mined at height %d", i+1, testCoinbaseMaturity+1, sideBlock.Height)
 	}
 
-	// Wait for reorg to complete
-	time.Sleep(10 * time.Second)
+	// Wait for reorg to complete - verify we're at expected height
+	td.WaitForBlockHeight(t, prevBlock, 30*time.Second)
 
 	// Verify AFTER reorg - tx now on orphaned side chain
 	meta, err = td.UtxoStore.Get(ctx, testTx2Hash, fields.UnminedSince, fields.BlockIDs)
