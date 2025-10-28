@@ -386,17 +386,24 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 // 3. Reorgs involving invalid blocks that require clean state
 //
 // The reset process:
-// 1. Marks transactions from moveBackBlocks as NOT on longest chain (sets unmined_since)
-//   - These are transactions that were mined on main chain but are now unmined (on side chain)
+// 1. Waits for BlockValidation background jobs to complete (WaitForPendingBlocks)
+//   - Ensures all blocks have mined_set=true
+//   - Invalid blocks: Already have block_ids removed, unmined_since set
+//   - moveForward blocks: Already have unmined_since cleared (processed with onLongestChain=true)
 //
-// 2. Marks transactions from moveForwardBlocks as ON longest chain (clears unmined_since)
-//   - These are transactions that were unmined (on side chain) but are now mined on main chain
+// 2. Marks transactions from moveBackBlocks as NOT on longest chain (sets unmined_since)
+//   - These blocks were on main chain but are now on side chain
+//   - They still have mined_set=true (won't be re-processed by BlockValidation)
+//   - Must explicitly mark their transactions as unmined
 //
 // 3. Calls subtreeProcessor.Reset() to clear all subtrees
-// 4. Calls loadUnminedTransactions() to reload transactions from UTXO store
 //
-// This approach ensures unmined_since is correctly set for ALL transactions affected by the reorg,
-// regardless of whether they're in the UTXO store or need to be loaded into block assembly.
+// 4. Calls loadUnminedTransactions() which:
+//   - Loads all transactions with unmined_since set into block assembly
+//   - Fixes any data inconsistencies (transactions with block_ids on main but unmined_since incorrectly set)
+//
+// Key insight: BlockValidation handles moveForward and invalid blocks via background jobs.
+// reset() only needs to handle moveBack blocks that won't be re-processed.
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -446,36 +453,40 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 		return errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
 	}
 
-	// Mark transactions that need unmined_since updated during reorg
-	// Strategy: Collect all txs from moveBack, remove txs in moveForward, mark remainder as unmined
-	// This is more efficient than two separate calls and handles the net effect of the reorg
-	if len(moveBackBlocksWithMeta) > 0 || len(moveForwardBlocksWithMeta) > 0 {
-		// Collect all transactions from moveBack blocks (no longer on main chain)
-		moveBackTxMap := make(map[chainhash.Hash]bool)
-		for _, blockWithMeta := range moveBackBlocksWithMeta {
-			block := blockWithMeta.block
-			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
-			if err != nil {
-				b.logger.Warnf("[BlockAssembler][Reset] error getting subtrees for moveBack block %s: %v (will skip)", block.Hash().String(), err)
+	// Mark moveBack transactions as unmined (set unmined_since)
+	//
+	// Division of Responsibility During Reorg:
+	// - Invalid blocks: BlockValidation handles via background job (unsetMined=true removes block_ids, sets unmined_since)
+	// - moveForward blocks (side→main): BlockValidation handles via background job (mined_set=false → processes with onLongestChain=true → clears unmined_since)
+	// - moveBack blocks (main→side): reset() handles HERE (sets unmined_since)
+	//
+	// Why moveBack needs explicit handling:
+	// - These blocks were on main chain (unmined_since=NULL, mined_set=true)
+	// - Reorg moved them to side chain
+	// - BlockValidation won't re-process them (mined_set still true, not in GetBlocksMinedNotSet queue)
+	// - No background job will update them
+	// - Must explicitly mark their transactions as unmined here
+	//
+	// Why we DON'T handle moveForward:
+	// - moveForward blocks have mined_set=false (newly processed or re-validated)
+	// - BlockValidation background job processes them
+	// - Calls setTxMinedStatus with onLongestChain=CheckBlockIsInCurrentChain() = true
+	// - unmined_since is automatically cleared
+	// - No action needed from reset()
+	if len(moveBackBlocksWithMeta) > 0 {
+		// First, build a map of transactions in moveForward blocks
+		// These are transactions that are ALSO in the new main chain (don't need unmined_since set)
+		// Even though BlockValidation handles moveForward, we need this map to avoid marking
+		// transactions that appear in BOTH moveBack and moveForward as unmined
+		moveForwardTxMap := make(map[chainhash.Hash]bool)
+		for _, blockWithMeta := range moveForwardBlocksWithMeta {
+			if blockWithMeta.meta.Invalid {
 				continue
 			}
 
-			for _, st := range blockSubtrees {
-				for _, node := range st.Nodes {
-					if !node.Hash.IsEqual(subtree.CoinbasePlaceholderHash) {
-						moveBackTxMap[node.Hash] = true
-					}
-				}
-			}
-		}
-
-		// Collect all transactions from moveForward blocks (now mined on main chain)
-		moveForwardTxMap := make(map[chainhash.Hash]bool)
-		for _, blockWithMeta := range moveForwardBlocksWithMeta {
 			block := blockWithMeta.block
 			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
 			if err != nil {
-				b.logger.Warnf("[BlockAssembler][Reset] error getting subtrees for moveForward block %s: %v (will skip)", block.Hash().String(), err)
 				continue
 			}
 
@@ -488,35 +499,41 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 			}
 		}
 
-		// Net unmined txs = moveBack - moveForward
-		// These are transactions that were on main chain but are now only on side chain (unmined)
-		netUnminedTxs := make([]chainhash.Hash, 0, len(moveBackTxMap))
-		for txHash := range moveBackTxMap {
-			if !moveForwardTxMap[txHash] {
-				netUnminedTxs = append(netUnminedTxs, txHash)
+		// Now collect moveBack transactions, excluding those in moveForward
+		// Net unmined = transactions ONLY in moveBack (not also in moveForward)
+		moveBackTxs := make([]chainhash.Hash, 0, len(moveBackBlocksWithMeta)*100)
+
+		for _, blockWithMeta := range moveBackBlocksWithMeta {
+			if blockWithMeta.meta.Invalid {
+				// Skip invalid blocks - BlockValidation already handled them via unsetMined=true
+				continue
+			}
+
+			block := blockWithMeta.block
+			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
+			if err != nil {
+				b.logger.Warnf("[BlockAssembler][Reset] error getting subtrees for moveBack block %s: %v (will skip)", block.Hash().String(), err)
+				continue
+			}
+
+			for _, st := range blockSubtrees {
+				for _, node := range st.Nodes {
+					if !node.Hash.IsEqual(subtree.CoinbasePlaceholderHash) {
+						// Only add if NOT in moveForward (these are net unmined)
+						if !moveForwardTxMap[node.Hash] {
+							moveBackTxs = append(moveBackTxs, node.Hash)
+						}
+					}
+				}
 			}
 		}
 
-		// Mark unmined transactions as NOT on longest chain (set unmined_since)
-		if len(netUnminedTxs) > 0 {
-			if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, netUnminedTxs, false); err != nil {
-				b.logger.Errorf("[BlockAssembler][Reset] error marking unmined transactions: %v", err)
+		// Mark net unmined transactions as NOT on longest chain (set unmined_since)
+		if len(moveBackTxs) > 0 {
+			if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, moveBackTxs, false); err != nil {
+				b.logger.Errorf("[BlockAssembler][Reset] error marking moveBack transactions as unmined: %v", err)
 			} else {
-				b.logger.Infof("[BlockAssembler][Reset] marked %d net unmined transactions as not on longest chain", len(netUnminedTxs))
-			}
-		}
-
-		// Mark moveForward transactions as ON longest chain (clear unmined_since - they are now mined)
-		if len(moveForwardTxMap) > 0 {
-			moveForwardTxs := make([]chainhash.Hash, 0, len(moveForwardTxMap))
-			for txHash := range moveForwardTxMap {
-				moveForwardTxs = append(moveForwardTxs, txHash)
-			}
-
-			if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, moveForwardTxs, true); err != nil {
-				b.logger.Errorf("[BlockAssembler][Reset] error marking moveForward transactions: %v", err)
-			} else {
-				b.logger.Infof("[BlockAssembler][Reset] marked %d moveForward transactions as on longest chain (mined)", len(moveForwardTxs))
+				b.logger.Infof("[BlockAssembler][Reset] marked %d net unmined transactions (moveBack minus moveForward)", len(moveBackTxs))
 			}
 		}
 	}
@@ -1524,27 +1541,29 @@ func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) 
 
 // loadUnminedTransactions loads transactions from the UTXO store into block assembly.
 //
-// This function has two main responsibilities:
-//
-// 1. Load unmined transactions:
+// Primary responsibility: Load unmined transactions
 //   - Iterates through transactions with unmined_since set
 //   - Filters out transactions already on main chain (skip those with block_ids on best chain)
 //   - Loads remaining transactions into block assembly for potential inclusion in next block
 //
-// 2. Fix data inconsistencies (ALWAYS):
+// Secondary responsibility: Data integrity safety net (ALWAYS runs)
 //   - Identifies transactions with block_ids on main chain BUT unmined_since still set
 //   - Calls MarkTransactionsOnLongestChain to clear unmined_since for these transactions
-//   - This catches issues from: previous bugs, crashes mid-reorg, edge cases
-//   - Minimal performance impact since list is empty when data is correct
+//   - This catches edge cases from: previous bugs, crashes, timing issues
+//   - Minimal performance impact since list is usually empty when system is healthy
 //
 // The fullScan parameter controls iterator behavior:
 //   - fullScan=false: Uses index on unmined_since (fast, most common)
 //   - fullScan=true: Scans ALL records (Aerospike only; SQL always uses index)
 //
-// Relationship with reset():
-//   - reset() handles unmined_since for transactions in moveBack/moveForward blocks
-//   - loadUnminedTransactions() handles unmined_since for ALL OTHER transactions in UTXO store
-//   - Both work together to ensure complete data integrity
+// Relationship with reorg handling:
+//   - BlockValidation background jobs: Handle moveForward blocks and invalid blocks
+//   - reset(): Handles moveBack blocks (sets unmined_since for transactions moved to side chain)
+//   - loadUnminedTransactions(): Loads everything + catches any missed edge cases
+//
+// Note: For moveForward blocks, BlockValidation has already cleared unmined_since via
+// background job (mined_set=false triggers setTxMinedStatus with onLongestChain=true).
+// This function is just a safety net for any inconsistencies, not primary reorg handling.
 //
 // Called from:
 //   - reset() as postProcessFn (after reorg processing)
