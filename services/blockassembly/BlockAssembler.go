@@ -454,6 +454,40 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 		}
 	}
 
+	// Mark transactions from moveForwardBlocks as ON longest chain (clear unmined_since)
+	// This handles the case where side-chain blocks become part of the main chain
+	// These transactions are now confirmed and should have unmined_since cleared
+	if len(moveForwardBlocksWithMeta) > 0 {
+		moveForwardTxHashes := make([]chainhash.Hash, 0, len(moveForwardBlocksWithMeta)*100) // Pre-allocate
+		for _, blockWithMeta := range moveForwardBlocksWithMeta {
+			block := blockWithMeta.block
+			// Get all transactions from the block's subtrees
+			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
+			if err != nil {
+				b.logger.Warnf("[BlockAssembler][Reset] error getting subtrees for moveForward block %s: %v (will skip marking txs)", block.Hash().String(), err)
+				continue
+			}
+
+			for _, st := range blockSubtrees {
+				for _, node := range st.Nodes {
+					// Skip coinbase placeholder
+					if !node.Hash.IsEqual(subtree.CoinbasePlaceholderHash) {
+						moveForwardTxHashes = append(moveForwardTxHashes, node.Hash)
+					}
+				}
+			}
+		}
+
+		if len(moveForwardTxHashes) > 0 {
+			if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, moveForwardTxHashes, true); err != nil {
+				b.logger.Errorf("[BlockAssembler][Reset] error marking moveForward transactions as on longest chain: %v", err)
+				// Don't fail the reset, just log the error
+			} else {
+				b.logger.Infof("[BlockAssembler][Reset] marked %d transactions from moveForward blocks as on longest chain", len(moveForwardTxHashes))
+			}
+		}
+	}
+
 	// define a post process function to be called after the reset is complete, but before we release the lock
 	// in the for/select in the subtreeprocessor
 	postProcessFn := func() error {
@@ -1593,16 +1627,15 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		}
 	}
 
-	// Mark transactions that are already mined on the longest chain in the utxo store
-	// This is necessary to clear unmined_since for transactions that moved from side chain to main chain
-	// during reorgs. Previously this was only done during fullScan, but it must happen during all
-	// resets to prevent unmined_since from being incorrectly set on main-chain transactions.
-	if len(markAsMinedOnLongestChain) > 0 {
+	// During full scans, we do an exhaustive check and fix any inconsistencies
+	// This catches edge cases where unmined_since might be incorrectly set from previous bugs
+	// For normal resets, unmined_since is handled by the moveBack/moveForward logic in reset()
+	if fullScan && len(markAsMinedOnLongestChain) > 0 {
 		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, markAsMinedOnLongestChain, true); err != nil {
 			return errors.NewProcessingError("error marking transactions as mined on longest chain", err)
 		}
 
-		b.logger.Infof("[BlockAssembler] marked %d unmined transactions as mined on longest chain", len(markAsMinedOnLongestChain))
+		b.logger.Infof("[BlockAssembler] marked %d unmined transactions as mined on longest chain during full scan", len(markAsMinedOnLongestChain))
 	}
 
 	// order the transactions by createdAt
