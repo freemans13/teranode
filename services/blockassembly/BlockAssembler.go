@@ -388,9 +388,11 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 //
 // The reset process:
 // 1. Marks transactions from moveBackBlocks as NOT on longest chain (sets unmined_since)
-//    - These are transactions that were on main chain but are now orphaned
+//   - These are transactions that were on main chain but are now orphaned
+//
 // 2. Marks transactions from moveForwardBlocks as ON longest chain (clears unmined_since)
-//    - These are transactions that were on side chain but are now confirmed on main chain
+//   - These are transactions that were on side chain but are now confirmed on main chain
+//
 // 3. Calls subtreeProcessor.Reset() to clear all subtrees
 // 4. Calls loadUnminedTransactions() to reload transactions from UTXO store
 //
@@ -400,7 +402,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 // Parameters:
 //   - ctx: Context for cancellation
 //   - fullScan: If true, loadUnminedTransactions will scan all records and fix inconsistencies
-//               If false, uses index-based query for faster reload
+//     If false, uses index-based query for faster reload
 //
 // Returns:
 //   - error: Any error encountered during reset
@@ -1519,19 +1521,19 @@ func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) 
 // This function serves two distinct purposes depending on the fullScan parameter:
 //
 // 1. Normal Load (fullScan=false):
-//    - Loads transactions with unmined_since set (mempool + side chain transactions)
-//    - Used after reorgs where reset() has already handled unmined_since updates
-//    - Fast: Uses index on unmined_since field
-//    - Does NOT call MarkTransactionsOnLongestChain (reorg logic done in reset())
+//   - Loads transactions with unmined_since set (mempool + side chain transactions)
+//   - Used after reorgs where reset() has already handled unmined_since updates
+//   - Fast: Uses index on unmined_since field
+//   - Does NOT call MarkTransactionsOnLongestChain (reorg logic done in reset())
 //
 // 2. Full Scan (fullScan=true):
-//    - Scans ALL transactions in UTXO store (Aerospike only; SQL always filters)
-//    - Finds and FIXES data inconsistencies (cleanup mode)
-//    - Used during: startup, manual reset, recovery scenarios
-//    - Calls MarkTransactionsOnLongestChain to fix transactions with:
-//      * block_ids on main chain BUT unmined_since incorrectly set
-//      * This can happen from: previous bugs, crashes, edge cases
-//    - Slower but ensures data integrity
+//   - Scans ALL transactions in UTXO store (Aerospike only; SQL always filters)
+//   - Finds and FIXES data inconsistencies (cleanup mode)
+//   - Used during: startup, manual reset, recovery scenarios
+//   - Calls MarkTransactionsOnLongestChain to fix transactions with:
+//   - block_ids on main chain BUT unmined_since incorrectly set
+//   - This can happen from: previous bugs, crashes, edge cases
+//   - Slower but ensures data integrity
 //
 // Key Subtlety - Why fullScan check for MarkTransactionsOnLongestChain?
 //

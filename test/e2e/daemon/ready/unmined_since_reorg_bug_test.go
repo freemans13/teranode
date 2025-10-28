@@ -28,13 +28,13 @@ import (
 // TestUnminedSinceReorgScenarios tests unmined_since field handling during various reorg scenarios
 func TestUnminedSinceReorgScenarios(t *testing.T) {
 	testCases := []struct {
-		name            string
-		storeType       string // "sql" or "aerospike"
-		scenario        string // "side-to-main"
-		expectedBefore  uint32 // expected unmined_since before reorg
-		expectedAfter   uint32 // expected unmined_since after reorg (0 = NULL)
-		onChainBefore   bool   // should be on current chain before reorg
-		onChainAfter    bool   // should be on current chain after reorg
+		name           string
+		storeType      string // "sql" or "aerospike"
+		scenario       string // "side-to-main"
+		expectedBefore uint32 // expected unmined_since before reorg
+		expectedAfter  uint32 // expected unmined_since after reorg (0 = NULL)
+		onChainBefore  bool   // should be on current chain before reorg
+		onChainAfter   bool   // should be on current chain after reorg
 	}{
 		{
 			name:           "SQL: Side to Main",
