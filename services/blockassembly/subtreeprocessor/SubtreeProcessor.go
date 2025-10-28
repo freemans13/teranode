@@ -1662,16 +1662,16 @@ func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlo
 //
 // The reorg process:
 // 1. Move back: Loads transactions from moveBackBlocks into block assembly
-//   - Extracts transactions from orphaned blocks
+//   - Extracts transactions from blocks no longer on main chain
 //   - Adds them to subtrees for re-mining
 //   - Tracks which transactions were in moveBack blocks
 //
 // 2. Move forward: Processes transactions from moveForwardBlocks
 //   - Marks transactions (that weren't in moveBack) as ON longest chain (clears unmined_since) - Line 1796
-//   - Removes them from block assembly (they're confirmed)
+//   - Removes them from block assembly (they're now mined)
 //
 // 3. Mark remaining block assembly txs as NOT on longest chain (sets unmined_since) - Lines 1816, 1854
-//   - These are transactions still in mempool after the reorg
+//   - These are transactions still unmined after the reorg
 //
 // This function is MUTUALLY EXCLUSIVE with BlockAssembler.reset():
 // - Small/medium successful reorgs: Use reorgBlocks() (this function)
@@ -1679,7 +1679,7 @@ func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlo
 //
 // Parameters:
 //   - ctx: Context for cancellation
-//   - moveBackBlocks: Blocks being removed from main chain (orphaned)
+//   - moveBackBlocks: Blocks being removed from main chain (now on side chain)
 //   - moveForwardBlocks: Blocks being added to main chain (new longest chain)
 //
 // Returns:

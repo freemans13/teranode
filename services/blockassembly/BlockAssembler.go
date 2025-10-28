@@ -1525,34 +1525,27 @@ func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) 
 
 // loadUnminedTransactions loads transactions from the UTXO store into block assembly.
 //
-// This function serves two distinct purposes depending on the fullScan parameter:
+// This function has two main responsibilities:
 //
-// 1. Normal Load (fullScan=false):
-//   - Loads transactions with unmined_since set (mempool + side chain transactions)
-//   - Used after reorgs where reset() has already handled unmined_since updates
-//   - Fast: Uses index on unmined_since field
-//   - Does NOT call MarkTransactionsOnLongestChain (reorg logic done in reset())
+// 1. Load unmined transactions:
+//   - Iterates through transactions with unmined_since set
+//   - Filters out transactions already on main chain (skip those with block_ids on best chain)
+//   - Loads remaining transactions into block assembly for potential inclusion in next block
 //
-// 2. Full Scan (fullScan=true):
-//   - Scans ALL transactions in UTXO store (Aerospike only; SQL always filters)
-//   - Finds and FIXES data inconsistencies (cleanup mode)
-//   - Used during: startup, manual reset, recovery scenarios
-//   - Calls MarkTransactionsOnLongestChain to fix transactions with:
-//   - block_ids on main chain BUT unmined_since incorrectly set
-//   - This can happen from: previous bugs, crashes, edge cases
-//   - Slower but ensures data integrity
+// 2. Fix data inconsistencies (ALWAYS):
+//   - Identifies transactions with block_ids on main chain BUT unmined_since still set
+//   - Calls MarkTransactionsOnLongestChain to clear unmined_since for these transactions
+//   - This catches issues from: previous bugs, crashes mid-reorg, edge cases
+//   - Minimal performance impact since list is empty when data is correct
 //
-// Key Subtlety - Why fullScan check for MarkTransactionsOnLongestChain?
+// The fullScan parameter controls iterator behavior:
+//   - fullScan=false: Uses index on unmined_since (fast, most common)
+//   - fullScan=true: Scans ALL records (Aerospike only; SQL always uses index)
 //
-// During normal resets (fullScan=false):
-//   - unmined_since is ALREADY correct (set by reset() lines 448, 482)
-//   - MarkTransactionsOnLongestChain would be redundant
-//   - Skip it for performance
-//
-// During full scans (fullScan=true):
-//   - Finding and fixing ALL inconsistencies (including from old bugs)
-//   - MarkTransactionsOnLongestChain repairs broken data
-//   - Worth the extra cost for data integrity
+// Relationship with reset():
+//   - reset() handles unmined_since for transactions in moveBack/moveForward blocks
+//   - loadUnminedTransactions() handles unmined_since for ALL OTHER transactions in UTXO store
+//   - Both work together to ensure complete data integrity
 //
 // Called from:
 //   - reset() as postProcessFn (after reorg processing)
@@ -1560,7 +1553,7 @@ func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) 
 //
 // Parameters:
 //   - ctx: Context for cancellation
-//   - fullScan: true = scan all + fix issues, false = fast index-based load
+//   - fullScan: true = scan all records, false = use index (faster)
 //
 // Returns:
 //   - error: Any error encountered during loading
