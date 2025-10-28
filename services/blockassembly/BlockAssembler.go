@@ -379,6 +379,31 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 	return nil
 }
 
+// reset performs a full reset of the block assembler state by clearing all subtrees and reloading from blockchain.
+//
+// This is the "nuclear option" for handling blockchain reorganizations and is used when:
+// 1. Large reorgs (>= CoinbaseMaturity blocks AND height > 1000) where incremental reorg is too expensive
+// 2. Failed reorgs where subtreeProcessor.Reorg() encountered errors
+// 3. Reorgs involving invalid blocks that require clean state
+//
+// The reset process:
+// 1. Marks transactions from moveBackBlocks as NOT on longest chain (sets unmined_since)
+//    - These are transactions that were on main chain but are now orphaned
+// 2. Marks transactions from moveForwardBlocks as ON longest chain (clears unmined_since)
+//    - These are transactions that were on side chain but are now confirmed on main chain
+// 3. Calls subtreeProcessor.Reset() to clear all subtrees
+// 4. Calls loadUnminedTransactions() to reload transactions from UTXO store
+//
+// This approach ensures unmined_since is correctly set for ALL transactions affected by the reorg,
+// regardless of whether they're in the UTXO store or need to be loaded into block assembly.
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - fullScan: If true, loadUnminedTransactions will scan all records and fix inconsistencies
+//               If false, uses index-based query for faster reload
+//
+// Returns:
+//   - error: Any error encountered during reset
 func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 	bestBlockchainBlockHeader, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
@@ -1489,26 +1514,47 @@ func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) 
 	return nbit, nil
 }
 
-// loadUnminedTransactions loads previously unmined transactions from the UTXO store.
-// This method is called during block assembler initialization to restore the state
-// of transactions that were previously processed but not yet included in a mined block.
-// It helps maintain continuity across service restarts by reloading pending transactions.
+// loadUnminedTransactions loads transactions from the UTXO store into block assembly.
 //
-// The function performs the following operations:
-// - Checks if a UTXO store is available (logs warning and returns if not)
-// - Creates an iterator for unmined transactions from the UTXO store
-// - Processes each unmined transaction and adds it to the subtree processor
-// - Handles any errors during transaction loading and processing
+// This function serves two distinct purposes depending on the fullScan parameter:
 //
-// This is an important initialization step that ensures the block assembler can
-// continue processing transactions that were in progress before a restart or
-// service interruption.
+// 1. Normal Load (fullScan=false):
+//    - Loads transactions with unmined_since set (mempool + side chain transactions)
+//    - Used after reorgs where reset() has already handled unmined_since updates
+//    - Fast: Uses index on unmined_since field
+//    - Does NOT call MarkTransactionsOnLongestChain (reorg logic done in reset())
+//
+// 2. Full Scan (fullScan=true):
+//    - Scans ALL transactions in UTXO store (Aerospike only; SQL always filters)
+//    - Finds and FIXES data inconsistencies (cleanup mode)
+//    - Used during: startup, manual reset, recovery scenarios
+//    - Calls MarkTransactionsOnLongestChain to fix transactions with:
+//      * block_ids on main chain BUT unmined_since incorrectly set
+//      * This can happen from: previous bugs, crashes, edge cases
+//    - Slower but ensures data integrity
+//
+// Key Subtlety - Why fullScan check for MarkTransactionsOnLongestChain?
+//
+// During normal resets (fullScan=false):
+//   - unmined_since is ALREADY correct (set by reset() lines 448, 482)
+//   - MarkTransactionsOnLongestChain would be redundant
+//   - Skip it for performance
+//
+// During full scans (fullScan=true):
+//   - Finding and fixing ALL inconsistencies (including from old bugs)
+//   - MarkTransactionsOnLongestChain repairs broken data
+//   - Worth the extra cost for data integrity
+//
+// Called from:
+//   - reset() as postProcessFn (after reorg processing)
+//   - Startup initialization
 //
 // Parameters:
-//   - ctx: Context for the loading operation, allowing for cancellation
+//   - ctx: Context for cancellation
+//   - fullScan: true = scan all + fix issues, false = fast index-based load
 //
 // Returns:
-//   - error: Any error encountered during transaction loading or processing
+//   - error: Any error encountered during loading
 func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan bool) (err error) {
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "loadUnminedTransactions",
 		tracing.WithParentStat(b.stats),
