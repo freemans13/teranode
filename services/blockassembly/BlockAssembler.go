@@ -420,6 +420,40 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 		return errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
 	}
 
+	// Mark transactions from moveBackBlocks as NOT on longest chain (set unmined_since)
+	// This handles the case where blocks are overtaken by a longer chain (not invalidated)
+	// These transactions should be available for block assembly again
+	if len(moveBackBlocksWithMeta) > 0 {
+		moveBackTxHashes := make([]chainhash.Hash, 0, len(moveBackBlocksWithMeta)*100) // Pre-allocate
+		for _, blockWithMeta := range moveBackBlocksWithMeta {
+			block := blockWithMeta.block
+			// Get all transactions from the block's subtrees
+			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
+			if err != nil {
+				b.logger.Warnf("[BlockAssembler][Reset] error getting subtrees for moveBack block %s: %v (will skip marking txs)", block.Hash().String(), err)
+				continue
+			}
+
+			for _, st := range blockSubtrees {
+				for _, node := range st.Nodes {
+					// Skip coinbase placeholder
+					if !node.Hash.IsEqual(subtree.CoinbasePlaceholderHash) {
+						moveBackTxHashes = append(moveBackTxHashes, node.Hash)
+					}
+				}
+			}
+		}
+
+		if len(moveBackTxHashes) > 0 {
+			if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, moveBackTxHashes, false); err != nil {
+				b.logger.Errorf("[BlockAssembler][Reset] error marking moveBack transactions as not on longest chain: %v", err)
+				// Don't fail the reset, just log the error
+			} else {
+				b.logger.Infof("[BlockAssembler][Reset] marked %d transactions from moveBack blocks as not on longest chain", len(moveBackTxHashes))
+			}
+		}
+	}
+
 	// define a post process function to be called after the reset is complete, but before we release the lock
 	// in the for/select in the subtreeprocessor
 	postProcessFn := func() error {
