@@ -642,17 +642,17 @@ func TestSyncCoordinator_checkAndUpdateURLResponsiveness(t *testing.T) {
 		{
 			ID:         peer.ID("peer1"),
 			DataHubURL: successServer.URL,
-			Storage:   "full",
+			Storage:    "full",
 		},
 		{
 			ID:         peer.ID("peer2"),
 			DataHubURL: "http://localhost:99999",
-			Storage:   "full",
+			Storage:    "full",
 		},
 		{
 			ID:         peer.ID("peer3"),
 			DataHubURL: "",
-			Storage:   "full",
+			Storage:    "full",
 		},
 	}
 
@@ -877,14 +877,14 @@ func TestSyncCoordinator_LogPeerList(t *testing.T) {
 			DataHubURL: "http://example1.com",
 			Height:     100,
 			BanScore:   5,
-			Storage:   "full",
+			Storage:    "full",
 		},
 		{
 			ID:         peer.ID("peer2"),
 			DataHubURL: "http://example2.com",
 			Height:     200,
 			BanScore:   10,
-			Storage:   "full",
+			Storage:    "full",
 		},
 	}
 
@@ -923,14 +923,14 @@ func TestSyncCoordinator_LogCandidateList(t *testing.T) {
 			DataHubURL: "http://candidate1.com",
 			Height:     150,
 			BanScore:   3,
-			Storage:   "full",
+			Storage:    "full",
 		},
 		{
 			ID:         peer.ID("candidate2"),
 			DataHubURL: "http://candidate2.com",
 			Height:     250,
 			BanScore:   7,
-			Storage:   "full",
+			Storage:    "full",
 		},
 	}
 
