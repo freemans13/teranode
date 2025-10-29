@@ -558,6 +558,18 @@ func (b *BlockAssembler) setBestBlockHeader(bestBlockchainBlockHeader *model.Blo
 	// Invalidate cache when block height changes
 	b.invalidateMiningCandidateCache()
 
+	// Run cleanup operations sequentially to prevent races
+	// Step 1: Preserve parents of old unmined transactions FIRST
+	// This sets preserve_until and clears delete_at_height on parent transactions
+	if b.utxoStore != nil && height > 0 {
+		_, err := utxo.PreserveParentsOfOldUnminedTransactions(context.Background(), b.utxoStore, height, b.settings, b.logger)
+		if err != nil {
+			b.logger.Errorf("[BlockAssembler] error preserving parents during block height update: %v", err)
+		}
+	}
+
+	// Step 2: Then run DAH cleanup
+	// This runs AFTER preserve, so it won't delete parents that were just preserved
 	if b.cleanupServiceLoaded.Load() && b.cleanupService != nil && height > 0 {
 		if err := b.cleanupService.UpdateBlockHeight(height); err != nil {
 			b.logger.Errorf("[BlockAssembler] cleanup service error updating block height: %v", err)
@@ -693,10 +705,6 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	}
 
 	prometheusBlockAssemblyCurrentBlockHeight.Set(float64(b.bestBlockHeight.Load()))
-
-	// Start background cleanup of unmined transactions every 10 minutes
-	// This is started after initial cleanup and loading is complete
-	b.startUnminedTransactionCleanup(ctx)
 
 	return nil
 }
@@ -1597,56 +1605,6 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	}
 
 	return nil
-}
-
-// startUnminedTransactionCleanup starts a background goroutine that periodically cleans up old unmined transactions.
-// The cleanup runs every 10 minutes and uses the store-agnostic cleanup function.
-func (b *BlockAssembler) startUnminedTransactionCleanup(ctx context.Context) {
-	if b.utxoStore == nil {
-		b.logger.Warnf("[BlockAssembler] no utxostore, skipping unmined transaction cleanup background job")
-		return
-	}
-
-	// Don't start if already running
-	if b.unminedCleanupTicker != nil {
-		b.logger.Debugf("[BlockAssembler] unmined transaction cleanup background job already running")
-		return
-	}
-
-	// Create a ticker for 10-minute intervals
-	b.unminedCleanupTicker = time.NewTicker(10 * time.Minute)
-
-	b.logger.Infof("[BlockAssembler] starting background cleanup of unmined transactions every 10 minutes")
-
-	go func() {
-		defer func() {
-			b.unminedCleanupTicker.Stop()
-			b.unminedCleanupTicker = nil
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				b.logger.Infof("[BlockAssembler] stopping unmined transaction cleanup background job")
-				return
-
-			case <-b.unminedCleanupTicker.C:
-				currentBlockHeight := b.bestBlockHeight.Load()
-				if currentBlockHeight > 0 {
-					cleanupCount, err := utxo.PreserveParentsOfOldUnminedTransactions(ctx, b.utxoStore, currentBlockHeight, b.settings, b.logger)
-
-					switch {
-					case err != nil:
-						b.logger.Errorf("[BlockAssembler] background cleanup of unmined transactions failed: %v", err)
-					case cleanupCount > 0:
-						b.logger.Infof("[BlockAssembler] background cleanup removed %d old unmined transactions", cleanupCount)
-					default:
-						b.logger.Debugf("[BlockAssembler] background cleanup found no old unmined transactions to remove")
-					}
-				}
-			}
-		}
-	}()
 }
 
 // invalidateMiningCandidateCache invalidates the cached mining candidate
