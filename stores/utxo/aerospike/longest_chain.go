@@ -21,6 +21,50 @@ type batchLongestChain struct {
 	errCh          chan error // Channel for completion notification
 }
 
+// MarkTransactionsOnLongestChain updates unmined_since for transactions based on their chain status.
+//
+// This function is critical for maintaining data integrity during blockchain reorganizations.
+// Uses Aerospike batch operations for efficient updates of potentially millions of transactions.
+//
+// Behavior:
+//   - onLongestChain=true: Clears unmined_since (transaction is mined on main chain)
+//   - onLongestChain=false: Sets unmined_since to current height (transaction is unmined)
+//
+// CRITICAL - Resilient Error Handling (Must Not Fail Fast):
+// This function attempts to update ALL transactions even if some fail. Uses concurrent
+// goroutines with batching for performance while ensuring all transactions are attempted.
+//
+// Error handling strategy:
+//   - Processes ALL transactions concurrently (does not stop on first error)
+//   - Collects up to 10 errors for logging/debugging (prevents log spam)
+//   - Logs summary: attempted, succeeded, failed counts
+//   - Returns aggregated errors after attempting all transactions
+//   - Missing transactions trigger FATAL error (data corruption - unrecoverable)
+//
+// Why resilient processing is critical:
+//   - Large reorgs can affect millions of transactions
+//   - Transient errors shouldn't prevent updating other transactions
+//   - Maximizes data integrity by updating as many as possible
+//   - Process halts only for unrecoverable errors (missing transactions)
+//
+// Timing guarantee:
+// This function is called synchronously from reset/reorg operations. Cleanup operations
+// (preserve parents, DAH cleanup) only run AFTER this completes via setBestBlockHeader,
+// ensuring they see consistent transaction state.
+//
+// Called from:
+//   - BlockAssembler.reset() - marks moveBack transactions during large reorgs
+//   - SubtreeProcessor.reorgBlocks() - marks transactions during small/medium reorgs
+//   - loadUnminedTransactions() - fixes data inconsistencies
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - txHashes: Transactions to update (can be millions during large reorgs)
+//   - onLongestChain: true = clear unmined_since (mined), false = set unmined_since (unmined)
+//
+// Returns:
+//   - error: Aggregated errors (up to 10) if any failures occurred
+//   - Note: Function calls logger.Fatalf for missing transactions before returning
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	allErrors := make([]error, 0, 10) // Pre-allocate capacity for up to 10 errors
 	missingTxErrors := make([]error, 0, 10)

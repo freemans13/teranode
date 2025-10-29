@@ -1904,6 +1904,51 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	return nil
 }
 
+// MarkTransactionsOnLongestChain updates unmined_since for transactions based on their chain status.
+//
+// This function is critical for maintaining data integrity during blockchain reorganizations.
+// It ensures transactions have the correct unmined_since value based on whether they are on
+// the longest (main) chain or on a side chain.
+//
+// Behavior:
+//   - onLongestChain=true: Clears unmined_since (transaction is mined on main chain)
+//   - onLongestChain=false: Sets unmined_since to current height (transaction is unmined)
+//
+// CRITICAL - Resilient Error Handling (Must Not Fail Fast):
+// This function attempts to update ALL transactions even if some fail. This is essential during
+// large reorgs where millions of transactions need updating.
+//
+// Error handling strategy:
+//   - Processes ALL transactions (does not stop on first error)
+//   - Collects up to 10 errors for logging/debugging (prevents log spam)
+//   - Logs summary: attempted, succeeded, failed counts
+//   - Returns aggregated errors after attempting all transactions
+//   - Missing transactions trigger FATAL error (data corruption)
+//
+// Why resilient processing is critical:
+//   - Large reorgs can affect millions of transactions
+//   - Transient network errors shouldn't prevent updating other transactions
+//   - Maximizes data integrity by updating as many as possible
+//   - Missing transaction = unrecoverable (FATAL to prevent corrupt state)
+//
+// Timing guarantee:
+// This function is called synchronously from reset/reorg operations. By the time cleanup
+// operations run (via setBestBlockHeader), all MarkTransactionsOnLongestChain calls have
+// completed, ensuring cleanup only sees consistent transaction state.
+//
+// Called from:
+//   - BlockAssembler.reset() - marks moveBack transactions during large reorgs
+//   - SubtreeProcessor.reorgBlocks() - marks transactions during small/medium reorgs
+//   - loadUnminedTransactions() - fixes data inconsistencies
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - txHashes: Transactions to update (can be millions during large reorgs)
+//   - onLongestChain: true = clear unmined_since (mined), false = set unmined_since (unmined)
+//
+// Returns:
+//   - error: Aggregated errors (up to 10) if any failures occurred
+//   - Note: Function calls logger.Fatalf for missing transactions before returning
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	var q string
 	allErrors := make([]error, 0, 10) // Pre-allocate capacity for up to 10 errors
@@ -1920,20 +1965,25 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		`
 
 		for _, txHash := range txHashes {
-			_, err := s.db.ExecContext(ctx, q, txHash[:])
+			result, err := s.db.ExecContext(ctx, q, txHash[:])
 			if err != nil {
 				errorCount++
 				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
 				if len(allErrors) < 10 {
 					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
 					allErrors = append(allErrors, errors.NewStorageError("failed to mark transaction %s as on longest chain", txHash, err))
-
-					// Track missing transaction errors separately (these are fatal)
-					if errors.Is(err, sql.ErrNoRows) {
-						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash, err))
-					}
 				}
 				// Continue processing remaining transactions
+			} else {
+				// Check if transaction was actually found and updated
+				rowsAffected, _ := result.RowsAffected()
+				if rowsAffected == 0 {
+					errorCount++
+					// Transaction not found - this is FATAL (data corruption)
+					if len(missingTxErrors) < 10 {
+						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash))
+					}
+				}
 			}
 		}
 	} else {
@@ -1947,20 +1997,25 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		`
 
 		for _, txHash := range txHashes {
-			_, err := s.db.ExecContext(ctx, q, txHash[:], currentBlockHeight)
+			result, err := s.db.ExecContext(ctx, q, txHash[:], currentBlockHeight)
 			if err != nil {
 				errorCount++
 				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
 				if len(allErrors) < 10 {
 					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
 					allErrors = append(allErrors, errors.NewStorageError("failed to mark transaction %s as not on longest chain", txHash, err))
-
-					// Track missing transaction errors separately (these are fatal)
-					if errors.Is(err, sql.ErrNoRows) {
-						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash, err))
-					}
 				}
 				// Continue processing remaining transactions
+			} else {
+				// Check if transaction was actually found and updated
+				rowsAffected, _ := result.RowsAffected()
+				if rowsAffected == 0 {
+					errorCount++
+					// Transaction not found - this is FATAL (data corruption)
+					if len(missingTxErrors) < 10 {
+						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash))
+					}
+				}
 			}
 		}
 	}
