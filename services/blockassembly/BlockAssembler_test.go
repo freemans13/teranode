@@ -1869,6 +1869,11 @@ func TestBlockAssembly_setBestBlockHeader_CleanupServiceFailures(t *testing.T) {
 		testItems.blockAssembler.cleanupService = mockCleanupService
 		testItems.blockAssembler.cleanupServiceLoaded.Store(true)
 
+		// Start the cleanup queue worker
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		testItems.blockAssembler.startCleanupQueueWorker(ctx)
+
 		// Set state to running so cleanup is triggered
 		testItems.blockAssembler.setCurrentRunningState(StateRunning)
 
@@ -1889,6 +1894,9 @@ func TestBlockAssembly_setBestBlockHeader_CleanupServiceFailures(t *testing.T) {
 		// Verify the block header was still set correctly
 		assert.Equal(t, newHeader, testItems.blockAssembler.bestBlockHeader.Load())
 		assert.Equal(t, newHeight, testItems.blockAssembler.bestBlockHeight.Load())
+
+		// Wait for background goroutine to complete (parent preserve + cleanup trigger)
+		time.Sleep(100 * time.Millisecond)
 
 		// Verify cleanup service was called
 		mockCleanupService.AssertCalled(t, "UpdateBlockHeight", newHeight, mock.Anything)
