@@ -1906,6 +1906,10 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	var q string
+	allErrors := make([]error, 0, 10) // Pre-allocate capacity for up to 10 errors
+	missingTxErrors := make([]error, 0, 10)
+	attempted := len(txHashes)
+	errorCount := 0
 
 	if onLongestChain {
 		// Transaction is on longest chain - unset unminedSince field (set to NULL)
@@ -1918,7 +1922,18 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		for _, txHash := range txHashes {
 			_, err := s.db.ExecContext(ctx, q, txHash[:])
 			if err != nil {
-				return errors.NewStorageError("failed to mark transaction as on longest chain for %s", txHash, err)
+				errorCount++
+				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
+				if len(allErrors) < 10 {
+					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
+					allErrors = append(allErrors, errors.NewStorageError("failed to mark transaction %s as on longest chain", txHash, err))
+
+					// Track missing transaction errors separately (these are fatal)
+					if errors.Is(err, sql.ErrNoRows) {
+						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash, err))
+					}
+				}
+				// Continue processing remaining transactions
 			}
 		}
 	} else {
@@ -1934,9 +1949,39 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		for _, txHash := range txHashes {
 			_, err := s.db.ExecContext(ctx, q, txHash[:], currentBlockHeight)
 			if err != nil {
-				return errors.NewStorageError("failed to mark transaction as not on longest chain for %s", txHash, err)
+				errorCount++
+				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
+				if len(allErrors) < 10 {
+					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
+					allErrors = append(allErrors, errors.NewStorageError("failed to mark transaction %s as not on longest chain", txHash, err))
+
+					// Track missing transaction errors separately (these are fatal)
+					if errors.Is(err, sql.ErrNoRows) {
+						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash, err))
+					}
+				}
+				// Continue processing remaining transactions
 			}
 		}
+	}
+
+	// Log summary
+	succeeded := attempted - errorCount
+	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, succeeded=%d, failed=%d, onLongestChain=%t",
+		attempted, succeeded, errorCount, onLongestChain)
+
+	// FATAL if we have missing transactions - this indicates data corruption
+	if len(missingTxErrors) > 0 {
+		s.logger.Fatalf("CRITICAL: %d missing transactions during MarkTransactionsOnLongestChain - data integrity compromised. First errors: %v",
+			len(missingTxErrors), errors.Join(missingTxErrors...))
+	}
+
+	// Return aggregated errors (up to 10) for other error types
+	if len(allErrors) > 0 {
+		if errorCount > 10 {
+			s.logger.Errorf("[MarkTransactionsOnLongestChain] only returned first 10 of %d errors", errorCount)
+		}
+		return errors.Join(allErrors...)
 	}
 
 	return nil

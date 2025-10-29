@@ -2,6 +2,7 @@ package aerospike
 
 import (
 	"context"
+	"sync"
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -21,6 +22,11 @@ type batchLongestChain struct {
 }
 
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	allErrors := make([]error, 0, 10) // Pre-allocate capacity for up to 10 errors
+	missingTxErrors := make([]error, 0, 10)
+	var errorCount int
+	var mu sync.Mutex
+
 	g, ctx := errgroup.WithContext(ctx)
 
 	for _, txHash := range txHashes {
@@ -36,11 +42,53 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 				errCh:          errCh,
 			})
 
-			return <-errCh
+			err := <-errCh
+			if err != nil {
+				mu.Lock()
+				errorCount++
+				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
+				if len(allErrors) < 10 {
+					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
+					allErrors = append(allErrors, err)
+
+					// Track missing transaction errors separately (these are fatal)
+					if errors.Is(err, aerospike.ErrKeyNotFound) {
+						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash, err))
+					}
+				}
+				mu.Unlock()
+			}
+			// Don't return error - continue processing all transactions
+			return nil
 		})
 	}
 
-	return g.Wait()
+	_ = g.Wait() // Ignore error since we're collecting them manually
+
+	// Log summary
+	mu.Lock()
+	attempted := len(txHashes)
+	succeeded := attempted - errorCount
+	mu.Unlock()
+
+	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, succeeded=%d, failed=%d, onLongestChain=%t",
+		attempted, succeeded, errorCount, onLongestChain)
+
+	// FATAL if we have missing transactions - this indicates data corruption
+	if len(missingTxErrors) > 0 {
+		s.logger.Fatalf("CRITICAL: %d missing transactions during MarkTransactionsOnLongestChain - data integrity compromised. First errors: %v",
+			len(missingTxErrors), errors.Join(missingTxErrors...))
+	}
+
+	// Return aggregated errors (up to 10) for other error types
+	if len(allErrors) > 0 {
+		if errorCount > 10 {
+			s.logger.Errorf("[MarkTransactionsOnLongestChain] only returned first 10 of %d errors", errorCount)
+		}
+		return errors.Join(allErrors...)
+	}
+
+	return nil
 }
 
 // setLongestChainBatch marks transactions as on/not on the longest chain in a batch using direct Aerospike expressions
