@@ -1234,8 +1234,10 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 }
 
 // determineStorage determines whether this node is a full node or pruned node.
-// A full node has the block persister running and caught up (within threshold blocks of tip).
-// A pruned node either doesn't have block persister running or it's lagging behind.
+// A full node has the block persister running and within the retention window (default: 288 blocks).
+// Since data isn't purged until older than the retention period, a node can serve as "full"
+// as long as the persister lag is within this window.
+// A pruned node either doesn't have block persister running or it's lagging beyond the retention window.
 // Always returns "full" or "pruned" - never returns empty string.
 func (s *Server) determineStorage(ctx context.Context, bestHeight uint32) (mode string) {
 	if s.blockchainClient == nil {
@@ -1275,13 +1277,17 @@ func (s *Server) determineStorage(ctx context.Context, bestHeight uint32) (mode 
 		lag = 0
 	}
 
-	// Get lag threshold from settings (default: 10 blocks)
-	lagThreshold := uint32(10)
-	if s.settings != nil && s.settings.P2P.FullNodeLagThreshold > 0 {
-		lagThreshold = s.settings.P2P.FullNodeLagThreshold
+	// Get lag threshold from GlobalBlockHeightRetention
+	// Since data isn't purged until it's older than this retention window, the node can still
+	// serve as a full node as long as the persister is within this retention period.
+	lagThreshold := uint32(288) // Default 2 days of blocks (144 blocks/day * 2)
+	if s.settings != nil && s.settings.GlobalBlockHeightRetention > 0 {
+		lagThreshold = s.settings.GlobalBlockHeightRetention
 	}
 
-	// Determine mode based on lag threshold
+	// Determine mode based on retention window
+	// If BlockPersister is within the retention window, node is "full"
+	// If BlockPersister lags beyond the retention window, node is "pruned"
 	if lag <= lagThreshold {
 		return "full"
 	}
