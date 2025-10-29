@@ -17,10 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestStartUnminedTransactionCleanup(t *testing.T) {
-	t.Skip("Ticker mechanism removed - parent preserve now runs in setBestBlockHeader. See TestParentPreserveInSetBestBlockHeader instead")
-}
-
 // TestCleanupDuringStartup tests that cleanup runs before loading unmined transactions
 func TestCleanupDuringStartup(t *testing.T) {
 	t.Run("cleanup runs before loading unmined transactions", func(t *testing.T) {
@@ -58,14 +54,14 @@ func TestCleanupDuringStartup(t *testing.T) {
 			utxoStore:        mockStore,
 			logger:           logger,
 			settings:         settings,
-			bestBlockHeight:  atomic.Uint32{},
+			bestBlock:        atomic.Pointer[BestBlockInfo]{},
 			subtreeProcessor: subtreeProcessor,
 			blockchainClient: blockchainClient,
 			cachedCandidate:  &CachedMiningCandidate{},
 		}
 
 		// Set block height
-		ba.bestBlockHeight.Store(100)
+		ba.setBestBlockHeader(nil, 100)
 
 		// Call loadUnminedTransactions which includes cleanup
 		err := ba.loadUnminedTransactions(ctx, false)
@@ -145,7 +141,8 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 		mockSubtreeProcessor.On("AddDirectly", mock.MatchedBy(func(node subtree.SubtreeNode) bool {
 			return node.Hash.String() == normalTx.Hash.String()
 		}), mock.Anything, true).Return(nil).Once()
-		mockSubtreeProcessor.On("GetCurrentBlockHeader").Return(blockHeader1, nil)
+		// GetCurrentBlockHeader may be called multiple times during loading
+		mockSubtreeProcessor.On("GetCurrentBlockHeader").Return(blockHeader1, nil).Maybe()
 
 		blockchainClient := &blockchain.Mock{}
 		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
@@ -155,14 +152,13 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 			utxoStore:        mockStore,
 			logger:           logger,
 			settings:         settings,
-			bestBlockHeight:  atomic.Uint32{},
 			subtreeProcessor: mockSubtreeProcessor,
 			blockchainClient: blockchainClient,
 			cachedCandidate:  &CachedMiningCandidate{},
 		}
 
 		// Set block height
-		ba.bestBlockHeight.Store(100)
+		ba.setBestBlockHeader(nil, 100)
 
 		// Call loadUnminedTransactions
 		err := ba.loadUnminedTransactions(ctx, false)
