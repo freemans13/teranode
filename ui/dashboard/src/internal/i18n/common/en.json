@@ -114,7 +114,7 @@
           "uptime": "Uptime",
           "miner_name": "Miner",
           "listen_mode": "Mode",
-          "node_mode": "Storage",
+          "storage": "Storage",
           "receivedAt": "Received at",
           "peer_id": "Peer"
         }
@@ -382,7 +382,7 @@
           "size_in_bytes": "Size",
           "miner": "Miner",
           "listen_mode": "Mode",
-          "node_mode": "Storage",
+          "storage": "Storage",
           "hash": "Latest hash",
           "hash_and_miner": "Latest Block",
           "previousblockhash": "Previous hash",

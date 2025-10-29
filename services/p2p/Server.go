@@ -865,11 +865,11 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 
 	// Log all received node_status messages for debugging
 	if from == nodeStatusMessage.PeerID {
-		s.logger.Infof("[handleNodeStatusTopic] DIRECT node_status from %s (is_self: %v, version: %s, height: %d, node_mode: %q)",
-			nodeStatusMessage.PeerID, isSelf, nodeStatusMessage.Version, nodeStatusMessage.BestHeight, nodeStatusMessage.NodeMode)
+		s.logger.Infof("[handleNodeStatusTopic] DIRECT node_status from %s (is_self: %v, version: %s, height: %d, storage: %q)",
+			nodeStatusMessage.PeerID, isSelf, nodeStatusMessage.Version, nodeStatusMessage.BestHeight, nodeStatusMessage.Storage)
 	} else {
-		s.logger.Infof("[handleNodeStatusTopic] RELAY  node_status (originator: %s, via: %s, is_self: %v, version: %s, height: %d, node_mode: %q)",
-			nodeStatusMessage.PeerID, from, isSelf, nodeStatusMessage.Version, nodeStatusMessage.BestHeight, nodeStatusMessage.NodeMode)
+		s.logger.Infof("[handleNodeStatusTopic] RELAY  node_status (originator: %s, via: %s, is_self: %v, version: %s, height: %d, storage: %q)",
+			nodeStatusMessage.PeerID, from, isSelf, nodeStatusMessage.Version, nodeStatusMessage.BestHeight, nodeStatusMessage.Storage)
 	}
 	s.logger.Debugf("[handleNodeStatusTopic] Received JSON: %s", string(m))
 
@@ -917,7 +917,7 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 		SyncConnectedAt:     nodeStatusMessage.SyncConnectedAt,
 		MinMiningTxFee:      nodeStatusMessage.MinMiningTxFee,
 		ConnectedPeersCount: nodeStatusMessage.ConnectedPeersCount,
-		NodeMode:            nodeStatusMessage.NodeMode,
+		Storage:             nodeStatusMessage.Storage,
 	}:
 	default:
 		s.logger.Warnf("[handleNodeStatusTopic] notification channel full, dropped node_status notification for %s", nodeStatusMessage.PeerID)
@@ -951,11 +951,11 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 				s.logger.Debugf("[handleNodeStatusTopic] Updated block hash %s for peer %s", nodeStatusMessage.BestBlockHash, peerID)
 			}
 
-			// Update node mode if provided
+			// Update storage mode if provided
 			// Store whether the peer is a full node or pruned node
-			if nodeStatusMessage.NodeMode != "" {
-				s.updateNodeMode(peerID, nodeStatusMessage.NodeMode)
-				s.logger.Debugf("[handleNodeStatusTopic] Updated node mode to %s for peer %s", nodeStatusMessage.NodeMode, peerID)
+			if nodeStatusMessage.Storage != "" {
+				s.updateStorage(peerID, nodeStatusMessage.Storage)
+				s.logger.Debugf("[handleNodeStatusTopic] Updated storage mode to %s for peer %s", nodeStatusMessage.Storage, peerID)
 			}
 		}
 	}
@@ -1200,9 +1200,9 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		}
 	}
 
-	// Determine node mode (full vs pruned) based on block persister status
-	nodeMode := s.determineNodeMode(ctx, height)
-	s.logger.Infof("[getNodeStatusMessage] Determined node_mode=%q for this node at height %d", nodeMode, height)
+	// Determine storage mode (full vs pruned) based on block persister status
+	storage := s.determineStorage(ctx, height)
+	s.logger.Infof("[getNodeStatusMessage] Determined storage=%q for this node at height %d", storage, height)
 
 	// Return the notification message
 	return &notificationMsg{
@@ -1229,15 +1229,15 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		SyncConnectedAt:     syncConnectedAt,
 		MinMiningTxFee:      minMiningTxFee,
 		ConnectedPeersCount: connectedPeersCount,
-		NodeMode:            nodeMode,
+		Storage:             storage,
 	}
 }
 
-// determineNodeMode determines whether this node is a full node or pruned node.
+// determineStorage determines whether this node is a full node or pruned node.
 // A full node has the block persister running and caught up (within threshold blocks of tip).
 // A pruned node either doesn't have block persister running or it's lagging behind.
 // Always returns "full" or "pruned" - never returns empty string.
-func (s *Server) determineNodeMode(ctx context.Context, bestHeight uint32) (mode string) {
+func (s *Server) determineStorage(ctx context.Context, bestHeight uint32) (mode string) {
 	if s.blockchainClient == nil {
 		return "pruned"
 	}
@@ -1320,7 +1320,7 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 		SyncConnectedAt:     msg.SyncConnectedAt,
 		MinMiningTxFee:      msg.MinMiningTxFee,
 		ConnectedPeersCount: msg.ConnectedPeersCount,
-		NodeMode:            msg.NodeMode,
+		Storage:             msg.Storage,
 	}
 
 	msgBytes, err := json.Marshal(nodeStatusMessage)
@@ -1328,7 +1328,7 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 		return errors.NewError("nodeStatusMessage - json marshal error: %w", err)
 	}
 
-	s.logger.Infof("[handleNodeStatusNotification] P2P publishing node_status to topic %s (height=%d, version=%s, node_mode=%q)", s.nodeStatusTopicName, nodeStatusMessage.BestHeight, nodeStatusMessage.Version, nodeStatusMessage.NodeMode)
+	s.logger.Infof("[handleNodeStatusNotification] P2P publishing node_status to topic %s (height=%d, version=%s, storage=%q)", s.nodeStatusTopicName, nodeStatusMessage.BestHeight, nodeStatusMessage.Version, nodeStatusMessage.Storage)
 	s.logger.Debugf("[handleNodeStatusNotification] JSON payload: %s", string(msgBytes))
 
 	if err = s.P2PClient.Publish(ctx, s.nodeStatusTopicName, msgBytes); err != nil {
@@ -2451,10 +2451,10 @@ func (s *Server) updateDataHubURL(peerID peer.ID, url string) {
 	}
 }
 
-// updateNodeMode updates peer node mode in the registry
-func (s *Server) updateNodeMode(peerID peer.ID, mode string) {
+// updateStorage updates peer storage mode in the registry
+func (s *Server) updateStorage(peerID peer.ID, mode string) {
 	if s.peerRegistry != nil && mode != "" {
-		s.peerRegistry.UpdateNodeMode(peerID, mode)
+		s.peerRegistry.UpdateStorage(peerID, mode)
 	}
 }
 

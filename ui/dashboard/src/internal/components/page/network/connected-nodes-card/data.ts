@@ -154,8 +154,8 @@ export const getColDefs = (t) => {
       },
     },
     {
-      id: 'node_mode',
-      name: t(`${fieldKey}.node_mode`),
+      id: 'storage',
+      name: t(`${fieldKey}.storage`),
       type: 'string',
       props: {
         width: '8%',
@@ -446,7 +446,7 @@ export const renderCells = {
       value: '',
     }
   },
-  node_mode: (idField, item, colId) => {
+  storage: (idField, item, colId) => {
     const mode = item[colId] || '-'
     let className = ''
     let displayValue = mode

@@ -25,7 +25,7 @@ type PeerInfo struct {
 	LastMessageTime time.Time // Last time we received any message from this peer
 	URLResponsive   bool      // Whether the DataHub URL is responsive
 	LastURLCheck    time.Time // Last time we checked URL responsiveness
-	NodeMode        string    // Node mode: "full", "pruned", or empty (unknown/old version)
+	Storage         string    // Storage mode: "full", "pruned", or empty (unknown/old version)
 }
 
 // PeerRegistry maintains peer information
@@ -189,13 +189,13 @@ func (pr *PeerRegistry) UpdateLastMessageTime(id peer.ID) {
 	}
 }
 
-// UpdateNodeMode updates a peer's node mode (full/pruned)
-func (pr *PeerRegistry) UpdateNodeMode(id peer.ID, mode string) {
+// UpdateStorage updates a peer's node mode (full/pruned)
+func (pr *PeerRegistry) UpdateStorage(id peer.ID, mode string) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
 	if info, exists := pr.peers[id]; exists {
-		info.NodeMode = mode
+		info.Storage = mode
 	}
 }
 

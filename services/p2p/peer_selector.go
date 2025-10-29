@@ -87,7 +87,7 @@ func (ps *PeerSelector) getFullNodeCandidates(peers []*PeerInfo, criteria Select
 	for _, p := range peers {
 		if ps.isEligibleFullNode(p, criteria) && p.Height > criteria.LocalHeight {
 			candidates = append(candidates, p)
-			ps.logger.Debugf("[PeerSelector] Full node candidate: %s at height %d (mode: %s)", p.ID, p.Height, p.NodeMode)
+			ps.logger.Debugf("[PeerSelector] Full node candidate: %s at height %d (mode: %s)", p.ID, p.Height, p.Storage)
 		}
 	}
 	return candidates
@@ -98,9 +98,9 @@ func (ps *PeerSelector) getPrunedNodeCandidates(peers []*PeerInfo, criteria Sele
 	var candidates []*PeerInfo
 	for _, p := range peers {
 		// Only include if eligible but NOT a full node
-		if ps.isEligible(p, criteria) && p.NodeMode != "full" && p.Height > criteria.LocalHeight {
+		if ps.isEligible(p, criteria) && p.Storage != "full" && p.Height > criteria.LocalHeight {
 			candidates = append(candidates, p)
-			ps.logger.Debugf("[PeerSelector] Pruned node candidate: %s at height %d (mode: %s)", p.ID, p.Height, p.NodeMode)
+			ps.logger.Debugf("[PeerSelector] Pruned node candidate: %s at height %d (mode: %s)", p.ID, p.Height, p.Storage)
 		}
 	}
 	return candidates
@@ -158,7 +158,7 @@ func (ps *PeerSelector) selectFromCandidates(candidates []*PeerInfo, criteria Se
 	// Log top 3 candidates for debugging
 	for i := 0; i < len(candidates) && i < 3; i++ {
 		ps.logger.Debugf("[PeerSelector] Candidate %d: %s (height=%d, banScore=%d, mode=%s, url=%s)",
-			i+1, candidates[i].ID, candidates[i].Height, candidates[i].BanScore, candidates[i].NodeMode, candidates[i].DataHubURL)
+			i+1, candidates[i].ID, candidates[i].Height, candidates[i].BanScore, candidates[i].Storage, candidates[i].DataHubURL)
 	}
 
 	return selected.ID
@@ -208,7 +208,7 @@ func (ps *PeerSelector) isEligibleFullNode(p *PeerInfo, criteria SelectionCriter
 
 	// Only peers announcing as "full" are considered full nodes
 	// Unknown/empty mode is treated as pruned
-	if p.NodeMode != "full" {
+	if p.Storage != "full" {
 		return false
 	}
 
