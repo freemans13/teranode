@@ -3072,7 +3072,19 @@ func TestBlockValidation_RevalidateBlockChan_Retries(t *testing.T) {
 	subChan := make(chan *blockchain_api.Notification, 1)
 	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(subChan, nil)
 
-	bv := NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, txMetaStore, nil, subtreeValidationClient)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, txMetaStore, nil, subtreeValidationClient)
+
+	// Start background goroutines to process revalidateBlockChan
+	err = bv.Start(ctx)
+	require.NoError(t, err)
+
+	// Defer cleanup in correct order
+	defer func() {
+		cancel()  // Cancel context first
+		bv.Stop() // Then wait for goroutines
+	}()
 
 	bv.revalidateBlockChan <- revalidateBlockData{block: block}
 

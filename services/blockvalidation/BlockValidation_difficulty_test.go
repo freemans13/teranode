@@ -141,6 +141,11 @@ func TestValidateBlock_IncorrectDifficultyBits(t *testing.T) {
 	// Create BlockValidation instance
 	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
 
+	// Start background goroutines
+	err = bv.Start(ctx)
+	require.NoError(t, err)
+	defer bv.Stop()
+
 	// Store the subtree
 	subtreeBytes, err := subtree.SerializeNodes()
 	require.NoError(t, err)
@@ -271,6 +276,11 @@ func TestValidateBlock_DoesNotMeetTargetDifficulty(t *testing.T) {
 
 	// Create BlockValidation instance
 	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
+
+	// Start background goroutines
+	err = bv.Start(ctx)
+	require.NoError(t, err)
+	defer bv.Stop()
 
 	// Store the subtree
 	subtreeBytes, err := subtree.SerializeNodes()
@@ -421,6 +431,11 @@ func TestValidateBlock_ValidDifficulty(t *testing.T) {
 
 	// Create BlockValidation instance
 	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
+
+	// Start background goroutines
+	err = bv.Start(ctx)
+	require.NoError(t, err)
+	defer bv.Stop()
 
 	// Store the subtree
 	subtreeBytes, err := subtree.SerializeNodes()

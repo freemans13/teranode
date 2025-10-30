@@ -439,6 +439,10 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		subtreeValidationClient,
 	)
 
+	// Start background processing goroutines
+	err = blockValidation.Start(d.Ctx)
+	require.NoError(t, err)
+
 	assert.NotNil(t, blockchainClient)
 	assert.NotNil(t, blockAssemblyClient)
 	assert.NotNil(t, propagationClient)

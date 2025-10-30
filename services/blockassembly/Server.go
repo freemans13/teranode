@@ -657,7 +657,13 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 		}, nil)
 	})
 
-	<-grpcReady
+	// Wait for gRPC server to be ready or context cancellation
+	select {
+	case <-grpcReady:
+		// Server is ready
+	case <-ctx.Done():
+		return errors.NewServiceError("context cancelled while waiting for gRPC server to start", ctx.Err())
+	}
 
 	// This must succeed for the service to be functional
 	if err = ba.blockAssembler.Start(ctx); err != nil {

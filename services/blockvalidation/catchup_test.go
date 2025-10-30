@@ -807,6 +807,7 @@ func TestServer_blockFoundCh_triggersCatchupCh_BlockLocator(t *testing.T) {
 	blockFoundCh := make(chan processBlockFound, 1)
 	catchupCh := make(chan processBlockCatchup, 1)
 
+	// Note: We don't call Start() on BlockValidation since this test doesn't need background goroutines
 	blockValidation := NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil)
 	baseServer := &Server{
 		logger:              ulogger.TestLogger{},
@@ -824,17 +825,14 @@ func TestServer_blockFoundCh_triggersCatchupCh_BlockLocator(t *testing.T) {
 		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer baseServer.processBlockNotify.Stop()
+
 	require.NoError(t, blockValidation.blockHashesCurrentlyValidated.Put(*block1.Header.Hash()))
 	require.NoError(t, blockValidation.blockHashesCurrentlyValidated.Put(*block2.Header.Hash()))
 
-	// Ensure processBlockNotify is stopped on cleanup
-	defer func() {
-		if baseServer.processBlockNotify != nil {
-			baseServer.processBlockNotify.Stop()
-		}
-	}()
-
-	err = baseServer.Init(context.Background())
+	err = baseServer.Init(ctx)
 	require.NoError(t, err)
 
 	// Fill blockFoundCh to trigger the catchup path

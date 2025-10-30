@@ -208,7 +208,9 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 
 		var err error
 
-		invalidBlockKafkaProducer, err = initialiseInvalidBlockKafkaProducer(ctx, logger, tSettings)
+		logger.Infof("Initializing Kafka producer for invalid blocks topic: %s", tSettings.Kafka.InvalidBlocks)
+
+		invalidBlockKafkaProducer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, tSettings.Kafka.InvalidBlocksConfig, &tSettings.Kafka)
 		if err != nil {
 			logger.Errorf("Failed to create Kafka producer for invalid blocks: %v", err)
 		} else {
@@ -246,7 +248,23 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		stats:                         gocore.NewStat("blockvalidation"),
 	}
 
+	return bv
+}
+
+// Start begins all background processing goroutines for BlockValidation.
+// This must be called after NewBlockValidation and before using the BlockValidation instance.
+// It starts:
+//   - Stats collection goroutine (every 5 seconds)
+//   - Blockchain subscription goroutine (for setMined signals)
+//   - Block processing goroutines (via the private start method)
+//
+// The goroutines will run until the context passed to NewBlockValidation is cancelled.
+// Call Stop() after cancelling the context to wait for clean shutdown.
+func (u *BlockValidation) Start(ctx context.Context) error {
+	// Start stats updater goroutine
+	u.backgroundTasks.Add(1)
 	go func() {
+		defer u.backgroundTasks.Done()
 		// update stats for the expiring maps every 5 seconds
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -256,31 +274,35 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				prometheusBlockValidationLastValidatedBlocksCache.Set(float64(bv.lastValidatedBlocks.Len()))
-				prometheusBlockValidationBlockExistsCache.Set(float64(bv.blockExistsCache.Len()))
-				prometheusBlockValidationSubtreeExistsCache.Set(float64(bv.subtreeExistsCache.Len()))
+				prometheusBlockValidationLastValidatedBlocksCache.Set(float64(u.lastValidatedBlocks.Len()))
+				prometheusBlockValidationBlockExistsCache.Set(float64(u.blockExistsCache.Len()))
+				prometheusBlockValidationSubtreeExistsCache.Set(float64(u.subtreeExistsCache.Len()))
 			}
 		}
 	}()
 
-	var (
-		subscribeCtx    context.Context
-		subscribeCancel context.CancelFunc
-	)
-
-	if bv.blockchainClient != nil {
+	// Start blockchain subscription goroutine
+	if u.blockchainClient != nil {
+		u.backgroundTasks.Add(1)
 		go func() {
+			defer u.backgroundTasks.Done()
+
+			var (
+				subscribeCtx    context.Context
+				subscribeCancel context.CancelFunc
+			)
+
 			for {
 				select {
 				case <-ctx.Done():
-					bv.logger.Warnf("[BlockValidation:setMined] exiting setMined goroutine: %s", ctx.Err())
+					u.logger.Warnf("[BlockValidation:setMined] exiting setMined goroutine: %s", ctx.Err())
 					return
 				default:
-					bv.logger.Infof("[BlockValidation:setMined] subscribing to blockchain for setTxMined signal")
+					u.logger.Infof("[BlockValidation:setMined] subscribing to blockchain for setTxMined signal")
 
 					subscribeCtx, subscribeCancel = context.WithCancel(ctx)
 
-					blockchainSubscription, err := bv.blockchainClient.Subscribe(subscribeCtx, "blockvalidation")
+					blockchainSubscription, err := u.blockchainClient.Subscribe(subscribeCtx, "blockvalidation")
 					if err != nil {
 						// Check if context is done before logging
 						select {
@@ -289,7 +311,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 						default:
 						}
 
-						bv.logger.Errorf("[BlockValidation:setMined] failed to subscribe to blockchain: %s", err)
+						u.logger.Errorf("[BlockValidation:setMined] failed to subscribe to blockchain: %s", err)
 
 						// Cancel context before retrying to prevent leak
 						subscribeCancel()
@@ -310,7 +332,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 						case notification, ok := <-blockchainSubscription:
 							if !ok {
 								// Channel closed, reconnect
-								bv.logger.Warnf("[BlockValidation:setMined] subscription channel closed, reconnecting")
+								u.logger.Warnf("[BlockValidation:setMined] subscription channel closed, reconnecting")
 								subscribeCancel()
 								time.Sleep(1 * time.Second)
 								break subscriptionLoop
@@ -322,9 +344,9 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 
 							if notification.Type == model.NotificationType_Block {
 								cHash := chainhash.Hash(notification.Hash)
-								bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
+								u.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
 								// push block hash to the setMinedChan
-								bv.setMinedChan <- &cHash
+								u.setMinedChan <- &cHash
 							}
 						}
 					}
@@ -333,37 +355,33 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		}()
 	}
 
+	// Start the main processing goroutine
+	u.backgroundTasks.Add(1)
 	go func() {
-		if err := bv.start(ctx); err != nil {
+		defer u.backgroundTasks.Done()
+		if err := u.start(ctx); err != nil {
 			// Check if context is done before logging
 			select {
 			case <-ctx.Done():
 				// Context canceled, don't log
 			default:
-				logger.Errorf("[BlockValidation:start] failed to start: %s", err)
+				u.logger.Errorf("[BlockValidation:start] failed to start: %s", err)
 			}
 		}
 	}()
 
-	return bv
-}
-
-func initialiseInvalidBlockKafkaProducer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings) (*kafka.KafkaAsyncProducer, error) {
-	logger.Infof("Initializing Kafka producer for invalid blocks topic: %s", tSettings.Kafka.InvalidBlocks)
-
-	invalidBlockKafkaProducer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, tSettings.Kafka.InvalidBlocksConfig, &tSettings.Kafka)
-	if err != nil {
-		return nil, err
-	}
-
-	return invalidBlockKafkaProducer, nil
+	return nil
 }
 
 // start initializes the block validation system and begins processing.
 // It handles the recovery of unprocessed blocks and starts background workers
 // for block validation tasks.
 func (u *BlockValidation) start(ctx context.Context) error {
-	go u.bloomFilterStats.BloomFilterStatsProcessor(ctx)
+	u.backgroundTasks.Add(1)
+	go func() {
+		defer u.backgroundTasks.Done()
+		u.bloomFilterStats.BloomFilterStatsProcessor(ctx)
+	}()
 
 	g, gCtx := errgroup.WithContext(ctx)
 
@@ -383,9 +401,12 @@ func (u *BlockValidation) start(ctx context.Context) error {
 
 	// start a ticker that checks every minute whether there are subtrees/mined that need to be set
 	// this is a light routine for periodic cleanup and handling of invalidated blocks
+	u.backgroundTasks.Add(1)
 	go func() {
+		defer u.backgroundTasks.Done()
 		u.logger.Infof("[BlockValidation:start] starting periodic block processing goroutine")
 		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
 
 		for {
 			select {
@@ -402,7 +423,9 @@ func (u *BlockValidation) start(ctx context.Context) error {
 	// start a worker to process the setMinedChan
 	u.logger.Infof("[BlockValidation:start] starting setMined goroutine")
 
+	u.backgroundTasks.Add(1)
 	go func() {
+		defer u.backgroundTasks.Done()
 		defer u.logger.Infof("[BlockValidation:start] setMinedChan worker stopped")
 
 		for {
@@ -470,7 +493,9 @@ func (u *BlockValidation) start(ctx context.Context) error {
 	// start a worker to revalidate blocks
 	u.logger.Infof("[BlockValidation:start] starting reValidation goroutine")
 
+	u.backgroundTasks.Add(1)
 	go func() {
+		defer u.backgroundTasks.Done()
 		defer u.logger.Infof("[BlockValidation:start] revalidateBlockChan worker stopped")
 
 		for {
@@ -515,6 +540,13 @@ func (u *BlockValidation) start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// Stop waits for all background goroutines to complete their shutdown.
+// This should be called after the context passed to NewBlockValidation is cancelled
+// to ensure proper cleanup before the test ends.
+func (u *BlockValidation) Stop() {
+	u.backgroundTasks.Wait()
 }
 
 func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgroup.Group) {
@@ -2015,10 +2047,4 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	})
 
 	return
-}
-
-// Wait waits for all background tasks to complete.
-// This should be called during shutdown to ensure graceful termination.
-func (u *BlockValidation) Wait() {
-	u.backgroundTasks.Wait()
 }

@@ -919,6 +919,11 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	u.logger.Infof("[Start] FSM transitioned from IDLE state, starting Kafka consumer")
 
+	// Start background processing goroutines
+	if err = u.blockValidation.Start(ctx); err != nil {
+		return errors.NewServiceError("[Init] failed to start block validation", err)
+	}
+
 	// start blocks kafka consumer
 	if u.kafkaConsumerClient == nil {
 		u.logger.Errorf("[Start] kafkaConsumerClient is nil!")
@@ -955,7 +960,7 @@ func (u *Server) Stop(_ context.Context) error {
 
 	// Wait for all background tasks in BlockValidation to complete
 	if u.blockValidation != nil {
-		u.blockValidation.Wait()
+		u.blockValidation.Stop()
 	}
 
 	// close the kafka consumer gracefully
