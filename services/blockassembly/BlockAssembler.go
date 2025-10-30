@@ -711,11 +711,12 @@ func (b *BlockAssembler) setBestBlockHeader(bestBlockchainBlockHeader *model.Blo
 
 	// Queue cleanup operations to prevent flooding during catchup
 	// The cleanup queue worker processes operations sequentially (parent preserve → DAH cleanup)
-	// Channel is never nil after initialization, safe to send directly
-	if b.utxoStore != nil && b.cleanupServiceLoaded.Load() && b.cleanupService != nil && height > 0 && b.cleanupQueueCh != nil {
+	// Capture channel reference to avoid TOCTOU race between nil check and send
+	ch := b.cleanupQueueCh
+	if b.utxoStore != nil && b.cleanupServiceLoaded.Load() && b.cleanupService != nil && height > 0 && ch != nil {
 		// Non-blocking send - drop if queue is full (shouldn't happen with 100 buffer, but safety check)
 		select {
-		case b.cleanupQueueCh <- height:
+		case ch <- height:
 			// Successfully queued
 		default:
 			b.logger.Warnf("[BlockAssembler] cleanup queue full, dropping cleanup for height %d", height)
