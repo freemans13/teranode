@@ -51,10 +51,10 @@ import (
 //
 // The implementation follows a sophisticated multi-tier approach to optimize performance:
 //
-// 1. Cache Layer: First checks the response cache for the best block header to avoid
-//    expensive database queries. This cache is carefully maintained with TTL-based expiration
-//    and is automatically invalidated when the blockchain state changes (e.g., when new blocks
-//    are added or during chain reorganizations).
+//  1. Cache Layer: First checks the response cache for the best block header to avoid
+//     expensive database queries. This cache is carefully maintained with TTL-based expiration
+//     and is automatically invalidated when the blockchain state changes (e.g., when new blocks
+//     are added or during chain reorganizations).
 //
 // 2. Database Layer: If not found in cache, executes an optimized SQL query that:
 //   - Filters for valid blocks only (is_valid = true)
