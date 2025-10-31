@@ -70,7 +70,7 @@ func (s *SQL) GetBlockExists(ctx context.Context, blockHash *chainhash.Hash) (bo
 	// Try to get from response cache using derived cache key
 	// Use operation-prefixed key to avoid conflicts with other cached data
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlockExists-%s", blockHash.String())))
-	
+
 	cached := s.responseCache.Get(cacheID)
 	if cached != nil {
 		// Check if it's a cached boolean result from previous GetBlockExists call
