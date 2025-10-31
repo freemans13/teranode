@@ -10,11 +10,10 @@
 // of times per second during peak processing.
 //
 // The implementation uses a multi-tier optimization strategy:
-//  1. First checks the response cache - if the block header was previously cached by
-//     GetBlockHeader or GetBestBlockHeader, we know the block exists
+//  1. First checks the response cache using a derived cache key for boolean existence results
 //  2. If not found in cache, executes a minimal SQL query that only checks existence without
 //     retrieving full block data
-//  3. Caches the existence result (as a boolean) to optimize future queries for the same block
+//  3. Caches the boolean existence result to optimize future queries for the same block
 //
 // This approach significantly reduces database load and improves response times for this
 // frequently called operation. The response cache is automatically invalidated whenever blocks
@@ -41,13 +40,11 @@ import (
 // architecture, this method is optimized for maximum performance.
 //
 // The implementation follows a tiered approach to minimize database load:
-//  1. First checks the response cache using the block hash as key
-//     - If a full block header is cached (from GetBlockHeader), we immediately know it exists
+//  1. First checks the response cache using a derived cache key (operation-prefixed)
+//     - If a boolean result was previously cached, return it immediately
 //  2. If not found in cache (cache miss), executes an optimized SQL query
 //     that only checks for existence without retrieving block data
-//
-// Note: We only leverage existing cached headers and do not cache the boolean result
-// to avoid type conflicts in the shared response cache
+//  3. Caches the boolean result (true or false) to optimize future queries for the same block
 //
 // The SQL query is carefully designed to be as lightweight as possible, only checking
 // for the presence of a block hash in the blocks table without retrieving any columns.
