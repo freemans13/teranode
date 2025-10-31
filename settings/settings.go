@@ -172,8 +172,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GetAndValidateSubtreesConcurrency:     getInt("block_getAndValidateSubtreesConcurrency", -1, alternativeContext...),
 			KafkaWorkers:                          getInt("block_kafkaWorkers", 0, alternativeContext...),
 			ValidOrderAndBlessedConcurrency:       getInt("block_validOrderAndBlessedConcurrency", -1, alternativeContext...),
-			StoreCacheEnabled:                     getBool("blockchain_store_cache_enabled", true, alternativeContext...),
-			StoreCacheSize:                        getInt("blockchain_store_cache_size", 200, alternativeContext...),
 			MaxSize:                               getInt("blockmaxsize", 4294967296, alternativeContext...),
 			BlockStore:                            getURL("blockstore", "file://./data/blockstore", alternativeContext...),
 			FailFastValidation:                    getBool("blockvalidation_fail_fast_validation", true, alternativeContext...),

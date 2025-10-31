@@ -178,8 +178,6 @@ type BlockSettings struct {
 	GetAndValidateSubtreesConcurrency     int
 	KafkaWorkers                          int
 	ValidOrderAndBlessedConcurrency       int
-	StoreCacheEnabled                     bool
-	StoreCacheSize                        int
 	MaxSize                               int
 	BlockStore                            *url.URL
 	FailFastValidation                    bool

@@ -91,9 +91,19 @@ func (s *SQL) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *mode
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "sql:GetBestBlockHeader")
 	defer deferFn()
 
-	header, meta := s.blocksCache.GetBestBlockHeader()
-	if header != nil {
-		return header, meta, nil
+	// Try to get from response cache using derived cache key
+	// Use operation-prefixed key to be consistent with other operations
+	cacheID := chainhash.HashH([]byte("GetBestBlockHeader"))
+	
+	cached := s.responseCache.Get(cacheID)
+	if cached != nil {
+		if result, ok := cached.Value().([2]interface{}); ok {
+			if header, ok := result[0].(*model.BlockHeader); ok {
+				if meta, ok := result[1].(*model.BlockHeaderMeta); ok {
+					return header, meta, nil
+				}
+			}
+		}
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -197,9 +207,8 @@ func (s *SQL) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *mode
 
 	// Set the block time to the timestamp in the meta
 	blockHeaderMeta.BlockTime = blockHeader.Timestamp
-
-	// Cache the fresh result for future calls to avoid repeated database queries
-	s.blocksCache.AddBlockHeader(blockHeader, blockHeaderMeta)
+	// Cache the result in response cache
+	s.responseCache.Set(cacheID, [2]interface{}{blockHeader, blockHeaderMeta}, s.cacheTTL)
 
 	return blockHeader, blockHeaderMeta, nil
 }
