@@ -66,7 +66,7 @@ func (s *SQL) GetBlocksByHeight(ctx context.Context, startHeight, endHeight uint
 	// Try to get from response cache using derived cache key
 	// Use operation-prefixed key to be consistent with other operations
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlocksByHeight-%d-%d", startHeight, endHeight)))
-	
+
 	cached := s.responseCache.Get(cacheID)
 	if cached != nil {
 		if blocks, ok := cached.Value().([]*model.Block); ok {

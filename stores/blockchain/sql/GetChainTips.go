@@ -40,7 +40,7 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 	// Try to get from response cache using derived cache key
 	// Use operation-prefixed key to be consistent with other operations
 	cacheID := chainhash.HashH([]byte("GetChainTips"))
-	
+
 	cached := s.responseCache.Get(cacheID)
 	if cached != nil {
 		if tips, ok := cached.Value().([]*model.ChainTip); ok {

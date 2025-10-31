@@ -55,9 +55,9 @@ func (s *SQL) GetBlocksByTime(ctx context.Context, fromTime, toTime time.Time) (
 	// Use operation-prefixed key to be consistent with other operations
 	fromTimeString := fromTime.Format("2006-01-02 15:04:05 +0000")
 	toTimeString := toTime.Format("2006-01-02 15:04:05 +0000")
-	
+
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlocksByTime-%s-%s", fromTimeString, toTimeString)))
-	
+
 	cached := s.responseCache.Get(cacheID)
 	if cached != nil {
 		if hashes, ok := cached.Value().([][]byte); ok {

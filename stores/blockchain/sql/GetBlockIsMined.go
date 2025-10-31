@@ -51,7 +51,7 @@ func (s *SQL) GetBlockIsMined(ctx context.Context, blockHash *chainhash.Hash) (b
 	// Try to get from response cache
 	// Use a derived cache key to avoid conflicts with other cached data
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlockIsMined-%s", blockHash.String())))
-	
+
 	cached := s.responseCache.Get(cacheID)
 	if cached != nil && cached.Value() != nil {
 		if cacheData, ok := cached.Value().(bool); ok {
