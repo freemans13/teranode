@@ -277,7 +277,7 @@ func mockBlock(ctx *testContext, t *testing.T) *model.Block {
 		HashPrevBlock:  hashPrevBlock,
 		HashMerkleRoot: subtree.RootHash(),                 // doesn't matter, we're only checking the value and not whether it's correct
 		Timestamp:      uint32(time.Now().Unix()),          // nolint:gosec
-		Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff}, // Set proper bits from mainnet genesis block
+		Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 		Nonce:          0,
 	}
 
@@ -426,7 +426,7 @@ func Test_getBlockHeadersToCommonAncestor(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix()),          // nolint:gosec
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff}, // Set proper bits from mainnet genesis block
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),                          // nolint:gosec
 			},
 			CoinbaseTx:       coinbaseTx,
@@ -716,7 +716,7 @@ func Test_GetBlockHeadersFromCommonAncestor(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix()),          // nolint:gosec
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff}, // Set proper bits from mainnet genesis block
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),                          // nolint:gosec
 			},
 			CoinbaseTx:       coinbaseTx,
@@ -1302,8 +1302,26 @@ func TestGetBestBlockHeader(t *testing.T) {
 		ctx := setup(t)
 
 		blk := mockBlock(ctx, t)
-		_, _, err := ctx.server.store.StoreBlock(context.Background(), blk, "peer1")
+		blockID, height, err := ctx.server.store.StoreBlock(context.Background(), blk, "peer1")
 		require.NoError(t, err)
+		t.Logf("Stored mock block: ID=%d, height=%d, hash=%s", blockID, height, blk.Hash())
+
+		// Query the database directly to see what's stored
+		db := ctx.server.store.GetDB()
+		rows, err := db.QueryContext(context.Background(), "SELECT id, height, chain_work, tx_count, peer_id FROM blocks ORDER BY id")
+		require.NoError(t, err)
+		defer rows.Close()
+
+		t.Logf("Blocks in database:")
+		for rows.Next() {
+			var id, height uint32
+			var chainWork []byte
+			var txCount uint64
+			var peerID string
+			err := rows.Scan(&id, &height, &chainWork, &txCount, &peerID)
+			require.NoError(t, err)
+			t.Logf("  ID=%d, height=%d, chainWork=%x, txCount=%d, peerID=%s", id, height, chainWork, txCount, peerID)
+		}
 
 		resp, err := ctx.server.GetBestBlockHeader(context.Background(), &emptypb.Empty{})
 		require.NoError(t, err)
