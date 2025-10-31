@@ -647,7 +647,7 @@ func Test_GetLastNBlocks(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix() + int64(i)),
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),
 			},
 			CoinbaseTx:       coinbase,
@@ -1365,7 +1365,7 @@ func Test_ServiceInvalidateBlock_ClearsBestAndDifficultyCache(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix()) + uint32(i),
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),
 			},
 			CoinbaseTx:       coinbase,
@@ -1681,7 +1681,7 @@ func TestGetBlockHeadersFromOldestRequest(t *testing.T) {
 					HashPrevBlock:  h, // not nil
 					HashMerkleRoot: h, // not nil
 					Timestamp:      uint32(time.Now().Unix()),
-					Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+					Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 					Nonce:          12345,
 				}
 
@@ -2421,7 +2421,7 @@ func TestGetBlocksMinedNotSet(t *testing.T) {
 			HashPrevBlock:  &hash,
 			HashMerkleRoot: &hash,
 			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+			Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 			Nonce:          1,
 		}
 		block := &model.Block{
@@ -2540,7 +2540,7 @@ func TestGetBlocksSubtreesNotSet(t *testing.T) {
 			HashPrevBlock:  &chainhash.Hash{},
 			HashMerkleRoot: &chainhash.Hash{},
 			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+			Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 			Nonce:          1,
 		}
 		block := &model.Block{
@@ -2601,7 +2601,7 @@ func TestLocateBlockHeaders(t *testing.T) {
 			HashPrevBlock:  &chainhash.Hash{},
 			HashMerkleRoot: &chainhash.Hash{},
 			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+			Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 			Nonce:          12345,
 		}
 
@@ -2664,7 +2664,7 @@ func Test_GetBlockHeadersFromTill(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix() + int64(i)),
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),
 			},
 			CoinbaseTx:       coinbaseTx,
@@ -2809,7 +2809,7 @@ func Test_GetBlockHeadersFromHeight(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix() + int64(i)),
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),
 			},
 			CoinbaseTx:       coinbaseTx,
@@ -2955,7 +2955,7 @@ func Test_GetBlockHeadersByHeight(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix() + int64(i)),
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),
 			},
 			CoinbaseTx:       coinbaseTx,
@@ -3103,7 +3103,7 @@ func Test_GetBlockHeadersToCommonAncestor_gRPC(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix() + int64(i)),
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),
 			},
 			CoinbaseTx:       coinbaseTx,
@@ -3247,7 +3247,7 @@ func Test_GetBestHeightAndTime(t *testing.T) {
 				HashPrevBlock:  prevHash,
 				HashMerkleRoot: merkleRoot,
 				Timestamp:      uint32(time.Now().Unix() + int64(i*60)), // 1 minute apart
-				Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+				Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d},      // mainnet genesis bits 0x1d00ffff in little endian
 				Nonce:          uint32(i),
 			},
 			CoinbaseTx:       coinbaseTx,
@@ -3328,7 +3328,7 @@ func Test_SetBlockProcessedAt(t *testing.T) {
 			HashPrevBlock:  prevHash,
 			HashMerkleRoot: merkleRoot,
 			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+			Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 			Nonce:          uint32(1),
 		},
 		CoinbaseTx:       coinbaseTx,
