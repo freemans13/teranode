@@ -326,7 +326,7 @@ func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan result
 					case validateBlocksChan <- orderedResult.block:
 						delete(results, nextIndex)
 						nextIndex++
-						size.Add(-1)
+						// Note: size counter is decremented by validateBlocksOnChannel after processing
 					case <-ctx.Done():
 						return ctx.Err()
 					}
@@ -406,20 +406,23 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 	// Check if we already have the subtree
 	subtreeExists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 	if err != nil {
-		u.logger.Warnf("[catchup:fetchAndStoreSubtree] Error checking subtree existence for %s: %v", subtreeHash.String(), err)
+		return nil, errors.NewProcessingError("[catchup:fetchAndStoreSubtree] Error checking subtree existence for %s: %v", subtreeHash.String(), err)
 	}
 
 	if subtreeExists {
 		u.logger.Debugf("[catchup:fetchAndStoreSubtree] Subtree already exists for %s, loading from store", subtreeHash.String())
+
 		// Load existing subtree from store
 		subtreeBytes, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 		if err != nil {
 			return nil, errors.NewStorageError("[catchup:fetchAndStoreSubtree] Failed to get existing subtree for %s", subtreeHash.String(), err)
 		}
+
 		subtree, err := subtreepkg.NewSubtreeFromBytes(subtreeBytes)
 		if err != nil {
 			return nil, errors.NewProcessingError("[catchup:fetchAndStoreSubtree] Failed to deserialize existing subtree for %s", subtreeHash.String(), err)
 		}
+
 		return subtree, nil
 	}
 
@@ -495,7 +498,7 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	// Check if we already have the subtreeData
 	subtreeDataExists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 	if err != nil {
-		u.logger.Warnf("[catchup:fetchAndStoreSubtreeData] Error checking subtreeData existence for %s: %v", subtreeHash.String(), err)
+		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Error checking subtreeData existence for %s: %v", subtreeHash.String(), err)
 	}
 
 	if subtreeDataExists {
@@ -571,7 +574,7 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 	}
 
 	// Then, fetch and store the subtreeData (if it doesn't already exist)
-	if err := u.fetchAndStoreSubtreeData(ctx, block, subtreeHash, subtree, baseURL, peerID); err != nil {
+	if err = u.fetchAndStoreSubtreeData(ctx, block, subtreeHash, subtree, baseURL, peerID); err != nil {
 		return err
 	}
 
