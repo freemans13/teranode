@@ -75,7 +75,7 @@ func (s *SQL) GetBlockHeaders(ctx context.Context, blockHashFrom *chainhash.Hash
 	// Try to get from response cache using derived cache key
 	// Use operation-prefixed key to avoid conflicts with other cached data
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlockHeaders-%s-%d", blockHashFrom.String(), numberOfHeaders)))
-	
+
 	cached := s.responseCache.Get(cacheID)
 	if cached != nil {
 		if result, ok := cached.Value().([2]interface{}); ok {
