@@ -50,11 +50,11 @@ import (
 //
 // The implementation follows a tiered retrieval strategy for optimal performance:
 //
-// 1. Cache Layer: First checks the in-memory blocksCache for the requested header
-//   - This cache is populated during block storage and previous retrievals
+// 1. Cache Layer: First checks the in-memory response cache for the requested header
+//   - This cache is populated during previous retrievals and related operations
 //   - Provides O(1) access time for frequently accessed headers
 //   - Particularly effective for recent blocks and chain tips
-//   - No cache expiration policy is applied as header data is immutable
+//   - Cache entries have a TTL and are automatically invalidated when blocks are added
 //
 // 2. Database Layer: If not found in cache, executes an optimized SQL query
 //   - Retrieves all header fields plus additional metadata in a single query
