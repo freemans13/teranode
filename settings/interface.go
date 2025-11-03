@@ -178,8 +178,6 @@ type BlockSettings struct {
 	GetAndValidateSubtreesConcurrency     int
 	KafkaWorkers                          int
 	ValidOrderAndBlessedConcurrency       int
-	StoreCacheEnabled                     bool
-	StoreCacheSize                        int
 	MaxSize                               int
 	BlockStore                            *url.URL
 	FailFastValidation                    bool
@@ -371,7 +369,7 @@ type UtxoStoreSettings struct {
 	CleanupParentUpdateBatcherDurationMillis int // Batch duration for parent record updates during cleanup (ms)
 	CleanupDeleteBatcherSize                 int // Batch size for record deletions during cleanup
 	CleanupDeleteBatcherDurationMillis       int // Batch duration for record deletions during cleanup (ms)
-	CleanupMaxConcurrentOperations           int // Maximum concurrent operations during cleanup processing
+	CleanupMaxConcurrentOperations           int // Maximum concurrent operations during cleanup (0 = use connection queue size)
 }
 
 type P2PSettings struct {

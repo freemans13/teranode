@@ -762,7 +762,11 @@ func contains(slice []fields.FieldName, item fields.FieldName) bool {
 //
 // The blockHeight parameter is used for coinbase maturity checking.
 // If blockHeight is 0, the current block height is used.
-func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	if blockHeight == 0 {
+		return nil, errors.NewProcessingError("blockHeight must be greater than zero")
+	}
+
 	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
 	defer cancelTimeout()
 
@@ -778,7 +782,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.Ignore
 	var err error
 
 	for attempt := 0; attempt <= 3; attempt++ {
-		spends, err = s.spendWithRetry(ctx, tx, ignoreFlags...)
+		spends, err = s.spendWithRetry(ctx, tx, blockHeight, ignoreFlags...)
 
 		// if no error or not a lock error, return immediately
 		if err == nil || !isLockError(err) {
@@ -802,9 +806,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.Ignore
 	return spends, err
 }
 
-func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
-	blockHeight := s.GetBlockHeight() + 1
-
+func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	spends, err := utxo.GetSpends(tx)
 	if err != nil {
 		return nil, err

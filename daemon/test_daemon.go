@@ -1896,3 +1896,36 @@ func (td *TestDaemon) DisconnectFromPeer(t *testing.T, peer *TestDaemon) {
 func peerAddress(peer *TestDaemon) string {
 	return fmt.Sprintf("/dns/127.0.0.1/tcp/%d/p2p/%s", peer.Settings.P2P.Port, peer.Settings.P2P.PeerID)
 }
+
+// WaitForBlockAssemblyToProcessTx waits for block assembly to process a transaction by polling GetTransactionHashes.
+// It checks if the transaction with the given hash string appears in the block assembly transaction list.
+// The function uses a context-based timeout (default 2 seconds) and polls every 100ms.
+func (td *TestDaemon) WaitForBlockAssemblyToProcessTx(t *testing.T, txHashStr string) {
+	timeout := 2 * time.Second
+	ctx, cancel := context.WithTimeout(td.Ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Timeout - fail the test
+			t.Fatalf("tx %s not found in block assembly after %v timeout", txHashStr, timeout)
+			return
+
+		case <-ticker.C:
+			txs, err := td.BlockAssemblyClient.GetTransactionHashes(ctx)
+			if err != nil {
+				// Continue retrying on error
+				continue
+			}
+
+			// Check if our transaction is in the list
+			if slices.Contains(txs, txHashStr) {
+				return
+			}
+		}
+	}
+}

@@ -694,7 +694,9 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	mockBlockchain := &blockchain.Mock{}
 	mockBlockchain.On("GetBlock", mock.Anything, mock.Anything).Return((*model.Block)(nil), errors.NewNotFoundError("not found"))
 	mockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return((chan *blockchain_api.Notification)(nil), nil)
+	// Return a buffered channel for Subscribe so BlockValidation.start() doesn't block
+	subscriptionCh := make(chan *blockchain_api.Notification, 10)
+	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(subscriptionCh, nil)
 	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 	mockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{1}, nil)
@@ -710,6 +712,11 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	// Mock ReportPeerFailure in case catchup fails (e.g., context cancellation)
 	mockBlockchain.On("ReportPeerFailure", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 
+	// Create context first so BlockValidation can use it
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer close(subscriptionCh)
+
 	blockFoundCh := make(chan processBlockFound, 1)
 	catchupCh := make(chan processBlockCatchup, 1)
 
@@ -719,7 +726,7 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 		blockFoundCh:        blockFoundCh,
 		catchupCh:           catchupCh,
 		stats:               gocore.NewStat("test"),
-		blockValidation:     NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil),
+		blockValidation:     NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil),
 		blockchainClient:    mockBlockchain,
 		forkManager:         NewForkManager(ulogger.TestLogger{}, tSettings),
 		subtreeStore:        nil,
@@ -730,8 +737,6 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	defer baseServer.processBlockNotify.Stop()
 
 	err = baseServer.Init(ctx)
@@ -758,6 +763,9 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 func TestServer_blockFoundCh_triggersCatchupCh_BlockLocator(t *testing.T) {
 	t.Skip("Skipping test that hangs - needs proper cleanup")
 	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.BlockValidation.UseCatchupWhenBehind = true
@@ -807,7 +815,7 @@ func TestServer_blockFoundCh_triggersCatchupCh_BlockLocator(t *testing.T) {
 	blockFoundCh := make(chan processBlockFound, 1)
 	catchupCh := make(chan processBlockCatchup, 1)
 
-	blockValidation := NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil)
+	blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil)
 	baseServer := &Server{
 		logger:              ulogger.TestLogger{},
 		settings:            tSettings,
@@ -860,6 +868,9 @@ func TestServer_blockFoundCh_triggersCatchupCh_BlockLocator(t *testing.T) {
 
 func TestProcessBlockFoundChannelCatchup(t *testing.T) {
 	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	// Use the shared setup for proper in-memory stores and fixtures
 
 	tSettings := test.CreateBaseTestSettings(t)
@@ -871,7 +882,10 @@ func TestProcessBlockFoundChannelCatchup(t *testing.T) {
 	// Create mock blockchain client
 	mockBlockchainClient := &blockchain.Mock{}
 	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-	mockBlockchainClient.On("Subscribe", mock.Anything, mock.Anything).Return((chan *blockchain_api.Notification)(nil), nil)
+	// Return a buffered channel for Subscribe so BlockValidation.start() doesn't block
+	subscriptionCh2 := make(chan *blockchain_api.Notification, 10)
+	defer close(subscriptionCh2)
+	mockBlockchainClient.On("Subscribe", mock.Anything, mock.Anything).Return(subscriptionCh2, nil)
 	mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 	mockBlockchainClient.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
 	mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{blocks[0].Header}, []*model.BlockHeaderMeta{&model.BlockHeaderMeta{Height: 100}}, nil)
@@ -906,7 +920,7 @@ func TestProcessBlockFoundChannelCatchup(t *testing.T) {
 		settings:            tSettings,
 		blockFoundCh:        make(chan processBlockFound, 10),
 		catchupCh:           make(chan processBlockCatchup, 10),
-		blockValidation:     NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchainClient, nil, nil, nil, nil, nil),
+		blockValidation:     NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchainClient, nil, nil, nil, nil, nil),
 		blockchainClient:    mockBlockchainClient,
 		forkManager:         NewForkManager(ulogger.TestLogger{}, tSettings),
 		subtreeStore:        nil,
@@ -934,7 +948,6 @@ func TestProcessBlockFoundChannelCatchup(t *testing.T) {
 	server.blockFoundCh <- pbf3
 	server.blockFoundCh <- pbf4
 
-	ctx := context.Background()
 	// Call processBlockFoundChannel with the first block
 	err := server.processBlockFoundChannel(ctx, pbf1)
 	require.NoError(t, err)
