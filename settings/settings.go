@@ -190,6 +190,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UtxoStore:                             getURL("txmeta_store", "", alternativeContext...),
 			FileStoreReadConcurrency:              getInt("filestore_read_concurrency", 768, alternativeContext...),
 			FileStoreWriteConcurrency:             getInt("filestore_write_concurrency", 256, alternativeContext...),
+			FileStoreUseSystemLimits:              getBool("filestore_use_system_limits", true, alternativeContext...),
 		},
 		BlockAssembly: BlockAssemblySettings{
 			Disabled:                            getBool("blockassembly_disabled", false, alternativeContext...),
@@ -431,6 +432,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlacklistedBaseURLs:                       blacklistMap,
 			BlockHeightRetentionAdjustment:            getInt32("subtreevalidation_blockHeightRetentionAdjustment", 0, alternativeContext...),
 			OrphanageTimeout:                          getDuration("subtreevalidation_orphanageTimeout", 15*time.Minute, alternativeContext...),
+			OrphanageMaxSize:                          getInt("subtreevalidation_orphanageMaxSize", 100_000, alternativeContext...),
 			CheckBlockSubtreesConcurrency:             getInt("subtreevalidation_check_block_subtrees_concurrency", 32, alternativeContext...),
 			PauseTimeout:                              getDuration("subtreevalidation_pauseTimeout", 5*time.Minute, alternativeContext...),
 		},
