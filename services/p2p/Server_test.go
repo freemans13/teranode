@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -2130,7 +2131,7 @@ func TestServerStartFull(t *testing.T) {
 			HashPrevBlock:  &hashPrev,
 			HashMerkleRoot: &hashMerkle,
 			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+			Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 			Nonce:          0,
 		},
 		&model.BlockHeaderMeta{Height: 0},
@@ -2145,6 +2146,11 @@ func TestServerStartFull(t *testing.T) {
 
 	state := blockchain_api.FSMStateType_RUNNING
 	mockBlockchain.On("GetFSMCurrentState", mock.Anything).Return(&state, nil)
+
+	// Mock GetState for BlockPersisterHeight query in determineStorage
+	blockPersisterHeightData := make([]byte, 4)
+	binary.LittleEndian.PutUint32(blockPersisterHeightData, 0)
+	mockBlockchain.On("GetState", mock.Anything, "BlockPersisterHeight").Return(blockPersisterHeightData, nil).Maybe()
 
 	mockRejectedKafka := new(MockKafkaConsumerGroup)
 	mockRejectedKafka.On("Start", mock.Anything, mock.Anything, mock.Anything).Return()
@@ -2699,7 +2705,7 @@ func TestHandleBlockNotificationSuccess(t *testing.T) {
 		HashPrevBlock:  testHash,
 		HashMerkleRoot: testHash,
 		Timestamp:      1234567890,
-		Bits:           model.NBit{0x1d, 0x00, 0xff, 0xff},
+		Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits 0x1d00ffff in little endian
 		Nonce:          1234,
 	}
 	meta := &model.BlockHeaderMeta{Height: 150}
