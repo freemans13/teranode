@@ -17,6 +17,7 @@ import (
 )
 
 func TestSyncCoordinator_NewSyncCoordinator(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -49,6 +50,7 @@ func TestSyncCoordinator_NewSyncCoordinator(t *testing.T) {
 }
 
 func TestSyncCoordinator_SetGetLocalHeightCallback(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -85,6 +87,7 @@ func TestSyncCoordinator_SetGetLocalHeightCallback(t *testing.T) {
 }
 
 func TestSyncCoordinator_StartAndStop(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -122,6 +125,7 @@ func TestSyncCoordinator_StartAndStop(t *testing.T) {
 }
 
 func TestSyncCoordinator_GetCurrentSyncPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -158,6 +162,7 @@ func TestSyncCoordinator_GetCurrentSyncPeer(t *testing.T) {
 }
 
 func TestSyncCoordinator_ClearSyncPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -193,6 +198,7 @@ func TestSyncCoordinator_ClearSyncPeer(t *testing.T) {
 }
 
 func TestSyncCoordinator_TriggerSync(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -235,6 +241,7 @@ func TestSyncCoordinator_TriggerSync(t *testing.T) {
 }
 
 func TestSyncCoordinator_TriggerSync_NoPeersAvailable(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -269,6 +276,7 @@ func TestSyncCoordinator_TriggerSync_NoPeersAvailable(t *testing.T) {
 }
 
 func TestSyncCoordinator_HandlePeerDisconnected(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -313,6 +321,7 @@ func TestSyncCoordinator_HandlePeerDisconnected(t *testing.T) {
 }
 
 func TestSyncCoordinator_HandlePeerDisconnected_NotSyncPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -357,6 +366,7 @@ func TestSyncCoordinator_HandlePeerDisconnected_NotSyncPeer(t *testing.T) {
 }
 
 func TestSyncCoordinator_HandleCatchupFailure(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -403,6 +413,7 @@ func TestSyncCoordinator_HandleCatchupFailure(t *testing.T) {
 }
 
 func TestSyncCoordinator_selectNewSyncPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -449,6 +460,7 @@ func TestSyncCoordinator_selectNewSyncPeer(t *testing.T) {
 }
 
 func TestSyncCoordinator_selectNewSyncPeer_ForcedPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	settings.P2P.ForceSyncPeer = "forced-peer"
@@ -496,6 +508,7 @@ func TestSyncCoordinator_selectNewSyncPeer_ForcedPeer(t *testing.T) {
 }
 
 func TestSyncCoordinator_UpdatePeerInfo(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -532,6 +545,7 @@ func TestSyncCoordinator_UpdatePeerInfo(t *testing.T) {
 }
 
 func TestSyncCoordinator_UpdateBanStatus(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -571,6 +585,7 @@ func TestSyncCoordinator_UpdateBanStatus(t *testing.T) {
 }
 
 func TestSyncCoordinator_checkURLResponsiveness(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -611,6 +626,7 @@ func TestSyncCoordinator_checkURLResponsiveness(t *testing.T) {
 }
 
 func TestSyncCoordinator_checkAndUpdateURLResponsiveness(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP servers
 	successServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -679,6 +695,7 @@ func TestSyncCoordinator_checkAndUpdateURLResponsiveness(t *testing.T) {
 }
 
 func TestSyncCoordinator_checkFSMState(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -728,6 +745,7 @@ func TestSyncCoordinator_checkFSMState(t *testing.T) {
 }
 
 func TestSyncCoordinator_evaluateSyncPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -781,6 +799,7 @@ func TestSyncCoordinator_evaluateSyncPeer(t *testing.T) {
 }
 
 func TestSyncCoordinator_evaluateSyncPeer_StuckAtHeight(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 
@@ -847,6 +866,7 @@ func TestSyncCoordinator_evaluateSyncPeer_StuckAtHeight(t *testing.T) {
 }
 
 func TestSyncCoordinator_LogPeerList(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -893,6 +913,7 @@ func TestSyncCoordinator_LogPeerList(t *testing.T) {
 }
 
 func TestSyncCoordinator_LogCandidateList(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -939,6 +960,7 @@ func TestSyncCoordinator_LogCandidateList(t *testing.T) {
 }
 
 func TestSyncCoordinator_CheckURLResponsiveness(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -983,6 +1005,7 @@ func TestSyncCoordinator_CheckURLResponsiveness(t *testing.T) {
 }
 
 func TestSyncCoordinator_CheckAndUpdateURLResponsiveness(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1055,6 +1078,7 @@ func TestSyncCoordinator_CheckAndUpdateURLResponsiveness(t *testing.T) {
 }
 
 func TestSyncCoordinator_EvaluateSyncPeer_Coverage(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1170,6 +1194,7 @@ func TestSyncCoordinator_EvaluateSyncPeer_Coverage(t *testing.T) {
 }
 
 func TestSyncCoordinator_IsCaughtUp(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1218,6 +1243,7 @@ func TestSyncCoordinator_IsCaughtUp(t *testing.T) {
 }
 
 func TestSyncCoordinator_SendSyncTriggerToKafka(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1272,6 +1298,7 @@ func TestSyncCoordinator_SendSyncTriggerToKafka(t *testing.T) {
 }
 
 func TestSyncCoordinator_SendSyncMessage(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1332,6 +1359,7 @@ func TestSyncCoordinator_SendSyncMessage(t *testing.T) {
 }
 
 func TestSyncCoordinator_MonitorFSM(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1423,6 +1451,7 @@ func TestSyncCoordinator_MonitorFSM(t *testing.T) {
 }
 
 func TestSyncCoordinator_MonitorFSM_AdaptiveIntervals(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1490,6 +1519,7 @@ func TestSyncCoordinator_MonitorFSM_AdaptiveIntervals(t *testing.T) {
 }
 
 func TestSyncCoordinator_HandleFSMTransition_Simplified(t *testing.T) {
+	defer serializeP2PTest(t)()
 	t.Skip("State transition banning temporarily disabled")
 
 	logger := ulogger.New("test")
@@ -1568,6 +1598,7 @@ func TestSyncCoordinator_HandleFSMTransition_Simplified(t *testing.T) {
 }
 
 func TestSyncCoordinator_FilterEligiblePeers(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1607,6 +1638,7 @@ func TestSyncCoordinator_FilterEligiblePeers(t *testing.T) {
 }
 
 func TestSyncCoordinator_FilterEligiblePeers_OldPeerLogging(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1676,6 +1708,7 @@ func TestSyncCoordinator_FilterEligiblePeers_OldPeerLogging(t *testing.T) {
 }
 
 func TestSyncCoordinator_SelectAndActivateNewPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1735,6 +1768,7 @@ func TestSyncCoordinator_SelectAndActivateNewPeer(t *testing.T) {
 }
 
 func TestSyncCoordinator_UpdateBanStatus_SyncPeerBanned(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1806,6 +1840,7 @@ func TestSyncCoordinator_UpdateBanStatus_SyncPeerBanned(t *testing.T) {
 }
 
 func TestSyncCoordinator_TriggerSync_SendMessageError(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1843,6 +1878,7 @@ func TestSyncCoordinator_TriggerSync_SendMessageError(t *testing.T) {
 }
 
 func TestSyncCoordinator_HandleCatchupFailure_NoNewPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()
@@ -1881,6 +1917,7 @@ func TestSyncCoordinator_HandleCatchupFailure_NoNewPeer(t *testing.T) {
 }
 
 func TestSyncCoordinator_PeriodicEvaluation(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()

@@ -13,6 +13,7 @@ import (
 
 // TestShouldSkipUnhealthyPeer tests the shouldSkipUnhealthyPeer helper function
 func TestShouldSkipUnhealthyPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	t.Run("skip_unhealthy_peer", func(t *testing.T) {
 		// Create peer registry with an unhealthy CONNECTED peer
 		peerRegistry := NewPeerRegistry()
@@ -80,6 +81,7 @@ func TestShouldSkipUnhealthyPeer(t *testing.T) {
 
 // TestHandleBlockTopic_UnhealthyPeer tests block topic handling with unhealthy peers
 func TestHandleBlockTopic_UnhealthyPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	t.Run("ignore_block_from_unhealthy_peer", func(t *testing.T) {
@@ -181,6 +183,7 @@ func TestHandleBlockTopic_UnhealthyPeer(t *testing.T) {
 
 // TestHandleSubtreeTopic_UnhealthyPeer tests subtree topic handling with unhealthy peers
 func TestHandleSubtreeTopic_UnhealthyPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	t.Run("ignore_subtree_from_unhealthy_peer", func(t *testing.T) {
@@ -288,6 +291,7 @@ func TestHandleSubtreeTopic_UnhealthyPeer(t *testing.T) {
 
 // TestHandleNodeStatusTopic_UnhealthyPeer tests node status topic handling with unhealthy peers
 func TestHandleNodeStatusTopic_UnhealthyPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	t.Run("skip_peer_updates_from_unhealthy_peer", func(t *testing.T) {
 		// Create mock P2PClient
 		mockP2PNode := new(MockServerP2PClient)
@@ -377,6 +381,7 @@ func TestHandleNodeStatusTopic_UnhealthyPeer(t *testing.T) {
 
 // TestConnectedVsGossipedPeers tests the distinction between connected and gossiped peers
 func TestConnectedVsGossipedPeers(t *testing.T) {
+	defer serializeP2PTest(t)()
 	t.Run("connected_peer_marked_as_connected", func(t *testing.T) {
 		peerRegistry := NewPeerRegistry()
 		connectedPeerID, _ := peer.Decode("12D3KooWEyX7hgdXy8zUjCs9CqvMGpB5dKVFj9MX2nUBLwajdSZH")
@@ -520,6 +525,7 @@ func TestConnectedVsGossipedPeers(t *testing.T) {
 
 // TestHandleRejectedTxTopic_UnhealthyPeer tests rejected tx topic handling with unhealthy peers
 func TestHandleRejectedTxTopic_UnhealthyPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	t.Run("ignore_rejected_tx_from_unhealthy_peer", func(t *testing.T) {

@@ -22,6 +22,7 @@ import (
 //
 // Make sure teranode is running first: make dev
 func TestLiveP2PWebSocketIntegration(t *testing.T) {
+	defer serializeP2PTest(t)()
 	t.SkipNow()
 
 	// Skip this test unless explicitly requested
@@ -183,6 +184,7 @@ analyzeMessages:
 
 // TestLiveP2PWebSocketOrdering specifically tests the message ordering
 func TestLiveP2PWebSocketOrdering(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Skip this test unless explicitly requested
 	if testing.Short() {
 		t.Skip("Skipping live integration test in short mode")

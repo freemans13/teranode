@@ -11,6 +11,7 @@ import (
 )
 
 func TestPeerSelector_SelectSyncPeer_NoPeers(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -23,6 +24,7 @@ func TestPeerSelector_SelectSyncPeer_NoPeers(t *testing.T) {
 }
 
 func TestSelector_SkipsPeerMarkedUnhealthyByHealthChecker(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -69,6 +71,7 @@ func TestSelector_SkipsPeerMarkedUnhealthyByHealthChecker(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_NoEligiblePeers(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -86,6 +89,7 @@ func TestPeerSelector_SelectSyncPeer_NoEligiblePeers(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_NoPeersAhead(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -108,6 +112,7 @@ func TestPeerSelector_SelectSyncPeer_NoPeersAhead(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_BasicSelection(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -131,6 +136,7 @@ func TestPeerSelector_SelectSyncPeer_BasicSelection(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_PreferLowerBanScore(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -182,6 +188,7 @@ func TestPeerSelector_SelectSyncPeer_PreferLowerBanScore(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_PreferHigherHeight(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -228,6 +235,7 @@ func TestPeerSelector_SelectSyncPeer_PreferHigherHeight(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_RequireHealthy(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -249,6 +257,7 @@ func TestPeerSelector_SelectSyncPeer_RequireHealthy(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_RequireDataHub(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -266,6 +275,7 @@ func TestPeerSelector_SelectSyncPeer_RequireDataHub(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_RequireResponsiveURL(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -304,6 +314,7 @@ func TestPeerSelector_SelectSyncPeer_RequireResponsiveURL(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_ForcedPeer(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -345,6 +356,7 @@ func TestPeerSelector_SelectSyncPeer_ForcedPeer(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_InvalidHeight(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -383,6 +395,7 @@ func TestPeerSelector_SelectSyncPeer_InvalidHeight(t *testing.T) {
 }
 
 func TestPeerSelector_SelectSyncPeer_ComplexCriteria(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -447,6 +460,7 @@ func TestPeerSelector_SelectSyncPeer_ComplexCriteria(t *testing.T) {
 }
 
 func TestPeerSelector_isEligible(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 
@@ -542,6 +556,7 @@ func TestPeerSelector_isEligible(t *testing.T) {
 }
 
 func TestPeerSelector_DeterministicSelectionAmongEqualPeers(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	ps := NewPeerSelector(logger, nil)
 

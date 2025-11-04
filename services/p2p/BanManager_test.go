@@ -25,6 +25,7 @@ func (h *testBanHandler) OnPeerBanned(peerID string, until time.Time, reason str
 }
 
 func TestAddScore_BanAndDecay(t *testing.T) {
+	defer serializeP2PTest(t)()
 	handler := &testBanHandler{}
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.P2P.BanThreshold = 30
@@ -59,6 +60,7 @@ func TestAddScore_BanAndDecay(t *testing.T) {
 }
 
 func TestAddScore_UnknownReason(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	m := NewPeerBanManager(context.Background(), nil, tSettings)
 	peerID := "peer2"
@@ -68,6 +70,7 @@ func TestAddScore_UnknownReason(t *testing.T) {
 }
 
 func TestResetAndCleanupBanScore(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	m := NewPeerBanManager(context.Background(), nil, tSettings)
 	peerID := "peer3"
@@ -87,6 +90,7 @@ func TestResetAndCleanupBanScore(t *testing.T) {
 }
 
 func TestGetBanScoreAndReasons(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.P2P.BanThreshold = 100
 	m := NewPeerBanManager(context.Background(), nil, tSettings)
@@ -104,6 +108,7 @@ func TestGetBanScoreAndReasons(t *testing.T) {
 }
 
 func TestIsBannedAndListBanned(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	m := NewPeerBanManager(context.Background(), nil, tSettings)
 	m.banThreshold = 10
@@ -125,6 +130,7 @@ func TestIsBannedAndListBanned(t *testing.T) {
 }
 
 func TestBanReason_String(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tests := []struct {
 		reason   BanReason
 		expected string
@@ -146,6 +152,7 @@ func TestBanReason_String(t *testing.T) {
 }
 
 func TestGetBanReasons_Empty(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	m := NewPeerBanManager(context.Background(), nil, tSettings)
 
@@ -155,6 +162,7 @@ func TestGetBanReasons_Empty(t *testing.T) {
 }
 
 func TestPeerBanManager_ConcurrentAccess(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	handler := &testBanHandler{}
 	m := NewPeerBanManager(context.Background(), handler, tSettings)
@@ -214,6 +222,7 @@ func TestPeerBanManager_ConcurrentAccess(t *testing.T) {
 }
 
 func TestPeerBanManager_BackgroundCleanup(t *testing.T) {
+	defer serializeP2PTest(t)()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -281,6 +290,7 @@ func TestPeerBanManager_BackgroundCleanup(t *testing.T) {
 }
 
 func TestPeerBanManager_NilHandler(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.P2P.BanThreshold = 90
 
@@ -299,6 +309,7 @@ func TestPeerBanManager_NilHandler(t *testing.T) {
 }
 
 func TestPeerBanManager_ContextCancellation(t *testing.T) {
+	defer serializeP2PTest(t)()
 	ctx, cancel := context.WithCancel(context.Background())
 	tSettings := test.CreateBaseTestSettings(t)
 	m := NewPeerBanManager(ctx, nil, tSettings)
@@ -326,6 +337,7 @@ func TestPeerBanManager_ContextCancellation(t *testing.T) {
 }
 
 func TestPeerBanManager_ExtendedDecayLogic(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	m := NewPeerBanManager(context.Background(), nil, tSettings)
 
@@ -354,6 +366,7 @@ func TestPeerBanManager_ExtendedDecayLogic(t *testing.T) {
 }
 
 func TestPeerBanManager_ReasonCatchupFailure(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tSettings := test.CreateBaseTestSettings(t)
 	m := NewPeerBanManager(context.Background(), nil, tSettings)
 

@@ -14,6 +14,7 @@ import (
 
 // TestReportInvalidBlock tests the ReportInvalidBlock functionality
 func TestReportInvalidBlock(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Setup test context
 	ctx := context.Background()
 
@@ -92,6 +93,7 @@ func TestReportInvalidBlock(t *testing.T) {
 
 // TestPeerMapCleanup tests the cleanup mechanism for peer maps
 func TestPeerMapCleanup(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test server with minimal required fields
 	server := &Server{
 		blockPeerMap:   sync.Map{},

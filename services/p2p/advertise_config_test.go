@@ -10,6 +10,7 @@ import (
 // TestAdvertiseConfiguration verifies that advertise addresses are configured correctly
 // With go-p2p v1.2.1, the library handles address advertisement intelligently
 func TestAdvertiseConfiguration(t *testing.T) {
+	defer serializeP2PTest(t)()
 	t.Run("empty_advertise_addresses_when_share_private_is_false", func(t *testing.T) {
 		// When SharePrivateAddresses is false and no explicit addresses configured,
 		// go-p2p v1.2.1 will automatically filter private IPs

@@ -12,6 +12,7 @@ import (
 )
 
 func TestSyncCoordinator_FSMTransitionBansPeerAndUpdatesRegistry(t *testing.T) {
+	defer serializeP2PTest(t)()
 	t.Skip("State transition banning temporarily disabled")
 
 	logger := ulogger.New("test")
@@ -90,6 +91,7 @@ func TestSyncCoordinator_FSMTransitionBansPeerAndUpdatesRegistry(t *testing.T) {
 }
 
 func TestSyncCoordinator_BannedPeerNotReselected(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
 	registry := NewPeerRegistry()

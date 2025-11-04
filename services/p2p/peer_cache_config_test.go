@@ -8,6 +8,7 @@ import (
 )
 
 func TestGetPeerCacheFilePath(t *testing.T) {
+	defer serializeP2PTest(t)()
 	tests := []struct {
 		name          string
 		configuredDir string
@@ -39,6 +40,7 @@ func TestGetPeerCacheFilePath(t *testing.T) {
 }
 
 func TestGetPeerCacheFilePathDefaultDirectory(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Test the default directory behavior
 	result := getPeerCacheFilePath("")
 
@@ -47,6 +49,7 @@ func TestGetPeerCacheFilePathDefaultDirectory(t *testing.T) {
 }
 
 func TestGetPeerCacheFilePathConsistency(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Test that the filename is always "teranode_peers.json" regardless of directory
 	testDirs := []string{
 		"",

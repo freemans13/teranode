@@ -15,6 +15,7 @@ import (
 )
 
 func TestPeerHealthChecker_NewPeerHealthChecker(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	settings := CreateTestSettings()
@@ -30,6 +31,7 @@ func TestPeerHealthChecker_NewPeerHealthChecker(t *testing.T) {
 }
 
 func TestPeerHealthChecker_StartAndStop(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	settings := CreateTestSettings()
@@ -54,6 +56,7 @@ func TestPeerHealthChecker_StartAndStop(t *testing.T) {
 }
 
 func TestPeerHealthChecker_isDataHubReachable_Success(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -74,6 +77,7 @@ func TestPeerHealthChecker_isDataHubReachable_Success(t *testing.T) {
 }
 
 func TestPeerHealthChecker_isDataHubReachable_Failure(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	settings := CreateTestSettings()
@@ -87,6 +91,7 @@ func TestPeerHealthChecker_isDataHubReachable_Failure(t *testing.T) {
 }
 
 func TestPeerHealthChecker_isDataHubReachable_EmptyURL(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	settings := CreateTestSettings()
@@ -100,6 +105,7 @@ func TestPeerHealthChecker_isDataHubReachable_EmptyURL(t *testing.T) {
 }
 
 func TestPeerHealthChecker_isDataHubReachable_404Offline(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server that returns offline indication
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -120,6 +126,7 @@ func TestPeerHealthChecker_isDataHubReachable_404Offline(t *testing.T) {
 }
 
 func TestPeerHealthChecker_isDataHubReachable_404Normal(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server that returns normal 404
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -140,6 +147,7 @@ func TestPeerHealthChecker_isDataHubReachable_404Normal(t *testing.T) {
 }
 
 func TestPeerHealthChecker_isDataHubReachable_500Error(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server that returns 500 error
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -160,6 +168,7 @@ func TestPeerHealthChecker_isDataHubReachable_500Error(t *testing.T) {
 }
 
 func TestPeerHealthChecker_checkPeerHealth(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -191,6 +200,7 @@ func TestPeerHealthChecker_checkPeerHealth(t *testing.T) {
 }
 
 func TestPeerHealthChecker_CheckPeerNow(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -220,6 +230,7 @@ func TestPeerHealthChecker_CheckPeerNow(t *testing.T) {
 }
 
 func TestPeerHealthChecker_checkAllPeers(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP servers
 	successServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -279,6 +290,7 @@ func TestPeerHealthChecker_checkAllPeers(t *testing.T) {
 }
 
 func TestPeerHealthChecker_ConcurrentHealthChecks(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server with delay to test concurrency
 	var requestCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +326,7 @@ func TestPeerHealthChecker_ConcurrentHealthChecks(t *testing.T) {
 }
 
 func TestPeerHealthChecker_HealthCheckLoop(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server
 	var checkCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -353,6 +366,7 @@ func TestPeerHealthChecker_HealthCheckLoop(t *testing.T) {
 }
 
 func TestPeerHealthChecker_DoesNotRemoveAfterConsecutiveFailures(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	settings := CreateTestSettings()
@@ -391,6 +405,7 @@ func TestPeerHealthChecker_DoesNotRemoveAfterConsecutiveFailures(t *testing.T) {
 }
 
 func TestPeerHealthChecker_FailureCountResetsOnSuccess(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Success after a failure resets the counter so removal requires full threshold again
 	// Prepare servers: one failing (500), then success (200), then failing again
 	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -438,6 +453,7 @@ func TestPeerHealthChecker_FailureCountResetsOnSuccess(t *testing.T) {
 }
 
 func TestPeerHealthChecker_SettingsOverrides(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	settings := CreateTestSettings()
@@ -455,6 +471,7 @@ func TestPeerHealthChecker_SettingsOverrides(t *testing.T) {
 }
 
 func TestPeerHealthChecker_HTTPTimeout(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Server sleeps longer than configured timeout -> unreachable
 	sleep := 100 * time.Millisecond
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -476,6 +493,7 @@ func TestPeerHealthChecker_HTTPTimeout(t *testing.T) {
 }
 
 func TestPeerHealthChecker_RedirectHandling(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Single redirect should be followed and considered reachable
 	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -516,6 +534,7 @@ func TestPeerHealthChecker_RedirectHandling(t *testing.T) {
 }
 
 func TestPeerHealthChecker_ListenOnlyPeersNotChecked(t *testing.T) {
+	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	settings := CreateTestSettings()
@@ -546,6 +565,7 @@ func TestPeerHealthChecker_ListenOnlyPeersNotChecked(t *testing.T) {
 }
 
 func TestPeerHealthChecker_CheckAllPeersSkipsListenOnly(t *testing.T) {
+	defer serializeP2PTest(t)()
 	// Create test HTTP server
 	var checkCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

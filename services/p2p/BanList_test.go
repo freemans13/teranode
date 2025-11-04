@@ -56,6 +56,7 @@ func setupBanList(t *testing.T) (*BanList, chan BanEvent, error) {
 // }
 
 func TestHandleSetBanAdd(t *testing.T) {
+	defer serializeP2PTest(t)()
 	banTime := int64(3600)
 	absolute := false
 	banTime2 := int64(7200)
@@ -152,6 +153,7 @@ func TestHandleSetBanAdd(t *testing.T) {
 }
 
 func TestIsBanned(t *testing.T) {
+	defer serializeP2PTest(t)()
 	banList, _, err := setupBanList(t)
 	require.NoError(t, err)
 	// Add a banned IP
@@ -188,6 +190,7 @@ func TestIsBanned(t *testing.T) {
 }
 
 func TestRemoveBan(t *testing.T) {
+	defer serializeP2PTest(t)()
 	banList, _, err := setupBanList(t)
 	require.NoError(t, err)
 
@@ -222,6 +225,7 @@ func TestRemoveBan(t *testing.T) {
 }
 
 func TestBanListChannel(t *testing.T) {
+	defer serializeP2PTest(t)()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -307,6 +311,7 @@ func TestBanListChannel(t *testing.T) {
 }
 
 func TestClearBanlist(t *testing.T) {
+	defer serializeP2PTest(t)()
 	banList, _, err := setupBanList(t)
 	require.NoError(t, err)
 
@@ -327,6 +332,7 @@ func TestClearBanlist(t *testing.T) {
 }
 
 func TestLoadFromDatabase(t *testing.T) {
+	defer serializeP2PTest(t)()
 	banList, _, err := setupBanList(t)
 	require.NoError(t, err)
 
@@ -349,6 +355,7 @@ func TestLoadFromDatabase(t *testing.T) {
 
 // TestIPv6Compatibility tests that the ban list correctly handles IPv6 addresses with ports
 func TestIPv6Compatibility(t *testing.T) {
+	defer serializeP2PTest(t)()
 	banList, _, err := setupBanList(t)
 	require.NoError(t, err)
 
