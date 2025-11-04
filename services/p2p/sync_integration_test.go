@@ -14,7 +14,6 @@ import (
 
 // Integration test that exercises the full sync coordination flow
 func TestSyncCoordination_FullFlow(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Setup blockchain
 	blockchainSetup := SetupTestBlockchain(t)
 	defer blockchainSetup.Cleanup()
@@ -206,7 +205,6 @@ func TestSyncCoordination_FullFlow(t *testing.T) {
 
 // Test sync with HTTP server mocking DataHub
 func TestSyncCoordination_WithHTTPServer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Setup test HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -275,7 +273,6 @@ func TestSyncCoordination_WithHTTPServer(t *testing.T) {
 
 // Test sync coordination with multiple concurrent operations
 func TestSyncCoordination_ConcurrentOperations(t *testing.T) {
-	defer serializeP2PTest(t)()
 	blockchainSetup := SetupTestBlockchain(t)
 	defer blockchainSetup.Cleanup()
 
@@ -370,7 +367,6 @@ func TestSyncCoordination_ConcurrentOperations(t *testing.T) {
 
 // Test sync coordination with catchup failures
 func TestSyncCoordination_CatchupFailures(t *testing.T) {
-	defer serializeP2PTest(t)()
 	blockchainSetup := SetupTestBlockchain(t)
 	defer blockchainSetup.Cleanup()
 
@@ -435,7 +431,6 @@ func TestSyncCoordination_CatchupFailures(t *testing.T) {
 
 // Test evaluateSyncPeer logic through actual sync operations
 func TestSyncCoordination_PeerEvaluation(t *testing.T) {
-	defer serializeP2PTest(t)()
 	blockchainSetup := SetupTestBlockchain(t)
 	defer blockchainSetup.Cleanup()
 

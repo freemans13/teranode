@@ -21,7 +21,6 @@ import (
 // 1. The first message received is a node_status message
 // 2. The first node_status message is from the current node (our own node)
 func TestP2PWebSocketIntegration(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.SkipNow()
 
 	// Create a mock P2PClient for testing
@@ -178,7 +177,6 @@ func TestP2PWebSocketIntegration(t *testing.T) {
 
 // TestP2PWebSocketCurrentNodeFirst specifically tests that the current node's status is always sent first
 func TestP2PWebSocketCurrentNodeFirst(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Create a mock P2PClient
 	mockP2PNode := new(MockServerP2PClient)
 	currentNodePeerID, err := peer.Decode("12D3KooWL8qb3L8nKPjDtQmJU8jge5Qspsn6YLSBei9MsbTjJDr8")
@@ -250,7 +248,6 @@ func TestP2PWebSocketCurrentNodeFirst(t *testing.T) {
 
 // TestP2PWebSocketMessageStructure tests that the message structure is correct
 func TestP2PWebSocketMessageStructure(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Create a mock P2PClient
 	mockP2PNode := new(MockServerP2PClient)
 	testPeerID, err := peer.Decode("12D3KooWBPqTBhshqRZMKZtqb5sfgckM9JYkWDR7eW5kSPEKwKCW")

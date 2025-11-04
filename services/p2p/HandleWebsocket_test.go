@@ -26,7 +26,6 @@ const (
 )
 
 func TestBroadcastMessage(t *testing.T) {
-	defer serializeP2PTest(t)()
 	tests := []struct {
 		name           string
 		clientCount    int
@@ -132,7 +131,6 @@ func TestBroadcastMessage(t *testing.T) {
 }
 
 func TestHandleClientMessages(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Run("Normal operation", func(t *testing.T) {
 		s := &Server{
 			gCtx:   t.Context(),
@@ -223,12 +221,12 @@ func (c *testWebSocketConn) ReadMessage() (messageType int, p []byte, err error)
 }
 
 func TestStartNotificationProcessor(t *testing.T) {
-	defer serializeP2PTest(t)()
 	s := &Server{
 		logger: &ulogger.TestLogger{},
 		settings: &settings.Settings{
 			P2P: settings.P2PSettings{
 				ListenMode: settings.ListenModeFull,
+				DisableNAT: true, // Disable NAT in tests to prevent data races in libp2p
 			},
 		},
 	}
@@ -361,7 +359,6 @@ func TestStartNotificationProcessor(t *testing.T) {
 }
 
 func TestHandleWebSocket(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Create server with logger
 	s := &Server{
 		gCtx:   t.Context(),
@@ -369,6 +366,7 @@ func TestHandleWebSocket(t *testing.T) {
 		settings: &settings.Settings{
 			P2P: settings.P2PSettings{
 				ListenMode: settings.ListenModeFull,
+				DisableNAT: true, // Disable NAT in tests to prevent data races in libp2p
 			},
 		},
 	}

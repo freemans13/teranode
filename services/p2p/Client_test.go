@@ -94,7 +94,6 @@ func (m *MockPeerServiceClient) DisconnectPeer(ctx context.Context, in *p2p_api.
 }
 
 func TestSimpleClientGetPeers(t *testing.T) {
-	defer serializeP2PTest(t)()
 	mockClient := &MockPeerServiceClient{
 		GetPeersFunc: func(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*p2p_api.GetPeersResponse, error) {
 			return &p2p_api.GetPeersResponse{
@@ -121,7 +120,6 @@ func TestSimpleClientGetPeers(t *testing.T) {
 }
 
 func TestSimpleClientBanPeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	mockClient := &MockPeerServiceClient{
 		BanPeerFunc: func(ctx context.Context, in *p2p_api.BanPeerRequest, opts ...grpc.CallOption) (*p2p_api.BanPeerResponse, error) {
 			assert.Equal(t, "192.168.1.1", in.Addr)
@@ -147,7 +145,6 @@ func TestSimpleClientBanPeer(t *testing.T) {
 }
 
 func TestSimpleClientUnbanPeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	mockClient := &MockPeerServiceClient{
 		UnbanPeerFunc: func(ctx context.Context, in *p2p_api.UnbanPeerRequest, opts ...grpc.CallOption) (*p2p_api.UnbanPeerResponse, error) {
 			assert.Equal(t, "192.168.1.1", in.Addr)
@@ -171,7 +168,6 @@ func TestSimpleClientUnbanPeer(t *testing.T) {
 }
 
 func TestSimpleClientIsBanned(t *testing.T) {
-	defer serializeP2PTest(t)()
 	mockClient := &MockPeerServiceClient{
 		IsBannedFunc: func(ctx context.Context, in *p2p_api.IsBannedRequest, opts ...grpc.CallOption) (*p2p_api.IsBannedResponse, error) {
 			assert.Equal(t, "192.168.1.1", in.IpOrSubnet)
@@ -195,7 +191,6 @@ func TestSimpleClientIsBanned(t *testing.T) {
 }
 
 func TestSimpleClientListBanned(t *testing.T) {
-	defer serializeP2PTest(t)()
 	mockClient := &MockPeerServiceClient{
 		ListBannedFunc: func(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*p2p_api.ListBannedResponse, error) {
 			return &p2p_api.ListBannedResponse{
@@ -218,7 +213,6 @@ func TestSimpleClientListBanned(t *testing.T) {
 }
 
 func TestSimpleClientClearBanned(t *testing.T) {
-	defer serializeP2PTest(t)()
 	mockClient := &MockPeerServiceClient{
 		ClearBannedFunc: func(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*p2p_api.ClearBannedResponse, error) {
 			return &p2p_api.ClearBannedResponse{Ok: true}, nil
@@ -238,7 +232,6 @@ func TestSimpleClientClearBanned(t *testing.T) {
 }
 
 func TestSimpleClientAddBanScore(t *testing.T) {
-	defer serializeP2PTest(t)()
 	mockClient := &MockPeerServiceClient{
 		AddBanScoreFunc: func(ctx context.Context, in *p2p_api.AddBanScoreRequest, opts ...grpc.CallOption) (*p2p_api.AddBanScoreResponse, error) {
 			assert.Equal(t, "peer1", in.PeerId)
@@ -264,7 +257,6 @@ func TestSimpleClientAddBanScore(t *testing.T) {
 }
 
 func TestSimpleClientConnectPeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Run("Success", func(t *testing.T) {
 		mockClient := &MockPeerServiceClient{
 			ConnectPeerFunc: func(ctx context.Context, in *p2p_api.ConnectPeerRequest, opts ...grpc.CallOption) (*p2p_api.ConnectPeerResponse, error) {
@@ -303,7 +295,6 @@ func TestSimpleClientConnectPeer(t *testing.T) {
 }
 
 func TestSimpleClientDisconnectPeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Run("Success", func(t *testing.T) {
 		mockClient := &MockPeerServiceClient{
 			DisconnectPeerFunc: func(ctx context.Context, in *p2p_api.DisconnectPeerRequest, opts ...grpc.CallOption) (*p2p_api.DisconnectPeerResponse, error) {

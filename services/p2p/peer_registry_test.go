@@ -10,7 +10,6 @@ import (
 )
 
 func TestPeerRegistry_AddPeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -37,7 +36,6 @@ func TestPeerRegistry_AddPeer(t *testing.T) {
 }
 
 func TestPeerRegistry_RemovePeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -54,7 +52,6 @@ func TestPeerRegistry_RemovePeer(t *testing.T) {
 }
 
 func TestPeerRegistry_UpdateLastMessageTime(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -82,7 +79,6 @@ func TestPeerRegistry_UpdateLastMessageTime(t *testing.T) {
 }
 
 func TestPeerRegistry_GetAllPeers(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 
 	// Start with empty registry
@@ -110,7 +106,6 @@ func TestPeerRegistry_GetAllPeers(t *testing.T) {
 }
 
 func TestPeerRegistry_UpdateHeight(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -127,7 +122,6 @@ func TestPeerRegistry_UpdateHeight(t *testing.T) {
 }
 
 func TestPeerRegistry_UpdateDataHubURL(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -140,7 +134,6 @@ func TestPeerRegistry_UpdateDataHubURL(t *testing.T) {
 }
 
 func TestPeerRegistry_UpdateHealth(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -163,7 +156,6 @@ func TestPeerRegistry_UpdateHealth(t *testing.T) {
 }
 
 func TestPeerRegistry_UpdateBanStatus(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -182,7 +174,6 @@ func TestPeerRegistry_UpdateBanStatus(t *testing.T) {
 }
 
 func TestPeerRegistry_UpdateNetworkStats(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -195,7 +186,6 @@ func TestPeerRegistry_UpdateNetworkStats(t *testing.T) {
 }
 
 func TestPeerRegistry_UpdateURLResponsiveness(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
@@ -214,7 +204,6 @@ func TestPeerRegistry_UpdateURLResponsiveness(t *testing.T) {
 }
 
 func TestPeerRegistry_PeerCount(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 
 	assert.Equal(t, 0, pr.PeerCount())
@@ -234,7 +223,6 @@ func TestPeerRegistry_PeerCount(t *testing.T) {
 }
 
 func TestPeerRegistry_ConcurrentAccess(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	done := make(chan bool)
 
@@ -286,7 +274,6 @@ func TestPeerRegistry_ConcurrentAccess(t *testing.T) {
 }
 
 func TestPeerRegistry_GetPeerReturnsCopy(t *testing.T) {
-	defer serializeP2PTest(t)()
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 

@@ -52,14 +52,6 @@ const (
 	peerIDStr       = "12D3KooWRj9ajsNaVuT2fNv7k2AyLnrC5NQQzZS9GixSVWKZZYRE"
 )
 
-// p2pTestMutex serializes P2P tests that create libp2p instances to prevent data races.
-// The go-libp2p@v0.44.0 NAT manager uses a global non-thread-safe math/rand.Rand instance
-// that is accessed by background NAT manager goroutines. By running tests serially, we prevent
-// concurrent access to this shared state.
-//
-// All tests that create libp2p hosts must call defer serializeP2PTest(t)() at the start.
-var p2pTestMutex sync.Mutex
-
 // MockKafkaConsumerGroup is a mock implementation of kafka.KafkaConsumerGroupI
 type MockKafkaConsumerGroup struct {
 	mock.Mock
@@ -118,6 +110,7 @@ func createTestServer(t *testing.T) *Server {
 			BanThreshold: 100,
 			BanDuration:  time.Hour,
 			PeerCacheDir: t.TempDir(),
+			DisableNAT:   true, // Disable NAT in tests to prevent data races in libp2p
 		},
 	}
 
@@ -133,7 +126,6 @@ func createTestServer(t *testing.T) *Server {
 }
 
 func TestGetIPFromMultiaddr(t *testing.T) {
-	defer serializeP2PTest(t)()
 	s := &Server{}
 	ctx := context.Background()
 
@@ -205,7 +197,6 @@ func TestGetIPFromMultiaddr(t *testing.T) {
 }
 
 func TestResolveDNS(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// This is an integration test that requires network connectivity
 	// Skip if we're in a CI environment or if explicitly requested
 	if testing.Short() {
@@ -296,7 +287,6 @@ func TestResolveDNS(t *testing.T) {
 }
 
 func TestServerHandlers(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Run("Test stream handler behaviour", func(t *testing.T) {
 		// Create a minimal Server for testing
 		server := &Server{
@@ -330,7 +320,6 @@ func TestServerHandlers(t *testing.T) {
 }
 
 func TestServerStart(t *testing.T) {
-	defer serializeP2PTest(t)()
 
 	t.Run("Test Start method", func(t *testing.T) {
 		logger := ulogger.New("test-server", ulogger.WithLevel("ERROR"))
@@ -479,12 +468,10 @@ func TestServerStart(t *testing.T) {
 }
 
 func TestServerIntegration(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Skip("Integration tests require more comprehensive mocking of dependencies")
 }
 
 func TestHandleBlockTopic(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Setup common test variables
 	ctx := context.Background()
 
@@ -738,7 +725,6 @@ func TestHandleBlockTopic(t *testing.T) {
 }
 
 func TestHandleSubtreeTopic(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Setup common test variables
 	ctx := context.Background()
 
@@ -810,7 +796,6 @@ func TestHandleSubtreeTopic(t *testing.T) {
 
 // TestReceiveBestBlockStreamHandler tests the receiveBestBlockStreamHandler function
 func TestReceiveBestBlockStreamHandler(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Create subtests for different scenarios
 	t.Run("successful stream handling", func(t *testing.T) {
 		// Create mock P2PClient
@@ -1001,7 +986,6 @@ func (m *MockPeerBanManager) AddScore(peerID string, reason BanReason) (score in
 }
 
 func TestContains(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Generate a valid peer ID using crypto key
 	privKey, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
 	require.NoError(t, err)
@@ -1066,7 +1050,6 @@ func TestContains(t *testing.T) {
 }
 
 func TestHandleBanEvent(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Skip("Skipping until we refactor ban handling to be more testable")
 	t.Run("non-add_ban_event", func(t *testing.T) {
 		// Setup
@@ -1443,7 +1426,6 @@ func (m *MockConnScope) Stat() network.ScopeStat {
 }
 
 func TestFixGetPeers(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Create mock ban manager
 	mockBanManager := new(MockPeerBanManager)
 	mockBanManager.On("GetBanScore", mock.Anything).Return(0, false, time.Time{})
@@ -1456,7 +1438,6 @@ func TestFixGetPeers(t *testing.T) {
 }
 
 func TestBlacklistBaseURL(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Run("isBlacklistedBaseURL_business_logic", func(t *testing.T) {
 		// Create settings with blacklisted URLs
 		tSettings := createBaseTestSettings()
@@ -1542,7 +1523,6 @@ func TestBlacklistBaseURL(t *testing.T) {
 }
 
 func TestSelfMessageFiltering(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Run("filters_own_block_messages", func(t *testing.T) {
 		tSettings := createBaseTestSettings()
 		tSettings.ChainCfgParams = &chaincfg.RegressionNetParams
@@ -1681,23 +1661,9 @@ func TestSelfMessageFiltering(t *testing.T) {
 func createBaseTestSettings() *settings.Settings {
 	s := settings.NewSettings()
 	s.SubtreeValidation.BlacklistedBaseURLs = make(map[string]struct{})
+	s.P2P.DisableNAT = true // Disable NAT in tests to prevent data races in libp2p
 
 	return s
-}
-
-// serializeP2PTest locks the global P2P test mutex to serialize test execution
-// Returns a cleanup function that must be called with defer to unlock the mutex
-// This prevents data races in libp2p's NAT manager background goroutines
-func serializeP2PTest(t *testing.T) func() {
-	t.Helper()
-	p2pTestMutex.Lock()
-	return func() {
-		// Sleep briefly to allow NAT manager goroutines from libp2p to terminate
-		// The NAT manager in go-libp2p@v0.44.0 uses a non-thread-safe rand.Rand
-		// and spawns background goroutines that can outlive the test
-		time.Sleep(200 * time.Millisecond)
-		p2pTestMutex.Unlock()
-	}
 }
 
 // TestNewServer_ConfigValidation ensures that NewServer properly validates the P2P settings
@@ -1705,7 +1671,6 @@ func serializeP2PTest(t *testing.T) func() {
 // Each subtest modifies one specific configuration field to trigger a different error path,
 // allowing full coverage of the early-return validation logic in the NewServer constructor.
 func TestNewServer_ConfigValidation(t *testing.T) {
-	defer serializeP2PTest(t)()
 
 	ctx := context.Background()
 	logger := ulogger.New("test-server")
@@ -1727,6 +1692,7 @@ func TestNewServer_ConfigValidation(t *testing.T) {
 				RejectedTxTopic: "rejected",
 				ListenMode:      settings.ListenModeFull,
 				PrivateKey:      "privkey",
+				DisableNAT:      true, // Disable NAT in tests to prevent data races in libp2p
 			},
 			ChainCfgParams: &chaincfg.Params{
 				TopicPrefix: "prefix",
@@ -1806,7 +1772,6 @@ func TestNewServer_ConfigValidation(t *testing.T) {
 }
 
 func TestPrivateKeyHandling(t *testing.T) {
-	defer serializeP2PTest(t)()
 
 	ctx := context.Background()
 	logger := ulogger.New("test-server")
@@ -1932,7 +1897,6 @@ func TestPrivateKeyHandling(t *testing.T) {
 }
 
 func TestServerHealth(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	t.Run("liveness check returns OK", func(t *testing.T) {
@@ -2000,7 +1964,6 @@ func TestServerHealth(t *testing.T) {
 }
 
 func TestServerInitHTTPPublicAddressSet(t *testing.T) {
-	defer serializeP2PTest(t)()
 
 	ctx := context.Background()
 	logger := ulogger.New("test-server")
@@ -2023,7 +1986,6 @@ func TestServerInitHTTPPublicAddressSet(t *testing.T) {
 }
 
 func TestServerInitHTTPPublicAddressEmpty(t *testing.T) {
-	defer serializeP2PTest(t)()
 
 	ctx := context.Background()
 	logger := ulogger.New("test-server")
@@ -2046,7 +2008,6 @@ func TestServerInitHTTPPublicAddressEmpty(t *testing.T) {
 }
 
 func TestServerSetupHTTPServer(t *testing.T) {
-	defer serializeP2PTest(t)()
 
 	ctx := context.Background()
 	logger := ulogger.New("test-logger")
@@ -2096,7 +2057,6 @@ func getFreePort(t *testing.T) int {
 }
 
 func TestServerStartFull(t *testing.T) {
-	defer serializeP2PTest(t)()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2220,7 +2180,6 @@ func TestServerStartFull(t *testing.T) {
 }
 
 func TestInvalidSubtreeHandlerHappyPath(t *testing.T) {
-	defer serializeP2PTest(t)()
 	banHandler := &testBanHandler{}
 	banManager := &PeerBanManager{
 		peerBanScores: make(map[string]*BanScore),
@@ -2284,7 +2243,6 @@ func TestInvalidSubtreeHandlerHappyPath(t *testing.T) {
 }
 
 func TestInvalidBlockHandler(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	logger := ulogger.New("test")
 
@@ -2404,7 +2362,6 @@ func TestInvalidBlockHandler(t *testing.T) {
 }
 
 func TestServerRejectedHandler(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Parallel()
 	topicDefaultString := "test-prefix-rejected"
 	ctx := context.Background()
@@ -2580,7 +2537,6 @@ func TestServerRejectedHandler(t *testing.T) {
 }
 
 func TestGenerateRandomKey(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Parallel()
 
 	k1, err := generateRandomKey()
@@ -2600,7 +2556,6 @@ func TestGenerateRandomKey(t *testing.T) {
 }
 
 func TestServerHandleNodeStatusTopic(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	t.Run("message_from_self_forwards_to_websocket_but_does_not_update_peer_height", func(t *testing.T) {
@@ -2695,7 +2650,6 @@ func TestServerHandleNodeStatusTopic(t *testing.T) {
 }
 
 func TestHandleBlockNotificationSuccess(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	fsmState := blockchain.FSMStateRUNNING
 
@@ -2746,7 +2700,6 @@ func TestHandleBlockNotificationSuccess(t *testing.T) {
 }
 
 func TestHandleSubtreeNotificationSuccess(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	hash := &chainhash.Hash{0x1}
 	subtreeTopicName := "subtree-topic"
@@ -2773,7 +2726,6 @@ func TestHandleSubtreeNotificationSuccess(t *testing.T) {
 }
 
 func TestProcessBlockchainNotificationSubtree(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	subtreeTopicName := "subtree-topic"
 	logger := ulogger.New("test")
@@ -2806,7 +2758,6 @@ func TestProcessBlockchainNotificationSubtree(t *testing.T) {
 }
 
 func TestProcessBlockchainNotificationUnknownType(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	logger := ulogger.New("test")
 
@@ -2826,7 +2777,6 @@ func TestProcessBlockchainNotificationUnknownType(t *testing.T) {
 }
 
 func TestProcessBlockchainNotificationInvalidHash(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	logger := ulogger.New("test")
 
@@ -2845,7 +2795,6 @@ func TestProcessBlockchainNotificationInvalidHash(t *testing.T) {
 }
 
 func TestServerStopSuccess(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	logger := ulogger.New("test")
 
@@ -2884,7 +2833,6 @@ func TestServerStopSuccess(t *testing.T) {
 }
 
 func TestDisconnectPeerSuccess(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Skip("disconnect peer is deprecated in new architecture")
 	ctx := context.Background()
 	peerID := "12D3KooWQ89fFeXZtbj4Lmq2Z3zAqz1QzAAzC7D2yxjZK7XWuK6h"
@@ -2912,7 +2860,6 @@ func TestDisconnectPeerSuccess(t *testing.T) {
 }
 
 func TestDisconnectPeerInvalidID(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Skip("disconnect peer is deprecated in new architecture")
 	ctx := context.Background()
 	invalidPeerID := "invalid-peer-id"
@@ -2932,7 +2879,6 @@ func TestDisconnectPeerInvalidID(t *testing.T) {
 }
 
 func TestDisconnectPeerNoP2PNode(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Skip("disconnect peer is deprecated in new architecture")
 	ctx := context.Background()
 	logger := ulogger.New("test")
@@ -2951,7 +2897,6 @@ func TestDisconnectPeerNoP2PNode(t *testing.T) {
 }
 
 func TestProcessInvalidBlockMessageSuccess(t *testing.T) {
-	defer serializeP2PTest(t)()
 
 	logger := ulogger.New("test")
 	mockPeerID := peer.ID("peer-123")
@@ -3003,7 +2948,6 @@ func TestProcessInvalidBlockMessageSuccess(t *testing.T) {
 }
 
 func TestProcessInvalidBlockMessageUnmarshalError(t *testing.T) {
-	defer serializeP2PTest(t)()
 	invalidBytes := []byte{0x00, 0x01, 0x02} // invalid proto
 	logger := ulogger.New("test")
 
@@ -3022,7 +2966,6 @@ func TestProcessInvalidBlockMessageUnmarshalError(t *testing.T) {
 }
 
 func TestProcessInvalidBlockMessageNoPeerInMap(t *testing.T) {
-	defer serializeP2PTest(t)()
 	blockHash := "not_in_map"
 	msgProto := &kafkamessage.KafkaInvalidBlockTopicMessage{
 		BlockHash: blockHash,
@@ -3048,7 +2991,6 @@ func TestProcessInvalidBlockMessageNoPeerInMap(t *testing.T) {
 }
 
 func TestProcessInvalidBlockMessageWrongTypeInMap(t *testing.T) {
-	defer serializeP2PTest(t)()
 	blockHash := "bad_type"
 	msgProto := &kafkamessage.KafkaInvalidBlockTopicMessage{
 		BlockHash: blockHash,
@@ -3075,7 +3017,6 @@ func TestProcessInvalidBlockMessageWrongTypeInMap(t *testing.T) {
 }
 
 func TestProcessInvalidBlockMessageAddBanScoreFails(t *testing.T) {
-	defer serializeP2PTest(t)()
 	blockHash := "fail_hash"
 	msgProto := &kafkamessage.KafkaInvalidBlockTopicMessage{
 		BlockHash: blockHash,
@@ -3121,7 +3062,6 @@ func TestProcessInvalidBlockMessageAddBanScoreFails(t *testing.T) {
 }
 
 func TestBlockchainSubscriptionListener(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Run("context cancelled - shutdown", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		subscription := make(chan *blockchain.Notification, 1)
@@ -3168,7 +3108,6 @@ func TestBlockchainSubscriptionListener(t *testing.T) {
 }
 
 func TestConnectPeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Skip("connect peer is deprecated in new architecture")
 	t.Run("P2P node is nil", func(t *testing.T) {
 		server := &Server{
@@ -3228,7 +3167,6 @@ func TestConnectPeer(t *testing.T) {
 }
 
 func TestServer_GetLocalHeight(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Test with nil blockchain client
 	server := &Server{
 		blockchainClient: nil,
@@ -3260,7 +3198,6 @@ func TestServer_GetLocalHeight(t *testing.T) {
 }
 
 func TestServer_UpdatePeerHeight(t *testing.T) {
-	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	server := &Server{
@@ -3286,7 +3223,6 @@ func TestServer_UpdatePeerHeight(t *testing.T) {
 }
 
 func TestServer_AddPeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	server := &Server{
@@ -3310,7 +3246,6 @@ func TestServer_AddPeer(t *testing.T) {
 }
 
 func TestServer_RemovePeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	server := &Server{
@@ -3334,7 +3269,6 @@ func TestServer_RemovePeer(t *testing.T) {
 }
 
 func TestServer_UpdateBlockHash(t *testing.T) {
-	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	server := &Server{
@@ -3364,7 +3298,6 @@ func TestServer_UpdateBlockHash(t *testing.T) {
 }
 
 func TestServer_GetPeer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	server := &Server{
@@ -3392,7 +3325,6 @@ func TestServer_GetPeer(t *testing.T) {
 }
 
 func TestServer_UpdateDataHubURL(t *testing.T) {
-	defer serializeP2PTest(t)()
 	logger := ulogger.New("test")
 	registry := NewPeerRegistry()
 	server := &Server{
@@ -3422,7 +3354,6 @@ func TestServer_UpdateDataHubURL(t *testing.T) {
 }
 
 func TestBanPeerCoverage(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server := createTestServer(t)
 
@@ -3445,7 +3376,6 @@ func TestBanPeerCoverage(t *testing.T) {
 }
 
 func TestUnbanPeerCoverage(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server := createTestServer(t)
 
@@ -3466,7 +3396,6 @@ func TestUnbanPeerCoverage(t *testing.T) {
 }
 
 func TestIsBannedCoverage(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server := createTestServer(t)
 
@@ -3488,7 +3417,6 @@ func TestIsBannedCoverage(t *testing.T) {
 }
 
 func TestListBannedCoverage(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server := createTestServer(t)
 
@@ -3505,7 +3433,6 @@ func TestListBannedCoverage(t *testing.T) {
 }
 
 func TestClearBannedCoverage(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server := createTestServer(t)
 
@@ -3522,7 +3449,6 @@ func TestClearBannedCoverage(t *testing.T) {
 }
 
 func TestOnPeerBannedCoverage(t *testing.T) {
-	defer serializeP2PTest(t)()
 	server := createTestServer(t)
 
 	// Skip if P2PClient is not initialized in test server
@@ -3554,7 +3480,6 @@ func TestOnPeerBannedCoverage(t *testing.T) {
 }
 
 func TestShouldSkipDuringSync(t *testing.T) {
-	defer serializeP2PTest(t)()
 	server := createTestServer(t)
 
 	// Test when no sync peer is set
@@ -3576,7 +3501,6 @@ func TestShouldSkipDuringSync(t *testing.T) {
 }
 
 func TestGetPeerIDFromDataHubURL(t *testing.T) {
-	defer serializeP2PTest(t)()
 	server := createTestServer(t)
 
 	// Test with invalid URL - function returns string only
@@ -3595,7 +3519,6 @@ func TestGetPeerIDFromDataHubURL(t *testing.T) {
 }
 
 func TestDisconnectPreExistingBannedPeers(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server := createTestServer(t)
 
@@ -3612,7 +3535,6 @@ func TestDisconnectPreExistingBannedPeers(t *testing.T) {
 }
 
 func TestStartInvalidBlockConsumer(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server := createTestServer(t)
 
@@ -3627,7 +3549,6 @@ func TestStartInvalidBlockConsumer(t *testing.T) {
 }
 
 func TestReportInvalidSubtreeCoverage(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server := createTestServer(t)
 
@@ -3655,6 +3576,7 @@ func createEnhancedTestServer(t *testing.T) (*Server, *MockServerP2PClient, *Moc
 			BanThreshold: 100,
 			BanDuration:  time.Hour,
 			PeerCacheDir: t.TempDir(),
+			DisableNAT:   true, // Disable NAT in tests to prevent data races in libp2p
 		},
 	}
 
@@ -3698,7 +3620,6 @@ func createEnhancedTestServer(t *testing.T) (*Server, *MockServerP2PClient, *Moc
 // Enhanced creative tests using mocks to achieve 100% coverage
 
 func TestBanPeerEnhanced(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	// Create a fresh mock for this test
@@ -3730,7 +3651,6 @@ func TestBanPeerEnhanced(t *testing.T) {
 }
 
 func TestUnbanPeerEnhanced(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	// Create a fresh mock for this test
@@ -3760,7 +3680,6 @@ func TestUnbanPeerEnhanced(t *testing.T) {
 }
 
 func TestListBannedEnhanced(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	// Create a fresh mock for this test
@@ -3786,7 +3705,6 @@ func TestListBannedEnhanced(t *testing.T) {
 }
 
 func TestClearBannedEnhanced(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 
 	// Create a fresh mock for this test
@@ -3816,7 +3734,6 @@ func TestClearBannedEnhanced(t *testing.T) {
 // the scope of isolated unit testing with mocks.
 /*
 func TestP2PNodeConnectedEnhanced(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// This test is commented out because P2PNodeConnected spawns a goroutine
 	// that calls sendDirectHandshake, which accesses s.blockchainClient
 	// Setting up a proper blockchain client mock requires extensive setup
@@ -3825,7 +3742,6 @@ func TestP2PNodeConnectedEnhanced(t *testing.T) {
 */
 
 func TestOnPeerBannedEnhanced(t *testing.T) {
-	defer serializeP2PTest(t)()
 	t.Skip("onPeerBanned is deprecated in new architecture")
 	// Create fresh mocks for this test
 	mockP2PNode := &MockServerP2PClient{}
@@ -3867,7 +3783,6 @@ func TestOnPeerBannedEnhanced(t *testing.T) {
 }
 
 func TestDisconnectPreExistingBannedPeersEnhanced(t *testing.T) {
-	defer serializeP2PTest(t)()
 	ctx := context.Background()
 	server, _, mockBanList := createEnhancedTestServer(t)
 

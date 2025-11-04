@@ -25,7 +25,6 @@ import (
 //
 // Make sure teranode is running first: make dev
 func TestAssetServiceWebSocketIntegration(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Skip this test unless explicitly requested
 	if testing.Short() {
 		t.Skip("Skipping live integration test in short mode")
@@ -245,7 +244,6 @@ analyzeMessages:
 
 // TestAssetServiceCachingBehavior tests that the asset service correctly caches and sends current node first after the fix
 func TestAssetServiceCachingBehavior(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Skip this test unless explicitly requested
 	if testing.Short() {
 		t.Skip("Skipping live integration test in short mode")
@@ -342,7 +340,6 @@ searchLoop:
 
 // TestAssetVsP2PComparison compares messages from both asset service and p2p service
 func TestAssetVsP2PComparison(t *testing.T) {
-	defer serializeP2PTest(t)()
 	// Skip this test unless explicitly requested
 	if testing.Short() {
 		t.Skip("Skipping live integration test in short mode")
