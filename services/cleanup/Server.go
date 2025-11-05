@@ -44,7 +44,7 @@ type Server struct {
 
 	// Internal state
 	cleanupService      cleanup.Service
-	lastProcessedHeight uint32
+	lastProcessedHeight atomic.Uint32
 	lastPersistedHeight atomic.Uint32
 	cleanupCh           chan uint32
 	stats               *gocore.Stat
