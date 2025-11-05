@@ -10,9 +10,8 @@ import (
 // pollingWorker polls the block assembly service every polling interval to check
 // if cleanup should be triggered. It only triggers cleanup when:
 // 1. Block assembly state is "running" (not reorging, resetting, etc.)
-// 2. Subtree processor state is "running"
-// 3. Block height has changed since last processed
-// 4. Cleanup channel is available (no cleanup currently in progress)
+// 2. Block height has changed since last processed
+// 3. Cleanup channel is available (no cleanup currently in progress)
 func (s *Server) pollingWorker(ctx context.Context) {
 	ticker := time.NewTicker(s.settings.Cleanup.PollingInterval)
 	defer ticker.Stop()
@@ -34,15 +33,10 @@ func (s *Server) pollingWorker(ctx context.Context) {
 				continue
 			}
 
-			// Check safety conditions
+			// Check safety condition: only run cleanup when block assembly is in stable "running" state
+			// This ensures we don't cleanup during reorgs, resets, or other unstable states
 			if state.BlockAssemblyState != "running" {
 				s.logger.Debugf("Skipping cleanup: block assembly state is %s (not running)", state.BlockAssemblyState)
-				cleanupSkipped.WithLabelValues("not_running").Inc()
-				continue
-			}
-
-			if state.SubtreeProcessorState != "running" {
-				s.logger.Debugf("Skipping cleanup: subtree processor state is %s (not running)", state.SubtreeProcessorState)
 				cleanupSkipped.WithLabelValues("not_running").Inc()
 				continue
 			}

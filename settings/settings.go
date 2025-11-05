@@ -411,6 +411,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TestMode:              getBool("coinbase_test_mode", false, alternativeContext...),
 			P2PPort:               getInt("p2p_port_coinbase", 9906, alternativeContext...),
 		},
+		Cleanup: CleanupSettings{
+			GRPCAddress:       getString("cleanup_grpcAddress", "localhost:8096", alternativeContext...),
+			GRPCListenAddress: getString("cleanup_grpcListenAddress", ":8096", alternativeContext...),
+			PollingInterval:   getDuration("cleanup_pollingInterval", time.Minute, alternativeContext...),
+		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
 			QuorumPath:                                getString("subtree_quorum_path", "", alternativeContext...),

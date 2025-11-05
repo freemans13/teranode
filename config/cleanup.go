@@ -4,9 +4,6 @@ import "time"
 
 // CleanupSettings contains configuration for the Cleanup service.
 type CleanupSettings struct {
-	// Disabled indicates whether the cleanup service is disabled
-	Disabled bool
-
 	// GRPCListenAddress is the address the cleanup service listens on for gRPC requests
 	GRPCListenAddress string
 

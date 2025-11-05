@@ -456,7 +456,6 @@ type CoinbaseSettings struct {
 }
 
 type CleanupSettings struct {
-	Disabled          bool
 	GRPCListenAddress string
 	GRPCAddress       string
 	PollingInterval   time.Duration
