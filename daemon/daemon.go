@@ -57,6 +57,7 @@ const (
 	loggerBlockchain               = "bchn"
 	loggerBlockchainClient         = "bchc"
 	loggerBlockchainSQL            = "bcsql"
+	loggerCleanup                  = "cleanup"
 	loggerKafkaConsumerBlocks      = "kcb"
 	loggerKafkaConsumerRejectedTx  = "kcrtx"
 	loggerKafkaConsumerSubtree     = "kcs"
@@ -87,6 +88,8 @@ const (
 	serviceBlockPersister          = "blockpersister"
 	serviceBlockPersisterFormal    = "BlockPersister"
 	serviceBlockValidation         = "blockvalidation"
+	serviceCleanup                 = "cleanup"
+	serviceCleanupFormal           = "Cleanup"
 	serviceBlockValidationFormal   = "BlockValidation"
 	serviceBlockchainFormal        = "Blockchain"
 	serviceHelp                    = "help"
@@ -509,6 +512,9 @@ func printUsage() {
 	fmt.Println("")
 	fmt.Println("    -alert=<1|0>")
 	fmt.Println("          whether to start the alert service")
+	fmt.Println("")
+	fmt.Println("    -cleanup=<1|0>")
+	fmt.Println("          whether to start the cleanup service")
 	fmt.Println("")
 	fmt.Println("    -all=0")
 	fmt.Println("          disable all services unless explicitly overridden")

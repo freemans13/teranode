@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package cleanup;
+
+option go_package = "github.com/bsv-blockchain/teranode/services/cleanup/cleanup_api";
+
+service CleanupAPI {
+  rpc HealthGRPC(EmptyMessage) returns (HealthResponse) {}
+}
+
+message EmptyMessage {}
+
+message HealthResponse {
+  bool ok = 1;
+  string details = 2;
+}

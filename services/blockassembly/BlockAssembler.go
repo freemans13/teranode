@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +20,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
-	"github.com/bsv-blockchain/teranode/stores/cleanup"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -125,10 +123,6 @@ type BlockAssembler struct {
 	stateChangeMu sync.RWMutex
 	stateChangeCh chan BestBlockInfo
 
-	// lastPersistedHeight tracks the last block height processed by block persister
-	// This is updated via BlockPersisted notifications and used to coordinate with cleanup
-	lastPersistedHeight atomic.Uint32
-
 	// currentChainMap maps block hashes to their heights
 	currentChainMap map[chainhash.Hash]uint32
 
@@ -149,18 +143,6 @@ type BlockAssembler struct {
 
 	// currentRunningState tracks the current operational state
 	currentRunningState atomic.Value
-
-	// cleanupService manages background cleanup tasks
-	cleanupService cleanup.Service
-
-	// cleanupServiceLoaded indicates if the cleanup service has been loaded
-	cleanupServiceLoaded atomic.Bool
-
-	// cleanupQueueCh queues cleanup operations (parent preserve + DAH cleanup) to prevent flooding during catchup
-	cleanupQueueCh chan uint32
-
-	// cleanupQueueWorkerStarted tracks if the cleanup queue worker is running
-	cleanupQueueWorkerStarted atomic.Bool
 
 	// unminedCleanupTicker manages periodic cleanup of old unmined transactions
 	unminedCleanupTicker *time.Ticker
@@ -360,28 +342,6 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 
 				if notification.Type == model.NotificationType_Block {
 					b.processNewBlockAnnouncement(ctx)
-				} else if notification.Type == model.NotificationType_BlockPersisted {
-					// RUNTIME COORDINATION: Update persisted height from block persister
-					//
-					// Block persister sends this notification after successfully persisting a block
-					// and creating its .subtree_data file. We track this height so cleanup can safely
-					// delete transactions from earlier blocks without breaking catchup.
-					//
-					// This notification-based update keeps our persisted height current during normal
-					// operation. Combined with the startup initialization from blockchain state,
-					// we always know how far block persister has progressed.
-					//
-					// Cleanup uses this via GetLastPersistedHeight() to calculate safe deletion height.
-					if notification.Metadata != nil && notification.Metadata.Metadata != nil {
-						if heightStr, ok := notification.Metadata.Metadata["height"]; ok {
-							if height, err := strconv.ParseUint(heightStr, 10, 32); err == nil {
-								b.lastPersistedHeight.Store(uint32(height))
-								b.logger.Debugf("[BlockAssembler] Block persister progress: height %d", height)
-							} else {
-								b.logger.Warnf("[BlockAssembler] Failed to parse persisted height from notification: %v", err)
-							}
-						}
-					}
 				}
 
 				b.setCurrentRunningState(StateRunning)
@@ -723,27 +683,6 @@ func (b *BlockAssembler) setBestBlockHeader(bestBlockchainBlockHeader *model.Blo
 
 	// Invalidate cache when block height changes
 	b.invalidateMiningCandidateCache()
-
-	// Queue cleanup operations to prevent flooding during catchup
-	// The cleanup queue worker processes operations sequentially (parent preserve → DAH cleanup)
-	// Capture channel reference to avoid TOCTOU race between nil check and send
-	ch := b.cleanupQueueCh
-	if b.utxoStore != nil && b.cleanupServiceLoaded.Load() && b.cleanupService != nil && height > 0 && ch != nil && b.cleanupQueueWorkerStarted.Load() {
-		// Non-blocking send - drop if queue is full (shouldn't happen with 100 buffer, but safety check)
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					b.logger.Debugf("[BlockAssembler] cleanup queue closed; skipping cleanup for height %d", height)
-				}
-			}()
-			select {
-			case ch <- height:
-				// Successfully queued
-			default:
-				b.logger.Warnf("[BlockAssembler] cleanup queue full, dropping cleanup for height %d", height)
-			}
-		}()
-	}
 }
 
 // setCurrentRunningState sets the current operational state.
@@ -761,106 +700,6 @@ func (b *BlockAssembler) setCurrentRunningState(state State) {
 //   - string: Current state description
 func (b *BlockAssembler) GetCurrentRunningState() State {
 	return b.currentRunningState.Load().(State)
-}
-
-// GetLastPersistedHeight returns the last block height processed by block persister.
-// This is used by cleanup service to avoid deleting transactions before they're persisted.
-//
-// Returns:
-//   - uint32: Last persisted block height
-func (b *BlockAssembler) GetLastPersistedHeight() uint32 {
-	return b.lastPersistedHeight.Load()
-}
-
-// startCleanupQueueWorker starts a background worker that processes cleanup operations sequentially.
-// This prevents flooding the system with concurrent cleanup operations during block catchup.
-//
-// The worker processes one block height at a time, running parent preserve followed by DAH cleanup.
-// If multiple heights are queued, only the latest is processed (deduplication).
-//
-// Parameters:
-//   - ctx: Context for cancellation
-func (b *BlockAssembler) startCleanupQueueWorker(ctx context.Context) {
-	// Only start once
-	if !b.cleanupQueueWorkerStarted.CompareAndSwap(false, true) {
-		return
-	}
-
-	// Initialize the cleanup queue channel with a buffer to handle bursts during catchup
-	b.cleanupQueueCh = make(chan uint32, 100)
-
-	go func() {
-		defer func() {
-			// Close the channel - no need to drain because:
-			// 1. Senders use non-blocking send (select with default)
-			// 2. Channel is never set to nil, so no risk of blocking on nil channel
-			close(b.cleanupQueueCh)
-			b.cleanupQueueWorkerStarted.Store(false)
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				b.logger.Infof("[BlockAssembler] cleanup queue worker stopping")
-				return
-
-			case height := <-b.cleanupQueueCh:
-				// Deduplicate: drain any additional heights and only process the latest
-				latestHeight := height
-				drained := false
-				for {
-					select {
-					case nextHeight := <-b.cleanupQueueCh:
-						latestHeight = nextHeight
-						drained = true
-					default:
-						// No more heights in queue
-						if drained {
-							b.logger.Debugf("[BlockAssembler] deduplicating cleanup operations, skipping to height %d", latestHeight)
-						}
-						goto processHeight
-					}
-				}
-
-			processHeight:
-				// Step 1: Preserve parents of old unmined transactions FIRST
-				// This sets preserve_until and clears delete_at_height on parent transactions
-				if b.utxoStore != nil {
-					_, err := utxo.PreserveParentsOfOldUnminedTransactions(ctx, b.utxoStore, latestHeight, b.settings, b.logger)
-					if err != nil {
-						b.logger.Errorf("[BlockAssembler] error preserving parents during block height %d update: %v", latestHeight, err)
-						continue
-					}
-				}
-
-				// Step 2: Then trigger DAH cleanup and WAIT for it to complete
-				// This ensures true sequential execution: preserve → cleanup (complete) → next height
-				// Without waiting, the cleanup is queued but runs async, which could cause races
-				if b.cleanupServiceLoaded.Load() && b.cleanupService != nil {
-					// Create a channel to wait for completion
-					doneCh := make(chan string, 1)
-
-					if err := b.cleanupService.UpdateBlockHeight(latestHeight, doneCh); err != nil {
-						b.logger.Errorf("[BlockAssembler] cleanup service error updating block height %d: %v", latestHeight, err)
-						continue
-					}
-
-					// Wait for cleanup to complete or context cancellation
-					select {
-					case status := <-doneCh:
-						if status != "completed" {
-							b.logger.Warnf("[BlockAssembler] cleanup for height %d finished with status: %s", latestHeight, status)
-						}
-					case <-ctx.Done():
-						b.logger.Infof("[BlockAssembler] context cancelled while waiting for cleanup at height %d", latestHeight)
-						return
-					}
-				}
-			}
-		}
-	}()
-
-	b.logger.Infof("[BlockAssembler] cleanup queue worker started")
 }
 
 // Start initializes and begins the block assembler operations.
@@ -891,81 +730,6 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 
 	if err = b.startChannelListeners(ctx); err != nil {
 		return errors.NewProcessingError("[BlockAssembler] failed to start channel listeners: %v", err)
-	}
-
-	// CRITICAL STARTUP COORDINATION: Initialize persisted height from block persister's state
-	//
-	// PROBLEM: Block persister creates .subtree_data files after a delay (BlockPersisterPersistAge blocks),
-	// but cleanup deletes transactions based only on delete_at_height. If cleanup runs before block persister
-	// has created .subtree_data files, those files will reference deleted transactions, causing catchup failures
-	// with "subtree length does not match tx data length" errors (actually missing transactions).
-	//
-	// SOLUTION: Cleanup coordinates with block persister by limiting deletion to:
-	//   max_cleanup_height = min(requested_cleanup_height, persisted_height + retention)
-	//
-	// STARTUP RACE: Block persister notifications arrive asynchronously after BlockAssembler starts.
-	// If cleanup runs before the first notification arrives, it doesn't know the persisted height and
-	// could delete transactions that block persister still needs.
-	//
-	// PREVENTION: Read block persister's last persisted height from blockchain state on startup.
-	// Block persister publishes this state on its own startup, so we have the current value immediately.
-	//
-	// SCENARIOS:
-	//   1. Block persister running: State available, cleanup immediately coordinates correctly
-	//   2. Block persister not deployed: State missing, cleanup proceeds normally (height=0 disables coordination)
-	//   3. Block persister hasn't started yet: State missing, will get notification soon, cleanup waits
-	//   4. Block persister disabled: State missing, cleanup works without coordination
-	//
-	// All scenarios are safe. This prevents premature cleanup during the startup window.
-	if state, err := b.blockchainClient.GetState(ctx, "BlockPersisterHeight"); err == nil && len(state) >= 4 {
-		height := binary.LittleEndian.Uint32(state)
-		if height > 0 {
-			b.lastPersistedHeight.Store(height)
-			b.logger.Infof("[BlockAssembler] Initialized persisted height from block persister state: %d", height)
-		}
-	} else if err != nil {
-		// State doesn't exist - block persister either not deployed, hasn't started, or first run.
-		// All cases are safe (cleanup checks for height=0 and proceeds normally without coordination).
-		b.logger.Debugf("[BlockAssembler] Block persister state not available: %v", err)
-	}
-
-	// Check if the UTXO store supports cleanup operations
-	if !b.settings.UtxoStore.DisableDAHCleaner {
-		if cleanupServiceProvider, ok := b.utxoStore.(cleanup.CleanupServiceProvider); ok {
-			b.logger.Infof("[BlockAssembler] initialising cleanup service")
-
-			b.cleanupService, err = cleanupServiceProvider.GetCleanupService()
-			if err != nil {
-				return err
-			}
-
-			if b.cleanupService != nil {
-				// CLEANUP COORDINATION: Wire up block persister progress tracking
-				//
-				// Cleanup needs to know how far block persister has progressed so it doesn't
-				// delete transactions that block persister still needs to create .subtree_data files.
-				//
-				// The cleanup service will call GetLastPersistedHeight() before each cleanup operation
-				// and limit deletion to: min(requested_height, persisted_height + retention)
-				//
-				// This getter provides the persisted height that was:
-				//   1. Initialized from blockchain state on startup (preventing startup race)
-				//   2. Updated via BlockPersisted notifications during runtime (keeping current)
-				//
-				// See processCleanupJob in cleanup_service.go for the coordination logic.
-				b.cleanupService.SetPersistedHeightGetter(b.GetLastPersistedHeight)
-				b.logger.Infof("[BlockAssembler] Configured cleanup service to coordinate with block persister")
-
-				b.logger.Infof("[BlockAssembler] starting cleanup service")
-				b.cleanupService.Start(ctx)
-			}
-
-			b.cleanupServiceLoaded.Store(true)
-
-			// Start the cleanup queue worker to process parent preserve and DAH cleanup operations
-			// This prevents flooding the system with concurrent operations during block catchup
-			b.startCleanupQueueWorker(ctx)
-		}
 	}
 
 	_, height := b.CurrentBlock()

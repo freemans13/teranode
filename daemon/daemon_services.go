@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockpersister"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/services/cleanup"
 	"github.com/bsv-blockchain/teranode/services/legacy"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/p2p"
@@ -68,6 +69,7 @@ func (d *Daemon) startServices(ctx context.Context, logger ulogger.Logger, appSe
 	startLegacy := d.shouldStart(serviceLegacyFormal, args)
 	startRPC := d.shouldStart(serviceRPCFormal, args)
 	startAlert := d.shouldStart(serviceAlertFormal, args)
+	startCleanup := d.shouldStart(serviceCleanupFormal, args)
 
 	// Create the application count based on the services that are going to be started
 	d.appCount += len(d.externalServices)
@@ -117,6 +119,7 @@ func (d *Daemon) startServices(ctx context.Context, logger ulogger.Logger, appSe
 		{startValidator, func() error { return d.startValidatorService(ctx, appSettings, createLogger) }},
 		{startPropagation, func() error { return d.startPropagationService(ctx, appSettings, createLogger) }},
 		{startLegacy, func() error { return d.startLegacyService(ctx, appSettings, createLogger) }},
+		{startCleanup, func() error { return d.startCleanupService(ctx, appSettings, createLogger) }},
 	}
 
 	// Loop through and start each service if needed
@@ -1053,5 +1056,40 @@ func (d *Daemon) startLegacyService(
 		subtreeValidationClient,
 		blockValidationClient,
 		blockassemblyClient,
+	))
+}
+
+// startCleanupService initializes and adds the Cleanup service to the ServiceManager.
+func (d *Daemon) startCleanupService(ctx context.Context, appSettings *settings.Settings,
+	createLogger func(string) ulogger.Logger) error {
+	// Create the UTXO store for the Cleanup service
+	utxoStore, err := d.daemonStores.GetUtxoStore(ctx, createLogger(loggerUtxos), appSettings)
+	if err != nil {
+		return err
+	}
+
+	// Create the blockchain client for the Cleanup service
+	blockchainClient, err := d.daemonStores.GetBlockchainClient(
+		ctx, createLogger(loggerBlockchainClient), appSettings, serviceCleanup,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Create the block assembly client for the Cleanup service
+	blockAssemblyClient, err := blockassembly.NewClient(ctx, createLogger(loggerBlockAssembly), appSettings)
+	if err != nil {
+		return err
+	}
+
+	// Add the Cleanup service to the ServiceManager
+	return d.ServiceManager.AddService(serviceCleanupFormal, cleanup.New(
+		ctx,
+		createLogger(loggerCleanup),
+		appSettings,
+		utxoStore,
+		blockchainClient,
+		blockAssemblyClient,
+		nil, // blobStore not needed for cleanup service
 	))
 }

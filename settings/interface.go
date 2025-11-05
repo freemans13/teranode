@@ -67,6 +67,7 @@ type Settings struct {
 	RPC                          RPCSettings
 	Faucet                       FaucetSettings
 	Dashboard                    DashboardSettings
+	Cleanup                      CleanupSettings
 	GlobalBlockHeightRetention   uint32
 }
 
@@ -452,6 +453,13 @@ type CoinbaseSettings struct {
 	SlackToken            string
 	TestMode              bool
 	P2PPort               int
+}
+
+type CleanupSettings struct {
+	Disabled          bool
+	GRPCListenAddress string
+	GRPCAddress       string
+	PollingInterval   time.Duration
 }
 
 type SubtreeValidationSettings struct {
