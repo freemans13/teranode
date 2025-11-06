@@ -1743,13 +1743,6 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 	// This is MUCH smaller than indexing all transactions
 	referencedParents := make(map[chainhash.Hash]bool)
 	for _, tx := range unminedTxs {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent validation cancelled during pass 1")
-			return nil, ctx.Err()
-		default:
-		}
 		parentHashes := tx.TxInpoints.GetParentTxHashes()
 		for _, parentHash := range parentHashes {
 			referencedParents[parentHash] = true
@@ -1762,15 +1755,6 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 	// This dramatically reduces memory usage from O(all_txs) to O(referenced_parents)
 	parentIndexMap := make(map[chainhash.Hash]int, len(referencedParents))
 	for idx, tx := range unminedTxs {
-		// Check for context cancellation periodically
-		if idx%10000 == 0 {
-			select {
-			case <-ctx.Done():
-				b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent validation cancelled during pass 2")
-				return nil, ctx.Err()
-			default:
-			}
-		}
 		if tx.Hash != nil && referencedParents[*tx.Hash] {
 			parentIndexMap[*tx.Hash] = idx
 		}
