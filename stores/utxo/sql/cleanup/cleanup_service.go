@@ -2,6 +2,8 @@ package cleanup
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -179,7 +181,7 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	}
 
 	// Execute the cleanup with safe height
-	err := deleteTombstoned(s.db, safeCleanupHeight)
+	err := deleteTombstoned(s.db, s.settings, s.logger, safeCleanupHeight, workerID)
 
 	if err != nil {
 		job.SetStatus(cleanup.JobStatusFailed)
@@ -206,12 +208,258 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	}
 }
 
+// ChildVerificationResult contains the result of verifying a transaction's children
+type ChildVerificationResult struct {
+	CanDelete           bool
+	Reason              string
+	ProblematicChildren []ChildInfo
+}
+
+// ChildInfo contains information about a child transaction
+type ChildInfo struct {
+	Hash        string
+	IsMined     bool
+	BlockHeight *uint32
+}
+
+// batchVerifyChildrenBeforeDeletion checks all transactions' children in a single query
+// Returns a map of tx hash -> verification result
+// NOTE: Transactions with no spent outputs will NOT be in the returned map - caller must handle this
+func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retention uint32) (map[string]*ChildVerificationResult, error) {
+	// Single query to get all transactions with their spent outputs and child transaction info
+	// This replaces N queries with 1 query, massively improving performance
+	//
+	// IMPORTANT: We only return transactions that HAVE spent outputs. Transactions with:
+	// - No outputs at all
+	// - Only unspent outputs
+	// Will NOT appear in the results map. The caller should treat these as safe to delete.
+	query := `
+		WITH transactions_to_check AS (
+			SELECT id, hash
+			FROM transactions
+			WHERE delete_at_height <= $1
+		)
+		SELECT
+			ttc.hash as parent_hash,
+			o.idx as output_index,
+			o.spending_data,
+			t_child.hash as child_hash,
+			t_child.block_height as child_block_height
+		FROM transactions_to_check ttc
+		INNER JOIN outputs o ON ttc.id = o.transaction_id
+		LEFT JOIN inputs i ON o.spending_data IS NOT NULL
+			AND i.input_hash = ttc.hash
+			AND i.input_index = o.idx
+		LEFT JOIN transactions t_child ON i.transaction_id = t_child.id
+		WHERE o.spending_data IS NOT NULL
+		ORDER BY ttc.hash
+	`
+
+	rows, err := db.Query(query, currentHeight)
+	if err != nil {
+		return nil, errors.NewStorageError("failed to batch query children", err)
+	}
+	defer rows.Close()
+
+	// Build results map
+	results := make(map[string]*ChildVerificationResult)
+
+	for rows.Next() {
+		var parentHash string
+		var outputIndex uint32
+		var spendingData *[]byte
+		var childHash *string
+		var childBlockHeight *uint32
+
+		if err := rows.Scan(&parentHash, &outputIndex, &spendingData, &childHash, &childBlockHeight); err != nil {
+			return nil, errors.NewStorageError("failed to scan batch child row", err)
+		}
+
+		// Initialize result for this parent if not exists
+		if _, exists := results[parentHash]; !exists {
+			results[parentHash] = &ChildVerificationResult{
+				CanDelete:           true,
+				ProblematicChildren: []ChildInfo{},
+			}
+		}
+
+		result := results[parentHash]
+
+		// Analyze this spent output's child transaction
+		if spendingData != nil {
+			// Child transaction should exist if output is spent
+			if childHash == nil {
+				// Spent output but no child found - data inconsistency
+				result.CanDelete = false
+				result.Reason = "has spent outputs with missing child transactions"
+				result.ProblematicChildren = append(result.ProblematicChildren, ChildInfo{
+					Hash:        fmt.Sprintf("output_%d", outputIndex),
+					IsMined:     false,
+					BlockHeight: nil,
+				})
+				continue
+			}
+
+			child := ChildInfo{
+				Hash:        *childHash,
+				IsMined:     childBlockHeight != nil,
+				BlockHeight: childBlockHeight,
+			}
+
+			// Check if child is mined
+			if !child.IsMined {
+				result.CanDelete = false
+				result.Reason = "has unmined children"
+				result.ProblematicChildren = append(result.ProblematicChildren, child)
+				continue
+			}
+
+			// Check if child is confirmed deep enough (current height - child height > retention)
+			confirmationDepth := currentHeight - *childBlockHeight
+			if confirmationDepth <= retention {
+				result.CanDelete = false
+				result.Reason = "has children not confirmed deep enough"
+				result.ProblematicChildren = append(result.ProblematicChildren, child)
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, errors.NewStorageError("error iterating batch child rows", err)
+	}
+
+	return results, nil
+}
+
 // deleteTombstoned removes transactions that have passed their expiration time.
-func deleteTombstoned(db *usql.DB, blockHeight uint32) error {
-	// Delete transactions that have passed their expiration time
-	// this will cascade to inputs, outputs, block_ids and conflicting_children
-	if _, err := db.Exec("DELETE FROM transactions WHERE delete_at_height <= $1", blockHeight); err != nil {
-		return errors.NewStorageError("failed to delete transactions", err)
+func deleteTombstoned(db *usql.DB, tSettings *settings.Settings, logger ulogger.Logger, blockHeight uint32, workerID int) error {
+	// If defensive cleanup is disabled, use the simple delete approach
+	if !tSettings.UtxoStore.DefensiveCleanupEnabled {
+		// Delete transactions that have passed their expiration time
+		// this will cascade to inputs, outputs, block_ids and conflicting_children
+		if _, err := db.Exec("DELETE FROM transactions WHERE delete_at_height <= $1", blockHeight); err != nil {
+			return errors.NewStorageError("failed to delete transactions", err)
+		}
+		return nil
+	}
+
+	// Defensive cleanup: verify children before deletion
+	logger.Debugf("[SQLCleanupService %d] defensive cleanup enabled, verifying children before deletion", workerID)
+
+	retention := tSettings.GetUtxoStoreBlockHeightRetention()
+
+	// Batch verify all transactions and their children in a single query
+	verificationResults, err := batchVerifyChildrenBeforeDeletion(db, blockHeight, retention)
+	if err != nil {
+		return errors.NewStorageError("failed to batch verify children", err)
+	}
+
+	// Query all transactions that would be deleted
+	query := "SELECT hash FROM transactions WHERE delete_at_height <= $1"
+	rows, err := db.Query(query, blockHeight)
+	if err != nil {
+		return errors.NewStorageError("failed to query transactions for deletion", err)
+	}
+	defer rows.Close()
+
+	var txHashesToDelete []string
+	skippedCount := 0
+
+	for rows.Next() {
+		var txHash string
+		if err := rows.Scan(&txHash); err != nil {
+			return errors.NewStorageError("failed to scan transaction hash", err)
+		}
+
+		// Check verification result from batch query
+		verificationResult, hasSpentOutputs := verificationResults[txHash]
+
+		// DEFENSIVE: If transaction is not in verification results, it means we found no spent outputs
+		// This could mean:
+		// 1. Transaction has unspent outputs (should NOT delete - UTXOs still in use!)
+		// 2. Transaction has no outputs at all (rare edge case)
+		// 3. Data inconsistency (delete_at_height set but outputs not properly tracked)
+		//
+		// In defensive mode, we SKIP deletion if we don't have positive confirmation
+		// that all children are safe. This is the conservative/safe approach.
+		if !hasSpentOutputs {
+			skippedCount++
+			logger.Warnf("[SQLCleanupService %d] skipping deletion of tx %s: no spent outputs found (may have unspent UTXOs or data inconsistency)",
+				workerID, txHash[:16])
+			continue
+		}
+
+		// Transaction has spent outputs, check if all their children are safe
+		if verificationResult.CanDelete {
+			txHashesToDelete = append(txHashesToDelete, txHash)
+		} else {
+			skippedCount++
+
+			// Log warning with details
+			problematicChildrenInfo := ""
+			for i, child := range verificationResult.ProblematicChildren {
+				if i > 0 {
+					problematicChildrenInfo += ", "
+				}
+				if child.IsMined {
+					problematicChildrenInfo += fmt.Sprintf("%s... (mined at height %d)", child.Hash[:8], *child.BlockHeight)
+				} else {
+					problematicChildrenInfo += child.Hash[:8] + "... (unmined)"
+				}
+			}
+
+			logger.Warnf("[SQLCleanupService %d] skipping deletion of tx %s: %s [children: %s]",
+				workerID, txHash[:16], verificationResult.Reason, problematicChildrenInfo)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("error iterating transactions", err)
+	}
+
+	// Delete transactions that passed verification
+	if len(txHashesToDelete) > 0 {
+		logger.Infof("[SQLCleanupService %d] deleting %d transactions (skipped %d)", workerID, len(txHashesToDelete), skippedCount)
+
+		// Delete in batches to avoid exceeding database parameter limits
+		// PostgreSQL limit is ~32,767 parameters, we use 1000 for safety margin
+		const maxBatchSize = 1000
+		totalDeleted := 0
+
+		for i := 0; i < len(txHashesToDelete); i += maxBatchSize {
+			end := i + maxBatchSize
+			if end > len(txHashesToDelete) {
+				end = len(txHashesToDelete)
+			}
+			batch := txHashesToDelete[i:end]
+
+			// Build parameterized IN clause for cross-database compatibility
+			placeholders := make([]string, len(batch))
+			args := make([]interface{}, len(batch))
+			for j, hash := range batch {
+				placeholders[j] = fmt.Sprintf("$%d", j+1)
+				args[j] = hash
+			}
+
+			// This will cascade to inputs, outputs, block_ids and conflicting_children
+			deleteQuery := fmt.Sprintf("DELETE FROM transactions WHERE hash IN (%s)", strings.Join(placeholders, ","))
+			result, err := db.Exec(deleteQuery, args...)
+			if err != nil {
+				return errors.NewStorageError(fmt.Sprintf("failed to delete batch of %d transactions", len(batch)), err)
+			}
+
+			if result != nil {
+				if rowsAffected, err := result.RowsAffected(); err == nil {
+					totalDeleted += int(rowsAffected)
+				}
+			}
+
+			logger.Debugf("[SQLCleanupService %d] deleted batch %d-%d (%d transactions)", workerID, i, end, len(batch))
+		}
+
+		logger.Infof("[SQLCleanupService %d] completed deletion of %d transactions", workerID, totalDeleted)
+	} else {
+		logger.Debugf("[SQLCleanupService %d] no transactions to delete (skipped %d)", workerID, skippedCount)
 	}
 
 	return nil

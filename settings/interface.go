@@ -365,6 +365,7 @@ type UtxoStoreSettings struct {
 	MaxMinedBatchSize                 int
 	BlockHeightRetentionAdjustment    int32 // Adjustment to GlobalBlockHeightRetention (can be positive or negative)
 	DisableDAHCleaner                 bool  // Disable the DAH cleaner process completely
+	DefensiveCleanupEnabled           bool  // Enable defensive checks before deleting transactions (verify children are mined > BlockHeightRetention blocks ago)
 	// Cleanup-specific settings
 	CleanupParentUpdateBatcherSize           int // Batch size for parent record updates during cleanup
 	CleanupParentUpdateBatcherDurationMillis int // Batch duration for parent record updates during cleanup (ms)

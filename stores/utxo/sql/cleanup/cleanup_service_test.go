@@ -681,3 +681,61 @@ func TestSQLCleanupWithBlockPersisterCoordination(t *testing.T) {
 		}
 	})
 }
+
+func TestDefensiveCleanup(t *testing.T) {
+	t.Run("DefensiveCleanupDisabled_DeletesNormally", func(t *testing.T) {
+		logger := &MockLogger{}
+		db := NewMockDB()
+
+		deleteCallCount := 0
+		db.ExecFunc = func(query string, args ...interface{}) (sql.Result, error) {
+			deleteCallCount++
+			assert.Contains(t, query, "DELETE FROM transactions WHERE delete_at_height")
+			return &MockResult{rowsAffected: 10}, nil
+		}
+
+		tSettings := createTestSettings()
+		tSettings.UtxoStore.DefensiveCleanupEnabled = false
+
+		service, err := NewService(tSettings, Options{
+			Logger: logger,
+			DB:     db.DB,
+			Ctx:    context.Background(),
+		})
+		require.NoError(t, err)
+
+		service.Start(context.Background())
+
+		doneCh := make(chan string, 1)
+		err = service.UpdateBlockHeight(100, doneCh)
+		require.NoError(t, err)
+
+		select {
+		case <-doneCh:
+			// Success - should have deleted directly
+			assert.Equal(t, 1, deleteCallCount, "Should have called DELETE once")
+		case <-time.After(2 * time.Second):
+			t.Fatal("Cleanup should complete")
+		}
+	})
+
+	t.Run("DefensiveCleanupEnabled_SettingRespected", func(t *testing.T) {
+		logger := &MockLogger{}
+		db := NewMockDB()
+
+		tSettings := createTestSettings()
+		tSettings.UtxoStore.DefensiveCleanupEnabled = true
+		tSettings.UtxoStore.BlockHeightRetention = 288
+
+		service, err := NewService(tSettings, Options{
+			Logger: logger,
+			DB:     db.DB,
+			Ctx:    context.Background(),
+		})
+		require.NoError(t, err)
+
+		// Verify the setting is properly stored
+		assert.True(t, service.settings.UtxoStore.DefensiveCleanupEnabled)
+		assert.Equal(t, uint32(288), service.settings.GetUtxoStoreBlockHeightRetention())
+	})
+}
