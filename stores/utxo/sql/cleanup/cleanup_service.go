@@ -224,15 +224,14 @@ type ChildInfo struct {
 
 // batchVerifyChildrenBeforeDeletion checks all transactions' children in a single query
 // Returns a map of tx hash -> verification result
-// NOTE: Transactions with no spent outputs will NOT be in the returned map - caller must handle this
+// NOTE: Transactions with no outputs at all will NOT be in the returned map - caller must handle this
 func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retention uint32) (map[string]*ChildVerificationResult, error) {
-	// Single query to get all transactions with their spent outputs and child transaction info
+	// Single query to get ALL outputs (spent and unspent) for transactions to be deleted
 	// This replaces N queries with 1 query, massively improving performance
 	//
-	// IMPORTANT: We only return transactions that HAVE spent outputs. Transactions with:
-	// - No outputs at all
-	// - Only unspent outputs
-	// Will NOT appear in the results map. The caller should treat these as safe to delete.
+	// IMPORTANT: We return ALL transactions that have outputs. For defensive verification:
+	// 1. Check that ALL outputs are spent (no unspent UTXOs remaining)
+	// 2. Check that all children of spent outputs are mined and confirmed deep enough
 	query := `
 		WITH transactions_to_check AS (
 			SELECT id, hash
@@ -251,8 +250,7 @@ func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retent
 			AND i.input_hash = ttc.hash
 			AND i.input_index = o.idx
 		LEFT JOIN transactions t_child ON i.transaction_id = t_child.id
-		WHERE o.spending_data IS NOT NULL
-		ORDER BY ttc.hash
+		ORDER BY ttc.hash, o.idx
 	`
 
 	rows, err := db.Query(query, currentHeight)
@@ -285,42 +283,53 @@ func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retent
 
 		result := results[parentHash]
 
-		// Analyze this spent output's child transaction
-		if spendingData != nil {
-			// Child transaction should exist if output is spent
-			if childHash == nil {
-				// Spent output but no child found - data inconsistency
-				result.CanDelete = false
-				result.Reason = "has spent outputs with missing child transactions"
-				result.ProblematicChildren = append(result.ProblematicChildren, ChildInfo{
-					Hash:        fmt.Sprintf("output_%d", outputIndex),
-					IsMined:     false,
-					BlockHeight: nil,
-				})
-				continue
-			}
+		// First check: Is this an unspent output?
+		if spendingData == nil {
+			// UNSPENT OUTPUT - Transaction should NOT be deleted (has UTXOs still in use)
+			result.CanDelete = false
+			result.Reason = "has unspent outputs (UTXOs still in use)"
+			result.ProblematicChildren = append(result.ProblematicChildren, ChildInfo{
+				Hash:        fmt.Sprintf("output_%d_unspent", outputIndex),
+				IsMined:     false,
+				BlockHeight: nil,
+			})
+			continue
+		}
 
-			child := ChildInfo{
-				Hash:        *childHash,
-				IsMined:     childBlockHeight != nil,
-				BlockHeight: childBlockHeight,
-			}
+		// Output is spent - analyze the child transaction
+		// Child transaction should exist if output is spent
+		if childHash == nil {
+			// Spent output but no child found - data inconsistency
+			result.CanDelete = false
+			result.Reason = "has spent outputs with missing child transactions"
+			result.ProblematicChildren = append(result.ProblematicChildren, ChildInfo{
+				Hash:        fmt.Sprintf("output_%d", outputIndex),
+				IsMined:     false,
+				BlockHeight: nil,
+			})
+			continue
+		}
 
-			// Check if child is mined
-			if !child.IsMined {
-				result.CanDelete = false
-				result.Reason = "has unmined children"
-				result.ProblematicChildren = append(result.ProblematicChildren, child)
-				continue
-			}
+		child := ChildInfo{
+			Hash:        *childHash,
+			IsMined:     childBlockHeight != nil,
+			BlockHeight: childBlockHeight,
+		}
 
-			// Check if child is confirmed deep enough (current height - child height > retention)
-			confirmationDepth := currentHeight - *childBlockHeight
-			if confirmationDepth <= retention {
-				result.CanDelete = false
-				result.Reason = "has children not confirmed deep enough"
-				result.ProblematicChildren = append(result.ProblematicChildren, child)
-			}
+		// Check if child is mined
+		if !child.IsMined {
+			result.CanDelete = false
+			result.Reason = "has unmined children"
+			result.ProblematicChildren = append(result.ProblematicChildren, child)
+			continue
+		}
+
+		// Check if child is confirmed deep enough (current height - child height > retention)
+		confirmationDepth := currentHeight - *childBlockHeight
+		if confirmationDepth <= retention {
+			result.CanDelete = false
+			result.Reason = "has children not confirmed deep enough"
+			result.ProblematicChildren = append(result.ProblematicChildren, child)
 		}
 	}
 

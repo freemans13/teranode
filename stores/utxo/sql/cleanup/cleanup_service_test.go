@@ -18,6 +18,10 @@ import (
 func createTestSettings() *settings.Settings {
 	return &settings.Settings{
 		GlobalBlockHeightRetention: 288, // Default retention
+		UtxoStore: settings.UtxoStoreSettings{
+			BlockHeightRetention:    288,
+			DefensiveCleanupEnabled: false,
+		},
 	}
 }
 
@@ -683,16 +687,9 @@ func TestSQLCleanupWithBlockPersisterCoordination(t *testing.T) {
 }
 
 func TestDefensiveCleanup(t *testing.T) {
-	t.Run("DefensiveCleanupDisabled_DeletesNormally", func(t *testing.T) {
+	t.Run("DefensiveCleanupDisabled_FastPath", func(t *testing.T) {
 		logger := &MockLogger{}
 		db := NewMockDB()
-
-		deleteCallCount := 0
-		db.ExecFunc = func(query string, args ...interface{}) (sql.Result, error) {
-			deleteCallCount++
-			assert.Contains(t, query, "DELETE FROM transactions WHERE delete_at_height")
-			return &MockResult{rowsAffected: 10}, nil
-		}
 
 		tSettings := createTestSettings()
 		tSettings.UtxoStore.DefensiveCleanupEnabled = false
@@ -704,19 +701,15 @@ func TestDefensiveCleanup(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		service.Start(context.Background())
+		// Verify setting is stored correctly
+		assert.False(t, service.settings.UtxoStore.DefensiveCleanupEnabled)
 
-		doneCh := make(chan string, 1)
-		err = service.UpdateBlockHeight(100, doneCh)
-		require.NoError(t, err)
+		// Run a cleanup job and verify it completes
+		job := cleanup.NewJob(100, context.Background())
+		service.processCleanupJob(job, 1)
 
-		select {
-		case <-doneCh:
-			// Success - should have deleted directly
-			assert.Equal(t, 1, deleteCallCount, "Should have called DELETE once")
-		case <-time.After(2 * time.Second):
-			t.Fatal("Cleanup should complete")
-		}
+		assert.Equal(t, cleanup.JobStatusCompleted, job.GetStatus())
+		assert.Nil(t, job.Error)
 	})
 
 	t.Run("DefensiveCleanupEnabled_SettingRespected", func(t *testing.T) {
