@@ -1737,14 +1737,25 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 
 	b.logger.Infof("[BlockAssembler] Starting parent chain validation for %d unmined transactions", len(unminedTxs))
 
-	// Create a map of unmined transaction hashes for quick lookup
-	unminedTxMap := make(map[chainhash.Hash]bool, len(unminedTxs))
-	// Create a map of unmined transaction hash to index for ordering validation
-	unminedTxIndexMap := make(map[chainhash.Hash]int, len(unminedTxs))
+	// OPTIMIZATION: Two-pass approach to minimize memory usage
+	// Pass 1: Collect only the parent hashes that are actually referenced
+	// This is MUCH smaller than indexing all transactions
+	referencedParents := make(map[chainhash.Hash]bool)
+	for _, tx := range unminedTxs {
+		parentHashes := tx.TxInpoints.GetParentTxHashes()
+		for _, parentHash := range parentHashes {
+			referencedParents[parentHash] = true
+		}
+	}
+	b.logger.Debugf("[BlockAssembler] Found %d unique parent references out of %d transactions",
+		len(referencedParents), len(unminedTxs))
+
+	// Pass 2: Build index ONLY for transactions that are referenced as parents
+	// This dramatically reduces memory usage from O(all_txs) to O(referenced_parents)
+	parentIndexMap := make(map[chainhash.Hash]int, len(referencedParents))
 	for idx, tx := range unminedTxs {
-		if tx.Hash != nil {
-			unminedTxMap[*tx.Hash] = true
-			unminedTxIndexMap[*tx.Hash] = idx
+		if tx.Hash != nil && referencedParents[*tx.Hash] {
+			parentIndexMap[*tx.Hash] = idx
 		}
 	}
 
@@ -1872,8 +1883,8 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 					}
 				} else {
 					// Parent exists but has no BlockIDs - it's unmined
-					// Check if it's in our unmined list
-					if unminedTxMap[parentTxID] {
+					// Check if it's in our unmined list by seeing if it has an index
+					if _, isInUnminedList := parentIndexMap[parentTxID]; isInUnminedList || referencedParents[parentTxID] {
 						// It's in our list - track it for ordering validation
 						unminedParents = append(unminedParents, parentTxID)
 					} else {
@@ -1888,21 +1899,32 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 			// Handle transactions with unmined parents that ARE in our list
 			// Check if unmined parents appear BEFORE this transaction in the sorted list
 			if len(unminedParents) > 0 {
-				// Get current transaction's index
-				currentIdx, currentExists := unminedTxIndexMap[*tx.Hash]
-				if !currentExists {
-					// This shouldn't happen, but be defensive
-					b.logger.Errorf("[BlockAssembler] Transaction %s not found in index map", tx.Hash.String())
+				// We need to find the current transaction's index in the batch
+				currentBatchIdx := -1
+				for bIdx, batchTx := range batch {
+					if batchTx.Hash != nil && tx.Hash != nil && *batchTx.Hash == *tx.Hash {
+						currentBatchIdx = bIdx
+						break
+					}
+				}
+
+				if currentBatchIdx == -1 {
+					// This shouldn't happen
+					b.logger.Errorf("[BlockAssembler] Transaction %s not found in current batch", tx.Hash.String())
 					skippedCount++
 					continue
 				}
 
+				// Calculate the global index of this transaction
+				currentIdx := i + currentBatchIdx
+
 				// Check if all unmined parents come BEFORE this transaction
 				hasInvalidOrdering := false
 				for _, parentTxID := range unminedParents {
-					parentIdx, parentExists := unminedTxIndexMap[parentTxID]
+					parentIdx, parentExists := parentIndexMap[parentTxID]
 					if !parentExists {
-						// Parent not in index map - shouldn't happen since we confirmed it's in unminedTxMap
+						// Parent not in index map - this means it's not in the unmined list
+						// This shouldn't happen as we just checked it was referenced
 						b.logger.Errorf("[BlockAssembler] Parent tx %s not found in index map", parentTxID.String())
 						hasInvalidOrdering = true
 						break
