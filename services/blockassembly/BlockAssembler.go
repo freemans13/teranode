@@ -1742,6 +1742,13 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 	// This is MUCH smaller than indexing all transactions
 	referencedParents := make(map[chainhash.Hash]bool)
 	for _, tx := range unminedTxs {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			b.logger.Infof("[BlockAssembler] Parent validation cancelled during pass 1")
+			return nil
+		default:
+		}
 		parentHashes := tx.TxInpoints.GetParentTxHashes()
 		for _, parentHash := range parentHashes {
 			referencedParents[parentHash] = true
@@ -1754,6 +1761,15 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 	// This dramatically reduces memory usage from O(all_txs) to O(referenced_parents)
 	parentIndexMap := make(map[chainhash.Hash]int, len(referencedParents))
 	for idx, tx := range unminedTxs {
+		// Check for context cancellation periodically
+		if idx%10000 == 0 {
+			select {
+			case <-ctx.Done():
+				b.logger.Infof("[BlockAssembler] Parent validation cancelled during pass 2")
+				return nil
+			default:
+			}
+		}
 		if tx.Hash != nil && referencedParents[*tx.Hash] {
 			parentIndexMap[*tx.Hash] = idx
 		}
@@ -1765,6 +1781,13 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 
 	// Process transactions in batches for performance
 	for i := 0; i < len(unminedTxs); i += batchSize {
+		// Check for context cancellation at start of each batch
+		select {
+		case <-ctx.Done():
+			b.logger.Infof("[BlockAssembler] Parent validation cancelled during batch processing at index %d", i)
+			return validTxs
+		default:
+		}
 		end := i + batchSize
 		if end > len(unminedTxs) {
 			end = len(unminedTxs)
@@ -1794,9 +1817,8 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 			// Create UnresolvedMetaData slice for batch operation
 			unresolvedParents := make([]*utxo.UnresolvedMetaData, 0, len(parentTxIDs))
 			for i, parentTxID := range parentTxIDs {
-				parentTxIDCopy := parentTxID // Make a copy
 				unresolvedParents = append(unresolvedParents, &utxo.UnresolvedMetaData{
-					Hash: parentTxIDCopy,
+					Hash: parentTxID,
 					Idx:  i,
 				})
 			}
@@ -1826,7 +1848,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 		}
 
 		// Validate each transaction in the batch
-		for _, tx := range batch {
+		for batchIdx, tx := range batch {
 			// First check: Is this transaction already on the best chain?
 			// If yes, we filter it out (it shouldn't be in unmined list, but be defensive)
 			if len(tx.BlockIDs) > 0 {
@@ -1884,7 +1906,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 				} else {
 					// Parent exists but has no BlockIDs - it's unmined
 					// Check if it's in our unmined list by seeing if it has an index
-					if _, isInUnminedList := parentIndexMap[parentTxID]; isInUnminedList || referencedParents[parentTxID] {
+					if _, isInUnminedList := parentIndexMap[parentTxID]; isInUnminedList {
 						// It's in our list - track it for ordering validation
 						unminedParents = append(unminedParents, parentTxID)
 					} else {
@@ -1899,24 +1921,8 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 			// Handle transactions with unmined parents that ARE in our list
 			// Check if unmined parents appear BEFORE this transaction in the sorted list
 			if len(unminedParents) > 0 {
-				// We need to find the current transaction's index in the batch
-				currentBatchIdx := -1
-				for bIdx, batchTx := range batch {
-					if batchTx.Hash != nil && tx.Hash != nil && *batchTx.Hash == *tx.Hash {
-						currentBatchIdx = bIdx
-						break
-					}
-				}
-
-				if currentBatchIdx == -1 {
-					// This shouldn't happen
-					b.logger.Errorf("[BlockAssembler] Transaction %s not found in current batch", tx.Hash.String())
-					skippedCount++
-					continue
-				}
-
-				// Calculate the global index of this transaction
-				currentIdx := i + currentBatchIdx
+				// Calculate the global index of this transaction directly using batchIdx
+				currentIdx := i + batchIdx
 
 				// Check if all unmined parents come BEFORE this transaction
 				hasInvalidOrdering := false
