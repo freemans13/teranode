@@ -1725,14 +1725,15 @@ func (b *BlockAssembler) getNextNbits(nextBlockTime int64) (*model.NBit, error) 
 //
 // Returns:
 //   - []*utxo.UnminedTransaction: Filtered list of transactions with valid parents
+//   - error: Context cancellation error if cancelled, nil otherwise
 func (b *BlockAssembler) filterTransactionsWithValidParents(
 	ctx context.Context,
 	unminedTxs []*utxo.UnminedTransaction,
 	bestBlockHeaderIDsMap map[uint32]bool,
-) []*utxo.UnminedTransaction {
+) ([]*utxo.UnminedTransaction, error) {
 
 	if len(unminedTxs) == 0 {
-		return unminedTxs
+		return unminedTxs, nil
 	}
 
 	b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Starting parent chain validation for %d unmined transactions", len(unminedTxs))
@@ -1746,7 +1747,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 		select {
 		case <-ctx.Done():
 			b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent validation cancelled during pass 1")
-			return nil
+			return nil, ctx.Err()
 		default:
 		}
 		parentHashes := tx.TxInpoints.GetParentTxHashes()
@@ -1766,7 +1767,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 			select {
 			case <-ctx.Done():
 				b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent validation cancelled during pass 2")
-				return nil
+				return nil, ctx.Err()
 			default:
 			}
 		}
@@ -1785,7 +1786,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 		select {
 		case <-ctx.Done():
 			b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent validation cancelled during batch processing at index %d", i)
-			return nil
+			return nil, ctx.Err()
 		default:
 		}
 		end := i + batchSize
@@ -1972,7 +1973,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 	b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent chain validation complete: %d valid, %d skipped",
 		len(validTxs), skippedCount)
 
-	return validTxs
+	return validTxs, nil
 }
 
 // loadUnminedTransactions loads transactions from the UTXO store into block assembly.
@@ -2147,7 +2148,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 
 	// Apply parent chain validation if enabled
 	if b.settings.BlockAssembly.ValidateParentChainOnRestart {
-		unminedTransactions = b.filterTransactionsWithValidParents(ctx, unminedTransactions, bestBlockHeaderIDsMap)
+		var err error
+		unminedTransactions, err = b.filterTransactionsWithValidParents(ctx, unminedTransactions, bestBlockHeaderIDsMap)
+		if err != nil {
+			// Context was cancelled during parent validation
+			return err
+		}
 	}
 
 	for _, unminedTransaction := range unminedTransactions {
