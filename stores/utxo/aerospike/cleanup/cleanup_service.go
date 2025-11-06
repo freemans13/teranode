@@ -3,6 +3,7 @@ package cleanup
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -695,11 +696,14 @@ func (s *Service) verifyChildrenBeforeDeletion(bins aerospike.BinMap, txHash *ch
 		return false, "cannot parse outputs data"
 	}
 
+	hasUnspentOutputs := false
 	problematicChildren := []string{}
 
-	for _, spendingDataInterface := range outputsMap {
+	for outputIdx, spendingDataInterface := range outputsMap {
 		if spendingDataInterface == nil {
-			// Output not spent, continue
+			// UNSPENT OUTPUT - Transaction should NOT be deleted (has UTXOs still in use)
+			hasUnspentOutputs = true
+			problematicChildren = append(problematicChildren, fmt.Sprintf("output_%v_unspent", outputIdx))
 			continue
 		}
 
@@ -782,6 +786,16 @@ func (s *Service) verifyChildrenBeforeDeletion(bins aerospike.BinMap, txHash *ch
 			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (not confirmed deep enough)")
 			continue
 		}
+	}
+
+	// Check if transaction has unspent outputs
+	if hasUnspentOutputs {
+		reason := "has unspent outputs (UTXOs still in use)"
+		if len(problematicChildren) > 1 {
+			// Also report which outputs are unspent
+			reason = fmt.Sprintf("%s: %s", reason, strings.Join(problematicChildren, ", "))
+		}
+		return false, reason
 	}
 
 	if len(problematicChildren) > 0 {
