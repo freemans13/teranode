@@ -711,13 +711,18 @@ func (s *Service) verifyChildrenBeforeDeletion(bins aerospike.BinMap, txHash *ch
 		// spending_data format: [32 bytes tx hash][4 bytes output index]
 		spendingData, ok := spendingDataInterface.([]byte)
 		if !ok || len(spendingData) < 32 {
+			// Malformed spending data - be conservative and skip deletion
+			s.logger.Warnf("Worker %d: malformed spending data for output %v of tx %s", workerID, outputIdx, txHash.String()[:16])
+			problematicChildren = append(problematicChildren, fmt.Sprintf("output_%v... (malformed spending data)", outputIdx))
 			continue
 		}
 
 		// Get the spending transaction hash (child)
 		childTxHash, err := chainhash.NewHash(spendingData[:32])
 		if err != nil {
-			s.logger.Warnf("Worker %d: failed to parse child tx hash for tx %s: %v", workerID, txHash.String()[:16], err)
+			// Corrupt child transaction hash - be conservative and skip deletion
+			s.logger.Warnf("Worker %d: failed to parse child tx hash for output %v of tx %s: %v", workerID, outputIdx, txHash.String()[:16], err)
+			problematicChildren = append(problematicChildren, fmt.Sprintf("output_%v... (corrupt child hash)", outputIdx))
 			continue
 		}
 
@@ -791,7 +796,7 @@ func (s *Service) verifyChildrenBeforeDeletion(bins aerospike.BinMap, txHash *ch
 	// Check if transaction has unspent outputs
 	if hasUnspentOutputs {
 		reason := "has unspent outputs (UTXOs still in use)"
-		if len(problematicChildren) > 1 {
+		if len(problematicChildren) > 0 {
 			// Also report which outputs are unspent
 			reason = fmt.Sprintf("%s: %s", reason, strings.Join(problematicChildren, ", "))
 		}
