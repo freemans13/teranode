@@ -355,11 +355,10 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	stmt := aerospike.NewStatement(s.namespace, s.set)
 
 	// Add Outputs field if defensive cleanup is enabled
-	binNames := []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String()}
+	stmt.BinNames = []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String()}
 	if s.settings.UtxoStore.DefensiveCleanupEnabled {
-		binNames = append(binNames, fields.Outputs.String())
+		stmt.BinNames = append(stmt.BinNames, fields.Outputs.String())
 	}
-	stmt.BinNames = binNames
 
 	// Set the filter to find records with a delete_at_height less than or equal to the safe cleanup height
 	// This will automatically use the index since the filter is on the indexed bin
