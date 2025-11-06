@@ -1785,7 +1785,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 		select {
 		case <-ctx.Done():
 			b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent validation cancelled during batch processing at index %d", i)
-			return validTxs
+			return nil
 		default:
 		}
 		end := i + batchSize
