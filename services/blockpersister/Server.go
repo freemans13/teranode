@@ -244,17 +244,11 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 
 	// REORG DETECTION: Check if the last persisted block is still on the current chain
 	// This detects blockchain reorganizations that may have occurred since the last persistence
-	if lastPersistedHeight > 0 && lastPersistedHash != "" {
-		// Parse the hash string to get the block
-		hash, err := chainhash.NewHashFromStr(lastPersistedHash)
-		if err != nil {
-			return nil, errors.NewProcessingError("failed to parse last persisted block hash", err)
-		}
-
+	if lastPersistedHeight > 0 && lastPersistedHash != nil {
 		// Get the block to obtain its ID
-		lastBlock, err := u.blockchainClient.GetBlock(ctx, hash)
+		lastBlock, err := u.blockchainClient.GetBlock(ctx, lastPersistedHash)
 		if err != nil {
-			u.logger.Warnf("[BlockPersister] Could not retrieve last persisted block %s for reorg check: %v. Continuing with next block.", lastPersistedHash, err)
+			u.logger.Warnf("[BlockPersister] Could not retrieve last persisted block %s for reorg check: %v. Continuing with next block.", lastPersistedHash.String(), err)
 		} else {
 			// Check if this block is still on the current chain using its ID
 			onCurrentChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{lastBlock.ID})
@@ -267,7 +261,7 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 				// We must return nil to trigger recovery logic - continuing would cause an infinite loop
 				// because the parent hash validation will fail (new chain block's parent != orphaned block)
 				u.logger.Infof("[BlockPersister] Detected reorg: last persisted block %s at height %d is no longer on current chain. Returning nil to trigger recovery.",
-					lastPersistedHash, lastPersistedHeight)
+					lastPersistedHash.String(), lastPersistedHeight)
 				// Return nil to prevent infinite loop - manual intervention or proper reorg recovery needed
 				return nil, nil
 			}
@@ -288,12 +282,12 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 		// PARENT HASH VALIDATION: Verify chain continuity
 		// This provides early detection of chain inconsistencies or reorgs that occurred
 		// between the reorg check above and this block retrieval
-		if lastPersistedHeight > 0 && lastPersistedHash != "" {
+		if lastPersistedHeight > 0 && lastPersistedHash != nil {
 			// Get the parent hash from the retrieved block's header
 			parentHash := block.Header.HashPrevBlock
-			if parentHash.String() != lastPersistedHash {
+			if !parentHash.IsEqual(lastPersistedHash) {
 				u.logger.Infof("[BlockPersister] Chain discontinuity detected: block %s at height %d has parent %s, expected %s. Reorg likely occurred during processing. Will retry and recover on next iteration.",
-					block.Hash().String(), block.Height, parentHash.String(), lastPersistedHash)
+					block.Hash().String(), block.Height, parentHash.String(), lastPersistedHash.String())
 				// Return nil to skip this block and retry on next iteration
 				// GetBlockByHeight will return the correct block from the current chain on the next attempt
 				return nil, nil
