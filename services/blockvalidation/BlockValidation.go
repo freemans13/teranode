@@ -1611,9 +1611,9 @@ func (u *BlockValidation) waitForPreviousBlocksToBeProcessed(ctx context.Context
 		ctx,
 		u.logger,
 		checkParentBlock,
-		retry.WithBackoffDurationType(100*time.Millisecond),
-		retry.WithBackoffMultiplier(u.settings.BlockValidation.ArePreviousBlocksProcessedRetryBackoffMultiplier),
-		retry.WithRetryCount(u.settings.BlockValidation.ArePreviousBlocksProcessedMaxRetry),
+		retry.WithBackoffDurationType(u.settings.BlockValidation.IsParentMinedRetryBackoffDuration),
+		retry.WithBackoffMultiplier(u.settings.BlockValidation.IsParentMinedRetryBackoffMultiplier),
+		retry.WithRetryCount(u.settings.BlockValidation.IsParentMinedRetryMaxRetry),
 	)
 
 	return err
