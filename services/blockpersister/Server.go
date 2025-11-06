@@ -264,11 +264,12 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 
 			if !onCurrentChain {
 				// Reorg detected - last persisted block is no longer on the current chain
-				// System will automatically recover by fetching blocks from the new best chain
-				u.logger.Infof("[BlockPersister] Detected reorg: last persisted block %s at height %d is no longer on current chain. Continuing with blocks from new chain.",
+				// We must return nil to trigger recovery logic - continuing would cause an infinite loop
+				// because the parent hash validation will fail (new chain block's parent != orphaned block)
+				u.logger.Infof("[BlockPersister] Detected reorg: last persisted block %s at height %d is no longer on current chain. Returning nil to trigger recovery.",
 					lastPersistedHash, lastPersistedHeight)
-				// Note: GetBlockByHeight will return blocks from the current best chain,
-				// so we can continue safely. The state file will track the new chain's blocks.
+				// Return nil to prevent infinite loop - manual intervention or proper reorg recovery needed
+				return nil, nil
 			}
 		}
 	}

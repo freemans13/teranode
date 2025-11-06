@@ -1217,6 +1217,52 @@ func TestGetNextBlockToProcess_NoBlocksToProcess(t *testing.T) {
 	mockClient.AssertExpectations(t)
 }
 
+// TestGetNextBlockToProcess_ReorgDetected tests when a reorg is detected
+func TestGetNextBlockToProcess_ReorgDetected(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+
+	// Create temp directory for state file
+	tempDir := t.TempDir()
+	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.BlockPersisterPersistAge = 2
+
+	// Create mock blockchain client
+	mockClient := &blockchain.Mock{}
+
+	// Create mock block for the last persisted block (height 100)
+	lastPersistedHash, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000064")
+	lastPersistedBlock := &model.Block{
+		Height: 100,
+		ID:     100,
+	}
+
+	// Mock the GetBlock call for reorg detection
+	mockClient.On("GetBlock", ctx, lastPersistedHash).Return(
+		lastPersistedBlock, nil)
+	// Mock the CheckBlockIsInCurrentChain call - returning false to simulate reorg
+	mockClient.On("CheckBlockIsInCurrentChain", ctx, []uint32{uint32(100)}).Return(
+		false, nil) // false indicates block is NOT on current chain (reorg detected)
+	// GetBestBlockHeader should NOT be called because we return early
+
+	server := New(ctx, logger, tSettings, nil, nil, nil, mockClient)
+
+	// Set initial persisted height with the orphaned hash
+	err := server.state.AddBlock(100, lastPersistedHash.String())
+	require.NoError(t, err)
+
+	// Call getNextBlockToProcess
+	block, err := server.getNextBlockToProcess(ctx)
+
+	// Verify that we return nil block and nil error (triggering recovery)
+	require.NoError(t, err)
+	assert.Nil(t, block, "Should return nil block when reorg is detected")
+
+	// Verify mock expectations
+	mockClient.AssertExpectations(t)
+}
+
 // TestGetNextBlockToProcess_GetBestBlockHeaderError tests error handling when GetBestBlockHeader fails
 func TestGetNextBlockToProcess_GetBestBlockHeaderError(t *testing.T) {
 	ctx := context.Background()
