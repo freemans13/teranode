@@ -395,6 +395,15 @@ func (d *Daemon) startAssetService(ctx context.Context, appSettings *settings.Se
 		return err
 	}
 
+	var blockvalidationClient blockvalidation.Interface
+
+	blockvalidationClient, err = d.daemonStores.GetBlockValidationClient(
+		ctx, createLogger(loggerBlockchainClient), appSettings,
+	)
+	if err != nil {
+		return err
+	}
+
 	// Initialize the Asset service with the necessary parts
 	return d.ServiceManager.AddService(serviceAssetFormal, asset.NewServer(
 		createLogger(serviceAsset),
@@ -404,6 +413,7 @@ func (d *Daemon) startAssetService(ctx context.Context, appSettings *settings.Se
 		subtreeStore,
 		blockPersisterStore,
 		blockchainClient,
+		blockvalidationClient,
 	))
 }
 
