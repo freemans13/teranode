@@ -244,7 +244,8 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 
 	// REORG DETECTION: Check if the last persisted block is still on the current chain
 	// This detects blockchain reorganizations that may have occurred since the last persistence
-	if lastPersistedHeight > 0 && lastPersistedHash != nil {
+	// This check can be disabled via settings for testing or special scenarios
+	if u.settings.Block.BlockPersisterEnableDefensiveReorgCheck && lastPersistedHeight > 0 && lastPersistedHash != nil {
 		// Get the block to obtain its ID
 		lastBlock, err := u.blockchainClient.GetBlock(ctx, lastPersistedHash)
 		if err != nil {
@@ -282,7 +283,8 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 		// PARENT HASH VALIDATION: Verify chain continuity
 		// This provides early detection of chain inconsistencies or reorgs that occurred
 		// between the reorg check above and this block retrieval
-		if lastPersistedHeight > 0 && lastPersistedHash != nil {
+		// This check can be disabled via settings for testing or special scenarios
+		if u.settings.Block.BlockPersisterEnableDefensiveReorgCheck && lastPersistedHeight > 0 && lastPersistedHash != nil {
 			// Get the parent hash from the retrieved block's header
 			parentHash := block.Header.HashPrevBlock
 			if !parentHash.IsEqual(lastPersistedHash) {

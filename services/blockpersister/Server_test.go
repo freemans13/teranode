@@ -1263,6 +1263,66 @@ func TestGetNextBlockToProcess_ReorgDetected(t *testing.T) {
 	mockClient.AssertExpectations(t)
 }
 
+// TestGetNextBlockToProcess_ReorgDetected_DefensiveCheckDisabled tests when defensive check is disabled
+func TestGetNextBlockToProcess_ReorgDetected_DefensiveCheckDisabled(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+
+	// Create temp directory for state file
+	tempDir := t.TempDir()
+	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.BlockPersisterPersistAge = 2
+	// DISABLE the defensive reorg check
+	tSettings.Block.BlockPersisterEnableDefensiveReorgCheck = false
+
+	// Create mock blockchain client
+	mockClient := &blockchain.Mock{}
+
+	// Create mock block header meta with 10 blocks ahead
+	blockHeaderMeta := &model.BlockHeaderMeta{
+		Height: 110,
+	}
+
+	// Create mock block for the last persisted block (height 100) - on old chain
+	lastPersistedHash, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000064")
+
+	// Create mock block for next block (height 101) - from new chain with different parent
+	differentParentHash, _ := chainhash.NewHashFromStr("1111111111111111111111111111111111111111111111111111111111111111")
+	mockBlock := &model.Block{
+		Height: 101,
+		Header: &model.BlockHeader{
+			HashPrevBlock: differentParentHash, // Different parent - would normally fail validation
+		},
+	}
+
+	// With defensive check disabled, these reorg detection calls should NOT happen
+	// GetBlock and CheckBlockIsInCurrentChain should NOT be called
+
+	// Only GetBestBlockHeader and GetBlockByHeight should be called
+	mockClient.On("GetBestBlockHeader", ctx).Return(
+		&model.BlockHeader{}, blockHeaderMeta, nil)
+	mockClient.On("GetBlockByHeight", ctx, uint32(101)).Return(
+		mockBlock, nil)
+
+	server := New(ctx, logger, tSettings, nil, nil, nil, mockClient)
+
+	// Set initial persisted height with an orphaned hash
+	err := server.state.AddBlock(100, lastPersistedHash.String())
+	require.NoError(t, err)
+
+	// Call getNextBlockToProcess
+	block, err := server.getNextBlockToProcess(ctx)
+
+	// With defensive check disabled, it should return the block even with mismatched parent
+	require.NoError(t, err)
+	require.NotNil(t, block, "Should return the block when defensive check is disabled")
+	assert.Equal(t, uint32(101), block.Height)
+
+	// Verify mock expectations - GetBlock and CheckBlockIsInCurrentChain should NOT have been called
+	mockClient.AssertExpectations(t)
+}
+
 // TestGetNextBlockToProcess_GetBestBlockHeaderError tests error handling when GetBestBlockHeader fails
 func TestGetNextBlockToProcess_GetBestBlockHeaderError(t *testing.T) {
 	ctx := context.Background()
