@@ -229,9 +229,9 @@ func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retent
 	// Single query to get ALL outputs (spent and unspent) for transactions to be deleted
 	// This replaces N queries with 1 query, massively improving performance
 	//
-	// IMPORTANT: We distinguish between:
+	// IMPORTANT: We enforce data integrity:
 	// 1. Unspent outputs (spending_data = NULL) → Block deletion (has UTXOs still in use)
-	// 2. Spent outputs with no child in DB → Allow deletion (external/mempool/already cleaned)
+	// 2. Spent outputs with no child in DB → Block deletion (data integrity issue - child MUST exist)
 	// 3. Spent outputs with child in DB → Check if child is mined deep enough
 	query := `
 		WITH transactions_to_check AS (
@@ -297,20 +297,23 @@ func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retent
 		}
 
 		// Output is spent - analyze the child transaction
+		// IMPORTANT: If spending_data is set, the child transaction MUST exist in our database
+		// If it doesn't, this indicates a data integrity issue that needs investigation
 		if childHash == nil {
-			// Spent output but no child found in our database
-			// This can happen for:
-			// 1. External transactions (spending tx not in our database)
-			// 2. Mempool transactions (not yet stored)
-			// 3. Already cleaned up transactions
-			// Since the output is marked as spent, we can allow deletion
-			// but note it for monitoring
+			// DATA INTEGRITY ISSUE: Output marked as spent but spending transaction not found
+			// This should never happen in normal operation and indicates:
+			// 1. The spending transaction was incorrectly deleted
+			// 2. Data corruption or incomplete transaction storage
+			// 3. A bug in the system
+			// We must NOT delete the parent transaction until this is resolved
+			result.CanDelete = false
+			result.Reason = "data integrity issue: output marked as spent but spending transaction not found"
 			result.ProblematicChildren = append(result.ProblematicChildren, ChildInfo{
-				Hash:        fmt.Sprintf("output_%d_external_or_missing", outputIndex),
+				Hash:        fmt.Sprintf("output_%d_missing_child", outputIndex),
 				IsMined:     false,
 				BlockHeight: nil,
 			})
-			continue // Allow deletion to proceed
+			continue
 		}
 
 		child := ChildInfo{
