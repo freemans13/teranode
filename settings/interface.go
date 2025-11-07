@@ -371,6 +371,7 @@ type UtxoStoreSettings struct {
 	CleanupDeleteBatcherSize                 int // Batch size for record deletions during cleanup
 	CleanupDeleteBatcherDurationMillis       int // Batch duration for record deletions during cleanup (ms)
 	CleanupMaxConcurrentOperations           int // Maximum concurrent operations during cleanup (0 = use connection queue size)
+	CleanupDefensiveBatchReadSize            int // Batch size for reading child transactions during defensive cleanup (default: 1024)
 }
 
 type P2PSettings struct {
