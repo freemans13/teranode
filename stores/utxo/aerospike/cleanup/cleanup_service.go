@@ -675,6 +675,99 @@ func (s *Service) ProcessSingleRecord(txid *chainhash.Hash, inputs []*bt.Input) 
 	return <-errCh
 }
 
+// childInfo holds information about a child transaction needed for verification
+type childInfo struct {
+	outputIdx    uint32
+	childTxHash  *chainhash.Hash
+	blockHeights []interface{} // Block heights from Aerospike
+}
+
+// batchGetChildrenBlockHeights performs batch reads for all child transactions
+// Returns a map of child tx hash string -> block heights
+func (s *Service) batchGetChildrenBlockHeights(childHashes []*chainhash.Hash) (map[string][]interface{}, error) {
+	if len(childHashes) == 0 {
+		return make(map[string][]interface{}), nil
+	}
+
+	result := make(map[string][]interface{})
+	batchSize := 1024 // Process in chunks to avoid memory issues
+
+	// Get batch policy from settings
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	batchPolicy.ReplicaPolicy = aerospike.SEQUENCE
+
+	readPolicy := util.GetAerospikeBatchReadPolicy(s.settings)
+
+	for i := 0; i < len(childHashes); i += batchSize {
+		end := i + batchSize
+		if end > len(childHashes) {
+			end = len(childHashes)
+		}
+
+		chunk := childHashes[i:end]
+		batchRecords := make([]aerospike.BatchRecordIfc, len(chunk))
+
+		// Create batch read records
+		for j, hash := range chunk {
+			key, err := aerospike.NewKey(s.namespace, s.set, hash.CloneBytes())
+			if err != nil {
+				// Log error but continue with other children
+				s.logger.Warnf("Failed to create key for child tx %s: %v", hash.String()[:16], err)
+				continue
+			}
+			batchRecords[j] = aerospike.NewBatchRead(readPolicy, key, []string{fields.BlockHeights.String()})
+		}
+
+		// Execute batch read
+		err := s.client.BatchOperate(batchPolicy, batchRecords)
+		if err != nil {
+			// Log error but continue - we'll handle missing children conservatively
+			s.logger.Warnf("Batch read error for children: %v", err)
+		}
+
+		// Process results
+		for j, batchRecord := range batchRecords {
+			if chunk[j] == nil {
+				continue
+			}
+
+			hashKey := chunk[j].String()
+
+			if batchRecord.BatchRec().Err != nil {
+				// Child not found or error - will be handled conservatively
+				if !errors.Is(batchRecord.BatchRec().Err, aerospike.ErrKeyNotFound) {
+					s.logger.Warnf("Error reading child tx %s: %v", chunk[j].String()[:16], batchRecord.BatchRec().Err)
+				}
+				result[hashKey] = nil
+				continue
+			}
+
+			if batchRecord.BatchRec().Record == nil || batchRecord.BatchRec().Record.Bins == nil {
+				// No record found
+				result[hashKey] = nil
+				continue
+			}
+
+			// Extract block heights
+			blockHeightsData, ok := batchRecord.BatchRec().Record.Bins[fields.BlockHeights.String()]
+			if !ok || blockHeightsData == nil {
+				// Child is unmined
+				result[hashKey] = nil
+				continue
+			}
+
+			// Store block heights as interface slice
+			if blockHeights, ok := blockHeightsData.([]interface{}); ok {
+				result[hashKey] = blockHeights
+			} else {
+				result[hashKey] = nil
+			}
+		}
+	}
+
+	return result, nil
+}
+
 // verifyChildrenBeforeDeletion checks if all children of a transaction are mined deep enough
 // Returns (canDelete bool, reason string)
 func (s *Service) verifyChildrenBeforeDeletion(bins aerospike.BinMap, txHash *chainhash.Hash, currentHeight uint32, workerID int) (bool, string) {
@@ -695,8 +788,11 @@ func (s *Service) verifyChildrenBeforeDeletion(bins aerospike.BinMap, txHash *ch
 		return false, "cannot parse outputs data"
 	}
 
+	// Phase 1: Collect all child transaction hashes and metadata
 	hasUnspentOutputs := false
 	problematicChildren := []string{}
+	childrenToVerify := make([]childInfo, 0, len(outputsMap))
+	uniqueChildHashes := make(map[string]*chainhash.Hash)
 
 	for outputIdx, spendingDataInterface := range outputsMap {
 		if spendingDataInterface == nil {
@@ -725,41 +821,73 @@ func (s *Service) verifyChildrenBeforeDeletion(bins aerospike.BinMap, txHash *ch
 			continue
 		}
 
-		// Query the child transaction to check its block height
-		childKey, err := aerospike.NewKey(s.namespace, s.set, childTxHash.CloneBytes())
-		if err != nil {
-			s.logger.Warnf("Worker %d: failed to create key for child tx %s: %v", workerID, childTxHash.String()[:16], err)
-			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (key error)")
-			continue
+		// Convert outputIdx to uint32
+		var outputIdxUint32 uint32
+		switch v := outputIdx.(type) {
+		case uint32:
+			outputIdxUint32 = v
+		case int:
+			outputIdxUint32 = uint32(v)
+		case int64:
+			outputIdxUint32 = uint32(v)
+		default:
+			outputIdxUint32 = 0
 		}
 
-		childRec, err := s.client.Get(nil, childKey, fields.BlockHeights.String())
-		if err != nil {
+		childrenToVerify = append(childrenToVerify, childInfo{
+			outputIdx:   outputIdxUint32,
+			childTxHash: childTxHash,
+		})
+
+		// Collect unique child hashes for batch read
+		uniqueChildHashes[childTxHash.String()] = childTxHash
+	}
+
+	// Check if transaction has unspent outputs
+	if hasUnspentOutputs {
+		reason := "has unspent outputs (UTXOs still in use)"
+		if len(problematicChildren) > 0 {
+			// Also report which outputs are unspent
+			reason = fmt.Sprintf("%s: %s", reason, strings.Join(problematicChildren, ", "))
+		}
+		return false, reason
+	}
+
+	// If no children to verify, we can safely delete
+	if len(childrenToVerify) == 0 {
+		if len(problematicChildren) > 0 {
+			reason := "has children that are not safe to delete: " + strings.Join(problematicChildren, ", ")
+			return false, reason
+		}
+		return true, ""
+	}
+
+	// Phase 2: Batch read all child transactions
+	childHashSlice := make([]*chainhash.Hash, 0, len(uniqueChildHashes))
+	for _, hash := range uniqueChildHashes {
+		childHashSlice = append(childHashSlice, hash)
+	}
+
+	childBlockHeightsMap, err := s.batchGetChildrenBlockHeights(childHashSlice)
+	if err != nil {
+		// Log error but continue with conservative approach
+		s.logger.Warnf("Worker %d: error during batch read of children for tx %s: %v", workerID, txHash.String()[:16], err)
+	}
+
+	// Phase 3: Verify each child using the pre-fetched data
+	for _, child := range childrenToVerify {
+		childHashStr := child.childTxHash.String()
+		blockHeights, exists := childBlockHeightsMap[childHashStr]
+
+		if !exists || blockHeights == nil {
 			// Child not found or error reading - be conservative and skip deletion
-			s.logger.Warnf("Worker %d: failed to read child tx %s: %v", workerID, childTxHash.String()[:16], err)
-			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (read error)")
+			problematicChildren = append(problematicChildren, child.childTxHash.String()[:8]+"... (not found)")
 			continue
 		}
 
-		if childRec == nil || childRec.Bins == nil {
-			// Child transaction not found, skip deletion to be safe
-			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (not found)")
-			continue
-		}
-
-		// Check block heights
-		blockHeightsData, ok := childRec.Bins[fields.BlockHeights.String()]
-		if !ok || blockHeightsData == nil {
+		if len(blockHeights) == 0 {
 			// Child is unmined
-			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (unmined)")
-			continue
-		}
-
-		// BlockHeights is stored as []uint32
-		blockHeights, ok := blockHeightsData.([]interface{})
-		if !ok || len(blockHeights) == 0 {
-			// No block heights, child is unmined
-			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (unmined)")
+			problematicChildren = append(problematicChildren, child.childTxHash.String()[:8]+"... (unmined)")
 			continue
 		}
 
@@ -773,33 +901,23 @@ func (s *Service) verifyChildrenBeforeDeletion(bins aerospike.BinMap, txHash *ch
 		case int64:
 			childBlockHeight = uint32(v)
 		default:
-			s.logger.Warnf("Worker %d: unexpected block height type for child tx %s: %T", workerID, childTxHash.String()[:16], v)
-			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (invalid height type)")
+			s.logger.Warnf("Worker %d: unexpected block height type for child tx %s: %T", workerID, child.childTxHash.String()[:16], v)
+			problematicChildren = append(problematicChildren, child.childTxHash.String()[:8]+"... (invalid height type)")
 			continue
 		}
 
 		// Check if child is confirmed deep enough
 		if currentHeight <= childBlockHeight {
 			// Current height is less than or equal to child height - this shouldn't happen
-			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (height inconsistency)")
+			problematicChildren = append(problematicChildren, child.childTxHash.String()[:8]+"... (height inconsistency)")
 			continue
 		}
 
 		confirmationDepth := currentHeight - childBlockHeight
 		if confirmationDepth <= retention {
-			problematicChildren = append(problematicChildren, childTxHash.String()[:8]+"... (not confirmed deep enough)")
+			problematicChildren = append(problematicChildren, child.childTxHash.String()[:8]+"... (not confirmed deep enough)")
 			continue
 		}
-	}
-
-	// Check if transaction has unspent outputs
-	if hasUnspentOutputs {
-		reason := "has unspent outputs (UTXOs still in use)"
-		if len(problematicChildren) > 0 {
-			// Also report which outputs are unspent
-			reason = fmt.Sprintf("%s: %s", reason, strings.Join(problematicChildren, ", "))
-		}
-		return false, reason
 	}
 
 	if len(problematicChildren) > 0 {
