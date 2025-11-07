@@ -125,6 +125,24 @@ func (m *JobManager) Stop() {
 	}
 	m.mu.Unlock()
 
+	// Signal any running jobs before waiting for workers
+	m.jobsMutex.Lock()
+	for _, job := range m.jobs {
+		status := job.GetStatus()
+		if status == JobStatusRunning || status == JobStatusPending {
+			// Mark as cancelled and signal the channel
+			job.SetStatus(JobStatusCancelled)
+			job.Ended = time.Now()
+
+			// Signal the doneCh so waiting goroutines aren't blocked
+			m.sendAndClose(job.DoneCh, JobStatusCancelled.String())
+
+			// Cancel the job's context if it has one
+			job.Cancel()
+		}
+	}
+	m.jobsMutex.Unlock()
+
 	// Wait for all workers to exit
 	m.wg.Wait()
 }

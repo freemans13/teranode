@@ -151,6 +151,11 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// Initialize cleanup channel (buffer of 1 to prevent blocking while ensuring only one cleanup)
 	s.cleanupCh = make(chan uint32, 1)
 
+	// Start the cleanup service (Aerospike or SQL)
+	if s.cleanupService != nil {
+		s.cleanupService.Start(ctx)
+	}
+
 	// Start cleanup processor goroutine
 	go s.cleanupProcessor(ctx)
 
@@ -173,6 +178,20 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 // Stop gracefully shuts down the cleanup service. Context cancellation will stop
 // the polling worker and cleanup processor goroutines.
 func (s *Server) Stop(ctx context.Context) error {
+	// Stop the cleanup service if it has a Stop method
+	if s.cleanupService != nil {
+		// Check if the cleanup service implements Stop
+		// Aerospike has Stop, SQL doesn't
+		type stopper interface {
+			Stop(ctx context.Context) error
+		}
+		if stoppable, ok := s.cleanupService.(stopper); ok {
+			if err := stoppable.Stop(ctx); err != nil {
+				s.logger.Errorf("Error stopping cleanup service: %v", err)
+			}
+		}
+	}
+
 	// Context cancellation will stop goroutines
 	s.logger.Infof("Cleanup service stopped")
 	return nil

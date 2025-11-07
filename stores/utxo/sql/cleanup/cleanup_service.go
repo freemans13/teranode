@@ -178,8 +178,12 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 		}
 	}
 
+	// Log start of cleanup
+	s.logger.Infof("[SQLCleanupService %d] starting cleanup scan for height %d (delete_at_height <= %d)",
+		workerID, job.BlockHeight, safeCleanupHeight)
+
 	// Execute the cleanup with safe height
-	err := deleteTombstoned(s.db, safeCleanupHeight)
+	deletedCount, err := deleteTombstonedWithCount(s.db, safeCleanupHeight)
 
 	if err != nil {
 		job.SetStatus(cleanup.JobStatusFailed)
@@ -187,23 +191,30 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 		job.Ended = time.Now()
 
 		s.logger.Errorf("[SQLCleanupService %d] cleanup job failed for block height %d: %v", workerID, job.BlockHeight, err)
-
-		if job.DoneCh != nil {
-			job.DoneCh <- cleanup.JobStatusFailed.String()
-			close(job.DoneCh)
-		}
 	} else {
 		job.SetStatus(cleanup.JobStatusCompleted)
 		job.Ended = time.Now()
 
-		s.logger.Debugf("[SQLCleanupService %d] cleanup job completed for block height %d in %v",
-			workerID, job.BlockHeight, time.Since(job.Started))
-
-		if job.DoneCh != nil {
-			job.DoneCh <- cleanup.JobStatusCompleted.String()
-			close(job.DoneCh)
-		}
+		s.logger.Infof("[SQLCleanupService %d] cleanup job completed for block height %d in %v - deleted %d records",
+			workerID, job.BlockHeight, time.Since(job.Started), deletedCount)
 	}
+}
+
+// deleteTombstonedWithCount removes transactions that have passed their expiration time and returns the count.
+func deleteTombstonedWithCount(db *usql.DB, blockHeight uint32) (int64, error) {
+	// Delete transactions that have passed their expiration time
+	// this will cascade to inputs, outputs, block_ids and conflicting_children
+	result, err := db.Exec("DELETE FROM transactions WHERE delete_at_height <= $1", blockHeight)
+	if err != nil {
+		return 0, errors.NewStorageError("failed to delete transactions", err)
+	}
+
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, errors.NewStorageError("failed to get rows affected", err)
+	}
+
+	return count, nil
 }
 
 // deleteTombstoned removes transactions that have passed their expiration time.

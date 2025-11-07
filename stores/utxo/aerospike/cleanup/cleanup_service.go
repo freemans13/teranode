@@ -378,9 +378,16 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 
 	result := recordset.Results()
 	recordCount := atomic.Int64{}
+	lastProgressLog := atomic.Int64{}
+	lastProgressLog.Store(time.Now().Unix())
+	progressLogInterval := int64(30) // Log progress every 30 seconds
 
 	g := &errgroup.Group{}
 	util.SafeSetLimit(g, s.maxConcurrentOperations)
+
+	// Log initial start
+	s.logger.Infof("Worker %d: starting cleanup scan for height %d (delete_at_height <= %d)",
+		workerID, job.BlockHeight, safeCleanupHeight)
 
 	for {
 		rec, ok := <-result
@@ -394,7 +401,18 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 				return err
 			}
 
-			recordCount.Add(1)
+			count := recordCount.Add(1)
+
+			// Log progress every N records or every X seconds (thread-safe)
+			now := time.Now().Unix()
+			lastLog := lastProgressLog.Load()
+			if count%10000 == 0 || (now-lastLog) > progressLogInterval {
+				// Try to update last log time - only one goroutine will succeed
+				if lastProgressLog.CompareAndSwap(lastLog, now) {
+					s.logger.Infof("Worker %d: cleanup progress for height %d - processed %d records so far",
+						workerID, job.BlockHeight, count)
+				}
+			}
 
 			return nil
 		})
@@ -413,11 +431,6 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 
 	prometheusUtxoCleanupBatch.Observe(float64(time.Since(job.Started).Microseconds()) / 1_000_000)
 
-	if job.DoneCh != nil {
-		job.DoneCh <- cleanup.JobStatusCompleted.String()
-		close(job.DoneCh)
-	}
-
 	finalRecordCount := recordCount.Load()
 	s.logger.Infof("Worker %d completed cleanup job for block height %d in %v, processed %d records", workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
 }
@@ -431,18 +444,24 @@ func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aeros
 		txBytes, err := s.external.Get(s.ctx, txHash.CloneBytes(), fileformat.FileTypeTx)
 		if err != nil {
 			if errors.Is(err, errors.ErrNotFound) {
+				// Check if outputs exist (sometimes only outputs are stored)
 				exists, err := s.external.Exists(s.ctx, txHash.CloneBytes(), fileformat.FileTypeOutputs)
 				if err != nil {
 					return nil, errors.NewProcessingError("Worker %d: error checking existence of outputs for external tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
 				}
 
 				if exists {
-					// nothing more to do here, continue processing other records
+					// Only outputs exist, no inputs needed for cleanup
 					return nil, nil
 				}
 
-				return nil, errors.NewProcessingError("Worker %d: external tx %s not found in external store for cleanup job %d", workerID, txHash.String(), job.BlockHeight)
+				// External blob already deleted (by LocalDAH or previous cleanup), just need to delete Aerospike record
+				s.logger.Debugf("Worker %d: external tx %s already deleted from blob store for cleanup job %d, proceeding to delete Aerospike record",
+					workerID, txHash.String(), job.BlockHeight)
+				return []*bt.Input{}, nil
 			}
+			// Other errors should still be reported
+			return nil, errors.NewProcessingError("Worker %d: error getting external tx %s for cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
 		}
 
 		tx, err := bt.NewTxFromBytes(txBytes)
@@ -453,9 +472,17 @@ func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aeros
 		inputs = tx.Inputs
 	} else {
 		// get the inputs from the record directly
-		inputInterfaces, ok := bins[fields.Inputs.String()].([]interface{})
+		inputsValue := bins[fields.Inputs.String()]
+		if inputsValue == nil {
+			// Inputs field might be nil for certain records (e.g., coinbase)
+			return []*bt.Input{}, nil
+		}
+
+		inputInterfaces, ok := inputsValue.([]interface{})
 		if !ok {
-			return nil, errors.NewProcessingError("Worker %d: missing inputs for record in cleanup job %d", workerID, job.BlockHeight)
+			// Log more helpful error with actual type
+			return nil, errors.NewProcessingError("Worker %d: inputs field has unexpected type %T (expected []interface{}) for record in cleanup job %d",
+				workerID, inputsValue, job.BlockHeight)
 		}
 
 		inputs = make([]*bt.Input, len(inputInterfaces))
@@ -477,11 +504,6 @@ func (s *Service) markJobAsFailed(job *cleanup.Job, err error) {
 	job.SetStatus(cleanup.JobStatusFailed)
 	job.Error = err
 	job.Ended = time.Now()
-
-	if job.DoneCh != nil {
-		job.DoneCh <- cleanup.JobStatusFailed.String()
-		close(job.DoneCh)
-	}
 }
 
 // sendParentUpdateBatch processes a batch of parent update operations

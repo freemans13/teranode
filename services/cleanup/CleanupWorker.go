@@ -191,7 +191,11 @@ func (s *Server) cleanupProcessor(ctx context.Context) {
 					continue
 				}
 
-				// Wait for cleanup to complete or context cancellation
+				// Wait for cleanup to complete with timeout
+				cleanupTimeout := 10 * time.Minute
+				timeoutTimer := time.NewTimer(cleanupTimeout)
+				defer timeoutTimer.Stop()
+
 				select {
 				case status := <-doneCh:
 					if status != "completed" {
@@ -202,6 +206,10 @@ func (s *Server) cleanupProcessor(ctx context.Context) {
 						cleanupDuration.WithLabelValues("dah_cleanup").Observe(time.Since(startTime).Seconds())
 						cleanupProcessed.Inc()
 					}
+				case <-timeoutTimer.C:
+					s.logger.Errorf("Cleanup for height %d timed out after %v", latestHeight, cleanupTimeout)
+					cleanupErrors.WithLabelValues("timeout").Inc()
+					// Continue to next iteration - don't block forever
 				case <-ctx.Done():
 					return
 				}
