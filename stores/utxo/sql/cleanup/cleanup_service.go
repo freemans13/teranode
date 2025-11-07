@@ -229,9 +229,10 @@ func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retent
 	// Single query to get ALL outputs (spent and unspent) for transactions to be deleted
 	// This replaces N queries with 1 query, massively improving performance
 	//
-	// IMPORTANT: We return ALL transactions that have outputs. For defensive verification:
-	// 1. Check that ALL outputs are spent (no unspent UTXOs remaining)
-	// 2. Check that all children of spent outputs are mined and confirmed deep enough
+	// IMPORTANT: We distinguish between:
+	// 1. Unspent outputs (spending_data = NULL) → Block deletion (has UTXOs still in use)
+	// 2. Spent outputs with no child in DB → Allow deletion (external/mempool/already cleaned)
+	// 3. Spent outputs with child in DB → Check if child is mined deep enough
 	query := `
 		WITH transactions_to_check AS (
 			SELECT id, hash
@@ -296,17 +297,20 @@ func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retent
 		}
 
 		// Output is spent - analyze the child transaction
-		// Child transaction should exist if output is spent
 		if childHash == nil {
-			// Spent output but no child found - data inconsistency
-			result.CanDelete = false
-			result.Reason = "has spent outputs with missing child transactions"
+			// Spent output but no child found in our database
+			// This can happen for:
+			// 1. External transactions (spending tx not in our database)
+			// 2. Mempool transactions (not yet stored)
+			// 3. Already cleaned up transactions
+			// Since the output is marked as spent, we can allow deletion
+			// but note it for monitoring
 			result.ProblematicChildren = append(result.ProblematicChildren, ChildInfo{
-				Hash:        fmt.Sprintf("output_%d", outputIndex),
+				Hash:        fmt.Sprintf("output_%d_external_or_missing", outputIndex),
 				IsMined:     false,
 				BlockHeight: nil,
 			})
-			continue
+			continue // Allow deletion to proceed
 		}
 
 		child := ChildInfo{
@@ -409,10 +413,13 @@ func deleteTombstoned(db *usql.DB, tSettings *settings.Settings, logger ulogger.
 				if i > 0 {
 					problematicChildrenInfo += ", "
 				}
-				if child.IsMined {
-					problematicChildrenInfo += fmt.Sprintf("%s... (mined at height %d)", child.Hash[:8], *child.BlockHeight)
+				// Check if this is a placeholder for external/missing child
+				if strings.HasPrefix(child.Hash, "output_") {
+					problematicChildrenInfo += child.Hash
+				} else if child.IsMined {
+					problematicChildrenInfo += fmt.Sprintf("%s (mined at height %d)", child.Hash, *child.BlockHeight)
 				} else {
-					problematicChildrenInfo += child.Hash[:8] + "... (unmined)"
+					problematicChildrenInfo += child.Hash + " (unmined)"
 				}
 			}
 
