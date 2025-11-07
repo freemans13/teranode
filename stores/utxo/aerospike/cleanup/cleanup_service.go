@@ -713,6 +713,10 @@ func (s *Service) batchGetChildrenBlockHeights(childHashes []*chainhash.Hash) (m
 			if err != nil {
 				// Log error but continue with other children
 				s.logger.Warnf("Failed to create key for child tx %s: %v", hash.String()[:16], err)
+				// Set nil in batchRecords to maintain index alignment
+				batchRecords[j] = nil
+				// Mark this child as failed in the result map
+				result[hash.String()] = nil
 				continue
 			}
 			batchRecords[j] = aerospike.NewBatchRead(readPolicy, key, []string{fields.BlockHeights.String()})
@@ -727,7 +731,7 @@ func (s *Service) batchGetChildrenBlockHeights(childHashes []*chainhash.Hash) (m
 
 		// Process results
 		for j, batchRecord := range batchRecords {
-			if chunk[j] == nil {
+			if chunk[j] == nil || batchRecord == nil {
 				continue
 			}
 
