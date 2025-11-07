@@ -247,8 +247,8 @@ func batchVerifyChildrenBeforeDeletion(db *usql.DB, currentHeight uint32, retent
 		FROM transactions_to_check ttc
 		INNER JOIN outputs o ON ttc.id = o.transaction_id
 		LEFT JOIN inputs i ON o.spending_data IS NOT NULL
-			AND i.input_hash = ttc.hash
-			AND i.input_index = o.idx
+			AND i.previous_transaction_hash = ttc.hash
+			AND i.previous_tx_idx = o.idx
 		LEFT JOIN transactions t_child ON i.transaction_id = t_child.id
 		ORDER BY ttc.hash, o.idx
 	`
