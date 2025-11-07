@@ -1859,7 +1859,6 @@ func TestBlockAssembly_processNewBlockAnnouncement_ErrorHandling(t *testing.T) {
 	})
 }
 
-
 // TestBlockAssembly_CoinbaseCalculationFix specifically targets issue #3968
 // This test ensures coinbase value never exceeds fees + subsidy by exactly 1 satoshi
 func TestBlockAssembly_CoinbaseCalculationFix(t *testing.T) {
@@ -2416,4 +2415,3 @@ func TestGetMiningCandidate_SendTimeoutResetsGenerationFlag(t *testing.T) {
 	assert.Nil(t, ba.cachedCandidate.generationChan, "generation channel should still be nil")
 	ba.cachedCandidate.mu.RUnlock()
 }
-
