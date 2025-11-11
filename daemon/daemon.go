@@ -77,6 +77,7 @@ const (
 	loggerTransactions             = "txs"
 	loggerTxValidator              = "txval"
 	loggerUtxos                    = "utxos"
+	loggerAlert                    = "alert"
 
 	// Service names
 	serviceAlert                   = "alert"
