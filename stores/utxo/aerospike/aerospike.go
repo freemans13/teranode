@@ -788,8 +788,8 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 
 	queryPolicy := aerospike.NewQueryPolicy()
 	queryPolicy.MaxRetries = 3
-	queryPolicy.SocketTimeout = 30 * time.Second
-	queryPolicy.TotalTimeout = 120 * time.Second
+	queryPolicy.SocketTimeout = 5 * time.Minute
+	queryPolicy.TotalTimeout = 30 * time.Minute
 
 	recordset, err := s.client.Query(queryPolicy, stmt)
 	if err != nil {

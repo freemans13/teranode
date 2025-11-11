@@ -140,6 +140,7 @@ type AerospikeSettings struct {
 	BatchPolicyURL         *url.URL
 	ReadPolicyURL          *url.URL
 	WritePolicyURL         *url.URL
+	QueryPolicyURL         *url.URL
 	Port                   int
 	UseDefaultBasePolicies bool
 	UseDefaultPolicies     bool
@@ -460,6 +461,7 @@ type CleanupSettings struct {
 	GRPCListenAddress string
 	GRPCAddress       string
 	PollingInterval   time.Duration
+	WorkerCount       int
 }
 
 type SubtreeValidationSettings struct {

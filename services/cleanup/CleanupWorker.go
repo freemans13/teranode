@@ -146,23 +146,6 @@ func (s *Server) cleanupProcessor(ctx context.Context) {
 				continue
 			}
 
-			// Step 2: Process expired preservations
-			// This converts transactions with expired preserve_until back to delete_at_height
-			// so they can be cleaned up by DAH cleanup in the next phase
-			s.logger.Infof("Starting cleanup for height %d: processing expired preservations", latestHeight)
-			startTime = time.Now()
-
-			if s.utxoStore != nil {
-				err := s.utxoStore.ProcessExpiredPreservations(ctx, latestHeight)
-				if err != nil {
-					s.logger.Errorf("Error processing expired preservations during block height %d update: %v", latestHeight, err)
-					cleanupErrors.WithLabelValues("process_expired_preservations").Inc()
-					// Continue to DAH cleanup even if processing expired preservations fails
-				} else {
-					cleanupDuration.WithLabelValues("process_expired_preservations").Observe(time.Since(startTime).Seconds())
-				}
-			}
-
 			// Safety check before DAH cleanup phase
 			// Recheck block assembly state to ensure it hasn't changed (e.g., to reorg)
 			state, err = s.blockAssemblyClient.GetBlockAssemblyState(ctx)
@@ -178,7 +161,7 @@ func (s *Server) cleanupProcessor(ctx context.Context) {
 				continue
 			}
 
-			// Step 3: Then trigger DAH cleanup and WAIT for it to complete
+			// Step 2: Then trigger DAH cleanup and WAIT for it to complete
 			// DAH cleanup deletes transactions marked for deletion at or before the current height
 			if s.cleanupService != nil {
 				s.logger.Infof("Starting cleanup for height %d: DAH cleanup", latestHeight)

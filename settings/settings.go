@@ -136,6 +136,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BatchPolicyURL:         getURL("aerospike_batchPolicy", "defaultBatchPolicy", alternativeContext...),
 			ReadPolicyURL:          getURL("aerospike_readPolicy", "defaultReadPolicy", alternativeContext...),
 			WritePolicyURL:         getURL("aerospike_writePolicy", "defaultWritePolicy", alternativeContext...),
+			QueryPolicyURL:         getURL("aerospike_queryPolicy", "defaultQueryPolicy", alternativeContext...),
 			Port:                   getInt("aerospike_port", 3000, alternativeContext...),
 			UseDefaultBasePolicies: getBool("aerospike_useDefaultBasePolicies", false, alternativeContext...),
 			UseDefaultPolicies:     getBool("aerospike_useDefaultPolicies", false, alternativeContext...),
@@ -416,6 +417,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GRPCAddress:       getString("cleanup_grpcAddress", "localhost:8096", alternativeContext...),
 			GRPCListenAddress: getString("cleanup_grpcListenAddress", ":8096", alternativeContext...),
 			PollingInterval:   getDuration("cleanup_pollingInterval", time.Minute, alternativeContext...),
+			WorkerCount:       getInt("cleanup_workerCount", 4, alternativeContext...), // Default to 4 workers
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),

@@ -65,6 +65,7 @@ func (s *Store) GetCleanupService() (cleanup.Service, error) {
 		Namespace:     s.namespace,
 		Set:           s.setName,
 		IndexWaiter:   s,
+		WorkerCount:   s.settings.Cleanup.WorkerCount,
 	}
 
 	// Create a new cleanup service

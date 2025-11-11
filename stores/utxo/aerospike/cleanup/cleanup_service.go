@@ -101,6 +101,7 @@ type Service struct {
 	queryPolicy      *aerospike.QueryPolicy
 	writePolicy      *aerospike.WritePolicy
 	batchWritePolicy *aerospike.BatchWritePolicy
+	batchPolicy      *aerospike.BatchPolicy
 
 	// separate batchers for background batch processing
 	parentUpdateBatcher batcherIfc[batchParentUpdate]
@@ -164,19 +165,19 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		})
 	})
 
-	queryPolicy := aerospike.NewQueryPolicy()
-	queryPolicy.IncludeBinData = true
-	queryPolicy.MaxRetries = 3
-	queryPolicy.SocketTimeout = 30 * time.Second
-	queryPolicy.TotalTimeout = 120 * time.Second
+	// Use the configured query policy from settings (configured via aerospike_queryPolicy URL)
+	queryPolicy := util.GetAerospikeQueryPolicy(tSettings)
+	queryPolicy.IncludeBinData = true // Need to include bin data for cleanup processing
 
-	writePolicy := aerospike.NewWritePolicy(0, 0)
-	writePolicy.MaxRetries = 3
-	writePolicy.SocketTimeout = 30 * time.Second
-	writePolicy.TotalTimeout = 120 * time.Second
+	// Use the configured write policy from settings
+	writePolicy := util.GetAerospikeWritePolicy(tSettings, 0)
 
-	batchWritePolicy := aerospike.NewBatchWritePolicy()
+	// Use the configured batch policies from settings
+	batchWritePolicy := util.GetAerospikeBatchWritePolicy(tSettings)
 	batchWritePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
+
+	// Use the configured batch policy from settings (configured via aerospike_batchPolicy URL)
+	batchPolicy := util.GetAerospikeBatchPolicy(tSettings)
 
 	// Determine max concurrent operations:
 	// - Use connection queue size as the upper bound (to prevent connection exhaustion)
@@ -202,6 +203,7 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		queryPolicy:             queryPolicy,
 		writePolicy:             writePolicy,
 		batchWritePolicy:        batchWritePolicy,
+		batchPolicy:             batchPolicy,
 		getPersistedHeight:      opts.GetPersistedHeight,
 		maxConcurrentOperations: maxConcurrentOps,
 	}
@@ -304,6 +306,9 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	job.SetStatus(cleanup.JobStatusRunning)
 	job.Started = time.Now()
 
+	// Get the job's context for cancellation support
+	jobCtx := job.Context()
+
 	s.logger.Infof("Worker %d starting cleanup job for block height %d", workerID, job.BlockHeight)
 
 	// BLOCK PERSISTER COORDINATION: Calculate safe cleanup height
@@ -390,6 +395,18 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 		workerID, job.BlockHeight, safeCleanupHeight)
 
 	for {
+		// Check for cancellation before processing next record
+		select {
+		case <-jobCtx.Done():
+			s.logger.Infof("Worker %d: cleanup job for height %d cancelled, stopping record processing", workerID, job.BlockHeight)
+			// Close the recordset to stop receiving more records
+			recordset.Close()
+			// Break out of the loop to allow graceful shutdown
+			goto waitForInProgress
+		default:
+			// Continue processing
+		}
+
 		rec, ok := <-result
 		if !ok || rec == nil {
 			break // No more records
@@ -418,21 +435,71 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		s.logger.Errorf(err.Error())
-		s.markJobAsFailed(job, err)
-		return
+waitForInProgress:
+	// Wait for all in-progress operations to complete (even during cancellation)
+	// IMPORTANT: Capture the error but DON'T return immediately - we need to flush batchers!
+	processingErr := g.Wait()
+	if processingErr != nil {
+		s.logger.Errorf("Worker %d: error during cleanup processing for height %d: %v", workerID, job.BlockHeight, processingErr)
+	}
+
+	// Check if we were cancelled
+	wasCancelled := false
+	select {
+	case <-jobCtx.Done():
+		wasCancelled = true
+		s.logger.Infof("Worker %d: cleanup job for height %d was cancelled", workerID, job.BlockHeight)
+	default:
+		// Not cancelled
 	}
 
 	s.logger.Infof("Worker %d: processed %d records for cleanup job %d", workerID, recordCount.Load(), job.BlockHeight)
 
-	job.SetStatus(cleanup.JobStatusCompleted)
+	// CRITICAL: Always flush batchers, even on error!
+	// This ensures that work already queued gets committed to the database.
+	// Without this, timeouts or errors would cause data loss of already processed records.
+	s.logger.Debugf("Worker %d: flushing batchers for cleanup job %d (error: %v)", workerID, job.BlockHeight, processingErr != nil)
+
+	// Flush delete batcher to ensure all pending deletions are executed
+	if s.deleteBatcher != nil {
+		s.deleteBatcher.Trigger()
+	}
+
+	// Flush parent update batcher to ensure all pending parent updates are executed
+	if s.parentUpdateBatcher != nil {
+		s.parentUpdateBatcher.Trigger()
+	}
+
+	s.logger.Debugf("Worker %d: batchers flushed for cleanup job %d", workerID, job.BlockHeight)
+
+	// Set appropriate status based on errors and cancellation
+	if processingErr != nil {
+		// Had an error during processing, but batchers were still flushed
+		job.SetStatus(cleanup.JobStatusFailed)
+		job.Error = processingErr
+		s.logger.Warnf("Worker %d: cleanup job for height %d failed with error, but %d records were still committed to database",
+			workerID, job.BlockHeight, recordCount.Load())
+	} else if wasCancelled {
+		job.SetStatus(cleanup.JobStatusCancelled)
+		s.logger.Infof("Worker %d: cleanup job for height %d marked as cancelled after graceful shutdown", workerID, job.BlockHeight)
+	} else {
+		job.SetStatus(cleanup.JobStatusCompleted)
+	}
 	job.Ended = time.Now()
 
 	prometheusUtxoCleanupBatch.Observe(float64(time.Since(job.Started).Microseconds()) / 1_000_000)
 
 	finalRecordCount := recordCount.Load()
-	s.logger.Infof("Worker %d completed cleanup job for block height %d in %v, processed %d records", workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
+	if processingErr != nil {
+		s.logger.Infof("Worker %d failed cleanup job for block height %d after %v, but successfully committed %d records to database before error",
+			workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
+	} else if wasCancelled {
+		s.logger.Infof("Worker %d cancelled cleanup job for block height %d after %v, processed %d records before cancellation",
+			workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
+	} else {
+		s.logger.Infof("Worker %d completed cleanup job for block height %d in %v, processed %d records",
+			workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
+	}
 }
 
 func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
@@ -447,7 +514,7 @@ func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aeros
 				// Check if outputs exist (sometimes only outputs are stored)
 				exists, err := s.external.Exists(s.ctx, txHash.CloneBytes(), fileformat.FileTypeOutputs)
 				if err != nil {
-					return nil, errors.NewProcessingError("Worker %d: error checking existence of outputs for external tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+					return nil, errors.NewProcessingError("Worker %d: error checking existence of outputs for external tx %s in cleanup job %d", workerID, txHash.String(), job.BlockHeight, err)
 				}
 
 				if exists {
@@ -461,12 +528,12 @@ func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aeros
 				return []*bt.Input{}, nil
 			}
 			// Other errors should still be reported
-			return nil, errors.NewProcessingError("Worker %d: error getting external tx %s for cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+			return nil, errors.NewProcessingError("Worker %d: error getting external tx %s for cleanup job %d", workerID, txHash.String(), job.BlockHeight, err)
 		}
 
 		tx, err := bt.NewTxFromBytes(txBytes)
 		if err != nil {
-			return nil, errors.NewProcessingError("Worker %d: invalid tx bytes for external tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+			return nil, errors.NewProcessingError("Worker %d: invalid tx bytes for external tx %s in cleanup job %d", workerID, txHash.String(), job.BlockHeight, err)
 		}
 
 		inputs = tx.Inputs
@@ -492,7 +559,7 @@ func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aeros
 			inputs[i] = &bt.Input{}
 
 			if _, err := inputs[i].ReadFrom(bytes.NewReader(input)); err != nil {
-				return nil, errors.NewProcessingError("Worker %d: invalid input for record in cleanup job %d: %v", workerID, job.BlockHeight, err)
+				return nil, errors.NewProcessingError("Worker %d: invalid input for record in cleanup job %d", workerID, job.BlockHeight, err)
 			}
 		}
 	}
@@ -536,7 +603,7 @@ func (s *Service) sendParentUpdateBatch(batch []*batchParentUpdate) {
 			parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
 			if err != nil {
 				// Send error to this batch item immediately
-				item.errCh <- errors.NewProcessingError("error creating parent key for input in external tx %s: %v", item.txHash.String(), err)
+				item.errCh <- errors.NewProcessingError("error creating parent key for input in external tx %s", item.txHash.String(), err)
 				continue
 			}
 
@@ -604,13 +671,13 @@ func (s *Service) sendParentUpdateBatch(batch []*batchParentUpdate) {
 		parentsList = append(parentsList, parent)
 	}
 
-	// Execute the batch operation
-	err := s.client.BatchOperate(s.client.DefaultBatchPolicy, batchRecords)
+	// Execute the batch operation with custom batch policy
+	err := s.client.BatchOperate(s.batchPolicy, batchRecords)
 	if err != nil {
 		// Send error to all batch items that have parent updates
 		for _, item := range batch {
 			if len(itemToParents[item]) > 0 {
-				item.errCh <- errors.NewProcessingError("error batch updating parent records: %v", err)
+				item.errCh <- errors.NewProcessingError("error batch updating parent records", err)
 			}
 		}
 		return
@@ -624,7 +691,7 @@ func (s *Service) sendParentUpdateBatch(batch []*batchParentUpdate) {
 		if batchRec.BatchRec().Err != nil {
 			if !errors.Is(batchRec.BatchRec().Err, aerospike.ErrKeyNotFound) {
 				// Real error occurred
-				itemErr = errors.NewProcessingError("error updating parent record: %v", batchRec.BatchRec().Err)
+				itemErr = errors.NewProcessingError("error updating parent record", batchRec.BatchRec().Err)
 			}
 			// For ErrKeyNotFound, itemErr remains nil (success)
 		}
@@ -642,6 +709,9 @@ func (s *Service) sendDeleteBatch(batch []*batchDelete) {
 		return
 	}
 
+	// Log batch deletion for verification
+	// s.logger.Debugf("Sending delete batch of %d records to Aerospike", len(batch))
+
 	// Create batch delete records
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(batch))
 	batchDeletePolicy := aerospike.NewBatchDeletePolicy()
@@ -650,32 +720,43 @@ func (s *Service) sendDeleteBatch(batch []*batchDelete) {
 		batchRecords = append(batchRecords, aerospike.NewBatchDelete(batchDeletePolicy, item.key))
 	}
 
-	// Execute the batch delete operation
-	err := s.client.BatchOperate(s.client.DefaultBatchPolicy, batchRecords)
+	// Execute the batch delete operation with custom batch policy
+	err := s.client.BatchOperate(s.batchPolicy, batchRecords)
 	if err != nil {
 		// Send error to all batch items
 		for _, item := range batch {
-			item.errCh <- errors.NewProcessingError("error batch deleting records: %v", err)
+			item.errCh <- errors.NewProcessingError("error batch deleting records", err)
 		}
 
 		return
 	}
 
 	// Check individual batch results and send individual responses
+	successCount := 0
+	alreadyDeletedCount := 0
+	errorCount := 0
+
 	for i, batchRec := range batchRecords {
 		if batchRec.BatchRec().Err != nil {
 			if errors.Is(batchRec.BatchRec().Err, aerospike.ErrKeyNotFound) {
 				// Record not found, treat as success (already deleted)
 				batch[i].errCh <- nil
+				alreadyDeletedCount++
 			} else {
 				// Real error occurred
-				batch[i].errCh <- errors.NewProcessingError("error deleting record for tx %s: %v", batch[i].txHash.String(), batchRec.BatchRec().Err)
+				batch[i].errCh <- errors.NewProcessingError("error deleting record for tx %s", batch[i].txHash.String(), batchRec.BatchRec().Err)
+				errorCount++
 			}
 		} else {
 			// Success
 			batch[i].errCh <- nil
+			successCount++
 		}
 	}
+
+	// Log batch results for verification
+	// s.logger.Debugf("Delete batch completed: %d successful, %d already deleted, %d errors (total: %d)",
+	// 	successCount, alreadyDeletedCount, errorCount, len(batch))
 }
 
 func (s *Service) ProcessSingleRecord(txid *chainhash.Hash, inputs []*bt.Input) error {
@@ -693,7 +774,7 @@ func (s *Service) ProcessSingleRecord(txid *chainhash.Hash, inputs []*bt.Input) 
 // processRecordCleanup processes a single record for cleanup using batchers
 func (s *Service) processRecordCleanup(job *cleanup.Job, workerID int, rec *aerospike.Result) error {
 	if rec.Err != nil {
-		return errors.NewProcessingError("Worker %d: error reading record for cleanup job %d: %v", workerID, job.BlockHeight, rec.Err)
+		return errors.NewProcessingError("Worker %d: error reading record for cleanup job %d", workerID, job.BlockHeight, rec.Err)
 	}
 
 	// get all the unique parent records of the record being deleted
@@ -731,7 +812,7 @@ func (s *Service) processRecordCleanup(job *cleanup.Job, workerID int, rec *aero
 
 		// Wait for parent update to complete
 		if err = <-parentErrCh; err != nil {
-			return errors.NewProcessingError("Worker %d: error updating parents for tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+			return errors.NewProcessingError("Worker %d: error updating parents for tx %s in cleanup job %d", workerID, txHash.String(), job.BlockHeight, err)
 		}
 	}
 
@@ -746,7 +827,7 @@ func (s *Service) processRecordCleanup(job *cleanup.Job, workerID int, rec *aero
 
 	// Wait for deletion to complete
 	if err = <-deleteErrCh; err != nil {
-		return errors.NewProcessingError("Worker %d: error deleting record for tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+		return errors.NewProcessingError("Worker %d: error deleting record for tx %s in cleanup job %d", workerID, txHash.String(), job.BlockHeight, err)
 	}
 
 	// Wait for all operations to complete
