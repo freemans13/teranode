@@ -661,7 +661,7 @@ func (u *Server) Init(ctx context.Context) (err error) {
 									break // Success, exit the peer loop
 								} else {
 									u.logger.Warnf("[catchup] Peer %s also failed for block %s: %v", bestPeer.ID, blockHash.String(), altErr)
-									u.reportCatchupFailure(ctx, c.peerID)
+									u.reportCatchupFailure(ctx, bestPeer.ID)
 									// Failure will be reported by the catchup function itself
 								}
 							}
@@ -697,7 +697,7 @@ func (u *Server) Init(ctx context.Context) (err error) {
 									break
 								} else {
 									u.logger.Warnf("[catchup] Alternative peer %s also failed for block %s: %v", alt.peerID, blockHash.String(), altErr)
-									u.reportCatchupFailure(ctx, c.peerID)
+									u.reportCatchupFailure(ctx, alt.peerID)
 								}
 							}
 						} else {

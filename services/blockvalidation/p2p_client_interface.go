@@ -34,6 +34,10 @@ type P2PClientI interface {
 	// Returns a slice of PeerInfo sorted by reputation (highest first).
 	GetPeersForCatchup(ctx context.Context) ([]*p2p.PeerInfo, error)
 
+	// GetPeer returns information about a specific peer.
+	// Returns nil if the peer is not found.
+	GetPeer(ctx context.Context, peerID string) (*p2p.PeerInfo, error)
+
 	// ReportValidBlock reports that a block was successfully received and validated from a peer.
 	ReportValidBlock(ctx context.Context, peerID string, blockHash string) error
 
@@ -47,4 +51,8 @@ type P2PClientI interface {
 	// IsPeerUnhealthy checks if a peer is considered unhealthy based on their performance.
 	// A peer is considered unhealthy if they have poor performance metrics or low reputation.
 	IsPeerUnhealthy(ctx context.Context, peerID string) (bool, string, float32, error)
+
+	// RecordBytesDownloaded records the number of bytes downloaded via HTTP from a peer.
+	// This is called after downloading data (blocks, subtrees, etc.) from a peer's DataHub URL.
+	RecordBytesDownloaded(ctx context.Context, peerID string, bytesDownloaded uint64) error
 }

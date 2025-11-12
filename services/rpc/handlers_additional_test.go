@@ -5219,6 +5219,7 @@ func (m *mockLegacyPeerClient) ClearBanned(ctx context.Context, req *emptypb.Emp
 
 type mockP2PClient struct {
 	getPeersFunc           func(ctx context.Context) ([]*p2p.PeerInfo, error)
+	getPeerFunc            func(ctx context.Context, peerID string) (*p2p.PeerInfo, error)
 	getPeersForCatchupFunc func(ctx context.Context) ([]*p2p.PeerInfo, error)
 	isBannedFunc           func(ctx context.Context, ipOrSubnet string) (bool, error)
 	listBannedFunc         func(ctx context.Context) ([]string, error)
@@ -5234,6 +5235,13 @@ func (m *mockP2PClient) GetPeers(ctx context.Context) ([]*p2p.PeerInfo, error) {
 		return m.getPeersFunc(ctx)
 	}
 	return []*p2p.PeerInfo{}, nil
+}
+
+func (m *mockP2PClient) GetPeer(ctx context.Context, peerID string) (*p2p.PeerInfo, error) {
+	if m.getPeerFunc != nil {
+		return m.getPeerFunc(ctx, peerID)
+	}
+	return nil, nil
 }
 
 func (m *mockP2PClient) GetPeersForCatchup(ctx context.Context) ([]*p2p.PeerInfo, error) {
@@ -5330,6 +5338,10 @@ func (m *mockP2PClient) ReportValidSubtree(ctx context.Context, peerID string, s
 }
 
 func (m *mockP2PClient) ReportValidBlock(ctx context.Context, peerID string, blockHash string) error {
+	return nil
+}
+
+func (m *mockP2PClient) RecordBytesDownloaded(ctx context.Context, peerID string, bytesDownloaded uint64) error {
 	return nil
 }
 

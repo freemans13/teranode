@@ -75,6 +75,16 @@ type ClientI interface {
 	// Returns a slice of PeerInfo or an error if the operation fails.
 	GetPeers(ctx context.Context) ([]*PeerInfo, error)
 
+	// GetPeer retrieves information about a specific peer from the P2P network.
+	// Returns nil if the peer is not found in the registry.
+	//
+	// Parameters:
+	// - ctx: Context for the operation
+	// - peerID: The peer ID to look up
+	//
+	// Returns the peer information or nil if not found, or an error if the operation fails.
+	GetPeer(ctx context.Context, peerID string) (*PeerInfo, error)
+
 	// BanPeer adds a peer to the ban list to prevent future connections.
 	// It can ban by peer ID, IP address, or subnet depending on the request parameters.
 	//
@@ -187,4 +197,16 @@ type ClientI interface {
 	// GetPeerRegistry retrieves the comprehensive peer registry data.
 	// Returns all peers in the registry with their complete information.
 	GetPeerRegistry(ctx context.Context) ([]*PeerInfo, error)
+
+	// RecordBytesDownloaded records the number of bytes downloaded via HTTP from a peer.
+	// This method is called after downloading data (blocks, subtrees, etc.) from a peer's
+	// DataHub URL to track total network usage per peer.
+	//
+	// Parameters:
+	// - ctx: Context for the operation
+	// - peerID: Peer ID string that provided the data
+	// - bytesDownloaded: Number of bytes downloaded in this operation
+	//
+	// Returns an error if the operation fails.
+	RecordBytesDownloaded(ctx context.Context, peerID string, bytesDownloaded uint64) error
 }

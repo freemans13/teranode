@@ -118,9 +118,23 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 		maxRetries = 3
 	}
 
+	// Get the peer's actual chain tip from P2P registry
+	// This is the peer's BestBlockHash from their node_status messages,
+	// not just a block they announced (which could be invalid or relayed)
+	chainTipHash := blockUpTo.Hash() // Default to announced block
+	if peerID != "" {
+		peerChainTip, err := u.getPeerChainTip(ctx, peerID)
+		if err != nil {
+			// Log but don't fail - fall back to using blockUpTo
+			u.logger.Warnf("[catchup][%s] Could not get peer chain tip from P2P registry for peer %s: %v, falling back to announced block", blockUpTo.Hash().String(), peerID, err)
+		} else if peerChainTip != nil {
+			u.logger.Infof("[catchup][%s] Using peer %s's actual chain tip %s instead of announced block %s", blockUpTo.Hash().String(), peerID, peerChainTip.String(), blockUpTo.Hash().String())
+			chainTipHash = peerChainTip
+		}
+	}
+
 	// Collect all headers through iteration
 	allCatchupHeaders := make([]*model.BlockHeader, 0, maxBlockHeadersPerRequest)
-	chainTipHash := blockUpTo.Hash()
 	currentLocatorHashes := locatorHashes
 
 	// iteration variables
@@ -380,4 +394,46 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 	result := catchup.CreateCatchupResultWithLocator(allCatchupHeaders, blockUpTo.Hash(), startHash, startHeight, startTime, baseURL, iteration, failedIterations, reachedTarget, stopReason, locatorHashes)
 
 	return result, bestBlockHeader, nil
+}
+
+// getPeerChainTip retrieves the peer's actual chain tip hash from the P2P registry.
+// This returns the peer's BestBlockHash (from their node_status messages), which represents
+// their actual chain position, not just blocks they've announced or are relaying.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - peerID: The peer ID to look up
+//
+// Returns:
+//   - *chainhash.Hash: The peer's chain tip hash, or nil if not found or P2P client unavailable
+//   - error: Any error encountered
+func (u *Server) getPeerChainTip(ctx context.Context, peerID string) (*chainhash.Hash, error) {
+	// Check if P2P client is available
+	if u.p2pClient == nil {
+		return nil, errors.NewServiceError("P2P client not available")
+	}
+
+	// Get peer info from P2P registry
+	peerInfo, err := u.p2pClient.GetPeer(ctx, peerID)
+	if err != nil {
+		return nil, errors.NewServiceError("failed to get peer info from P2P service: %w", err)
+	}
+
+	// Check if peer was found
+	if peerInfo == nil {
+		return nil, errors.NewNotFoundError("peer %s not found in P2P registry", peerID)
+	}
+
+	// Check if peer has a block hash
+	if peerInfo.BlockHash == "" {
+		return nil, errors.NewNotFoundError("peer %s has no block hash in registry", peerID)
+	}
+
+	// Parse the block hash
+	chainTipHash, err := chainhash.NewHashFromStr(peerInfo.BlockHash)
+	if err != nil {
+		return nil, errors.NewInvalidArgumentError("invalid block hash for peer %s: %w", peerID, err)
+	}
+
+	return chainTipHash, nil
 }

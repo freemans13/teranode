@@ -192,6 +192,7 @@ The project includes a Bitcoin expert agent (`.claude/agents/bitcoin-expert.md`)
 - Use TestContainers for integration tests requiring external services
 - Don't use mock blockchain client/store - you can use a real one using the sqlitememory store
 - Don't use mock kafka - you can use in_memory_kafka.go
+- **Log messages must always be on a single line** - never use multi-line log statements
 
 ### Service Interface Design Pattern
 

@@ -37,6 +37,10 @@ type MockPeerServiceClient struct {
 	GetPeersForCatchupFunc      func(ctx context.Context, in *p2p_api.GetPeersForCatchupRequest, opts ...grpc.CallOption) (*p2p_api.GetPeersForCatchupResponse, error)
 	ReportValidSubtreeFunc      func(ctx context.Context, in *p2p_api.ReportValidSubtreeRequest, opts ...grpc.CallOption) (*p2p_api.ReportValidSubtreeResponse, error)
 	ReportValidBlockFunc        func(ctx context.Context, in *p2p_api.ReportValidBlockRequest, opts ...grpc.CallOption) (*p2p_api.ReportValidBlockResponse, error)
+	IsPeerMaliciousFunc         func(ctx context.Context, in *p2p_api.IsPeerMaliciousRequest, opts ...grpc.CallOption) (*p2p_api.IsPeerMaliciousResponse, error)
+	IsPeerUnhealthyFunc         func(ctx context.Context, in *p2p_api.IsPeerUnhealthyRequest, opts ...grpc.CallOption) (*p2p_api.IsPeerUnhealthyResponse, error)
+	GetPeerRegistryFunc         func(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*p2p_api.GetPeerRegistryResponse, error)
+	GetPeerFunc                 func(ctx context.Context, in *p2p_api.GetPeerRequest, opts ...grpc.CallOption) (*p2p_api.GetPeerResponse, error)
 }
 
 func (m *MockPeerServiceClient) GetPeers(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*p2p_api.GetPeersResponse, error) {
@@ -166,16 +170,38 @@ func (m *MockPeerServiceClient) ReportValidBlock(ctx context.Context, in *p2p_ap
 }
 
 func (m *MockPeerServiceClient) IsPeerMalicious(ctx context.Context, in *p2p_api.IsPeerMaliciousRequest, opts ...grpc.CallOption) (*p2p_api.IsPeerMaliciousResponse, error) {
+	if m.IsPeerMaliciousFunc != nil {
+		return m.IsPeerMaliciousFunc(ctx, in, opts...)
+	}
 	return &p2p_api.IsPeerMaliciousResponse{IsMalicious: false}, nil
 }
 
 func (m *MockPeerServiceClient) IsPeerUnhealthy(ctx context.Context, in *p2p_api.IsPeerUnhealthyRequest, opts ...grpc.CallOption) (*p2p_api.IsPeerUnhealthyResponse, error) {
+	if m.IsPeerUnhealthyFunc != nil {
+		return m.IsPeerUnhealthyFunc(ctx, in, opts...)
+	}
 	return &p2p_api.IsPeerUnhealthyResponse{IsUnhealthy: false, ReputationScore: 50.0}, nil
 }
 
 func (m *MockPeerServiceClient) GetPeerRegistry(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*p2p_api.GetPeerRegistryResponse, error) {
+	if m.GetPeerRegistryFunc != nil {
+		return m.GetPeerRegistryFunc(ctx, in, opts...)
+	}
 	return &p2p_api.GetPeerRegistryResponse{
 		Peers: []*p2p_api.PeerRegistryInfo{},
+	}, nil
+}
+
+func (m *MockPeerServiceClient) RecordBytesDownloaded(ctx context.Context, in *p2p_api.RecordBytesDownloadedRequest, opts ...grpc.CallOption) (*p2p_api.RecordBytesDownloadedResponse, error) {
+	return &p2p_api.RecordBytesDownloadedResponse{Ok: true}, nil
+}
+
+func (m *MockPeerServiceClient) GetPeer(ctx context.Context, in *p2p_api.GetPeerRequest, opts ...grpc.CallOption) (*p2p_api.GetPeerResponse, error) {
+	if m.GetPeerFunc != nil {
+		return m.GetPeerFunc(ctx, in, opts...)
+	}
+	return &p2p_api.GetPeerResponse{
+		Found: false,
 	}, nil
 }
 
