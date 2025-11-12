@@ -462,6 +462,7 @@ type CleanupSettings struct {
 	GRPCAddress       string
 	PollingInterval   time.Duration
 	WorkerCount       int
+	JobTimeout        time.Duration // Timeout for waiting for cleanup job completion
 }
 
 type SubtreeValidationSettings struct {

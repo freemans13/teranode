@@ -418,6 +418,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GRPCListenAddress: getString("cleanup_grpcListenAddress", ":8096", alternativeContext...),
 			PollingInterval:   getDuration("cleanup_pollingInterval", time.Minute, alternativeContext...),
 			WorkerCount:       getInt("cleanup_workerCount", 4, alternativeContext...), // Default to 4 workers
+			JobTimeout:        getDuration("cleanup_jobTimeout", 10*time.Minute, alternativeContext...),
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),

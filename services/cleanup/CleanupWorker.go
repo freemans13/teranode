@@ -175,7 +175,7 @@ func (s *Server) cleanupProcessor(ctx context.Context) {
 				}
 
 				// Wait for cleanup to complete with timeout
-				cleanupTimeout := 10 * time.Minute
+				cleanupTimeout := s.settings.Cleanup.JobTimeout
 				timeoutTimer := time.NewTimer(cleanupTimeout)
 				defer timeoutTimer.Stop()
 
@@ -190,9 +190,19 @@ func (s *Server) cleanupProcessor(ctx context.Context) {
 						cleanupProcessed.Inc()
 					}
 				case <-timeoutTimer.C:
-					s.logger.Errorf("Cleanup for height %d timed out after %v", latestHeight, cleanupTimeout)
-					cleanupErrors.WithLabelValues("timeout").Inc()
-					// Continue to next iteration - don't block forever
+					s.logger.Infof("Cleanup for height %d exceeded coordinator timeout of %v - cleanup continues in background, re-queuing immediately", latestHeight, cleanupTimeout)
+					// Note: This is not an error - the cleanup job continues processing in the background.
+					// The coordinator re-queues immediately to check again without waiting for the next polling interval.
+					// Very large cleanups may take longer than the timeout and require multiple iterations.
+
+					// Immediately re-queue to check again (non-blocking)
+					select {
+					case s.cleanupCh <- latestHeight:
+						s.logger.Debugf("Re-queued cleanup for height %d after timeout", latestHeight)
+					default:
+						// Channel full, will be picked up by next poll anyway
+						s.logger.Debugf("Cleanup channel full, will retry on next poll")
+					}
 				case <-ctx.Done():
 					return
 				}
