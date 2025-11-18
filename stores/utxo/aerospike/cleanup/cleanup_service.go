@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -28,12 +27,6 @@ import (
 var _ cleanup.Service = (*Service)(nil)
 
 var IndexName, _ = gocore.Config().Get("cleanup_IndexName", "cleanup_dah_index")
-
-// batcherIfc defines the interface for batching operations
-type batcherIfc[T any] interface {
-	Put(item *T, payloadSize ...int)
-	Trigger()
-}
 
 // Constants for the cleanup service
 const (
@@ -101,10 +94,6 @@ type Service struct {
 	batchWritePolicy *aerospike.BatchWritePolicy
 	batchPolicy      *aerospike.BatchPolicy
 
-	// separate batchers for background batch processing
-	parentUpdateBatcher batcherIfc[batchParentUpdate]
-	deleteBatcher       batcherIfc[batchDelete]
-
 	// getPersistedHeight returns the last block height processed by block persister
 	// Used to coordinate cleanup with block persister progress (can be nil)
 	getPersistedHeight func() uint32
@@ -118,20 +107,6 @@ type Service struct {
 type parentUpdateInfo struct {
 	key         *aerospike.Key
 	childHashes []*chainhash.Hash // Child transactions being deleted
-}
-
-// batchParentUpdate represents a parent record update operation in a batch
-type batchParentUpdate struct {
-	txHash *chainhash.Hash
-	inputs []*bt.Input
-	errCh  chan error
-}
-
-// batchDelete represents a record deletion operation in a batch
-type batchDelete struct {
-	key    *aerospike.Key
-	txHash *chainhash.Hash
-	errCh  chan error
 }
 
 // NewService creates a new cleanup service
@@ -229,15 +204,6 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	}
 
 	service.jobManager = jobManager
-
-	// Initialize cleanup batchers using dedicated cleanup settings
-	parentUpdateBatchSize := tSettings.UtxoStore.CleanupParentUpdateBatcherSize
-	parentUpdateBatchDuration := time.Duration(tSettings.UtxoStore.CleanupParentUpdateBatcherDurationMillis) * time.Millisecond
-	service.parentUpdateBatcher = batcher.New[batchParentUpdate](parentUpdateBatchSize, parentUpdateBatchDuration, service.sendParentUpdateBatch, true)
-
-	deleteBatchSize := tSettings.UtxoStore.CleanupDeleteBatcherSize
-	deleteBatchDuration := time.Duration(tSettings.UtxoStore.CleanupDeleteBatcherDurationMillis) * time.Millisecond
-	service.deleteBatcher = batcher.New[batchDelete](deleteBatchSize, deleteBatchDuration, service.sendDeleteBatch, true)
 
 	return service, nil
 }
@@ -406,8 +372,10 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 		case <-jobCtx.Done():
 			s.logger.Infof("Worker %d: cleanup job for height %d cancelled", workerID, job.BlockHeight)
 			recordset.Close()
-			// Flush any accumulated operations before exiting
-			s.flushCleanupBatches(jobCtx, workerID, job.BlockHeight, parentUpdates, deletions)
+			// Flush any accumulated operations before exiting (use parent context since jobCtx is cancelled)
+			if err := s.flushCleanupBatches(s.ctx, workerID, job.BlockHeight, parentUpdates, deletions); err != nil {
+				s.logger.Errorf("Worker %d: error flushing batches during cancellation: %v", workerID, err)
+			}
 			s.markJobAsFailed(job, errors.NewProcessingError("Worker %d: cleanup job for height %d cancelled", workerID, job.BlockHeight))
 			return
 		default:
@@ -472,14 +440,21 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 
 		// Execute batch when full
 		if len(deletions) >= batchSize {
-			s.flushCleanupBatches(jobCtx, workerID, job.BlockHeight, parentUpdates, deletions)
+			if err := s.flushCleanupBatches(jobCtx, workerID, job.BlockHeight, parentUpdates, deletions); err != nil {
+				s.logger.Errorf("Worker %d: error flushing batches: %v", workerID, err)
+				// Continue processing despite flush error - will retry at end
+			}
 			parentUpdates = make(map[string]*parentUpdateInfo)
 			deletions = make([]*aerospike.Key, 0, batchSize)
 		}
 	}
 
 	// Flush any remaining operations
-	s.flushCleanupBatches(jobCtx, workerID, job.BlockHeight, parentUpdates, deletions)
+	if err := s.flushCleanupBatches(jobCtx, workerID, job.BlockHeight, parentUpdates, deletions); err != nil {
+		s.logger.Errorf("Worker %d: error flushing final batches: %v", workerID, err)
+		s.markJobAsFailed(job, errors.NewStorageError("failed to flush final batches", err))
+		return
+	}
 
 	// Check if we were cancelled
 	wasCancelled := false
@@ -579,212 +554,19 @@ func (s *Service) markJobAsFailed(job *cleanup.Job, err error) {
 	job.Ended = time.Now()
 }
 
-// sendParentUpdateBatch processes a batch of parent update operations
-func (s *Service) sendParentUpdateBatch(batch []*batchParentUpdate) {
-	if len(batch) == 0 {
-		return
-	}
-
-	// Track which batch items are associated with which parent keys
-	type parentInfo struct {
-		key         *aerospike.Key
-		childHashes []*chainhash.Hash
-		batchItems  []*batchParentUpdate // Track which items depend on this parent
-	}
-
-	parentMap := make(map[string]*parentInfo)                   // Use key string for deduplication
-	itemToParents := make(map[*batchParentUpdate][]*parentInfo) // Track parents per item
-
-	// First pass: collect all parent updates and track relationships
-	for _, item := range batch {
-		if len(item.inputs) == 0 {
-			// No inputs, send success immediately
-			item.errCh <- nil
-			continue
-		}
-
-		var itemParents []*parentInfo
-		for _, input := range item.inputs {
-			keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.settings.UtxoStore.UtxoBatchSize)
-			parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
-			if err != nil {
-				// Send error to this batch item immediately
-				item.errCh <- errors.NewProcessingError("error creating parent key for input in external tx %s", item.txHash.String(), err)
-				continue
-			}
-
-			keyStr := parentKey.String()
-			parent, exists := parentMap[keyStr]
-			if !exists {
-				parent = &parentInfo{
-					key:         parentKey,
-					childHashes: make([]*chainhash.Hash, 0),
-					batchItems:  make([]*batchParentUpdate, 0),
-				}
-				parentMap[keyStr] = parent
-			}
-
-			// Add this child tx hash if not already present
-			found := false
-			for _, existingHash := range parent.childHashes {
-				if existingHash.IsEqual(item.txHash) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				parent.childHashes = append(parent.childHashes, item.txHash)
-			}
-
-			// Add this item to the parent's dependent items if not already there
-			found = false
-			for _, existingItem := range parent.batchItems {
-				if existingItem == item {
-					found = true
-					break
-				}
-			}
-			if !found {
-				parent.batchItems = append(parent.batchItems, item)
-			}
-
-			itemParents = append(itemParents, parent)
-		}
-		itemToParents[item] = itemParents
-	}
-
-	if len(parentMap) == 0 {
-		return // All items already handled
-	}
-
-	// Create batch operations
-	mapPolicy := aerospike.DefaultMapPolicy()
-	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(parentMap))
-	parentsList := make([]*parentInfo, 0, len(parentMap))
-
-	for _, parent := range parentMap {
-		// Create multiple MapPutOp operations for this parent
-		ops := make([]*aerospike.Operation, 0, len(parent.childHashes))
-		for _, childTxHash := range parent.childHashes {
-			ops = append(ops, aerospike.MapPutOp(mapPolicy, fields.DeletedChildren.String(), aerospike.NewStringValue(childTxHash.String()), aerospike.BoolValue(true)))
-		}
-
-		batchRecords = append(batchRecords, aerospike.NewBatchWrite(
-			s.batchWritePolicy,
-			parent.key,
-			ops...,
-		))
-		parentsList = append(parentsList, parent)
-	}
-
-	// Execute the batch operation with custom batch policy
-	err := s.client.BatchOperate(s.batchPolicy, batchRecords)
-	if err != nil {
-		// Send error to all batch items that have parent updates
-		for _, item := range batch {
-			if len(itemToParents[item]) > 0 {
-				item.errCh <- errors.NewProcessingError("error batch updating parent records", err)
-			}
-		}
-		return
-	}
-
-	// Check individual batch results and send responses to affected items
-	for i, batchRec := range batchRecords {
-		parent := parentsList[i]
-		var itemErr error
-
-		if batchRec.BatchRec().Err != nil {
-			if !errors.Is(batchRec.BatchRec().Err, aerospike.ErrKeyNotFound) {
-				// Real error occurred
-				itemErr = errors.NewProcessingError("error updating parent record", batchRec.BatchRec().Err)
-			}
-			// For ErrKeyNotFound, itemErr remains nil (success)
-		}
-
-		// Send response to all items that depend on this parent
-		for _, item := range parent.batchItems {
-			item.errCh <- itemErr
-		}
-	}
-}
-
-// sendDeleteBatch processes a batch of deletion operations
-func (s *Service) sendDeleteBatch(batch []*batchDelete) {
-	if len(batch) == 0 {
-		return
-	}
-
-	// Log batch deletion for verification
-	// s.logger.Debugf("Sending delete batch of %d records to Aerospike", len(batch))
-
-	// Create batch delete records
-	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(batch))
-	batchDeletePolicy := aerospike.NewBatchDeletePolicy()
-
-	for _, item := range batch {
-		batchRecords = append(batchRecords, aerospike.NewBatchDelete(batchDeletePolicy, item.key))
-	}
-
-	// Execute the batch delete operation with custom batch policy
-	err := s.client.BatchOperate(s.batchPolicy, batchRecords)
-	if err != nil {
-		// Send error to all batch items
-		for _, item := range batch {
-			item.errCh <- errors.NewProcessingError("error batch deleting records", err)
-		}
-
-		return
-	}
-
-	// Check individual batch results and send individual responses
-	successCount := 0
-	alreadyDeletedCount := 0
-	errorCount := 0
-
-	for i, batchRec := range batchRecords {
-		if batchRec.BatchRec().Err != nil {
-			if errors.Is(batchRec.BatchRec().Err, aerospike.ErrKeyNotFound) {
-				// Record not found, treat as success (already deleted)
-				batch[i].errCh <- nil
-				alreadyDeletedCount++
-			} else {
-				// Real error occurred
-				batch[i].errCh <- errors.NewProcessingError("error deleting record for tx %s", batch[i].txHash.String(), batchRec.BatchRec().Err)
-				errorCount++
-			}
-		} else {
-			// Success
-			batch[i].errCh <- nil
-			successCount++
-		}
-	}
-
-	// Log batch results for verification
-	// s.logger.Debugf("Delete batch completed: %d successful, %d already deleted, %d errors (total: %d)",
-	// 	successCount, alreadyDeletedCount, errorCount, len(batch))
-}
-
-func (s *Service) ProcessSingleRecord(txid *chainhash.Hash, inputs []*bt.Input) error {
-	errCh := make(chan error)
-
-	s.parentUpdateBatcher.Put(&batchParentUpdate{
-		txHash: txid,
-		inputs: inputs,
-		errCh:  errCh,
-	})
-
-	return <-errCh
-}
-
 // flushCleanupBatches flushes accumulated parent updates and deletions
-func (s *Service) flushCleanupBatches(ctx context.Context, workerID int, blockHeight uint32, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key) {
+func (s *Service) flushCleanupBatches(ctx context.Context, workerID int, blockHeight uint32, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key) error {
 	if len(parentUpdates) > 0 {
-		s.executeBatchParentUpdates(ctx, workerID, blockHeight, parentUpdates)
+		if err := s.executeBatchParentUpdates(ctx, workerID, blockHeight, parentUpdates); err != nil {
+			return err
+		}
 	}
 	if len(deletions) > 0 {
-		s.executeBatchDeletions(ctx, workerID, blockHeight, deletions)
+		if err := s.executeBatchDeletions(ctx, workerID, blockHeight, deletions); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // extractTxHash extracts the transaction hash from record bins
@@ -807,25 +589,14 @@ func (s *Service) extractInputs(job *cleanup.Job, workerID int, bins aerospike.B
 	return s.getTxInputsFromBins(job, workerID, bins, txHash)
 }
 
-// flushBatches flushes any accumulated parent updates and deletions
-func (s *Service) flushBatches(ctx context.Context, workerID int, blockHeight uint32, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key) {
-	if len(parentUpdates) > 0 {
-		s.executeBatchParentUpdates(ctx, workerID, blockHeight, parentUpdates)
-	}
-	if len(deletions) > 0 {
-		s.executeBatchDeletions(ctx, workerID, blockHeight, deletions)
-	}
-}
-
 // executeBatchParentUpdates executes a batch of parent update operations
-func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, blockHeight uint32, updates map[string]*parentUpdateInfo) {
+func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, blockHeight uint32, updates map[string]*parentUpdateInfo) error {
 	if len(updates) == 0 {
-		return
+		return nil
 	}
 
 	// Convert map to batch operations
 	// Track deleted children by adding child tx hashes to the DeletedChildren map
-	// This matches the approach used in sendParentUpdateBatch (async batcher)
 	mapPolicy := aerospike.DefaultMapPolicy()
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates))
 
@@ -840,10 +611,18 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, b
 		batchRecords = append(batchRecords, aerospike.NewBatchWrite(s.batchWritePolicy, info.key, ops...))
 	}
 
+	// Check context before expensive operation
+	select {
+	case <-ctx.Done():
+		s.logger.Infof("Worker %d: context cancelled, skipping parent update batch", workerID)
+		return ctx.Err()
+	default:
+	}
+
 	// Execute batch
 	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
 		s.logger.Errorf("Worker %d: batch parent update failed: %v", workerID, err)
-		return
+		return errors.NewStorageError("batch parent update failed", err)
 	}
 
 	// Check for errors
@@ -866,16 +645,18 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, b
 		}
 	}
 
-	// if successCount > 0 || notFoundCount > 0 || errorCount > 0 {
-	// 	s.logger.Infof("Worker %d: parent updates - %d successful, %d not found, %d errors",
-	// 		workerID, successCount, notFoundCount, errorCount)
-	// }
+	// Return error if any individual record operations failed
+	if errorCount > 0 {
+		return errors.NewStorageError("Worker %d: %d parent update operations failed", workerID, errorCount)
+	}
+
+	return nil
 }
 
 // executeBatchDeletions executes a batch of deletion operations
-func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, blockHeight uint32, keys []*aerospike.Key) {
+func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, blockHeight uint32, keys []*aerospike.Key) error {
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 
 	// Create batch delete records
@@ -885,10 +666,18 @@ func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, block
 		batchRecords[i] = aerospike.NewBatchDelete(batchDeletePolicy, key)
 	}
 
+	// Check context before expensive operation
+	select {
+	case <-ctx.Done():
+		s.logger.Infof("Worker %d: context cancelled, skipping deletion batch", workerID)
+		return ctx.Err()
+	default:
+	}
+
 	// Execute batch
 	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
 		s.logger.Errorf("Worker %d: batch deletion failed for %d records: %v", workerID, len(keys), err)
-		return
+		return errors.NewStorageError("batch deletion failed", err)
 	}
 
 	// Check for errors and count successes
@@ -910,71 +699,43 @@ func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, block
 		}
 	}
 
-	// s.logger.Infof("Worker %d: deleted %d records (%d already deleted, %d errors)",
-	// 	workerID, successCount, alreadyDeletedCount, errorCount)
+	// Return error if any individual record operations failed
+	if errorCount > 0 {
+		return errors.NewStorageError("Worker %d: %d deletion operations failed", workerID, errorCount)
+	}
+
+	return nil
 }
 
-// processRecordCleanup processes a single record for cleanup using batchers
-func (s *Service) processRecordCleanup(ctx context.Context, job *cleanup.Job, workerID int, rec *aerospike.Result) error {
-	if rec.Err != nil {
-		return errors.NewProcessingError("Worker %d: error reading record for cleanup job %d", workerID, job.BlockHeight, rec.Err)
+// ProcessSingleRecord processes a single transaction for cleanup (for testing/manual cleanup)
+// This is a simplified wrapper around the batch operations for single-record processing
+func (s *Service) ProcessSingleRecord(txHash *chainhash.Hash, inputs []*bt.Input) error {
+	if len(inputs) == 0 {
+		return nil // No parents to update
 	}
 
-	// get all the unique parent records of the record being deleted
-	bins := rec.Record.Bins
-	if bins == nil {
-		return errors.NewProcessingError("Worker %d: missing bins for record in cleanup job %d", workerID, job.BlockHeight)
-	}
+	// Build parent updates map
+	parentUpdates := make(map[string]*parentUpdateInfo)
+	for _, input := range inputs {
+		keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.settings.UtxoStore.UtxoBatchSize)
+		parentKeyStr := string(keySource)
 
-	txIDBytes, ok := bins[fields.TxID.String()].([]byte)
-	if !ok || len(txIDBytes) != 32 {
-		return errors.NewProcessingError("Worker %d: invalid or missing txid for record in cleanup job %d", workerID, job.BlockHeight)
-	}
-
-	txHash, err := chainhash.NewHash(txIDBytes)
-	if err != nil {
-		return errors.NewProcessingError("Worker %d: invalid txid bytes for record in cleanup job %d", workerID, job.BlockHeight)
-	}
-
-	inputs, err := s.getTxInputsFromBins(job, workerID, bins, txHash)
-	if err != nil {
-		return err
-	}
-
-	// inputs could be empty on seeded records, in which case we just delete the record
-	// and do not need to update any parents
-	if len(inputs) > 0 {
-		// Update parents using batcher in goroutine
-		parentErrCh := make(chan error)
-
-		s.parentUpdateBatcher.Put(&batchParentUpdate{
-			txHash: txHash,
-			inputs: inputs,
-			errCh:  parentErrCh,
-		})
-
-		// Wait for parent update to complete
-		if err = <-parentErrCh; err != nil {
-			return errors.NewProcessingError("Worker %d: error updating parents for tx %s in cleanup job %d", workerID, txHash.String(), job.BlockHeight, err)
+		if existing, ok := parentUpdates[parentKeyStr]; ok {
+			existing.childHashes = append(existing.childHashes, txHash)
+		} else {
+			parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
+			if err != nil {
+				return errors.NewProcessingError("failed to create parent key", err)
+			}
+			parentUpdates[parentKeyStr] = &parentUpdateInfo{
+				key:         parentKey,
+				childHashes: []*chainhash.Hash{txHash},
+			}
 		}
 	}
 
-	// Delete the record using batcher in goroutine
-	deleteErrCh := make(chan error)
-
-	s.deleteBatcher.Put(&batchDelete{
-		key:    rec.Record.Key,
-		txHash: txHash,
-		errCh:  deleteErrCh,
-	})
-
-	// Wait for deletion to complete
-	if err = <-deleteErrCh; err != nil {
-		return errors.NewProcessingError("Worker %d: error deleting record for tx %s in cleanup job %d", workerID, txHash.String(), job.BlockHeight, err)
-	}
-
-	// Wait for all operations to complete
-	return nil
+	// Execute parent updates synchronously
+	return s.executeBatchParentUpdates(s.ctx, 0, 0, parentUpdates)
 }
 
 // GetJobs returns a copy of the current jobs list (primarily for testing)
