@@ -219,6 +219,9 @@ func TestService_processCleanupJob(t *testing.T) {
 			DebugfFunc: func(format string, args ...interface{}) {
 				loggedMessages = append(loggedMessages, format)
 			},
+			InfofFunc: func(format string, args ...interface{}) {
+				loggedMessages = append(loggedMessages, format)
+			},
 		}
 
 		db := NewMockDB()
@@ -244,9 +247,10 @@ func TestService_processCleanupJob(t *testing.T) {
 		assert.Nil(t, job.Error)
 
 		// Verify logging
-		assert.Len(t, loggedMessages, 2)
+		assert.Len(t, loggedMessages, 3)
 		assert.Contains(t, loggedMessages[0], "running cleanup job")
-		assert.Contains(t, loggedMessages[1], "cleanup job completed")
+		assert.Contains(t, loggedMessages[1], "starting cleanup scan")
+		assert.Contains(t, loggedMessages[2], "cleanup job completed")
 	})
 
 	t.Run("FailedCleanup", func(t *testing.T) {
