@@ -1076,7 +1076,7 @@ func TestBatchingIntegration(t *testing.T) {
 			require.NoError(t, err)
 
 			job := &cleanup.Job{BlockHeight: 1}
-			processErr := service.processRecordCleanup(job, 0, &aerospike.Result{Record: record})
+			processErr := service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{Record: record})
 			assert.NoError(t, processErr)
 
 			// Verify parent was updated
@@ -1113,7 +1113,7 @@ func TestBatchingIntegration(t *testing.T) {
 			require.NoError(t, err)
 
 			job := &cleanup.Job{BlockHeight: 1}
-			processErr := service.processRecordCleanup(job, 0, &aerospike.Result{Record: record})
+			processErr := service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{Record: record})
 			assert.NoError(t, processErr)
 
 			// Verify transaction record was deleted
@@ -1140,7 +1140,7 @@ func TestBatchingIntegration(t *testing.T) {
 			require.NoError(t, err)
 
 			job := &cleanup.Job{BlockHeight: 1}
-			processErr := service.processRecordCleanup(job, 0, &aerospike.Result{Record: record})
+			processErr := service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{Record: record})
 			assert.Error(t, processErr)
 			assert.Contains(t, processErr.Error(), "not found in external store")
 
@@ -1171,7 +1171,7 @@ func TestBatchingIntegration(t *testing.T) {
 			require.NoError(t, err)
 
 			job := &cleanup.Job{BlockHeight: 1}
-			processErr := service.processRecordCleanup(job, 0, &aerospike.Result{Record: record})
+			processErr := service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{Record: record})
 			assert.Error(t, processErr)
 			assert.Contains(t, processErr.Error(), "invalid tx bytes")
 
@@ -1203,7 +1203,7 @@ func TestBatchingIntegration(t *testing.T) {
 			job := &cleanup.Job{BlockHeight: 1}
 
 			// Test with nil bins
-			err := service.processRecordCleanup(job, 0, &aerospike.Result{
+			err := service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{
 				Record: &aerospike.Record{Bins: nil},
 			})
 			assert.Error(t, err)
@@ -1214,7 +1214,7 @@ func TestBatchingIntegration(t *testing.T) {
 			job := &cleanup.Job{BlockHeight: 1}
 
 			// Test with missing TxID
-			err := service.processRecordCleanup(job, 0, &aerospike.Result{
+			err := service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{
 				Record: &aerospike.Record{
 					Bins: aerospike.BinMap{
 						fields.DeleteAtHeight.String(): 1,
@@ -1225,7 +1225,7 @@ func TestBatchingIntegration(t *testing.T) {
 			assert.Contains(t, err.Error(), "invalid or missing txid")
 
 			// Test with invalid TxID format
-			err = service.processRecordCleanup(job, 0, &aerospike.Result{
+			err = service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{
 				Record: &aerospike.Record{
 					Bins: aerospike.BinMap{
 						fields.TxID.String():           "invalid-txid",
@@ -1237,7 +1237,7 @@ func TestBatchingIntegration(t *testing.T) {
 			assert.Contains(t, err.Error(), "invalid or missing txid")
 
 			// Test with wrong length TxID
-			err = service.processRecordCleanup(job, 0, &aerospike.Result{
+			err = service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{
 				Record: &aerospike.Record{
 					Bins: aerospike.BinMap{
 						fields.TxID.String():           []byte("short"),
@@ -1253,7 +1253,7 @@ func TestBatchingIntegration(t *testing.T) {
 			txHash := chainhash.HashH([]byte("no-inputs-tx"))
 			job := &cleanup.Job{BlockHeight: 1}
 
-			err := service.processRecordCleanup(job, 0, &aerospike.Result{
+			err := service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{
 				Record: &aerospike.Record{
 					Bins: aerospike.BinMap{
 						fields.TxID.String():           txHash.CloneBytes(),
@@ -1271,7 +1271,7 @@ func TestBatchingIntegration(t *testing.T) {
 			txHash := chainhash.HashH([]byte("invalid-inputs-tx"))
 			job := &cleanup.Job{BlockHeight: 1}
 
-			err := service.processRecordCleanup(job, 0, &aerospike.Result{
+			err := service.processRecordCleanup(context.Background(), job, 0, &aerospike.Result{
 				Record: &aerospike.Record{
 					Bins: aerospike.BinMap{
 						fields.TxID.String():           txHash.CloneBytes(),
@@ -1299,7 +1299,7 @@ func TestBatchingIntegration(t *testing.T) {
 				},
 			}
 
-			processErr := service.processRecordCleanup(job, 0, result)
+			processErr := service.processRecordCleanup(context.Background(), job, 0, result)
 			assert.Error(t, processErr)
 			assert.Contains(t, processErr.Error(), "invalid")
 		})
