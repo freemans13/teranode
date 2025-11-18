@@ -375,7 +375,7 @@ func TestHandleWebSocket(t *testing.T) {
 	notificationCh := make(chan *notificationMsg, 1)
 
 	// Create handler
-	handler := s.HandleWebSocket(notificationCh, baseURL)
+	handler := s.HandleWebSocket(notificationCh)
 
 	// Create test server
 	serverReady := make(chan struct{}, 1)

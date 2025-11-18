@@ -501,7 +501,7 @@ func (s *Server) setupHTTPServer() *echo.Echo {
 		return c.String(http.StatusOK, "OK")
 	})
 
-	e.GET("/p2p-ws", s.HandleWebSocket(s.notificationCh, s.AssetHTTPAddressURL))
+	e.GET("/p2p-ws", s.HandleWebSocket(s.notificationCh))
 
 	return e
 }
