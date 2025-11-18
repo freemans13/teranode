@@ -1877,10 +1877,10 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 
 			// Create UnresolvedMetaData slice for batch operation
 			unresolvedParents := make([]*utxo.UnresolvedMetaData, 0, len(parentTxIDs))
-			for i, parentTxID := range parentTxIDs {
+			for parentIdx, parentTxID := range parentTxIDs {
 				unresolvedParents = append(unresolvedParents, &utxo.UnresolvedMetaData{
 					Hash: parentTxID,
-					Idx:  i,
+					Idx:  parentIdx,
 				})
 			}
 
@@ -1897,7 +1897,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 			for _, unresolved := range unresolvedParents {
 				if unresolved.Err != nil {
 					// Parent doesn't exist or error retrieving it
-					b.logger.Debugf("[BlockAssembler][filterTransactionsWithValidParents] Failed to get parent tx %s metadata: %v",
+					b.logger.Errorf("[BlockAssembler][filterTransactionsWithValidParents] Failed to get parent tx %s metadata: %v",
 						unresolved.Hash.String(), unresolved.Err)
 					continue
 				}
@@ -2003,7 +2003,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 						hasInvalidOrdering = true
 						invalidReason = fmt.Sprintf("parent tx %s (index %d) comes after child tx %s (index %d)",
 							parentTxID.String(), parentIdx, tx.Hash.String(), currentIdx)
-						b.logger.Debugf("[BlockAssembler][filterTransactionsWithValidParents] Skipping tx %s: %s", tx.Hash.String(), invalidReason)
+						b.logger.Warnf("[BlockAssembler][filterTransactionsWithValidParents] Skipping tx %s: %s", tx.Hash.String(), invalidReason)
 						break
 					}
 				}
@@ -2021,7 +2021,6 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 				validTxs = append(validTxs, tx)
 			} else {
 				skippedCount++
-				b.logger.Debugf("[BlockAssembler][filterTransactionsWithValidParents] Skipping tx %s: %s", tx.Hash.String(), invalidReason)
 			}
 		}
 	}
