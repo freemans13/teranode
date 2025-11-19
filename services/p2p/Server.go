@@ -213,8 +213,6 @@ func NewServer(
 		return nil, errors.NewServiceError("error getting banlist", err)
 	}
 
-	staticPeers := tSettings.P2P.StaticPeers
-
 	privateKey := tSettings.P2P.PrivateKey
 
 	// Attempt to get the private key if not provided in settings
@@ -314,12 +312,11 @@ func NewServer(
 		Name:               tSettings.ClientName,
 		Logger:             logger,
 		PeerCacheFile:      getPeerCacheFilePath(tSettings.P2P.PeerCacheDir),
-		BootstrapPeers:     staticPeers,
 		RelayPeers:         tSettings.P2P.RelayPeers,
 		ProtocolVersion:    bitcoinProtocolVersion,
 		DHTMode:            tSettings.P2P.DHTMode,
 		DHTCleanupInterval: tSettings.P2P.DHTCleanupInterval,
-		DisableNAT:         tSettings.P2P.DisableNAT,
+		EnableNAT:          tSettings.P2P.EnableNAT,
 		EnableMDNS:         tSettings.P2P.EnableMDNS,
 		AllowPrivateIPs:    tSettings.P2P.AllowPrivateIPs,
 	}
@@ -501,7 +498,7 @@ func (s *Server) setupHTTPServer() *echo.Echo {
 		return c.String(http.StatusOK, "OK")
 	})
 
-	e.GET("/p2p-ws", s.HandleWebSocket(s.notificationCh, s.AssetHTTPAddressURL))
+	e.GET("/p2p-ws", s.HandleWebSocket(s.notificationCh))
 
 	return e
 }
@@ -1641,11 +1638,6 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 			continue
 		}
 
-		// ignore bootstrap server
-		if contains(s.settings.P2P.BootstrapAddresses, sp.ID) {
-			continue
-		}
-
 		banScore, _, _ := s.banManager.GetBanScore(sp.ID)
 
 		var addr string
@@ -1763,10 +1755,24 @@ func (s *Server) RecordBytesDownloaded(ctx context.Context, req *p2p_api.RecordB
 	// Update the peer registry with the new total
 	s.peerRegistry.UpdateNetworkStats(peerID, newTotal)
 
-	s.logger.Debugf("[RecordBytesDownloaded] Updated peer %s: added %d bytes, new total: %d bytes",
-		req.PeerId, req.BytesDownloaded, newTotal)
+	s.logger.Debugf("[RecordBytesDownloaded] Updated peer %s: added %d bytes, new total: %d bytes", req.PeerId, req.BytesDownloaded, newTotal)
 
 	return &p2p_api.RecordBytesDownloadedResponse{Ok: true}, nil
+}
+
+func (s *Server) ResetReputation(ctx context.Context, req *p2p_api.ResetReputationRequest) (*p2p_api.ResetReputationResponse, error) {
+	peersReset := s.peerRegistry.ResetReputation(req.PeerId)
+
+	if req.PeerId == "" {
+		s.logger.Infof("[ResetReputation] Reset reputation for all peers. Count: %d", peersReset)
+	} else {
+		s.logger.Infof("[ResetReputation] Reset reputation for peer %s", req.PeerId)
+	}
+
+	return &p2p_api.ResetReputationResponse{
+		Ok:         true,
+		PeersReset: int32(peersReset),
+	}, nil
 }
 
 // ReportInvalidBlock adds ban score to the peer that sent an invalid block.
