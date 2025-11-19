@@ -381,7 +381,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PrivateKey:         getString("p2p_private_key", "", alternativeContext...),
 			RejectedTxTopic:    getString("p2p_rejected_tx_topic", "", alternativeContext...),
 			StaticPeers:        getMultiString("p2p_static_peers", "|", []string{}, alternativeContext...),
-			RelayPeers:         getMultiString("p2p_relay_peers", "|", []string{}, alternativeContext...),
+			BootstrapPeers:     getMultiString("p2p_bootstrap_peers", "|", []string{}, alternativeContext...),
 			// Peer persistence
 			PeerCacheDir: getString("p2p_peer_cache_dir", "", alternativeContext...), // Empty = binary directory
 			BanThreshold: getInt("p2p_ban_threshold", 100, alternativeContext...),

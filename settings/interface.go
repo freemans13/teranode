@@ -402,8 +402,8 @@ type P2PSettings struct {
 	RejectedTxTopic string
 	SubtreeTopic    string
 
-	StaticPeers []string
-	RelayPeers  []string // Relay peers for NAT traversal (multiaddr strings)
+	StaticPeers    []string
+	BootstrapPeers []string // Bootstrap peers for DHT and relay (multiaddr strings)
 
 	// Peer persistence (from go-p2p improvements)
 	PeerCacheDir string // Directory for peer cache file (empty = binary directory)
