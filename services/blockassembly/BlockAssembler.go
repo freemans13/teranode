@@ -165,8 +165,6 @@ type BlockAssembler struct {
 	// cleanupQueueWorkerStarted tracks if the cleanup queue worker is running
 	cleanupQueueWorkerStarted atomic.Bool
 
-	// unminedCleanupTicker manages periodic cleanup of old unmined transactions
-	unminedCleanupTicker *time.Ticker
 	// cachedCandidate stores the cached mining candidate
 	cachedCandidate *CachedMiningCandidate
 

@@ -398,17 +398,22 @@ func SetupCreatePostgresSchemaSuccessMocks(mockDB *MockDB) {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "preserve_until") && strings.Contains(query, "ADD COLUMN")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 15. DROP CONSTRAINT block_ids_transaction_id_fkey (DO $$ block)
+	// 15. ADD COLUMN last_spender to transactions (DO $$ block)
+	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
+		return strings.Contains(query, "DO $$") && strings.Contains(query, "last_spender") && strings.Contains(query, "ADD COLUMN")
+	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
+
+	// 16. DROP CONSTRAINT block_ids_transaction_id_fkey (DO $$ block)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "block_ids_transaction_id_fkey") && strings.Contains(query, "DROP CONSTRAINT")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 16. ADD CONSTRAINT block_ids_transaction_id_fkey (DO $$ block)
+	// 17. ADD CONSTRAINT block_ids_transaction_id_fkey (DO $$ block)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "block_ids_transaction_id_fkey") && strings.Contains(query, "ADD CONSTRAINT")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 17. CREATE TABLE conflicting_children
+	// 18. CREATE TABLE conflicting_children
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE TABLE IF NOT EXISTS conflicting_children")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
@@ -446,6 +451,7 @@ func SetupCreatePostgresSchemaErrorMocks(mockDB *MockDB, errorAtStep int) {
 		func(q string) bool { return strings.Contains(q, "block_height") && strings.Contains(q, "ADD COLUMN") },
 		func(q string) bool { return strings.Contains(q, "unmined_since") && strings.Contains(q, "ADD COLUMN") },
 		func(q string) bool { return strings.Contains(q, "preserve_until") && strings.Contains(q, "ADD COLUMN") },
+		func(q string) bool { return strings.Contains(q, "last_spender") && strings.Contains(q, "ADD COLUMN") },
 		func(q string) bool {
 			return strings.Contains(q, "block_ids_transaction_id_fkey") && strings.Contains(q, "DROP CONSTRAINT")
 		},

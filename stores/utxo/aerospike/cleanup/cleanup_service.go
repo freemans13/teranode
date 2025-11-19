@@ -351,7 +351,7 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 
 	// Create a query statement
 	stmt := aerospike.NewStatement(s.namespace, s.set)
-	stmt.BinNames = []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String()}
+	stmt.BinNames = []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String(), fields.Utxos.String()}
 
 	// Set the filter to find records with a delete_at_height less than or equal to the safe cleanup height
 	// This will automatically use the index since the filter is on the indexed bin
@@ -379,29 +379,60 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	result := recordset.Results()
 	recordCount := atomic.Int64{}
 
-	g := &errgroup.Group{}
-	util.SafeSetLimit(g, s.maxConcurrentOperations)
+	// Process records in chunks for efficient batch verification of children
+	const chunkSize = 1000
+	chunk := make([]*aerospike.Result, 0, chunkSize)
+
+	// Use errgroup to process chunks in parallel with controlled concurrency
+	chunkGroup := &errgroup.Group{}
+	// Limit parallel chunk processing to avoid overwhelming the system
+	// Allow up to 10 chunks in parallel (10,000 parent records being processed at once)
+	util.SafeSetLimit(chunkGroup, 10)
 
 	for {
 		rec, ok := <-result
 		if !ok || rec == nil {
-			break // No more records
+			// Process final chunk if any
+			if len(chunk) > 0 {
+				finalChunk := make([]*aerospike.Result, len(chunk))
+				copy(finalChunk, chunk)
+
+				chunkGroup.Go(func() error {
+					processed, err := s.processRecordChunk(job, workerID, finalChunk)
+					if err != nil {
+						return err
+					}
+					recordCount.Add(int64(processed))
+					return nil
+				})
+			}
+			break
 		}
 
-		currentRec := rec // capture for goroutine
-		g.Go(func() error {
-			if err := s.processRecordCleanup(job, workerID, currentRec); err != nil {
-				return err
-			}
+		chunk = append(chunk, rec)
 
-			recordCount.Add(1)
+		// Process chunk when full (in parallel)
+		if len(chunk) >= chunkSize {
+			// Copy chunk for goroutine to avoid race
+			currentChunk := make([]*aerospike.Result, len(chunk))
+			copy(currentChunk, chunk)
 
-			return nil
-		})
+			chunkGroup.Go(func() error {
+				processed, err := s.processRecordChunk(job, workerID, currentChunk)
+				if err != nil {
+					return err
+				}
+				recordCount.Add(int64(processed))
+				return nil
+			})
+
+			chunk = chunk[:0] // Reset chunk
+		}
 	}
 
-	if err := g.Wait(); err != nil {
-		s.logger.Errorf(err.Error())
+	// Wait for all parallel chunks to complete
+	if err := chunkGroup.Wait(); err != nil {
+		s.logger.Errorf("Worker %d: error processing chunks: %v", workerID, err)
 		s.markJobAsFailed(job, err)
 		return
 	}
@@ -420,6 +451,189 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 
 	finalRecordCount := recordCount.Load()
 	s.logger.Infof("Worker %d completed cleanup job for block height %d in %v, processed %d records", workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
+}
+
+// processRecordChunk processes a chunk of parent records with batched child verification
+func (s *Service) processRecordChunk(job *cleanup.Job, workerID int, chunk []*aerospike.Result) (int, error) {
+	if len(chunk) == 0 {
+		return 0, nil
+	}
+
+	// Step 1: Extract ALL unique spending children from chunk
+	// For each parent record, we extract all spending child TX hashes from spent UTXOs
+	// We must verify EVERY child is stable before deleting the parent
+	uniqueSpendingChildren := make(map[string][]byte) // hex hash -> bytes
+	parentToChildren := make(map[string][]string)     // parent record key -> child hashes
+
+	for _, rec := range chunk {
+		if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
+			continue
+		}
+
+		// Extract all spending children from this parent's UTXOs
+		utxosRaw, hasUtxos := rec.Record.Bins[fields.Utxos.String()]
+		if !hasUtxos {
+			continue
+		}
+
+		utxosList, ok := utxosRaw.([]interface{})
+		if !ok {
+			continue
+		}
+
+		parentKey := rec.Record.Key.String()
+		childrenForThisParent := make([]string, 0)
+
+		// Scan all UTXOs for spending data
+		for _, utxoRaw := range utxosList {
+			utxoBytes, ok := utxoRaw.([]byte)
+			if !ok || len(utxoBytes) < 68 { // 32 (utxo hash) + 36 (spending data)
+				continue
+			}
+
+			// spending_data starts at byte 32, first 32 bytes of spending_data is child TX hash
+			childTxHashBytes := utxoBytes[32:64]
+
+			// Check if this is actual spending data (not all zeros)
+			hasSpendingData := false
+			for _, b := range childTxHashBytes {
+				if b != 0 {
+					hasSpendingData = true
+					break
+				}
+			}
+
+			if hasSpendingData {
+				hexHash := chainhash.Hash(childTxHashBytes).String()
+				uniqueSpendingChildren[hexHash] = childTxHashBytes
+				childrenForThisParent = append(childrenForThisParent, hexHash)
+			}
+		}
+
+		if len(childrenForThisParent) > 0 {
+			parentToChildren[parentKey] = childrenForThisParent
+		}
+	}
+
+	// Step 2: Batch verify all unique children (single BatchGet call for entire chunk)
+	var safetyMap map[string]bool
+	if len(uniqueSpendingChildren) > 0 {
+		safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, job.BlockHeight)
+		s.logger.Debugf("Worker %d: batch verified %d unique children from chunk of %d records", workerID, len(uniqueSpendingChildren), len(chunk))
+	} else {
+		safetyMap = make(map[string]bool)
+	}
+
+	// Step 3: Process deletions using the safety map
+	g := &errgroup.Group{}
+	// Limit concurrent operations within each chunk to avoid overwhelming Aerospike
+	// Use configured limit, or default to reasonable concurrency (100) if set to 0
+	maxConcurrent := s.settings.UtxoStore.CleanupMaxConcurrentOperations
+	if maxConcurrent == 0 {
+		maxConcurrent = 100 // Default reasonable concurrency for record processing
+	}
+	util.SafeSetLimit(g, maxConcurrent)
+
+	processedCount := atomic.Int64{}
+
+	for _, rec := range chunk {
+		currentRec := rec // capture for goroutine
+		g.Go(func() error {
+			if err := s.processRecordCleanupWithSafetyMap(job, workerID, currentRec, safetyMap, parentToChildren); err != nil {
+				return err
+			}
+
+			processedCount.Add(1)
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return 0, err
+	}
+
+	return int(processedCount.Load()), nil
+}
+
+// processRecordCleanupWithSafetyMap processes a single record using pre-computed safety map
+func (s *Service) processRecordCleanupWithSafetyMap(job *cleanup.Job, workerID int, rec *aerospike.Result, safetyMap map[string]bool, parentToChildren map[string][]string) error {
+	if rec.Err != nil {
+		return errors.NewProcessingError("Worker %d: error reading record for cleanup job %d: %v", workerID, job.BlockHeight, rec.Err)
+	}
+
+	bins := rec.Record.Bins
+	if bins == nil {
+		return errors.NewProcessingError("Worker %d: missing bins for record in cleanup job %d", workerID, job.BlockHeight)
+	}
+
+	txIDBytes, ok := bins[fields.TxID.String()].([]byte)
+	if !ok || len(txIDBytes) != 32 {
+		return errors.NewProcessingError("Worker %d: invalid or missing txid for record in cleanup job %d", workerID, job.BlockHeight)
+	}
+
+	txHash, err := chainhash.NewHash(txIDBytes)
+	if err != nil {
+		return errors.NewProcessingError("Worker %d: invalid txid bytes for record in cleanup job %d", workerID, job.BlockHeight)
+	}
+
+	// Verify ALL spending children are stable before deleting parent
+	// We extract all children from the parent's spent UTXOs and verify EVERY one is stable
+	// If even ONE child is unmined or recently mined, we must keep the parent
+	parentKey := rec.Record.Key.String()
+	childrenHashes, hasChildren := parentToChildren[parentKey]
+
+	if hasChildren && len(childrenHashes) > 0 {
+		// Check if ALL children are safe
+		for _, childHash := range childrenHashes {
+			if !safetyMap[childHash] {
+				// At least one child not yet stable - skip deletion for now
+				// Parent will be reconsidered in future cleanup passes
+				s.logger.Debugf("Worker %d: skipping deletion of parent %s - child %s not yet safe (%d children total)",
+					workerID, txHash.String(), childHash[:8], len(childrenHashes))
+				return nil
+			}
+		}
+
+		s.logger.Debugf("Worker %d: all %d children verified stable for parent %s - proceeding with deletion",
+			workerID, len(childrenHashes), txHash.String())
+	}
+
+	// Safe to delete - proceed with cleanup
+	inputs, err := s.getTxInputsFromBins(job, workerID, bins, txHash)
+	if err != nil {
+		return err
+	}
+
+	// inputs could be empty on seeded records, in which case we just delete the record
+	if len(inputs) > 0 {
+		parentErrCh := make(chan error)
+
+		s.parentUpdateBatcher.Put(&batchParentUpdate{
+			txHash: txHash,
+			inputs: inputs,
+			errCh:  parentErrCh,
+		})
+
+		if err = <-parentErrCh; err != nil {
+			return errors.NewProcessingError("Worker %d: error updating parents for tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+		}
+	}
+
+	// Delete the record
+	deleteErrCh := make(chan error)
+
+	s.deleteBatcher.Put(&batchDelete{
+		key:    rec.Record.Key,
+		txHash: txHash,
+		errCh:  deleteErrCh,
+	})
+
+	if err = <-deleteErrCh; err != nil {
+		return errors.NewProcessingError("Worker %d: error deleting record for tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+	}
+
+	return nil
 }
 
 func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
@@ -669,66 +883,197 @@ func (s *Service) ProcessSingleRecord(txid *chainhash.Hash, inputs []*bt.Input) 
 }
 
 // processRecordCleanup processes a single record for cleanup using batchers
+// Kept for backward compatibility with tests - delegates to chunk processing
 func (s *Service) processRecordCleanup(job *cleanup.Job, workerID int, rec *aerospike.Result) error {
-	if rec.Err != nil {
-		return errors.NewProcessingError("Worker %d: error reading record for cleanup job %d: %v", workerID, job.BlockHeight, rec.Err)
+	// Process as a chunk of 1 for backward compatibility
+	chunk := []*aerospike.Result{rec}
+	_, err := s.processRecordChunk(job, workerID, chunk)
+	return err
+}
+
+// batchVerifyChildrenSafety checks multiple child transactions at once to determine if their parents
+// can be safely deleted. This is much more efficient than checking each child individually.
+//
+// Safety guarantee: A parent can only be deleted if ALL spending children have been mined and stable
+// for at least 288 blocks. This prevents orphaning children by ensuring we never delete a parent while
+// ANY of its spending children might still be reorganized out of the chain.
+//
+// The spending children are extracted from the parent's UTXO spending_data (embedded in each spent UTXO).
+// This ensures we verify EVERY child that spent any output, not just one representative child.
+//
+// Parameters:
+//   - spendingChildrenHashes: Map of child TX hashes to verify (32 bytes each) - ALL unique children
+//   - currentBlockHeight: Current block height for safety window calculation
+//
+// Returns:
+//   - map[string]bool: Map of childHash (hex string) -> isSafe (true = this child is stable)
+func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte, currentBlockHeight uint32) map[string]bool {
+	if len(lastSpenderHashes) == 0 {
+		return make(map[string]bool)
 	}
 
-	// get all the unique parent records of the record being deleted
-	bins := rec.Record.Bins
-	if bins == nil {
-		return errors.NewProcessingError("Worker %d: missing bins for record in cleanup job %d", workerID, job.BlockHeight)
+	safetyMap := make(map[string]bool, len(lastSpenderHashes))
+
+	// Create batch read operations
+	batchPolicy := aerospike.NewBatchPolicy()
+	batchPolicy.MaxRetries = 3
+	batchPolicy.TotalTimeout = 120 * time.Second
+
+	readPolicy := aerospike.NewBatchReadPolicy()
+	readPolicy.ReadModeSC = aerospike.ReadModeSCSession
+
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(lastSpenderHashes))
+	hashToKey := make(map[string]string, len(lastSpenderHashes)) // hex hash -> key for mapping
+
+	for hexHash, hashBytes := range lastSpenderHashes {
+		if len(hashBytes) != 32 {
+			s.logger.Warnf("[batchVerifyChildrenSafety] Invalid hash length for %s", hexHash)
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		childHash, err := chainhash.NewHash(hashBytes)
+		if err != nil {
+			s.logger.Warnf("[batchVerifyChildrenSafety] Failed to create hash: %v", err)
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		key, err := aerospike.NewKey(s.namespace, s.set, childHash[:])
+		if err != nil {
+			s.logger.Warnf("[batchVerifyChildrenSafety] Failed to create key for child %s: %v", childHash.String(), err)
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		batchRecords = append(batchRecords, aerospike.NewBatchRead(
+			readPolicy,
+			key,
+			[]string{fields.UnminedSince.String(), fields.BlockHeights.String()},
+		))
+		hashToKey[hexHash] = key.String()
 	}
 
-	txIDBytes, ok := bins[fields.TxID.String()].([]byte)
-	if !ok || len(txIDBytes) != 32 {
-		return errors.NewProcessingError("Worker %d: invalid or missing txid for record in cleanup job %d", workerID, job.BlockHeight)
+	if len(batchRecords) == 0 {
+		return safetyMap
 	}
 
-	txHash, err := chainhash.NewHash(txIDBytes)
+	// Execute batch operation
+	err := s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
-		return errors.NewProcessingError("Worker %d: invalid txid bytes for record in cleanup job %d", workerID, job.BlockHeight)
+		s.logger.Errorf("[batchVerifyChildrenSafety] Batch operation failed: %v", err)
+		// Mark all as unsafe on batch error
+		for hexHash := range lastSpenderHashes {
+			if _, exists := safetyMap[hexHash]; !exists {
+				safetyMap[hexHash] = false
+			}
+		}
+		return safetyMap
 	}
 
-	inputs, err := s.getTxInputsFromBins(job, workerID, bins, txHash)
-	if err != nil {
-		return err
-	}
+	// Process results - use configured retention setting as safety window
+	safetyWindow := s.settings.GetUtxoStoreBlockHeightRetention()
 
-	// inputs could be empty on seeded records, in which case we just delete the record
-	// and do not need to update any parents
-	if len(inputs) > 0 {
-		// Update parents using batcher in goroutine
-		parentErrCh := make(chan error)
+	for hexHash, keyStr := range hashToKey {
+		// Find the batch record for this key
+		var record *aerospike.BatchRecord
+		for _, batchRec := range batchRecords {
+			if batchRec.BatchRec().Key.String() == keyStr {
+				record = batchRec.BatchRec()
+				break
+			}
+		}
 
-		s.parentUpdateBatcher.Put(&batchParentUpdate{
-			txHash: txHash,
-			inputs: inputs,
-			errCh:  parentErrCh,
-		})
+		if record == nil {
+			safetyMap[hexHash] = false
+			continue
+		}
 
-		// Wait for parent update to complete
-		if err = <-parentErrCh; err != nil {
-			return errors.NewProcessingError("Worker %d: error updating parents for tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+		if record.Err != nil {
+			// Any error (including child not found) → be conservative, don't delete parent
+			// Even if child was deleted, it might be restored during a reorg
+			// We only delete parent after POSITIVE verification of child stability
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		if record.Record == nil || record.Record.Bins == nil {
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		bins := record.Record.Bins
+
+		// Check unmined status
+		unminedSince, hasUnminedSince := bins[fields.UnminedSince.String()]
+		if hasUnminedSince && unminedSince != nil {
+			// Child is unmined, not safe
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		// Check block heights
+		blockHeightsRaw, hasBlockHeights := bins[fields.BlockHeights.String()]
+		if !hasBlockHeights {
+			// No block heights, treat as not safe
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		blockHeightsList, ok := blockHeightsRaw.([]interface{})
+		if !ok || len(blockHeightsList) == 0 {
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		// Find maximum block height
+		var maxChildBlockHeight uint32
+		for _, heightRaw := range blockHeightsList {
+			height, ok := heightRaw.(int)
+			if ok && uint32(height) > maxChildBlockHeight {
+				maxChildBlockHeight = uint32(height)
+			}
+		}
+
+		if maxChildBlockHeight == 0 {
+			safetyMap[hexHash] = false
+			continue
+		}
+
+		// Check if child has been stable long enough
+		if currentBlockHeight < maxChildBlockHeight+safetyWindow {
+			safetyMap[hexHash] = false
+		} else {
+			safetyMap[hexHash] = true
 		}
 	}
 
-	// Delete the record using batcher in goroutine
-	deleteErrCh := make(chan error)
+	s.logger.Debugf("[batchVerifyChildrenSafety] Verified %d children: %d safe, %d not safe",
+		len(safetyMap), countTrue(safetyMap), countFalse(safetyMap))
 
-	s.deleteBatcher.Put(&batchDelete{
-		key:    rec.Record.Key,
-		txHash: txHash,
-		errCh:  deleteErrCh,
-	})
+	return safetyMap
+}
 
-	// Wait for deletion to complete
-	if err = <-deleteErrCh; err != nil {
-		return errors.NewProcessingError("Worker %d: error deleting record for tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+// Helper to count true values in map
+func countTrue(m map[string]bool) int {
+	count := 0
+	for _, v := range m {
+		if v {
+			count++
+		}
 	}
+	return count
+}
 
-	// Wait for all operations to complete
-	return nil
+// Helper to count false values in map
+func countFalse(m map[string]bool) int {
+	count := 0
+	for _, v := range m {
+		if !v {
+			count++
+		}
+	}
+	return count
 }
 
 // GetJobs returns a copy of the current jobs list (primarily for testing)

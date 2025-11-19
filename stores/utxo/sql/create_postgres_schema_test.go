@@ -224,12 +224,26 @@ func TestCreatePostgresSchema_ErrorAtPreserveUntilColumnAdd(t *testing.T) {
 	assert.Contains(t, err.Error(), "could not add preserve_until column to transactions table")
 }
 
+func TestCreatePostgresSchema_ErrorAtLastSpender(t *testing.T) {
+	mockDB := CreateMockDBForSchema()
+	defer mockDB.AssertExpectations(t)
+
+	// Setup error at step 14 (last_spender column add)
+	SetupCreatePostgresSchemaErrorMocks(mockDB, 14)
+
+	udb := &usql.DB{DB: nil}
+	err := createPostgresSchemaWithMockDB(udb, mockDB)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "could not add last_spender column to transactions table")
+}
+
 func TestCreatePostgresSchema_ErrorAtBlockIDsConstraintDrop(t *testing.T) {
 	mockDB := CreateMockDBForSchema()
 	defer mockDB.AssertExpectations(t)
 
-	// Setup error at step 14 (block_ids constraint drop)
-	SetupCreatePostgresSchemaErrorMocks(mockDB, 14)
+	// Setup error at step 15 (block_ids constraint drop) - was 14, now 15 due to last_spender
+	SetupCreatePostgresSchemaErrorMocks(mockDB, 15)
 
 	udb := &usql.DB{DB: nil}
 	err := createPostgresSchemaWithMockDB(udb, mockDB)
@@ -242,8 +256,8 @@ func TestCreatePostgresSchema_ErrorAtBlockIDsConstraintAdd(t *testing.T) {
 	mockDB := CreateMockDBForSchema()
 	defer mockDB.AssertExpectations(t)
 
-	// Setup error at step 15 (block_ids constraint add)
-	SetupCreatePostgresSchemaErrorMocks(mockDB, 15)
+	// Setup error at step 16 (block_ids constraint add) - was 15, now 16 due to last_spender
+	SetupCreatePostgresSchemaErrorMocks(mockDB, 16)
 
 	udb := &usql.DB{DB: nil}
 	err := createPostgresSchemaWithMockDB(udb, mockDB)
@@ -256,8 +270,8 @@ func TestCreatePostgresSchema_ErrorAtConflictingChildrenTable(t *testing.T) {
 	mockDB := CreateMockDBForSchema()
 	defer mockDB.AssertExpectations(t)
 
-	// Setup error at step 16 (conflicting_children table creation)
-	SetupCreatePostgresSchemaErrorMocks(mockDB, 16)
+	// Setup error at step 17 (conflicting_children table creation) - was 16, now 17 due to last_spender
+	SetupCreatePostgresSchemaErrorMocks(mockDB, 17)
 
 	udb := &usql.DB{DB: nil}
 	err := createPostgresSchemaWithMockDB(udb, mockDB)
@@ -491,6 +505,19 @@ func createPostgresSchemaTestWrapper(db interface {
 	`); err != nil {
 		_ = db.Close()
 		return NewStorageError("could not add preserve_until column to transactions table - [%+v]", err)
+	}
+
+	// Add last_spender column to transactions table if it doesn't exist
+	if _, err := db.Exec(`
+		DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'transactions' AND column_name = 'last_spender') THEN
+				ALTER TABLE transactions ADD COLUMN last_spender BYTEA;
+			END IF;
+		END $$;
+	`); err != nil {
+		_ = db.Close()
+		return NewStorageError("could not add last_spender column to transactions table - [%+v]", err)
 	}
 
 	// Drop the existing foreign key constraint if it exists

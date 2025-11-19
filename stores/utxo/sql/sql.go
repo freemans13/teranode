@@ -1016,42 +1016,51 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 }
 
 func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) error {
-	// doing 2 updates is the only thing that works in both postgres and sqlite
-	qSetDAH := `
+	if s.settings.GetUtxoStoreBlockHeightRetention() == 0 {
+		return nil
+	}
+
+	// check whether the transaction has any unspent outputs
+	qUnspent := `
+		SELECT count(o.idx), t.conflicting
+		FROM transactions t
+		LEFT JOIN outputs o ON t.id = o.transaction_id
+		   AND o.spending_data IS NULL
+		WHERE t.id = $1
+		GROUP BY t.id
+	`
+
+	var (
+		unspent              int
+		conflicting          bool
+		deleteAtHeightOrNull sql.NullInt64
+	)
+
+	if err := txn.QueryRowContext(ctx, qUnspent, transactionID).Scan(&unspent, &conflicting); err != nil {
+		return errors.NewStorageError("[setDAH] error checking for unspent outputs for %d", transactionID, err)
+	}
+
+	if unspent == 0 || conflicting {
+		// Transaction is fully spent or conflicting
+		// Set DAH at normal retention - cleanup service will verify child stability (288 blocks)
+		// before actually deleting, providing the real safety guarantee
+		conservativeRetention := s.settings.GetUtxoStoreBlockHeightRetention()
+		_ = deleteAtHeightOrNull.Scan(int64(s.blockHeight.Load() + conservativeRetention))
+
+		// Note: We do NOT track spending children separately
+		// They are derived from outputs.spending_data when needed by cleanup
+		// This ensures we verify ALL children (not just one) before parent deletion
+	}
+
+	// Update delete_at_height
+	qUpdate := `
 		UPDATE transactions
 		SET delete_at_height = $2
 		WHERE id = $1
 	`
 
-	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 {
-		// check whether the transaction has any unspent outputs
-		qUnspent := `
-			SELECT count(o.idx), t.conflicting
-			FROM transactions t
-			LEFT JOIN outputs o ON t.id = o.transaction_id
-			   AND o.spending_data IS NULL
-			WHERE t.id = $1
-			GROUP BY t.id
-		`
-
-		var (
-			unspent              int
-			conflicting          bool
-			deleteAtHeightOrNull sql.NullInt64
-		)
-
-		if err := txn.QueryRowContext(ctx, qUnspent, transactionID).Scan(&unspent, &conflicting); err != nil {
-			return errors.NewStorageError("[setDAH] error checking for unspent outputs for %d", transactionID, err)
-		}
-
-		if unspent == 0 || conflicting {
-			// Now mark the transaction as tombstoned if there are no more unspent outputs
-			_ = deleteAtHeightOrNull.Scan(int64(s.blockHeight.Load() + s.settings.GetUtxoStoreBlockHeightRetention()))
-		}
-
-		if _, err := txn.ExecContext(ctx, qSetDAH, transactionID, deleteAtHeightOrNull); err != nil {
-			return errors.NewStorageError("[setDAH] error setting DAH for %d", transactionID, err)
-		}
+	if _, err := txn.ExecContext(ctx, qUpdate, transactionID, deleteAtHeightOrNull); err != nil {
+		return errors.NewStorageError("[setDAH] error setting DAH for %d", transactionID, err)
 	}
 
 	return nil
@@ -2078,6 +2087,7 @@ func createPostgresSchemaImpl(db DBExecutor) error {
         ,delete_at_height BIGINT
         ,unmined_since    BIGINT
         ,preserve_until   BIGINT
+        ,last_spender     BYTEA
         ,inserted_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 	  );
 	`); err != nil {
@@ -2273,6 +2283,19 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not add preserve_until column to transactions table - [%+v]", err)
 	}
 
+	// Add last_spender column to transactions table if it doesn't exist
+	if _, err := db.Exec(`
+		DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'transactions' AND column_name = 'last_spender') THEN
+				ALTER TABLE transactions ADD COLUMN last_spender BYTEA;
+			END IF;
+		END $$;
+	`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not add last_spender column to transactions table - [%+v]", err)
+	}
+
 	// Drop the existing foreign key constraint if it exists
 	if _, err := db.Exec(`
 		DO $$
@@ -2341,6 +2364,7 @@ func createSqliteSchema(db *usql.DB) error {
         ,delete_at_height BIGINT
         ,unmined_since    BIGINT
         ,preserve_until   BIGINT
+        ,last_spender     BLOB
         ,inserted_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 	  );
 	`); err != nil {
@@ -2609,6 +2633,38 @@ func createSqliteSchema(db *usql.DB) error {
 		`); err != nil {
 			_ = db.Close()
 			return errors.NewStorageError("could not add preserve_until column to transactions table - [%+v]", err)
+		}
+	}
+
+	// Check if we need to add the last_spender column to transactions table
+	rows, err = db.Query(`
+		SELECT COUNT(*)
+		FROM pragma_table_info('transactions')
+		WHERE name = 'last_spender'
+	`)
+	if err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not check transactions table for last_spender column - [%+v]", err)
+	}
+
+	var lastSpenderColumnCount int
+
+	if rows.Next() {
+		if err := rows.Scan(&lastSpenderColumnCount); err != nil {
+			_ = db.Close()
+			return errors.NewStorageError("could not scan last_spender column count - [%+v]", err)
+		}
+	}
+
+	rows.Close()
+
+	// Add last_spender column if it doesn't exist
+	if lastSpenderColumnCount == 0 {
+		if _, err := db.Exec(`
+			ALTER TABLE transactions ADD COLUMN last_spender BLOB;
+		`); err != nil {
+			_ = db.Close()
+			return errors.NewStorageError("could not add last_spender column to transactions table - [%+v]", err)
 		}
 	}
 

@@ -1842,3 +1842,293 @@ func TestSetPersistedHeightGetter(t *testing.T) {
 		t.Fatal("Cleanup should complete within 5 seconds")
 	}
 }
+
+// TestChildStabilitySafety tests the delete-at-height-safely feature
+func TestChildStabilitySafety(t *testing.T) {
+	logger := ulogger.New("test")
+	ctx := context.Background()
+
+	container, err := aeroTest.RunContainer(ctx)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		err = container.Terminate(ctx)
+		require.NoError(t, err)
+	})
+
+	host, err := container.Host(ctx)
+	require.NoError(t, err)
+
+	port, err := container.ServicePort(ctx)
+	require.NoError(t, err)
+
+	client, err := uaerospike.NewClient(host, port)
+	require.NoError(t, err)
+
+	namespace := "test"
+	set := "test"
+
+	mockIndexWaiter := &MockIndexWaiter{
+		Client:    client,
+		Namespace: namespace,
+		Set:       set,
+	}
+
+	tSettings := createTestSettings()
+	tSettings.GlobalBlockHeightRetention = 288
+
+	service, err := NewService(tSettings, Options{
+		Logger:        logger,
+		Client:        client,
+		ExternalStore: memory.New(),
+		Namespace:     namespace,
+		Set:           set,
+		WorkerCount:   1,
+		IndexWaiter:   mockIndexWaiter,
+	})
+	require.NoError(t, err)
+
+	service.Start(ctx)
+	defer func() {
+		_ = service.Stop(ctx)
+	}()
+
+	t.Run("ParentDeletionBlockedWhenChildUnmined", func(t *testing.T) {
+		// Create parent transaction that's fully spent and eligible for deletion
+		parentTxHash := chainhash.HashH([]byte("parent-tx-unmined-child"))
+		parentKey, _ := aerospike.NewKey(namespace, set, parentTxHash[:])
+
+		// Create child transaction that spent the parent, but is unmined
+		childTxHash := chainhash.HashH([]byte("child-tx-unmined"))
+		childKey, _ := aerospike.NewKey(namespace, set, childTxHash[:])
+
+		writePolicy := aerospike.NewWritePolicy(0, 0)
+
+		// Create child first - unmined
+		err = client.Put(writePolicy, childKey, aerospike.BinMap{
+			fields.TxID.String():         childTxHash.CloneBytes(),
+			fields.UnminedSince.String(): 290, // Unmined since height 290
+		})
+		require.NoError(t, err)
+
+		// Create UTXO bytes: 32 bytes UTXO hash + 32 bytes spending child hash
+		utxoBytes := make([]byte, 68) // 32 (utxo hash) + 32 (child tx hash) + 4 (other data)
+		copy(utxoBytes[0:32], []byte("utxo-hash-placeholder-32bytes!!"))
+		copy(utxoBytes[32:64], childTxHash.CloneBytes()) // Child TX hash at bytes 32-64
+
+		// Create parent with deleteAtHeight and Utxos containing spending data
+		err = client.Put(writePolicy, parentKey, aerospike.BinMap{
+			fields.TxID.String():           parentTxHash.CloneBytes(),
+			fields.DeleteAtHeight.String(): 300,
+			fields.BlockHeights.String():   []interface{}{10}, // Mined at height 10
+			fields.Utxos.String():          []interface{}{utxoBytes},
+			fields.Inputs.String():         []interface{}{}, // Empty inputs for simplicity
+		})
+		require.NoError(t, err)
+
+		// Try to clean up at height 300
+		done := make(chan string, 1)
+		err = service.UpdateBlockHeight(300, done)
+		require.NoError(t, err)
+
+		<-done
+
+		// Verify parent was NOT deleted (child is unmined)
+		record, err := client.Get(nil, parentKey)
+		assert.NoError(t, err)
+		assert.NotNil(t, record, "Parent should NOT be deleted when child is unmined")
+	})
+
+	t.Run("AllChildrenMustBeStable", func(t *testing.T) {
+		// Create parent with multiple children - some stable, some not
+		parentTxHash := chainhash.HashH([]byte("parent-multi-children"))
+		parentKey, _ := aerospike.NewKey(namespace, set, parentTxHash[:])
+
+		writePolicy := aerospike.NewWritePolicy(0, 0)
+
+		// Create child 1 - stable (mined at height 50, now at 388 = 338 blocks old)
+		child1TxHash := chainhash.HashH([]byte("stable-child-1"))
+		child1Key, _ := aerospike.NewKey(namespace, set, child1TxHash[:])
+		err = client.Put(writePolicy, child1Key, aerospike.BinMap{
+			fields.TxID.String():         child1TxHash.CloneBytes(),
+			fields.BlockHeights.String(): []interface{}{50}, // Stable
+		})
+		require.NoError(t, err)
+
+		// Create child 2 - NOT stable (mined at height 200, now at 388 = only 188 blocks old)
+		child2TxHash := chainhash.HashH([]byte("unstable-child-2"))
+		child2Key, _ := aerospike.NewKey(namespace, set, child2TxHash[:])
+		err = client.Put(writePolicy, child2Key, aerospike.BinMap{
+			fields.TxID.String():         child2TxHash.CloneBytes(),
+			fields.BlockHeights.String(): []interface{}{200}, // NOT stable (< 288 blocks old)
+		})
+		require.NoError(t, err)
+
+		// Create UTXO bytes for both outputs
+		utxo1Bytes := make([]byte, 68)
+		copy(utxo1Bytes[0:32], []byte("utxo1-hash-placeholder-32bytes!"))
+		copy(utxo1Bytes[32:64], child1TxHash.CloneBytes())
+
+		utxo2Bytes := make([]byte, 68)
+		copy(utxo2Bytes[0:32], []byte("utxo2-hash-placeholder-32bytes!"))
+		copy(utxo2Bytes[32:64], child2TxHash.CloneBytes())
+
+		// Parent fully spent at height 100, eligible for deletion at 100+288=388
+		err = client.Put(writePolicy, parentKey, aerospike.BinMap{
+			fields.TxID.String():           parentTxHash.CloneBytes(),
+			fields.DeleteAtHeight.String(): 388,
+			fields.BlockHeights.String():   []interface{}{100},
+			fields.Utxos.String():          []interface{}{utxo1Bytes, utxo2Bytes},
+			fields.Inputs.String():         []interface{}{},
+		})
+		require.NoError(t, err)
+
+		// Try to clean up at height 388
+		done := make(chan string, 1)
+		err = service.UpdateBlockHeight(388, done)
+		require.NoError(t, err)
+
+		<-done
+
+		// Verify parent was NOT deleted (child 2 is not stable)
+		record, err := client.Get(nil, parentKey)
+		assert.NoError(t, err)
+		assert.NotNil(t, record, "Parent should NOT be deleted when ANY child is unstable")
+	})
+
+	t.Run("SafetyWindow288Blocks", func(t *testing.T) {
+		// Test exact 288-block boundary
+		parentTxHash := chainhash.HashH([]byte("parent-288-boundary"))
+		parentKey, _ := aerospike.NewKey(namespace, set, parentTxHash[:])
+
+		writePolicy := aerospike.NewWritePolicy(0, 0)
+
+		// Create child mined at height 212 (at cleanup height 500, child is exactly 288 blocks old)
+		childTxHash := chainhash.HashH([]byte("child-288-boundary"))
+		childKey, _ := aerospike.NewKey(namespace, set, childTxHash[:])
+		err = client.Put(writePolicy, childKey, aerospike.BinMap{
+			fields.TxID.String():         childTxHash.CloneBytes(),
+			fields.BlockHeights.String(): []interface{}{212}, // 500 - 212 = 288 blocks
+		})
+		require.NoError(t, err)
+
+		// Create UTXO bytes with child spending data
+		utxoBytes := make([]byte, 68)
+		copy(utxoBytes[0:32], []byte("utxo-hash-placeholder-32bytes!!"))
+		copy(utxoBytes[32:64], childTxHash.CloneBytes())
+
+		// Parent eligible for deletion at height 500
+		err = client.Put(writePolicy, parentKey, aerospike.BinMap{
+			fields.TxID.String():           parentTxHash.CloneBytes(),
+			fields.DeleteAtHeight.String(): 500,
+			fields.BlockHeights.String():   []interface{}{200},
+			fields.Utxos.String():          []interface{}{utxoBytes},
+			fields.Inputs.String():         []interface{}{},
+		})
+		require.NoError(t, err)
+
+		// Clean up at height 500 (child is exactly 288 blocks old - should be safe)
+		done := make(chan string, 1)
+		err = service.UpdateBlockHeight(500, done)
+		require.NoError(t, err)
+
+		<-done
+
+		// Verify parent WAS deleted (child is exactly 288 blocks old = stable)
+		record, err := client.Get(nil, parentKey)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+		assert.Nil(t, record, "Parent SHOULD be deleted when child is >= 288 blocks old")
+	})
+
+	t.Run("SafetyWindow287BlocksNotSafe", func(t *testing.T) {
+		// Test 287 blocks - should NOT be safe
+		parentTxHash := chainhash.HashH([]byte("parent-287-blocks"))
+		parentKey, _ := aerospike.NewKey(namespace, set, parentTxHash[:])
+
+		writePolicy := aerospike.NewWritePolicy(0, 0)
+
+		// Child mined at height 213 (at cleanup height 500, child is only 287 blocks old)
+		childTxHash := chainhash.HashH([]byte("child-287-blocks"))
+		childKey, _ := aerospike.NewKey(namespace, set, childTxHash[:])
+		err = client.Put(writePolicy, childKey, aerospike.BinMap{
+			fields.TxID.String():         childTxHash.CloneBytes(),
+			fields.BlockHeights.String(): []interface{}{213}, // 500 - 213 = 287 blocks (NOT safe)
+		})
+		require.NoError(t, err)
+
+		// Create UTXO bytes with child spending data
+		utxoBytes := make([]byte, 68)
+		copy(utxoBytes[0:32], []byte("utxo-hash-placeholder-32bytes!!"))
+		copy(utxoBytes[32:64], childTxHash.CloneBytes())
+
+		err = client.Put(writePolicy, parentKey, aerospike.BinMap{
+			fields.TxID.String():           parentTxHash.CloneBytes(),
+			fields.DeleteAtHeight.String(): 500,
+			fields.BlockHeights.String():   []interface{}{200},
+			fields.Utxos.String():          []interface{}{utxoBytes},
+			fields.Inputs.String():         []interface{}{},
+		})
+		require.NoError(t, err)
+
+		// Clean up at height 500
+		done := make(chan string, 1)
+		err = service.UpdateBlockHeight(500, done)
+		require.NoError(t, err)
+
+		<-done
+
+		// Verify parent was NOT deleted (child is only 287 blocks old)
+		record, err := client.Get(nil, parentKey)
+		assert.NoError(t, err)
+		assert.NotNil(t, record, "Parent should NOT be deleted when child is < 288 blocks old")
+	})
+
+	t.Run("AllChildrenStableAllowsDeletion", func(t *testing.T) {
+		// When ALL children are stable, parent should be deleted
+		parentTxHash := chainhash.HashH([]byte("parent-all-stable"))
+		parentKey, _ := aerospike.NewKey(namespace, set, parentTxHash[:])
+
+		writePolicy := aerospike.NewWritePolicy(0, 0)
+
+		// Create 3 children - all stable (mined at height 200, now at 600 = 400 blocks old)
+		var utxoBytesList []interface{}
+		for i := 0; i < 3; i++ {
+			childTxHash := chainhash.HashH([]byte(fmt.Sprintf("stable-child-%d", i)))
+			childKey, _ := aerospike.NewKey(namespace, set, childTxHash[:])
+			err = client.Put(writePolicy, childKey, aerospike.BinMap{
+				fields.TxID.String():         childTxHash.CloneBytes(),
+				fields.BlockHeights.String(): []interface{}{200}, // 600 - 200 = 400 blocks (stable)
+			})
+			require.NoError(t, err)
+
+			// Create UTXO bytes with this child's spending data
+			utxoBytes := make([]byte, 68)
+			copy(utxoBytes[0:32], []byte(fmt.Sprintf("utxo%d-hash-placeholder-32byte", i)))
+			copy(utxoBytes[32:64], childTxHash.CloneBytes())
+			utxoBytesList = append(utxoBytesList, utxoBytes)
+		}
+
+		err = client.Put(writePolicy, parentKey, aerospike.BinMap{
+			fields.TxID.String():           parentTxHash.CloneBytes(),
+			fields.DeleteAtHeight.String(): 600,
+			fields.BlockHeights.String():   []interface{}{100},
+			fields.Utxos.String():          utxoBytesList,
+			fields.Inputs.String():         []interface{}{},
+		})
+		require.NoError(t, err)
+
+		// Clean up at height 600
+		done := make(chan string, 1)
+		err = service.UpdateBlockHeight(600, done)
+		require.NoError(t, err)
+
+		<-done
+
+		// Verify parent WAS deleted (all children are stable)
+		record, err := client.Get(nil, parentKey)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+		assert.Nil(t, record, "Parent SHOULD be deleted when ALL children are stable")
+	})
+}

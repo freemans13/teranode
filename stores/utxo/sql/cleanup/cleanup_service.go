@@ -25,6 +25,7 @@ const (
 
 // Service implements the utxo.CleanupService interface for SQL-based UTXO stores
 type Service struct {
+	safetyWindow       uint32 // Block height retention for child stability verification
 	logger             ulogger.Logger
 	settings           *settings.Settings
 	db                 *usql.DB
@@ -49,6 +50,10 @@ type Options struct {
 
 	// Ctx is the context to use to signal shutdown
 	Ctx context.Context
+
+	// SafetyWindow is the number of blocks a child must be stable before parent deletion
+	// If not specified, defaults to global_blockHeightRetention (288 blocks)
+	SafetyWindow uint32
 }
 
 // NewService creates a new cleanup service for the SQL store
@@ -75,11 +80,18 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		maxJobsHistory = DefaultMaxJobsHistory
 	}
 
+	safetyWindow := opts.SafetyWindow
+	if safetyWindow == 0 {
+		// Default to global retention setting (288 blocks)
+		safetyWindow, _ = gocore.Config().GetUint32("global_blockHeightRetention", 288)
+	}
+
 	service := &Service{
-		logger:   opts.Logger,
-		settings: tSettings,
-		db:       opts.DB,
-		ctx:      opts.Ctx,
+		safetyWindow: safetyWindow,
+		logger:       opts.Logger,
+		settings:     tSettings,
+		db:           opts.DB,
+		ctx:          opts.Ctx,
 	}
 
 	// Create the job processor function
@@ -179,7 +191,7 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	}
 
 	// Execute the cleanup with safe height
-	err := deleteTombstoned(s.db, safeCleanupHeight)
+	err := s.deleteTombstoned(safeCleanupHeight)
 
 	if err != nil {
 		job.SetStatus(cleanup.JobStatusFailed)
@@ -207,11 +219,54 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 }
 
 // deleteTombstoned removes transactions that have passed their expiration time.
-func deleteTombstoned(db *usql.DB, blockHeight uint32) error {
+// Only deletes parent transactions if their last spending child is mined and stable.
+func (s *Service) deleteTombstoned(blockHeight uint32) error {
+	// Use configured safety window from settings
+	safetyWindow := s.safetyWindow
+
 	// Delete transactions that have passed their expiration time
-	// this will cascade to inputs, outputs, block_ids and conflicting_children
-	if _, err := db.Exec("DELETE FROM transactions WHERE delete_at_height <= $1", blockHeight); err != nil {
+	// Only delete if ALL spending children are verified as stable
+	// This prevents orphaning any child transaction
+
+	deleteQuery := `
+		DELETE FROM transactions
+		WHERE id IN (
+			SELECT t.id
+			FROM transactions t
+			WHERE t.delete_at_height IS NOT NULL
+			  AND t.delete_at_height <= $1
+			  AND NOT EXISTS (
+			    -- Find ANY unstable child - if found, parent cannot be deleted
+			    -- This ensures ALL children must be stable before parent deletion
+			    SELECT 1
+			    FROM outputs o
+			    WHERE o.transaction_id = t.id
+			      AND o.spending_data IS NOT NULL
+			      AND (
+			        -- Extract child TX hash from spending_data (first 32 bytes)
+			        -- Check if this child is NOT stable
+			        NOT EXISTS (
+			          SELECT 1
+			          FROM transactions child
+			          INNER JOIN block_ids child_blocks ON child.id = child_blocks.transaction_id
+			          WHERE child.hash = substr(o.spending_data, 1, 32)
+			            AND child.unmined_since IS NULL  -- Child must be mined
+			            AND child_blocks.block_height <= ($1 - $2)  -- Child must be stable
+			        )
+			      )
+			  )
+		)
+	`
+
+	result, err := s.db.Exec(deleteQuery, blockHeight, safetyWindow)
+	if err != nil {
 		return errors.NewStorageError("failed to delete transactions", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err == nil && rowsAffected > 0 {
+		// Log how many were deleted (useful for monitoring)
+		// Note: logger not available in this function, would need to be passed in
 	}
 
 	return nil
