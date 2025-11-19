@@ -564,7 +564,7 @@ func TestAerospike(t *testing.T) {
 
 		// Now call SetMinedMulti
 		blockIDsMap, err := store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{
-			BlockID: 1, BlockHeight: 123, SubtreeIdx: 1,
+			BlockID: 1, BlockHeight: 123, SubtreeIdx: 1, OnLongestChain: true,
 		})
 		require.NoError(t, err)
 		require.Equal(t, 1, len(blockIDsMap))
@@ -1598,7 +1598,7 @@ func TestCreateZeroSat(t *testing.T) {
 
 	// Now setMined and check the DAH is not set
 	blockIDsMap, err := store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{
-		BlockID: 1, BlockHeight: 123, SubtreeIdx: 1,
+		BlockID: 1, BlockHeight: 123, SubtreeIdx: 1, OnLongestChain: true,
 	})
 	require.NoError(t, err)
 	require.Len(t, blockIDsMap, 1)
@@ -2281,8 +2281,9 @@ func TestDeletedChildren(t *testing.T) {
 	)
 
 	_, err := store.Create(ctx, coinbaseTx, 0, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
-		BlockID:     1,
-		BlockHeight: 1,
+		BlockID:        1,
+		BlockHeight:    1,
+		OnLongestChain: true,
 	}))
 	require.NoError(t, err)
 
@@ -2300,8 +2301,9 @@ func TestDeletedChildren(t *testing.T) {
 	parentTx := transactions.Create(t, parentTxOptions...)
 
 	_, err = store.Create(ctx, parentTx, 0, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
-		BlockID:     1,
-		BlockHeight: 1,
+		BlockID:        1,
+		BlockHeight:    1,
+		OnLongestChain: true,
 	}))
 	require.NoError(t, err)
 
@@ -2322,8 +2324,9 @@ func TestDeletedChildren(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = store.Create(ctx, childTx, 0, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
-		BlockID:     1,
-		BlockHeight: 1,
+		BlockID:        1,
+		BlockHeight:    1,
+		OnLongestChain: true,
 	}))
 
 	require.NoError(t, err)

@@ -248,6 +248,7 @@ func TestStore_IncrementSpentRecords(t *testing.T) {
 			fields.SpentUtxos.String():     2,
 			fields.BlockIDs.String():       []int{101},
 			fields.TotalExtraRecs.String(): 2,
+			fields.UnminedSince.String():   nil, // Clear unminedSince to simulate transaction on longest chain
 		})
 		require.NoError(t, err)
 
