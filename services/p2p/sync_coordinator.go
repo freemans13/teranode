@@ -500,7 +500,7 @@ func (sc *SyncCoordinator) logCandidateList(candidates []*PeerInfo) {
 func (sc *SyncCoordinator) periodicEvaluation(ctx context.Context) {
 	defer sc.wg.Done()
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(sc.settings.P2P.SyncCoordinatorPeriodicEvaluationInterval)
 	defer ticker.Stop()
 
 	for {
