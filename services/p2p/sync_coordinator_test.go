@@ -2,8 +2,6 @@ package p2p
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,7 +208,6 @@ func TestSyncCoordinator_TriggerSync(t *testing.T) {
 	registry.AddPeer(peerID, "")
 	registry.UpdateHeight(peerID, 110, "hash")
 	registry.UpdateDataHubURL(peerID, "http://test.com")
-	registry.UpdateURLResponsiveness(peerID, true)
 
 	// Trigger sync
 	err := sc.TriggerSync()
@@ -367,7 +364,6 @@ func TestSyncCoordinator_HandleCatchupFailure(t *testing.T) {
 	registry.AddPeer(newPeer, "")
 	registry.UpdateHeight(newPeer, 110, "hash")
 	registry.UpdateDataHubURL(newPeer, "http://test.com")
-	registry.UpdateURLResponsiveness(newPeer, true)
 
 	sc.SetGetLocalHeightCallback(func() uint32 {
 		return 100
@@ -411,17 +407,17 @@ func TestSyncCoordinator_selectNewSyncPeer(t *testing.T) {
 	registry.AddPeer(peer1, "")
 	registry.UpdateHeight(peer1, 105, "hash1")
 	registry.UpdateDataHubURL(peer1, "http://peer1.com")
-	registry.UpdateURLResponsiveness(peer1, false) // Not responsive
 
 	registry.AddPeer(peer2, "")
 	registry.UpdateHeight(peer2, 110, "hash2")
 	registry.UpdateDataHubURL(peer2, "http://peer2.com")
-	registry.UpdateURLResponsiveness(peer2, true) // Responsive
+	// Give peer2 better reputation to ensure it's selected
+	registry.UpdateReputation(peer2, 80.0)
 
 	// Select new sync peer
 	selected := sc.selectNewSyncPeer()
 
-	// Should select peer2 (responsive and higher)
+	// Should select peer2 (higher reputation and higher height)
 	assert.Equal(t, peer2, selected)
 }
 
@@ -456,14 +452,12 @@ func TestSyncCoordinator_selectNewSyncPeer_ForcedPeer(t *testing.T) {
 	registry.AddPeer(forcedPeer, "")
 	registry.UpdateHeight(forcedPeer, 110, "hash")
 	registry.UpdateDataHubURL(forcedPeer, "http://forced.com")
-	registry.UpdateURLResponsiveness(forcedPeer, true)
 
 	// Add another better peer
 	betterPeer := peer.ID("better-peer")
 	registry.AddPeer(betterPeer, "")
 	registry.UpdateHeight(betterPeer, 120, "hash2")
 	registry.UpdateDataHubURL(betterPeer, "http://better.com")
-	registry.UpdateURLResponsiveness(betterPeer, true)
 
 	// Should select forced peer
 	selected := sc.selectNewSyncPeer()
@@ -541,110 +535,6 @@ func TestSyncCoordinator_UpdateBanStatus(t *testing.T) {
 	assert.Equal(t, 100, info.BanScore)
 }
 
-func TestSyncCoordinator_checkURLResponsiveness(t *testing.T) {
-	// Create test HTTP server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	logger := ulogger.New("test")
-	settings := CreateTestSettings()
-	registry := NewPeerRegistry()
-	selector := NewPeerSelector(logger, nil)
-	banManager := NewPeerBanManager(context.Background(), nil, settings, registry)
-	blockchainSetup := SetupTestBlockchain(t)
-	defer blockchainSetup.Cleanup()
-
-	sc := NewSyncCoordinator(
-		logger,
-		settings,
-		registry,
-		selector,
-		banManager,
-		blockchainSetup.Client,
-		nil, // blocksKafkaProducerClient
-	)
-
-	// Test responsive URL
-	responsive := sc.checkURLResponsiveness(server.URL)
-	assert.True(t, responsive)
-
-	// Test unresponsive URL
-	responsive = sc.checkURLResponsiveness("http://localhost:99999")
-	assert.False(t, responsive)
-
-	// Test empty URL
-	responsive = sc.checkURLResponsiveness("")
-	assert.False(t, responsive)
-}
-
-func TestSyncCoordinator_checkAndUpdateURLResponsiveness(t *testing.T) {
-	// Create test HTTP servers
-	successServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer successServer.Close()
-
-	logger := ulogger.New("test")
-	settings := CreateTestSettings()
-	registry := NewPeerRegistry()
-	selector := NewPeerSelector(logger, nil)
-	banManager := NewPeerBanManager(context.Background(), nil, settings, registry)
-	blockchainSetup := SetupTestBlockchain(t)
-	defer blockchainSetup.Cleanup()
-
-	sc := NewSyncCoordinator(
-		logger,
-		settings,
-		registry,
-		selector,
-		banManager,
-		blockchainSetup.Client,
-		nil, // blocksKafkaProducerClient
-	)
-
-	// Create test peers
-	peers := []*PeerInfo{
-		{
-			ID:         peer.ID("peer1"),
-			DataHubURL: successServer.URL,
-			Storage:    "full",
-		},
-		{
-			ID:         peer.ID("peer2"),
-			DataHubURL: "http://localhost:99999",
-			Storage:    "full",
-		},
-		{
-			ID:         peer.ID("peer3"),
-			DataHubURL: "",
-			Storage:    "full",
-		},
-	}
-
-	// Add peers to registry
-	for _, p := range peers {
-		registry.AddPeer(p.ID, "")
-		if p.DataHubURL != "" {
-			registry.UpdateDataHubURL(p.ID, p.DataHubURL)
-		}
-	}
-
-	// Check and update responsiveness
-	sc.checkAndUpdateURLResponsiveness(peers)
-
-	// Verify updates
-	info1, _ := registry.GetPeer(peer.ID("peer1"))
-	assert.True(t, info1.URLResponsive)
-
-	info2, _ := registry.GetPeer(peer.ID("peer2"))
-	assert.False(t, info2.URLResponsive)
-
-	info3, _ := registry.GetPeer(peer.ID("peer3"))
-	assert.False(t, info3.URLResponsive)
-}
-
 func TestSyncCoordinator_checkFSMState(t *testing.T) {
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
@@ -674,7 +564,6 @@ func TestSyncCoordinator_checkFSMState(t *testing.T) {
 	registry.AddPeer(peerID, "")
 	registry.UpdateHeight(peerID, 110, "hash")
 	registry.UpdateDataHubURL(peerID, "http://test.com")
-	registry.UpdateURLResponsiveness(peerID, true)
 
 	// Check FSM state (LocalClient returns RUNNING by default)
 	sc.checkFSMState(blockchainSetup.Ctx)
@@ -726,7 +615,6 @@ func TestSyncCoordinator_evaluateSyncPeer(t *testing.T) {
 	registry.AddPeer(betterPeer, "")
 	registry.UpdateHeight(betterPeer, 120, "hash")
 	registry.UpdateDataHubURL(betterPeer, "http://better.com")
-	registry.UpdateURLResponsiveness(betterPeer, true)
 
 	// Set current sync peer
 	sc.mu.Lock()
@@ -775,7 +663,6 @@ func TestSyncCoordinator_evaluateSyncPeer_StuckAtHeight(t *testing.T) {
 	registry.AddPeer(syncPeer, "")
 	registry.UpdateHeight(syncPeer, 110, "hash")
 	registry.UpdateDataHubURL(syncPeer, "http://test.com")
-	registry.UpdateURLResponsiveness(syncPeer, true)
 
 	// Set sync peer and simulate being stuck for too long
 	sc.mu.Lock()
@@ -797,7 +684,6 @@ func TestSyncCoordinator_evaluateSyncPeer_StuckAtHeight(t *testing.T) {
 	registry.AddPeer(altPeer, "")
 	registry.UpdateHeight(altPeer, 115, "hash2")
 	registry.UpdateDataHubURL(altPeer, "http://alt.com")
-	registry.UpdateURLResponsiveness(altPeer, true)
 
 	// Evaluate - should clear peer due to long sync without progress and select new one
 	sc.evaluateSyncPeer()
@@ -893,118 +779,6 @@ func TestSyncCoordinator_LogCandidateList(t *testing.T) {
 
 	// This just logs, so we're mainly testing it doesn't panic
 	sc.logCandidateList(candidates)
-}
-
-func TestSyncCoordinator_CheckURLResponsiveness(t *testing.T) {
-	logger := ulogger.New("test")
-	settings := CreateTestSettings()
-	registry := NewPeerRegistry()
-	selector := NewPeerSelector(logger, nil)
-	banManager := NewPeerBanManager(context.Background(), nil, settings, registry)
-	blockchainSetup := SetupTestBlockchain(t)
-	defer blockchainSetup.Cleanup()
-
-	sc := NewSyncCoordinator(
-		logger,
-		settings,
-		registry,
-		selector,
-		banManager,
-		blockchainSetup.Client,
-		nil, // blocksKafkaProducerClient
-	)
-
-	// Test with empty URL
-	assert.False(t, sc.checkURLResponsiveness(""))
-
-	// Test with mock server that responds OK
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	assert.True(t, sc.checkURLResponsiveness(server.URL))
-
-	// Test with mock server that returns server error
-	errorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer errorServer.Close()
-
-	assert.False(t, sc.checkURLResponsiveness(errorServer.URL))
-
-	// Test with invalid URL
-	assert.False(t, sc.checkURLResponsiveness("http://invalid.localhost.test:99999"))
-}
-
-func TestSyncCoordinator_CheckAndUpdateURLResponsiveness(t *testing.T) {
-	logger := ulogger.New("test")
-	settings := CreateTestSettings()
-	registry := NewPeerRegistry()
-	selector := NewPeerSelector(logger, nil)
-	banManager := NewPeerBanManager(context.Background(), nil, settings, registry)
-	blockchainSetup := SetupTestBlockchain(t)
-	defer blockchainSetup.Cleanup()
-
-	sc := NewSyncCoordinator(
-		logger,
-		settings,
-		registry,
-		selector,
-		banManager,
-		blockchainSetup.Client,
-		nil, // blocksKafkaProducerClient
-	)
-
-	// Create test server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	// Test with peers
-	peerID1 := peer.ID("peer1")
-	peerID2 := peer.ID("peer2")
-
-	// Add peers to registry first
-	registry.AddPeer(peerID1, "")
-	registry.UpdateDataHubURL(peerID1, server.URL)
-
-	registry.AddPeer(peerID2, "")
-	registry.UpdateDataHubURL(peerID2, "http://invalid.localhost.test:99999")
-
-	// Get peers and set old check times
-	peer1Info, _ := registry.GetPeer(peerID1)
-	peer1Info.LastURLCheck = time.Now().Add(-1 * time.Minute)
-
-	peer2Info, _ := registry.GetPeer(peerID2)
-	peer2Info.LastURLCheck = time.Now().Add(-1 * time.Minute)
-
-	peers := []*PeerInfo{peer1Info, peer2Info}
-
-	// Check and update responsiveness
-	sc.checkAndUpdateURLResponsiveness(peers)
-
-	// Verify results in registry
-	peer1InfoUpdated, _ := registry.GetPeer(peerID1)
-	assert.True(t, peer1InfoUpdated.URLResponsive, "Peer1 URL should be responsive")
-
-	peer2InfoUpdated, _ := registry.GetPeer(peerID2)
-	assert.False(t, peer2InfoUpdated.URLResponsive, "Peer2 URL should not be responsive")
-
-	// Test with peer that was checked recently (should skip)
-	peerID3 := peer.ID("peer3")
-	registry.AddPeer(peerID3, "")
-	registry.UpdateDataHubURL(peerID3, server.URL)
-
-	peer3Info, _ := registry.GetPeer(peerID3)
-	peer3Info.LastURLCheck = time.Now() // Just checked
-
-	peers3 := []*PeerInfo{peer3Info}
-	sc.checkAndUpdateURLResponsiveness(peers3)
-	// Should not update since it was checked recently
-	peer3InfoUpdated, _ := registry.GetPeer(peerID3)
-	assert.False(t, peer3InfoUpdated.URLResponsive, "Peer3 URL should not be updated (checked recently)")
 }
 
 func TestSyncCoordinator_IsCaughtUp(t *testing.T) {
@@ -1351,7 +1125,6 @@ func TestSyncCoordinator_HandleFSMTransition_Simplified(t *testing.T) {
 	registry.AddPeer(altPeer, "")
 	registry.UpdateHeight(altPeer, 120, "hash2")
 	registry.UpdateDataHubURL(altPeer, "http://alt.com")
-	registry.UpdateURLResponsiveness(altPeer, true)
 
 	sc.mu.Lock()
 	sc.currentSyncPeer = syncPeer
@@ -1529,7 +1302,6 @@ func TestSyncCoordinator_SelectAndActivateNewPeer(t *testing.T) {
 	registry.AddPeer(newPeer, "")
 	registry.UpdateHeight(newPeer, 110, "blockhash123")
 	registry.UpdateDataHubURL(newPeer, "http://datahub.example.com")
-	registry.UpdateURLResponsiveness(newPeer, true)
 
 	// Start monitoring the publish channel
 	done := make(chan bool)
@@ -1592,7 +1364,6 @@ func TestSyncCoordinator_UpdateBanStatus_SyncPeerBanned(t *testing.T) {
 	registry.AddPeer(altPeer, "")
 	registry.UpdateHeight(altPeer, 115, "hash2")
 	registry.UpdateDataHubURL(altPeer, "http://alt.example.com")
-	registry.UpdateURLResponsiveness(altPeer, true)
 
 	// Start monitoring the publish channel
 	done := make(chan bool)
@@ -1650,7 +1421,6 @@ func TestSyncCoordinator_TriggerSync_SendMessageError(t *testing.T) {
 	registry.AddPeer(peerID, "")
 	registry.UpdateHeight(peerID, 110, "") // No block hash
 	registry.UpdateDataHubURL(peerID, "http://test.com")
-	registry.UpdateURLResponsiveness(peerID, true)
 
 	// Trigger sync - should fail to send message but not panic
 	err := sc.TriggerSync()

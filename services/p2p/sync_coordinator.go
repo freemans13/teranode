@@ -3,7 +3,6 @@ package p2p
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"sync"
 	"time"
 
@@ -264,9 +263,6 @@ func (sc *SyncCoordinator) selectNewSyncPeer() peer.ID {
 	// Get all peers and select
 	peers := sc.registry.GetAllPeers()
 
-	// Check URL responsiveness before selecting
-	sc.checkAndUpdateURLResponsiveness(peers)
-
 	return sc.selector.SelectSyncPeer(peers, criteria)
 }
 
@@ -413,8 +409,6 @@ func (sc *SyncCoordinator) selectAndActivateNewPeer(localHeight int32, oldPeer p
 	// Get all peers
 	peers := sc.registry.GetAllPeers()
 
-	// Check URL responsiveness for all peers first
-	sc.checkAndUpdateURLResponsiveness(peers)
 	// Filter eligible peers
 	eligiblePeers := sc.filterEligiblePeers(peers, oldPeer, localHeight)
 
@@ -600,54 +594,6 @@ func (sc *SyncCoordinator) UpdateBanStatus(peerID peer.ID) {
 	}
 }
 
-// checkURLResponsiveness checks if a peer's DataHub URL is responsive with a short timeout
-func (sc *SyncCoordinator) checkURLResponsiveness(url string) bool {
-	if url == "" {
-		return false
-	}
-
-	// Create a client with a very short timeout (2 seconds)
-	client := &http.Client{
-		Timeout: 2 * time.Second,
-	}
-
-	// Try to make a HEAD request to check if the server is responsive
-	testURL := fmt.Sprintf("%s/health", url) // Try health endpoint first
-	resp, err := client.Head(testURL)
-	if err == nil {
-		resp.Body.Close()
-		return resp.StatusCode < 500 // Consider it responsive if not a server error
-	}
-
-	// If health endpoint fails, try the base URL
-	resp, err = client.Head(url)
-	if err == nil {
-		resp.Body.Close()
-		return resp.StatusCode < 500
-	}
-
-	return false
-}
-
-// checkAndUpdateURLResponsiveness checks URL responsiveness for all peers and updates registry
-func (sc *SyncCoordinator) checkAndUpdateURLResponsiveness(peers []*PeerInfo) {
-	for _, p := range peers {
-		// Skip if URL was checked recently (within 30 seconds)
-		if time.Since(p.LastURLCheck) < 30*time.Second {
-			continue
-		}
-
-		if p.DataHubURL != "" {
-			responsive := sc.checkURLResponsiveness(p.DataHubURL)
-			sc.registry.UpdateURLResponsiveness(p.ID, responsive)
-
-			if !responsive {
-				sc.logger.Debugf("[SyncCoordinator] Peer %s URL %s is not responsive", p.ID, p.DataHubURL)
-			}
-		}
-	}
-}
-
 // isInBackoffPeriod checks if we're currently in a backoff period
 func (sc *SyncCoordinator) isInBackoffPeriod() bool {
 	sc.mu.RLock()
@@ -716,7 +662,7 @@ func (sc *SyncCoordinator) checkAllPeersAttempted() {
 	for _, p := range peers {
 		// Count peers that would normally be eligible
 		if p.Height > localHeight && !p.IsBanned &&
-			p.DataHubURL != "" && p.URLResponsive && p.ReputationScore >= 20 {
+			p.DataHubURL != "" && p.ReputationScore >= 20 {
 			eligibleCount++
 
 			// Check if attempted recently

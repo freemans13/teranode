@@ -1941,8 +1941,6 @@ func (s *Server) GetPeerRegistry(_ context.Context, _ *emptypb.Empty) (*p2p_api.
 			BytesReceived:   p.BytesReceived,
 			LastBlockTime:   timeToUnix(p.LastBlockTime),
 			LastMessageTime: timeToUnix(p.LastMessageTime),
-			UrlResponsive:   p.URLResponsive,
-			LastUrlCheck:    timeToUnix(p.LastURLCheck),
 
 			// Interaction/catchup metrics
 			InteractionAttempts:    p.InteractionAttempts,
@@ -2015,8 +2013,6 @@ func (s *Server) GetPeer(_ context.Context, req *p2p_api.GetPeerRequest) (*p2p_a
 		BytesReceived:   peerInfo.BytesReceived,
 		LastBlockTime:   timeToUnix(peerInfo.LastBlockTime),
 		LastMessageTime: timeToUnix(peerInfo.LastMessageTime),
-		UrlResponsive:   peerInfo.URLResponsive,
-		LastUrlCheck:    timeToUnix(peerInfo.LastURLCheck),
 
 		// Interaction/catchup metrics
 		InteractionAttempts:    peerInfo.InteractionAttempts,

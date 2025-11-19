@@ -184,24 +184,6 @@ func TestPeerRegistry_UpdateNetworkStats(t *testing.T) {
 	assert.NotZero(t, info.LastBlockTime)
 }
 
-func TestPeerRegistry_UpdateURLResponsiveness(t *testing.T) {
-	pr := NewPeerRegistry()
-	peerID := peer.ID("test-peer-1")
-
-	pr.AddPeer(peerID, "")
-	pr.UpdateDataHubURL(peerID, "http://test.com")
-
-	// Initially not responsive
-	info, _ := pr.GetPeer(peerID)
-	assert.False(t, info.URLResponsive)
-
-	// Mark as responsive
-	pr.UpdateURLResponsiveness(peerID, true)
-	info, _ = pr.GetPeer(peerID)
-	assert.True(t, info.URLResponsive)
-	assert.NotZero(t, info.LastURLCheck)
-}
-
 func TestPeerRegistry_PeerCount(t *testing.T) {
 	pr := NewPeerRegistry()
 

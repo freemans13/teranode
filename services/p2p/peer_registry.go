@@ -130,17 +130,6 @@ func (pr *PeerRegistry) UpdateNetworkStats(id peer.ID, bytesReceived uint64) {
 	}
 }
 
-// UpdateURLResponsiveness updates whether a peer's DataHub URL is responsive
-func (pr *PeerRegistry) UpdateURLResponsiveness(id peer.ID, responsive bool) {
-	pr.mu.Lock()
-	defer pr.mu.Unlock()
-
-	if info, exists := pr.peers[id]; exists {
-		info.URLResponsive = responsive
-		info.LastURLCheck = time.Now()
-	}
-}
-
 // UpdateLastMessageTime updates the last time we received a message from a peer
 func (pr *PeerRegistry) UpdateLastMessageTime(id peer.ID) {
 	pr.mu.Lock()
