@@ -191,12 +191,6 @@ func (ps *PeerSelector) isEligible(p *PeerInfo, criteria SelectionCriteria) bool
 		return false
 	}
 
-	// Check URL responsiveness
-	if p.DataHubURL != "" && !p.URLResponsive {
-		ps.logger.Debugf("[PeerSelector] Peer %s URL is not responsive", p.ID)
-		return false
-	}
-
 	// Check valid height
 	if p.Height <= 0 {
 		ps.logger.Debugf("[PeerSelector] Peer %s has invalid height %d", p.ID, p.Height)

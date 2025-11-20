@@ -24,8 +24,6 @@ type PeerInfoResponse struct {
 	BytesReceived   uint64 `json:"bytes_received"`
 	LastBlockTime   int64  `json:"last_block_time"`
 	LastMessageTime int64  `json:"last_message_time"`
-	URLResponsive   bool   `json:"url_responsive"`
-	LastURLCheck    int64  `json:"last_url_check"`
 
 	// Catchup metrics
 	CatchupAttempts        int64   `json:"catchup_attempts"`
@@ -91,8 +89,6 @@ func (h *HTTP) GetPeers(c echo.Context) error {
 			BytesReceived:   peer.BytesReceived,
 			LastBlockTime:   peer.LastBlockTime.Unix(),
 			LastMessageTime: peer.LastMessageTime.Unix(),
-			URLResponsive:   peer.URLResponsive,
-			LastURLCheck:    peer.LastURLCheck.Unix(),
 
 			// Interaction/catchup metrics (using the original field names for backward compatibility)
 			CatchupAttempts:        peer.InteractionAttempts,

@@ -249,6 +249,7 @@ type BlockAssemblySettings struct {
 	// GetMiningCandidate timeouts
 	GetMiningCandidateSendTimeout     time.Duration // Timeout when sending request on internal channel (default: 1s)
 	GetMiningCandidateResponseTimeout time.Duration // Timeout waiting for mining candidate response (default: 10s)
+	SubtreeAnnouncementInterval       time.Duration
 }
 
 type BlockValidationSettings struct {
@@ -403,8 +404,8 @@ type P2PSettings struct {
 	RejectedTxTopic string
 	SubtreeTopic    string
 
-	StaticPeers []string
-	RelayPeers  []string // Relay peers for NAT traversal (multiaddr strings)
+	StaticPeers    []string
+	BootstrapPeers []string // Bootstrap peers for DHT and relay (multiaddr strings)
 
 	// Peer persistence (from go-p2p improvements)
 	PeerCacheDir string // Directory for peer cache file (empty = binary directory)

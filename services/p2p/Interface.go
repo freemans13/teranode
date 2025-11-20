@@ -24,8 +24,6 @@ type PeerInfo struct {
 	BytesReceived   uint64
 	LastBlockTime   time.Time
 	LastMessageTime time.Time // Last time we received any message from this peer
-	URLResponsive   bool      // Whether the DataHub URL is responsive
-	LastURLCheck    time.Time // Last time we checked URL responsiveness
 	Storage         string    // Storage mode: "full", "pruned", or empty (unknown/old version)
 
 	// Interaction metrics - track peer reliability across all interactions (blocks, subtrees, catchup, etc.)

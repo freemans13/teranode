@@ -228,7 +228,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// getMiningCandidate timeout settings
 			GetMiningCandidateSendTimeout:     getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
 			GetMiningCandidateResponseTimeout: getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
+			SubtreeAnnouncementInterval:       getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
 		},
+
 		BlockChain: BlockChainSettings{
 			GRPCAddress:           getString("blockchain_grpcAddress", "localhost:8087", alternativeContext...),
 			GRPCListenAddress:     getString("blockchain_grpcListenAddress", ":8087", alternativeContext...),
@@ -380,7 +382,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PrivateKey:         getString("p2p_private_key", "", alternativeContext...),
 			RejectedTxTopic:    getString("p2p_rejected_tx_topic", "", alternativeContext...),
 			StaticPeers:        getMultiString("p2p_static_peers", "|", []string{}, alternativeContext...),
-			RelayPeers:         getMultiString("p2p_relay_peers", "|", []string{}, alternativeContext...),
+			BootstrapPeers:     getMultiString("p2p_bootstrap_peers", "|", []string{}, alternativeContext...),
 			// Peer persistence
 			PeerCacheDir: getString("p2p_peer_cache_dir", "", alternativeContext...), // Empty = binary directory
 			BanThreshold: getInt("p2p_ban_threshold", 100, alternativeContext...),

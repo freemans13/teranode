@@ -690,8 +690,6 @@ func convertFromAPIPeerInfo(apiPeer interface{}) *PeerInfo {
 			BytesReceived:          p.BytesReceived,
 			LastBlockTime:          time.Unix(p.LastBlockTime, 0),
 			LastMessageTime:        time.Unix(p.LastMessageTime, 0),
-			URLResponsive:          p.UrlResponsive,
-			LastURLCheck:           time.Unix(p.LastUrlCheck, 0),
 			Storage:                p.Storage,
 			InteractionAttempts:    p.InteractionAttempts,
 			InteractionSuccesses:   p.InteractionSuccesses,

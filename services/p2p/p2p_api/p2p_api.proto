@@ -236,8 +236,6 @@ message AddBanScoreRequest {
     uint64 bytes_received = 9;
     int64 last_block_time = 10;  // Unix timestamp
     int64 last_message_time = 11;  // Unix timestamp
-    bool url_responsive = 12;
-    int64 last_url_check = 13;  // Unix timestamp
 
     // Interaction/catchup metrics
     int64 interaction_attempts = 14;
