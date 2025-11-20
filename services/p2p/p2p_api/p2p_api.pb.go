@@ -46,8 +46,8 @@ type Peer struct {
 	TimeOffset       int64                  `protobuf:"varint,20,opt,name=timeOffset,proto3" json:"timeOffset,omitempty"`
 	Version          uint32                 `protobuf:"varint,21,opt,name=version,proto3" json:"version,omitempty"`
 	SubVer           string                 `protobuf:"bytes,22,opt,name=subVer,proto3" json:"subVer,omitempty"`
-	StartingHeight   int32                  `protobuf:"varint,23,opt,name=startingHeight,proto3" json:"startingHeight,omitempty"`
-	CurrentHeight    int32                  `protobuf:"varint,24,opt,name=currentHeight,proto3" json:"currentHeight,omitempty"`
+	StartingHeight   uint32                 `protobuf:"varint,23,opt,name=startingHeight,proto3" json:"startingHeight,omitempty"`
+	CurrentHeight    uint32                 `protobuf:"varint,24,opt,name=currentHeight,proto3" json:"currentHeight,omitempty"`
 	Banscore         int32                  `protobuf:"varint,25,opt,name=banscore,proto3" json:"banscore,omitempty"`
 	Whitelisted      bool                   `protobuf:"varint,26,opt,name=whitelisted,proto3" json:"whitelisted,omitempty"`
 	FeeFilter        int64                  `protobuf:"varint,27,opt,name=feeFilter,proto3" json:"feeFilter,omitempty"`
@@ -239,14 +239,14 @@ func (x *Peer) GetSubVer() string {
 	return ""
 }
 
-func (x *Peer) GetStartingHeight() int32 {
+func (x *Peer) GetStartingHeight() uint32 {
 	if x != nil {
 		return x.StartingHeight
 	}
 	return 0
 }
 
-func (x *Peer) GetCurrentHeight() int32 {
+func (x *Peer) GetCurrentHeight() uint32 {
 	if x != nil {
 		return x.CurrentHeight
 	}
@@ -1654,7 +1654,7 @@ func (*GetPeersForCatchupRequest) Descriptor() ([]byte, []int) {
 type PeerInfoForCatchup struct {
 	state                  protoimpl.MessageState `protogen:"open.v1"`
 	Id                     string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Height                 int32                  `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
+	Height                 uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
 	BlockHash              string                 `protobuf:"bytes,3,opt,name=block_hash,json=blockHash,proto3" json:"block_hash,omitempty"`
 	DataHubUrl             string                 `protobuf:"bytes,4,opt,name=data_hub_url,json=dataHubUrl,proto3" json:"data_hub_url,omitempty"`
 	CatchupReputationScore float64                `protobuf:"fixed64,5,opt,name=catchup_reputation_score,json=catchupReputationScore,proto3" json:"catchup_reputation_score,omitempty"`
@@ -1702,7 +1702,7 @@ func (x *PeerInfoForCatchup) GetId() string {
 	return ""
 }
 
-func (x *PeerInfoForCatchup) GetHeight() int32 {
+func (x *PeerInfoForCatchup) GetHeight() uint32 {
 	if x != nil {
 		return x.Height
 	}
@@ -2210,7 +2210,7 @@ func (x *IsPeerUnhealthyResponse) GetReputationScore() float32 {
 type PeerRegistryInfo struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Id              string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Height          int32                  `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
+	Height          uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
 	BlockHash       string                 `protobuf:"bytes,3,opt,name=block_hash,json=blockHash,proto3" json:"block_hash,omitempty"`
 	DataHubUrl      string                 `protobuf:"bytes,4,opt,name=data_hub_url,json=dataHubUrl,proto3" json:"data_hub_url,omitempty"`
 	BanScore        int32                  `protobuf:"varint,5,opt,name=ban_score,json=banScore,proto3" json:"ban_score,omitempty"`
@@ -2275,7 +2275,7 @@ func (x *PeerRegistryInfo) GetId() string {
 	return ""
 }
 
-func (x *PeerRegistryInfo) GetHeight() int32 {
+func (x *PeerRegistryInfo) GetHeight() uint32 {
 	if x != nil {
 		return x.Height
 	}
@@ -2706,8 +2706,8 @@ const file_services_p2p_p2p_api_p2p_api_proto_rawDesc = "" +
 	"timeOffset\x12\x18\n" +
 	"\aversion\x18\x15 \x01(\rR\aversion\x12\x16\n" +
 	"\x06subVer\x18\x16 \x01(\tR\x06subVer\x12&\n" +
-	"\x0estartingHeight\x18\x17 \x01(\x05R\x0estartingHeight\x12$\n" +
-	"\rcurrentHeight\x18\x18 \x01(\x05R\rcurrentHeight\x12\x1a\n" +
+	"\x0estartingHeight\x18\x17 \x01(\rR\x0estartingHeight\x12$\n" +
+	"\rcurrentHeight\x18\x18 \x01(\rR\rcurrentHeight\x12\x1a\n" +
 	"\bbanscore\x18\x19 \x01(\x05R\bbanscore\x12 \n" +
 	"\vwhitelisted\x18\x1a \x01(\bR\vwhitelisted\x12\x1c\n" +
 	"\tfeeFilter\x18\x1b \x01(\x03R\tfeeFilter\"7\n" +
@@ -2784,7 +2784,7 @@ const file_services_p2p_p2p_api_p2p_api_proto_rawDesc = "" +
 	"\x19GetPeersForCatchupRequest\"\xba\x02\n" +
 	"\x12PeerInfoForCatchup\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
-	"\x06height\x18\x02 \x01(\x05R\x06height\x12\x1d\n" +
+	"\x06height\x18\x02 \x01(\rR\x06height\x12\x1d\n" +
 	"\n" +
 	"block_hash\x18\x03 \x01(\tR\tblockHash\x12 \n" +
 	"\fdata_hub_url\x18\x04 \x01(\tR\n" +
@@ -2821,7 +2821,7 @@ const file_services_p2p_p2p_api_p2p_api_proto_rawDesc = "" +
 	"\x10reputation_score\x18\x03 \x01(\x02R\x0freputationScore\"\xe4\a\n" +
 	"\x10PeerRegistryInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
-	"\x06height\x18\x02 \x01(\x05R\x06height\x12\x1d\n" +
+	"\x06height\x18\x02 \x01(\rR\x06height\x12\x1d\n" +
 	"\n" +
 	"block_hash\x18\x03 \x01(\tR\tblockHash\x12 \n" +
 	"\fdata_hub_url\x18\x04 \x01(\tR\n" +

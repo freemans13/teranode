@@ -62,8 +62,8 @@ func CreateTestPeerInfo(id peer.ID, height int32, healthy bool, banned bool, dat
 	}
 	return &PeerInfo{
 		ID:              id,
-		Height:          height,
-		BlockHash:       "test-hash",
+		Height:          uint32(height),
+		BlockHash:       nil, // test-hash
 		DataHubURL:      dataHubURL,
 		IsBanned:        banned,
 		BanScore:        0,
@@ -109,8 +109,8 @@ func CreateTestPeerInfoList(count int) []*PeerInfo {
 		}
 		peers[i] = &PeerInfo{
 			ID:              ids[i],
-			Height:          int32(100 + i*10),
-			BlockHash:       "test-hash",
+			Height:          uint32(100 + i*10),
+			BlockHash:       nil, // test-hash
 			DataHubURL:      "",
 			IsBanned:        i >= count-2, // Last two peers are banned
 			BanScore:        i * 10,
@@ -211,7 +211,7 @@ func CreatePeerWithReputation(id peer.ID, reputation float64, successes, failure
 	return &PeerInfo{
 		ID:                     id,
 		Height:                 100,
-		BlockHash:              "test-hash",
+		BlockHash:              nil, // test-hash
 		DataHubURL:             "http://test.com",
 		IsBanned:               false,
 		BanScore:               0,

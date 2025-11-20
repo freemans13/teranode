@@ -50,19 +50,16 @@ func TestSelector_SkipsPeerMarkedUnhealthyByHealthChecker(t *testing.T) {
 	// Add two peers
 	healthyID := peer.ID("H")
 	unhealthyID := peer.ID("U")
-	registry.AddPeer(healthyID, "")
-	registry.AddPeer(unhealthyID, "")
-	// Set heights so both are ahead
-	registry.UpdateHeight(healthyID, 120, "hashH")
-	registry.UpdateHeight(unhealthyID, 125, "hashU")
-	// Assign DataHub URLs
-	registry.UpdateDataHubURL(healthyID, okSrv.URL)
-	registry.UpdateDataHubURL(unhealthyID, failSrv.URL)
 
-	// Run immediate health checks
+	// Set heights so both are ahead
+	registry.Put(healthyID, "", 120, nil, okSrv.URL)
+	registry.UpdateStorage(healthyID, "full")
+
+	registry.Put(unhealthyID, "", 125, nil, failSrv.URL)
 
 	// Fetch peers and select
-	peers := registry.GetAllPeers()
+	peers := registry.GetAll()
+
 	selected := ps.SelectSyncPeer(peers, SelectionCriteria{LocalHeight: 100})
 
 	assert.Equal(t, healthyID, selected, "selector should skip peer marked unhealthy by health checker")
@@ -302,7 +299,7 @@ func TestPeerSelector_SelectSyncPeer_InvalidHeight(t *testing.T) {
 		},
 		{
 			ID:              peer.ID("B"),
-			Height:          -1,   // Invalid height
+			Height:          0,    // Invalid/unset height
 			ReputationScore: 80.0, // Good reputation
 			DataHubURL:      "http://test.com",
 			Storage:         "full",
