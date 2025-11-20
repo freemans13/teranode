@@ -939,15 +939,27 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		addedToOrphanage atomic.Uint64
 	)
 
-	// OPTIMIZATION: Use pipeline processing instead of level barriers
-	// This allows transactions to start as soon as their dependencies complete
-	// rather than waiting for entire levels to finish
-	if maxLevel <= 3 || len(allTransactions) < 1000 {
-		// For shallow dependency trees or small transaction counts, use simpler level-based processing
-		// The overhead of pipeline coordination isn't worth it for these cases
+	// OPTIMIZATION: Choose processing strategy based on transaction count
+	// Benchmark results show a clear crossover point at ~100 transactions:
+	//
+	// Transaction Count vs Performance (coordination overhead only):
+	//   20 txs:   ByLevel 4.2x faster  (15,257 ns vs 64,397 ns)
+	//   30 txs:   ByLevel 2.9x faster  (23,125 ns vs 65,977 ns)
+	//   90 txs:   ByLevel 1.3x faster  (52,703 ns vs 70,021 ns)
+	//  150 txs:   Pipelined 1.1x faster (76,064 ns vs 81,764 ns)
+	//  300 txs:   Pipelined 1.7x faster (89,065 ns vs 149,895 ns)
+	// 1970 txs:   Pipelined 3.8x faster (402,161 ns vs 1,523,933 ns)
+	// 5000 txs:   Pipelined 4.7x faster (538,022 ns vs 2,536,742 ns)
+	//
+	// Below 100 txs: Graph-building overhead dominates, ByLevel wins
+	// Above 100 txs: Parallelism benefits outweigh overhead, Pipelined wins
+	if len(allTransactions) < 100 {
+		// Use level-based processing for small transaction counts (< 100 txs)
+		// Simpler approach without dependency graph overhead
 		err = u.processTransactionsByLevel(ctx, blockHash, subtreeHash, maxLevel, txsPerLevel, blockHeight, blockIds, processedValidatorOptions, &errorsFound, &addedToOrphanage)
 	} else {
-		// For deep dependency trees (like 197 levels), use pipeline processing for massive speedup
+		// Use pipelined processing for larger transaction counts (>= 100 txs)
+		// Builds dependency graph to enable fine-grained parallelism
 		err = u.processTransactionsPipelined(ctx, blockHash, subtreeHash, missingTxs, blockHeight, blockIds, processedValidatorOptions, &errorsFound, &addedToOrphanage)
 	}
 
@@ -963,8 +975,28 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	return nil
 }
 
-// processTransactionsByLevel processes transactions level by level with barriers
-// This is the simpler approach suitable for shallow dependency trees
+// processTransactionsByLevel processes transactions level by level with barriers between levels.
+//
+// This approach is optimal for small transaction counts (< 100 txs) where the overhead
+// of building a dependency graph outweighs the benefits of fine-grained parallelism.
+//
+// How it works:
+// - Processes transactions in dependency order: level 0, then level 1, etc.
+// - All transactions within a level are processed in parallel
+// - Waits for entire level to complete before starting the next level
+//
+// Performance characteristics:
+// - Simple coordination: uses basic errgroup for parallel processing within levels
+// - Lower memory overhead: no dependency graph construction
+// - Optimal for < 100 txs: 1.3-4.2x faster than pipelined approach
+// - Level barriers become bottleneck for large counts (>100 txs)
+//
+// Example with 3 levels: [Tx0] -> [Tx1, Tx2, Tx3] -> [Tx4, Tx5]
+// - Level 0: Process Tx0
+// - Wait for level 0 to complete
+// - Level 1: Process Tx1, Tx2, Tx3 in parallel
+// - Wait for level 1 to complete (even if Tx1 finishes early, must wait for Tx2, Tx3)
+// - Level 2: Process Tx4, Tx5 in parallel
 func (u *Server) processTransactionsByLevel(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, maxLevel uint32, txsPerLevel [][]missingTx,
 	blockHeight uint32, blockIds map[uint32]bool, processedValidatorOptions *validator.Options,
 	errorsFound, addedToOrphanage *atomic.Uint64) error {
@@ -1004,9 +1036,40 @@ func (u *Server) processTransactionsByLevel(ctx context.Context, blockHash chain
 	return nil
 }
 
-// processTransactionsPipelined processes transactions using dependency-aware pipeline
-// This allows transactions to start immediately when their dependencies complete
-// Ideal for deep dependency trees (197 levels) where level barriers create significant overhead
+// processTransactionsPipelined processes transactions using a dependency-aware pipeline.
+//
+// This approach is optimal for larger transaction counts (>= 100 txs) where fine-grained
+// parallelism provides significant speedups despite the graph construction overhead.
+//
+// How it works:
+// - Builds a complete dependency graph of all transactions
+// - Tracks parent/child relationships and pending dependency counts
+// - Transactions start processing immediately when their specific dependencies complete
+// - No level barriers: maximum parallelism within dependency constraints
+//
+// Performance characteristics:
+// - Graph construction overhead: 2 passes over all transactions
+// - Higher memory usage: maintains txMap, dependencies, and childrenMap
+// - Optimal for >= 100 txs: 1.1-4.7x faster than level-based approach
+// - Scales excellently with deep trees (197 levels: 3.8x faster)
+// - Scales excellently with wide trees (5000 txs: 4.7x faster)
+//
+// Example with dependencies: Tx0 -> Tx1 -> Tx4
+//
+//	Tx0 -> Tx2 -> Tx5
+//	Tx0 -> Tx3
+//
+// Level-based would process in 3 waves with barriers:
+//
+//	Wave 1: Tx0
+//	Wave 2: Tx1, Tx2, Tx3 (wait for slowest)
+//	Wave 3: Tx4, Tx5 (wait even though dependencies met earlier)
+//
+// Pipelined processes with no barriers:
+//   - Tx0 starts immediately
+//   - Tx1, Tx2, Tx3 start as soon as Tx0 completes
+//   - Tx4 starts as soon as Tx1 completes (doesn't wait for Tx2, Tx3)
+//   - Tx5 starts as soon as Tx2 completes (doesn't wait for Tx3)
 func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, transactions []missingTx,
 	blockHeight uint32, blockIds map[uint32]bool, processedValidatorOptions *validator.Options,
 	errorsFound, addedToOrphanage *atomic.Uint64) error {
