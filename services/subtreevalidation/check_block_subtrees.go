@@ -27,6 +27,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	// aerospikeBatchChunkSize limits the number of records per Aerospike batch operation
+	// to prevent timeouts on large blocks. Aerospike can struggle with batches >10K records.
+	// This value balances performance (fewer round trips) with reliability (avoiding timeouts).
+	aerospikeBatchChunkSize = 5000
+)
+
 // bufioReaderPool reduces GC pressure by reusing bufio.Reader instances.
 // With 14,496 subtrees per block, using 32KB buffers provides excellent I/O performance
 // while dramatically reducing memory pressure and GC overhead (16x reduction from previous 512KB).
@@ -612,8 +619,6 @@ func (u *Server) prefetchAndCacheParentUTXOs(ctx context.Context, allTransaction
 		return nil
 	}
 
-	u.logger.Infof("[prefetchAndCacheParentUTXOs] Prefetching %d unique parent UTXOs", len(parentHashes))
-
 	// Step 2: Create UnresolvedMetaData slice for BatchDecorate
 	unresolvedMeta := make([]*utxo.UnresolvedMetaData, 0, len(parentHashes))
 	for hash := range parentHashes {
@@ -630,15 +635,29 @@ func (u *Server) prefetchAndCacheParentUTXOs(ctx context.Context, allTransaction
 		})
 	}
 
-	// Step 3: Batch fetch all parent UTXOs using existing BatchDecorate
+	totalRecords := len(unresolvedMeta)
+	u.logger.Infof("[prefetchAndCacheParentUTXOs] Prefetching %d unique parent UTXOs", totalRecords)
+
+	// Step 3: Batch fetch all parent UTXOs in chunks to prevent Aerospike timeouts
+	// Large batches (>10K records) can cause network errors and timeouts
 	start := time.Now()
-	err := u.utxoStore.BatchDecorate(ctx, unresolvedMeta, fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.BlockIDs, fields.IsCoinbase)
-	if err != nil {
-		return errors.NewProcessingError("[prefetchAndCacheParentUTXOs] Failed to batch fetch parent UTXOs", err)
+	totalChunks := (totalRecords + aerospikeBatchChunkSize - 1) / aerospikeBatchChunkSize
+
+	for i := 0; i < totalRecords; i += aerospikeBatchChunkSize {
+		end := min(i+aerospikeBatchChunkSize, totalRecords)
+		chunk := unresolvedMeta[i:end]
+		chunkNum := i/aerospikeBatchChunkSize + 1
+
+		u.logger.Infof("[prefetchAndCacheParentUTXOs] Processing chunk %d/%d (%d records)", chunkNum, totalChunks, len(chunk))
+
+		err := u.utxoStore.BatchDecorate(ctx, chunk, fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.BlockIDs, fields.IsCoinbase)
+		if err != nil {
+			return errors.NewProcessingError("[prefetchAndCacheParentUTXOs] Failed to batch fetch parent UTXOs (chunk %d/%d)", chunkNum, totalChunks, err)
+		}
 	}
 
 	fetchDuration := time.Since(start)
-	u.logger.Infof("[prefetchAndCacheParentUTXOs] Fetched %d parent UTXOs in %v", len(unresolvedMeta), fetchDuration)
+	u.logger.Infof("[prefetchAndCacheParentUTXOs] Fetched %d parent UTXOs in %d chunks in %v", totalRecords, totalChunks, fetchDuration)
 
 	// Step 4: Pre-populate the cache with fetched data
 	// This ensures subsequent validations hit the cache instead of the store
@@ -724,9 +743,7 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 		return nil
 	}
 
-	u.logger.Infof("[batchExtendTransactions] Fetching %d unique parent UTXOs for transaction extension", len(parentHashes))
-
-	// Fetch all parent UTXOs using BatchDecorate
+	// Fetch all parent UTXOs using BatchDecorate in chunks to prevent Aerospike timeouts
 	unresolvedMeta := make([]*utxo.UnresolvedMetaData, 0, len(parentHashes))
 	parentMap := make(map[chainhash.Hash]int, len(parentHashes))
 	idx := 0
@@ -743,14 +760,28 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 		idx++
 	}
 
+	totalRecords := len(unresolvedMeta)
+	u.logger.Infof("[batchExtendTransactions] Fetching %d unique parent UTXOs for transaction extension", totalRecords)
+
+	// Fetch in chunks to prevent Aerospike timeouts on large batches
 	start := time.Now()
-	err := u.utxoStore.BatchDecorate(ctx, unresolvedMeta, fields.Tx)
-	if err != nil {
-		return errors.NewProcessingError("[batchExtendTransactions] Failed to batch fetch parent UTXOs", err)
+	totalChunks := (totalRecords + aerospikeBatchChunkSize - 1) / aerospikeBatchChunkSize
+
+	for i := 0; i < totalRecords; i += aerospikeBatchChunkSize {
+		end := min(i+aerospikeBatchChunkSize, totalRecords)
+		chunk := unresolvedMeta[i:end]
+		chunkNum := i/aerospikeBatchChunkSize + 1
+
+		u.logger.Infof("[batchExtendTransactions] Processing chunk %d/%d (%d records)", chunkNum, totalChunks, len(chunk))
+
+		err := u.utxoStore.BatchDecorate(ctx, chunk, fields.Tx)
+		if err != nil {
+			return errors.NewProcessingError("[batchExtendTransactions] Failed to batch fetch parent UTXOs (chunk %d/%d)", chunkNum, totalChunks, err)
+		}
 	}
 
 	fetchDuration := time.Since(start)
-	u.logger.Infof("[batchExtendTransactions] Fetched %d parent UTXOs in %v", len(unresolvedMeta), fetchDuration)
+	u.logger.Infof("[batchExtendTransactions] Fetched %d parent UTXOs in %d chunks in %v", totalRecords, totalChunks, fetchDuration)
 
 	// Build a map of parent hash -> parent tx for quick lookup
 	// Also count large transactions that may be stored externally
@@ -832,19 +863,33 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		return nil
 	}
 
-	// OPTIMIZATION: Prefetch and cache all parent UTXOs before validation
-	// This eliminates 197+ round-trips to the UTXO store by batching all fetches upfront
+	// OPTIMIZATION STEP 1: Prefetch and cache all parent UTXOs before validation
+	// This eliminates 197+ round-trips to the UTXO store by batching all fetches upfront.
+	// CRITICAL: Must succeed - the next step (batch extend) requires this data.
+	// If prefetch fails (typically Aerospike timeout), fail fast to trigger immediate retry
+	// rather than proceeding to validation which will fail anyway.
 	if err := u.prefetchAndCacheParentUTXOs(ctx, allTransactions); err != nil {
-		u.logger.Warnf("[processTransactionsInLevels] Failed to prefetch parent UTXOs: %v - continuing without prefetch", err)
-		// Don't fail - validation can still proceed without prefetch (just slower)
+		return errors.NewProcessingError("[processTransactionsInLevels] Failed to prefetch parent UTXOs", err)
 	}
 
-	// OPTIMIZATION: Extend all transactions upfront using prefetched parent data
-	// This eliminates ~195K individual Get() calls during validation (one per parent tx)
-	// Validator will see transactions are already extended and skip getTransactionInputBlockHeightsAndExtendTx
+	// OPTIMIZATION STEP 2: Extend all transactions upfront using prefetched parent data
+	// This eliminates ~195K individual Get() calls during validation (one per parent tx).
+	// Validator will see transactions are already extended and skip getTransactionInputBlockHeightsAndExtendTx.
+	//
+	// CRITICAL: Must succeed - subtree serialization requires TxInpoints which come from extended transactions.
+	// If batch extend fails (typically Aerospike timeout during BatchDecorate), we MUST fail fast because:
+	//   1. Individual validator fallback would require 195K individual Get() calls (extremely slow)
+	//   2. If Aerospike is timing out on batch operations, individual operations will likely timeout too
+	//   3. Even if individual extension succeeds, TxInpoints may not properly propagate through
+	//      validation -> storage -> retrieval -> serialization flow, causing "parent tx hashes not set" errors
+	//   4. Failing fast triggers immediate retry, giving Aerospike another chance to succeed
+	//
+	// The validator fallback (individual tx extension) is still used for:
+	//   - Transactions with missing parents (partial batch extend success)
+	//   - Regular transaction validation (non-block validation paths)
+	//   - Any validation path that doesn't use batchExtendTransactions
 	if err := u.batchExtendTransactions(ctx, allTransactions); err != nil {
-		u.logger.Warnf("[processTransactionsInLevels] Failed to batch extend transactions: %v - continuing without extend", err)
-		// Don't fail - validator can extend transactions individually (just slower)
+		return errors.NewProcessingError("[processTransactionsInLevels] Failed to batch extend transactions - cannot continue without extended transactions", err)
 	}
 
 	u.logger.Infof("[processTransactionsInLevels] Organizing %d transactions into dependency levels", len(allTransactions))
