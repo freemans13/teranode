@@ -362,7 +362,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	} else {
 		u.logger.Infof("[CheckBlockSubtrees] Processing %d transactions from %d subtrees using level-based validation", len(allTransactions), len(missingSubtrees))
 
-		if err = u.processTransactionsInLevels(ctx, allTransactions, block.Height, blockIds); err != nil {
+		if err = u.processTransactionsInLevels(ctx, allTransactions, *block.Hash(), chainhash.Hash{}, block.Height, blockIds); err != nil {
 			return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in levels", err)
 		}
 
@@ -851,8 +851,7 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 
 // processTransactionsInLevels processes all transactions from all subtrees using level-based validation
 // This ensures transactions are processed in dependency order while maximizing parallelism
-func (u *Server) processTransactionsInLevels(ctx context.Context, allTransactions []*bt.Tx,
-	blockHeight uint32, blockIds map[uint32]bool) error {
+func (u *Server) processTransactionsInLevels(ctx context.Context, allTransactions []*bt.Tx, blockHash chainhash.Hash, subtreeHash chainhash.Hash, blockHeight uint32, blockIds map[uint32]bool) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processTransactionsInLevels",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[processTransactionsInLevels] Processing %d transactions at block height %d", len(allTransactions), blockHeight),
@@ -946,10 +945,10 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	if maxLevel <= 3 || len(allTransactions) < 1000 {
 		// For shallow dependency trees or small transaction counts, use simpler level-based processing
 		// The overhead of pipeline coordination isn't worth it for these cases
-		err = u.processTransactionsByLevel(ctx, maxLevel, txsPerLevel, blockHeight, blockIds, processedValidatorOptions, &errorsFound, &addedToOrphanage)
+		err = u.processTransactionsByLevel(ctx, blockHash, subtreeHash, maxLevel, txsPerLevel, blockHeight, blockIds, processedValidatorOptions, &errorsFound, &addedToOrphanage)
 	} else {
 		// For deep dependency trees (like 197 levels), use pipeline processing for massive speedup
-		err = u.processTransactionsPipelined(ctx, missingTxs, blockHeight, blockIds, processedValidatorOptions, &errorsFound, &addedToOrphanage)
+		err = u.processTransactionsPipelined(ctx, blockHash, subtreeHash, missingTxs, blockHeight, blockIds, processedValidatorOptions, &errorsFound, &addedToOrphanage)
 	}
 
 	if err != nil {
@@ -966,7 +965,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 // processTransactionsByLevel processes transactions level by level with barriers
 // This is the simpler approach suitable for shallow dependency trees
-func (u *Server) processTransactionsByLevel(ctx context.Context, maxLevel uint32, txsPerLevel [][]missingTx,
+func (u *Server) processTransactionsByLevel(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, maxLevel uint32, txsPerLevel [][]missingTx,
 	blockHeight uint32, blockIds map[uint32]bool, processedValidatorOptions *validator.Options,
 	errorsFound, addedToOrphanage *atomic.Uint64) error {
 
@@ -990,7 +989,7 @@ func (u *Server) processTransactionsByLevel(ctx context.Context, maxLevel uint32
 			}
 
 			g.Go(func() error {
-				return u.validateSingleTransaction(gCtx, tx, blockHeight, blockIds, processedValidatorOptions, errorsFound, addedToOrphanage)
+				return u.validateSingleTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions, errorsFound, addedToOrphanage)
 			})
 		}
 
@@ -1008,7 +1007,7 @@ func (u *Server) processTransactionsByLevel(ctx context.Context, maxLevel uint32
 // processTransactionsPipelined processes transactions using dependency-aware pipeline
 // This allows transactions to start immediately when their dependencies complete
 // Ideal for deep dependency trees (197 levels) where level barriers create significant overhead
-func (u *Server) processTransactionsPipelined(ctx context.Context, transactions []missingTx,
+func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, transactions []missingTx,
 	blockHeight uint32, blockIds map[uint32]bool, processedValidatorOptions *validator.Options,
 	errorsFound, addedToOrphanage *atomic.Uint64) error {
 
@@ -1101,7 +1100,7 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, transactions 
 					}
 
 					// Validate this transaction
-					err := u.validateSingleTransaction(gCtx, state.tx, blockHeight, blockIds, processedValidatorOptions, errorsFound, addedToOrphanage)
+					err := u.validateSingleTransaction(gCtx, blockHash, subtreeHash, state.tx, blockHeight, blockIds, processedValidatorOptions, errorsFound, addedToOrphanage)
 					if err != nil {
 						return err
 					}
@@ -1164,12 +1163,12 @@ type pipelineTxState struct {
 
 // validateSingleTransaction validates a single transaction with common error handling
 // Extracted to avoid code duplication between level-based and pipelined processing
-func (u *Server) validateSingleTransaction(ctx context.Context, tx *bt.Tx, blockHeight uint32,
+func (u *Server) validateSingleTransaction(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, tx *bt.Tx, blockHeight uint32,
 	blockIds map[uint32]bool, processedValidatorOptions *validator.Options,
 	errorsFound, addedToOrphanage *atomic.Uint64) error {
 
 	// Use existing blessMissingTransaction logic for validation
-	txMeta, err := u.blessMissingTransaction(ctx, chainhash.Hash{}, tx, blockHeight, blockIds, processedValidatorOptions)
+	txMeta, err := u.blessMissingTransaction(ctx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
 	if err != nil {
 		u.logger.Debugf("[validateSingleTransaction] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
 

@@ -5,17 +5,19 @@ import (
 	"context"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // PeerInfo holds all information about a peer in the P2P network.
 // This struct represents the public API contract for peer data, decoupled from
 // any transport-specific representations (like protobuf).
+// Thread safety: All access to peer data is protected by PeerRegistry's mutex.
 type PeerInfo struct {
 	ID              peer.ID
 	ClientName      string // Human-readable name of the client software
-	Height          int32
-	BlockHash       string
+	Height          uint32
+	BlockHash       *chainhash.Hash
 	DataHubURL      string
 	BanScore        int
 	IsBanned        bool

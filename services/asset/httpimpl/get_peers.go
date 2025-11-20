@@ -14,7 +14,7 @@ import (
 type PeerInfoResponse struct {
 	ID              string `json:"id"`
 	ClientName      string `json:"client_name"`
-	Height          int32  `json:"height"`
+	Height          uint32 `json:"height"`
 	BlockHash       string `json:"block_hash"`
 	DataHubURL      string `json:"data_hub_url"`
 	BanScore        int    `json:"ban_score"`
@@ -76,11 +76,17 @@ func (h *HTTP) GetPeers(c echo.Context) error {
 	peerResponses := make([]PeerInfoResponse, 0, len(peers))
 	for _, peerPtr := range peers {
 		peer := (*p2p.PeerInfo)(peerPtr) // Explicit type assertion to satisfy import checker
+
+		blockHashStr := ""
+		if peer.BlockHash != nil {
+			blockHashStr = peer.BlockHash.String()
+		}
+
 		peerResponses = append(peerResponses, PeerInfoResponse{
 			ID:              peer.ID.String(),
 			ClientName:      peer.ClientName,
 			Height:          peer.Height,
-			BlockHash:       peer.BlockHash,
+			BlockHash:       blockHashStr,
 			DataHubURL:      peer.DataHubURL,
 			BanScore:        peer.BanScore,
 			IsBanned:        peer.IsBanned,
