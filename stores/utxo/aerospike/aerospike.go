@@ -77,7 +77,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -205,10 +205,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	// Ensure index creation/wait is only done once per process
-	if cleanup.IndexName != "" {
+	if pruner.IndexName != "" {
 		s.indexOnce.Do(func() {
 			if s.client != nil && s.client.Client != nil {
-				exists, err := s.indexExists(cleanup.IndexName)
+				exists, err := s.indexExists(pruner.IndexName)
 				if err != nil {
 					s.logger.Errorf("Failed to check index existence: %v", err)
 					return
@@ -216,7 +216,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 				if !exists {
 					// Only one process should try to create the index
-					err := s.CreateIndexIfNotExists(ctx, cleanup.IndexName, fields.DeleteAtHeight.String(), aerospike.NUMERIC)
+					err := s.CreateIndexIfNotExists(ctx, pruner.IndexName, fields.DeleteAtHeight.String(), aerospike.NUMERIC)
 					if err != nil {
 						s.logger.Errorf("Failed to create index: %v", err)
 					}

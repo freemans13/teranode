@@ -1,10 +1,10 @@
 syntax = "proto3";
 
-package cleanup;
+package pruner;
 
-option go_package = "github.com/bsv-blockchain/teranode/services/cleanup/cleanup_api";
+option go_package = "github.com/bsv-blockchain/teranode/services/pruner/pruner_api";
 
-service CleanupAPI {
+service PrunerAPI {
   rpc HealthGRPC(EmptyMessage) returns (HealthResponse) {}
 }
 

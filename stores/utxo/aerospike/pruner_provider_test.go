@@ -6,27 +6,27 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/settings"
-	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestCleanupProviderInterface(t *testing.T) {
-	// Test that Store implements the CleanupServiceProvider interface
-	var _ cleanup.CleanupServiceProvider = (*Store)(nil)
+	// Test that Store implements the PrunerServiceProvider interface
+	var _ pruner.PrunerServiceProvider = (*Store)(nil)
 }
 
 func TestCleanupServiceSingleton(t *testing.T) {
 	// Test basic singleton pattern without complex mocking
 
 	// Reset singleton state for testing
-	cleanupServiceInstance = nil
-	cleanupServiceError = nil
+	prunerServiceInstance = nil
+	prunerServiceError = nil
 
 	// Test that multiple calls to create service maintain singleton pattern
-	assert.Nil(t, cleanupServiceInstance)
-	assert.Nil(t, cleanupServiceError)
+	assert.Nil(t, prunerServiceInstance)
+	assert.Nil(t, prunerServiceError)
 }
 
 func TestCleanupServiceConcurrency(t *testing.T) {
@@ -40,10 +40,10 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// Test that the mutex exists and can be used
-			cleanupServiceMutex.Lock()
+			prunerServiceMutex.Lock()
 			// Simulate some work
-			_ = cleanupServiceInstance
-			cleanupServiceMutex.Unlock()
+			_ = prunerServiceInstance
+			prunerServiceMutex.Unlock()
 		}()
 	}
 
@@ -61,7 +61,7 @@ func TestCleanupServiceDisabled(t *testing.T) {
 		},
 	}
 
-	service, err := store.GetCleanupService()
+	service, err := store.GetPrunerService()
 	assert.Nil(t, service)
 	assert.Nil(t, err)
 }
@@ -76,7 +76,7 @@ func TestCleanupServiceEnabled(t *testing.T) {
 		},
 	}
 
-	service, err := store.GetCleanupService()
+	service, err := store.GetPrunerService()
 	// Should return an error because we don't have a valid aerospike client
 	// but the important thing is that it didn't return early due to disabled setting
 	assert.NotNil(t, err)
@@ -85,7 +85,7 @@ func TestCleanupServiceEnabled(t *testing.T) {
 
 func TestCleanupServiceWithContext(t *testing.T) {
 	// Reset singleton state for testing
-	ResetCleanupServiceForTests()
+	ResetPrunerServiceForTests()
 
 	ctx := context.Background()
 	testLogger := ulogger.NewErrorTestLogger(t)
@@ -104,7 +104,7 @@ func TestCleanupServiceWithContext(t *testing.T) {
 	// Verify that the store context is not nil
 	require.NotNil(t, store.ctx, "Store context should not be nil")
 
-	service, err := store.GetCleanupService()
+	service, err := store.GetPrunerService()
 	// Should return an error because we don't have a valid aerospike client,
 	// but the important thing is that it didn't panic due to nil context
 	assert.NotNil(t, err)

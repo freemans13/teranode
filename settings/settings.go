@@ -360,12 +360,12 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MaxMinedBatchSize:                 getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment:    getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
 			DisableDAHCleaner:                 getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
-			// Cleanup-specific settings optimized for multi-million record cleanups
-			CleanupParentUpdateBatcherSize:           getInt("utxostore_cleanupParentUpdateBatcherSize", 2000, alternativeContext...),
-			CleanupParentUpdateBatcherDurationMillis: getInt("utxostore_cleanupParentUpdateBatcherDurationMillis", 100, alternativeContext...),
-			CleanupDeleteBatcherSize:                 getInt("utxostore_cleanupDeleteBatcherSize", 5000, alternativeContext...),
-			CleanupDeleteBatcherDurationMillis:       getInt("utxostore_cleanupDeleteBatcherDurationMillis", 100, alternativeContext...),
-			CleanupMaxConcurrentOperations:           getInt("utxostore_cleanupMaxConcurrentOperations", 0, alternativeContext...),
+			// Pruner-specific settings optimized for multi-million record pruning operations
+			PrunerParentUpdateBatcherSize:           getInt("utxostore_prunerParentUpdateBatcherSize", 2000, alternativeContext...),
+			PrunerParentUpdateBatcherDurationMillis: getInt("utxostore_prunerParentUpdateBatcherDurationMillis", 100, alternativeContext...),
+			PrunerDeleteBatcherSize:                 getInt("utxostore_prunerDeleteBatcherSize", 5000, alternativeContext...),
+			PrunerDeleteBatcherDurationMillis:       getInt("utxostore_prunerDeleteBatcherDurationMillis", 100, alternativeContext...),
+			PrunerMaxConcurrentOperations:           getInt("utxostore_prunerMaxConcurrentOperations", 0, alternativeContext...),
 		},
 		P2P: P2PSettings{
 			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),
@@ -423,12 +423,12 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TestMode:              getBool("coinbase_test_mode", false, alternativeContext...),
 			P2PPort:               getInt("p2p_port_coinbase", 9906, alternativeContext...),
 		},
-		Cleanup: CleanupSettings{
-			GRPCAddress:       getString("cleanup_grpcAddress", "localhost:8096", alternativeContext...),
-			GRPCListenAddress: getString("cleanup_grpcListenAddress", ":8096", alternativeContext...),
-			PollingInterval:   getDuration("cleanup_pollingInterval", time.Minute, alternativeContext...),
-			WorkerCount:       getInt("cleanup_workerCount", 4, alternativeContext...), // Default to 4 workers
-			JobTimeout:        getDuration("cleanup_jobTimeout", 10*time.Minute, alternativeContext...),
+		Pruner: PrunerSettings{
+			GRPCAddress:       getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
+			GRPCListenAddress: getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
+			PollingInterval:   getDuration("pruner_pollingInterval", time.Minute, alternativeContext...),
+			WorkerCount:       getInt("pruner_workerCount", 4, alternativeContext...), // Default to 4 workers
+			JobTimeout:        getDuration("pruner_jobTimeout", 10*time.Minute, alternativeContext...),
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),

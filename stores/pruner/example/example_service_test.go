@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -102,11 +102,11 @@ func (m *mockLogger) GetLogs() []string {
 	return logs
 }
 
-func TestNewExampleCleanupService(t *testing.T) {
+func TestNewExamplePrunerService(t *testing.T) {
 	t.Run("successful_creation", func(t *testing.T) {
 		logger := &mockLogger{}
 
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 
 		require.NoError(t, err)
 		require.NotNil(t, service)
@@ -115,9 +115,9 @@ func TestNewExampleCleanupService(t *testing.T) {
 	})
 
 	t.Run("job_processor_logic_coverage", func(t *testing.T) {
-		// This test specifically exercises the job processor function defined in NewExampleCleanupService
+		// This test specifically exercises the job processor function defined in NewExamplePrunerService
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -128,7 +128,7 @@ func TestNewExampleCleanupService(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 
 		// Test job processor with nil done channel (covers line 37 check)
-		err = service.TriggerCleanup(900)
+		err = service.TriggerPruner(900)
 		require.NoError(t, err)
 
 		// Wait for job to complete
@@ -136,13 +136,13 @@ func TestNewExampleCleanupService(t *testing.T) {
 
 		// Test job processor with non-nil done channel (covers lines 53-56)
 		doneCh := make(chan string, 1)
-		err = service.TriggerCleanup(901, doneCh)
+		err = service.TriggerPruner(901, doneCh)
 		require.NoError(t, err)
 
 		// Wait for completion
 		select {
 		case status := <-doneCh:
-			assert.Equal(t, cleanup.JobStatusCompleted.String(), status)
+			assert.Equal(t, pruner.JobStatusCompleted.String(), status)
 		case <-time.After(1 * time.Second):
 			t.Fatal("Timeout waiting for job completion")
 		}
@@ -153,10 +153,10 @@ func TestNewExampleCleanupService(t *testing.T) {
 		foundCompleteLogs := 0
 
 		for _, log := range logs {
-			if strings.Contains(log, "starting cleanup job for block height") {
+			if strings.Contains(log, "starting pruner job for block height") {
 				foundStartLogs++
 			}
-			if strings.Contains(log, "completed cleanup job for block height") {
+			if strings.Contains(log, "completed pruner job for block height") {
 				foundCompleteLogs++
 			}
 		}
@@ -169,7 +169,7 @@ func TestNewExampleCleanupService(t *testing.T) {
 func TestExampleCleanupService_Start(t *testing.T) {
 	t.Run("start_service", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -192,7 +192,7 @@ func TestExampleCleanupService_Start(t *testing.T) {
 func TestExampleCleanupService_UpdateBlockHeight(t *testing.T) {
 	t.Run("update_block_height_success", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -209,7 +209,7 @@ func TestExampleCleanupService_UpdateBlockHeight(t *testing.T) {
 
 	t.Run("update_block_height_with_done_channel", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -239,7 +239,7 @@ func TestExampleCleanupService_UpdateBlockHeight(t *testing.T) {
 func TestExampleCleanupService_TriggerCleanup(t *testing.T) {
 	t.Run("trigger_cleanup_success", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -250,13 +250,13 @@ func TestExampleCleanupService_TriggerCleanup(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 
 		// Trigger cleanup
-		err = service.TriggerCleanup(300)
+		err = service.TriggerPruner(300)
 		assert.NoError(t, err)
 	})
 
 	t.Run("trigger_cleanup_with_done_channel", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -270,7 +270,7 @@ func TestExampleCleanupService_TriggerCleanup(t *testing.T) {
 		doneCh := make(chan string, 1)
 
 		// Trigger cleanup with done channel
-		err = service.TriggerCleanup(400, doneCh)
+		err = service.TriggerPruner(400, doneCh)
 		assert.NoError(t, err)
 
 		// Wait for completion
@@ -286,7 +286,7 @@ func TestExampleCleanupService_TriggerCleanup(t *testing.T) {
 func TestExampleCleanupService_GetJobs(t *testing.T) {
 	t.Run("get_jobs_initially_empty", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		jobs := service.GetJobs()
@@ -296,7 +296,7 @@ func TestExampleCleanupService_GetJobs(t *testing.T) {
 
 	t.Run("get_jobs_after_triggering_cleanup", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -307,7 +307,7 @@ func TestExampleCleanupService_GetJobs(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 
 		// Trigger cleanup
-		err = service.TriggerCleanup(500)
+		err = service.TriggerPruner(500)
 		require.NoError(t, err)
 
 		// Give job time to be processed
@@ -324,7 +324,7 @@ func TestExampleCleanupService_GetJobs(t *testing.T) {
 func TestJobProcessor_Integration(t *testing.T) {
 	t.Run("job_processor_completes_successfully", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -337,14 +337,14 @@ func TestJobProcessor_Integration(t *testing.T) {
 		// Create done channel to monitor completion
 		doneCh := make(chan string, 1)
 
-		// Trigger cleanup job
-		err = service.TriggerCleanup(600, doneCh)
+		// Trigger pruner job
+		err = service.TriggerPruner(600, doneCh)
 		require.NoError(t, err)
 
 		// Wait for job completion
 		select {
 		case status := <-doneCh:
-			assert.Equal(t, cleanup.JobStatusCompleted.String(), status)
+			assert.Equal(t, pruner.JobStatusCompleted.String(), status)
 		case <-time.After(2 * time.Second):
 			t.Fatal("Timeout waiting for job completion")
 		}
@@ -355,10 +355,10 @@ func TestJobProcessor_Integration(t *testing.T) {
 		foundCompleteLog := false
 
 		for _, log := range logs {
-			if strings.Contains(log, "starting cleanup job for block height 600") {
+			if strings.Contains(log, "starting pruner job for block height 600") {
 				foundStartLog = true
 			}
-			if strings.Contains(log, "completed cleanup job for block height 600") {
+			if strings.Contains(log, "completed pruner job for block height 600") {
 				foundCompleteLog = true
 			}
 		}
@@ -369,7 +369,7 @@ func TestJobProcessor_Integration(t *testing.T) {
 
 	t.Run("job_processor_handles_cancellation", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -381,8 +381,8 @@ func TestJobProcessor_Integration(t *testing.T) {
 		// Create done channel to monitor completion
 		doneCh := make(chan string, 1)
 
-		// Trigger cleanup job
-		err = service.TriggerCleanup(700, doneCh)
+		// Trigger pruner job
+		err = service.TriggerPruner(700, doneCh)
 		require.NoError(t, err)
 
 		// Give the job a very brief moment to start, then cancel
@@ -393,7 +393,7 @@ func TestJobProcessor_Integration(t *testing.T) {
 		select {
 		case status := <-doneCh:
 			// Job should be either cancelled or completed (timing dependent)
-			assert.Contains(t, []string{cleanup.JobStatusCancelled.String(), cleanup.JobStatusCompleted.String()}, status)
+			assert.Contains(t, []string{pruner.JobStatusCancelled.String(), pruner.JobStatusCompleted.String()}, status)
 		case <-time.After(1 * time.Second):
 			// If timeout, check if we can find any relevant logs
 			logs := logger.GetLogs()
@@ -407,7 +407,7 @@ func TestJobProcessor_Integration(t *testing.T) {
 func TestJobProcessor_Coverage(t *testing.T) {
 	t.Run("job_processor_without_done_channel", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -418,7 +418,7 @@ func TestJobProcessor_Coverage(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 
 		// Trigger cleanup without done channel
-		err = service.TriggerCleanup(800)
+		err = service.TriggerPruner(800)
 		require.NoError(t, err)
 
 		// Wait for job to complete
@@ -430,10 +430,10 @@ func TestJobProcessor_Coverage(t *testing.T) {
 		foundCompleteLog := false
 
 		for _, log := range logs {
-			if strings.Contains(log, "starting cleanup job for block height 800") {
+			if strings.Contains(log, "starting pruner job for block height 800") {
 				foundStartLog = true
 			}
-			if strings.Contains(log, "completed cleanup job for block height 800") {
+			if strings.Contains(log, "completed pruner job for block height 800") {
 				foundCompleteLog = true
 			}
 		}
@@ -447,7 +447,7 @@ func TestJobProcessor_Coverage(t *testing.T) {
 func TestJobProcessor_MoreCoverage(t *testing.T) {
 	t.Run("multiple_concurrent_jobs", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -461,9 +461,9 @@ func TestJobProcessor_MoreCoverage(t *testing.T) {
 		done2 := make(chan string, 1)
 		done3 := make(chan string, 1)
 
-		err1 := service.TriggerCleanup(1001, done1)
-		err2 := service.TriggerCleanup(1002, done2)
-		err3 := service.TriggerCleanup(1003, done3)
+		err1 := service.TriggerPruner(1001, done1)
+		err2 := service.TriggerPruner(1002, done2)
+		err3 := service.TriggerPruner(1003, done3)
 
 		require.NoError(t, err1)
 		require.NoError(t, err2)
@@ -475,15 +475,15 @@ func TestJobProcessor_MoreCoverage(t *testing.T) {
 			select {
 			case result := <-done1:
 				// Job can be completed or cancelled depending on timing
-				assert.Contains(t, []string{cleanup.JobStatusCompleted.String(), cleanup.JobStatusCancelled.String()}, result)
+				assert.Contains(t, []string{pruner.JobStatusCompleted.String(), pruner.JobStatusCancelled.String()}, result)
 				completedCount++
 				done1 = nil // Prevent reading again
 			case result := <-done2:
-				assert.Contains(t, []string{cleanup.JobStatusCompleted.String(), cleanup.JobStatusCancelled.String()}, result)
+				assert.Contains(t, []string{pruner.JobStatusCompleted.String(), pruner.JobStatusCancelled.String()}, result)
 				completedCount++
 				done2 = nil
 			case result := <-done3:
-				assert.Contains(t, []string{cleanup.JobStatusCompleted.String(), cleanup.JobStatusCancelled.String()}, result)
+				assert.Contains(t, []string{pruner.JobStatusCompleted.String(), pruner.JobStatusCancelled.String()}, result)
 				completedCount++
 				done3 = nil
 			case <-time.After(2 * time.Second):
@@ -501,7 +501,7 @@ func TestJobProcessor_MoreCoverage(t *testing.T) {
 		jobLogCount := 0
 
 		for _, log := range logs {
-			if strings.Contains(log, "cleanup job for block height") {
+			if strings.Contains(log, "pruner job for block height") {
 				jobLogCount++
 			}
 		}
@@ -510,10 +510,10 @@ func TestJobProcessor_MoreCoverage(t *testing.T) {
 	})
 }
 
-// TestNewExampleCleanupService_ErrorHandling tests error paths in NewExampleCleanupService
-func TestNewExampleCleanupService_ErrorHandling(t *testing.T) {
+// TestNewExamplePrunerService_ErrorHandling tests error paths in NewExamplePrunerService
+func TestNewExamplePrunerService_ErrorHandling(t *testing.T) {
 	t.Run("job_manager_creation_error_simulation", func(t *testing.T) {
-		// This test ensures we cover the error handling path in NewExampleCleanupService
+		// This test ensures we cover the error handling path in NewExamplePrunerService
 		// While we can't easily make NewJobManager fail with valid inputs,
 		// we can ensure our service handles all the cases properly
 
@@ -521,12 +521,12 @@ func TestNewExampleCleanupService_ErrorHandling(t *testing.T) {
 
 		// Test with various logger configurations to exercise different paths
 		logger.SetLogLevel("debug")
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 		require.NotNil(t, service)
 
 		logger.SetLogLevel("info")
-		service2, err := NewExampleCleanupService(logger)
+		service2, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 		require.NotNil(t, service2)
 
@@ -539,18 +539,18 @@ func TestNewExampleCleanupService_ErrorHandling(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 
 		// Test job without done channel (covers if job.DoneCh != nil check on line 37)
-		err = service.TriggerCleanup(2000) // No done channel
+		err = service.TriggerPruner(2000) // No done channel
 		require.NoError(t, err)
 
 		// Test job with done channel (covers if job.DoneCh != nil check on line 53)
 		doneCh := make(chan string, 1)
-		err = service.TriggerCleanup(2001, doneCh)
+		err = service.TriggerPruner(2001, doneCh)
 		require.NoError(t, err)
 
 		// Wait for completion
 		select {
 		case result := <-doneCh:
-			assert.Contains(t, []string{cleanup.JobStatusCompleted.String(), cleanup.JobStatusCancelled.String()}, result)
+			assert.Contains(t, []string{pruner.JobStatusCompleted.String(), pruner.JobStatusCancelled.String()}, result)
 		case <-time.After(1 * time.Second):
 			t.Fatal("Timeout waiting for job completion")
 		}
@@ -563,7 +563,7 @@ func TestNewExampleCleanupService_ErrorHandling(t *testing.T) {
 		foundJobLogs := 0
 
 		for _, log := range logs {
-			if strings.Contains(log, "cleanup job for block height 200") {
+			if strings.Contains(log, "pruner job for block height 200") {
 				foundJobLogs++
 			}
 		}
@@ -578,14 +578,14 @@ func TestNewExampleCleanupService_ErrorHandling(t *testing.T) {
 
 		// The best we can do is ensure the error return path is exercised by
 		// testing a condition that would normally cause NewJobManager to fail
-		// Since we can't modify the parameters to NewJobManager directly in NewExampleCleanupService,
+		// Since we can't modify the parameters to NewJobManager directly in NewExamplePrunerService,
 		// and we can't pass nil logger due to type constraints,
 		// we need to ensure that our error handling code would work if NewJobManager failed
 
 		logger := &mockLogger{}
 
 		// This will succeed, but we're testing that the error handling path exists
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 		require.NotNil(t, service)
 
@@ -596,7 +596,7 @@ func TestNewExampleCleanupService_ErrorHandling(t *testing.T) {
 		// To achieve higher coverage, we need to ensure all initialization paths are tested
 		// Test with different logger states
 		logger.SetLogLevel("error")
-		service2, err := NewExampleCleanupService(logger)
+		service2, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 		require.NotNil(t, service2)
 	})
@@ -606,7 +606,7 @@ func TestNewExampleCleanupService_ErrorHandling(t *testing.T) {
 func TestJobProcessor_CancellationPath(t *testing.T) {
 	t.Run("force_job_cancellation", func(t *testing.T) {
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -618,8 +618,8 @@ func TestJobProcessor_CancellationPath(t *testing.T) {
 		// Create done channel to capture cancellation
 		doneCh := make(chan string, 1)
 
-		// Trigger cleanup job and immediately cancel to hit the 100ms sleep window
-		err = service.TriggerCleanup(3000, doneCh)
+		// Trigger pruner job and immediately cancel to hit the 100ms sleep window
+		err = service.TriggerPruner(3000, doneCh)
 		require.NoError(t, err)
 
 		// Cancel context after a very brief delay - during the 100ms sleep in the job processor
@@ -632,10 +632,10 @@ func TestJobProcessor_CancellationPath(t *testing.T) {
 		select {
 		case result := <-doneCh:
 			// Should be either completed or cancelled
-			assert.Contains(t, []string{cleanup.JobStatusCompleted.String(), cleanup.JobStatusCancelled.String()}, result)
+			assert.Contains(t, []string{pruner.JobStatusCompleted.String(), pruner.JobStatusCancelled.String()}, result)
 
 			// If we got cancelled, we successfully hit the cancellation code path
-			if result == cleanup.JobStatusCancelled.String() {
+			if result == pruner.JobStatusCancelled.String() {
 				logs := logger.GetLogs()
 				foundCancelLog := false
 				for _, log := range logs {
@@ -658,7 +658,7 @@ func TestJobProcessor_CancellationPath(t *testing.T) {
 		// of hitting the cancellation path during job processing
 
 		logger := &mockLogger{}
-		service, err := NewExampleCleanupService(logger)
+		service, err := NewExamplePrunerService(logger)
 		require.NoError(t, err)
 
 		// Run multiple iterations to increase chance of hitting the cancellation timing
@@ -669,7 +669,7 @@ func TestJobProcessor_CancellationPath(t *testing.T) {
 			time.Sleep(1 * time.Millisecond) // Very brief startup time
 
 			doneCh := make(chan string, 1)
-			err = service.TriggerCleanup(uint32(3100+i), doneCh)
+			err = service.TriggerPruner(uint32(3100+i), doneCh)
 			if err != nil {
 				cancel()
 				continue
@@ -684,7 +684,7 @@ func TestJobProcessor_CancellationPath(t *testing.T) {
 			// Wait for result
 			select {
 			case result := <-doneCh:
-				if result == cleanup.JobStatusCancelled.String() {
+				if result == pruner.JobStatusCancelled.String() {
 					// We successfully hit the cancellation path!
 					t.Logf("Successfully triggered cancellation on iteration %d", i)
 					return // Success - we hit the cancellation path

@@ -1,4 +1,4 @@
-package cleanup
+package pruner
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
-	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
@@ -23,12 +23,12 @@ import (
 func createTestSettings() *settings.Settings {
 	return &settings.Settings{
 		UtxoStore: settings.UtxoStoreSettings{
-			CleanupParentUpdateBatcherSize:           100,
-			CleanupParentUpdateBatcherDurationMillis: 10,
-			CleanupDeleteBatcherSize:                 256,
-			CleanupDeleteBatcherDurationMillis:       10,
-			CleanupMaxConcurrentOperations:           0,   //  0 = auto-detect from connection queue size
-			UtxoBatchSize:                            128, // Add missing UtxoBatchSize
+			PrunerParentUpdateBatcherSize:           100,
+			PrunerParentUpdateBatcherDurationMillis: 10,
+			PrunerDeleteBatcherSize:                 256,
+			PrunerDeleteBatcherDurationMillis:       10,
+			PrunerMaxConcurrentOperations:           0,   //  0 = auto-detect from connection queue size
+			UtxoBatchSize:                           128, // Add missing UtxoBatchSize
 		},
 	}
 }
@@ -80,7 +80,7 @@ func TestCleanupServiceLogicWithoutProcessor(t *testing.T) {
 
 		jobs := service.GetJobs()
 		assert.Len(t, jobs, 1)
-		assert.Equal(t, cleanup.JobStatusPending, jobs[0].GetStatus())
+		assert.Equal(t, pruner.JobStatusPending, jobs[0].GetStatus())
 	})
 
 	t.Run("New block height", func(t *testing.T) {
@@ -95,8 +95,8 @@ func TestCleanupServiceLogicWithoutProcessor(t *testing.T) {
 
 		jobs := service.GetJobs()
 		assert.Len(t, jobs, 2)
-		assert.Equal(t, cleanup.JobStatusCancelled, jobs[0].GetStatus())
-		assert.Equal(t, cleanup.JobStatusPending, jobs[1].GetStatus())
+		assert.Equal(t, pruner.JobStatusCancelled, jobs[0].GetStatus())
+		assert.Equal(t, pruner.JobStatusPending, jobs[1].GetStatus())
 	})
 
 	t.Run("Max jobs history", func(t *testing.T) {
@@ -116,13 +116,13 @@ func TestCleanupServiceLogicWithoutProcessor(t *testing.T) {
 
 		assert.Len(t, jobs, 3)
 		assert.Equal(t, uint32(1), jobs[0].BlockHeight)
-		assert.Equal(t, cleanup.JobStatusCancelled, jobs[0].GetStatus())
+		assert.Equal(t, pruner.JobStatusCancelled, jobs[0].GetStatus())
 
 		assert.Equal(t, uint32(2), jobs[1].BlockHeight)
-		assert.Equal(t, cleanup.JobStatusCancelled, jobs[1].GetStatus())
+		assert.Equal(t, pruner.JobStatusCancelled, jobs[1].GetStatus())
 
 		assert.Equal(t, uint32(3), jobs[2].BlockHeight)
-		assert.Equal(t, cleanup.JobStatusPending, jobs[2].GetStatus())
+		assert.Equal(t, pruner.JobStatusPending, jobs[2].GetStatus())
 
 		err = service.UpdateBlockHeight(4)
 		require.NoError(t, err)
@@ -131,13 +131,13 @@ func TestCleanupServiceLogicWithoutProcessor(t *testing.T) {
 
 		assert.Len(t, jobs, 3)
 		assert.Equal(t, uint32(2), jobs[0].BlockHeight)
-		assert.Equal(t, cleanup.JobStatusCancelled, jobs[0].GetStatus())
+		assert.Equal(t, pruner.JobStatusCancelled, jobs[0].GetStatus())
 
 		assert.Equal(t, uint32(3), jobs[1].BlockHeight)
-		assert.Equal(t, cleanup.JobStatusCancelled, jobs[1].GetStatus())
+		assert.Equal(t, pruner.JobStatusCancelled, jobs[1].GetStatus())
 
 		assert.Equal(t, uint32(4), jobs[2].BlockHeight)
-		assert.Equal(t, cleanup.JobStatusPending, jobs[2].GetStatus())
+		assert.Equal(t, pruner.JobStatusPending, jobs[2].GetStatus())
 	})
 }
 
@@ -437,7 +437,7 @@ func TestDeleteAtHeight(t *testing.T) {
 	require.NoError(t, err)
 
 	// Wait for the job to complete
-	require.Equal(t, cleanup.JobStatusCompleted.String(), <-done)
+	require.Equal(t, pruner.JobStatusCompleted.String(), <-done)
 
 	// Verify the record was not deleted
 	record, err = client.Get(nil, key1)
@@ -451,7 +451,7 @@ func TestDeleteAtHeight(t *testing.T) {
 	require.NoError(t, err)
 
 	// Wait for the job to complete
-	require.Equal(t, cleanup.JobStatusCompleted.String(), <-done)
+	require.Equal(t, pruner.JobStatusCompleted.String(), <-done)
 
 	// Verify the record1 was deleted
 	record, err = client.Get(nil, key1)
@@ -479,7 +479,7 @@ func TestDeleteAtHeight(t *testing.T) {
 	require.NoError(t, err)
 
 	// Wait for the job to complete
-	require.Equal(t, cleanup.JobStatusCompleted.String(), <-done)
+	require.Equal(t, pruner.JobStatusCompleted.String(), <-done)
 
 	// Verify the record2 was deleted
 	record, err = client.Get(nil, key2)
@@ -572,7 +572,6 @@ func TestServiceSimple(t *testing.T) {
 	})
 }
 
-
 // TestCleanupWithBlockPersisterCoordination tests cleanup coordination with block persister
 func TestCleanupWithBlockPersisterCoordination(t *testing.T) {
 	t.Run("BlockPersisterBehind_LimitsCleanup", func(t *testing.T) {
@@ -637,7 +636,7 @@ func TestCleanupWithBlockPersisterCoordination(t *testing.T) {
 		// Wait for completion
 		select {
 		case status := <-done:
-			assert.Equal(t, cleanup.JobStatusCompleted.String(), status)
+			assert.Equal(t, pruner.JobStatusCompleted.String(), status)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Cleanup should complete within 5 seconds")
 		}
@@ -705,7 +704,7 @@ func TestCleanupWithBlockPersisterCoordination(t *testing.T) {
 
 		select {
 		case status := <-done:
-			assert.Equal(t, cleanup.JobStatusCompleted.String(), status)
+			assert.Equal(t, pruner.JobStatusCompleted.String(), status)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Cleanup should complete within 5 seconds")
 		}
@@ -768,7 +767,7 @@ func TestCleanupWithBlockPersisterCoordination(t *testing.T) {
 
 		select {
 		case status := <-done:
-			assert.Equal(t, cleanup.JobStatusCompleted.String(), status)
+			assert.Equal(t, pruner.JobStatusCompleted.String(), status)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Cleanup should complete within 5 seconds")
 		}
@@ -827,7 +826,7 @@ func TestCleanupWithBlockPersisterCoordination(t *testing.T) {
 
 		select {
 		case status := <-done:
-			assert.Equal(t, cleanup.JobStatusCompleted.String(), status)
+			assert.Equal(t, pruner.JobStatusCompleted.String(), status)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Cleanup should complete within 5 seconds")
 		}
@@ -894,7 +893,7 @@ func TestSetPersistedHeightGetter(t *testing.T) {
 
 	select {
 	case status := <-done:
-		assert.Equal(t, cleanup.JobStatusCompleted.String(), status)
+		assert.Equal(t, pruner.JobStatusCompleted.String(), status)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Cleanup should complete within 5 seconds")
 	}

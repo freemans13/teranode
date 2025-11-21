@@ -52,7 +52,7 @@ teranode/
 ├── stores/                       # Data storage implementations
 │   ├── blob/                     # Blob storage implementation
 │   ├── blockchain/               # Blockchain storage implementation
-│   ├── cleanup/                  # Cleanup storage utilities
+│   ├── pruner/                   # Pruner storage utilities
 │   ├── txmetacache/             # Transaction metadata cache implementation
 │   └── utxo/                     # UTXO storage implementation
 │

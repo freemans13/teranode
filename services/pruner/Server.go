@@ -1,8 +1,8 @@
-// Package cleanup provides the Cleanup Service which handles periodic cleanup of unmined transaction
+// Package pruner provides the Pruner Service which handles periodic pruning of unmined transaction
 // parents and delete-at-height (DAH) records in the UTXO store. It polls the Block Assembly service
-// state and triggers cleanup operations only when safe to do so (i.e., when block assembly is in
+// state and triggers pruner operations only when safe to do so (i.e., when block assembly is in
 // "running" state and not performing reorgs or resets).
-package cleanup
+package pruner
 
 import (
 	"context"
@@ -16,10 +16,10 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
-	"github.com/bsv-blockchain/teranode/services/cleanup/cleanup_api"
+	"github.com/bsv-blockchain/teranode/services/pruner/pruner_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
-	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -28,10 +28,10 @@ import (
 	"google.golang.org/grpc"
 )
 
-// Server implements the Cleanup service which handles periodic cleanup operations
-// for the UTXO store. It polls block assembly state and triggers cleanup when safe.
+// Server implements the Pruner service which handles periodic pruner operations
+// for the UTXO store. It polls block assembly state and triggers pruner when safe.
 type Server struct {
-	cleanup_api.UnsafeCleanupAPIServer
+	pruner_api.UnsafePrunerAPIServer
 
 	// Dependencies (injected via constructor)
 	ctx                 context.Context
@@ -43,14 +43,14 @@ type Server struct {
 	blobStore           blob.Store
 
 	// Internal state
-	cleanupService      cleanup.Service
+	prunerService       pruner.Service
 	lastProcessedHeight atomic.Uint32
 	lastPersistedHeight atomic.Uint32
-	cleanupCh           chan uint32
+	prunerCh            chan uint32
 	stats               *gocore.Stat
 }
 
-// New creates a new Cleanup server instance with the provided dependencies.
+// New creates a new Pruner server instance with the provided dependencies.
 // This function initializes the server but does not start any background processes.
 // Call Init() and then Start() to begin operation.
 func New(
@@ -70,12 +70,12 @@ func New(
 		blockchainClient:    blockchainClient,
 		blockAssemblyClient: blockAssemblyClient,
 		blobStore:           blobStore,
-		stats:               gocore.NewStat("cleanup"),
+		stats:               gocore.NewStat("pruner"),
 	}
 }
 
-// Init initializes the cleanup service. This is called before Start() and is responsible
-// for setting up the cleanup service provider from the UTXO store and subscribing to
+// Init initializes the pruner service. This is called before Start() and is responsible
+// for setting up the pruner service provider from the UTXO store and subscribing to
 // block persisted notifications for coordination with the block persister service.
 func (s *Server) Init(ctx context.Context) error {
 	s.ctx = ctx
@@ -83,28 +83,28 @@ func (s *Server) Init(ctx context.Context) error {
 	// Initialize metrics
 	initPrometheusMetrics()
 
-	// Initialize cleanup service from UTXO store
-	cleanupProvider, ok := s.utxoStore.(cleanup.CleanupServiceProvider)
+	// Initialize pruner service from UTXO store
+	prunerProvider, ok := s.utxoStore.(pruner.PrunerServiceProvider)
 	if !ok {
-		return errors.NewServiceError("UTXO store does not provide cleanup service")
+		return errors.NewServiceError("UTXO store does not provide pruner service")
 	}
 
 	var err error
-	s.cleanupService, err = cleanupProvider.GetCleanupService()
+	s.prunerService, err = prunerProvider.GetPrunerService()
 	if err != nil {
-		return errors.NewServiceError("failed to get cleanup service", err)
+		return errors.NewServiceError("failed to get pruner service", err)
 	}
-	if s.cleanupService == nil {
-		return errors.NewServiceError("cleanup service not available from UTXO store")
+	if s.prunerService == nil {
+		return errors.NewServiceError("pruner service not available from UTXO store")
 	}
 
 	// Set persisted height getter for block persister coordination
-	s.cleanupService.SetPersistedHeightGetter(s.GetLastPersistedHeight)
+	s.prunerService.SetPersistedHeightGetter(s.GetLastPersistedHeight)
 
 	// Subscribe to BlockPersisted notifications using blockchain client
 	// The Subscribe method returns a channel, but we'll handle notifications in the polling worker
 	// For now, we'll track persisted height via blockchain state and notifications separately
-	subscriptionCh, err := s.blockchainClient.Subscribe(ctx, "Cleanup")
+	subscriptionCh, err := s.blockchainClient.Subscribe(ctx, "Pruner")
 	if err != nil {
 		return errors.NewServiceError("failed to subscribe to blockchain notifications", err)
 	}
@@ -135,7 +135,7 @@ func (s *Server) Init(ctx context.Context) error {
 	return nil
 }
 
-// Start begins the cleanup service operation. It starts the polling worker and cleanup
+// Start begins the pruner service operation. It starts the polling worker and pruner
 // processor goroutines, then starts the gRPC server. This function blocks until the
 // server shuts down or encounters an error.
 func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
@@ -148,25 +148,25 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return err
 	}
 
-	// Initialize cleanup channel (buffer of 1 to prevent blocking while ensuring only one cleanup)
-	s.cleanupCh = make(chan uint32, 1)
+	// Initialize pruner channel (buffer of 1 to prevent blocking while ensuring only one pruner)
+	s.prunerCh = make(chan uint32, 1)
 
-	// Start the cleanup service (Aerospike or SQL)
-	if s.cleanupService != nil {
-		s.cleanupService.Start(ctx)
+	// Start the pruner service (Aerospike or SQL)
+	if s.prunerService != nil {
+		s.prunerService.Start(ctx)
 	}
 
-	// Start cleanup processor goroutine
-	go s.cleanupProcessor(ctx)
+	// Start pruner processor goroutine
+	go s.prunerProcessor(ctx)
 
 	// Start polling worker goroutine
 	go s.pollingWorker(ctx)
 
 	// Start gRPC server (BLOCKING - must be last)
-	if err := util.StartGRPCServer(ctx, s.logger, s.settings, "cleanup",
-		s.settings.Cleanup.GRPCListenAddress,
+	if err := util.StartGRPCServer(ctx, s.logger, s.settings, "pruner",
+		s.settings.Pruner.GRPCListenAddress,
 		func(server *grpc.Server) {
-			cleanup_api.RegisterCleanupAPIServer(server, s)
+			pruner_api.RegisterPrunerAPIServer(server, s)
 			closeOnce.Do(func() { close(readyCh) })
 		}, nil); err != nil {
 		return err
@@ -175,29 +175,29 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	return nil
 }
 
-// Stop gracefully shuts down the cleanup service. Context cancellation will stop
-// the polling worker and cleanup processor goroutines.
+// Stop gracefully shuts down the pruner service. Context cancellation will stop
+// the polling worker and pruner processor goroutines.
 func (s *Server) Stop(ctx context.Context) error {
-	// Stop the cleanup service if it has a Stop method
-	if s.cleanupService != nil {
-		// Check if the cleanup service implements Stop
+	// Stop the pruner service if it has a Stop method
+	if s.prunerService != nil {
+		// Check if the pruner service implements Stop
 		// Aerospike has Stop, SQL doesn't
 		type stopper interface {
 			Stop(ctx context.Context) error
 		}
-		if stoppable, ok := s.cleanupService.(stopper); ok {
+		if stoppable, ok := s.prunerService.(stopper); ok {
 			if err := stoppable.Stop(ctx); err != nil {
-				s.logger.Errorf("Error stopping cleanup service: %v", err)
+				s.logger.Errorf("Error stopping pruner service: %v", err)
 			}
 		}
 	}
 
 	// Context cancellation will stop goroutines
-	s.logger.Infof("Cleanup service stopped")
+	s.logger.Infof("Pruner service stopped")
 	return nil
 }
 
-// Health implements the health check for the cleanup service. When checkLiveness is true,
+// Health implements the health check for the pruner service. When checkLiveness is true,
 // it only checks if the service process is running. When false, it checks all dependencies
 // including gRPC server, block assembly client, blockchain client, and UTXO store.
 func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
@@ -210,10 +210,10 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 	checks := make([]health.Check, 0, 5)
 
 	// Check gRPC server is listening
-	if s.settings.Cleanup.GRPCListenAddress != "" {
+	if s.settings.Pruner.GRPCListenAddress != "" {
 		checks = append(checks, health.Check{
 			Name: "gRPC Server",
-			Check: health.CheckGRPCServerWithSettings(s.settings.Cleanup.GRPCListenAddress, s.settings, func(ctx context.Context, conn *grpc.ClientConn) error {
+			Check: health.CheckGRPCServerWithSettings(s.settings.Pruner.GRPCListenAddress, s.settings, func(ctx context.Context, conn *grpc.ClientConn) error {
 				// Simple connection check - if we can create a client, server is up
 				return nil
 			}),
@@ -252,13 +252,13 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 }
 
 // HealthGRPC implements the gRPC health check endpoint.
-func (s *Server) HealthGRPC(ctx context.Context, _ *cleanup_api.EmptyMessage) (*cleanup_api.HealthResponse, error) {
+func (s *Server) HealthGRPC(ctx context.Context, _ *pruner_api.EmptyMessage) (*pruner_api.HealthResponse, error) {
 	// Add context value to prevent circular dependency when checking gRPC server
 	ctx = context.WithValue(ctx, "skip-grpc-self-check", true)
 
 	status, details, err := s.Health(ctx, false)
 
-	return &cleanup_api.HealthResponse{
+	return &pruner_api.HealthResponse{
 		Ok:      status == http.StatusOK,
 		Details: details,
 	}, errors.WrapGRPC(err)

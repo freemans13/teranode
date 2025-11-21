@@ -1,4 +1,4 @@
-package cleanup
+package pruner
 
 import (
 	"context"
@@ -6,14 +6,14 @@ import (
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
-	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/ordishs/gocore"
 )
 
-// Ensure Store implements the Cleanup Service interface
-var _ cleanup.Service = (*Service)(nil)
+// Ensure Store implements the Pruner Service interface
+var _ pruner.Service = (*Service)(nil)
 
 const (
 	// DefaultWorkerCount is the default number of worker goroutines
@@ -28,7 +28,7 @@ type Service struct {
 	logger             ulogger.Logger
 	settings           *settings.Settings
 	db                 *usql.DB
-	jobManager         *cleanup.JobManager
+	jobManager         *pruner.JobManager
 	ctx                context.Context
 	getPersistedHeight func() uint32
 }
@@ -83,12 +83,12 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	}
 
 	// Create the job processor function
-	jobProcessor := func(job *cleanup.Job, workerID int) {
+	jobProcessor := func(job *pruner.Job, workerID int) {
 		service.processCleanupJob(job, workerID)
 	}
 
 	// Create the job manager
-	jobManager, err := cleanup.NewJobManager(cleanup.JobManagerOptions{
+	jobManager, err := pruner.NewJobManager(pruner.JobManagerOptions{
 		Logger:         opts.Logger,
 		WorkerCount:    workerCount,
 		MaxJobsHistory: maxJobsHistory,
@@ -115,7 +115,7 @@ func (s *Service) UpdateBlockHeight(blockHeight uint32, doneCh ...chan string) e
 		return errors.NewProcessingError("Cannot update block height to 0")
 	}
 
-	return s.jobManager.TriggerCleanup(blockHeight, doneCh...)
+	return s.jobManager.TriggerPruner(blockHeight, doneCh...)
 }
 
 // SetPersistedHeightGetter sets the function used to get block persister progress.
@@ -125,12 +125,12 @@ func (s *Service) SetPersistedHeightGetter(getter func() uint32) {
 }
 
 // GetJobs returns a copy of the current jobs list (primarily for testing)
-func (s *Service) GetJobs() []*cleanup.Job {
+func (s *Service) GetJobs() []*pruner.Job {
 	return s.jobManager.GetJobs()
 }
 
 // processCleanupJob executes the cleanup for a specific job
-func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
+func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	s.logger.Debugf("[SQLCleanupService %d] running cleanup job for block height %d", workerID, job.BlockHeight)
 
 	job.Started = time.Now()
@@ -186,13 +186,13 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	deletedCount, err := deleteTombstonedWithCount(s.db, safeCleanupHeight)
 
 	if err != nil {
-		job.SetStatus(cleanup.JobStatusFailed)
+		job.SetStatus(pruner.JobStatusFailed)
 		job.Error = err
 		job.Ended = time.Now()
 
 		s.logger.Errorf("[SQLCleanupService %d] cleanup job failed for block height %d: %v", workerID, job.BlockHeight, err)
 	} else {
-		job.SetStatus(cleanup.JobStatusCompleted)
+		job.SetStatus(pruner.JobStatusCompleted)
 		job.Ended = time.Now()
 
 		s.logger.Infof("[SQLCleanupService %d] cleanup job completed for block height %d in %v - deleted %d records",

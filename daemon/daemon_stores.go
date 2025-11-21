@@ -409,5 +409,5 @@ func (d *Stores) Cleanup() {
 
 	// Reset the Aerospike cleanup service singleton if it exists
 	// This prevents state leakage between test runs
-	aerospike.ResetCleanupServiceForTests()
+	aerospike.ResetPrunerServiceForTests()
 }

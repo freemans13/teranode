@@ -1,4 +1,4 @@
-package cleanup
+package pruner
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
-	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -23,12 +23,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Ensure Store implements the Cleanup Service interface
-var _ cleanup.Service = (*Service)(nil)
+// Ensure Store implements the Pruner Service interface
+var _ pruner.Service = (*Service)(nil)
 
-var IndexName, _ = gocore.Config().Get("cleanup_IndexName", "cleanup_dah_index")
+var IndexName, _ = gocore.Config().Get("pruner_IndexName", "pruner_dah_index")
 
-// Constants for the cleanup service
+// Constants for the pruner service
 const (
 	// DefaultWorkerCount is the default number of worker goroutines
 	DefaultWorkerCount = 4
@@ -84,7 +84,7 @@ type Service struct {
 	external    blob.Store
 	namespace   string
 	set         string
-	jobManager  *cleanup.JobManager
+	jobManager  *pruner.JobManager
 	ctx         context.Context
 	indexWaiter IndexWaiter
 
@@ -164,9 +164,9 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	// - If setting is 0 or unset, use connection queue size
 	connectionQueueSize := opts.Client.GetConnectionQueueSize()
 	maxConcurrentOps := connectionQueueSize
-	if tSettings.UtxoStore.CleanupMaxConcurrentOperations > 0 {
-		if tSettings.UtxoStore.CleanupMaxConcurrentOperations < maxConcurrentOps {
-			maxConcurrentOps = tSettings.UtxoStore.CleanupMaxConcurrentOperations
+	if tSettings.UtxoStore.PrunerMaxConcurrentOperations > 0 {
+		if tSettings.UtxoStore.PrunerMaxConcurrentOperations < maxConcurrentOps {
+			maxConcurrentOps = tSettings.UtxoStore.PrunerMaxConcurrentOperations
 		}
 	}
 
@@ -188,12 +188,12 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	}
 
 	// Create the job processor function
-	jobProcessor := func(job *cleanup.Job, workerID int) {
+	jobProcessor := func(job *pruner.Job, workerID int) {
 		service.processCleanupJob(job, workerID)
 	}
 
 	// Create the job manager
-	jobManager, err := cleanup.NewJobManager(cleanup.JobManagerOptions{
+	jobManager, err := pruner.NewJobManager(pruner.JobManagerOptions{
 		Logger:         opts.Logger,
 		WorkerCount:    opts.WorkerCount,
 		MaxJobsHistory: opts.MaxJobsHistory,
@@ -271,9 +271,9 @@ func (s *Service) UpdateBlockHeight(blockHeight uint32, done ...chan string) err
 }
 
 // processCleanupJob processes a cleanup job
-func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
+func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	// Update job status to running
-	job.SetStatus(cleanup.JobStatusRunning)
+	job.SetStatus(pruner.JobStatusRunning)
 	job.Started = time.Now()
 
 	// Get the job's context for cancellation support
@@ -332,7 +332,7 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	// This will automatically use the index since the filter is on the indexed bin
 	err := stmt.SetFilter(aerospike.NewRangeFilter(fields.DeleteAtHeight.String(), 1, int64(safeCleanupHeight)))
 	if err != nil {
-		job.SetStatus(cleanup.JobStatusFailed)
+		job.SetStatus(pruner.JobStatusFailed)
 		job.Error = err
 		job.Ended = time.Now()
 
@@ -361,7 +361,7 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 		workerID, job.BlockHeight, safeCleanupHeight)
 
 	// Batch accumulation slices
-	batchSize := s.settings.UtxoStore.CleanupDeleteBatcherSize
+	batchSize := s.settings.UtxoStore.PrunerDeleteBatcherSize
 	parentUpdates := make(map[string]*parentUpdateInfo) // keyed by parent txid
 	deletions := make([]*aerospike.Key, 0, batchSize)
 
@@ -470,11 +470,11 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 
 	// Set appropriate status based on cancellation
 	if wasCancelled {
-		job.SetStatus(cleanup.JobStatusCancelled)
+		job.SetStatus(pruner.JobStatusCancelled)
 		s.logger.Infof("Worker %d cancelled cleanup job for block height %d after %v, processed %d records before cancellation",
 			workerID, job.BlockHeight, time.Since(job.Started), recordCount)
 	} else {
-		job.SetStatus(cleanup.JobStatusCompleted)
+		job.SetStatus(pruner.JobStatusCompleted)
 		s.logger.Infof("Worker %d completed cleanup job for block height %d in %v, processed %d records",
 			workerID, job.BlockHeight, time.Since(job.Started), recordCount)
 	}
@@ -483,7 +483,7 @@ func (s *Service) processCleanupJob(job *cleanup.Job, workerID int) {
 	prometheusUtxoCleanupBatch.Observe(float64(time.Since(job.Started).Microseconds()) / 1_000_000)
 }
 
-func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
+func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
 	var inputs []*bt.Input
 
 	external, ok := bins[fields.External.String()].(bool)
@@ -548,8 +548,8 @@ func (s *Service) getTxInputsFromBins(job *cleanup.Job, workerID int, bins aeros
 	return inputs, nil
 }
 
-func (s *Service) markJobAsFailed(job *cleanup.Job, err error) {
-	job.SetStatus(cleanup.JobStatusFailed)
+func (s *Service) markJobAsFailed(job *pruner.Job, err error) {
+	job.SetStatus(pruner.JobStatusFailed)
 	job.Error = err
 	job.Ended = time.Now()
 }
@@ -585,7 +585,7 @@ func (s *Service) extractTxHash(bins aerospike.BinMap) (*chainhash.Hash, error) 
 }
 
 // extractInputs extracts the transaction inputs from record bins
-func (s *Service) extractInputs(job *cleanup.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
+func (s *Service) extractInputs(job *pruner.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
 	return s.getTxInputsFromBins(job, workerID, bins, txHash)
 }
 
@@ -739,6 +739,6 @@ func (s *Service) ProcessSingleRecord(txHash *chainhash.Hash, inputs []*bt.Input
 }
 
 // GetJobs returns a copy of the current jobs list (primarily for testing)
-func (s *Service) GetJobs() []*cleanup.Job {
+func (s *Service) GetJobs() []*pruner.Job {
 	return s.jobManager.GetJobs()
 }

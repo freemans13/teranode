@@ -2,9 +2,9 @@
 // versions:
 // 	protoc-gen-go v1.36.10
 // 	protoc        v6.33.0
-// source: services/cleanup/cleanup_api/cleanup_api.proto
+// source: services/pruner/pruner_api/pruner_api.proto
 
-package cleanup_api
+package pruner_api
 
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
@@ -29,7 +29,7 @@ type EmptyMessage struct {
 
 func (x *EmptyMessage) Reset() {
 	*x = EmptyMessage{}
-	mi := &file_services_cleanup_cleanup_api_cleanup_api_proto_msgTypes[0]
+	mi := &file_services_pruner_pruner_api_pruner_api_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -41,7 +41,7 @@ func (x *EmptyMessage) String() string {
 func (*EmptyMessage) ProtoMessage() {}
 
 func (x *EmptyMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_services_cleanup_cleanup_api_cleanup_api_proto_msgTypes[0]
+	mi := &file_services_pruner_pruner_api_pruner_api_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -54,7 +54,7 @@ func (x *EmptyMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EmptyMessage.ProtoReflect.Descriptor instead.
 func (*EmptyMessage) Descriptor() ([]byte, []int) {
-	return file_services_cleanup_cleanup_api_cleanup_api_proto_rawDescGZIP(), []int{0}
+	return file_services_pruner_pruner_api_pruner_api_proto_rawDescGZIP(), []int{0}
 }
 
 type HealthResponse struct {
@@ -67,7 +67,7 @@ type HealthResponse struct {
 
 func (x *HealthResponse) Reset() {
 	*x = HealthResponse{}
-	mi := &file_services_cleanup_cleanup_api_cleanup_api_proto_msgTypes[1]
+	mi := &file_services_pruner_pruner_api_pruner_api_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -79,7 +79,7 @@ func (x *HealthResponse) String() string {
 func (*HealthResponse) ProtoMessage() {}
 
 func (x *HealthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_services_cleanup_cleanup_api_cleanup_api_proto_msgTypes[1]
+	mi := &file_services_pruner_pruner_api_pruner_api_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -92,7 +92,7 @@ func (x *HealthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthResponse.ProtoReflect.Descriptor instead.
 func (*HealthResponse) Descriptor() ([]byte, []int) {
-	return file_services_cleanup_cleanup_api_cleanup_api_proto_rawDescGZIP(), []int{1}
+	return file_services_pruner_pruner_api_pruner_api_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *HealthResponse) GetOk() bool {
@@ -109,40 +109,39 @@ func (x *HealthResponse) GetDetails() string {
 	return ""
 }
 
-var File_services_cleanup_cleanup_api_cleanup_api_proto protoreflect.FileDescriptor
+var File_services_pruner_pruner_api_pruner_api_proto protoreflect.FileDescriptor
 
-const file_services_cleanup_cleanup_api_cleanup_api_proto_rawDesc = "" +
+const file_services_pruner_pruner_api_pruner_api_proto_rawDesc = "" +
 	"\n" +
-	".services/cleanup/cleanup_api/cleanup_api.proto\x12\acleanup\"\x0e\n" +
+	"+services/pruner/pruner_api/pruner_api.proto\x12\x06pruner\"\x0e\n" +
 	"\fEmptyMessage\":\n" +
 	"\x0eHealthResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
-	"\adetails\x18\x02 \x01(\tR\adetails2L\n" +
+	"\adetails\x18\x02 \x01(\tR\adetails2I\n" +
+	"\tPrunerAPI\x12<\n" +
 	"\n" +
-	"CleanupAPI\x12>\n" +
-	"\n" +
-	"HealthGRPC\x12\x15.cleanup.EmptyMessage\x1a\x17.cleanup.HealthResponse\"\x00BAZ?github.com/bsv-blockchain/teranode/services/cleanup/cleanup_apib\x06proto3"
+	"HealthGRPC\x12\x14.pruner.EmptyMessage\x1a\x16.pruner.HealthResponse\"\x00B?Z=github.com/bsv-blockchain/teranode/services/pruner/pruner_apib\x06proto3"
 
 var (
-	file_services_cleanup_cleanup_api_cleanup_api_proto_rawDescOnce sync.Once
-	file_services_cleanup_cleanup_api_cleanup_api_proto_rawDescData []byte
+	file_services_pruner_pruner_api_pruner_api_proto_rawDescOnce sync.Once
+	file_services_pruner_pruner_api_pruner_api_proto_rawDescData []byte
 )
 
-func file_services_cleanup_cleanup_api_cleanup_api_proto_rawDescGZIP() []byte {
-	file_services_cleanup_cleanup_api_cleanup_api_proto_rawDescOnce.Do(func() {
-		file_services_cleanup_cleanup_api_cleanup_api_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_services_cleanup_cleanup_api_cleanup_api_proto_rawDesc), len(file_services_cleanup_cleanup_api_cleanup_api_proto_rawDesc)))
+func file_services_pruner_pruner_api_pruner_api_proto_rawDescGZIP() []byte {
+	file_services_pruner_pruner_api_pruner_api_proto_rawDescOnce.Do(func() {
+		file_services_pruner_pruner_api_pruner_api_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_services_pruner_pruner_api_pruner_api_proto_rawDesc), len(file_services_pruner_pruner_api_pruner_api_proto_rawDesc)))
 	})
-	return file_services_cleanup_cleanup_api_cleanup_api_proto_rawDescData
+	return file_services_pruner_pruner_api_pruner_api_proto_rawDescData
 }
 
-var file_services_cleanup_cleanup_api_cleanup_api_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
-var file_services_cleanup_cleanup_api_cleanup_api_proto_goTypes = []any{
-	(*EmptyMessage)(nil),   // 0: cleanup.EmptyMessage
-	(*HealthResponse)(nil), // 1: cleanup.HealthResponse
+var file_services_pruner_pruner_api_pruner_api_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_services_pruner_pruner_api_pruner_api_proto_goTypes = []any{
+	(*EmptyMessage)(nil),   // 0: pruner.EmptyMessage
+	(*HealthResponse)(nil), // 1: pruner.HealthResponse
 }
-var file_services_cleanup_cleanup_api_cleanup_api_proto_depIdxs = []int32{
-	0, // 0: cleanup.CleanupAPI.HealthGRPC:input_type -> cleanup.EmptyMessage
-	1, // 1: cleanup.CleanupAPI.HealthGRPC:output_type -> cleanup.HealthResponse
+var file_services_pruner_pruner_api_pruner_api_proto_depIdxs = []int32{
+	0, // 0: pruner.PrunerAPI.HealthGRPC:input_type -> pruner.EmptyMessage
+	1, // 1: pruner.PrunerAPI.HealthGRPC:output_type -> pruner.HealthResponse
 	1, // [1:2] is the sub-list for method output_type
 	0, // [0:1] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
@@ -150,26 +149,26 @@ var file_services_cleanup_cleanup_api_cleanup_api_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_services_cleanup_cleanup_api_cleanup_api_proto_init() }
-func file_services_cleanup_cleanup_api_cleanup_api_proto_init() {
-	if File_services_cleanup_cleanup_api_cleanup_api_proto != nil {
+func init() { file_services_pruner_pruner_api_pruner_api_proto_init() }
+func file_services_pruner_pruner_api_pruner_api_proto_init() {
+	if File_services_pruner_pruner_api_pruner_api_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_services_cleanup_cleanup_api_cleanup_api_proto_rawDesc), len(file_services_cleanup_cleanup_api_cleanup_api_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_services_pruner_pruner_api_pruner_api_proto_rawDesc), len(file_services_pruner_pruner_api_pruner_api_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_services_cleanup_cleanup_api_cleanup_api_proto_goTypes,
-		DependencyIndexes: file_services_cleanup_cleanup_api_cleanup_api_proto_depIdxs,
-		MessageInfos:      file_services_cleanup_cleanup_api_cleanup_api_proto_msgTypes,
+		GoTypes:           file_services_pruner_pruner_api_pruner_api_proto_goTypes,
+		DependencyIndexes: file_services_pruner_pruner_api_pruner_api_proto_depIdxs,
+		MessageInfos:      file_services_pruner_pruner_api_pruner_api_proto_msgTypes,
 	}.Build()
-	File_services_cleanup_cleanup_api_cleanup_api_proto = out.File
-	file_services_cleanup_cleanup_api_cleanup_api_proto_goTypes = nil
-	file_services_cleanup_cleanup_api_cleanup_api_proto_depIdxs = nil
+	File_services_pruner_pruner_api_pruner_api_proto = out.File
+	file_services_pruner_pruner_api_pruner_api_proto_goTypes = nil
+	file_services_pruner_pruner_api_pruner_api_proto_depIdxs = nil
 }
