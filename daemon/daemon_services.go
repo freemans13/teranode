@@ -447,7 +447,7 @@ func (d *Daemon) startRPCService(ctx context.Context, appSettings *settings.Sett
 		return err
 	}
 
-	blockAssemblyClient, err := GetBlockAssemblyClient(ctx, createLogger("rpc"), appSettings)
+	blockAssemblyClient, err := d.daemonStores.GetBlockAssemblyClient(ctx, createLogger("rpc"), appSettings)
 	if err != nil {
 		return err
 	}
@@ -528,7 +528,7 @@ func (d *Daemon) startAlertService(ctx context.Context, appSettings *settings.Se
 	}
 
 	// Create the block assembly client for the Alert service
-	blockAssemblyClient, err = GetBlockAssemblyClient(ctx, createLogger(loggerAlert), appSettings)
+	blockAssemblyClient, err = d.daemonStores.GetBlockAssemblyClient(ctx, createLogger(loggerAlert), appSettings)
 	if err != nil {
 		return err
 	}
@@ -1116,7 +1116,7 @@ func (d *Daemon) startPrunerService(ctx context.Context, appSettings *settings.S
 	}
 
 	// Create the block assembly client for the Pruner service
-	blockAssemblyClient, err := blockassembly.NewClient(ctx, createLogger(loggerBlockAssembly), appSettings)
+	blockAssemblyClient, err := d.daemonStores.GetBlockAssemblyClient(ctx, createLogger(loggerBlockAssembly), appSettings)
 	if err != nil {
 		return err
 	}
