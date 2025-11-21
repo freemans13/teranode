@@ -32,6 +32,16 @@ const (
 	// to prevent timeouts on large blocks. Aerospike can struggle with batches >10K records.
 	// This value balances performance (fewer round trips) with reliability (avoiding timeouts).
 	aerospikeBatchChunkSize = 5000
+
+	// maxTransactionsPerChunk bounds memory usage for very large blocks (600M+ transactions)
+	// Target: ~2GB peak memory per chunk
+	// Calculation:
+	//   - 8M transactions × 250 bytes avg = 2GB transaction data
+	//   - ~400K external parents (5%) × 1KB metadata = 400MB parent data
+	//   - Dependency graph overhead = ~300MB
+	//   Total: ~2.7GB per chunk
+	// For 600M tx block: 75 chunks × 125ms = ~10 seconds, 2.7GB peak memory
+	maxTransactionsPerChunk = 8_000_000 // 8 million transactions
 )
 
 // bufioReaderPool reduces GC pressure by reusing bufio.Reader instances.
@@ -184,10 +194,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	}
 
 	// Shared collection for all transactions across subtrees
-	var (
-		subtreeTxs      = make([][]*bt.Tx, len(missingSubtrees))
-		allTransactions = make([]*bt.Tx, 0, block.TransactionCount)
-	)
+	subtreeTxs := make([][]*bt.Tx, len(missingSubtrees))
 
 	// get all the subtrees that are missing from the peer in parallel
 	g, gCtx := errgroup.WithContext(ctx)
@@ -335,91 +342,72 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to get subtree tx hashes", err)
 	}
 
-	// Collect all transactions from all subtrees into a single slice for processing
-	for _, txs := range subtreeTxs {
-		if len(txs) > 0 {
-			allTransactions = append(allTransactions, txs...)
-		}
-	}
-
-	subtreeTxs = nil // Clear the slice to free memory
-
-	// get the previous block headers on this chain and pass into the validation
+	// Get block header IDs once for all chunks
 	blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Header.HashPrevBlock, uint64(u.settings.GetUtxoStoreBlockHeightRetention()*2))
 	if err != nil {
 		return nil, errors.NewProcessingError("[CheckSubtree] Failed to get block headers from blockchain client", err)
 	}
 
 	blockIds := make(map[uint32]bool, len(blockHeaderIDs))
-
 	for _, blockID := range blockHeaderIDs {
 		blockIds[blockID] = true
 	}
 
-	// Process all transactions using block-wide level-based validation
-	if len(allTransactions) == 0 {
+	// Process transactions in chunks to bound memory usage for very large blocks
+	// Each chunk processes up to maxTransactionsPerChunk (8M) transactions, limiting memory to ~2GB
+	currentChunk := make([]*bt.Tx, 0, maxTransactionsPerChunk)
+	chunkNum := 0
+	totalProcessed := 0
+
+	for subtreeIdx, txs := range subtreeTxs {
+		if len(txs) == 0 {
+			continue
+		}
+
+		currentChunk = append(currentChunk, txs...)
+
+		// Process chunk when it reaches size limit or is the last subtree
+		isLastSubtree := subtreeIdx == len(subtreeTxs)-1
+		shouldProcessChunk := len(currentChunk) >= maxTransactionsPerChunk || isLastSubtree
+
+		if shouldProcessChunk && len(currentChunk) > 0 {
+			chunkNum++
+			u.logger.Infof("[CheckBlockSubtrees] Processing chunk %d with %d transactions (total processed: %d)", chunkNum, len(currentChunk), totalProcessed)
+
+			// Process this chunk with existing optimized pipeline
+			if err = u.processTransactionsInLevels(ctx, currentChunk, *block.Hash(), chainhash.Hash{}, block.Height, blockIds); err != nil {
+				return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in chunk %d", chunkNum, err)
+			}
+
+			totalProcessed += len(currentChunk)
+			u.logger.Infof("[CheckBlockSubtrees] Completed chunk %d, total processed: %d", chunkNum, totalProcessed)
+
+			// Free memory before next chunk (only if not last subtree)
+			if !isLastSubtree {
+				currentChunk = make([]*bt.Tx, 0, maxTransactionsPerChunk)
+			}
+		}
+	}
+
+	subtreeTxs = nil // Clear the slice to free memory
+
+	if totalProcessed == 0 {
 		u.logger.Infof("[CheckBlockSubtrees] No transactions to validate")
 	} else {
-		u.logger.Infof("[CheckBlockSubtrees] Processing %d transactions from %d subtrees using level-based validation", len(allTransactions), len(missingSubtrees))
+		u.logger.Infof("[CheckBlockSubtrees] Completed processing %d transactions in %d chunks from %d subtrees", totalProcessed, chunkNum, len(missingSubtrees))
+	}
 
-		if err = u.processTransactionsInLevels(ctx, allTransactions, *block.Hash(), chainhash.Hash{}, block.Height, blockIds); err != nil {
-			return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in levels", err)
-		}
+	g, gCtx = errgroup.WithContext(ctx)
+	util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
-		g, gCtx = errgroup.WithContext(ctx)
-		util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
+	var revalidateSubtreesMutex sync.Mutex
+	revalidateSubtrees := make([]chainhash.Hash, 0, len(missingSubtrees))
 
-		var revalidateSubtreesMutex sync.Mutex
-		revalidateSubtrees := make([]chainhash.Hash, 0, len(missingSubtrees))
+	// validate all the subtrees in parallel, since we already validated all transactions
+	for _, subtreeHash := range missingSubtrees {
+		subtreeHash := subtreeHash
 
-		// validate all the subtrees in parallel, since we already validated all transactions
-		for _, subtreeHash := range missingSubtrees {
-			subtreeHash := subtreeHash
-
-			g.Go(func() (err error) {
-				// This line is only reached when the base URL is not "legacy"
-				v := ValidateSubtree{
-					SubtreeHash:   subtreeHash,
-					BaseURL:       request.BaseUrl,
-					AllowFailFast: false,
-					PeerID:        peerID,
-				}
-
-				subtree, err := u.ValidateSubtreeInternal(
-					ctx,
-					v,
-					block.Height,
-					blockIds,
-					validator.WithSkipPolicyChecks(true),
-					validator.WithCreateConflicting(true),
-					validator.WithIgnoreLocked(true),
-				)
-				if err != nil {
-					u.logger.Debugf("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err)
-					revalidateSubtreesMutex.Lock()
-					revalidateSubtrees = append(revalidateSubtrees, subtreeHash)
-					revalidateSubtreesMutex.Unlock()
-
-					return nil
-				}
-
-				// Remove validated transactions from orphanage
-				for _, node := range subtree.Nodes {
-					u.orphanage.Delete(node.Hash)
-				}
-
-				return nil
-			})
-		}
-
-		// Wait for all parallel validations to complete
-		if err = g.Wait(); err != nil {
-			return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed during parallel subtree validation", err))
-		}
-
-		// Now validate the subtrees, in order, which should be much faster since we already validated all transactions
-		// and they should have been added to the internal cache
-		for _, subtreeHash := range revalidateSubtrees {
+		g.Go(func() (err error) {
 			// This line is only reached when the base URL is not "legacy"
 			v := ValidateSubtree{
 				SubtreeHash:   subtreeHash,
@@ -438,13 +426,55 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				validator.WithIgnoreLocked(true),
 			)
 			if err != nil {
-				return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err))
+				u.logger.Debugf("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err)
+				revalidateSubtreesMutex.Lock()
+				revalidateSubtrees = append(revalidateSubtrees, subtreeHash)
+				revalidateSubtreesMutex.Unlock()
+
+				return nil
 			}
 
 			// Remove validated transactions from orphanage
 			for _, node := range subtree.Nodes {
 				u.orphanage.Delete(node.Hash)
 			}
+
+			return nil
+		})
+	}
+
+	// Wait for all parallel validations to complete
+	if err = g.Wait(); err != nil {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed during parallel subtree validation", err))
+	}
+
+	// Now validate the subtrees, in order, which should be much faster since we already validated all transactions
+	// and they should have been added to the internal cache
+	for _, subtreeHash := range revalidateSubtrees {
+		// This line is only reached when the base URL is not "legacy"
+		v := ValidateSubtree{
+			SubtreeHash:   subtreeHash,
+			BaseURL:       request.BaseUrl,
+			AllowFailFast: false,
+			PeerID:        peerID,
+		}
+
+		subtree, err := u.ValidateSubtreeInternal(
+			ctx,
+			v,
+			block.Height,
+			blockIds,
+			validator.WithSkipPolicyChecks(true),
+			validator.WithCreateConflicting(true),
+			validator.WithIgnoreLocked(true),
+		)
+		if err != nil {
+			return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err))
+		}
+
+		// Remove validated transactions from orphanage
+		for _, node := range subtree.Nodes {
+			u.orphanage.Delete(node.Hash)
 		}
 	}
 
@@ -753,7 +783,7 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 			Hash: hash,
 			Idx:  idx,
 			Fields: []fields.FieldName{
-				fields.Tx, // Need full transaction to extend inputs
+				fields.Outputs, // Only need output data (amount + locking script), not full transaction with inputs/signatures
 			},
 		})
 		parentMap[hash] = idx
@@ -761,7 +791,7 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 	}
 
 	totalRecords := len(unresolvedMeta)
-	u.logger.Infof("[batchExtendTransactions] Fetching %d unique parent UTXOs for transaction extension", totalRecords)
+	u.logger.Infof("[batchExtendTransactions] Fetching %d unique parent outputs for transaction extension", totalRecords)
 
 	// Fetch in chunks to prevent Aerospike timeouts on large batches
 	start := time.Now()
@@ -774,7 +804,7 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 
 		u.logger.Infof("[batchExtendTransactions] Processing chunk %d/%d (%d records)", chunkNum, totalChunks, len(chunk))
 
-		err := u.utxoStore.BatchDecorate(ctx, chunk, fields.Tx)
+		err := u.utxoStore.BatchDecorate(ctx, chunk, fields.Outputs)
 		if err != nil {
 			return errors.NewProcessingError("[batchExtendTransactions] Failed to batch fetch parent UTXOs (chunk %d/%d)", chunkNum, totalChunks, err)
 		}
