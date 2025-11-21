@@ -1129,6 +1129,5 @@ func (d *Daemon) startPrunerService(ctx context.Context, appSettings *settings.S
 		utxoStore,
 		blockchainClient,
 		blockAssemblyClient,
-		nil, // blobStore not needed for pruner service
 	))
 }

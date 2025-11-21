@@ -24,7 +24,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/pruner/pruner_api"
 	"github.com/bsv-blockchain/teranode/settings"
-	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -47,7 +46,6 @@ type Server struct {
 	utxoStore           utxo.Store
 	blockchainClient    blockchain.ClientI
 	blockAssemblyClient blockassembly.ClientI
-	blobStore           blob.Store
 
 	// Internal state
 	prunerService       pruner.Service
@@ -67,7 +65,6 @@ func New(
 	utxoStore utxo.Store,
 	blockchainClient blockchain.ClientI,
 	blockAssemblyClient blockassembly.ClientI,
-	blobStore blob.Store,
 ) *Server {
 	return &Server{
 		ctx:                 ctx,
@@ -76,7 +73,6 @@ func New(
 		utxoStore:           utxoStore,
 		blockchainClient:    blockchainClient,
 		blockAssemblyClient: blockAssemblyClient,
-		blobStore:           blobStore,
 		stats:               gocore.NewStat("pruner"),
 	}
 }

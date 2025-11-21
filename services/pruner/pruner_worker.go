@@ -9,10 +9,9 @@ import (
 
 // prunerProcessor processes pruner requests from the pruner channel.
 // It drains the channel to get the latest height (deduplication), then performs
-// pruner in three sequential steps:
+// pruner in two sequential steps:
 // 1. Preserve parents of old unmined transactions
-// 2. Process expired preservations (convert preserve_until to delete_at_height)
-// 3. Delete-at-height (DAH) pruner
+// 2. Delete-at-height (DAH) pruner
 //
 // Safety checks (block assembly state) are performed immediately before each phase
 // to prevent race conditions where state could change between queueing and execution.
@@ -77,13 +76,12 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					s.logger.Errorf("CRITICAL: Failed to preserve parents at height %d, ABORTING pruner to prevent data loss: %v", latestHeight, err)
 					prunerErrors.WithLabelValues("preserve_parents_failed").Inc()
 					prunerSkipped.WithLabelValues("preserve_failed").Inc()
-					// ABORT: Do not proceed to Phase 2 or 3 - could cause data loss
+					// ABORT: Do not proceed to Phase 2 (DAH pruner) - could cause data loss
 					continue
 				}
 				prunerDuration.WithLabelValues("preserve_parents").Observe(time.Since(startTime).Seconds())
 			}
 
-			// Safety check before process expired preservations phase
 			// Recheck block assembly state to ensure it hasn't changed (e.g., to reorg)
 			state, err = s.blockAssemblyClient.GetBlockAssemblyState(ctx)
 			if err != nil {
