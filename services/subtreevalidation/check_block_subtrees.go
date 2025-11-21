@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -19,9 +20,18 @@ import (
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
+)
+
+const (
+	// aerospikeBatchChunkSize limits the number of records per Aerospike batch operation
+	// to prevent timeouts on large blocks. Aerospike can struggle with batches >10K records.
+	// This value balances performance (fewer round trips) with reliability (avoiding timeouts).
+	aerospikeBatchChunkSize = 5000
 )
 
 // bufioReaderPool reduces GC pressure by reusing bufio.Reader instances.
@@ -570,6 +580,275 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 	return txIndex, nil
 }
 
+// prefetchAndCacheParentUTXOs scans all transactions, identifies required parent UTXOs,
+// fetches them in batch, and pre-populates the cache to eliminate round-trips during validation
+func (u *Server) prefetchAndCacheParentUTXOs(ctx context.Context, allTransactions []*bt.Tx) error {
+	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "prefetchAndCacheParentUTXOs",
+		tracing.WithParentStat(u.stats),
+		tracing.WithLogMessage(u.logger, "[prefetchAndCacheParentUTXOs] Prefetching parent UTXOs for %d transactions", len(allTransactions)),
+	)
+	defer deferFn()
+
+	// Step 1: Collect all unique parent UTXO hashes from all transactions
+	parentHashes := make(map[chainhash.Hash]struct{})
+	transactionHashes := make(map[chainhash.Hash]struct{}, len(allTransactions))
+
+	for _, tx := range allTransactions {
+		if tx == nil || tx.IsCoinbase() {
+			continue
+		}
+
+		// Track this transaction hash
+		txHash := *tx.TxIDChainHash()
+		transactionHashes[txHash] = struct{}{}
+
+		// Collect parent hashes from inputs
+		for _, input := range tx.Inputs {
+			parentHash := *input.PreviousTxIDChainHash()
+
+			// Only prefetch if the parent is NOT in this block (external parents)
+			// Parents in the block will be validated in dependency order
+			if _, inBlock := transactionHashes[parentHash]; !inBlock {
+				parentHashes[parentHash] = struct{}{}
+			}
+		}
+	}
+
+	if len(parentHashes) == 0 {
+		u.logger.Infof("[prefetchAndCacheParentUTXOs] No external parent UTXOs to prefetch")
+		return nil
+	}
+
+	// Step 2: Create UnresolvedMetaData slice for BatchDecorate
+	unresolvedMeta := make([]*utxo.UnresolvedMetaData, 0, len(parentHashes))
+	for hash := range parentHashes {
+		hash := hash // capture loop variable
+		unresolvedMeta = append(unresolvedMeta, &utxo.UnresolvedMetaData{
+			Hash: hash,
+			Fields: []fields.FieldName{
+				fields.Fee,
+				fields.SizeInBytes,
+				fields.TxInpoints,
+				fields.BlockIDs,
+				fields.IsCoinbase,
+			},
+		})
+	}
+
+	totalRecords := len(unresolvedMeta)
+	u.logger.Infof("[prefetchAndCacheParentUTXOs] Prefetching %d unique parent UTXOs", totalRecords)
+
+	// Step 3: Batch fetch all parent UTXOs in chunks to prevent Aerospike timeouts
+	// Large batches (>10K records) can cause network errors and timeouts
+	start := time.Now()
+	totalChunks := (totalRecords + aerospikeBatchChunkSize - 1) / aerospikeBatchChunkSize
+
+	for i := 0; i < totalRecords; i += aerospikeBatchChunkSize {
+		end := min(i+aerospikeBatchChunkSize, totalRecords)
+		chunk := unresolvedMeta[i:end]
+		chunkNum := i/aerospikeBatchChunkSize + 1
+
+		u.logger.Infof("[prefetchAndCacheParentUTXOs] Processing chunk %d/%d (%d records)", chunkNum, totalChunks, len(chunk))
+
+		err := u.utxoStore.BatchDecorate(ctx, chunk, fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.BlockIDs, fields.IsCoinbase)
+		if err != nil {
+			return errors.NewProcessingError("[prefetchAndCacheParentUTXOs] Failed to batch fetch parent UTXOs (chunk %d/%d)", chunkNum, totalChunks, err)
+		}
+	}
+
+	fetchDuration := time.Since(start)
+	u.logger.Infof("[prefetchAndCacheParentUTXOs] Fetched %d parent UTXOs in %d chunks in %v", totalRecords, totalChunks, fetchDuration)
+
+	// Step 4: Pre-populate the cache with fetched data
+	// This ensures subsequent validations hit the cache instead of the store
+	cacheKeys := make([][]byte, 0, len(unresolvedMeta))
+	cacheValues := make([][]byte, 0, len(unresolvedMeta))
+
+	for _, item := range unresolvedMeta {
+		if item.Err != nil {
+			// Parent not found is expected (could be in a different block)
+			if errors.Is(item.Err, errors.ErrTxNotFound) {
+				continue
+			}
+			u.logger.Warnf("[prefetchAndCacheParentUTXOs] Error fetching parent %s: %v", item.Hash.String(), item.Err)
+			continue
+		}
+
+		if item.Data == nil {
+			continue
+		}
+
+		// Serialize metadata for cache
+		metaBytes, err := item.Data.MetaBytes()
+		if err != nil {
+			u.logger.Warnf("[prefetchAndCacheParentUTXOs] Failed to serialize metadata for %s: %v", item.Hash.String(), err)
+			continue
+		}
+
+		cacheKeys = append(cacheKeys, item.Hash[:])
+		cacheValues = append(cacheValues, metaBytes)
+	}
+
+	// Use SetCacheMulti if available (TxMetaCache), otherwise individual sets
+	if len(cacheKeys) > 0 {
+		// Try to use SetCacheMulti for batch cache population
+		type batchCacher interface {
+			SetCacheMulti(keys [][]byte, values [][]byte) error
+		}
+
+		if batchCache, ok := u.utxoStore.(batchCacher); ok {
+			start = time.Now()
+			if err := batchCache.SetCacheMulti(cacheKeys, cacheValues); err != nil {
+				u.logger.Warnf("[prefetchAndCacheParentUTXOs] Failed to pre-populate cache: %v", err)
+			} else {
+				u.logger.Infof("[prefetchAndCacheParentUTXOs] Pre-populated cache with %d entries in %v", len(cacheKeys), time.Since(start))
+			}
+		}
+	}
+
+	return nil
+}
+
+// batchExtendTransactions extends all transactions using the prefetched parent UTXO data
+// This eliminates the need for validator to call getTransactionInputBlockHeightsAndExtendTx
+// which would do ~195K individual Get() calls (one per parent transaction)
+func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []*bt.Tx) error {
+	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "batchExtendTransactions",
+		tracing.WithParentStat(u.stats),
+		tracing.WithLogMessage(u.logger, "[batchExtendTransactions] Extending %d transactions", len(allTransactions)),
+	)
+	defer deferFn()
+
+	// Collect all unique parent transaction hashes across all transactions
+	parentHashes := make(map[chainhash.Hash]struct{})
+	transactionHashes := make(map[chainhash.Hash]struct{}, len(allTransactions))
+
+	for _, tx := range allTransactions {
+		if tx == nil || tx.IsCoinbase() || tx.IsExtended() {
+			continue // Skip if already extended
+		}
+
+		txHash := *tx.TxIDChainHash()
+		transactionHashes[txHash] = struct{}{}
+
+		for _, input := range tx.Inputs {
+			parentHash := *input.PreviousTxIDChainHash()
+			// Collect both in-block and external parents
+			parentHashes[parentHash] = struct{}{}
+		}
+	}
+
+	if len(parentHashes) == 0 {
+		u.logger.Infof("[batchExtendTransactions] No parent UTXOs to fetch for extension")
+		return nil
+	}
+
+	// Fetch all parent UTXOs using BatchDecorate in chunks to prevent Aerospike timeouts
+	unresolvedMeta := make([]*utxo.UnresolvedMetaData, 0, len(parentHashes))
+	parentMap := make(map[chainhash.Hash]int, len(parentHashes))
+	idx := 0
+	for hash := range parentHashes {
+		hash := hash
+		unresolvedMeta = append(unresolvedMeta, &utxo.UnresolvedMetaData{
+			Hash: hash,
+			Idx:  idx,
+			Fields: []fields.FieldName{
+				fields.Tx, // Need full transaction to extend inputs
+			},
+		})
+		parentMap[hash] = idx
+		idx++
+	}
+
+	totalRecords := len(unresolvedMeta)
+	u.logger.Infof("[batchExtendTransactions] Fetching %d unique parent UTXOs for transaction extension", totalRecords)
+
+	// Fetch in chunks to prevent Aerospike timeouts on large batches
+	start := time.Now()
+	totalChunks := (totalRecords + aerospikeBatchChunkSize - 1) / aerospikeBatchChunkSize
+
+	for i := 0; i < totalRecords; i += aerospikeBatchChunkSize {
+		end := min(i+aerospikeBatchChunkSize, totalRecords)
+		chunk := unresolvedMeta[i:end]
+		chunkNum := i/aerospikeBatchChunkSize + 1
+
+		u.logger.Infof("[batchExtendTransactions] Processing chunk %d/%d (%d records)", chunkNum, totalChunks, len(chunk))
+
+		err := u.utxoStore.BatchDecorate(ctx, chunk, fields.Tx)
+		if err != nil {
+			return errors.NewProcessingError("[batchExtendTransactions] Failed to batch fetch parent UTXOs (chunk %d/%d)", chunkNum, totalChunks, err)
+		}
+	}
+
+	fetchDuration := time.Since(start)
+	u.logger.Infof("[batchExtendTransactions] Fetched %d parent UTXOs in %d chunks in %v", totalRecords, totalChunks, fetchDuration)
+
+	// Build a map of parent hash -> parent tx for quick lookup
+	// Also count large transactions that may be stored externally
+	parentTxMap := make(map[chainhash.Hash]*bt.Tx, len(unresolvedMeta))
+	largeTxCount := 0
+	for _, item := range unresolvedMeta {
+		if item.Err != nil || item.Data == nil || item.Data.Tx == nil {
+			continue
+		}
+
+		// Count potentially external transactions (large ones likely stored in blob)
+		// External threshold is typically >100 outputs
+		if len(item.Data.Tx.Outputs) > 100 {
+			largeTxCount++
+		}
+
+		parentTxMap[item.Hash] = item.Data.Tx
+	}
+
+	if largeTxCount > 0 {
+		u.logger.Infof("[batchExtendTransactions] Found %d large parent transactions (>100 outputs, likely external) out of %d parents", largeTxCount, len(unresolvedMeta))
+	}
+
+	// Now extend all transactions using the parent data
+	extendedCount := 0
+	for _, tx := range allTransactions {
+		if tx == nil || tx.IsCoinbase() || tx.IsExtended() {
+			continue
+		}
+
+		// Extend each input with parent transaction output data
+		allInputsExtended := true
+		for _, input := range tx.Inputs {
+			parentHash := *input.PreviousTxIDChainHash()
+			parentTx := parentTxMap[parentHash]
+
+			if parentTx == nil {
+				// Parent not found - mark as not fully extended
+				allInputsExtended = false
+				continue
+			}
+
+			// Check if parent has the required output
+			if int(input.PreviousTxOutIndex) >= len(parentTx.Outputs) {
+				u.logger.Warnf("[batchExtendTransactions] Parent tx %s doesn't have output index %d", parentHash.String(), input.PreviousTxOutIndex)
+				allInputsExtended = false
+				continue
+			}
+
+			parentOutput := parentTx.Outputs[input.PreviousTxOutIndex]
+
+			// Extend the input with parent output data
+			input.PreviousTxSatoshis = parentOutput.Satoshis
+			input.PreviousTxScript = parentOutput.LockingScript
+		}
+
+		// Mark transaction as extended if all inputs were successfully extended
+		if allInputsExtended {
+			tx.SetExtended(true)
+			extendedCount++
+		}
+	}
+
+	u.logger.Infof("[batchExtendTransactions] Extended %d/%d transactions", extendedCount, len(allTransactions))
+	return nil
+}
+
 // processTransactionsInLevels processes all transactions from all subtrees using level-based validation
 // This ensures transactions are processed in dependency order while maximizing parallelism
 func (u *Server) processTransactionsInLevels(ctx context.Context, allTransactions []*bt.Tx, blockHash chainhash.Hash, subtreeHash chainhash.Hash, blockHeight uint32, blockIds map[uint32]bool) error {
@@ -625,11 +904,102 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	// Pre-process validation options
 	processedValidatorOptions := validator.ProcessOptions(validatorOptions...)
 
+	// OPTIMIZATION STEP 1: Prefetch and cache all parent UTXOs before validation
+	// This eliminates 197+ round-trips to the UTXO store by batching all fetches upfront.
+	// CRITICAL: Must succeed - the next step (batch extend) requires this data.
+	// If prefetch fails (typically Aerospike timeout), fail fast to trigger immediate retry
+	// rather than proceeding to validation which will fail anyway.
+	if err := u.prefetchAndCacheParentUTXOs(ctx, allTransactions); err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] Failed to prefetch parent UTXOs", err)
+	}
+
+	// OPTIMIZATION STEP 2: Extend all transactions upfront using prefetched parent data
+	// This eliminates ~195K individual Get() calls during validation (one per parent tx).
+	// Validator will see transactions are already extended and skip getTransactionInputBlockHeightsAndExtendTx.
+	//
+	// CRITICAL: Must succeed - subtree serialization requires TxInpoints which come from extended transactions.
+	// If batch extend fails (typically Aerospike timeout during BatchDecorate), we MUST fail fast because:
+	//   1. Individual validator fallback would require 195K individual Get() calls (extremely slow)
+	//   2. If Aerospike is timing out on batch operations, individual operations will likely timeout too
+	//   3. Even if individual extension succeeds, TxInpoints may not properly propagate through
+	//      validation -> storage -> retrieval -> serialization flow, causing "parent tx hashes not set" errors
+	//   4. Failing fast triggers immediate retry, giving Aerospike another chance to succeed
+	//
+	// The validator fallback (individual tx extension) is still used for:
+	//   - Transactions with missing parents (partial batch extend success)
+	//   - Regular transaction validation (non-block validation paths)
+	//   - Any validation path that doesn't use batchExtendTransactions
+	if err := u.batchExtendTransactions(ctx, allTransactions); err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] Failed to batch extend transactions - cannot continue without extended transactions", err)
+	}
+
 	// Track validation results
 	var (
 		errorsFound      atomic.Uint64
 		addedToOrphanage atomic.Uint64
 	)
+
+	// OPTIMIZATION: Choose processing strategy based on transaction count
+	// Benchmark results show a clear crossover point at ~100 transactions:
+	//
+	// Transaction Count vs Performance (coordination overhead only):
+	//   20 txs:   ByLevel 4.2x faster  (15,257 ns vs 64,397 ns)
+	//   30 txs:   ByLevel 2.9x faster  (23,125 ns vs 65,977 ns)
+	//   90 txs:   ByLevel 1.3x faster  (52,703 ns vs 70,021 ns)
+	//  150 txs:   Pipelined 1.1x faster (76,064 ns vs 81,764 ns)
+	//  300 txs:   Pipelined 1.7x faster (89,065 ns vs 149,895 ns)
+	// 1970 txs:   Pipelined 3.8x faster (402,161 ns vs 1,523,933 ns)
+	// 5000 txs:   Pipelined 4.7x faster (538,022 ns vs 2,536,742 ns)
+	//
+	// Below 100 txs: Graph-building overhead dominates, ByLevel wins
+	// Above 100 txs: Parallelism benefits outweigh overhead, Pipelined wins
+	if len(allTransactions) < 100 {
+		// Use level-based processing for small transaction counts (< 100 txs)
+		// Simpler approach without dependency graph overhead
+		err = u.processTransactionsByLevel(ctx, blockHash, subtreeHash, maxLevel, txsPerLevel, blockHeight, blockIds, processedValidatorOptions, &errorsFound, &addedToOrphanage)
+	} else {
+		// Use pipelined processing for larger transaction counts (>= 100 txs)
+		// Builds dependency graph to enable fine-grained parallelism
+		err = u.processTransactionsPipelined(ctx, blockHash, subtreeHash, missingTxs, blockHeight, blockIds, processedValidatorOptions, &errorsFound, &addedToOrphanage)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if errorsFound.Load() > 0 {
+		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
+	}
+
+	u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions", len(allTransactions))
+	return nil
+}
+
+// processTransactionsByLevel processes transactions level by level with barriers between levels.
+//
+// This approach is optimal for small transaction counts (< 100 txs) where the overhead
+// of building a dependency graph outweighs the benefits of fine-grained parallelism.
+//
+// How it works:
+// - Processes transactions in dependency order: level 0, then level 1, etc.
+// - All transactions within a level are processed in parallel
+// - Waits for entire level to complete before starting the next level
+//
+// Performance characteristics:
+// - Simple coordination: uses basic errgroup for parallel processing within levels
+// - Lower memory overhead: no dependency graph construction
+// - Optimal for < 100 txs: 1.3-4.2x faster than pipelined approach
+// - Level barriers become bottleneck for large counts (>100 txs)
+//
+// Example with 3 levels: [Tx0] -> [Tx1, Tx2, Tx3] -> [Tx4, Tx5]
+// - Level 0: Process Tx0
+// - Wait for level 0 to complete
+// - Level 1: Process Tx1, Tx2, Tx3 in parallel
+// - Wait for level 1 to complete (even if Tx1 finishes early, must wait for Tx2, Tx3)
+// - Level 2: Process Tx4, Tx5 in parallel
+func (u *Server) processTransactionsByLevel(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, maxLevel uint32, txsPerLevel [][]missingTx,
+	blockHeight uint32, blockIds map[uint32]bool, processedValidatorOptions *validator.Options,
+	errorsFound, addedToOrphanage *atomic.Uint64) error {
 
 	// Process each level in series, but all transactions within a level in parallel
 	for level := uint32(0); level <= maxLevel; level++ {
@@ -638,7 +1008,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			continue
 		}
 
-		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions", level+1, maxLevel+1, len(levelTxs))
+		u.logger.Debugf("[processTransactionsByLevel] Processing level %d/%d with %d transactions", level+1, maxLevel+1, len(levelTxs))
 
 		// Process all transactions at this level in parallel
 		g, gCtx := errgroup.WithContext(ctx)
@@ -647,73 +1017,265 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		for _, mTx := range levelTxs {
 			tx := mTx.tx
 			if tx == nil {
-				return errors.NewProcessingError("[processTransactionsInLevels] transaction is nil at level %d", level)
+				return errors.NewProcessingError("[processTransactionsByLevel] transaction is nil at level %d", level)
 			}
 
 			g.Go(func() error {
-				// Use existing blessMissingTransaction logic for validation
-				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
-				if err != nil {
-					u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
-
-					// TX_EXISTS is not an error - transaction was already validated
-					if errors.Is(err, errors.ErrTxExists) {
-						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping", tx.TxIDChainHash().String())
-						return nil
-					}
-
-					// Count all other errors
-					errorsFound.Add(1)
-
-					// Handle missing parent transactions by adding to orphanage
-					if errors.Is(err, errors.ErrTxMissingParent) {
-						isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(gCtx, blockchain.FSMStateRUNNING)
-						if runningErr == nil && isRunning {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
-							if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
-								addedToOrphanage.Add(1)
-							} else {
-								u.logger.Warnf("[processTransactionsInLevels] Failed to add transaction %s to orphanage - orphanage is full", tx.TxIDChainHash().String())
-							}
-						} else {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
-						}
-					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
-						// Log truly invalid transactions
-						u.logger.Warnf("[processTransactionsInLevels] Invalid transaction detected: %s: %v", tx.TxIDChainHash().String(), err)
-
-						if errors.Is(err, errors.ErrTxInvalid) {
-							return err
-						}
-					} else {
-						u.logger.Errorf("[processTransactionsInLevels] Processing error for transaction %s: %v", tx.TxIDChainHash().String(), err)
-					}
-
-					return nil // Don't fail the entire level
-				}
-
-				if txMeta == nil {
-					u.logger.Debugf("[processTransactionsInLevels] Transaction metadata is nil for %s", tx.TxIDChainHash().String())
-				} else {
-					u.logger.Debugf("[processTransactionsInLevels] Successfully validated transaction %s", tx.TxIDChainHash().String())
-				}
-
-				return nil
+				return u.validateSingleTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions, errorsFound, addedToOrphanage)
 			})
 		}
 
 		// Fail early if we get an actual tx error thrown
-		if err = g.Wait(); err != nil {
-			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level+1, err)
+		if err := g.Wait(); err != nil {
+			return errors.NewProcessingError("[processTransactionsByLevel] Failed to process level %d", level+1, err)
 		}
 
-		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))
+		u.logger.Debugf("[processTransactionsByLevel] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))
 	}
 
-	if errorsFound.Load() > 0 {
-		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
+	return nil
+}
+
+// processTransactionsPipelined processes transactions using a dependency-aware pipeline.
+//
+// This approach is optimal for larger transaction counts (>= 100 txs) where fine-grained
+// parallelism provides significant speedups despite the graph construction overhead.
+//
+// How it works:
+// - Builds a complete dependency graph of all transactions
+// - Tracks parent/child relationships and pending dependency counts
+// - Transactions start processing immediately when their specific dependencies complete
+// - No level barriers: maximum parallelism within dependency constraints
+//
+// Performance characteristics:
+// - Graph construction overhead: 2 passes over all transactions
+// - Higher memory usage: maintains txMap, dependencies, and childrenMap
+// - Optimal for >= 100 txs: 1.1-4.7x faster than level-based approach
+// - Scales excellently with deep trees (197 levels: 3.8x faster)
+// - Scales excellently with wide trees (5000 txs: 4.7x faster)
+//
+// Example with dependencies: Tx0 -> Tx1 -> Tx4
+//
+//	Tx0 -> Tx2 -> Tx5
+//	Tx0 -> Tx3
+//
+// Level-based would process in 3 waves with barriers:
+//
+//	Wave 1: Tx0
+//	Wave 2: Tx1, Tx2, Tx3 (wait for slowest)
+//	Wave 3: Tx4, Tx5 (wait even though dependencies met earlier)
+//
+// Pipelined processes with no barriers:
+//   - Tx0 starts immediately
+//   - Tx1, Tx2, Tx3 start as soon as Tx0 completes
+//   - Tx4 starts as soon as Tx1 completes (doesn't wait for Tx2, Tx3)
+//   - Tx5 starts as soon as Tx2 completes (doesn't wait for Tx3)
+func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, transactions []missingTx,
+	blockHeight uint32, blockIds map[uint32]bool, processedValidatorOptions *validator.Options,
+	errorsFound, addedToOrphanage *atomic.Uint64) error {
+
+	u.logger.Infof("[processTransactionsPipelined] Using pipeline processing for %d transactions", len(transactions))
+
+	// Build dependency graph
+	txMap := make(map[chainhash.Hash]*pipelineTxState, len(transactions))
+	dependencies := make(map[chainhash.Hash][]chainhash.Hash) // child -> parents
+	childrenMap := make(map[chainhash.Hash][]chainhash.Hash)  // parent -> children
+
+	for _, mTx := range transactions {
+		if mTx.tx == nil || mTx.tx.IsCoinbase() {
+			continue
+		}
+
+		txHash := *mTx.tx.TxIDChainHash()
+		txMap[txHash] = &pipelineTxState{
+			tx:               mTx.tx,
+			pendingParents:   0,
+			childrenWaiting:  make([]chainhash.Hash, 0),
+			completionSignal: make(chan struct{}),
+		}
+
+		dependencies[txHash] = make([]chainhash.Hash, 0)
+
+		// Build dependency relationships
+		for _, input := range mTx.tx.Inputs {
+			parentHash := *input.PreviousTxIDChainHash()
+
+			// Only track dependencies within this block
+			if _, exists := txMap[parentHash]; exists {
+				dependencies[txHash] = append(dependencies[txHash], parentHash)
+
+				if childrenMap[parentHash] == nil {
+					childrenMap[parentHash] = make([]chainhash.Hash, 0)
+				}
+				childrenMap[parentHash] = append(childrenMap[parentHash], txHash)
+			}
+		}
 	}
 
-	u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions", len(allTransactions))
+	// Set up pending parent counts and children references
+	readyQueue := make([]chainhash.Hash, 0, len(txMap))
+
+	for txHash, state := range txMap {
+		parents := dependencies[txHash]
+		state.pendingParents = int32(len(parents))
+		state.childrenWaiting = childrenMap[txHash]
+
+		// Transactions with no in-block dependencies are ready immediately
+		if len(parents) == 0 {
+			readyQueue = append(readyQueue, txHash)
+		}
+	}
+
+	u.logger.Infof("[processTransactionsPipelined] %d transactions ready to start immediately", len(readyQueue))
+
+	// Worker pool for processing transactions
+	g, gCtx := errgroup.WithContext(ctx)
+	concurrency := u.settings.SubtreeValidation.SpendBatcherSize * 2
+	util.SafeSetLimit(g, concurrency)
+
+	// Channel for transactions that become ready
+	readyChan := make(chan chainhash.Hash, len(txMap))
+
+	// Seed the ready channel with initial ready transactions
+	for _, txHash := range readyQueue {
+		readyChan <- txHash
+	}
+
+	// Track completion
+	var completedCount atomic.Uint64
+	totalToProcess := uint64(len(txMap))
+
+	// Spawn workers
+	for i := 0; i < concurrency; i++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-gCtx.Done():
+					return gCtx.Err()
+				case txHash, ok := <-readyChan:
+					if !ok {
+						return nil // Channel closed, worker done
+					}
+
+					state := txMap[txHash]
+					if state == nil {
+						continue
+					}
+
+					// Validate this transaction
+					err := u.validateSingleTransaction(gCtx, blockHash, subtreeHash, state.tx, blockHeight, blockIds, processedValidatorOptions, errorsFound, addedToOrphanage)
+					if err != nil {
+						return err
+					}
+
+					// Mark complete and notify children
+					completed := completedCount.Add(1)
+
+					if completed%1000 == 0 {
+						u.logger.Infof("[processTransactionsPipelined] Progress: %d/%d transactions completed", completed, totalToProcess)
+					}
+
+					// Notify all children that this parent is complete
+					for _, childHash := range state.childrenWaiting {
+						childState := txMap[childHash]
+						if childState == nil {
+							continue
+						}
+
+						// Decrement child's pending count atomically
+						remaining := atomic.AddInt32(&childState.pendingParents, -1)
+
+						// If child has no more pending parents, it's ready to process
+						if remaining == 0 {
+							select {
+							case readyChan <- childHash:
+							case <-gCtx.Done():
+								return gCtx.Err()
+							}
+						}
+					}
+				}
+			}
+		})
+	}
+
+	// Separate goroutine to close channel when all work is done
+	go func() {
+		for completedCount.Load() < totalToProcess {
+			time.Sleep(100 * time.Millisecond)
+		}
+		close(readyChan)
+	}()
+
+	// Wait for all workers to complete
+	if err := g.Wait(); err != nil {
+		return errors.NewProcessingError("[processTransactionsPipelined] Pipeline processing failed", err)
+	}
+
+	u.logger.Infof("[processTransactionsPipelined] Completed processing %d transactions", completedCount.Load())
+	return nil
+}
+
+// pipelineTxState tracks the state of a transaction in the pipeline
+type pipelineTxState struct {
+	tx               *bt.Tx
+	pendingParents   int32            // Atomic counter of parents not yet completed
+	childrenWaiting  []chainhash.Hash // Children that depend on this transaction
+	completionSignal chan struct{}
+}
+
+// validateSingleTransaction validates a single transaction with common error handling
+// Extracted to avoid code duplication between level-based and pipelined processing
+func (u *Server) validateSingleTransaction(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, tx *bt.Tx, blockHeight uint32,
+	blockIds map[uint32]bool, processedValidatorOptions *validator.Options,
+	errorsFound, addedToOrphanage *atomic.Uint64) error {
+
+	// Use existing blessMissingTransaction logic for validation
+	txMeta, err := u.blessMissingTransaction(ctx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
+	if err != nil {
+		u.logger.Debugf("[validateSingleTransaction] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
+
+		// TX_EXISTS is not an error - transaction was already validated
+		if errors.Is(err, errors.ErrTxExists) {
+			u.logger.Debugf("[validateSingleTransaction] Transaction %s already exists, skipping", tx.TxIDChainHash().String())
+			return nil
+		}
+
+		// Count all other errors
+		errorsFound.Add(1)
+
+		// Handle missing parent transactions by adding to orphanage
+		if errors.Is(err, errors.ErrTxMissingParent) {
+			isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
+			if runningErr == nil && isRunning {
+				u.logger.Debugf("[validateSingleTransaction] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
+				if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
+					addedToOrphanage.Add(1)
+				} else {
+					u.logger.Warnf("[validateSingleTransaction] Failed to add transaction %s to orphanage - orphanage is full", tx.TxIDChainHash().String())
+				}
+			} else {
+				u.logger.Debugf("[validateSingleTransaction] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
+			}
+		} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
+			// Log truly invalid transactions
+			u.logger.Warnf("[validateSingleTransaction] Invalid transaction detected: %s: %v", tx.TxIDChainHash().String(), err)
+
+			if errors.Is(err, errors.ErrTxInvalid) {
+				return err
+			}
+		} else {
+			u.logger.Errorf("[validateSingleTransaction] Processing error for transaction %s: %v", tx.TxIDChainHash().String(), err)
+		}
+
+		return nil // Don't fail the entire batch
+	}
+
+	if txMeta == nil {
+		u.logger.Debugf("[validateSingleTransaction] Transaction metadata is nil for %s", tx.TxIDChainHash().String())
+	} else {
+		u.logger.Debugf("[validateSingleTransaction] Successfully validated transaction %s", tx.TxIDChainHash().String())
+	}
+
 	return nil
 }
