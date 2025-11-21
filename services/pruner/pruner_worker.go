@@ -82,20 +82,6 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				prunerDuration.WithLabelValues("preserve_parents").Observe(time.Since(startTime).Seconds())
 			}
 
-			// Recheck block assembly state to ensure it hasn't changed (e.g., to reorg)
-			state, err = s.blockAssemblyClient.GetBlockAssemblyState(ctx)
-			if err != nil {
-				s.logger.Errorf("Failed to get block assembly state before process expired preservations: %v", err)
-				prunerErrors.WithLabelValues("state_check").Inc()
-				continue
-			}
-
-			if state.BlockAssemblyState != "running" {
-				s.logger.Infof("Skipping process expired preservations for height %d: block assembly state changed to %s (not running)", latestHeight, state.BlockAssemblyState)
-				prunerSkipped.WithLabelValues("not_running").Inc()
-				continue
-			}
-
 			// Safety check before DAH pruner phase
 			// Recheck block assembly state to ensure it hasn't changed (e.g., to reorg)
 			state, err = s.blockAssemblyClient.GetBlockAssemblyState(ctx)
