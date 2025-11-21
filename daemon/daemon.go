@@ -513,7 +513,7 @@ func printUsage() {
 	fmt.Println("          whether to start the alert service")
 	fmt.Println("")
 	fmt.Println("    -cleanup=<1|0>")
-	fmt.Println("          whether to start the cleanup service")
+	fmt.Println("          whether to start the pruner service")
 	fmt.Println("")
 	fmt.Println("    -all=0")
 	fmt.Println("          disable all services unless explicitly overridden")
