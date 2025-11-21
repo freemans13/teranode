@@ -1,11 +1,35 @@
 package pruner
 
 import (
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 var (
+	prunerDuration  *prometheus.HistogramVec
+	prunerSkipped   *prometheus.CounterVec
+	prunerProcessed prometheus.Counter
+	prunerErrors    *prometheus.CounterVec
+
+	prometheusMetricsInitOnce sync.Once
+)
+
+// initPrometheusMetrics initializes all Prometheus metrics for the pruner service.
+// This function uses sync.Once to ensure metrics are only initialized once,
+// regardless of how many times it's called, preventing duplicate metric registration errors.
+func initPrometheusMetrics() {
+	prometheusMetricsInitOnce.Do(_initPrometheusMetrics)
+}
+
+// _initPrometheusMetrics is the internal implementation that registers all Prometheus metrics
+// used by the pruner service. Metrics track:
+// - Duration of pruner operations (preserve_parents, dah_pruner)
+// - Operations skipped due to various conditions
+// - Successfully processed operations
+// - Errors during pruner operations
+func _initPrometheusMetrics() {
 	prunerDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "pruner_duration_seconds",
@@ -37,9 +61,4 @@ var (
 		},
 		[]string{"operation"}, // "preserve_parents", "dah_pruner", "poll"
 	)
-)
-
-func initPrometheusMetrics() {
-	// Metrics are auto-registered via promauto
-	// This function exists for consistency with other services
 }
