@@ -7,54 +7,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-// pollingWorker polls the block assembly service every polling interval to check
-// if pruner should be triggered. It queues pruner when:
-// 1. Block height has changed since last processed
-// 2. Pruner channel is available (no pruner currently in progress)
-//
-// Safety checks (block assembly state) are performed in prunerProcessor to eliminate
-// race conditions where state could change between queueing and execution.
-func (s *Server) pollingWorker(ctx context.Context) {
-	ticker := time.NewTicker(s.settings.Pruner.PollingInterval)
-	defer ticker.Stop()
-
-	s.logger.Infof("Starting pruner polling worker (interval: %v)", s.settings.Pruner.PollingInterval)
-
-	for {
-		select {
-		case <-ctx.Done():
-			s.logger.Infof("Stopping pruner polling worker")
-			return
-
-		case <-ticker.C:
-			// Poll block assembly state to get current height
-			state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
-			if err != nil {
-				s.logger.Errorf("Failed to get block assembly state: %v", err)
-				prunerErrors.WithLabelValues("poll").Inc()
-				continue
-			}
-
-			if state.CurrentHeight <= s.lastProcessedHeight.Load() {
-				s.logger.Debugf("Skipping pruner: no new height (current: %d, last processed: %d)",
-					state.CurrentHeight, s.lastProcessedHeight.Load())
-				prunerSkipped.WithLabelValues("no_new_height").Inc()
-				continue
-			}
-
-			// Try to queue pruner (non-blocking)
-			// Safety checks are performed in prunerProcessor to avoid race conditions
-			select {
-			case s.prunerCh <- state.CurrentHeight:
-				s.logger.Debugf("Queued pruner for height %d", state.CurrentHeight)
-			default:
-				s.logger.Infof("Pruner already in progress, skipping height %d", state.CurrentHeight)
-				prunerSkipped.WithLabelValues("already_in_progress").Inc()
-			}
-		}
-	}
-}
-
 // prunerProcessor processes pruner requests from the pruner channel.
 // It drains the channel to get the latest height (deduplication), then performs
 // pruner in three sequential steps:
@@ -192,7 +144,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				case <-timeoutTimer.C:
 					s.logger.Infof("Pruner for height %d exceeded coordinator timeout of %v - pruner continues in background, re-queuing immediately", latestHeight, prunerTimeout)
 					// Note: This is not an error - the pruner job continues processing in the background.
-					// The coordinator re-queues immediately to check again without waiting for the next polling interval.
+					// The coordinator re-queues immediately to check again.
 					// Very large pruners may take longer than the timeout and require multiple iterations.
 
 					// Immediately re-queue to check again (non-blocking)
@@ -200,8 +152,8 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					case s.prunerCh <- latestHeight:
 						s.logger.Debugf("Re-queued pruner for height %d after timeout", latestHeight)
 					default:
-						// Channel full, will be picked up by next poll anyway
-						s.logger.Debugf("Pruner channel full, will retry on next poll")
+						// Channel full, will be retried when notifications trigger again
+						s.logger.Debugf("Pruner channel full, will retry on next notification")
 					}
 				case <-ctx.Done():
 					return

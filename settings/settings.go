@@ -426,7 +426,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 		Pruner: PrunerSettings{
 			GRPCAddress:       getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
 			GRPCListenAddress: getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
-			PollingInterval:   getDuration("pruner_pollingInterval", time.Minute, alternativeContext...),
 			WorkerCount:       getInt("pruner_workerCount", 4, alternativeContext...), // Default to 4 workers
 			JobTimeout:        getDuration("pruner_jobTimeout", 10*time.Minute, alternativeContext...),
 		},

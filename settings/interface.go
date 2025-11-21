@@ -480,7 +480,6 @@ type CoinbaseSettings struct {
 type PrunerSettings struct {
 	GRPCListenAddress string
 	GRPCAddress       string
-	PollingInterval   time.Duration
 	WorkerCount       int
 	JobTimeout        time.Duration // Timeout for waiting for pruner job completion
 }
