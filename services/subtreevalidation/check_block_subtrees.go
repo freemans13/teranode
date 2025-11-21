@@ -1201,8 +1201,18 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash cha
 
 	// Separate goroutine to close channel when all work is done
 	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
 		for completedCount.Load() < totalToProcess {
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				// Context cancelled, exit goroutine
+				close(readyChan)
+				return
+			case <-ticker.C:
+				// Continue polling
+			}
 		}
 		close(readyChan)
 	}()
