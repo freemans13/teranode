@@ -92,9 +92,9 @@ import (
 
 // batchSpend represents a single UTXO spend request in a batch
 type batchSpend struct {
-	spend             *utxo.Spend // UTXO to spend
-	blockHeight       uint32      // Current block height
-	errCh             chan error  // Channel for completion notification
+	spend             *utxo.Spend         // UTXO to spend
+	blockHeight       uint32              // Current block height
+	errCh             chan error          // Channel for completion notification
 	voutDataCh        chan *utxo.VoutData // Channel for vout data (optional)
 	ignoreConflicting bool
 	ignoreLocked      bool
