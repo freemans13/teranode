@@ -42,6 +42,12 @@ const (
 	//   Total: ~2.7GB per chunk
 	// For 600M tx block: 75 chunks × 125ms = ~10 seconds, 2.7GB peak memory
 	maxTransactionsPerChunk = 8_000_000 // 8 million transactions
+
+	// Average transaction statistics for capacity pre-sizing
+	// Based on Bitcoin/BSV transaction analysis
+	avgInputsPerTx     = 2.5  // Average number of inputs per transaction
+	avgOutputsPerTx    = 2.0  // Average number of outputs per transaction
+	externalParentRate = 0.05 // ~5% of parents are external (outside current block)
 )
 
 // bufioReaderPool reduces GC pressure by reusing bufio.Reader instances.
@@ -50,6 +56,28 @@ const (
 var bufioReaderPool = sync.Pool{
 	New: func() interface{} {
 		return bufio.NewReaderSize(nil, 32*1024) // 32KB buffer - optimized for sequential I/O
+	},
+}
+
+// pipelineTxStatePool reduces allocation overhead for pipelined transaction processing.
+// For 8M transaction chunks, this eliminates 8M allocations of ~80 bytes each = 640MB saved.
+// Critical for multi-million transaction blocks to reduce GC pressure.
+var pipelineTxStatePool = sync.Pool{
+	New: func() interface{} {
+		return &pipelineTxState{
+			childrenWaiting:  make([]chainhash.Hash, 0, 2), // avgOutputsPerTx = 2
+			completionSignal: make(chan struct{}),
+		}
+	},
+}
+
+// hashSlicePool reduces allocation overhead for dependency and children tracking.
+// Pre-allocates slices with typical capacity to avoid repeated reallocation.
+// For 8M transactions with avg 2.5 inputs: eliminates 20M+ slice reallocations.
+var hashSlicePool = sync.Pool{
+	New: func() interface{} {
+		slice := make([]chainhash.Hash, 0, 3) // avgInputsPerTx = 2.5, rounded up to 3
+		return &slice
 	},
 }
 
@@ -633,7 +661,11 @@ func (u *Server) prefetchAndCacheParentUTXOs(ctx context.Context, allTransaction
 	}
 
 	// Step 2: Collect parent hashes with complete knowledge of in-block transactions (SECOND PASS)
-	parentHashes := make(map[chainhash.Hash]struct{})
+	// Pre-size map: estimate external parents = txCount × avgInputs × externalParentRate
+	// For 8M txs: 8M × 2.5 × 0.05 = 1M external parents
+	estimatedExternalParents := int(float64(len(allTransactions)) * avgInputsPerTx * externalParentRate)
+	parentHashes := make(map[chainhash.Hash]struct{}, estimatedExternalParents)
+
 	for _, tx := range allTransactions {
 		if tx == nil || tx.IsCoinbase() {
 			continue
@@ -768,8 +800,15 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 	}
 
 	// Step 2: Collect parent hashes and separate in-block vs external parents (SECOND PASS)
-	externalParentHashes := make(map[chainhash.Hash]struct{})
-	inBlockParents := make(map[chainhash.Hash]*bt.Tx)
+	// Pre-size maps to avoid rehashing during population
+	// External parents: ~5% of total parents (txCount × avgInputs × externalRate)
+	// In-block parents: ~95% of total parents
+	estimatedTotalParents := int(float64(len(allTransactions)) * avgInputsPerTx)
+	estimatedExternalParents := int(float64(estimatedTotalParents) * externalParentRate)
+	estimatedInBlockParents := estimatedTotalParents - estimatedExternalParents
+
+	externalParentHashes := make(map[chainhash.Hash]struct{}, estimatedExternalParents)
+	inBlockParents := make(map[chainhash.Hash]*bt.Tx, estimatedInBlockParents)
 
 	// First, build a map of in-block transactions for quick lookup
 	txMap := make(map[chainhash.Hash]*bt.Tx, len(allTransactions))
@@ -1161,26 +1200,42 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash cha
 	// CRITICAL: Must build complete txMap first before checking dependencies
 	// Otherwise, if child appears before parent in array, dependency won't be detected
 
-	// PASS 1: Build complete txMap
+	// PASS 1: Build complete txMap using object pool to reduce allocations
 	txMap := make(map[chainhash.Hash]*pipelineTxState, len(transactions))
+	pooledStates := make([]*pipelineTxState, 0, len(transactions)) // Track pooled objects for cleanup
+
 	for _, mTx := range transactions {
 		if mTx.tx == nil || mTx.tx.IsCoinbase() {
 			continue
 		}
 
 		txHash := *mTx.tx.TxIDChainHash()
-		txMap[txHash] = &pipelineTxState{
-			tx:               mTx.tx,
-			pendingParents:   0,
-			childrenWaiting:  make([]chainhash.Hash, 0),
-			completionSignal: make(chan struct{}),
-		}
+
+		// Get state from pool and reset fields
+		state := pipelineTxStatePool.Get().(*pipelineTxState)
+		state.tx = mTx.tx
+		state.pendingParents = 0
+		state.childrenWaiting = state.childrenWaiting[:0] // Reset slice, keep capacity
+
+		txMap[txHash] = state
+		pooledStates = append(pooledStates, state)
 	}
 
+	// Defer cleanup: return all states to pool after processing
+	defer func() {
+		for _, state := range pooledStates {
+			// Reset state before returning to pool
+			state.tx = nil
+			state.pendingParents = 0
+			state.childrenWaiting = state.childrenWaiting[:0]
+			pipelineTxStatePool.Put(state)
+		}
+	}()
+
 	// PASS 2: Build dependencies and children relationships
-	// Now txMap is complete, so we can correctly detect all in-block parents
-	dependencies := make(map[chainhash.Hash][]chainhash.Hash) // child -> parents
-	childrenMap := make(map[chainhash.Hash][]chainhash.Hash)  // parent -> children
+	// Pre-size maps to avoid rehashing
+	dependencies := make(map[chainhash.Hash][]chainhash.Hash, len(transactions))
+	childrenMap := make(map[chainhash.Hash][]chainhash.Hash, len(transactions))
 
 	for _, mTx := range transactions {
 		if mTx.tx == nil || mTx.tx.IsCoinbase() {
@@ -1188,7 +1243,10 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash cha
 		}
 
 		txHash := *mTx.tx.TxIDChainHash()
-		dependencies[txHash] = make([]chainhash.Hash, 0)
+
+		// Get slice from pool for dependencies
+		depsSlicePtr := hashSlicePool.Get().(*[]chainhash.Hash)
+		depsSlice := (*depsSlicePtr)[:0] // Reset to length 0, keep capacity
 
 		// Build dependency relationships
 		for _, input := range mTx.tx.Inputs {
@@ -1196,15 +1254,36 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash cha
 
 			// Only track dependencies within this block
 			if _, exists := txMap[parentHash]; exists {
-				dependencies[txHash] = append(dependencies[txHash], parentHash)
+				depsSlice = append(depsSlice, parentHash)
 
+				// Add to children map
 				if childrenMap[parentHash] == nil {
-					childrenMap[parentHash] = make([]chainhash.Hash, 0)
+					// Get slice from pool for children
+					childSlicePtr := hashSlicePool.Get().(*[]chainhash.Hash)
+					childrenMap[parentHash] = (*childSlicePtr)[:0]
 				}
 				childrenMap[parentHash] = append(childrenMap[parentHash], txHash)
 			}
 		}
+
+		dependencies[txHash] = depsSlice
 	}
+
+	// Defer cleanup: return all dependency and children slices to pool
+	defer func() {
+		for _, depsSlice := range dependencies {
+			if cap(depsSlice) > 0 {
+				sliceCopy := depsSlice[:0]
+				hashSlicePool.Put(&sliceCopy)
+			}
+		}
+		for _, childSlice := range childrenMap {
+			if cap(childSlice) > 0 {
+				sliceCopy := childSlice[:0]
+				hashSlicePool.Put(&sliceCopy)
+			}
+		}
+	}()
 
 	// Set up pending parent counts and children references
 	readyQueue := make([]chainhash.Hash, 0, len(txMap))
