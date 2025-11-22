@@ -355,7 +355,8 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 	// Process transactions in chunks to bound memory usage for very large blocks
 	// Each chunk processes up to maxTransactionsPerChunk (8M) transactions, limiting memory to ~2GB
-	currentChunk := make([]*bt.Tx, 0, maxTransactionsPerChunk)
+	// Pre-allocate chunk buffer once and reuse to minimize GC pressure
+	chunkBuffer := make([]*bt.Tx, 0, maxTransactionsPerChunk)
 	chunkNum := 0
 	totalProcessed := 0
 
@@ -364,27 +365,28 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			continue
 		}
 
-		currentChunk = append(currentChunk, txs...)
+		chunkBuffer = append(chunkBuffer, txs...)
 
 		// Process chunk when it reaches size limit or is the last subtree
 		isLastSubtree := subtreeIdx == len(subtreeTxs)-1
-		shouldProcessChunk := len(currentChunk) >= maxTransactionsPerChunk || isLastSubtree
+		shouldProcessChunk := len(chunkBuffer) >= maxTransactionsPerChunk || isLastSubtree
 
-		if shouldProcessChunk && len(currentChunk) > 0 {
+		if shouldProcessChunk && len(chunkBuffer) > 0 {
 			chunkNum++
-			u.logger.Infof("[CheckBlockSubtrees] Processing chunk %d with %d transactions (total processed: %d)", chunkNum, len(currentChunk), totalProcessed)
+			u.logger.Infof("[CheckBlockSubtrees] Processing chunk %d with %d transactions (total processed: %d)", chunkNum, len(chunkBuffer), totalProcessed)
 
 			// Process this chunk with existing optimized pipeline
-			if err = u.processTransactionsInLevels(ctx, currentChunk, *block.Hash(), chainhash.Hash{}, block.Height, blockIds); err != nil {
+			if err = u.processTransactionsInLevels(ctx, chunkBuffer, *block.Hash(), chainhash.Hash{}, block.Height, blockIds); err != nil {
 				return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in chunk %d", chunkNum, err)
 			}
 
-			totalProcessed += len(currentChunk)
+			totalProcessed += len(chunkBuffer)
 			u.logger.Infof("[CheckBlockSubtrees] Completed chunk %d, total processed: %d", chunkNum, totalProcessed)
 
-			// Free memory before next chunk (only if not last subtree)
+			// Reset buffer for reuse (keeps capacity, no reallocation!)
+			// This minimizes GC pressure by reusing the same underlying array
 			if !isLastSubtree {
-				currentChunk = make([]*bt.Tx, 0, maxTransactionsPerChunk)
+				chunkBuffer = chunkBuffer[:0]
 			}
 		}
 	}
@@ -619,18 +621,23 @@ func (u *Server) prefetchAndCacheParentUTXOs(ctx context.Context, allTransaction
 	)
 	defer deferFn()
 
-	// Step 1: Collect all unique parent UTXO hashes from all transactions
-	parentHashes := make(map[chainhash.Hash]struct{})
+	// Step 1: Build complete set of transaction hashes in this block (FIRST PASS)
+	// This must be done BEFORE collecting parent hashes to correctly identify in-block vs external parents
 	transactionHashes := make(map[chainhash.Hash]struct{}, len(allTransactions))
-
 	for _, tx := range allTransactions {
 		if tx == nil || tx.IsCoinbase() {
 			continue
 		}
-
-		// Track this transaction hash
 		txHash := *tx.TxIDChainHash()
 		transactionHashes[txHash] = struct{}{}
+	}
+
+	// Step 2: Collect parent hashes with complete knowledge of in-block transactions (SECOND PASS)
+	parentHashes := make(map[chainhash.Hash]struct{})
+	for _, tx := range allTransactions {
+		if tx == nil || tx.IsCoinbase() {
+			continue
+		}
 
 		// Collect parent hashes from inputs
 		for _, input := range tx.Inputs {
@@ -749,17 +756,23 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 	)
 	defer deferFn()
 
-	// Collect all unique parent transaction hashes across all transactions
-	parentHashes := make(map[chainhash.Hash]struct{})
+	// Step 1: Build complete set of transaction hashes in this block (FIRST PASS)
+	// This must be done BEFORE collecting parent hashes for accurate in-block detection
 	transactionHashes := make(map[chainhash.Hash]struct{}, len(allTransactions))
-
 	for _, tx := range allTransactions {
 		if tx == nil || tx.IsCoinbase() || tx.IsExtended() {
 			continue // Skip if already extended
 		}
-
 		txHash := *tx.TxIDChainHash()
 		transactionHashes[txHash] = struct{}{}
+	}
+
+	// Step 2: Collect parent hashes with complete knowledge of in-block transactions (SECOND PASS)
+	parentHashes := make(map[chainhash.Hash]struct{})
+	for _, tx := range allTransactions {
+		if tx == nil || tx.IsCoinbase() || tx.IsExtended() {
+			continue
+		}
 
 		for _, input := range tx.Inputs {
 			parentHash := *input.PreviousTxIDChainHash()
@@ -1237,8 +1250,8 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash cha
 		for completedCount.Load() < totalToProcess {
 			select {
 			case <-ctx.Done():
-				// Context cancelled, exit goroutine
-				close(readyChan)
+				// Context cancelled, exit polling but don't close channel
+				// Channel will be closed after g.Wait() to avoid panic
 				return
 			case <-ticker.C:
 				// Continue polling
@@ -1248,7 +1261,18 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash cha
 	}()
 
 	// Wait for all workers to complete
-	if err := g.Wait(); err != nil {
+	err := g.Wait()
+
+	// Ensure channel is closed after all workers have stopped
+	// This prevents "send on closed channel" panics during shutdown
+	select {
+	case <-readyChan:
+		// Channel already closed by the polling goroutine
+	default:
+		close(readyChan)
+	}
+
+	if err != nil {
 		return errors.NewProcessingError("[processTransactionsPipelined] Pipeline processing failed", err)
 	}
 
