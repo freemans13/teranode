@@ -1327,26 +1327,22 @@ func (u *Server) prepareTxsPerLevel(ctx context.Context, transactions []missingT
 
 	defer deferFn()
 
-	// Build dependency graph with adjacency lists for efficient lookups
-	txMap := make(map[chainhash.Hash]*txMapWrapper, len(transactions))
-	maxLevel := uint32(0)
-	sizePerLevel := make(map[uint32]uint64)
+	//  OPTIMIZED: Uses Kahn's algorithm for O(n+e) topological sort vs O(n²) iterative
+	// Pre-size all structures with power-of-2 capacity to prevent rehashing
+	txCount := len(transactions)
+	mapCapacity := nextPowerOf2(txCount)
+	txMap := make(map[chainhash.Hash]*txMapWrapper, mapCapacity)
+	levelCache := make(map[chainhash.Hash]uint32, mapCapacity)
+	inDegree := make(map[chainhash.Hash]int32, mapCapacity) // Count of unprocessed parents
 
-	// First pass: create all nodes and initialize structures
-	for _, mTx := range transactions {
-		if mTx.tx != nil && !mTx.tx.IsCoinbase() {
-			hash := *mTx.tx.TxIDChainHash()
-			txMap[hash] = &txMapWrapper{
-				missingTx:         mTx,
-				childLevelInBlock: 0,
-			}
-		}
+	// PASS 1: Build txMap and calculate in-degrees (combined with dependency tracking)
+	// This combines what used to be separate passes for efficiency
+	type txDep struct {
+		wrapper      *txMapWrapper
+		parentList   []chainhash.Hash
+		childrenList []chainhash.Hash
 	}
-
-	// Second pass: calculate dependency levels using topological approach
-	// Build dependency graph first
-	dependencies := make(map[chainhash.Hash][]chainhash.Hash) // child -> parents
-	childrenMap := make(map[chainhash.Hash][]chainhash.Hash)  // parent -> children
+	depGraph := make(map[chainhash.Hash]*txDep, mapCapacity)
 
 	for _, mTx := range transactions {
 		if mTx.tx == nil || mTx.tx.IsCoinbase() {
@@ -1354,113 +1350,109 @@ func (u *Server) prepareTxsPerLevel(ctx context.Context, transactions []missingT
 		}
 
 		txHash := *mTx.tx.TxIDChainHash()
-		dependencies[txHash] = make([]chainhash.Hash, 0)
+		wrapper := &txMapWrapper{
+			missingTx:         mTx,
+			childLevelInBlock: 0,
+		}
+		txMap[txHash] = wrapper
 
-		// Check each input of the transaction to find its parents
+		// Initialize dependency tracking
+		depGraph[txHash] = &txDep{
+			wrapper:      wrapper,
+			parentList:   make([]chainhash.Hash, 0, 3), // avg 2.5 inputs
+			childrenList: make([]chainhash.Hash, 0, 2), // avg 2 children
+		}
+		inDegree[txHash] = 0
+	}
+
+	// PASS 2: Build dependency edges and count in-degrees
+	for _, mTx := range transactions {
+		if mTx.tx == nil || mTx.tx.IsCoinbase() {
+			continue
+		}
+
+		txHash := *mTx.tx.TxIDChainHash()
+		dep := depGraph[txHash]
+
 		for _, input := range mTx.tx.Inputs {
 			parentHash := *input.PreviousTxIDChainHash()
 
-			// check if parentHash exists in the map, which means it is part of the subtree
-			if _, exists := txMap[parentHash]; exists {
-				dependencies[txHash] = append(dependencies[txHash], parentHash)
-
-				if childrenMap[parentHash] == nil {
-					childrenMap[parentHash] = make([]chainhash.Hash, 0)
-				}
-				childrenMap[parentHash] = append(childrenMap[parentHash], txHash)
+			// Only track in-block dependencies
+			if parentDep, exists := depGraph[parentHash]; exists {
+				dep.parentList = append(dep.parentList, parentHash)
+				parentDep.childrenList = append(parentDep.childrenList, txHash)
+				inDegree[txHash]++
 			}
 		}
 	}
 
-	// Calculate levels using iterative topological sort to avoid stack overflow
-	// and detect circular dependencies
-	levelCache := make(map[chainhash.Hash]uint32)
-
-	// Find all transactions with no dependencies (level 0)
-	for txHash, parents := range dependencies {
-		if len(parents) == 0 {
+	// PASS 3: Kahn's algorithm for topological sort (guaranteed O(n+e))
+	// Initialize queue with all transactions that have no dependencies (in-degree = 0)
+	queue := make([]chainhash.Hash, 0, txCount/10) // estimate 10% have no deps
+	for txHash, degree := range inDegree {
+		if degree == 0 {
 			levelCache[txHash] = 0
+			queue = append(queue, txHash)
 		}
 	}
 
-	// Process remaining transactions level by level
-	// Maximum iterations is len(dependencies) + 1 to handle all possible levels
-	maxIterations := len(dependencies) + 1
-	for iteration := 0; iteration < maxIterations; iteration++ {
-		progress := false
+	// Process queue: assign levels based on maximum parent level + 1
+	processed := 0
+	maxLevel := uint32(0)
+	sizePerLevel := make(map[uint32]int, 10) // estimate ~10 levels average
 
-		for txHash, parents := range dependencies {
-			if _, exists := levelCache[txHash]; exists {
-				continue
-			}
+	for len(queue) > 0 {
+		// Pop from queue
+		current := queue[0]
+		queue = queue[1:]
+		processed++
 
-			// Check if all parents have computed levels
-			allParentsComputed := true
-			maxParentLevel := uint32(0)
-			for _, parentHash := range parents {
-				parentLevel, exists := levelCache[parentHash]
-				if !exists {
-					allParentsComputed = false
-					break
-				}
-				if parentLevel > maxParentLevel {
-					maxParentLevel = parentLevel
-				}
-			}
+		currentLevel := levelCache[current]
+		dep := depGraph[current]
 
-			if allParentsComputed {
-				levelCache[txHash] = maxParentLevel + 1
-				progress = true
-			}
+		// Update wrapper
+		dep.wrapper.childLevelInBlock = currentLevel
+		dep.wrapper.someParentsInBlock = len(dep.parentList) > 0
+
+		// Track level statistics
+		sizePerLevel[currentLevel]++
+		if currentLevel > maxLevel {
+			maxLevel = currentLevel
 		}
 
-		if !progress {
-			// No progress made - check if we're done or have a cycle
-			if len(levelCache) < len(dependencies) {
-				return 0, nil, errors.NewProcessingError("Circular dependency detected in transaction graph")
+		// Process children: decrement in-degree, add to queue if ready
+		childLevel := currentLevel + 1
+		for _, childHash := range dep.childrenList {
+			inDegree[childHash]--
+
+			if inDegree[childHash] == 0 {
+				// All parents processed, assign level
+				levelCache[childHash] = childLevel
+				queue = append(queue, childHash)
+			} else if inDegree[childHash] < 0 {
+				// Sanity check - should never happen
+				return 0, nil, errors.NewProcessingError("Internal error: negative in-degree for transaction %s", childHash.String())
 			}
-			break
 		}
 	}
 
-	// Update wrappers with calculated levels
-	for _, mTx := range transactions {
-		if mTx.tx == nil || mTx.tx.IsCoinbase() {
-			continue
-		}
-
-		txHash := *mTx.tx.TxIDChainHash()
-		wrapper := txMap[txHash]
-		if wrapper == nil {
-			continue
-		}
-
-		level, exists := levelCache[txHash]
-		if !exists {
-			// This shouldn't happen if the algorithm is correct
-			return 0, nil, errors.NewProcessingError("Failed to calculate level for transaction")
-		}
-
-		wrapper.childLevelInBlock = level
-		wrapper.someParentsInBlock = len(dependencies[txHash]) > 0
-
-		sizePerLevel[level]++
-		if level > maxLevel {
-			maxLevel = level
-		}
+	// Detect circular dependencies
+	if processed < len(txMap) {
+		return 0, nil, errors.NewProcessingError("Circular dependency detected: processed %d of %d transactions", processed, len(txMap))
 	}
 
+	// PASS 4: Build result slices with pre-allocated capacity
 	blocksPerLevelSlice := make([][]missingTx, maxLevel+1)
-
-	// Build result map with pre-allocated slices
-	for _, wrapper := range txMap {
-		level := wrapper.childLevelInBlock
-		if blocksPerLevelSlice[level] == nil {
-			// Initialize the slice for this level if it doesn't exist
-			blocksPerLevelSlice[level] = make([]missingTx, 0, sizePerLevel[level])
+	for level := uint32(0); level <= maxLevel; level++ {
+		if size := sizePerLevel[level]; size > 0 {
+			blocksPerLevelSlice[level] = make([]missingTx, 0, size)
 		}
+	}
 
-		blocksPerLevelSlice[level] = append(blocksPerLevelSlice[level], wrapper.missingTx)
+	// Distribute transactions to levels
+	for _, dep := range depGraph {
+		level := dep.wrapper.childLevelInBlock
+		blocksPerLevelSlice[level] = append(blocksPerLevelSlice[level], dep.wrapper.missingTx)
 	}
 
 	return maxLevel, blocksPerLevelSlice, nil
