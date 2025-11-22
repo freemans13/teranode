@@ -767,8 +767,20 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 		transactionHashes[txHash] = struct{}{}
 	}
 
-	// Step 2: Collect parent hashes with complete knowledge of in-block transactions (SECOND PASS)
-	parentHashes := make(map[chainhash.Hash]struct{})
+	// Step 2: Collect parent hashes and separate in-block vs external parents (SECOND PASS)
+	externalParentHashes := make(map[chainhash.Hash]struct{})
+	inBlockParents := make(map[chainhash.Hash]*bt.Tx)
+
+	// First, build a map of in-block transactions for quick lookup
+	txMap := make(map[chainhash.Hash]*bt.Tx, len(allTransactions))
+	for _, tx := range allTransactions {
+		if tx == nil || tx.IsCoinbase() {
+			continue
+		}
+		txMap[*tx.TxIDChainHash()] = tx
+	}
+
+	// Now collect parent hashes, separating in-block from external
 	for _, tx := range allTransactions {
 		if tx == nil || tx.IsCoinbase() || tx.IsExtended() {
 			continue
@@ -776,21 +788,37 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 
 		for _, input := range tx.Inputs {
 			parentHash := *input.PreviousTxIDChainHash()
-			// Collect both in-block and external parents
-			parentHashes[parentHash] = struct{}{}
+
+			// Check if parent is in this block
+			if parentTx, inBlock := txMap[parentHash]; inBlock {
+				// Parent is in-block - use in-memory transaction (no need to fetch from Aerospike)
+				inBlockParents[parentHash] = parentTx
+			} else {
+				// Parent is external - needs to be fetched from Aerospike
+				externalParentHashes[parentHash] = struct{}{}
+			}
 		}
 	}
 
-	if len(parentHashes) == 0 {
-		u.logger.Infof("[batchExtendTransactions] No parent UTXOs to fetch for extension")
-		return nil
+	u.logger.Infof("[batchExtendTransactions] Found %d in-block parents (using in-memory), %d external parents (fetching from store)", len(inBlockParents), len(externalParentHashes))
+
+	if len(externalParentHashes) == 0 {
+		// All parents are in-block, use them directly without fetching
+		if len(inBlockParents) == 0 {
+			u.logger.Infof("[batchExtendTransactions] No parent UTXOs needed for extension")
+			return nil
+		}
+
+		// Skip to extension step using only in-block parents
+		u.logger.Infof("[batchExtendTransactions] All parents are in-block, skipping Aerospike fetch")
+		return u.extendTransactionsWithParents(allTransactions, inBlockParents)
 	}
 
-	// Fetch all parent UTXOs using BatchDecorate in chunks to prevent Aerospike timeouts
-	unresolvedMeta := make([]*utxo.UnresolvedMetaData, 0, len(parentHashes))
-	parentMap := make(map[chainhash.Hash]int, len(parentHashes))
+	// Fetch only external parent UTXOs using BatchDecorate in chunks to prevent Aerospike timeouts
+	unresolvedMeta := make([]*utxo.UnresolvedMetaData, 0, len(externalParentHashes))
+	parentMap := make(map[chainhash.Hash]int, len(externalParentHashes))
 	idx := 0
-	for hash := range parentHashes {
+	for hash := range externalParentHashes {
 		hash := hash
 		unresolvedMeta = append(unresolvedMeta, &utxo.UnresolvedMetaData{
 			Hash: hash,
@@ -804,7 +832,7 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 	}
 
 	totalRecords := len(unresolvedMeta)
-	u.logger.Infof("[batchExtendTransactions] Fetching %d unique parent outputs for transaction extension", totalRecords)
+	u.logger.Infof("[batchExtendTransactions] Fetching %d unique external parent outputs for transaction extension", totalRecords)
 
 	// Fetch in chunks to prevent Aerospike timeouts on large batches
 	start := time.Now()
@@ -824,11 +852,16 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 	}
 
 	fetchDuration := time.Since(start)
-	u.logger.Infof("[batchExtendTransactions] Fetched %d parent UTXOs in %d chunks in %v", totalRecords, totalChunks, fetchDuration)
+	u.logger.Infof("[batchExtendTransactions] Fetched %d external parent UTXOs in %d chunks in %v", totalRecords, totalChunks, fetchDuration)
 
 	// Build a map of parent hash -> parent tx for quick lookup
-	// Also count large transactions that may be stored externally
-	parentTxMap := make(map[chainhash.Hash]*bt.Tx, len(unresolvedMeta))
+	// Start with in-block parents (already in memory)
+	parentTxMap := make(map[chainhash.Hash]*bt.Tx, len(inBlockParents)+len(unresolvedMeta))
+	for hash, tx := range inBlockParents {
+		parentTxMap[hash] = tx
+	}
+
+	// Add fetched external parents and count large transactions
 	largeTxCount := 0
 	for _, item := range unresolvedMeta {
 		if item.Err != nil || item.Data == nil || item.Data.Tx == nil {
@@ -844,11 +877,16 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 		parentTxMap[item.Hash] = item.Data.Tx
 	}
 
+	u.logger.Infof("[batchExtendTransactions] Built parent map with %d in-block + %d external parents = %d total", len(inBlockParents), len(unresolvedMeta), len(parentTxMap))
 	if largeTxCount > 0 {
-		u.logger.Infof("[batchExtendTransactions] Found %d large parent transactions (>100 outputs, likely external) out of %d parents", largeTxCount, len(unresolvedMeta))
+		u.logger.Infof("[batchExtendTransactions] Found %d large parent transactions (>100 outputs, likely external) out of %d external parents", largeTxCount, len(unresolvedMeta))
 	}
 
-	// Now extend all transactions using the parent data
+	return u.extendTransactionsWithParents(allTransactions, parentTxMap)
+}
+
+// extendTransactionsWithParents extends all transactions using the provided parent transaction map
+func (u *Server) extendTransactionsWithParents(allTransactions []*bt.Tx, parentTxMap map[chainhash.Hash]*bt.Tx) error {
 	extendedCount := 0
 	for _, tx := range allTransactions {
 		if tx == nil || tx.IsCoinbase() || tx.IsExtended() {
@@ -869,7 +907,7 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 
 			// Check if parent has the required output
 			if int(input.PreviousTxOutIndex) >= len(parentTx.Outputs) {
-				u.logger.Warnf("[batchExtendTransactions] Parent tx %s doesn't have output index %d", parentHash.String(), input.PreviousTxOutIndex)
+				u.logger.Warnf("[extendTransactionsWithParents] Parent tx %s doesn't have output index %d", parentHash.String(), input.PreviousTxOutIndex)
 				allInputsExtended = false
 				continue
 			}
@@ -888,7 +926,7 @@ func (u *Server) batchExtendTransactions(ctx context.Context, allTransactions []
 		}
 	}
 
-	u.logger.Infof("[batchExtendTransactions] Extended %d/%d transactions", extendedCount, len(allTransactions))
+	u.logger.Infof("[extendTransactionsWithParents] Extended %d/%d transactions", extendedCount, len(allTransactions))
 	return nil
 }
 
@@ -1119,11 +1157,12 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash cha
 
 	u.logger.Infof("[processTransactionsPipelined] Using pipeline processing for %d transactions", len(transactions))
 
-	// Build dependency graph
-	txMap := make(map[chainhash.Hash]*pipelineTxState, len(transactions))
-	dependencies := make(map[chainhash.Hash][]chainhash.Hash) // child -> parents
-	childrenMap := make(map[chainhash.Hash][]chainhash.Hash)  // parent -> children
+	// Build dependency graph in two passes to handle transactions in any order
+	// CRITICAL: Must build complete txMap first before checking dependencies
+	// Otherwise, if child appears before parent in array, dependency won't be detected
 
+	// PASS 1: Build complete txMap
+	txMap := make(map[chainhash.Hash]*pipelineTxState, len(transactions))
 	for _, mTx := range transactions {
 		if mTx.tx == nil || mTx.tx.IsCoinbase() {
 			continue
@@ -1136,7 +1175,19 @@ func (u *Server) processTransactionsPipelined(ctx context.Context, blockHash cha
 			childrenWaiting:  make([]chainhash.Hash, 0),
 			completionSignal: make(chan struct{}),
 		}
+	}
 
+	// PASS 2: Build dependencies and children relationships
+	// Now txMap is complete, so we can correctly detect all in-block parents
+	dependencies := make(map[chainhash.Hash][]chainhash.Hash) // child -> parents
+	childrenMap := make(map[chainhash.Hash][]chainhash.Hash)  // parent -> children
+
+	for _, mTx := range transactions {
+		if mTx.tx == nil || mTx.tx.IsCoinbase() {
+			continue
+		}
+
+		txHash := *mTx.tx.TxIDChainHash()
 		dependencies[txHash] = make([]chainhash.Hash, 0)
 
 		// Build dependency relationships
