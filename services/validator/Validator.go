@@ -486,75 +486,78 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		utxoMapErr error
 	)
 
-	// this will reverse the spends if there is an error
-	if spentUtxos, err = v.spendUtxos(decoupledCtx, tx, blockHeight, validationOptions.IgnoreLocked); err != nil {
-		if errors.Is(err, errors.ErrUtxoError) {
-			saveAsConflicting := false
+	// Spend UTXOs unless already spent via optimistic spend
+	if !validationOptions.SkipSpend {
+		// this will reverse the spends if there is an error
+		if spentUtxos, err = v.spendUtxos(decoupledCtx, tx, blockHeight, validationOptions.IgnoreLocked); err != nil {
+			if errors.Is(err, errors.ErrUtxoError) {
+				saveAsConflicting := false
 
-			var spendErrs *errors.Error
+				var spendErrs *errors.Error
 
-			for _, spend := range spentUtxos {
-				if spend.Err != nil {
-					if validationOptions.CreateConflicting && (errors.Is(spend.Err, errors.ErrSpent) || errors.Is(spend.Err, errors.ErrTxConflicting)) {
-						saveAsConflicting = true
-					}
+				for _, spend := range spentUtxos {
+					if spend.Err != nil {
+						if validationOptions.CreateConflicting && (errors.Is(spend.Err, errors.ErrSpent) || errors.Is(spend.Err, errors.ErrTxConflicting)) {
+							saveAsConflicting = true
+						}
 
-					var spendErr *errors.Error
-					if errors.As(spend.Err, &spendErr) {
-						if spendErrs == nil {
-							spendErrs = errors.New(spendErr.Code(), spendErr.Message(), spendErr)
-						} else {
-							spendErrs = errors.New(spendErrs.Code(), spendErrs.Message(), spendErr)
+						var spendErr *errors.Error
+						if errors.As(spend.Err, &spendErr) {
+							if spendErrs == nil {
+								spendErrs = errors.New(spendErr.Code(), spendErr.Message(), spendErr)
+							} else {
+								spendErrs = errors.New(spendErrs.Code(), spendErrs.Message(), spendErr)
+							}
 						}
 					}
 				}
-			}
 
-			if spendErrs != nil {
-				if errors.As(err, &tErr) {
-					tErr.SetWrappedErr(spendErrs)
+				if spendErrs != nil {
+					if errors.As(err, &tErr) {
+						tErr.SetWrappedErr(spendErrs)
+					}
 				}
-			}
 
-			if saveAsConflicting {
-				if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false); utxoMapErr != nil {
-					if errors.Is(utxoMapErr, errors.ErrTxExists) {
-						if txMetaData, err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash()); err != nil {
-							err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, utxoMapErr)
-							span.RecordError(err)
+				if saveAsConflicting {
+					if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false); utxoMapErr != nil {
+						if errors.Is(utxoMapErr, errors.ErrTxExists) {
+							if txMetaData, err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash()); err != nil {
+								err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, utxoMapErr)
+								span.RecordError(err)
 
-							return nil, err
+								return nil, err
+							}
 						}
+
+						err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, utxoMapErr)
+						span.RecordError(err)
+
+						return txMetaData, err
 					}
 
-					err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, utxoMapErr)
+					// We successfully added the tx to the utxo store as a conflicting tx,
+					// so we can return a conflicting error
+					err = errors.NewTxConflictingError("[Validate][%s] tx is conflicting", txID, err)
 					span.RecordError(err)
 
 					return txMetaData, err
 				}
+			} else if errors.Is(err, errors.ErrTxNotFound) {
+				// the parent transaction was not found, this can happen when the parent tx has been DAH'd and removed from
+				// the utxo store. We can check whether the tx already exists, which means it has been validated and
+				// blessed. In this case we can just return early.
+				if txMetaData, err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash()); err == nil {
+					v.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", txID)
 
-				// We successfully added the tx to the utxo store as a conflicting tx,
-				// so we can return a conflicting error
-				err = errors.NewTxConflictingError("[Validate][%s] tx is conflicting", txID, err)
-				span.RecordError(err)
-
-				return txMetaData, err
+					return txMetaData, nil
+				}
 			}
-		} else if errors.Is(err, errors.ErrTxNotFound) {
-			// the parent transaction was not found, this can happen when the parent tx has been DAH'd and removed from
-			// the utxo store. We can check whether the tx already exists, which means it has been validated and
-			// blessed. In this case we can just return early.
-			if txMetaData, err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash()); err == nil {
-				v.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", txID)
 
-				return txMetaData, nil
-			}
+			err = errors.NewProcessingError("[Validate][%s] error spending utxos", txID, err)
+			span.RecordError(err)
+
+			return nil, err
 		}
-
-		err = errors.NewProcessingError("[Validate][%s] error spending utxos", txID, err)
-		span.RecordError(err)
-
-		return nil, err
 	}
 
 	// the option blockAssemblyDisabled is false by default

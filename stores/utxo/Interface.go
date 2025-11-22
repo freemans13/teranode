@@ -123,6 +123,22 @@ func (s *Spend) Clone() *Spend {
 	return clone
 }
 
+// VoutData contains transaction output data returned from optimistic spend operations.
+// This enables spend-validate-rollback pattern where validation happens after spending.
+type VoutData struct {
+	// Amount in satoshis from the output
+	Amount uint64
+
+	// LockingScript from the output
+	LockingScript []byte
+
+	// BlockIDs where this UTXO appears (for BIP68 validation)
+	BlockIDs []uint32
+
+	// Vout index
+	Vout uint32
+}
+
 // IgnoreFlags controls which UTXO states should be ignored during spend operations.
 type IgnoreFlags struct {
 	IgnoreConflicting bool
@@ -251,6 +267,12 @@ type Store interface {
 
 	// Spend marks all the UTXOs of the transaction as spent.
 	Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...IgnoreFlags) ([]*Spend, error)
+
+	// SpendWithVoutData atomically spends a UTXO and returns its output data.
+	// This enables optimistic spending where validation happens after spending.
+	// Returns vout data (amount, locking script, block IDs) needed for validation.
+	// If UTXO is already spent or doesn't exist, returns error.
+	SpendWithVoutData(ctx context.Context, spend *Spend) (*VoutData, error)
 
 	// Unspend reverses a previous spend operation, marking UTXOs as unspent.
 	// This is used during blockchain reorganizations.

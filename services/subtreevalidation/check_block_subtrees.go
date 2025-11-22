@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -19,6 +20,8 @@ import (
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
@@ -570,6 +573,123 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 	return txIndex, nil
 }
 
+// optimisticBatchSpendAndExtend optimistically spends UTXOs and extends transactions with returned vout data
+// Returns map of transaction -> spends for potential rollback on validation failure
+func (u *Server) optimisticBatchSpendAndExtend(ctx context.Context, allTransactions []*bt.Tx) (map[*bt.Tx][]*utxo.Spend, error) {
+	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "optimisticBatchSpendAndExtend",
+		tracing.WithParentStat(u.stats),
+		tracing.WithLogMessage(u.logger, "[optimisticBatchSpendAndExtend] Optimistically spending for %d transactions", len(allTransactions)),
+	)
+	defer deferFn()
+
+	// Collect all spends from all transactions
+	type spendJob struct {
+		tx       *bt.Tx
+		inputIdx int
+		input    *bt.Input
+		spend    *utxo.Spend
+		voutData *utxo.VoutData
+		err      error
+	}
+
+	// Build list of all spends across all transactions
+	var allJobs []*spendJob
+	for _, tx := range allTransactions {
+		if tx == nil || tx.IsCoinbase() || tx.IsExtended() {
+			continue
+		}
+
+		for inputIdx, input := range tx.Inputs {
+			utxoHash, err := util.UTXOHashFromInput(input)
+			if err != nil {
+				u.logger.Warnf("[optimisticBatchSpendAndExtend] Failed to calculate UTXO hash for tx %s input %d: %v", tx.TxID(), inputIdx, err)
+				continue
+			}
+
+			job := &spendJob{
+				tx:       tx,
+				inputIdx: inputIdx,
+				input:    input,
+				spend: &utxo.Spend{
+					TxID:         input.PreviousTxIDChainHash(),
+					Vout:         input.PreviousTxOutIndex,
+					UTXOHash:     utxoHash,
+					SpendingData: spend.NewSpendingData(tx.TxIDChainHash(), inputIdx),
+				},
+			}
+			allJobs = append(allJobs, job)
+		}
+	}
+
+	u.logger.Debugf("[optimisticBatchSpendAndExtend] Processing %d spends in parallel", len(allJobs))
+
+	// Process all spends in parallel
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
+
+	for _, job := range allJobs {
+		job := job // Capture for goroutine
+		g.Go(func() error {
+			voutData, err := u.utxoStore.SpendWithVoutData(gCtx, job.spend)
+			if err != nil {
+				job.err = err
+				return nil // Don't fail entire batch on individual spend errors
+			}
+			job.voutData = voutData
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, errors.NewProcessingError("[optimisticBatchSpendAndExtend] Failed to process spends", err)
+	}
+
+	// Organize results by transaction and extend inputs
+	txToSpends := make(map[*bt.Tx][]*utxo.Spend, len(allTransactions))
+	extendedCount := 0
+
+	// Group jobs by transaction
+	txToJobs := make(map[*bt.Tx][]*spendJob)
+	for _, job := range allJobs {
+		txToJobs[job.tx] = append(txToJobs[job.tx], job)
+	}
+
+	// Process each transaction
+	for tx, jobs := range txToJobs {
+		allInputsExtended := true
+		spends := make([]*utxo.Spend, 0, len(jobs))
+
+		for _, job := range jobs {
+			if job.err != nil {
+				u.logger.Warnf("[optimisticBatchSpendAndExtend] Failed to spend %s:%d: %v", job.spend.TxID.String(), job.spend.Vout, job.err)
+				allInputsExtended = false
+				continue
+			}
+
+			if job.voutData == nil {
+				u.logger.Warnf("[optimisticBatchSpendAndExtend] No vout data returned for %s:%d", job.spend.TxID.String(), job.spend.Vout)
+				allInputsExtended = false
+				continue
+			}
+
+			// Extend input with returned data
+			job.input.PreviousTxSatoshis = job.voutData.Amount
+			job.input.PreviousTxScript = bscript.NewFromBytes(job.voutData.LockingScript)
+
+			spends = append(spends, job.spend)
+		}
+
+		if allInputsExtended && len(spends) > 0 {
+			tx.SetExtended(true)
+			txToSpends[tx] = spends
+			extendedCount++
+		}
+	}
+
+	u.logger.Infof("[optimisticBatchSpendAndExtend] Extended %d/%d transactions via optimistic spend", extendedCount, len(allTransactions))
+	return txToSpends, nil
+}
+
 // processTransactionsInLevels processes all transactions from all subtrees using level-based validation
 // This ensures transactions are processed in dependency order while maximizing parallelism
 func (u *Server) processTransactionsInLevels(ctx context.Context, allTransactions []*bt.Tx, blockHash chainhash.Hash, subtreeHash chainhash.Hash, blockHeight uint32, blockIds map[uint32]bool) error {
@@ -584,6 +704,12 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	u.logger.Infof("[processTransactionsInLevels] Organizing %d transactions into dependency levels", len(allTransactions))
+
+	// Optimistically spend UTXOs and extend transactions
+	txToSpends, err := u.optimisticBatchSpendAndExtend(ctx, allTransactions)
+	if err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] Optimistic spend failed", err)
+	}
 
 	// Convert transactions to missingTx format for prepareTxsPerLevel
 	missingTxs := make([]missingTx, len(allTransactions))
@@ -606,7 +732,8 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	u.logger.Infof("[processTransactionsInLevels] Processing transactions across %d levels", maxLevel+1)
 
-	validatorOptions := []validator.Option{
+	// Base validator options (common for all transactions)
+	baseValidatorOptions := []validator.Option{
 		validator.WithSkipPolicyChecks(true),
 		validator.WithCreateConflicting(true),
 		validator.WithIgnoreLocked(true),
@@ -619,11 +746,8 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	// During legacy syncing or catching up, disable adding transactions to block assembly
 	if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
-		validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
+		baseValidatorOptions = append(baseValidatorOptions, validator.WithAddTXToBlockAssembly(false))
 	}
-
-	// Pre-process validation options
-	processedValidatorOptions := validator.ProcessOptions(validatorOptions...)
 
 	// Track validation results
 	var (
@@ -651,10 +775,28 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 
 			g.Go(func() error {
+				// Build validator options per-transaction
+				txValidatorOptions := append([]validator.Option{}, baseValidatorOptions...)
+
+				// Only skip spend if this transaction was successfully optimistically spent
+				_, wasOptimisticallySpent := txToSpends[tx]
+				txValidatorOptions = append(txValidatorOptions, validator.WithSkipSpend(wasOptimisticallySpent))
+
+				processedOptions := validator.ProcessOptions(txValidatorOptions...)
+
 				// Use existing blessMissingTransaction logic for validation
-				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
+				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedOptions)
 				if err != nil {
 					u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
+
+					// Rollback optimistic spends for this transaction
+					if spends, ok := txToSpends[tx]; ok && len(spends) > 0 {
+						if rollbackErr := u.utxoStore.Unspend(gCtx, spends); rollbackErr != nil {
+							u.logger.Errorf("[processTransactionsInLevels] Failed to rollback spends for invalid tx %s: %v", tx.TxIDChainHash().String(), rollbackErr)
+						} else {
+							u.logger.Debugf("[processTransactionsInLevels] Rolled back %d spends for invalid tx %s", len(spends), tx.TxIDChainHash().String())
+						}
+					}
 
 					// TX_EXISTS is not an error - transaction was already validated
 					if errors.Is(err, errors.ErrTxExists) {

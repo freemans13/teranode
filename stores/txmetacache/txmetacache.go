@@ -780,6 +780,11 @@ func (t *TxMetaCache) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, 
 	return t.utxoStore.Spend(ctx, tx, blockHeight, ignoreFlags...)
 }
 
+// SpendWithVoutData atomically spends a UTXO and returns its output data
+func (t *TxMetaCache) SpendWithVoutData(ctx context.Context, spend *utxo.Spend) (*utxo.VoutData, error) {
+	return t.utxoStore.SpendWithVoutData(ctx, spend)
+}
+
 // Unspend marks previously spent UTXOs as unspent.
 // This method delegates directly to the underlying UTXO store without caching.
 //

@@ -195,6 +195,12 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	return spends, err
 }
 
+func (s *Store) SpendWithVoutData(ctx context.Context, spend *utxo.Spend) (*utxo.VoutData, error) {
+	voutData, err := s.store.SpendWithVoutData(ctx, spend)
+	s.logger.Debugf("[UTXOStore][logger][SpendWithVoutData] TxID: %s, Vout: %d, err: %v : %s", spend.TxID, spend.Vout, err, caller())
+	return voutData, err
+}
+
 func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) error {
 	err := s.store.Unspend(ctx, spends, false)
 	spendDetails := make([]string, len(spends))

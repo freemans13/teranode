@@ -77,6 +77,14 @@ func (m *MockStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ig
 	return args.Get(0).([]*utxo.Spend), args.Error(1)
 }
 
+func (m *MockStore) SpendWithVoutData(ctx context.Context, spend *utxo.Spend) (*utxo.VoutData, error) {
+	args := m.Called(ctx, spend)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*utxo.VoutData), args.Error(1)
+}
+
 func (m *MockStore) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) error {
 	args := m.Called(ctx, spends, flagAsLocked)
 	return args.Error(0)

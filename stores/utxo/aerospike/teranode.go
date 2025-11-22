@@ -70,7 +70,7 @@ import (
 //go:embed teranode.lua
 var teranodeLUA []byte
 
-var LuaPackage = "teranode_v50" // N.B. Do not have any "." in this string
+var LuaPackage = "teranode_v51" // N.B. Do not have any "." in this string
 
 // frozenUTXOBytes which is FF...FF, which is equivalent to a coinbase placeholder
 var frozenUTXOBytes = subtree.FrozenBytes[:]
@@ -269,7 +269,15 @@ type LuaMapResponse struct {
 	BlockIDs   []int                `json:"blockIDs,omitempty"`
 	Errors     map[int]LuaErrorInfo `json:"errors,omitempty"`
 	ChildCount int                  `json:"childCount,omitempty"`
+	VoutData   map[int]LuaVoutData  `json:"voutData,omitempty"`
 	// Debug      string               `json:"debug,omitempty"`
+}
+
+// LuaVoutData represents output data returned from spend operations
+type LuaVoutData struct {
+	Satoshis uint64 `json:"satoshis"`
+	Script   []byte `json:"script"`
+	BlockIDs []int  `json:"blockIDs,omitempty"`
 }
 
 // ParseLuaMapResponse parses the map response from Lua scripts.
@@ -373,6 +381,67 @@ func (s *Store) ParseLuaMapResponse(response interface{}) (*LuaMapResponse, erro
 	if childCount, ok := respMap["childCount"]; ok {
 		if count, ok := childCount.(int); ok {
 			result.ChildCount = count
+		}
+	}
+
+	// Parse voutData map
+	if voutDataField, ok := respMap["voutData"]; ok {
+		voutMap, ok := voutDataField.(map[interface{}]interface{})
+		if !ok {
+			return nil, errors.NewProcessingError("invalid voutData type: %T", voutDataField)
+		}
+
+		result.VoutData = make(map[int]LuaVoutData)
+		for k, v := range voutMap {
+			idx, ok := k.(int)
+			if !ok {
+				return nil, errors.NewProcessingError("invalid voutData index type: %T", k)
+			}
+
+			voutObj, ok := v.(map[interface{}]interface{})
+			if !ok {
+				return nil, errors.NewProcessingError("invalid voutData object type: %T", v)
+			}
+
+			var voutData LuaVoutData
+
+			// Parse satoshis (can be int or int64)
+			if satoshis, ok := voutObj["satoshis"]; ok {
+				switch s := satoshis.(type) {
+				case int:
+					voutData.Satoshis = uint64(s)
+				case int64:
+					voutData.Satoshis = uint64(s)
+				case float64:
+					voutData.Satoshis = uint64(s)
+				default:
+					return nil, errors.NewProcessingError("invalid satoshis type: %T", satoshis)
+				}
+			}
+
+			// Parse script (bytes)
+			if script, ok := voutObj["script"].([]byte); ok {
+				voutData.Script = script
+			} else {
+				return nil, errors.NewProcessingError("invalid or missing script in voutData")
+			}
+
+			// Parse blockIDs (optional)
+			if blockIDs, ok := voutObj["blockIDs"]; ok {
+				switch v := blockIDs.(type) {
+				case []interface{}:
+					voutData.BlockIDs = make([]int, len(v))
+					for i, id := range v {
+						if idInt, ok := id.(int); ok {
+							voutData.BlockIDs[i] = idInt
+						} else {
+							return nil, errors.NewProcessingError("invalid blockID in voutData at index %d", i)
+						}
+					}
+				}
+			}
+
+			result.VoutData[idx] = voutData
 		}
 	}
 

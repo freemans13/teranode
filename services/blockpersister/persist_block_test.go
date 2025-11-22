@@ -132,6 +132,15 @@ func (m *MockStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ig
 	return nil, nil
 }
 
+func (m *MockStore) SpendWithVoutData(ctx context.Context, spend *utxo.Spend) (*utxo.VoutData, error) {
+	return &utxo.VoutData{
+		Amount:        100_000_000_000,
+		LockingScript: []byte("test"),
+		BlockIDs:      []uint32{1},
+		Vout:          spend.Vout,
+	}, nil
+}
+
 func (m *MockStore) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) error {
 	return nil
 }

@@ -813,6 +813,59 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	return spends, err
 }
 
+// SpendWithVoutData atomically spends a UTXO and returns its output data for validation
+func (s *Store) SpendWithVoutData(ctx context.Context, spend *utxo.Spend) (*utxo.VoutData, error) {
+	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
+	defer cancelTimeout()
+
+	txn, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = txn.Rollback()
+	}()
+
+	// Query to get vout data and mark as spent atomically
+	query := `
+		WITH vout_data AS (
+			SELECT o.satoshis, o.locking_script, t.block_ids, o.idx
+			FROM outputs o
+			JOIN transactions t ON o.transaction_id = t.id
+			WHERE t.hash = $1 AND o.idx = $2 AND o.spending_data IS NULL
+		)
+		UPDATE outputs SET spending_data = $3
+		FROM transactions t, vout_data v
+		WHERE outputs.transaction_id = t.id AND t.hash = $1 AND outputs.idx = $2
+		RETURNING (SELECT satoshis FROM vout_data), (SELECT locking_script FROM vout_data), (SELECT block_ids FROM vout_data), (SELECT idx FROM vout_data)
+	`
+
+	spendingData := spend.SpendingData.Bytes()
+	var amount uint64
+	var script []byte
+	var blockIDs []uint32
+	var vout uint32
+
+	err = txn.QueryRowContext(ctx, query, spend.TxID[:], spend.Vout, spendingData).Scan(&amount, &script, &blockIDs, &vout)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, errors.NewProcessingError("UTXO not found or already spent")
+		}
+		return nil, err
+	}
+
+	if err = txn.Commit(); err != nil {
+		return nil, err
+	}
+
+	return &utxo.VoutData{
+		Amount:        amount,
+		LockingScript: script,
+		BlockIDs:      blockIDs,
+		Vout:          vout,
+	}, nil
+}
+
 func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	spends, err := utxo.GetSpends(tx)
 	if err != nil {

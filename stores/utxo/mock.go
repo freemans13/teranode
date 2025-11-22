@@ -83,6 +83,14 @@ func (m *MockUtxostore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32
 	return args.Get(0).([]*Spend), args.Error(1)
 }
 
+func (m *MockUtxostore) SpendWithVoutData(ctx context.Context, spend *Spend) (*VoutData, error) {
+	args := m.Called(ctx, spend)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*VoutData), args.Error(1)
+}
+
 // Unspend mocks the reversal of transaction output spending in the UTXO store.
 // Returns the configured mock response for transaction unspending operations.
 func (m *MockUtxostore) Unspend(ctx context.Context, spends []*Spend, flagAsLocked ...bool) error {

@@ -25,6 +25,7 @@ local BIN_UTXOS = "utxos"
 local BIN_UTXO_SPENDABLE_IN = "utxoSpendableIn"
 local BIN_LAST_SPENT_STATE = "lastSpentState"  -- Tracks last signaled state: "ALLSPENT" or "NOTALLSPENT"
 local BIN_DELETED_CHILDREN = "deletedChildren"  -- Tracks which child transactions have already been deleted
+local BIN_OUTPUTS = "outputs"  -- Transaction outputs data
 
 -- Status constants
 local STATUS_OK = "OK"
@@ -86,6 +87,7 @@ local FIELD_BLOCK_IDS = "blockIDs"
 local FIELD_ERRORS = "errors"
 local FIELD_CHILD_COUNT = "childCount"
 local FIELD_SPENDING_DATA = "spendingData"
+local FIELD_VOUT_DATA = "voutData"
 -- local FIELD_DEBUG = "debug"
 
 -- Helper functions
@@ -229,6 +231,59 @@ local function isFrozen(spendingData)
     return true
 end
 
+-- Parse varint from bytes starting at given position
+-- Returns: value, number of bytes consumed
+local function parseVarint(data, startPos)
+    local value = 0
+    local byte = data[startPos]
+
+    if byte < 0xFD then
+        return byte, 1
+    elseif byte == 0xFD then
+        -- 2-byte value (little-endian)
+        value = data[startPos + 1] + (data[startPos + 2] * 256)
+        return value, 3
+    elseif byte == 0xFE then
+        -- 4-byte value (little-endian)
+        value = data[startPos + 1] + (data[startPos + 2] * 256) +
+                (data[startPos + 3] * 65536) + (data[startPos + 4] * 16777216)
+        return value, 5
+    else
+        -- 0xFF: 8-byte value (little-endian)
+        -- For simplicity, only handle up to 32-bit values
+        value = data[startPos + 1] + (data[startPos + 2] * 256) +
+                (data[startPos + 3] * 65536) + (data[startPos + 4] * 16777216)
+        return value, 9
+    end
+end
+
+-- Parse output bytes to extract satoshis and locking script
+-- Output format: 8 bytes satoshis (uint64 LE) + varint script length + script bytes
+-- Returns: satoshis, script (as bytes), or nil on error
+local function parseOutput(outputBytes)
+    if outputBytes == nil or bytes.size(outputBytes) < 9 then
+        return nil, nil  -- Need at least 8 bytes for satoshis + 1 for varint
+    end
+
+    -- Parse satoshis (8 bytes, little-endian uint64)
+    local satoshis = 0
+    for i = 1, 8 do
+        satoshis = satoshis + (outputBytes[i] * (2 ^ ((i - 1) * 8)))
+    end
+
+    -- Parse varint for script length
+    local scriptLen, varintSize = parseVarint(outputBytes, 9)
+
+    -- Extract script bytes
+    local scriptStart = 8 + varintSize
+    local script = bytes(scriptLen)
+    for i = 1, scriptLen do
+        script[i] = outputBytes[scriptStart + i]
+    end
+
+    return satoshis, script
+end
+
 -- The first argument is the record to update. This is passed to the UDF by aerospike based on the Key that the UDF is getting executed on
 -- offset number - the offset in the utxos list (vout % utxoBatchSize)
 -- utxoHash []byte - 32 byte little-endian hash of the UTXO
@@ -333,7 +388,11 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
 
     local blockIDs = rec[BIN_BLOCK_IDS]
 
+    -- Fetch outputs for returning vout data
+    local outputs = rec[BIN_OUTPUTS]
+
     local errors = map()
+    local voutData = map()  -- Store vout data for successful spends
     local deletedChildren = rec[BIN_DELETED_CHILDREN]
 
     -- loop through the spends
@@ -425,6 +484,24 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
         utxos[offset + 1] = newUtxo -- NB - lua arrays are 1-based!!!!
         rec[BIN_SPENT_UTXOS] = rec[BIN_SPENT_UTXOS] + 1
 
+        -- Extract and return vout data for successful spend
+        if outputs then
+            local vOut = spend['vOut']
+            if vOut ~= nil and outputs[vOut + 1] then  -- Lua is 1-indexed
+                local outputBytes = outputs[vOut + 1]
+                local satoshis, script = parseOutput(outputBytes)
+                if satoshis and script then
+                    local voutInfo = map()
+                    voutInfo['satoshis'] = satoshis
+                    voutInfo['script'] = script
+                    if blockIDs then
+                        voutInfo['blockIDs'] = blockIDs
+                    end
+                    voutData[idx] = voutInfo
+                end
+            end
+        end
+
         ::continue::
     end
 
@@ -445,6 +522,11 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
 
     if blockIDs then
         response[FIELD_BLOCK_IDS] = blockIDs
+    end
+
+    -- Include vout data for successful spends
+    if map.size(voutData) > 0 then
+        response[FIELD_VOUT_DATA] = voutData
     end
 
     if signal and signal ~= "" then

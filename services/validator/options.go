@@ -30,6 +30,10 @@ type Options struct {
 
 	// IgnoreLocked determines whether to ignore transactions marked as locked when spending
 	IgnoreLocked bool
+
+	// SkipSpend determines whether UTXO spending should be skipped
+	// When true, the validator assumes UTXOs were already spent (e.g., via optimistic spend)
+	SkipSpend bool
 }
 
 // Option defines a function type for setting options
@@ -136,6 +140,18 @@ func WithIgnoreConflicting(ignore bool) Option {
 func WithIgnoreLocked(ignoreLocked bool) Option {
 	return func(o *Options) {
 		o.IgnoreLocked = ignoreLocked
+	}
+}
+
+// WithSkipSpend creates an option to skip the UTXO spending step
+// Parameters:
+//   - skip: When true, the validator will skip spending UTXOs (assumes already spent)
+//
+// Returns:
+//   - Option: Function that sets the skipSpend option
+func WithSkipSpend(skip bool) Option {
+	return func(o *Options) {
+		o.SkipSpend = skip
 	}
 }
 

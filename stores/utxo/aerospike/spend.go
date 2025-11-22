@@ -95,6 +95,7 @@ type batchSpend struct {
 	spend             *utxo.Spend // UTXO to spend
 	blockHeight       uint32      // Current block height
 	errCh             chan error  // Channel for completion notification
+	voutDataCh        chan *utxo.VoutData // Channel for vout data (optional)
 	ignoreConflicting bool
 	ignoreLocked      bool
 }
@@ -623,7 +624,7 @@ func (s *Store) processSingleBatchResult(ctx context.Context, batchRecord aerosp
 	// Process based on status
 	switch res.Status {
 	case LuaStatusOK:
-		s.handleSuccessfulSpends(batchByKey, batch)
+		s.handleSuccessfulSpends(batchByKey, batch, res.VoutData)
 	case LuaStatusError:
 		s.handleErrorSpends(res, batchByKey, batch, txID, thisBlockHeight, batchID)
 	}
@@ -682,10 +683,34 @@ func (s *Store) handleSpendSignal(ctx context.Context, signal LuaSignal, txID *c
 }
 
 // handleSuccessfulSpends handles successful spend operations
-func (s *Store) handleSuccessfulSpends(batchByKey []aerospike.MapValue, batch []*batchSpend) {
+func (s *Store) handleSuccessfulSpends(batchByKey []aerospike.MapValue, batch []*batchSpend, voutDataMap map[int]LuaVoutData) {
 	for _, batchItem := range batchByKey {
 		idx := batchItem["idx"].(int)
+
+		// Send error result (nil for success)
 		batch[idx].errCh <- nil
+
+		// Send vout data if channel is present
+		if batch[idx].voutDataCh != nil {
+			if luaVoutData, ok := voutDataMap[idx]; ok {
+				// Convert LuaVoutData to utxo.VoutData
+				blockIDs := make([]uint32, len(luaVoutData.BlockIDs))
+				for i, bid := range luaVoutData.BlockIDs {
+					blockIDs[i] = uint32(bid)
+				}
+
+				voutData := &utxo.VoutData{
+					Amount:        luaVoutData.Satoshis,
+					LockingScript: luaVoutData.Script,
+					BlockIDs:      blockIDs,
+					Vout:          batch[idx].spend.Vout,
+				}
+				batch[idx].voutDataCh <- voutData
+			} else {
+				// No vout data returned for this spend
+				batch[idx].voutDataCh <- nil
+			}
+		}
 	}
 }
 
@@ -1073,4 +1098,44 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 
 		batch[batchIdx].errCh <- nil
 	}
+}
+
+// SpendWithVoutData atomically spends a UTXO and returns its output data
+// This uses the same batching infrastructure as Spend() but also returns vout data
+func (s *Store) SpendWithVoutData(ctx context.Context, spend *utxo.Spend) (*utxo.VoutData, error) {
+	defer func() {
+		if recoverErr := recover(); recoverErr != nil {
+			prometheusUtxoMapErrors.WithLabelValues("SpendWithVoutData", "Failed").Inc()
+			s.logger.Errorf("ERROR panic in aerospike SpendWithVoutData: %v\n", recoverErr)
+		}
+	}()
+
+	if spend.SpendingData == nil {
+		return nil, errors.NewProcessingError("SpendingData is required")
+	}
+
+	errCh := make(chan error)
+	voutDataCh := make(chan *utxo.VoutData)
+
+	s.spendBatcher.Put(&batchSpend{
+		spend:             spend,
+		blockHeight:       s.blockHeight.Load(),
+		errCh:             errCh,
+		voutDataCh:        voutDataCh,
+		ignoreConflicting: false,
+		ignoreLocked:      false,
+	})
+
+	// Wait for response
+	err := <-errCh
+	if err != nil {
+		return nil, err
+	}
+
+	voutData := <-voutDataCh
+	if voutData == nil {
+		return nil, errors.NewProcessingError("vout data not returned for spend %s:%d", spend.TxID, spend.Vout)
+	}
+
+	return voutData, nil
 }
