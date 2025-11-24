@@ -259,11 +259,58 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 
 			if !onCurrentChain {
 				// Reorg detected - last persisted block is no longer on the current chain
-				// We must return nil to trigger recovery logic - continuing would cause an infinite loop
-				// because the parent hash validation will fail (new chain block's parent != orphaned block)
-				u.logger.Infof("[BlockPersister] Detected reorg: last persisted block %s at height %d is no longer on current chain. Returning nil to trigger recovery.",
+				// Use block locator to find common ancestor and recover
+				u.logger.Infof("[BlockPersister] Detected reorg: last persisted block %s at height %d is no longer on current chain. Starting recovery...",
 					lastPersistedHash.String(), lastPersistedHeight)
-				// Return nil to prevent infinite loop - manual intervention or proper reorg recovery needed
+
+				// Get current best block for block locator query
+				bestBlockHeader, _, err := u.blockchainClient.GetBestBlockHeader(ctx)
+				if err != nil {
+					return nil, errors.NewProcessingError("failed to get best block header during reorg recovery", err)
+				}
+
+				// Create block locator from our last persisted position
+				// This gives us checkpoints going back exponentially
+				locatorHashes, err := u.blockchainClient.GetBlockLocator(ctx, lastPersistedHash, lastPersistedHeight)
+				if err != nil {
+					return nil, errors.NewProcessingError("failed to create block locator during reorg recovery", err)
+				}
+
+				// Convert locator hashes to the format expected by GetLatestBlockHeaderFromBlockLocator
+				locator := make([]chainhash.Hash, len(locatorHashes))
+				for i, hash := range locatorHashes {
+					locator[i] = *hash
+				}
+
+				// Find the latest header from that locator that exists in current chain
+				// This will be the common ancestor (fork point)
+				commonAncestorHeader, commonAncestorMeta, err := u.blockchainClient.GetLatestBlockHeaderFromBlockLocator(
+					ctx,
+					bestBlockHeader.Hash(),
+					locator,
+				)
+				if err != nil {
+					return nil, errors.NewProcessingError("failed to find common ancestor during reorg recovery", err)
+				}
+
+				if commonAncestorHeader == nil {
+					// No common ancestor found - this should be extremely rare
+					// Fall back to genesis or return error
+					return nil, errors.NewProcessingError("no common ancestor found during reorg recovery - chain may be corrupted", nil)
+				}
+
+				// Calculate how many blocks we're rolling back
+				blocksRolledBack := lastPersistedHeight - commonAncestorMeta.Height
+
+				// Rollback state to common ancestor using hash (the canonical block identifier)
+				if err := u.state.RollbackToHash(commonAncestorHeader.Hash()); err != nil {
+					return nil, errors.NewProcessingError("failed to rollback state during reorg recovery", err)
+				}
+
+				u.logger.Infof("[BlockPersister] Reorg recovery complete: rolled back %d blocks from height %d to common ancestor at height %d (hash: %s). Will resume processing from height %d.",
+					blocksRolledBack, lastPersistedHeight, commonAncestorMeta.Height, commonAncestorHeader.Hash().String(), commonAncestorMeta.Height+1)
+
+				// Return nil to trigger next iteration, which will start processing from common ancestor + 1
 				return nil, nil
 			}
 		}
