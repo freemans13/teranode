@@ -47,6 +47,9 @@ go test -v ./test/chaos/...
 
 # Scenario 4: Intermittent Connection Drops
 ./test/chaos/run_scenario_04.sh
+
+# Scenario 5: Bandwidth Constraints
+./test/chaos/run_scenario_05.sh
 ```
 
 The helper scripts will:
@@ -70,6 +73,9 @@ go test -v ./test/chaos -run TestScenario03_NetworkPartition
 
 # Scenario 4: Intermittent Connection Drops
 go test -v ./test/chaos -run TestScenario04_IntermittentDrops
+
+# Scenario 5: Bandwidth Constraints
+go test -v ./test/chaos -run TestScenario05
 ```
 
 ### Run in Verbose Mode
@@ -297,6 +303,94 @@ go test -v ./test/chaos -run TestScenario04_LoadUnderFailures
 
 **Test duration:** ~28 seconds
 
+### Scenario 5: Bandwidth Constraints (2 variants)
+**File:** `scenario_05_bandwidth_constraints_test.go`
+
+This scenario tests system behavior under network bandwidth limitations, simulating datacenter congestion and severely degraded network conditions.
+
+#### Variant A: Database Bandwidth Constraints
+**Test:** `TestScenario05_DatabaseBandwidth`
+
+**What it tests:**
+- PostgreSQL behavior under bandwidth limitations
+- Connection pooling efficiency with slow data transfer
+- Query timeout behavior with constrained bandwidth
+- Transaction processing with moderate (500 KB/s) and heavy (100 KB/s) constraints
+- Recovery after bandwidth constraints are removed
+- Data consistency despite slow network
+
+**How to run:**
+```bash
+# Using helper script (recommended)
+./test/chaos/run_scenario_05.sh
+
+# Using go test directly
+go test -v ./test/chaos -run TestScenario05_DatabaseBandwidth
+```
+
+**Test phases:**
+1. Establish baseline query performance
+2. Inject moderate bandwidth limit (500 KB/s - datacenter congestion)
+3. Test database operations under moderate constraint
+4. Inject heavy bandwidth limit (100 KB/s - severe degradation)
+5. Test database operations under heavy constraint
+6. Remove bandwidth constraints and verify recovery
+7. Confirm data consistency
+
+**Expected results:**
+- ✅ Baseline queries complete quickly (<100ms)
+- ✅ Moderate constraint (500 KB/s): Queries slower but complete successfully
+- ✅ Heavy constraint (100 KB/s): Significant slowdown but no failures
+- ✅ Large result sets most affected (proportional to data size)
+- ✅ Connection pool handles slow transfers gracefully
+- ✅ Full recovery after constraints removed
+- ✅ No data corruption
+
+**Test duration:** ~2.1 seconds
+
+#### Variant B: Kafka Bandwidth Constraints
+**Test:** `TestScenario05_KafkaBandwidth`
+
+**What it tests:**
+- Kafka producer/consumer behavior under bandwidth limitations
+- Message publishing with constrained network
+- Consumer fetch behavior with slow data transfer
+- Backpressure handling with moderate (500 KB/s) and heavy (100 KB/s) limits
+- Recovery after bandwidth restoration
+- Message consistency despite network constraints
+
+**How to run:**
+```bash
+# Using helper script (recommended)
+./test/chaos/run_scenario_05.sh
+
+# Using go test directly
+go test -v ./test/chaos -run TestScenario05_KafkaBandwidth
+```
+
+**Test phases:**
+1. Establish baseline Kafka producer/consumer performance
+2. Inject moderate bandwidth limit (500 KB/s)
+3. Test message production and consumption under moderate constraint
+4. Inject heavy bandwidth limit (100 KB/s)
+5. Test message production and consumption under heavy constraint
+6. Remove bandwidth constraints and verify recovery
+7. Confirm message consistency
+
+**Expected results:**
+- ✅ Baseline: Fast message publishing and consumption
+- ✅ Moderate constraint (500 KB/s): Slower throughput but successful
+- ✅ Heavy constraint (100 KB/s): Significant slowdown, backpressure visible
+- ✅ No message loss (all published messages eventually consumed)
+- ✅ Producer handles slow sends gracefully
+- ✅ Consumer handles slow fetches gracefully
+- ✅ Full recovery after constraints removed
+- ✅ Message offsets maintained correctly
+
+**Test duration:** ~2.1 seconds
+
+**Combined scenario duration:** ~4.4 seconds
+
 ## Test Structure
 
 Each chaos test follows this pattern:
@@ -467,7 +561,8 @@ Chaos tests take longer than unit tests:
 - Scenario 4A (Intermittent Drops): ~8 minutes (includes retry logic with delays)
 - Scenario 4B (Cascading Effects): ~2 seconds (fast failure detection test)
 - Scenario 4C (Load Under Failures): ~28 seconds (load testing under failures)
-- Full suite: ~12-15 minutes (with all Scenario 4 variants)
+- Scenario 5 (Bandwidth Constraints): ~4.4 seconds (database + Kafka bandwidth tests)
+- Full suite: ~11-12 minutes (with all scenarios)
 
 ## Troubleshooting
 
@@ -539,6 +634,6 @@ curl -X POST http://localhost:8474/reset
 - [x] Scenario 4A: Intermittent Connection Drops ✅ **Implemented**
 - [x] Scenario 4B: Cascading Effects ✅ **Implemented**
 - [x] Scenario 4C: Load Under Failures ✅ **Implemented**
-- [ ] Scenario 5: Bandwidth Constraints
+- [x] Scenario 5: Bandwidth Constraints ✅ **Implemented**
 - [ ] Scenario 6: Slow Close Connections (Slicer toxic)
 - [ ] Scenario 7: Combined Failures (DB + Kafka simultaneously)
