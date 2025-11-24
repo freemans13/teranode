@@ -14,9 +14,9 @@ require (
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.0-beta11
 	github.com/bitcoin-sv/go-sdk v1.1.21
 	github.com/bitcoin-sv/testcontainers-aerospike-go v0.2.2
-	github.com/bsv-blockchain/go-bt/v2 v2.5.0
+	github.com/bsv-blockchain/go-bt/v2 v2.5.1
 	github.com/bsv-blockchain/go-chaincfg v1.4.0
-	github.com/bsv-blockchain/go-subtree v1.1.1
+	github.com/bsv-blockchain/go-subtree v1.1.2
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
 	github.com/centrifugal/centrifuge v0.33.2
@@ -178,7 +178,7 @@ require (
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.7
 	github.com/bsv-blockchain/go-safe-conversion v1.1.0
-	github.com/bsv-blockchain/go-sdk v1.2.10
+	github.com/bsv-blockchain/go-sdk v1.2.11
 	github.com/bsv-blockchain/go-tx-map v1.2.0
 	github.com/bsv-blockchain/go-wire v1.0.6
 	github.com/felixge/fgprof v0.9.5
