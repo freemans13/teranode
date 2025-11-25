@@ -282,8 +282,9 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 				// Get the block from the current chain at this height
 				currentChainBlock, err := u.blockchainClient.GetBlockByHeight(ctx, height)
 				if err != nil {
-					u.logger.Warnf("[BlockPersister] Could not get block at height %d from current chain during recovery: %v", height, err)
-					continue
+					// Blockchain service should be reliable during recovery
+					// If it's failing, there's likely a real infrastructure problem that needs attention
+					return nil, errors.NewProcessingError("blockchain service unavailable during reorg recovery at height %d", height, err)
 				}
 
 				// Try to rollback to this block's hash
