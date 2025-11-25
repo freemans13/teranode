@@ -47,10 +47,8 @@ type Batcher struct {
 	writeKeys bool
 	// queue is a lock-free queue for storing batch items to be processed asynchronously
 	queue *lockfreequeue.LockFreeQ[BatchItem]
-	// queueCtx is the context for controlling the background batch processing goroutine
-	queueCtx context.Context
-	// queueCancel is the function to cancel the queue context and stop background processing
-	queueCancel context.CancelFunc
+	// done is the channel for signaling the background batch processing goroutine to stop
+	done chan struct{}
 	// currentBatch holds the accumulated blob data for the current batch
 	currentBatch []byte
 	// currentBatchKeys holds the accumulated key data for the current batch (if writeKeys is true)
@@ -94,15 +92,13 @@ type blobStoreSetter interface {
 // Returns:
 //   - *Batcher: A configured batcher instance ready to accept blob operations
 func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writeKeys bool) *Batcher {
-	ctx, cancel := context.WithCancel(context.Background())
 	b := &Batcher{
 		logger:           logger,
 		blobStore:        blobStore,
 		sizeInBytes:      sizeInBytes,
 		writeKeys:        writeKeys,
 		queue:            lockfreequeue.NewLockFreeQ[BatchItem](),
-		queueCtx:         ctx,
-		queueCancel:      cancel,
+		done:             make(chan struct{}),
 		currentBatch:     make([]byte, 0, sizeInBytes),
 		currentBatchKeys: make([]byte, 0, sizeInBytes),
 	}
@@ -115,7 +111,7 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 
 		for {
 			select {
-			case <-b.queueCtx.Done():
+			case <-b.done:
 				// Process remaining items before exiting
 				for {
 					batchItem = b.queue.Dequeue()
@@ -298,7 +294,7 @@ func (b *Batcher) Health(ctx context.Context, checkLiveness bool) (int, string, 
 //   - error: Any error that occurred during shutdown
 func (b *Batcher) Close(_ context.Context) error {
 	// Signal the background goroutine to stop
-	b.queueCancel()
+	close(b.done)
 
 	// Wait a bit to ensure the goroutine has time to process remaining items
 	time.Sleep(100 * time.Millisecond)
