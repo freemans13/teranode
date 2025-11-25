@@ -51,6 +51,8 @@ type Batcher struct {
 	queueCtx context.Context
 	// queueCancel is the function to cancel the queue context and stop background processing
 	queueCancel context.CancelFunc
+	// notifyCh is used to signal the worker when new items are enqueued, avoiding busy-wait polling
+	notifyCh chan struct{}
 	// currentBatch holds the accumulated blob data for the current batch
 	currentBatch []byte
 	// currentBatchKeys holds the accumulated key data for the current batch (if writeKeys is true)
@@ -103,6 +105,7 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 		queue:            lockfreequeue.NewLockFreeQ[BatchItem](),
 		queueCtx:         ctx,
 		queueCancel:      cancel,
+		notifyCh:         make(chan struct{}, 1), // Buffered to avoid blocking enqueue
 		currentBatch:     make([]byte, 0, sizeInBytes),
 		currentBatchKeys: make([]byte, 0, sizeInBytes),
 	}
@@ -114,9 +117,20 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 		)
 
 		for {
+			// Try immediate dequeue (optimistic fast path)
+			batchItem = b.queue.Dequeue()
+			if batchItem != nil {
+				err = b.processBatchItem(batchItem)
+				if err != nil {
+					b.logger.Errorf("error processing batch item: %v", err)
+				}
+				continue
+			}
+
+			// Queue is empty - wait for notification or shutdown
 			select {
 			case <-b.queueCtx.Done():
-				// Process remaining items before exiting
+				// Shutdown: process remaining items before exiting
 				for {
 					batchItem = b.queue.Dequeue()
 					if batchItem == nil {
@@ -133,19 +147,11 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 						b.logger.Errorf("error writing final batch during shutdown: %v", err)
 					}
 				}
-
 				return
-			default:
-				batchItem = b.queue.Dequeue()
-				if batchItem == nil {
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
 
-				err = b.processBatchItem(batchItem)
-				if err != nil {
-					b.logger.Errorf("error processing batch item: %v", err)
-				}
+			case <-b.notifyCh:
+				// Item available, loop back to dequeue
+				continue
 			}
 		}
 	}()
@@ -350,6 +356,12 @@ func (b *Batcher) Set(_ context.Context, hash []byte, fileType fileformat.FileTy
 		fileType: fileType,
 		value:    value,
 	})
+
+	// Notify worker that new item is available (non-blocking)
+	select {
+	case b.notifyCh <- struct{}{}:
+	default: // Already notified, don't block
+	}
 
 	return nil
 }
