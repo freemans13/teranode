@@ -491,6 +491,14 @@ jobs:
         continue-on-error: false
         timeout-minutes: 2
 
+      - name: Run Chaos Test Scenario 07 (Combined Failures)
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/teranode-test-results
+          go test -v ./test/chaos -run TestScenario07 2>&1 | tee /tmp/teranode-test-results/chaostest-scenario-07-results.txt
+        continue-on-error: false
+        timeout-minutes: 2
+
       - name: Upload chaostest results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
