@@ -47,11 +47,9 @@ type Batcher struct {
 	writeKeys bool
 	// queue is a lock-free queue for storing batch items to be processed asynchronously
 	queue *lockfreequeue.LockFreeQ[BatchItem]
-	// queueCtx is the context for controlling the background batch processing goroutine
-	queueCtx context.Context
-	// queueCancel is the function to cancel the queue context and stop background processing
-	queueCancel context.CancelFunc
-	// notifyCh is used to signal the worker when new items are enqueued, avoiding busy-wait polling
+	// done is the channel for signaling the background batch processing goroutine to stop
+	done chan struct{}
+	// notifyCh is used to notify the worker goroutine when new items are enqueued
 	notifyCh chan struct{}
 	// currentBatch holds the accumulated blob data for the current batch
 	currentBatch []byte
@@ -96,16 +94,14 @@ type blobStoreSetter interface {
 // Returns:
 //   - *Batcher: A configured batcher instance ready to accept blob operations
 func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writeKeys bool) *Batcher {
-	ctx, cancel := context.WithCancel(context.Background())
 	b := &Batcher{
 		logger:           logger,
 		blobStore:        blobStore,
 		sizeInBytes:      sizeInBytes,
 		writeKeys:        writeKeys,
 		queue:            lockfreequeue.NewLockFreeQ[BatchItem](),
-		queueCtx:         ctx,
-		queueCancel:      cancel,
-		notifyCh:         make(chan struct{}, 1), // Buffered to avoid blocking enqueue
+		done:             make(chan struct{}),
+		notifyCh:         make(chan struct{}, 1),
 		currentBatch:     make([]byte, 0, sizeInBytes),
 		currentBatchKeys: make([]byte, 0, sizeInBytes),
 	}
@@ -129,8 +125,8 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 
 			// Queue is empty - wait for notification or shutdown
 			select {
-			case <-b.queueCtx.Done():
-				// Shutdown: process remaining items before exiting
+			case <-b.done:
+				// Process remaining items before exiting
 				for {
 					batchItem = b.queue.Dequeue()
 					if batchItem == nil {
@@ -304,7 +300,7 @@ func (b *Batcher) Health(ctx context.Context, checkLiveness bool) (int, string, 
 //   - error: Any error that occurred during shutdown
 func (b *Batcher) Close(_ context.Context) error {
 	// Signal the background goroutine to stop
-	b.queueCancel()
+	close(b.done)
 
 	// Wait a bit to ensure the goroutine has time to process remaining items
 	time.Sleep(100 * time.Millisecond)
