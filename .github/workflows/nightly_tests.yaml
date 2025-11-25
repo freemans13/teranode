@@ -1,5 +1,7 @@
 name: nightly-test-runs
 on:
+  schedule:
+    - cron: '0 2 * * *'  # Runs at 2:00 AM UTC every day
   workflow_dispatch:
 
 env:
