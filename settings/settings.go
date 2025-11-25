@@ -222,7 +222,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MiningCandidateSmartCacheMaxAge:     getDuration("blockassembly_miningCandidateSmartCacheMaxAge", 10*time.Second, alternativeContext...),
 			BlockchainSubscriptionTimeout:       getDuration("blockassembly_blockchainSubscriptionTimeout", 5*time.Minute, alternativeContext...),
 			ValidateParentChainOnRestart:        getBool("blockassembly_validateParentChainOnRestart", true, alternativeContext...),
-			ParentValidationBatchSize:           getInt("blockassembly_parentValidationBatchSize", 1000, alternativeContext...),
+			ParentValidationBatchSize:             getInt("blockassembly_parentValidationBatchSize", 1000, alternativeContext...),
+			FilterTransactionsWithInvalidParents:  getBool("blockassembly_filterTransactionsWithInvalidParents", false, alternativeContext...),
 			// getMiningCandidate timeout settings
 			GetMiningCandidateSendTimeout:     getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
 			GetMiningCandidateResponseTimeout: getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),

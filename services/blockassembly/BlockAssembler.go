@@ -1921,11 +1921,15 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 					}
 				}
 				if onBestChain {
-					// Transaction is already on the best chain - skip it
+					// Transaction is already on the best chain
 					// (though it shouldn't be in unmined list - this is a data inconsistency)
-					b.logger.Warnf("[BlockAssembler][filterTransactionsWithValidParents] Transaction %s is already on best chain but marked as unmined - skipping it", tx.Hash.String())
-					skippedCount++
-					continue
+					b.logger.Warnf("[BlockAssembler][filterTransactionsWithValidParents] Transaction %s is already on best chain but marked as unmined", tx.Hash.String())
+					if b.settings.BlockAssembly.FilterTransactionsWithInvalidParents {
+						// Filtering enabled - skip this transaction
+						skippedCount++
+						continue
+					}
+					// Filtering disabled - keep transaction despite being on best chain
 				}
 				// Transaction has BlockIDs but not on best chain - it's on an orphaned chain
 				// Continue to validate its parents to decide if it can be re-included
@@ -1946,6 +1950,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 					// This means BatchDecorate couldn't find it - it doesn't exist
 					allParentsValid = false
 					invalidReason = fmt.Sprintf("parent tx %s not found in UTXO store", parentTxID.String())
+					b.logger.Warnf("[BlockAssembler][filterTransactionsWithValidParents] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
 					break
 				}
 
@@ -1962,6 +1967,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 						allParentsValid = false
 						invalidReason = fmt.Sprintf("parent tx %s is on wrong chain (blocks: %v)",
 							parentTxID.String(), parentMeta.BlockIDs)
+						b.logger.Warnf("[BlockAssembler][filterTransactionsWithValidParents] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
 						break
 					}
 				} else {
@@ -1974,6 +1980,7 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 						// Unmined but not in our list - this is a problem
 						allParentsValid = false
 						invalidReason = fmt.Sprintf("parent tx %s is unmined but not in processing list", parentTxID.String())
+						b.logger.Warnf("[BlockAssembler][filterTransactionsWithValidParents] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
 						break
 					}
 				}
@@ -2020,17 +2027,29 @@ func (b *BlockAssembler) filterTransactionsWithValidParents(
 			if allParentsValid {
 				validTxs = append(validTxs, tx)
 			} else {
-				skippedCount++
+				// Transaction has invalid parent chain - use setting to decide whether to exclude
+				if b.settings.BlockAssembly.FilterTransactionsWithInvalidParents {
+					// Filtering enabled - skip this transaction
+					skippedCount++
+				} else {
+					// Filtering disabled (default) - keep transaction despite invalid parents
+					validTxs = append(validTxs, tx)
+				}
 			}
 		}
 	}
 
-	if skippedCount > 0 {
-		b.logger.Warnf("[BlockAssembler][filterTransactionsWithValidParents] Skipped %d transactions due to invalid/missing parent chains", skippedCount)
+	filteringStatus := "disabled"
+	if b.settings.BlockAssembly.FilterTransactionsWithInvalidParents {
+		filteringStatus = "enabled"
 	}
 
-	b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent chain validation complete: %d valid, %d skipped",
-		len(validTxs), skippedCount)
+	if skippedCount > 0 {
+		b.logger.Warnf("[BlockAssembler][filterTransactionsWithValidParents] Skipped %d transactions due to invalid/missing parent chains (filtering: %s)", skippedCount, filteringStatus)
+	}
+
+	b.logger.Infof("[BlockAssembler][filterTransactionsWithValidParents] Parent chain validation complete: %d valid, %d skipped (filtering: %s)",
+		len(validTxs), skippedCount, filteringStatus)
 
 	return validTxs, nil
 }
