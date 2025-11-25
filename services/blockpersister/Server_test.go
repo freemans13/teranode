@@ -1242,7 +1242,6 @@ func TestGetNextBlockToProcess_ReorgDetected(t *testing.T) {
 		Bits:           *nBits,
 		Nonce:          1,
 	}
-	commonAncestorMeta := &model.BlockHeaderMeta{Height: 100}
 
 	// Use the computed hash as the last persisted hash
 	lastPersistedHash := commonAncestorHeader.Hash()
@@ -1258,27 +1257,11 @@ func TestGetNextBlockToProcess_ReorgDetected(t *testing.T) {
 	mockClient.On("CheckBlockIsInCurrentChain", ctx, []uint32{uint32(100)}).Return(
 		false, nil) // false indicates block is NOT on current chain (reorg detected)
 
-	// Mock recovery flow
-	bestBlockHash, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000110")
-	bestBlockHeader := &model.BlockHeader{
-		Version:        1,
-		HashPrevBlock:  lastPersistedHash,
-		HashMerkleRoot: bestBlockHash,
-		Timestamp:      1234567890,
-		Bits:           *nBits,
-		Nonce:          1,
-	}
-	bestBlockMeta := &model.BlockHeaderMeta{Height: 110}
-	mockClient.On("GetBestBlockHeader", ctx).Return(bestBlockHeader, bestBlockMeta, nil)
-
-	// Mock block locator - return just the current block as the locator
-	locatorHashes := []*chainhash.Hash{lastPersistedHash}
-	mockClient.On("GetBlockLocator", ctx, lastPersistedHash, uint32(100)).Return(locatorHashes, nil)
-
-	// Mock GetLatestBlockHeaderFromBlockLocator - returns the common ancestor
-	locator := []chainhash.Hash{*lastPersistedHash}
-	mockClient.On("GetLatestBlockHeaderFromBlockLocator", ctx, bestBlockHeader.Hash(), locator).Return(
-		commonAncestorHeader, commonAncestorMeta, nil)
+	// Mock recovery flow - new approach walks backward trying each height
+	// It will try to get the block at height 100 from current chain
+	// and that will match our state file, so recovery succeeds immediately
+	mockClient.On("GetBlockByHeight", ctx, uint32(100)).Return(
+		&model.Block{Height: 100, Header: commonAncestorHeader}, nil)
 
 	server := New(ctx, logger, tSettings, nil, nil, nil, mockClient)
 
@@ -1333,7 +1316,6 @@ func TestGetNextBlockToProcess_ReorgRecovery(t *testing.T) {
 		Bits:           *nBits,
 		Nonce:          1,
 	}
-	commonAncestorMeta := &model.BlockHeaderMeta{Height: 100}
 	commonAncestorHash := commonAncestorHeader.Hash()
 
 	// Old chain hashes (blocks after the fork)
@@ -1371,37 +1353,30 @@ func TestGetNextBlockToProcess_ReorgRecovery(t *testing.T) {
 	// 2. CheckBlockIsInCurrentChain returns false (reorg detected)
 	mockClient.On("CheckBlockIsInCurrentChain", ctx, []uint32{uint32(105)}).Return(false, nil)
 
-	// 3. GetBestBlockHeader for block locator query
-	bestBlockHash, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000110")
-	bestBlockHeader := &model.BlockHeader{
-		Version:        1,
-		HashPrevBlock:  commonAncestorHash,
-		HashMerkleRoot: bestBlockHash,
-		Timestamp:      1234567890,
-		Bits:           *nBits,
-		Nonce:          1,
-	}
-	bestBlockMeta := &model.BlockHeaderMeta{Height: 110}
-	mockClient.On("GetBestBlockHeader", ctx).Return(bestBlockHeader, bestBlockMeta, nil)
+	// 3. Mock recovery flow - new approach walks backward from height 105
+	// trying to find a block from current chain that exists in our state file
+	// Heights 105, 104, 103, 102, 101 won't match (different hashes)
+	// Height 100 will match (common ancestor)
+	newChainHash105, _ := chainhash.NewHashFromStr("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	newChainHash104, _ := chainhash.NewHashFromStr("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	newChainHash103, _ := chainhash.NewHashFromStr("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	newChainHash102, _ := chainhash.NewHashFromStr("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+	newChainHash101, _ := chainhash.NewHashFromStr("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
 
-	// 4. GetBlockLocator from last persisted position
-	locatorHashes := []*chainhash.Hash{
-		oldChainHash105,
-		oldChainHash104,
-		oldChainHash103,
-		oldChainHash102,
-		oldChainHash101,
-		commonAncestorHash, // Common ancestor - use computed hash
-	}
-	mockClient.On("GetBlockLocator", ctx, oldChainHash105, uint32(105)).Return(locatorHashes, nil)
-
-	// Convert locator for the call expectation
-	locator := make([]chainhash.Hash, len(locatorHashes))
-	for i, hash := range locatorHashes {
-		locator[i] = *hash
-	}
-	mockClient.On("GetLatestBlockHeaderFromBlockLocator", ctx, bestBlockHeader.Hash(), locator).Return(
-		commonAncestorHeader, commonAncestorMeta, nil)
+	// Mock GetBlockByHeight for each height during backward search
+	// Create proper block headers for each height on the new chain
+	mockClient.On("GetBlockByHeight", ctx, uint32(105)).Return(
+		&model.Block{Height: 105, Header: &model.BlockHeader{Version: 1, HashPrevBlock: oldChainHash104, HashMerkleRoot: newChainHash105, Timestamp: 1234567890, Bits: *nBits, Nonce: 1}}, nil)
+	mockClient.On("GetBlockByHeight", ctx, uint32(104)).Return(
+		&model.Block{Height: 104, Header: &model.BlockHeader{Version: 1, HashPrevBlock: oldChainHash103, HashMerkleRoot: newChainHash104, Timestamp: 1234567890, Bits: *nBits, Nonce: 1}}, nil)
+	mockClient.On("GetBlockByHeight", ctx, uint32(103)).Return(
+		&model.Block{Height: 103, Header: &model.BlockHeader{Version: 1, HashPrevBlock: oldChainHash102, HashMerkleRoot: newChainHash103, Timestamp: 1234567890, Bits: *nBits, Nonce: 1}}, nil)
+	mockClient.On("GetBlockByHeight", ctx, uint32(102)).Return(
+		&model.Block{Height: 102, Header: &model.BlockHeader{Version: 1, HashPrevBlock: oldChainHash101, HashMerkleRoot: newChainHash102, Timestamp: 1234567890, Bits: *nBits, Nonce: 1}}, nil)
+	mockClient.On("GetBlockByHeight", ctx, uint32(101)).Return(
+		&model.Block{Height: 101, Header: &model.BlockHeader{Version: 1, HashPrevBlock: commonAncestorHash, HashMerkleRoot: newChainHash101, Timestamp: 1234567890, Bits: *nBits, Nonce: 1}}, nil)
+	mockClient.On("GetBlockByHeight", ctx, uint32(100)).Return(
+		&model.Block{Height: 100, Header: commonAncestorHeader}, nil)
 
 	// Call getNextBlockToProcess - should trigger reorg recovery
 	block, err := server.getNextBlockToProcess(ctx)

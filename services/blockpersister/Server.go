@@ -246,10 +246,15 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 	// This detects blockchain reorganizations that may have occurred since the last persistence
 	// This check can be disabled via settings for testing or special scenarios
 	if u.settings.Block.BlockPersisterEnableDefensiveReorgCheck && lastPersistedHeight > 0 && lastPersistedHash != nil {
+		needsRecovery := false
+		var recoveryReason string
+
 		// Get the block to obtain its ID
 		lastBlock, err := u.blockchainClient.GetBlock(ctx, lastPersistedHash)
 		if err != nil {
-			u.logger.Warnf("[BlockPersister] Could not retrieve last persisted block %s for reorg check: %v. Continuing with next block.", lastPersistedHash.String(), err)
+			// If we can't retrieve the block, it's likely been pruned because it's on an orphaned chain
+			needsRecovery = true
+			recoveryReason = fmt.Sprintf("last persisted block %s not found in blockchain store (likely pruned orphan)", lastPersistedHash.String())
 		} else {
 			// Check if this block is still on the current chain using its ID
 			onCurrentChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{lastBlock.ID})
@@ -258,61 +263,52 @@ func (u *Server) getNextBlockToProcess(ctx context.Context) (*model.Block, error
 			}
 
 			if !onCurrentChain {
-				// Reorg detected - last persisted block is no longer on the current chain
-				// Use block locator to find common ancestor and recover
-				u.logger.Infof("[BlockPersister] Detected reorg: last persisted block %s at height %d is no longer on current chain. Starting recovery...",
-					lastPersistedHash.String(), lastPersistedHeight)
-
-				// Get current best block for block locator query
-				bestBlockHeader, _, err := u.blockchainClient.GetBestBlockHeader(ctx)
-				if err != nil {
-					return nil, errors.NewProcessingError("failed to get best block header during reorg recovery", err)
-				}
-
-				// Create block locator from our last persisted position
-				// This gives us checkpoints going back exponentially
-				locatorHashes, err := u.blockchainClient.GetBlockLocator(ctx, lastPersistedHash, lastPersistedHeight)
-				if err != nil {
-					return nil, errors.NewProcessingError("failed to create block locator during reorg recovery", err)
-				}
-
-				// Convert locator hashes to the format expected by GetLatestBlockHeaderFromBlockLocator
-				locator := make([]chainhash.Hash, len(locatorHashes))
-				for i, hash := range locatorHashes {
-					locator[i] = *hash
-				}
-
-				// Find the latest header from that locator that exists in current chain
-				// This will be the common ancestor (fork point)
-				commonAncestorHeader, commonAncestorMeta, err := u.blockchainClient.GetLatestBlockHeaderFromBlockLocator(
-					ctx,
-					bestBlockHeader.Hash(),
-					locator,
-				)
-				if err != nil {
-					return nil, errors.NewProcessingError("failed to find common ancestor during reorg recovery", err)
-				}
-
-				if commonAncestorHeader == nil {
-					// No common ancestor found - this should be extremely rare
-					// Fall back to genesis or return error
-					return nil, errors.NewProcessingError("no common ancestor found during reorg recovery - chain may be corrupted", nil)
-				}
-
-				// Calculate how many blocks we're rolling back
-				blocksRolledBack := lastPersistedHeight - commonAncestorMeta.Height
-
-				// Rollback state to common ancestor using hash (the canonical block identifier)
-				if err := u.state.RollbackToHash(commonAncestorHeader.Hash()); err != nil {
-					return nil, errors.NewProcessingError("failed to rollback state during reorg recovery", err)
-				}
-
-				u.logger.Infof("[BlockPersister] Reorg recovery complete: rolled back %d blocks from height %d to common ancestor at height %d (hash: %s). Will resume processing from height %d.",
-					blocksRolledBack, lastPersistedHeight, commonAncestorMeta.Height, commonAncestorHeader.Hash().String(), commonAncestorMeta.Height+1)
-
-				// Return nil to trigger next iteration, which will start processing from common ancestor + 1
-				return nil, nil
+				needsRecovery = true
+				recoveryReason = fmt.Sprintf("last persisted block %s at height %d is no longer on current chain", lastPersistedHash.String(), lastPersistedHeight)
 			}
+		}
+
+		if needsRecovery {
+			// Reorg detected - trigger recovery
+			u.logger.Infof("[BlockPersister] Detected reorg: %s. Starting recovery...", recoveryReason)
+
+			// Find common ancestor by walking backward and trying to rollback to each current chain block
+			// This approach works even if the orphaned blocks have been pruned from the blockchain store
+			var commonAncestorHeight uint32
+			var commonAncestorHash *chainhash.Hash
+
+			// Walk backward from last persisted height
+			for height := lastPersistedHeight; height > 0; height-- {
+				// Get the block from the current chain at this height
+				currentChainBlock, err := u.blockchainClient.GetBlockByHeight(ctx, height)
+				if err != nil {
+					u.logger.Warnf("[BlockPersister] Could not get block at height %d from current chain during recovery: %v", height, err)
+					continue
+				}
+
+				// Try to rollback to this block's hash
+				// This will succeed if the hash exists in our state file (meaning it's a common ancestor)
+				if err := u.state.RollbackToHash(currentChainBlock.Hash()); err == nil {
+					// Success - found common ancestor
+					commonAncestorHeight = height
+					commonAncestorHash = currentChainBlock.Hash()
+					break
+				}
+				// If rollback failed, this block isn't in our state file, continue backward
+			}
+
+			if commonAncestorHash == nil {
+				return nil, errors.NewProcessingError("no common ancestor found during reorg recovery - could not find any current chain block in state file", nil)
+			}
+
+			// Calculate how many blocks we rolled back
+			blocksRolledBack := lastPersistedHeight - commonAncestorHeight
+
+			u.logger.Infof("[BlockPersister] Reorg recovery complete: rolled back %d blocks from height %d to common ancestor at height %d (hash: %s). Will resume processing from height %d.",
+				blocksRolledBack, lastPersistedHeight, commonAncestorHeight, commonAncestorHash.String(), commonAncestorHeight+1)
+
+			// Return nil to trigger next iteration, which will start processing from common ancestor + 1
+			return nil, nil
 		}
 	}
 
