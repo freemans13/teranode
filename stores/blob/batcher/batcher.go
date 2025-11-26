@@ -237,7 +237,9 @@ func (b *Batcher) writeBatch(currentBatch []byte, batchKeys []byte) error {
 	binary.BigEndian.PutUint32(batchKey, timeUint32)
 	// add a random string as the next bytes, to prevent conflicting filenames from other pods
 	randBytes := make([]byte, 4)
-	_, _ = rand.Read(randBytes)
+	if _, err := rand.Read(randBytes); err != nil {
+		return errors.NewStorageError("failed to generate random bytes for batch key", err)
+	}
 	batchKey = append(batchKey, randBytes...)
 
 	g, gCtx := errgroup.WithContext(context.Background())
