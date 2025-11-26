@@ -1,4 +1,4 @@
-package cleanup
+package pruner
 
 import (
 	"context"
@@ -329,7 +329,7 @@ func TestJobManagerTriggerCleanup(t *testing.T) {
 		defer manager.Stop()
 
 		// Trigger cleanup
-		err = manager.TriggerCleanup(123)
+		err = manager.TriggerPruner(123)
 		require.NoError(t, err)
 
 		// Verify job was created
@@ -365,7 +365,7 @@ func TestJobManagerTriggerCleanup(t *testing.T) {
 		defer cancel()
 
 		// Trigger first cleanup
-		err = manager.TriggerCleanup(123)
+		err = manager.TriggerPruner(123)
 		require.NoError(t, err)
 
 		manager.Start(ctx)
@@ -374,7 +374,7 @@ func TestJobManagerTriggerCleanup(t *testing.T) {
 		doneCh := make(chan string)
 
 		// Trigger second cleanup while first is maybe running
-		err = manager.TriggerCleanup(456, doneCh)
+		err = manager.TriggerPruner(456, doneCh)
 		require.NoError(t, err)
 
 		select {
@@ -409,13 +409,13 @@ func TestJobManagerTriggerCleanup(t *testing.T) {
 		defer manager.Stop()
 
 		// Trigger multiple cleanups
-		err = manager.TriggerCleanup(100)
+		err = manager.TriggerPruner(100)
 		require.NoError(t, err)
 
-		err = manager.TriggerCleanup(200)
+		err = manager.TriggerPruner(200)
 		require.NoError(t, err)
 
-		err = manager.TriggerCleanup(300)
+		err = manager.TriggerPruner(300)
 		require.NoError(t, err)
 
 		// Verify only the most recent jobs are kept

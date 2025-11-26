@@ -1,4 +1,4 @@
-package cleanup
+package pruner
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
-	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -219,6 +219,9 @@ func TestService_processCleanupJob(t *testing.T) {
 			DebugfFunc: func(format string, args ...interface{}) {
 				loggedMessages = append(loggedMessages, format)
 			},
+			InfofFunc: func(format string, args ...interface{}) {
+				loggedMessages = append(loggedMessages, format)
+			},
 		}
 
 		db := NewMockDB()
@@ -234,19 +237,20 @@ func TestService_processCleanupJob(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		job := cleanup.NewJob(100, context.Background())
+		job := pruner.NewJob(100, context.Background())
 
 		service.processCleanupJob(job, 1)
 
-		assert.Equal(t, cleanup.JobStatusCompleted, job.GetStatus())
+		assert.Equal(t, pruner.JobStatusCompleted, job.GetStatus())
 		assert.False(t, job.Started.IsZero())
 		assert.False(t, job.Ended.IsZero())
 		assert.Nil(t, job.Error)
 
 		// Verify logging
-		assert.Len(t, loggedMessages, 2)
+		assert.Len(t, loggedMessages, 3)
 		assert.Contains(t, loggedMessages[0], "running cleanup job")
-		assert.Contains(t, loggedMessages[1], "cleanup job completed")
+		assert.Contains(t, loggedMessages[1], "starting cleanup scan")
+		assert.Contains(t, loggedMessages[2], "cleanup job completed")
 	})
 
 	t.Run("FailedCleanup", func(t *testing.T) {
@@ -270,11 +274,11 @@ func TestService_processCleanupJob(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		job := cleanup.NewJob(100, context.Background())
+		job := pruner.NewJob(100, context.Background())
 
 		// Manually set the job to failed state to test the logging paths
 		job.Started = time.Now()
-		job.SetStatus(cleanup.JobStatusFailed)
+		job.SetStatus(pruner.JobStatusFailed)
 		job.Error = errors.NewError("simulated database error")
 		job.Ended = time.Now()
 
@@ -284,7 +288,7 @@ func TestService_processCleanupJob(t *testing.T) {
 
 		// Test passes if the method doesn't panic and handles the job correctly
 		// The job will be marked as completed because our mock doesn't fail
-		assert.Equal(t, cleanup.JobStatusCompleted, job.GetStatus())
+		assert.Equal(t, pruner.JobStatusCompleted, job.GetStatus())
 		assert.False(t, job.Started.IsZero())
 		assert.False(t, job.Ended.IsZero())
 
@@ -309,12 +313,12 @@ func TestService_processCleanupJob(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		job := cleanup.NewJob(100, context.Background())
+		job := pruner.NewJob(100, context.Background())
 
 		// Should not panic when DoneCh is nil
 		service.processCleanupJob(job, 1)
 
-		assert.Equal(t, cleanup.JobStatusCompleted, job.GetStatus())
+		assert.Equal(t, pruner.JobStatusCompleted, job.GetStatus())
 	})
 }
 
@@ -335,10 +339,10 @@ func TestDeleteTombstoned(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		job := cleanup.NewJob(100, context.Background())
+		job := pruner.NewJob(100, context.Background())
 		service.processCleanupJob(job, 1)
 
-		assert.Equal(t, cleanup.JobStatusCompleted, job.GetStatus())
+		assert.Equal(t, pruner.JobStatusCompleted, job.GetStatus())
 		assert.Nil(t, job.Error)
 	})
 
@@ -354,12 +358,12 @@ func TestDeleteTombstoned(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		job := cleanup.NewJob(100, context.Background())
+		job := pruner.NewJob(100, context.Background())
 
 		// Test the successful path since our mock doesn't fail
 		service.processCleanupJob(job, 1)
 
-		assert.Equal(t, cleanup.JobStatusCompleted, job.GetStatus())
+		assert.Equal(t, pruner.JobStatusCompleted, job.GetStatus())
 		assert.Nil(t, job.Error)
 	})
 
@@ -377,10 +381,10 @@ func TestDeleteTombstoned(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		job := cleanup.NewJob(0, context.Background())
+		job := pruner.NewJob(0, context.Background())
 		service.processCleanupJob(job, 1)
 
-		assert.Equal(t, cleanup.JobStatusCompleted, job.GetStatus())
+		assert.Equal(t, pruner.JobStatusCompleted, job.GetStatus())
 		assert.Nil(t, job.Error)
 	})
 
@@ -398,10 +402,10 @@ func TestDeleteTombstoned(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		job := cleanup.NewJob(4294967295, context.Background()) // Max uint32
+		job := pruner.NewJob(4294967295, context.Background()) // Max uint32
 		service.processCleanupJob(job, 1)
 
-		assert.Equal(t, cleanup.JobStatusCompleted, job.GetStatus())
+		assert.Equal(t, pruner.JobStatusCompleted, job.GetStatus())
 		assert.Nil(t, job.Error)
 	})
 }
@@ -454,7 +458,7 @@ func TestService_IntegrationTests(t *testing.T) {
 		assert.GreaterOrEqual(t, len(jobs), 1, "Should have at least one job")
 		if len(jobs) > 0 {
 			assert.Equal(t, uint32(100), jobs[0].BlockHeight)
-			assert.Equal(t, cleanup.JobStatusCompleted, jobs[0].GetStatus())
+			assert.Equal(t, pruner.JobStatusCompleted, jobs[0].GetStatus())
 		}
 	})
 
@@ -469,7 +473,7 @@ func TestService_IntegrationTests(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify service implements the interface
-		var _ cleanup.Service = service
+		var _ pruner.Service = service
 	})
 }
 
@@ -555,7 +559,7 @@ func TestService_EdgeCases(t *testing.T) {
 		jobs := service.GetJobs()
 		assert.GreaterOrEqual(t, len(jobs), 1)
 		if len(jobs) > 0 {
-			assert.Equal(t, cleanup.JobStatusCompleted, jobs[0].GetStatus())
+			assert.Equal(t, pruner.JobStatusCompleted, jobs[0].GetStatus())
 		}
 	})
 }

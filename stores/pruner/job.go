@@ -1,4 +1,4 @@
-package cleanup
+package pruner
 
 import (
 	"context"
@@ -36,7 +36,7 @@ func (s JobStatus) String() string {
 	}
 }
 
-// Job represents a cleanup job
+// Job represents a pruner job
 type Job struct {
 	BlockHeight uint32
 	status      atomic.Int32 // Using atomic for thread-safe access
@@ -59,7 +59,7 @@ func (j *Job) SetStatus(status JobStatus) {
 	j.status.Store(int32(status))
 }
 
-// NewJob creates a new cleanup job for the specified block height
+// NewJob creates a new pruner job for the specified block height
 func NewJob(blockHeight uint32, parentCtx context.Context, doneCh ...chan string) *Job {
 	// If parentCtx is nil, use background context
 	if parentCtx == nil {

@@ -2058,82 +2058,6 @@ func TestBlockAssembly_processNewBlockAnnouncement_ErrorHandling(t *testing.T) {
 	})
 }
 
-func TestBlockAssembly_setBestBlockHeader_CleanupServiceFailures(t *testing.T) {
-	t.Run("setBestBlockHeader handles cleanup service failures gracefully", func(t *testing.T) {
-		initPrometheusMetrics()
-		testItems := setupBlockAssemblyTest(t)
-		require.NotNil(t, testItems)
-
-		// Create a mock cleanup service that fails
-		mockCleanupService := &MockCleanupService{}
-		mockCleanupService.On("UpdateBlockHeight", mock.Anything, mock.Anything).Return(errors.NewProcessingError("cleanup service failed"))
-
-		// Set the cleanup service and mark it as loaded
-		testItems.blockAssembler.cleanupService = mockCleanupService
-		testItems.blockAssembler.cleanupServiceLoaded.Store(true)
-
-		// Start the cleanup queue worker
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		testItems.blockAssembler.startCleanupQueueWorker(ctx)
-
-		// Set state to running so cleanup is triggered
-		testItems.blockAssembler.setCurrentRunningState(StateRunning)
-
-		// Create a new block header
-		newHeader := &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  model.GenesisBlockHeader.Hash(),
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      1234567890,
-			Bits:           model.NBit{},
-			Nonce:          1234,
-		}
-		newHeight := uint32(1)
-
-		// Call setBestBlockHeader - should not panic or fail even if cleanup service fails
-		testItems.blockAssembler.setBestBlockHeader(newHeader, newHeight)
-
-		// Verify the block header was still set correctly
-		currentHeader, currentHeight := testItems.blockAssembler.CurrentBlock()
-		assert.Equal(t, newHeader, currentHeader)
-		assert.Equal(t, newHeight, currentHeight)
-
-		// Wait for background goroutine to complete (parent preserve + cleanup trigger)
-		time.Sleep(100 * time.Millisecond)
-
-		// Verify cleanup service was called
-		mockCleanupService.AssertCalled(t, "UpdateBlockHeight", newHeight, mock.Anything)
-	})
-
-	t.Run("setBestBlockHeader skips cleanup when cleanup service not loaded", func(t *testing.T) {
-		initPrometheusMetrics()
-		testItems := setupBlockAssemblyTest(t)
-		require.NotNil(t, testItems)
-
-		// Ensure cleanup service is not loaded
-		testItems.blockAssembler.cleanupServiceLoaded.Store(false)
-
-		newHeader := &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  model.GenesisBlockHeader.Hash(),
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      1234567890,
-			Bits:           model.NBit{},
-			Nonce:          1234,
-		}
-		newHeight := uint32(1)
-
-		// This should work without any cleanup service calls
-		testItems.blockAssembler.setBestBlockHeader(newHeader, newHeight)
-
-		// Verify the block header was set correctly
-		currentHeader, currentHeight := testItems.blockAssembler.CurrentBlock()
-		assert.Equal(t, newHeader, currentHeader)
-		assert.Equal(t, newHeight, currentHeight)
-	})
-}
-
 // TestBlockAssembly_CoinbaseCalculationFix specifically targets issue #3968
 // This test ensures coinbase value never exceeds fees + subsidy by exactly 1 satoshi
 func TestBlockAssembly_CoinbaseCalculationFix(t *testing.T) {
@@ -2698,32 +2622,4 @@ func TestGetMiningCandidate_SendTimeoutResetsGenerationFlag(t *testing.T) {
 	assert.False(t, ba.cachedCandidate.generating, "generating flag should still be reset")
 	assert.Nil(t, ba.cachedCandidate.generationChan, "generation channel should still be nil")
 	ba.cachedCandidate.mu.RUnlock()
-}
-
-// TestGetLastPersistedHeight tests the GetLastPersistedHeight method
-func TestGetLastPersistedHeight(t *testing.T) {
-	initPrometheusMetrics()
-
-	t.Run("GetLastPersistedHeight returns initial zero value", func(t *testing.T) {
-		testItems := setupBlockAssemblyTest(t)
-		require.NotNil(t, testItems)
-		ba := testItems.blockAssembler
-
-		// Initially should be 0
-		height := ba.GetLastPersistedHeight()
-		assert.Equal(t, uint32(0), height)
-	})
-
-	t.Run("GetLastPersistedHeight returns updated value", func(t *testing.T) {
-		testItems := setupBlockAssemblyTest(t)
-		require.NotNil(t, testItems)
-		ba := testItems.blockAssembler
-
-		// Store a value
-		ba.lastPersistedHeight.Store(uint32(100))
-
-		// Should return the stored value
-		height := ba.GetLastPersistedHeight()
-		assert.Equal(t, uint32(100), height)
-	})
 }

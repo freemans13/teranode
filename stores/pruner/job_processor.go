@@ -1,4 +1,4 @@
-package cleanup
+package pruner
 
 import (
 	"context"
@@ -103,7 +103,7 @@ func (m *JobManager) Start(ctx context.Context) {
 	m.mu.Unlock()
 
 	// Start the worker pool
-	m.logger.Infof("[JobManager] Starting %d workers for cleanup service", m.workerCount)
+	m.logger.Infof("[JobManager] Starting %d workers for pruner service", m.workerCount)
 
 	for i := 0; i < m.workerCount; i++ {
 		m.wg.Add(1)
@@ -125,21 +125,39 @@ func (m *JobManager) Stop() {
 	}
 	m.mu.Unlock()
 
+	// Signal any running jobs before waiting for workers
+	m.jobsMutex.Lock()
+	for _, job := range m.jobs {
+		status := job.GetStatus()
+		if status == JobStatusRunning || status == JobStatusPending {
+			// Mark as cancelled and signal the channel
+			job.SetStatus(JobStatusCancelled)
+			job.Ended = time.Now()
+
+			// Signal the doneCh so waiting goroutines aren't blocked
+			m.sendAndClose(job.DoneCh, JobStatusCancelled.String())
+
+			// Cancel the job's context if it has one
+			job.Cancel()
+		}
+	}
+	m.jobsMutex.Unlock()
+
 	// Wait for all workers to exit
 	m.wg.Wait()
 }
 
-// UpdateBlockHeight updates the current block height and triggers cleanup if needed
+// UpdateBlockHeight updates the current block height and triggers pruner if needed
 func (m *JobManager) UpdateBlockHeight(height uint32, doneCh ...chan string) error {
 	// Store the new block height
 	m.currentBlockHeight.Store(height)
 
-	// Trigger a cleanup job for this height
-	return m.TriggerCleanup(height, doneCh...)
+	// Trigger a pruner job for this height
+	return m.TriggerPruner(height, doneCh...)
 }
 
-// TriggerCleanup triggers a new cleanup job for the specified block height
-func (m *JobManager) TriggerCleanup(blockHeight uint32, doneCh ...chan string) error {
+// TriggerPruner triggers a new pruner job for the specified block height
+func (m *JobManager) TriggerPruner(blockHeight uint32, doneCh ...chan string) error {
 	m.jobsMutex.Lock()
 	defer m.jobsMutex.Unlock()
 
