@@ -463,25 +463,27 @@ type P2PSettings struct {
 }
 
 type CoinbaseSettings struct {
-	DB                    string
-	UserPwd               string
-	ArbitraryText         string
-	GRPCAddress           string
-	GRPCListenAddress     string
-	NotificationThreshold int
-	P2PPeerID             string
-	P2PPrivateKey         string
-	P2PStaticPeers        []string
-	ShouldWait            bool
-	Store                 *url.URL
-	StoreDBTimeoutMillis  int
-	WaitForPeers          bool
-	WalletPrivateKey      string
-	PeerStatusTimeout     time.Duration
-	SlackChannel          string
-	SlackToken            string
-	TestMode              bool
-	P2PPort               int
+	DB                          string
+	UserPwd                     string
+	ArbitraryText               string
+	GRPCAddress                 string
+	GRPCListenAddress           string
+	NotificationThreshold       int
+	P2PPeerID                   string
+	P2PPrivateKey               string
+	P2PStaticPeers              []string
+	ShouldWait                  bool
+	Store                       *url.URL
+	StoreDBTimeoutMillis        int
+	WaitForPeers                bool
+	WalletPrivateKey            string
+	PeerStatusTimeout           time.Duration
+	SlackChannel                string
+	SlackToken                  string
+	TestMode                    bool
+	P2PPort                     int
+	DistributorFailureTolerance int
+	DistributorTimeout          time.Duration
 }
 
 type PrunerSettings struct {
