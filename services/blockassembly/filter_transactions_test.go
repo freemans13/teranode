@@ -16,11 +16,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestFilterTransactionsWithValidParents_BatchingAndOrdering tests that the filterTransactionsWithValidParents
+// TestValidateParentChain_BatchingAndOrdering tests that the validateParentChain
 // function correctly handles transaction ordering validation across batch boundaries.
 // This test specifically validates the fix for the variable shadowing bug where the loop variable 'i'
 // was being shadowed, causing incorrect currentIdx calculations in ordering validation.
-func TestFilterTransactionsWithValidParents_BatchingAndOrdering(t *testing.T) {
+func TestValidateParentChain_BatchingAndOrdering(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("Valid ordering across batches - bug regression test", func(t *testing.T) {
@@ -161,8 +161,8 @@ func TestFilterTransactionsWithValidParents_BatchingAndOrdering(t *testing.T) {
 		// Create bestBlockHeaderIDsMap
 		bestBlockHeaderIDsMap := map[uint32]bool{1: true}
 
-		// Call filterTransactionsWithValidParents
-		validTxs, err := blockAssembler.filterTransactionsWithValidParents(ctx, unminedTxs, bestBlockHeaderIDsMap)
+		// Call validateParentChain
+		validTxs, err := blockAssembler.validateParentChain(ctx, unminedTxs, bestBlockHeaderIDsMap)
 		require.NoError(t, err)
 
 		// All 101 transactions should be valid
@@ -273,8 +273,8 @@ func TestFilterTransactionsWithValidParents_BatchingAndOrdering(t *testing.T) {
 
 		bestBlockHeaderIDsMap := map[uint32]bool{1: true}
 
-		// Call filterTransactionsWithValidParents
-		validTxs, err := blockAssembler.filterTransactionsWithValidParents(ctx, unminedTxs, bestBlockHeaderIDsMap)
+		// Call validateParentChain
+		validTxs, err := blockAssembler.validateParentChain(ctx, unminedTxs, bestBlockHeaderIDsMap)
 		require.NoError(t, err)
 
 		// Only the parent should be valid, child should be skipped due to invalid ordering
