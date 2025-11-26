@@ -14,7 +14,7 @@ require (
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.0-beta11
 	github.com/bitcoin-sv/go-sdk v1.1.21
 	github.com/bitcoin-sv/testcontainers-aerospike-go v0.2.2
-	github.com/bsv-blockchain/go-bt/v2 v2.5.0
+	github.com/bsv-blockchain/go-bt/v2 v2.5.1
 	github.com/bsv-blockchain/go-chaincfg v1.4.0
 	github.com/bsv-blockchain/go-subtree v1.1.1
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
@@ -62,7 +62,7 @@ require (
 	go.uber.org/atomic v1.11.0
 	golang.org/x/crypto v0.43.0
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546
-	golang.org/x/sync v0.17.0
+	golang.org/x/sync v0.18.0
 	golang.org/x/sys v0.37.0
 	golang.org/x/term v0.36.0
 	golang.org/x/text v0.30.0 // indirect
@@ -173,13 +173,13 @@ require (
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/bitcoin-sv/alert-system v0.2.0
-	github.com/bsv-blockchain/go-batcher v1.1.0
+	github.com/bsv-blockchain/go-batcher v1.2.5
 	github.com/bsv-blockchain/go-bn v1.0.3
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.6
 	github.com/bsv-blockchain/go-safe-conversion v1.1.0
-	github.com/bsv-blockchain/go-sdk v1.2.10
-	github.com/bsv-blockchain/go-tx-map v1.2.0
+	github.com/bsv-blockchain/go-sdk v1.2.11
+	github.com/bsv-blockchain/go-tx-map v1.2.1
 	github.com/bsv-blockchain/go-wire v1.0.6
 	github.com/felixge/fgprof v0.9.5
 	github.com/gocarina/gocsv v0.0.0-20240520201108-78e41c74b4b1
