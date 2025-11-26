@@ -7,6 +7,25 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
+// checkBlockAssemblySafeForPruner verifies that block assembly is in "running" state
+// and safe to proceed with pruner operations. Returns true if safe, false otherwise.
+func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase string, height uint32) bool {
+	state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
+	if err != nil {
+		s.logger.Errorf("Failed to get block assembly state before %s: %v", phase, err)
+		prunerErrors.WithLabelValues("state_check").Inc()
+		return false
+	}
+
+	if state.BlockAssemblyState != "running" {
+		s.logger.Infof("Skipping %s for height %d: block assembly state is %s (not running)", phase, height, state.BlockAssemblyState)
+		prunerSkipped.WithLabelValues("not_running").Inc()
+		return false
+	}
+
+	return true
+}
+
 // prunerProcessor processes pruner requests from the pruner channel.
 // It drains the channel to get the latest height (deduplication), then performs
 // pruner in two sequential steps:
@@ -48,17 +67,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			}
 
 			// Safety check before preserve parents phase
-			// Check block assembly state to ensure it's safe to run pruner
-			state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
-			if err != nil {
-				s.logger.Errorf("Failed to get block assembly state before preserve parents: %v", err)
-				prunerErrors.WithLabelValues("state_check").Inc()
-				continue
-			}
-
-			if state.BlockAssemblyState != "running" {
-				s.logger.Infof("Skipping pruner for height %d: block assembly state is %s (not running)", latestHeight, state.BlockAssemblyState)
-				prunerSkipped.WithLabelValues("not_running").Inc()
+			if !s.checkBlockAssemblySafeForPruner(ctx, "preserve parents", latestHeight) {
 				continue
 			}
 
@@ -80,21 +89,6 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					continue
 				}
 				prunerDuration.WithLabelValues("preserve_parents").Observe(time.Since(startTime).Seconds())
-			}
-
-			// Safety check before DAH pruner phase
-			// Recheck block assembly state to ensure it hasn't changed (e.g., to reorg)
-			state, err = s.blockAssemblyClient.GetBlockAssemblyState(ctx)
-			if err != nil {
-				s.logger.Errorf("Failed to get block assembly state before DAH pruner: %v", err)
-				prunerErrors.WithLabelValues("state_check").Inc()
-				continue
-			}
-
-			if state.BlockAssemblyState != "running" {
-				s.logger.Infof("Skipping DAH pruner for height %d: block assembly state changed to %s (not running)", latestHeight, state.BlockAssemblyState)
-				prunerSkipped.WithLabelValues("not_running").Inc()
-				continue
 			}
 
 			// Step 2: Then trigger DAH pruner and WAIT for it to complete
