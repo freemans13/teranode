@@ -194,7 +194,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		workerID, job.BlockHeight, safeCleanupHeight)
 
 	// Execute the cleanup with safe height (using child safety checking version)
-	err := s.deleteTombstoned(safeCleanupHeight)
+	count, err := s.deleteTombstoned(safeCleanupHeight)
 
 	if err != nil {
 		job.SetStatus(pruner.JobStatusFailed)
@@ -206,31 +206,14 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		job.SetStatus(pruner.JobStatusCompleted)
 		job.Ended = time.Now()
 
-		s.logger.Infof("[SQLCleanupService %d] cleanup job completed for block height %d in %v",
-			workerID, job.BlockHeight, time.Since(job.Started))
+		s.logger.Infof("[SQLCleanupService %d] cleanup job completed for block height %d in %v - deleted %d records",
+			workerID, job.BlockHeight, time.Since(job.Started), count)
 	}
-}
-
-// deleteTombstonedWithCount removes transactions that have passed their expiration time and returns the count.
-func deleteTombstonedWithCount(db *usql.DB, blockHeight uint32) (int64, error) {
-	// Delete transactions that have passed their expiration time
-	// this will cascade to inputs, outputs, block_ids and conflicting_children
-	result, err := db.Exec("DELETE FROM transactions WHERE delete_at_height <= $1", blockHeight)
-	if err != nil {
-		return 0, errors.NewStorageError("failed to delete transactions", err)
-	}
-
-	count, err := result.RowsAffected()
-	if err != nil {
-		return 0, errors.NewStorageError("failed to get rows affected", err)
-	}
-
-	return count, nil
 }
 
 // deleteTombstoned removes transactions that have passed their expiration time.
 // Only deletes parent transactions if their last spending child is mined and stable.
-func (s *Service) deleteTombstoned(blockHeight uint32) error {
+func (s *Service) deleteTombstoned(blockHeight uint32) (int64, error) {
 	// Use configured safety window from settings
 	safetyWindow := s.safetyWindow
 
@@ -270,14 +253,13 @@ func (s *Service) deleteTombstoned(blockHeight uint32) error {
 
 	result, err := s.db.Exec(deleteQuery, blockHeight, safetyWindow)
 	if err != nil {
-		return errors.NewStorageError("failed to delete transactions", err)
+		return 0, errors.NewStorageError("failed to delete transactions", err)
 	}
 
-	rowsAffected, err := result.RowsAffected()
-	if err == nil && rowsAffected > 0 {
-		// Log how many were deleted (useful for monitoring)
-		// Note: logger not available in this function, would need to be passed in
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, errors.NewStorageError("failed to get rows affected", err)
 	}
 
-	return nil
+	return count, nil
 }
