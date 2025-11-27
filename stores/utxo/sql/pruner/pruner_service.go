@@ -9,7 +9,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/usql"
-	"github.com/ordishs/gocore"
 )
 
 // Ensure Store implements the Pruner Service interface
@@ -72,7 +71,7 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 
 	workerCount := opts.WorkerCount
 	if workerCount <= 0 {
-		workerCount, _ = gocore.Config().GetInt("sql_cleanup_worker_count", DefaultWorkerCount)
+		workerCount = DefaultWorkerCount
 	}
 
 	maxJobsHistory := opts.MaxJobsHistory
@@ -83,7 +82,7 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	safetyWindow := opts.SafetyWindow
 	if safetyWindow == 0 {
 		// Default to global retention setting (288 blocks)
-		safetyWindow, _ = gocore.Config().GetUint32("global_blockHeightRetention", 288)
+		safetyWindow = tSettings.GlobalBlockHeightRetention
 	}
 
 	service := &Service{
