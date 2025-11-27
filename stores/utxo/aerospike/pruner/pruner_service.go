@@ -382,8 +382,29 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		})
 	}
 
+	// Get job context for cancellation support
+	jobCtx := job.Context()
+
 	// Process records and accumulate into chunks
 	for {
+		// Check for cancellation before processing next chunk
+		select {
+		case <-jobCtx.Done():
+			s.logger.Infof("Worker %d: cleanup job for height %d cancelled", workerID, job.BlockHeight)
+			recordset.Close()
+			// Process any accumulated chunk before exiting
+			if len(chunk) > 0 {
+				submitChunk(chunk)
+			}
+			// Wait for submitted chunks to complete
+			if err := chunkGroup.Wait(); err != nil {
+				s.logger.Errorf("Worker %d: error in chunks during cancellation: %v", workerID, err)
+			}
+			s.markJobAsFailed(job, errors.NewProcessingError("Worker %d: cleanup job for height %d cancelled", workerID, job.BlockHeight))
+			return
+		default:
+		}
+
 		rec, ok := <-result
 		if !ok || rec == nil {
 			// Process final chunk if any
