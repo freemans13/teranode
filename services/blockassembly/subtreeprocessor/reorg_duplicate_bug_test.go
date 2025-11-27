@@ -50,12 +50,11 @@ func setupTestSubtreeProcessor(t *testing.T) *SubtreeProcessor {
 	})
 
 	// Create SubtreeProcessor
-	ctx := context.Background()
-	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, nil, utxoStore, newSubtreeChan)
+	stp, err := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, blobStore, nil, utxoStore, newSubtreeChan)
 	require.NoError(t, err)
 
 	// Start processing and ensure cleanup
-	stp.Start(ctx)
+	stp.Start(t.Context())
 	t.Cleanup(func() {
 		stp.Stop(context.Background())
 	})

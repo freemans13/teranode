@@ -1974,7 +1974,7 @@ func TestBlockAssembly_Start_InitStateFailures(t *testing.T) {
 		// Set skip wait for pending blocks
 		blockAssembler.SetSkipWaitForPendingBlocks(true)
 
-		err = blockAssembler.Start(context.Background())
+		err = blockAssembler.Start(t.Context())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to initialize state")
 	})
@@ -2024,7 +2024,7 @@ func TestBlockAssembly_Start_InitStateFailures(t *testing.T) {
 		// Set skip wait for pending blocks
 		blockAssembler.SetSkipWaitForPendingBlocks(true)
 
-		err = blockAssembler.Start(context.Background())
+		err = blockAssembler.Start(t.Context())
 		require.NoError(t, err)
 
 		// Verify state was properly initialized

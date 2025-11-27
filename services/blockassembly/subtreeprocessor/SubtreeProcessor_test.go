@@ -585,8 +585,8 @@ func TestMoveForwardBlock(t *testing.T) {
 	blockchainClient := &blockchain.Mock{}
 	blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-	stp, _ := NewSubtreeProcessor(context.Background(), logger, settings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
-	stp.Start(context.Background())
+	stp, _ := NewSubtreeProcessor(t.Context(), logger, settings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
+	stp.Start(t.Context())
 
 	for i, txid := range txIds {
 		hash, err := chainhash.NewHashFromStr(txid)
@@ -753,8 +753,8 @@ func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
 	blockchainClient := &blockchain.Mock{}
 	blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-	stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
-	stp.Start(context.Background())
+	stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
+	stp.Start(t.Context())
 
 	for i, txid := range txIds {
 		hash, err := chainhash.NewHashFromStr(txid)
@@ -856,8 +856,8 @@ func TestSubtreeMoveForwardBlockNewCurrent(t *testing.T) {
 	blockchainClient := &blockchain.Mock{}
 	blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-	stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
-	stp.Start(context.Background())
+	stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
+	stp.Start(t.Context())
 
 	for i, txid := range txIds {
 		hash, err := chainhash.NewHashFromStr(txid)
@@ -1322,8 +1322,8 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		blockchainClient := &blockchain.Mock{}
 		blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
-		stp.Start(context.Background())
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
+		stp.Start(t.Context())
 
 		for _, txHash := range txHashes {
 			stp.Add(subtreepkg.Node{Hash: txHash, Fee: 1}, subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}})
@@ -2139,7 +2139,7 @@ func Test_removeMap(t *testing.T) {
 			}
 		}()
 
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 
 		txHashes := make([]chainhash.Hash, 1000)
 		expectedNrTransactions := 1000
@@ -2154,7 +2154,7 @@ func Test_removeMap(t *testing.T) {
 
 			if i%33 == 0 {
 				// set this transaction to not be added
-				_ = stp.Remove(context.Background(), txHash)
+				_ = stp.Remove(t.Context(), txHash)
 				transactionsRemoved++
 			}
 		}
@@ -2328,10 +2328,10 @@ func BenchmarkAddNode(b *testing.B) {
 func BenchmarkAddNodeWithMap(b *testing.B) {
 	g, stp, txHashes := initTestAddNodeBenchmark(b)
 
-	_ = stp.Remove(context.Background(), txHashes[1000])
-	_ = stp.Remove(context.Background(), txHashes[2000])
-	_ = stp.Remove(context.Background(), txHashes[3000]) //nolint:gosec
-	_ = stp.Remove(context.Background(), txHashes[4000])
+	_ = stp.Remove(b.Context(), txHashes[1000])
+	_ = stp.Remove(b.Context(), txHashes[2000])
+	_ = stp.Remove(b.Context(), txHashes[3000]) //nolint:gosec
+	_ = stp.Remove(b.Context(), txHashes[4000])
 
 	for i := 0; i < 4; i++ {
 		txHash, err := generateTxHash()
@@ -2389,7 +2389,7 @@ func initTestAddNodeBenchmark(b *testing.B) (*errgroup.Group, *SubtreeProcessor,
 	settings.BlockAssembly.InitialMerkleItemsPerSubtree = 1048576
 	settings.BlockAssembly.DoubleSpendWindow = 0
 
-	stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+	stp, _ := NewSubtreeProcessor(b.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 
 	nrTxs := 1_048_576
 	txHashes := make([]chainhash.Hash, 10*nrTxs)
@@ -3092,7 +3092,7 @@ func TestInitCurrentBlockHeader_SubtreeCountingFix(t *testing.T) {
 	t.Run("InitCurrentBlockHeader sets subtreesInBlock to 0", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 
 		// Initialize with a block header
 		stp.InitCurrentBlockHeader(prevBlockHeader)
@@ -3106,7 +3106,7 @@ func TestInitCurrentBlockHeader_SubtreeCountingFix(t *testing.T) {
 	t.Run("InitCurrentBlockHeader handles nil header gracefully", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 
 		// This should not panic
 		stp.InitCurrentBlockHeader(nil)
@@ -3121,7 +3121,7 @@ func TestMoveForwardBlock_BlockHeaderValidation(t *testing.T) {
 	t.Run("moveForwardBlock enforces parent block header validation", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		// Create a block with mismatched parent hash
@@ -3151,7 +3151,7 @@ func TestMoveForwardBlock_BlockHeaderValidation(t *testing.T) {
 
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		// Test the parent hash validation logic directly
@@ -3171,7 +3171,7 @@ func TestAddNode_TransactionCounting(t *testing.T) {
 	t.Run("addNode increments transaction count correctly", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		initialTxCount := stp.TxCount()
@@ -3203,7 +3203,7 @@ func TestAddNode_TransactionCounting(t *testing.T) {
 	t.Run("addNode with duplicate transaction does not increment count", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		// Create a transaction node
@@ -3239,7 +3239,7 @@ func TestFinalizeBlockProcessing_StateConsistency(t *testing.T) {
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, mockBlockchainClient, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, mockBlockchainClient, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		// Create a block to finalize
@@ -3271,7 +3271,7 @@ func TestFinalizeBlockProcessing_StateConsistency(t *testing.T) {
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, mockBlockchainClient, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, mockBlockchainClient, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		// Note: subtreesInBlock and blockStartTime are internal state variables
@@ -3303,7 +3303,7 @@ func TestSubtreeProcessor_ConcurrentOperations_StateConsistency(t *testing.T) {
 	t.Run("concurrent Add operations maintain transaction count consistency", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		const numGoroutines = 10
@@ -3356,7 +3356,7 @@ func TestRemoveCoinbaseUtxos_MissingTransaction(t *testing.T) {
 		mockUtxoStore.On("SetLocked", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrTxNotFound)
 
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, mockUtxoStore, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, mockUtxoStore, newSubtreeChan)
 
 		// Create a block with coinbase transaction
 		block := &model.Block{
@@ -3389,7 +3389,7 @@ func TestRemoveCoinbaseUtxos_MissingTransaction(t *testing.T) {
 		mockUTXOStore.On("SetLocked", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		mockUTXOStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.NewProcessingError("UTXO store unavailable"))
 
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, mockUTXOStore, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, mockUTXOStore, newSubtreeChan)
 
 		block := &model.Block{
 			Header: &model.BlockHeader{
@@ -3421,7 +3421,7 @@ func TestMoveBackBlockCreateNewSubtrees_ErrorRecovery(t *testing.T) {
 		// Create a memory blob store for testing
 		blobStore := blob_memory.New()
 
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, blobStore, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, blobStore, nil, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		// Create a block with subtrees but corrupted data
@@ -3462,7 +3462,7 @@ func TestSubtreeProcessor_ErrorRecovery_ChannelOperations(t *testing.T) {
 	t.Run("channel operations handle context cancellation", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
-		stp, _ := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
+		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
 
 		// Create a context that will be cancelled
