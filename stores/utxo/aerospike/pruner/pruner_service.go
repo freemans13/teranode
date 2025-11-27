@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/pruner"
@@ -108,6 +109,12 @@ type Service struct {
 type parentUpdateInfo struct {
 	key         *aerospike.Key
 	childHashes []*chainhash.Hash // Child transactions being deleted
+}
+
+// externalFileInfo holds information about external files to delete
+type externalFileInfo struct {
+	txHash   *chainhash.Hash
+	fileType fileformat.FileType
 }
 
 // NewService creates a new cleanup service
@@ -324,7 +331,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 	// Create a query statement
 	stmt := aerospike.NewStatement(s.namespace, s.set)
-	stmt.BinNames = []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String(), fields.Utxos.String()}
+	stmt.BinNames = []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String(), fields.Utxos.String(), fields.TotalExtraRecs.String()}
 
 	// Set the filter to find records with a delete_at_height less than or equal to the safe cleanup height
 	// This will automatically use the index since the filter is on the indexed bin
@@ -616,12 +623,46 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 		}
 	}
 
+	// Handle external transactions: add file for deletion
+	externalFiles := make([]*externalFileInfo, 0)
+	external, isExternal := bins[fields.External.String()].(bool)
+	if isExternal && external {
+		// Determine file type: if we found inputs, it's a .tx file, otherwise it's .outputs
+		fileType := fileformat.FileTypeOutputs
+		if len(inputs) > 0 {
+			fileType = fileformat.FileTypeTx
+		}
+		externalFiles = append(externalFiles, &externalFileInfo{
+			txHash:   txHash,
+			fileType: fileType,
+		})
+	}
+
+	// Accumulate deletions: master record + any child records
+	deletions := []*aerospike.Key{rec.Record.Key}
+
+	// If this is a multi-record transaction, delete all child records
+	totalExtraRecs, hasExtraRecs := bins[fields.TotalExtraRecs.String()].(int)
+	if hasExtraRecs && totalExtraRecs > 0 {
+		// Generate keys for all child records: txid_1, txid_2, ..., txid_N
+		for i := 1; i <= totalExtraRecs; i++ {
+			childKeySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
+			childKey, err := aerospike.NewKey(s.namespace, s.set, childKeySource)
+			if err != nil {
+				s.logger.Errorf("Worker %d: failed to create child key for %s_%d: %v", workerID, txHash.String(), i, err)
+				continue
+			}
+			deletions = append(deletions, childKey)
+		}
+		s.logger.Debugf("Worker %d: deleting external tx %s with %d child records", workerID, txHash.String(), totalExtraRecs)
+	}
+
 	// Execute parent updates and deletion
 	ctx := s.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := s.flushCleanupBatches(ctx, workerID, job.BlockHeight, parentUpdates, []*aerospike.Key{rec.Record.Key}); err != nil {
+	if err := s.flushCleanupBatches(ctx, workerID, job.BlockHeight, parentUpdates, deletions, externalFiles); err != nil {
 		return errors.NewProcessingError("Worker %d: error flushing operations for tx %s: %v", workerID, txHash.String(), err)
 	}
 
@@ -816,20 +857,62 @@ func countFalse(m map[string]bool) int {
 func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
 	var inputs []*bt.Input
 
-	// Get the inputs from the record directly
-	inputInterfaces, ok := bins[fields.Inputs.String()].([]interface{})
-	if !ok {
-		return nil, errors.NewProcessingError("Worker %d: missing inputs for record in pruner job %d", workerID, job.BlockHeight)
-	}
+	external, ok := bins[fields.External.String()].(bool)
+	if ok && external {
+		// transaction is external, we need to get the data from the external store
+		txBytes, err := s.external.Get(s.ctx, txHash.CloneBytes(), fileformat.FileTypeTx)
+		if err != nil {
+			if errors.Is(err, errors.ErrNotFound) {
+				// Check if outputs exist (sometimes only outputs are stored)
+				exists, err := s.external.Exists(s.ctx, txHash.CloneBytes(), fileformat.FileTypeOutputs)
+				if err != nil {
+					return nil, errors.NewProcessingError("Worker %d: error checking existence of outputs for external tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+				}
 
-	inputs = make([]*bt.Input, len(inputInterfaces))
+				if exists {
+					// Only outputs exist, no inputs needed for cleanup
+					return nil, nil
+				}
 
-	for i, inputInterface := range inputInterfaces {
-		input := inputInterface.([]byte)
-		inputs[i] = &bt.Input{}
+				// External blob already deleted (by LocalDAH or previous cleanup), just need to delete Aerospike record
+				s.logger.Debugf("Worker %d: external tx %s already deleted from blob store for cleanup job %d, proceeding to delete Aerospike record",
+					workerID, txHash.String(), job.BlockHeight)
+				return []*bt.Input{}, nil
+			}
+			// Other errors should still be reported
+			return nil, errors.NewProcessingError("Worker %d: error getting external tx %s for cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+		}
 
-		if _, err := inputs[i].ReadFrom(bytes.NewReader(input)); err != nil {
-			return nil, errors.NewProcessingError("Worker %d: invalid input for record in pruner job %d: %v", workerID, job.BlockHeight, err)
+		tx, err := bt.NewTxFromBytes(txBytes)
+		if err != nil {
+			return nil, errors.NewProcessingError("Worker %d: invalid tx bytes for external tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+		}
+
+		inputs = tx.Inputs
+	} else {
+		// get the inputs from the record directly
+		inputsValue := bins[fields.Inputs.String()]
+		if inputsValue == nil {
+			// Inputs field might be nil for certain records (e.g., coinbase)
+			return []*bt.Input{}, nil
+		}
+
+		inputInterfaces, ok := inputsValue.([]interface{})
+		if !ok {
+			// Log more helpful error with actual type
+			return nil, errors.NewProcessingError("Worker %d: inputs field has unexpected type %T (expected []interface{}) for record in cleanup job %d",
+				workerID, inputsValue, job.BlockHeight)
+		}
+
+		inputs = make([]*bt.Input, len(inputInterfaces))
+
+		for i, inputInterface := range inputInterfaces {
+			input := inputInterface.([]byte)
+			inputs[i] = &bt.Input{}
+
+			if _, err := inputs[i].ReadFrom(bytes.NewReader(input)); err != nil {
+				return nil, errors.NewProcessingError("Worker %d: invalid input for record in cleanup job %d: %v", workerID, job.BlockHeight, err)
+			}
 		}
 	}
 
@@ -842,18 +925,29 @@ func (s *Service) markJobAsFailed(job *pruner.Job, err error) {
 	job.Ended = time.Now()
 }
 
-// flushCleanupBatches flushes accumulated parent updates and deletions
-func (s *Service) flushCleanupBatches(ctx context.Context, workerID int, blockHeight uint32, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key) error {
+// flushCleanupBatches flushes accumulated parent updates, external file deletions, and Aerospike deletions
+func (s *Service) flushCleanupBatches(ctx context.Context, workerID int, blockHeight uint32, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error {
+	// Execute parent updates first
 	if len(parentUpdates) > 0 {
 		if err := s.executeBatchParentUpdates(ctx, workerID, blockHeight, parentUpdates); err != nil {
 			return err
 		}
 	}
+
+	// Delete external files before Aerospike records (fail-safe: if file deletion fails, we keep the record)
+	if len(externalFiles) > 0 {
+		if err := s.executeBatchExternalFileDeletions(ctx, workerID, blockHeight, externalFiles); err != nil {
+			return err
+		}
+	}
+
+	// Delete Aerospike records last
 	if len(deletions) > 0 {
 		if err := s.executeBatchDeletions(ctx, workerID, blockHeight, deletions); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -990,6 +1084,51 @@ func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, block
 	// Return error if any individual record operations failed
 	if errorCount > 0 {
 		return errors.NewStorageError("Worker %d: %d deletion operations failed", workerID, errorCount)
+	}
+
+	return nil
+}
+
+// executeBatchExternalFileDeletions deletes external blob files for transactions being pruned
+func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, workerID int, blockHeight uint32, files []*externalFileInfo) error {
+	if len(files) == 0 {
+		return nil
+	}
+
+	successCount := 0
+	alreadyDeletedCount := 0
+	errorCount := 0
+
+	for _, fileInfo := range files {
+		// Check context before each deletion
+		select {
+		case <-ctx.Done():
+			s.logger.Infof("Worker %d: context cancelled, stopping external file deletions", workerID)
+			return ctx.Err()
+		default:
+		}
+
+		// Delete the external file
+		err := s.external.Del(ctx, fileInfo.txHash.CloneBytes(), fileInfo.fileType)
+		if err != nil {
+			if errors.Is(err, errors.ErrNotFound) {
+				// Already deleted (by LocalDAH cleanup or previous pruning)
+				alreadyDeletedCount++
+				s.logger.Debugf("Worker %d: external file for tx %s (type %d) already deleted", workerID, fileInfo.txHash.String(), fileInfo.fileType)
+			} else {
+				s.logger.Errorf("Worker %d: failed to delete external file for tx %s (type %d): %v", workerID, fileInfo.txHash.String(), fileInfo.fileType, err)
+				errorCount++
+			}
+		} else {
+			successCount++
+		}
+	}
+
+	s.logger.Debugf("Worker %d: external file deletion batch - success: %d, already deleted: %d, errors: %d", workerID, successCount, alreadyDeletedCount, errorCount)
+
+	// Return error if any deletions failed
+	if errorCount > 0 {
+		return errors.NewStorageError("Worker %d: %d external file deletions failed", workerID, errorCount)
 	}
 
 	return nil
