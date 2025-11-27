@@ -331,7 +331,12 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 	// Create a query statement
 	stmt := aerospike.NewStatement(s.namespace, s.set)
-	stmt.BinNames = []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String(), fields.Utxos.String(), fields.TotalExtraRecs.String()}
+	// Conditionally fetch Utxos bin only when defensive mode is enabled (for child verification)
+	binNames := []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String(), fields.TotalExtraRecs.String()}
+	if s.settings.Pruner.UTXODefensiveEnabled {
+		binNames = append(binNames, fields.Utxos.String())
+	}
+	stmt.BinNames = binNames
 
 	// Set the filter to find records with a delete_at_height less than or equal to the safe cleanup height
 	// This will automatically use the index since the filter is on the indexed bin
@@ -455,69 +460,79 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 		return 0, nil
 	}
 
-	// Step 1: Extract ALL unique spending children from chunk
-	// For each parent record, we extract all spending child TX hashes from spent UTXOs
-	// We must verify EVERY child is stable before deleting the parent
-	uniqueSpendingChildren := make(map[string][]byte) // hex hash -> bytes
-	parentToChildren := make(map[string][]string)     // parent record key -> child hashes
+	// Defensive child verification is conditional on the UTXODefensiveEnabled setting
+	// When disabled, parents are deleted without verifying children are stable
+	var safetyMap map[string]bool
+	var parentToChildren map[string][]string
 
-	for _, rec := range chunk {
-		if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
-			continue
-		}
+	if !s.settings.Pruner.UTXODefensiveEnabled {
+		// Defensive mode disabled - allow all deletions without child verification
+		safetyMap = make(map[string]bool)
+		parentToChildren = make(map[string][]string)
+	} else {
+		// Step 1: Extract ALL unique spending children from chunk
+		// For each parent record, we extract all spending child TX hashes from spent UTXOs
+		// We must verify EVERY child is stable before deleting the parent
+		uniqueSpendingChildren := make(map[string][]byte) // hex hash -> bytes
+		parentToChildren = make(map[string][]string)      // parent record key -> child hashes
 
-		// Extract all spending children from this parent's UTXOs
-		utxosRaw, hasUtxos := rec.Record.Bins[fields.Utxos.String()]
-		if !hasUtxos {
-			continue
-		}
-
-		utxosList, ok := utxosRaw.([]interface{})
-		if !ok {
-			continue
-		}
-
-		parentKey := rec.Record.Key.String()
-		childrenForThisParent := make([]string, 0)
-
-		// Scan all UTXOs for spending data
-		for _, utxoRaw := range utxosList {
-			utxoBytes, ok := utxoRaw.([]byte)
-			if !ok || len(utxoBytes) < 68 { // 32 (utxo hash) + 36 (spending data)
+		for _, rec := range chunk {
+			if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
 				continue
 			}
 
-			// spending_data starts at byte 32, first 32 bytes of spending_data is child TX hash
-			childTxHashBytes := utxoBytes[32:64]
+			// Extract all spending children from this parent's UTXOs
+			utxosRaw, hasUtxos := rec.Record.Bins[fields.Utxos.String()]
+			if !hasUtxos {
+				continue
+			}
 
-			// Check if this is actual spending data (not all zeros)
-			hasSpendingData := false
-			for _, b := range childTxHashBytes {
-				if b != 0 {
-					hasSpendingData = true
-					break
+			utxosList, ok := utxosRaw.([]interface{})
+			if !ok {
+				continue
+			}
+
+			parentKey := rec.Record.Key.String()
+			childrenForThisParent := make([]string, 0)
+
+			// Scan all UTXOs for spending data
+			for _, utxoRaw := range utxosList {
+				utxoBytes, ok := utxoRaw.([]byte)
+				if !ok || len(utxoBytes) < 68 { // 32 (utxo hash) + 36 (spending data)
+					continue
+				}
+
+				// spending_data starts at byte 32, first 32 bytes of spending_data is child TX hash
+				childTxHashBytes := utxoBytes[32:64]
+
+				// Check if this is actual spending data (not all zeros)
+				hasSpendingData := false
+				for _, b := range childTxHashBytes {
+					if b != 0 {
+						hasSpendingData = true
+						break
+					}
+				}
+
+				if hasSpendingData {
+					hexHash := chainhash.Hash(childTxHashBytes).String()
+					uniqueSpendingChildren[hexHash] = childTxHashBytes
+					childrenForThisParent = append(childrenForThisParent, hexHash)
 				}
 			}
 
-			if hasSpendingData {
-				hexHash := chainhash.Hash(childTxHashBytes).String()
-				uniqueSpendingChildren[hexHash] = childTxHashBytes
-				childrenForThisParent = append(childrenForThisParent, hexHash)
+			if len(childrenForThisParent) > 0 {
+				parentToChildren[parentKey] = childrenForThisParent
 			}
 		}
 
-		if len(childrenForThisParent) > 0 {
-			parentToChildren[parentKey] = childrenForThisParent
+		// Step 2: Batch verify all unique children (single BatchGet call for entire chunk)
+		if len(uniqueSpendingChildren) > 0 {
+			safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, job.BlockHeight)
+			s.logger.Debugf("Worker %d: batch verified %d unique children from chunk of %d records", workerID, len(uniqueSpendingChildren), len(chunk))
+		} else {
+			safetyMap = make(map[string]bool)
 		}
-	}
-
-	// Step 2: Batch verify all unique children (single BatchGet call for entire chunk)
-	var safetyMap map[string]bool
-	if len(uniqueSpendingChildren) > 0 {
-		safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, job.BlockHeight)
-		s.logger.Debugf("Worker %d: batch verified %d unique children from chunk of %d records", workerID, len(uniqueSpendingChildren), len(chunk))
-	} else {
-		safetyMap = make(map[string]bool)
 	}
 
 	// Step 3: Process deletions using the safety map
@@ -692,6 +707,43 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 
 	safetyMap := make(map[string]bool, len(lastSpenderHashes))
 
+	// Process children in batches to avoid overwhelming Aerospike
+	batchSize := s.settings.Pruner.UTXODefensiveBatchReadSize
+	if batchSize <= 0 {
+		batchSize = 1024 // Default batch size if not configured
+	}
+
+	// Convert map to slice for batching
+	hashEntries := make([]childHashEntry, 0, len(lastSpenderHashes))
+	for hexHash, hashBytes := range lastSpenderHashes {
+		hashEntries = append(hashEntries, childHashEntry{hexHash: hexHash, hashBytes: hashBytes})
+	}
+
+	// Process in batches
+	for i := 0; i < len(hashEntries); i += batchSize {
+		end := i + batchSize
+		if end > len(hashEntries) {
+			end = len(hashEntries)
+		}
+		batch := hashEntries[i:end]
+
+		s.processBatchOfChildren(batch, safetyMap, currentBlockHeight)
+	}
+
+	s.logger.Debugf("[batchVerifyChildrenSafety] Verified %d children: %d safe, %d not safe",
+		len(safetyMap), countTrue(safetyMap), countFalse(safetyMap))
+
+	return safetyMap
+}
+
+// childHashEntry holds a child transaction hash for batch processing
+type childHashEntry struct {
+	hexHash   string
+	hashBytes []byte
+}
+
+// processBatchOfChildren verifies a batch of child transactions
+func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[string]bool, currentBlockHeight uint32) {
 	// Create batch read operations
 	batchPolicy := aerospike.NewBatchPolicy()
 	batchPolicy.MaxRetries = 3
@@ -700,10 +752,12 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 	readPolicy := aerospike.NewBatchReadPolicy()
 	readPolicy.ReadModeSC = aerospike.ReadModeSCSession
 
-	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(lastSpenderHashes))
-	hashToKey := make(map[string]string, len(lastSpenderHashes)) // hex hash -> key for mapping
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(batch))
+	hashToKey := make(map[string]string, len(batch)) // hex hash -> key for mapping
 
-	for hexHash, hashBytes := range lastSpenderHashes {
+	for _, entry := range batch {
+		hexHash := entry.hexHash
+		hashBytes := entry.hashBytes
 		if len(hashBytes) != 32 {
 			s.logger.Warnf("[batchVerifyChildrenSafety] Invalid hash length for %s", hexHash)
 			safetyMap[hexHash] = false
@@ -733,20 +787,18 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 	}
 
 	if len(batchRecords) == 0 {
-		return safetyMap
+		return
 	}
 
 	// Execute batch operation
 	err := s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
-		s.logger.Errorf("[batchVerifyChildrenSafety] Batch operation failed: %v", err)
-		// Mark all as unsafe on batch error
-		for hexHash := range lastSpenderHashes {
-			if _, exists := safetyMap[hexHash]; !exists {
-				safetyMap[hexHash] = false
-			}
+		s.logger.Errorf("[processBatchOfChildren] Batch operation failed: %v", err)
+		// Mark all in this batch as unsafe on batch error
+		for hexHash := range hashToKey {
+			safetyMap[hexHash] = false
 		}
-		return safetyMap
+		return
 	}
 
 	// Process results - use configured retention setting as safety window
@@ -825,11 +877,6 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 			safetyMap[hexHash] = true
 		}
 	}
-
-	s.logger.Debugf("[batchVerifyChildrenSafety] Verified %d children: %d safe, %d not safe",
-		len(safetyMap), countTrue(safetyMap), countFalse(safetyMap))
-
-	return safetyMap
 }
 
 // Helper to count true values in map
