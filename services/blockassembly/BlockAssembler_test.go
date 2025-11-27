@@ -655,7 +655,7 @@ func setupBlockAssemblyTest(t *testing.T) *baTestItems {
 
 	// overwrite default subtree processor with a new one
 	ba.subtreeProcessor, err = subtreeprocessor.NewSubtreeProcessor(
-		context.Background(),
+		t.Context(),
 		ulogger.TestLogger{},
 		ba.settings,
 		nil,
@@ -672,6 +672,9 @@ func setupBlockAssemblyTest(t *testing.T) *baTestItems {
 			ba.subtreeProcessor.Stop(context.Background())
 		}
 	})
+
+	// Start the subtree processor
+	ba.subtreeProcessor.Start(t.Context())
 
 	items.blockAssembler = ba
 
