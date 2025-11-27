@@ -748,11 +748,11 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	require.NoError(t, err)
 
 	// Fill blockFoundCh to trigger the catchup path - send enough blocks so that
-	// when workers consume them, len(blockFoundCh) > 3 remains for threshold check
-	// With 10 concurrent workers on CI, need many more blocks to ensure len > 3
-	// when checked. Send 5 blocks to overwhelm the workers.
+	// when workers consume them, len(blockFoundCh) > 3 remains for threshold check.
+	// With 10 concurrent workers consuming in parallel, send 50 blocks to ensure
+	// len(blockFoundCh) > 3 is consistently true even under variable CI timing.
 	go func() {
-		for i := 0; i < 5; i++ {
+		for i := 0; i < 50; i++ {
 			blockFoundCh <- processBlockFound{
 				hash:    dummyBlock.Hash(),
 				baseURL: fmt.Sprintf("http://peer%d", i),
