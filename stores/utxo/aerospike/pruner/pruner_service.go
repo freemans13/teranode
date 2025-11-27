@@ -366,23 +366,29 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	s.logger.Infof("Worker %d: starting cleanup scan for height %d (delete_at_height <= %d)",
 		workerID, job.BlockHeight, safeCleanupHeight)
 
+	// Helper to submit a chunk for processing
+	submitChunk := func(chunkToProcess []*aerospike.Result) {
+		// Copy chunk for goroutine to avoid race
+		chunkCopy := make([]*aerospike.Result, len(chunkToProcess))
+		copy(chunkCopy, chunkToProcess)
+
+		chunkGroup.Go(func() error {
+			processed, err := s.processRecordChunk(job, workerID, chunkCopy)
+			if err != nil {
+				return err
+			}
+			recordCount.Add(int64(processed))
+			return nil
+		})
+	}
+
 	// Process records and accumulate into chunks
 	for {
 		rec, ok := <-result
 		if !ok || rec == nil {
 			// Process final chunk if any
 			if len(chunk) > 0 {
-				finalChunk := make([]*aerospike.Result, len(chunk))
-				copy(finalChunk, chunk)
-
-				chunkGroup.Go(func() error {
-					processed, err := s.processRecordChunk(job, workerID, finalChunk)
-					if err != nil {
-						return err
-					}
-					recordCount.Add(int64(processed))
-					return nil
-				})
+				submitChunk(chunk)
 			}
 			break
 		}
@@ -391,19 +397,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 		// Process chunk when full (in parallel)
 		if len(chunk) >= chunkSize {
-			// Copy chunk for goroutine to avoid race
-			currentChunk := make([]*aerospike.Result, len(chunk))
-			copy(currentChunk, chunk)
-
-			chunkGroup.Go(func() error {
-				processed, err := s.processRecordChunk(job, workerID, currentChunk)
-				if err != nil {
-					return err
-				}
-				recordCount.Add(int64(processed))
-				return nil
-			})
-
+			submitChunk(chunk)
 			chunk = chunk[:0] // Reset chunk
 		}
 	}
