@@ -873,12 +873,13 @@ func (b *BlockAssembler) AddTx(node subtree.Node, txInpoints subtree.TxInpoints)
 // RemoveTx removes a transaction from the block assembler.
 //
 // Parameters:
+//   - ctx: Context for the removal operation
 //   - hash: Hash of the transaction to remove
 //
 // Returns:
 //   - error: Any error encountered during removal
-func (b *BlockAssembler) RemoveTx(hash chainhash.Hash) error {
-	return b.subtreeProcessor.Remove(hash)
+func (b *BlockAssembler) RemoveTx(ctx context.Context, hash chainhash.Hash) error {
+	return b.subtreeProcessor.Remove(ctx, hash)
 }
 
 type resetRequest struct {

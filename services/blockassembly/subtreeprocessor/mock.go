@@ -162,8 +162,8 @@ func (m *MockSubtreeProcessor) Reorg(moveBackBlocks []*model.Block, modeUpBlocks
 }
 
 // Remove implements Interface.Remove
-func (m *MockSubtreeProcessor) Remove(hash chainhash.Hash) error {
-	args := m.Called(hash)
+func (m *MockSubtreeProcessor) Remove(ctx context.Context, hash chainhash.Hash) error {
+	args := m.Called(ctx, hash)
 	return args.Error(0)
 }
 
@@ -183,7 +183,7 @@ func (m *MockSubtreeProcessor) WaitForPendingBlocks(ctx context.Context) error {
 	return args.Error(0)
 }
 
-// Close implements Interface.Close
-func (m *MockSubtreeProcessor) Close() {
-	m.Called()
+// Stop implements Interface.Stop
+func (m *MockSubtreeProcessor) Stop(ctx context.Context) {
+	m.Called(ctx)
 }

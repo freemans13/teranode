@@ -54,12 +54,10 @@ func setupTestSubtreeProcessor(t *testing.T) *SubtreeProcessor {
 	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, nil, utxoStore, newSubtreeChan)
 	require.NoError(t, err)
 
-	// Start the processing goroutine
+	// Start processing and ensure cleanup
 	stp.Start(ctx)
-
-	// Ensure proper cleanup
 	t.Cleanup(func() {
-		stp.Close()
+		stp.Stop(context.Background())
 	})
 
 	return stp

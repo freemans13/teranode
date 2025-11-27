@@ -2154,7 +2154,7 @@ func Test_removeMap(t *testing.T) {
 
 			if i%33 == 0 {
 				// set this transaction to not be added
-				_ = stp.Remove(txHash)
+				_ = stp.Remove(context.Background(), txHash)
 				transactionsRemoved++
 			}
 		}
@@ -2328,10 +2328,10 @@ func BenchmarkAddNode(b *testing.B) {
 func BenchmarkAddNodeWithMap(b *testing.B) {
 	g, stp, txHashes := initTestAddNodeBenchmark(b)
 
-	_ = stp.Remove(txHashes[1000])
-	_ = stp.Remove(txHashes[2000])
-	_ = stp.Remove(txHashes[3000]) //nolint:gosec
-	_ = stp.Remove(txHashes[4000])
+	_ = stp.Remove(context.Background(), txHashes[1000])
+	_ = stp.Remove(context.Background(), txHashes[2000])
+	_ = stp.Remove(context.Background(), txHashes[3000]) //nolint:gosec
+	_ = stp.Remove(context.Background(), txHashes[4000])
 
 	for i := 0; i < 4; i++ {
 		txHash, err := generateTxHash()

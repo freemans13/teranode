@@ -669,7 +669,7 @@ func setupBlockAssemblyTest(t *testing.T) *baTestItems {
 	// Ensure SubtreeProcessor is properly cleaned up when test ends
 	t.Cleanup(func() {
 		if ba.subtreeProcessor != nil {
-			ba.subtreeProcessor.Close()
+			ba.subtreeProcessor.Stop(context.Background())
 		}
 	})
 
@@ -1931,7 +1931,7 @@ func TestBlockAssembly_RemoveTx(t *testing.T) {
 		txHash := tx.TxIDChainHash()
 
 		// Since RemoveTx returns an error, we can test it
-		err := testItems.blockAssembler.RemoveTx(*txHash)
+		err := testItems.blockAssembler.RemoveTx(t.Context(), *txHash)
 		// The error might be that the tx doesn't exist, which is fine for this test
 		_ = err
 	})
