@@ -23,12 +23,14 @@ import (
 func createTestSettings() *settings.Settings {
 	return &settings.Settings{
 		UtxoStore: settings.UtxoStoreSettings{
-			PrunerParentUpdateBatcherSize:           100,
-			PrunerParentUpdateBatcherDurationMillis: 10,
-			PrunerDeleteBatcherSize:                 256,
-			PrunerDeleteBatcherDurationMillis:       10,
-			PrunerMaxConcurrentOperations:           0,   //  0 = auto-detect from connection queue size
-			UtxoBatchSize:                           128, // Add missing UtxoBatchSize
+			UtxoBatchSize: 128,
+		},
+		Pruner: settings.PrunerSettings{
+			UTXOParentUpdateBatcherSize:           100,
+			UTXOParentUpdateBatcherDurationMillis: 10,
+			UTXODeleteBatcherSize:                 256,
+			UTXODeleteBatcherDurationMillis:       10,
+			UTXOMaxConcurrentOperations:           0, // 0 = auto-detect from connection queue size
 		},
 	}
 }

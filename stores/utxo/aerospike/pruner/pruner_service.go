@@ -165,9 +165,9 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	// - If setting is 0 or unset, use connection queue size
 	connectionQueueSize := opts.Client.GetConnectionQueueSize()
 	maxConcurrentOps := connectionQueueSize
-	if tSettings.UtxoStore.PrunerMaxConcurrentOperations > 0 {
-		if tSettings.UtxoStore.PrunerMaxConcurrentOperations < maxConcurrentOps {
-			maxConcurrentOps = tSettings.UtxoStore.PrunerMaxConcurrentOperations
+	if tSettings.Pruner.UTXOMaxConcurrentOperations > 0 {
+		if tSettings.Pruner.UTXOMaxConcurrentOperations < maxConcurrentOps {
+			maxConcurrentOps = tSettings.Pruner.UTXOMaxConcurrentOperations
 		}
 	}
 
@@ -517,7 +517,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 	g := &errgroup.Group{}
 	// Limit concurrent operations within each chunk to avoid overwhelming Aerospike
 	// Use configured limit, or default to reasonable concurrency (100) if set to 0
-	maxConcurrent := s.settings.UtxoStore.PrunerMaxConcurrentOperations
+	maxConcurrent := s.settings.Pruner.UTXOMaxConcurrentOperations
 	if maxConcurrent == 0 {
 		maxConcurrent = 100 // Default reasonable concurrency for record processing
 	}
