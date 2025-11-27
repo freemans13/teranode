@@ -333,7 +333,6 @@ func TestReChainSubtrees(t *testing.T) {
 		}
 	}()
 	subtreeStore, _ := null.New(ulogger.TestLogger{})
-	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 
 	tSettings := test.CreateBaseTestSettings(t)
@@ -342,11 +341,11 @@ func TestReChainSubtrees(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
 
-	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	utxoStore, err := sql.New(t.Context(), logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 
-	stp, _ := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
-	stp.Start(ctx)
+	stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+	stp.Start(t.Context())
 
 	// Create a common parent hash for all transactions
 	parentHash := chainhash.HashH([]byte("parent-tx"))
@@ -738,7 +737,6 @@ func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
 	}()
 
 	subtreeStore, _ := null.New(ulogger.TestLogger{})
-	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 
 	tSettings := test.CreateBaseTestSettings(t)
@@ -747,7 +745,7 @@ func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
 
-	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	utxoStore, err := sql.New(t.Context(), logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 
 	blockchainClient := &blockchain.Mock{}

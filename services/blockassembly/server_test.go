@@ -93,6 +93,10 @@ func TestCheckBlockAssembly(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		server, _, _, _ := setup(t)
 
+		// Start the block assembler so the subtree processor goroutine is running
+		err := server.blockAssembler.Start(t.Context())
+		require.NoError(t, err)
+
 		resp, err := server.CheckBlockAssembly(t.Context(), &blockassembly_api.EmptyMessage{})
 		require.NoError(t, err)
 
@@ -106,7 +110,7 @@ func TestCheckBlockAssembly(t *testing.T) {
 
 		mockSubtreeProcessor := &subtreeprocessor.MockSubtreeProcessor{}
 		mockSubtreeProcessor.On("CheckSubtreeProcessor").Return(errors.NewProcessingError("test error"))
-		mockSubtreeProcessor.On("Close").Return() // Expect Close() to be called during cleanup
+		mockSubtreeProcessor.On("Stop", mock.Anything).Return() // Expect Stop() to be called during cleanup
 
 		server.blockAssembler.subtreeProcessor = mockSubtreeProcessor
 
@@ -589,6 +593,10 @@ func TestGetBlockAssemblyStateCoverage(t *testing.T) {
 	server, _, _, _ := setup(t)
 	ctx := t.Context()
 
+	// Start the block assembler so the subtree processor goroutine is running
+	err := server.blockAssembler.Start(ctx)
+	require.NoError(t, err)
+
 	t.Run("get block assembly state", func(t *testing.T) {
 		resp, err := server.GetBlockAssemblyState(ctx, &blockassembly_api.EmptyMessage{})
 		if err == nil {
@@ -608,6 +616,10 @@ func TestGetBlockAssemblyStateCoverage(t *testing.T) {
 func TestGetBlockAssemblyTxsCoverage(t *testing.T) {
 	server, _, _, _ := setup(t)
 	ctx := t.Context()
+
+	// Start the block assembler so the subtree processor goroutine is running
+	err := server.blockAssembler.Start(ctx)
+	require.NoError(t, err)
 
 	t.Run("get block assembly transactions", func(t *testing.T) {
 		resp, err := server.GetBlockAssemblyTxs(ctx, &blockassembly_api.EmptyMessage{})
