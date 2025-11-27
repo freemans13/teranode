@@ -82,9 +82,6 @@ const (
 	PreserveUntil FieldName = "preserveUntil"
 	// DeletedChildren map of child records that have been deleted
 	DeletedChildren FieldName = "deletedChildren"
-	// LastSpender tracks the child transaction that spent the final output of this parent transaction.
-	// Used during cleanup to verify the spending child is mined and stable before deleting the parent.
-	LastSpender FieldName = "lastSpender"
 )
 
 // String returns the string representation of the FieldName.

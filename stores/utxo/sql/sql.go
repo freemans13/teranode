@@ -2087,7 +2087,6 @@ func createPostgresSchemaImpl(db DBExecutor) error {
         ,delete_at_height BIGINT
         ,unmined_since    BIGINT
         ,preserve_until   BIGINT
-        ,last_spender     BYTEA
         ,inserted_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 	  );
 	`); err != nil {
@@ -2283,19 +2282,6 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not add preserve_until column to transactions table - [%+v]", err)
 	}
 
-	// Add last_spender column to transactions table if it doesn't exist
-	if _, err := db.Exec(`
-		DO $$
-		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'transactions' AND column_name = 'last_spender') THEN
-				ALTER TABLE transactions ADD COLUMN last_spender BYTEA;
-			END IF;
-		END $$;
-	`); err != nil {
-		_ = db.Close()
-		return errors.NewStorageError("could not add last_spender column to transactions table - [%+v]", err)
-	}
-
 	// Drop the existing foreign key constraint if it exists
 	if _, err := db.Exec(`
 		DO $$
@@ -2364,7 +2350,6 @@ func createSqliteSchema(db *usql.DB) error {
         ,delete_at_height BIGINT
         ,unmined_since    BIGINT
         ,preserve_until   BIGINT
-        ,last_spender     BLOB
         ,inserted_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 	  );
 	`); err != nil {
@@ -2633,38 +2618,6 @@ func createSqliteSchema(db *usql.DB) error {
 		`); err != nil {
 			_ = db.Close()
 			return errors.NewStorageError("could not add preserve_until column to transactions table - [%+v]", err)
-		}
-	}
-
-	// Check if we need to add the last_spender column to transactions table
-	rows, err = db.Query(`
-		SELECT COUNT(*)
-		FROM pragma_table_info('transactions')
-		WHERE name = 'last_spender'
-	`)
-	if err != nil {
-		_ = db.Close()
-		return errors.NewStorageError("could not check transactions table for last_spender column - [%+v]", err)
-	}
-
-	var lastSpenderColumnCount int
-
-	if rows.Next() {
-		if err := rows.Scan(&lastSpenderColumnCount); err != nil {
-			_ = db.Close()
-			return errors.NewStorageError("could not scan last_spender column count - [%+v]", err)
-		}
-	}
-
-	rows.Close()
-
-	// Add last_spender column if it doesn't exist
-	if lastSpenderColumnCount == 0 {
-		if _, err := db.Exec(`
-			ALTER TABLE transactions ADD COLUMN last_spender BLOB;
-		`); err != nil {
-			_ = db.Close()
-			return errors.NewStorageError("could not add last_spender column to transactions table - [%+v]", err)
 		}
 	}
 
