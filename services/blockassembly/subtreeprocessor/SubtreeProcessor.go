@@ -256,6 +256,9 @@ type SubtreeProcessor struct {
 
 	// closeOnce ensures Close() is only executed once
 	closeOnce sync.Once
+
+	// startOnce ensures the processing goroutine is only started once
+	startOnce sync.Once
 }
 
 type State uint32
@@ -381,7 +384,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 		moveForwardBlockChan:     make(chan moveBlockRequest),
 		reorgBlockChan:           make(chan reorgBlocksRequest),
 		resetCh:                  make(chan *resetBlocks),
-		removeTxCh:               make(chan chainhash.Hash),
+		removeTxCh:               make(chan chainhash.Hash, 100),
 		lengthCh:                 make(chan chan int),
 		checkSubtreeProcessorCh:  make(chan chan error),
 		newSubtreeChan:           newSubtreeChan,
@@ -411,22 +414,38 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 		opts(stp)
 	}
 
-	stp.setCurrentRunningState(StateRunning)
+	// Goroutine does not start automatically - Start(ctx) must be called explicitly
+	// This ensures proper initialization order and avoids race conditions during loadUnminedTransactions
 
-	go func() {
-		// Recover from panics (e.g., send on closed channel during shutdown)
-		defer func() {
-			if r := recover(); r != nil {
-				logger.Warnf("[SubtreeProcessor] goroutine recovered from panic: %v", r)
-			}
-		}()
+	return stp, nil
+}
 
-		var (
-			err error
-		)
+// Start starts the main processing goroutine for the SubtreeProcessor.
+// This should be called after loading unmined transactions at startup to avoid race conditions.
+// For reset/reorg scenarios, the goroutine is already running and this is a no-op.
+//
+// Parameters:
+//   - ctx: Context for validation (should match the context used in NewSubtreeProcessor)
+func (stp *SubtreeProcessor) Start(ctx context.Context) {
+	stp.startOnce.Do(func() {
+		logger := stp.logger
 
-		for {
-			select {
+		stp.setCurrentRunningState(StateRunning)
+
+		go func() {
+			// Recover from panics (e.g., send on closed channel during shutdown)
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Warnf("[SubtreeProcessor] goroutine recovered from panic: %v", r)
+				}
+			}()
+
+			var (
+				err error
+			)
+
+			for {
+				select {
 			case <-stp.ctx.Done():
 				logger.Infof("[SubtreeProcessor] context cancelled, stopping processor")
 				stp.announcementTicker.Stop()
@@ -464,7 +483,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 
 					// Send announcement, respecting context cancellation
 					select {
-					case newSubtreeChan <- send:
+					case stp.newSubtreeChan <- send:
 						// Wait for a response to ensure proper synchronization.
 						// This prevents race conditions when mining initial blocks and running coinbase splitter together.
 						// Without this wait, getMiningCandidate creates subtrees in the background while
@@ -530,7 +549,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 				stp.setCurrentRunningState(StateReorg)
 				logger.Infof("[SubtreeProcessor] reorgReq subtree processor: %d, %d", len(reorgReq.moveBackBlocks), len(reorgReq.moveForwardBlocks))
 
-				reorgReq.errChan <- stp.reorgBlocks(ctx, reorgReq.moveBackBlocks, reorgReq.moveForwardBlocks)
+				reorgReq.errChan <- stp.reorgBlocks(stp.ctx, reorgReq.moveBackBlocks, reorgReq.moveForwardBlocks)
 
 				logger.Infof("[SubtreeProcessor] reorgReq subtree processor DONE: %d, %d", len(reorgReq.moveBackBlocks), len(reorgReq.moveForwardBlocks))
 				stp.setCurrentRunningState(StateRunning)
@@ -549,7 +568,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 				originalCurrentTxMap := stp.currentTxMap
 				currentBlockHeader := stp.currentBlockHeader
 
-				if _, err = stp.moveForwardBlock(ctx, moveForwardReq.block, false, processedConflictingHashesMap, false, true); err != nil {
+				if _, err = stp.moveForwardBlock(stp.ctx, moveForwardReq.block, false, processedConflictingHashesMap, false, true); err != nil {
 					// rollback to previous state
 					stp.chainedSubtrees = originalChainedSubtrees
 					stp.currentSubtree = originalCurrentSubtree
@@ -561,7 +580,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 				} else {
 					// Finalize block processing
 					// this will also set the current block header
-					stp.finalizeBlockProcessing(ctx, moveForwardReq.block)
+					stp.finalizeBlockProcessing(stp.ctx, moveForwardReq.block)
 				}
 
 				moveForwardReq.errChan <- err
@@ -585,7 +604,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 				// remove the given transaction from the subtrees
 				stp.setCurrentRunningState(StateRemoveTx)
 
-				if err = stp.removeTxFromSubtrees(ctx, removeTxHash); err != nil {
+				if err = stp.removeTxFromSubtrees(stp.ctx, removeTxHash); err != nil {
 					stp.logger.Errorf("[SubtreeProcessor] error removing tx from subtrees: %s", err.Error())
 				}
 
@@ -621,7 +640,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 
 					// Send announcement, but respect context cancellation
 					select {
-					case newSubtreeChan <- send:
+					case stp.newSubtreeChan <- send:
 						// Wait for response, also respecting context cancellation
 						select {
 						case <-send.ErrChan:
@@ -695,9 +714,8 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 				stp.setCurrentRunningState(StateRunning)
 			}
 		}
-	}()
-
-	return stp, nil
+		}()
+	})
 }
 
 // setCurrentRunningState updates the current operational state of the processor.
@@ -1465,7 +1483,13 @@ func (stp *SubtreeProcessor) Remove(hash chainhash.Hash) error {
 
 	// send a remove request to the subtree processor, making sure it does not block
 	go func() {
-		stp.removeTxCh <- hash
+		select {
+		case stp.removeTxCh <- hash:
+			// Successfully sent
+		case <-stp.ctx.Done():
+			// Context cancelled, don't block
+			return
+		}
 	}()
 
 	return nil

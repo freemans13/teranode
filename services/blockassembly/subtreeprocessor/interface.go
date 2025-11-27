@@ -46,6 +46,14 @@ type Interface interface {
 	//   - txInpoints: Transaction input points for dependency tracking
 	Add(node subtree.Node, txInpoints subtree.TxInpoints)
 
+	// Start starts the main processing goroutine for the SubtreeProcessor.
+	// This should be called after loading unmined transactions at startup to avoid race conditions.
+	// Uses sync.Once internally, so multiple calls are safe (only starts once).
+	//
+	// Parameters:
+	//   - ctx: Context for the processing goroutine
+	Start(ctx context.Context)
+
 	// AddDirectly adds a transaction node directly to the processor without
 	// using the queue. This is typically used for block assembly startup.
 	// It allows immediate processing of transactions without waiting for
