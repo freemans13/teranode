@@ -193,8 +193,8 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	s.logger.Infof("[SQLCleanupService %d] starting cleanup scan for height %d (delete_at_height <= %d)",
 		workerID, job.BlockHeight, safeCleanupHeight)
 
-	// Execute the cleanup with safe height (using child safety checking version)
-	count, err := s.deleteTombstoned(safeCleanupHeight)
+	// Execute the cleanup with safe height
+	deletedCount, err := s.deleteTombstoned(safeCleanupHeight)
 
 	if err != nil {
 		job.SetStatus(pruner.JobStatusFailed)
@@ -207,7 +207,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		job.Ended = time.Now()
 
 		s.logger.Infof("[SQLCleanupService %d] cleanup job completed for block height %d in %v - deleted %d records",
-			workerID, job.BlockHeight, time.Since(job.Started), count)
+			workerID, job.BlockHeight, time.Since(job.Started), deletedCount)
 	}
 }
 
