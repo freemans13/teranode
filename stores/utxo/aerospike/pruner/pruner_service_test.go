@@ -30,7 +30,7 @@ func createTestSettings() *settings.Settings {
 			UTXOParentUpdateBatcherDurationMillis: 10,
 			UTXODeleteBatcherSize:                 256,
 			UTXODeleteBatcherDurationMillis:       10,
-			UTXOMaxConcurrentOperations:           0, // 0 = auto-detect from connection queue size
+			UTXOMaxConcurrentOperations:           1,
 		},
 	}
 }
