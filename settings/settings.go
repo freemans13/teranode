@@ -436,7 +436,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UTXOParentUpdateBatcherDurationMillis: getInt("pruner_utxoParentUpdateBatcherDurationMillis", 100, alternativeContext...),
 			UTXODeleteBatcherSize:                 getInt("pruner_utxoDeleteBatcherSize", 5000, alternativeContext...),
 			UTXODeleteBatcherDurationMillis:       getInt("pruner_utxoDeleteBatcherDurationMillis", 100, alternativeContext...),
-			UTXOMaxConcurrentOperations:           getInt("pruner_utxoMaxConcurrentOperations", 0, alternativeContext...),
+			UTXOMaxConcurrentOperations:           getInt("pruner_utxoMaxConcurrentOperations", 1, alternativeContext...),
 			UTXODefensiveBatchReadSize:            getInt("pruner_utxoDefensiveBatchReadSize", 1024, alternativeContext...),
 		},
 		SubtreeValidation: SubtreeValidationSettings{

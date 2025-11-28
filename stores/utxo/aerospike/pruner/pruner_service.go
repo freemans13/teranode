@@ -80,9 +80,12 @@ type Options struct {
 }
 
 // Service manages background jobs for cleaning up records based on block height
+// Service implements the pruner.Service interface for Aerospike-backed UTXO stores.
+// This service extracts configuration values as fields during initialization rather than
+// storing the settings object, optimizing for performance in hot paths where settings
+// are accessed millions of times (e.g., utxoBatchSize in per-record processing loops).
 type Service struct {
 	logger      ulogger.Logger
-	settings    *settings.Settings
 	client      *uaerospike.Client
 	external    blob.Store
 	namespace   string
@@ -91,7 +94,17 @@ type Service struct {
 	ctx         context.Context
 	indexWaiter IndexWaiter
 
-	// internally reused variables
+	// Configuration values extracted from settings for performance
+	utxoBatchSize          int
+	blockHeightRetention   uint32
+	defensiveEnabled       bool
+	defensiveBatchReadSize int
+
+	// Cached field names (avoid repeated String() allocations in hot paths)
+	fieldTxID, fieldUtxos, fieldInputs, fieldDeletedChildren, fieldExternal        string
+	fieldDeleteAtHeight, fieldTotalExtraRecs, fieldUnminedSince, fieldBlockHeights string
+
+	// Internally reused variables
 	queryPolicy      *aerospike.QueryPolicy
 	writePolicy      *aerospike.WritePolicy
 	batchWritePolicy *aerospike.BatchWritePolicy
@@ -167,21 +180,8 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	// Use the configured batch policy from settings (configured via aerospike_batchPolicy URL)
 	batchPolicy := util.GetAerospikeBatchPolicy(tSettings)
 
-	// Determine max concurrent operations:
-	// - Use connection queue size as the upper bound (to prevent connection exhaustion)
-	// - If setting is configured (non-zero), use the minimum of setting and connection queue size
-	// - If setting is 0 or unset, use connection queue size
-	connectionQueueSize := opts.Client.GetConnectionQueueSize()
-	maxConcurrentOps := connectionQueueSize
-	if tSettings.Pruner.UTXOMaxConcurrentOperations > 0 {
-		if tSettings.Pruner.UTXOMaxConcurrentOperations < maxConcurrentOps {
-			maxConcurrentOps = tSettings.Pruner.UTXOMaxConcurrentOperations
-		}
-	}
-
 	service := &Service{
 		logger:                  opts.Logger,
-		settings:                tSettings,
 		client:                  opts.Client,
 		external:                opts.ExternalStore,
 		namespace:               opts.Namespace,
@@ -193,7 +193,20 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		batchWritePolicy:        batchWritePolicy,
 		batchPolicy:             batchPolicy,
 		getPersistedHeight:      opts.GetPersistedHeight,
-		maxConcurrentOperations: maxConcurrentOps,
+		maxConcurrentOperations: tSettings.Pruner.UTXOMaxConcurrentOperations,
+		utxoBatchSize:           tSettings.UtxoStore.UtxoBatchSize,
+		blockHeightRetention:    tSettings.GetUtxoStoreBlockHeightRetention(),
+		defensiveEnabled:        tSettings.Pruner.UTXODefensiveEnabled,
+		defensiveBatchReadSize:  tSettings.Pruner.UTXODefensiveBatchReadSize,
+		fieldTxID:               fields.TxID.String(),
+		fieldUtxos:              fields.Utxos.String(),
+		fieldInputs:             fields.Inputs.String(),
+		fieldDeletedChildren:    fields.DeletedChildren.String(),
+		fieldExternal:           fields.External.String(),
+		fieldDeleteAtHeight:     fields.DeleteAtHeight.String(),
+		fieldTotalExtraRecs:     fields.TotalExtraRecs.String(),
+		fieldUnminedSince:       fields.UnminedSince.String(),
+		fieldBlockHeights:       fields.BlockHeights.String(),
 	}
 
 	// Create the job processor function
@@ -316,7 +329,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 		// Only apply limitation if block persister has actually processed blocks (height > 0)
 		if persistedHeight > 0 {
-			retention := s.settings.GetUtxoStoreBlockHeightRetention()
+			retention := s.blockHeightRetention
 
 			// Calculate max safe height: persisted_height + retention
 			// Block persister at height N means blocks 0 to N are persisted in .subtree_data files.
@@ -333,15 +346,15 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	// Create a query statement
 	stmt := aerospike.NewStatement(s.namespace, s.set)
 	// Conditionally fetch Utxos and DeletedChildren bins only when defensive mode is enabled (for child verification)
-	binNames := []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String(), fields.TotalExtraRecs.String()}
-	if s.settings.Pruner.UTXODefensiveEnabled {
-		binNames = append(binNames, fields.Utxos.String(), fields.DeletedChildren.String())
+	binNames := []string{s.fieldTxID, s.fieldDeleteAtHeight, s.fieldInputs, s.fieldExternal, s.fieldTotalExtraRecs}
+	if s.defensiveEnabled {
+		binNames = append(binNames, s.fieldUtxos, s.fieldDeletedChildren)
 	}
 	stmt.BinNames = binNames
 
 	// Set the filter to find records with a delete_at_height less than or equal to the safe cleanup height
 	// This will automatically use the index since the filter is on the indexed bin
-	err := stmt.SetFilter(aerospike.NewRangeFilter(fields.DeleteAtHeight.String(), 1, int64(safeCleanupHeight)))
+	err := stmt.SetFilter(aerospike.NewRangeFilter(s.fieldDeleteAtHeight, 1, int64(safeCleanupHeight)))
 	if err != nil {
 		job.SetStatus(pruner.JobStatusFailed)
 		job.Error = err
@@ -467,7 +480,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 	var safetyMap map[string]bool
 	var parentToChildren map[string][]string
 
-	if !s.settings.Pruner.UTXODefensiveEnabled {
+	if !s.defensiveEnabled {
 		// Defensive mode disabled - allow all deletions without child verification
 		safetyMap = make(map[string]bool)
 		parentToChildren = make(map[string][]string)
@@ -475,9 +488,9 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 		// Step 1: Extract ALL unique spending children from chunk
 		// For each parent record, we extract all spending child TX hashes from spent UTXOs
 		// We must verify EVERY child is stable before deleting the parent
-		uniqueSpendingChildren := make(map[string][]byte) // hex hash -> bytes
-		parentToChildren = make(map[string][]string)      // parent record key -> child hashes
-		deletedChildren := make(map[string]bool)          // child hash -> already deleted
+		uniqueSpendingChildren := make(map[string][]byte, 100)   // hex hash -> bytes (typical: ~50-100 children per chunk)
+		parentToChildren = make(map[string][]string, len(chunk)) // parent record key -> child hashes
+		deletedChildren := make(map[string]bool, 20)             // child hash -> already deleted (typical: 0-20)
 
 		for _, rec := range chunk {
 			if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
@@ -486,7 +499,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 
 			// Extract deletedChildren map from parent record
 			// If a child is in this map, it means it was already pruned and shouldn't block parent deletion
-			if deletedChildrenRaw, hasDeleted := rec.Record.Bins[fields.DeletedChildren.String()]; hasDeleted {
+			if deletedChildrenRaw, hasDeleted := rec.Record.Bins[s.fieldDeletedChildren]; hasDeleted {
 				if deletedMap, ok := deletedChildrenRaw.(map[interface{}]interface{}); ok {
 					for childHashIface := range deletedMap {
 						if childHashStr, ok := childHashIface.(string); ok {
@@ -500,7 +513,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 			}
 
 			// Extract all spending children from this parent's UTXOs
-			utxosRaw, hasUtxos := rec.Record.Bins[fields.Utxos.String()]
+			utxosRaw, hasUtxos := rec.Record.Bins[s.fieldUtxos]
 			if !hasUtxos {
 				continue
 			}
@@ -511,7 +524,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 			}
 
 			parentKey := rec.Record.Key.String()
-			childrenForThisParent := make([]string, 0)
+			childrenForThisParent := make([]string, 0, 16) // Pre-allocate for typical ~10 spent UTXOs per tx
 
 			// Scan all UTXOs for spending data
 			for _, utxoRaw := range utxosList {
@@ -557,12 +570,8 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 	// Step 3: Process deletions using the safety map
 	g := &errgroup.Group{}
 	// Limit concurrent operations within each chunk to avoid overwhelming Aerospike
-	// Use configured limit, or default to reasonable concurrency (100) if set to 0
-	maxConcurrent := s.settings.Pruner.UTXOMaxConcurrentOperations
-	if maxConcurrent == 0 {
-		maxConcurrent = 100 // Default reasonable concurrency for record processing
-	}
-	util.SafeSetLimit(g, maxConcurrent)
+	// Use pre-calculated limit from service initialization
+	util.SafeSetLimit(g, s.maxConcurrentOperations)
 
 	processedCount := atomic.Int64{}
 
@@ -597,7 +606,7 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 		return errors.NewProcessingError("Worker %d: missing bins for record in pruner job %d", workerID, job.BlockHeight)
 	}
 
-	txIDBytes, ok := bins[fields.TxID.String()].([]byte)
+	txIDBytes, ok := bins[s.fieldTxID].([]byte)
 	if !ok || len(txIDBytes) != 32 {
 		return errors.NewProcessingError("Worker %d: invalid or missing txid for record in pruner job %d", workerID, job.BlockHeight)
 	}
@@ -606,6 +615,9 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 	if err != nil {
 		return errors.NewProcessingError("Worker %d: invalid txid bytes for record in pruner job %d", workerID, job.BlockHeight)
 	}
+
+	// Cache txHash string conversion (used multiple times in this function)
+	txHashStr := txHash.String()
 
 	// Verify ALL spending children are stable before deleting parent
 	// We extract all children from the parent's spent UTXOs and verify EVERY one is stable
@@ -620,7 +632,7 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 				// At least one child not yet stable - skip deletion for now
 				// Parent will be reconsidered in future cleanup passes
 				s.logger.Debugf("Worker %d: skipping deletion of parent %s - child %s not yet safe (%d children total)",
-					workerID, txHash.String(), childHash[:8], len(childrenHashes))
+					workerID, txHashStr, childHash[:8], len(childrenHashes))
 				return nil
 			}
 		}
@@ -633,11 +645,11 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 	}
 
 	// Build parent updates and deletions using main's batch accumulation pattern
-	parentUpdates := make(map[string]*parentUpdateInfo)
+	parentUpdates := make(map[string]*parentUpdateInfo, len(inputs)) // One parent per input (worst case)
 
 	// Accumulate parent updates
 	for _, input := range inputs {
-		keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.settings.UtxoStore.UtxoBatchSize)
+		keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.utxoBatchSize)
 		parentKeyStr := string(keySource)
 
 		if existing, ok := parentUpdates[parentKeyStr]; ok {
@@ -656,7 +668,7 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 
 	// Handle external transactions: add file for deletion
 	externalFiles := make([]*externalFileInfo, 0)
-	external, isExternal := bins[fields.External.String()].(bool)
+	external, isExternal := bins[s.fieldExternal].(bool)
 	if isExternal && external {
 		// Determine file type: if we found inputs, it's a .tx file, otherwise it's .outputs
 		fileType := fileformat.FileTypeOutputs
@@ -673,19 +685,19 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 	deletions := []*aerospike.Key{rec.Record.Key}
 
 	// If this is a multi-record transaction, delete all child records
-	totalExtraRecs, hasExtraRecs := bins[fields.TotalExtraRecs.String()].(int)
+	totalExtraRecs, hasExtraRecs := bins[s.fieldTotalExtraRecs].(int)
 	if hasExtraRecs && totalExtraRecs > 0 {
 		// Generate keys for all child records: txid_1, txid_2, ..., txid_N
 		for i := 1; i <= totalExtraRecs; i++ {
 			childKeySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
 			childKey, err := aerospike.NewKey(s.namespace, s.set, childKeySource)
 			if err != nil {
-				s.logger.Errorf("Worker %d: failed to create child key for %s_%d: %v", workerID, txHash.String(), i, err)
+				s.logger.Errorf("Worker %d: failed to create child key for %s_%d: %v", workerID, txHashStr, i, err)
 				continue
 			}
 			deletions = append(deletions, childKey)
 		}
-		s.logger.Debugf("Worker %d: deleting external tx %s with %d child records", workerID, txHash.String(), totalExtraRecs)
+		s.logger.Debugf("Worker %d: deleting external tx %s with %d child records", workerID, txHashStr, totalExtraRecs)
 	}
 
 	// Execute parent updates and deletion
@@ -694,7 +706,7 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 		ctx = context.Background()
 	}
 	if err := s.flushCleanupBatches(ctx, workerID, job.BlockHeight, parentUpdates, deletions, externalFiles); err != nil {
-		return errors.NewProcessingError("Worker %d: error flushing operations for tx %s: %v", workerID, txHash.String(), err)
+		return errors.NewProcessingError("Worker %d: error flushing operations for tx %s: %v", workerID, txHashStr, err)
 	}
 
 	return nil
@@ -731,7 +743,6 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 		if _, exists := lastSpenderHashes[hexHash]; exists {
 			safetyMap[hexHash] = true
 			markedSafeCount++
-			s.logger.Debugf("[batchVerifyChildrenSafety] Marked deleted child as safe: %s", hexHash[:8])
 		} else {
 			s.logger.Debugf("[batchVerifyChildrenSafety] Deleted child %s not in lastSpenderHashes (not a child of any parent in this chunk)", hexHash[:8])
 		}
@@ -741,7 +752,7 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 	}
 
 	// Process children in batches to avoid overwhelming Aerospike
-	batchSize := s.settings.Pruner.UTXODefensiveBatchReadSize
+	batchSize := s.defensiveBatchReadSize
 	if batchSize <= 0 {
 		batchSize = 1024 // Default batch size if not configured
 	}
@@ -819,7 +830,7 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 		batchRecords = append(batchRecords, aerospike.NewBatchRead(
 			readPolicy,
 			key,
-			[]string{fields.UnminedSince.String(), fields.BlockHeights.String()},
+			[]string{s.fieldUnminedSince, s.fieldBlockHeights},
 		))
 		hashToKey[hexHash] = key.String()
 	}
@@ -840,18 +851,18 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 	}
 
 	// Process results - use configured retention setting as safety window
-	safetyWindow := s.settings.GetUtxoStoreBlockHeightRetention()
+	safetyWindow := s.blockHeightRetention
+
+	// Build reverse map for O(1) lookup instead of O(n²) nested loop
+	// This avoids scanning all batch records for each child hash
+	keyToRecord := make(map[string]*aerospike.BatchRecord, len(batchRecords))
+	for _, batchRec := range batchRecords {
+		keyToRecord[batchRec.BatchRec().Key.String()] = batchRec.BatchRec()
+	}
 
 	for hexHash, keyStr := range hashToKey {
-		// Find the batch record for this key
-		var record *aerospike.BatchRecord
-		for _, batchRec := range batchRecords {
-			if batchRec.BatchRec().Key.String() == keyStr {
-				record = batchRec.BatchRec()
-				break
-			}
-		}
-
+		// O(1) map lookup instead of O(n) scan
+		record := keyToRecord[keyStr]
 		if record == nil {
 			safetyMap[hexHash] = false
 			continue
@@ -868,7 +879,6 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 				if aerospikeErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
 					// Child already deleted by another chunk - safe to proceed with parent deletion
 					safetyMap[hexHash] = true
-					s.logger.Debugf("[batchVerifyChildrenSafety] Child %s not found (already deleted) - marking as safe", hexHash[:8])
 					continue
 				}
 			}
@@ -886,7 +896,7 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 		bins := record.Record.Bins
 
 		// Check unmined status
-		unminedSince, hasUnminedSince := bins[fields.UnminedSince.String()]
+		unminedSince, hasUnminedSince := bins[s.fieldUnminedSince]
 		if hasUnminedSince && unminedSince != nil {
 			// Child is unmined, not safe
 			safetyMap[hexHash] = false
@@ -894,7 +904,7 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 		}
 
 		// Check block heights
-		blockHeightsRaw, hasBlockHeights := bins[fields.BlockHeights.String()]
+		blockHeightsRaw, hasBlockHeights := bins[s.fieldBlockHeights]
 		if !hasBlockHeights {
 			// No block heights, treat as not safe
 			safetyMap[hexHash] = false
@@ -955,7 +965,7 @@ func countFalse(m map[string]bool) int {
 func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
 	var inputs []*bt.Input
 
-	external, ok := bins[fields.External.String()].(bool)
+	external, ok := bins[s.fieldExternal].(bool)
 	if ok && external {
 		// transaction is external, we need to get the data from the external store
 		txBytes, err := s.external.Get(s.ctx, txHash.CloneBytes(), fileformat.FileTypeTx)
@@ -989,7 +999,7 @@ func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerosp
 		inputs = tx.Inputs
 	} else {
 		// get the inputs from the record directly
-		inputsValue := bins[fields.Inputs.String()]
+		inputsValue := bins[s.fieldInputs]
 		if inputsValue == nil {
 			// Inputs field might be nil for certain records (e.g., coinbase)
 			return []*bt.Input{}, nil
@@ -1051,7 +1061,7 @@ func (s *Service) flushCleanupBatches(ctx context.Context, workerID int, blockHe
 
 // extractTxHash extracts the transaction hash from record bins
 func (s *Service) extractTxHash(bins aerospike.BinMap) (*chainhash.Hash, error) {
-	txIDBytes, ok := bins[fields.TxID.String()].([]byte)
+	txIDBytes, ok := bins[s.fieldTxID].([]byte)
 	if !ok || len(txIDBytes) != 32 {
 		return nil, errors.NewProcessingError("invalid or missing txid")
 	}
@@ -1084,7 +1094,7 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, b
 		// For each child transaction being deleted, add it to the DeletedChildren map
 		ops := make([]*aerospike.Operation, len(info.childHashes))
 		for i, childHash := range info.childHashes {
-			ops[i] = aerospike.MapPutOp(mapPolicy, fields.DeletedChildren.String(),
+			ops[i] = aerospike.MapPutOp(mapPolicy, s.fieldDeletedChildren,
 				aerospike.NewStringValue(childHash.String()), aerospike.BoolValue(true))
 		}
 
@@ -1240,9 +1250,9 @@ func (s *Service) ProcessSingleRecord(txHash *chainhash.Hash, inputs []*bt.Input
 	}
 
 	// Build parent updates map
-	parentUpdates := make(map[string]*parentUpdateInfo)
+	parentUpdates := make(map[string]*parentUpdateInfo, len(inputs)) // One parent per input (worst case)
 	for _, input := range inputs {
-		keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.settings.UtxoStore.UtxoBatchSize)
+		keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.utxoBatchSize)
 		parentKeyStr := string(keySource)
 
 		if existing, ok := parentUpdates[parentKeyStr]; ok {
