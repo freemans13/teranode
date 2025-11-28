@@ -15,6 +15,9 @@ type Service interface {
 	// SetPersistedHeightGetter sets the function used to get block persister progress.
 	// This allows pruner to coordinate with block persister to avoid premature deletion.
 	SetPersistedHeightGetter(getter func() uint32)
+
+	// GetJobByHeight returns a job for the specified block height
+	GetJobByHeight(blockHeight uint32) *Job
 }
 
 // PrunerServiceProvider defines an interface for stores that can provide a pruner service.

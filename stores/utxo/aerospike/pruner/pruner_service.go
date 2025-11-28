@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
+	"github.com/aerospike/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -331,10 +332,10 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 	// Create a query statement
 	stmt := aerospike.NewStatement(s.namespace, s.set)
-	// Conditionally fetch Utxos bin only when defensive mode is enabled (for child verification)
+	// Conditionally fetch Utxos and DeletedChildren bins only when defensive mode is enabled (for child verification)
 	binNames := []string{fields.TxID.String(), fields.DeleteAtHeight.String(), fields.Inputs.String(), fields.External.String(), fields.TotalExtraRecs.String()}
 	if s.settings.Pruner.UTXODefensiveEnabled {
-		binNames = append(binNames, fields.Utxos.String())
+		binNames = append(binNames, fields.Utxos.String(), fields.DeletedChildren.String())
 	}
 	stmt.BinNames = binNames
 
@@ -444,8 +445,9 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 	finalRecordCount := recordCount.Load()
 
-	// Set job status
+	// Set job status and record count
 	job.SetStatus(pruner.JobStatusCompleted)
+	job.RecordsProcessed.Store(finalRecordCount)
 	job.Ended = time.Now()
 
 	s.logger.Infof("Worker %d completed cleanup job for block height %d in %v, processed %d records",
@@ -475,10 +477,26 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 		// We must verify EVERY child is stable before deleting the parent
 		uniqueSpendingChildren := make(map[string][]byte) // hex hash -> bytes
 		parentToChildren = make(map[string][]string)      // parent record key -> child hashes
+		deletedChildren := make(map[string]bool)          // child hash -> already deleted
 
 		for _, rec := range chunk {
 			if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
 				continue
+			}
+
+			// Extract deletedChildren map from parent record
+			// If a child is in this map, it means it was already pruned and shouldn't block parent deletion
+			if deletedChildrenRaw, hasDeleted := rec.Record.Bins[fields.DeletedChildren.String()]; hasDeleted {
+				if deletedMap, ok := deletedChildrenRaw.(map[interface{}]interface{}); ok {
+					for childHashIface := range deletedMap {
+						if childHashStr, ok := childHashIface.(string); ok {
+							deletedChildren[childHashStr] = true
+							// s.logger.Debugf("Worker %d: Found deleted child in parent record: %s", workerID, childHashStr[:8])
+						}
+					}
+				} else {
+					s.logger.Debugf("Worker %d: deletedChildren bin wrong type: %T", workerID, deletedChildrenRaw)
+				}
 			}
 
 			// Extract all spending children from this parent's UTXOs
@@ -518,6 +536,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 					hexHash := chainhash.Hash(childTxHashBytes).String()
 					uniqueSpendingChildren[hexHash] = childTxHashBytes
 					childrenForThisParent = append(childrenForThisParent, hexHash)
+					// s.logger.Debugf("Worker %d: Extracted spending child from UTXO: %s", workerID, hexHash[:8])
 				}
 			}
 
@@ -528,8 +547,8 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 
 		// Step 2: Batch verify all unique children (single BatchGet call for entire chunk)
 		if len(uniqueSpendingChildren) > 0 {
-			safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, job.BlockHeight)
-			s.logger.Debugf("Worker %d: batch verified %d unique children from chunk of %d records", workerID, len(uniqueSpendingChildren), len(chunk))
+			safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, job.BlockHeight, deletedChildren)
+			s.logger.Debugf("Worker %d: batch verified %d unique children from chunk of %d records (%d already deleted)", workerID, len(uniqueSpendingChildren), len(chunk), len(deletedChildren))
 		} else {
 			safetyMap = make(map[string]bool)
 		}
@@ -605,9 +624,6 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 				return nil
 			}
 		}
-
-		s.logger.Debugf("Worker %d: all %d children verified stable for parent %s - proceeding with deletion",
-			workerID, len(childrenHashes), txHash.String())
 	}
 
 	// Safe to delete - get inputs for parent update
@@ -700,12 +716,29 @@ func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID in
 //
 // Returns:
 //   - map[string]bool: Map of childHash (hex string) -> isSafe (true = this child is stable)
-func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte, currentBlockHeight uint32) map[string]bool {
+func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte, currentBlockHeight uint32, deletedChildren map[string]bool) map[string]bool {
 	if len(lastSpenderHashes) == 0 {
 		return make(map[string]bool)
 	}
 
 	safetyMap := make(map[string]bool, len(lastSpenderHashes))
+
+	// Mark already-deleted children as safe immediately
+	// If a child is in deletedChildren, it means it was already pruned successfully
+	// and shouldn't block the parent from being pruned
+	markedSafeCount := 0
+	for hexHash := range deletedChildren {
+		if _, exists := lastSpenderHashes[hexHash]; exists {
+			safetyMap[hexHash] = true
+			markedSafeCount++
+			s.logger.Debugf("[batchVerifyChildrenSafety] Marked deleted child as safe: %s", hexHash[:8])
+		} else {
+			s.logger.Debugf("[batchVerifyChildrenSafety] Deleted child %s not in lastSpenderHashes (not a child of any parent in this chunk)", hexHash[:8])
+		}
+	}
+	if markedSafeCount > 0 {
+		s.logger.Infof("[batchVerifyChildrenSafety] Marked %d already-deleted children as safe", markedSafeCount)
+	}
 
 	// Process children in batches to avoid overwhelming Aerospike
 	batchSize := s.settings.Pruner.UTXODefensiveBatchReadSize
@@ -713,9 +746,14 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 		batchSize = 1024 // Default batch size if not configured
 	}
 
-	// Convert map to slice for batching
+	// Convert map to slice for batching, skipping already-deleted children
+	// Children in deletedChildren are already marked as safe, no need to query Aerospike
 	hashEntries := make([]childHashEntry, 0, len(lastSpenderHashes))
 	for hexHash, hashBytes := range lastSpenderHashes {
+		// Skip children that are already marked as safe (deleted)
+		if safetyMap[hexHash] {
+			continue
+		}
 		hashEntries = append(hashEntries, childHashEntry{hexHash: hexHash, hashBytes: hashBytes})
 	}
 
@@ -820,9 +858,22 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 		}
 
 		if record.Err != nil {
-			// Any error (including child not found) → be conservative, don't delete parent
-			// Even if child was deleted, it might be restored during a reorg
-			// We only delete parent after POSITIVE verification of child stability
+			// Check if this is a "key not found" error - child was already deleted
+			// This can happen due to race conditions when processing chunks in parallel:
+			// - Chunk 1 deletes child C and updates parent A's deletedChildren
+			// - Chunk 2 already loaded parent A (before the update) and now queries child C
+			// - Child C is gone, so we get KEY_NOT_FOUND_ERROR
+			// In this case, the child is ALREADY deleted, so it's safe to consider it stable
+			if aerospikeErr, ok := record.Err.(*aerospike.AerospikeError); ok {
+				if aerospikeErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
+					// Child already deleted by another chunk - safe to proceed with parent deletion
+					safetyMap[hexHash] = true
+					s.logger.Debugf("[batchVerifyChildrenSafety] Child %s not found (already deleted) - marking as safe", hexHash[:8])
+					continue
+				}
+			}
+			// Any other error → be conservative, don't delete parent
+			s.logger.Warnf("[batchVerifyChildrenSafety] Unexpected error for child %s: %v", hexHash[:8], record.Err)
 			safetyMap[hexHash] = false
 			continue
 		}
@@ -1215,4 +1266,9 @@ func (s *Service) ProcessSingleRecord(txHash *chainhash.Hash, inputs []*bt.Input
 // GetJobs returns a copy of the current jobs list (primarily for testing)
 func (s *Service) GetJobs() []*pruner.Job {
 	return s.jobManager.GetJobs()
+}
+
+// GetJobByHeight returns a job for the specified block height
+func (s *Service) GetJobByHeight(blockHeight uint32) *pruner.Job {
+	return s.jobManager.GetJobByHeight(blockHeight)
 }

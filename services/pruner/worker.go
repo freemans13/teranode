@@ -115,7 +115,12 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 						s.logger.Warnf("Pruner for height %d finished with status: %s", latestHeight, status)
 						prunerErrors.WithLabelValues("dah_pruner").Inc()
 					} else {
-						s.logger.Infof("Pruner for height %d completed successfully", latestHeight)
+						// Get job info to log records processed
+						recordsProcessed := int64(0)
+						if job := s.prunerService.GetJobByHeight(latestHeight); job != nil {
+							recordsProcessed = job.RecordsProcessed.Load()
+						}
+						s.logger.Infof("Pruner for height %d completed successfully, pruned %d records", latestHeight, recordsProcessed)
 						prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
 						prunerProcessed.Inc()
 					}

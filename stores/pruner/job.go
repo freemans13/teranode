@@ -38,15 +38,16 @@ func (s JobStatus) String() string {
 
 // Job represents a pruner job
 type Job struct {
-	BlockHeight uint32
-	status      atomic.Int32 // Using atomic for thread-safe access
-	Error       error
-	Created     time.Time
-	Started     time.Time
-	Ended       time.Time
-	ctx         context.Context
-	cancel      context.CancelFunc
-	DoneCh      chan string // Channel to signal when the job is complete (for testing purposes)
+	BlockHeight      uint32
+	status           atomic.Int32 // Using atomic for thread-safe access
+	RecordsProcessed atomic.Int64 // Number of records processed/pruned
+	Error            error
+	Created          time.Time
+	Started          time.Time
+	Ended            time.Time
+	ctx              context.Context
+	cancel           context.CancelFunc
+	DoneCh           chan string // Channel to signal when the job is complete (for testing purposes)
 }
 
 // GetStatus returns the current status of the job

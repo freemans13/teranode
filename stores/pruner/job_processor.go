@@ -286,6 +286,20 @@ func (m *JobManager) GetJobs() []*Job {
 	return clone
 }
 
+// GetJobByHeight returns a job for the specified block height
+func (m *JobManager) GetJobByHeight(blockHeight uint32) *Job {
+	m.jobsMutex.RLock()
+	defer m.jobsMutex.RUnlock()
+
+	for _, job := range m.jobs {
+		if job.BlockHeight == blockHeight {
+			return job
+		}
+	}
+
+	return nil
+}
+
 // worker processes jobs from the queue
 func (m *JobManager) worker(workerID int) {
 	m.logger.Debugf("[JobManager] Worker %d started", workerID)

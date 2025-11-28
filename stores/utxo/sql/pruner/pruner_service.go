@@ -140,6 +140,11 @@ func (s *Service) GetJobs() []*pruner.Job {
 	return s.jobManager.GetJobs()
 }
 
+// GetJobByHeight returns a job for the specified block height
+func (s *Service) GetJobByHeight(blockHeight uint32) *pruner.Job {
+	return s.jobManager.GetJobByHeight(blockHeight)
+}
+
 // processCleanupJob executes the cleanup for a specific job
 func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	s.logger.Debugf("[SQLCleanupService %d] running cleanup job for block height %d", workerID, job.BlockHeight)
@@ -204,6 +209,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		s.logger.Errorf("[SQLCleanupService %d] cleanup job failed for block height %d: %v", workerID, job.BlockHeight, err)
 	} else {
 		job.SetStatus(pruner.JobStatusCompleted)
+		job.RecordsProcessed.Store(deletedCount)
 		job.Ended = time.Now()
 
 		s.logger.Infof("[SQLCleanupService %d] cleanup job completed for block height %d in %v - deleted %d records",
