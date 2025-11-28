@@ -25,6 +25,7 @@ const (
 // Service implements the utxo.CleanupService interface for SQL-based UTXO stores
 type Service struct {
 	safetyWindow       uint32 // Block height retention for child stability verification
+	defensiveEnabled   bool   // Enable defensive checks before deleting UTXO transactions
 	logger             ulogger.Logger
 	settings           *settings.Settings
 	db                 *usql.DB
@@ -86,11 +87,12 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	}
 
 	service := &Service{
-		safetyWindow: safetyWindow,
-		logger:       opts.Logger,
-		settings:     tSettings,
-		db:           opts.DB,
-		ctx:          opts.Ctx,
+		safetyWindow:     safetyWindow,
+		defensiveEnabled: tSettings.Pruner.UTXODefensiveEnabled,
+		logger:           opts.Logger,
+		settings:         tSettings,
+		db:               opts.DB,
+		ctx:              opts.Ctx,
 	}
 
 	// Create the job processor function
@@ -223,41 +225,55 @@ func (s *Service) deleteTombstoned(blockHeight uint32) (int64, error) {
 	// Use configured safety window from settings
 	safetyWindow := s.safetyWindow
 
-	// Delete transactions that have passed their expiration time
-	// Only delete if ALL spending children are verified as stable
-	// This prevents orphaning any child transaction
+	// Defensive child verification is conditional on the UTXODefensiveEnabled setting
+	// When disabled, parents are deleted without verifying children are stable
+	var deleteQuery string
+	var result interface{ RowsAffected() (int64, error) }
+	var err error
 
-	deleteQuery := `
-		DELETE FROM transactions
-		WHERE id IN (
-			SELECT t.id
-			FROM transactions t
-			WHERE t.delete_at_height IS NOT NULL
-			  AND t.delete_at_height <= $1
-			  AND NOT EXISTS (
-			    -- Find ANY unstable child - if found, parent cannot be deleted
-			    -- This ensures ALL children must be stable before parent deletion
-			    SELECT 1
-			    FROM outputs o
-			    WHERE o.transaction_id = t.id
-			      AND o.spending_data IS NOT NULL
-			      AND (
-			        -- Extract child TX hash from spending_data (first 32 bytes)
-			        -- Check if this child is NOT stable
-			        NOT EXISTS (
-			          SELECT 1
-			          FROM transactions child
-			          INNER JOIN block_ids child_blocks ON child.id = child_blocks.transaction_id
-			          WHERE child.hash = substr(o.spending_data, 1, 32)
-			            AND child.unmined_since IS NULL  -- Child must be mined
-			            AND child_blocks.block_height <= ($1 - $2)  -- Child must be stable
-			        )
-			      )
-			  )
-		)
-	`
+	if !s.defensiveEnabled {
+		// Defensive mode disabled - delete all transactions past their expiration
+		deleteQuery = `
+			DELETE FROM transactions
+			WHERE delete_at_height IS NOT NULL
+			  AND delete_at_height <= $1
+		`
+		result, err = s.db.Exec(deleteQuery, blockHeight)
+	} else {
+		// Defensive mode enabled - verify ALL spending children are stable before deletion
+		// This prevents orphaning any child transaction
+		deleteQuery = `
+			DELETE FROM transactions
+			WHERE id IN (
+				SELECT t.id
+				FROM transactions t
+				WHERE t.delete_at_height IS NOT NULL
+				  AND t.delete_at_height <= $1
+				  AND NOT EXISTS (
+				    -- Find ANY unstable child - if found, parent cannot be deleted
+				    -- This ensures ALL children must be stable before parent deletion
+				    SELECT 1
+				    FROM outputs o
+				    WHERE o.transaction_id = t.id
+				      AND o.spending_data IS NOT NULL
+				      AND (
+				        -- Extract child TX hash from spending_data (first 32 bytes)
+				        -- Check if this child is NOT stable
+				        NOT EXISTS (
+				          SELECT 1
+				          FROM transactions child
+				          INNER JOIN block_ids child_blocks ON child.id = child_blocks.transaction_id
+				          WHERE child.hash = substr(o.spending_data, 1, 32)
+				            AND child.unmined_since IS NULL  -- Child must be mined
+				            AND child_blocks.block_height <= ($1 - $2)  -- Child must be stable
+				        )
+				      )
+				  )
+			)
+		`
+		result, err = s.db.Exec(deleteQuery, blockHeight, safetyWindow)
+	}
 
-	result, err := s.db.Exec(deleteQuery, blockHeight, safetyWindow)
 	if err != nil {
 		return 0, errors.NewStorageError("failed to delete transactions", err)
 	}
