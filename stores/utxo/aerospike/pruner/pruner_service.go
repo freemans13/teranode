@@ -99,6 +99,8 @@ type Service struct {
 	blockHeightRetention   uint32
 	defensiveEnabled       bool
 	defensiveBatchReadSize int
+	chunkGroupLimit        int
+	progressLogInterval    time.Duration
 
 	// Cached field names (avoid repeated String() allocations in hot paths)
 	fieldTxID, fieldUtxos, fieldInputs, fieldDeletedChildren, fieldExternal        string
@@ -113,10 +115,6 @@ type Service struct {
 	// getPersistedHeight returns the last block height processed by block persister
 	// Used to coordinate cleanup with block persister progress (can be nil)
 	getPersistedHeight func() uint32
-
-	// maxConcurrentOperations limits concurrent operations during cleanup processing
-	// Auto-detected from Aerospike client connection queue size
-	maxConcurrentOperations int
 }
 
 // parentUpdateInfo holds accumulated parent update information for batching
@@ -188,16 +186,17 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		set:                     opts.Set,
 		ctx:                     opts.Ctx,
 		indexWaiter:             opts.IndexWaiter,
-		queryPolicy:             queryPolicy,
-		writePolicy:             writePolicy,
-		batchWritePolicy:        batchWritePolicy,
-		batchPolicy:             batchPolicy,
-		getPersistedHeight:      opts.GetPersistedHeight,
-		maxConcurrentOperations: tSettings.Pruner.UTXOMaxConcurrentOperations,
-		utxoBatchSize:           tSettings.UtxoStore.UtxoBatchSize,
-		blockHeightRetention:    tSettings.GetUtxoStoreBlockHeightRetention(),
+		queryPolicy:          queryPolicy,
+		writePolicy:          writePolicy,
+		batchWritePolicy:     batchWritePolicy,
+		batchPolicy:          batchPolicy,
+		getPersistedHeight:   opts.GetPersistedHeight,
+		utxoBatchSize:        tSettings.UtxoStore.UtxoBatchSize,
+		blockHeightRetention: tSettings.GetUtxoStoreBlockHeightRetention(),
 		defensiveEnabled:        tSettings.Pruner.UTXODefensiveEnabled,
 		defensiveBatchReadSize:  tSettings.Pruner.UTXODefensiveBatchReadSize,
+		chunkGroupLimit:         tSettings.Pruner.UTXOChunkGroupLimit,
+		progressLogInterval:     tSettings.Pruner.UTXOProgressLogInterval,
 		fieldTxID:               fields.TxID.String(),
 		fieldUtxos:              fields.Utxos.String(),
 		fieldInputs:             fields.Inputs.String(),
@@ -345,10 +344,12 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 	// Create a query statement
 	stmt := aerospike.NewStatement(s.namespace, s.set)
-	// Conditionally fetch Utxos and DeletedChildren bins only when defensive mode is enabled (for child verification)
-	binNames := []string{s.fieldTxID, s.fieldDeleteAtHeight, s.fieldInputs, s.fieldExternal, s.fieldTotalExtraRecs}
+	// Fetch minimal bins for production (non-defensive), full bins for defensive mode
+	binNames := []string{s.fieldTxID, s.fieldExternal, s.fieldTotalExtraRecs, s.fieldInputs}
 	if s.defensiveEnabled {
-		binNames = append(binNames, s.fieldUtxos, s.fieldDeletedChildren)
+		binNames = append(binNames, s.fieldDeleteAtHeight, s.fieldUtxos, s.fieldDeletedChildren)
+	} else {
+		binNames = append(binNames, s.fieldDeleteAtHeight)
 	}
 	stmt.BinNames = binNames
 
@@ -377,6 +378,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 	result := recordset.Results()
 	recordCount := atomic.Int64{}
+	skippedCount := atomic.Int64{} // Records skipped due to defensive logic
 
 	// Process records in chunks for efficient batch verification of children
 	const chunkSize = 1000
@@ -385,12 +387,46 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	// Use errgroup to process chunks in parallel with controlled concurrency
 	chunkGroup := &errgroup.Group{}
 	// Limit parallel chunk processing to avoid overwhelming the system
-	// Allow up to 10 chunks in parallel (10,000 parent records being processed at once)
-	util.SafeSetLimit(chunkGroup, 10)
+	// Configurable via pruner_utxoChunkGroupLimit setting (default: 1)
+	util.SafeSetLimit(chunkGroup, s.chunkGroupLimit)
 
 	// Log initial start
 	s.logger.Infof("Worker %d: starting cleanup scan for height %d (delete_at_height <= %d)",
 		workerID, job.BlockHeight, safeCleanupHeight)
+
+	// Start progress logging ticker if interval is configured
+	var progressTicker *time.Ticker
+	var progressDone chan struct{}
+	if s.progressLogInterval > 0 {
+		progressTicker = time.NewTicker(s.progressLogInterval)
+		progressDone = make(chan struct{})
+
+		go func() {
+			for {
+				select {
+				case <-progressTicker.C:
+					current := recordCount.Load()
+					skipped := skippedCount.Load()
+					elapsed := time.Since(job.Started)
+					if s.defensiveEnabled {
+						s.logger.Infof("Worker %d: pruner progress at height %d: pruned %d records, skipped %d records (elapsed: %v)",
+							workerID, job.BlockHeight, current, skipped, elapsed)
+					} else {
+						s.logger.Infof("Worker %d: pruner progress at height %d: pruned %d records (elapsed: %v)",
+							workerID, job.BlockHeight, current, elapsed)
+					}
+				case <-progressDone:
+					return
+				}
+			}
+		}()
+
+		// Ensure ticker is stopped and goroutine is cleaned up
+		defer func() {
+			progressTicker.Stop()
+			close(progressDone)
+		}()
+	}
 
 	// Helper to submit a chunk for processing
 	submitChunk := func(chunkToProcess []*aerospike.Result) {
@@ -399,11 +435,12 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		copy(chunkCopy, chunkToProcess)
 
 		chunkGroup.Go(func() error {
-			processed, err := s.processRecordChunk(job, workerID, chunkCopy)
+			processed, skipped, err := s.processRecordChunk(job, workerID, chunkCopy)
 			if err != nil {
 				return err
 			}
 			recordCount.Add(int64(processed))
+			skippedCount.Add(int64(skipped))
 			return nil
 		})
 	}
@@ -457,22 +494,30 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	}
 
 	finalRecordCount := recordCount.Load()
+	finalSkippedCount := skippedCount.Load()
 
 	// Set job status and record count
 	job.SetStatus(pruner.JobStatusCompleted)
 	job.RecordsProcessed.Store(finalRecordCount)
 	job.Ended = time.Now()
 
-	s.logger.Infof("Worker %d completed cleanup job for block height %d in %v, processed %d records",
-		workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
+	// Summary log: total pruned and total prevented by defensive logic
+	if s.defensiveEnabled {
+		s.logger.Infof("Worker %d completed cleanup job for block height %d in %v: pruned %d records, skipped %d records (defensive logic)",
+			workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount, finalSkippedCount)
+	} else {
+		s.logger.Infof("Worker %d completed cleanup job for block height %d in %v: pruned %d records",
+			workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
+	}
 
 	prometheusUtxoCleanupBatch.Observe(float64(time.Since(job.Started).Microseconds()) / 1_000_000)
 }
 
 // processRecordChunk processes a chunk of parent records with batched child verification
-func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aerospike.Result) (int, error) {
+// Returns: (processedCount, skippedCount, error)
+func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aerospike.Result) (int, int, error) {
 	if len(chunk) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	// Defensive child verification is conditional on the UTXODefensiveEnabled setting
@@ -488,9 +533,9 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 		// Step 1: Extract ALL unique spending children from chunk
 		// For each parent record, we extract all spending child TX hashes from spent UTXOs
 		// We must verify EVERY child is stable before deleting the parent
-		uniqueSpendingChildren := make(map[string][]byte, 100)   // hex hash -> bytes (typical: ~50-100 children per chunk)
-		parentToChildren = make(map[string][]string, len(chunk)) // parent record key -> child hashes
-		deletedChildren := make(map[string]bool, 20)             // child hash -> already deleted (typical: 0-20)
+		uniqueSpendingChildren := make(map[string][]byte, 100000) // hex hash -> bytes (typical: ~50-100 children per chunk)
+		parentToChildren = make(map[string][]string, len(chunk))  // parent record key -> child hashes
+		deletedChildren := make(map[string]bool, 20)              // child hash -> already deleted (typical: 0-20)
 
 		for _, rec := range chunk {
 			if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
@@ -561,155 +606,121 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 		// Step 2: Batch verify all unique children (single BatchGet call for entire chunk)
 		if len(uniqueSpendingChildren) > 0 {
 			safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, job.BlockHeight, deletedChildren)
-			s.logger.Debugf("Worker %d: batch verified %d unique children from chunk of %d records (%d already deleted)", workerID, len(uniqueSpendingChildren), len(chunk), len(deletedChildren))
 		} else {
 			safetyMap = make(map[string]bool)
 		}
 	}
 
-	// Step 3: Process deletions using the safety map
-	g := &errgroup.Group{}
-	// Limit concurrent operations within each chunk to avoid overwhelming Aerospike
-	// Use pre-calculated limit from service initialization
-	util.SafeSetLimit(g, s.maxConcurrentOperations)
-
-	processedCount := atomic.Int64{}
+	// Step 3: Accumulate operations for entire chunk, then flush once (efficient batching)
+	allParentUpdates := make(map[string]*parentUpdateInfo, 1000) // Accumulate all parent updates for chunk
+	allDeletions := make([]*aerospike.Key, 0, 1000)              // Accumulate all deletions for chunk
+	allExternalFiles := make([]*externalFileInfo, 0, 10)         // Accumulate external files (<1%)
+	processedCount := 0
+	skippedCount := 0
 
 	for _, rec := range chunk {
-		currentRec := rec // capture for goroutine
-		g.Go(func() error {
-			if err := s.processRecordCleanupWithSafetyMap(job, workerID, currentRec, safetyMap, parentToChildren); err != nil {
-				return err
-			}
-
-			processedCount.Add(1)
-
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		return 0, err
-	}
-
-	return int(processedCount.Load()), nil
-}
-
-// processRecordCleanupWithSafetyMap processes a single record using pre-computed safety map
-func (s *Service) processRecordCleanupWithSafetyMap(job *pruner.Job, workerID int, rec *aerospike.Result, safetyMap map[string]bool, parentToChildren map[string][]string) error {
-	if rec.Err != nil {
-		return errors.NewProcessingError("Worker %d: error reading record for pruner job %d: %v", workerID, job.BlockHeight, rec.Err)
-	}
-
-	bins := rec.Record.Bins
-	if bins == nil {
-		return errors.NewProcessingError("Worker %d: missing bins for record in pruner job %d", workerID, job.BlockHeight)
-	}
-
-	txIDBytes, ok := bins[s.fieldTxID].([]byte)
-	if !ok || len(txIDBytes) != 32 {
-		return errors.NewProcessingError("Worker %d: invalid or missing txid for record in pruner job %d", workerID, job.BlockHeight)
-	}
-
-	txHash, err := chainhash.NewHash(txIDBytes)
-	if err != nil {
-		return errors.NewProcessingError("Worker %d: invalid txid bytes for record in pruner job %d", workerID, job.BlockHeight)
-	}
-
-	// Cache txHash string conversion (used multiple times in this function)
-	txHashStr := txHash.String()
-
-	// Verify ALL spending children are stable before deleting parent
-	// We extract all children from the parent's spent UTXOs and verify EVERY one is stable
-	// If even ONE child is unmined or recently mined, we must keep the parent
-	parentKey := rec.Record.Key.String()
-	childrenHashes, hasChildren := parentToChildren[parentKey]
-
-	if hasChildren && len(childrenHashes) > 0 {
-		// Check if ALL children are safe
-		for _, childHash := range childrenHashes {
-			if !safetyMap[childHash] {
-				// At least one child not yet stable - skip deletion for now
-				// Parent will be reconsidered in future cleanup passes
-				s.logger.Debugf("Worker %d: skipping deletion of parent %s - child %s not yet safe (%d children total)",
-					workerID, txHashStr, childHash[:8], len(childrenHashes))
-				return nil
-			}
+		if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
+			continue
 		}
-	}
 
-	// Safe to delete - get inputs for parent update
-	inputs, err := s.getTxInputsFromBins(job, workerID, bins, txHash)
-	if err != nil {
-		return err
-	}
-
-	// Build parent updates and deletions using main's batch accumulation pattern
-	parentUpdates := make(map[string]*parentUpdateInfo, len(inputs)) // One parent per input (worst case)
-
-	// Accumulate parent updates
-	for _, input := range inputs {
-		keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.utxoBatchSize)
-		parentKeyStr := string(keySource)
-
-		if existing, ok := parentUpdates[parentKeyStr]; ok {
-			existing.childHashes = append(existing.childHashes, txHash)
-		} else {
-			parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
-			if err != nil {
-				return errors.NewProcessingError("Worker %d: failed to create parent key: %v", workerID, err)
-			}
-			parentUpdates[parentKeyStr] = &parentUpdateInfo{
-				key:         parentKey,
-				childHashes: []*chainhash.Hash{txHash},
-			}
+		txIDBytes, ok := rec.Record.Bins[s.fieldTxID].([]byte)
+		if !ok || len(txIDBytes) != 32 {
+			continue
 		}
-	}
 
-	// Handle external transactions: add file for deletion
-	externalFiles := make([]*externalFileInfo, 0)
-	external, isExternal := bins[s.fieldExternal].(bool)
-	if isExternal && external {
-		// Determine file type: if we found inputs, it's a .tx file, otherwise it's .outputs
-		fileType := fileformat.FileTypeOutputs
-		if len(inputs) > 0 {
-			fileType = fileformat.FileTypeTx
+		txHash, err := chainhash.NewHash(txIDBytes)
+		if err != nil {
+			continue
 		}
-		externalFiles = append(externalFiles, &externalFileInfo{
-			txHash:   txHash,
-			fileType: fileType,
-		})
-	}
 
-	// Accumulate deletions: master record + any child records
-	deletions := []*aerospike.Key{rec.Record.Key}
+		// Check if children are safe (defensive mode only)
+		parentKey := rec.Record.Key.String()
+		childrenHashes, hasChildren := parentToChildren[parentKey]
 
-	// If this is a multi-record transaction, delete all child records
-	totalExtraRecs, hasExtraRecs := bins[s.fieldTotalExtraRecs].(int)
-	if hasExtraRecs && totalExtraRecs > 0 {
-		// Generate keys for all child records: txid_1, txid_2, ..., txid_N
-		for i := 1; i <= totalExtraRecs; i++ {
-			childKeySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
-			childKey, err := aerospike.NewKey(s.namespace, s.set, childKeySource)
-			if err != nil {
-				s.logger.Errorf("Worker %d: failed to create child key for %s_%d: %v", workerID, txHashStr, i, err)
+		if hasChildren && len(childrenHashes) > 0 {
+			allSafe := true
+			var unsafeChild string
+			for _, childHash := range childrenHashes {
+				if !safetyMap[childHash] {
+					allSafe = false
+					unsafeChild = childHash
+					break
+				}
+			}
+
+			if !allSafe {
+				// Skip this record - at least one child not stable
+				s.logger.Infof("Defensive skip - parent %s cannot be deleted due to unstable child %s (%d children total)",
+					txHash.String(), unsafeChild, len(childrenHashes))
+				skippedCount++
 				continue
 			}
-			deletions = append(deletions, childKey)
 		}
-		s.logger.Debugf("Worker %d: deleting external tx %s with %d child records", workerID, txHashStr, totalExtraRecs)
+
+		// Safe to delete - get inputs for parent updates
+		inputs, err := s.getTxInputsFromBins(job, workerID, rec.Record.Bins, txHash)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		// Accumulate parent updates
+		for _, input := range inputs {
+			keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.utxoBatchSize)
+			parentKeyStr := string(keySource)
+
+			if existing, ok := allParentUpdates[parentKeyStr]; ok {
+				existing.childHashes = append(existing.childHashes, txHash)
+			} else {
+				parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
+				if err != nil {
+					return 0, 0, err
+				}
+				allParentUpdates[parentKeyStr] = &parentUpdateInfo{
+					key:         parentKey,
+					childHashes: []*chainhash.Hash{txHash},
+				}
+			}
+		}
+
+		// Accumulate external files
+		external, isExternal := rec.Record.Bins[s.fieldExternal].(bool)
+		if isExternal && external {
+			fileType := fileformat.FileTypeOutputs
+			if len(inputs) > 0 {
+				fileType = fileformat.FileTypeTx
+			}
+			allExternalFiles = append(allExternalFiles, &externalFileInfo{
+				txHash:   txHash,
+				fileType: fileType,
+			})
+		}
+
+		// Accumulate deletions (master + child records)
+		allDeletions = append(allDeletions, rec.Record.Key)
+
+		if totalExtraRecs, hasExtraRecs := rec.Record.Bins[s.fieldTotalExtraRecs].(int); hasExtraRecs && totalExtraRecs > 0 {
+			for i := 1; i <= totalExtraRecs; i++ {
+				childKeySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
+				childKey, err := aerospike.NewKey(s.namespace, s.set, childKeySource)
+				if err == nil {
+					allDeletions = append(allDeletions, childKey)
+				}
+			}
+		}
+
+		processedCount++
 	}
 
-	// Execute parent updates and deletion
+	// Flush all accumulated operations in one batch per chunk
 	ctx := s.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := s.flushCleanupBatches(ctx, workerID, job.BlockHeight, parentUpdates, deletions, externalFiles); err != nil {
-		return errors.NewProcessingError("Worker %d: error flushing operations for tx %s: %v", workerID, txHashStr, err)
+	if err := s.flushCleanupBatches(ctx, workerID, job.BlockHeight, allParentUpdates, allDeletions, allExternalFiles); err != nil {
+		return 0, 0, err
 	}
 
-	return nil
+	return processedCount, skippedCount, nil
 }
 
 // batchVerifyChildrenSafety checks multiple child transactions at once to determine if their parents
@@ -738,17 +749,10 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 	// Mark already-deleted children as safe immediately
 	// If a child is in deletedChildren, it means it was already pruned successfully
 	// and shouldn't block the parent from being pruned
-	markedSafeCount := 0
 	for hexHash := range deletedChildren {
 		if _, exists := lastSpenderHashes[hexHash]; exists {
 			safetyMap[hexHash] = true
-			markedSafeCount++
-		} else {
-			s.logger.Debugf("[batchVerifyChildrenSafety] Deleted child %s not in lastSpenderHashes (not a child of any parent in this chunk)", hexHash[:8])
 		}
-	}
-	if markedSafeCount > 0 {
-		s.logger.Infof("[batchVerifyChildrenSafety] Marked %d already-deleted children as safe", markedSafeCount)
 	}
 
 	// Process children in batches to avoid overwhelming Aerospike
@@ -778,9 +782,6 @@ func (s *Service) batchVerifyChildrenSafety(lastSpenderHashes map[string][]byte,
 
 		s.processBatchOfChildren(batch, safetyMap, currentBlockHeight)
 	}
-
-	s.logger.Debugf("[batchVerifyChildrenSafety] Verified %d children: %d safe, %d not safe",
-		len(safetyMap), countTrue(safetyMap), countFalse(safetyMap))
 
 	return safetyMap
 }
@@ -938,28 +939,6 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 			safetyMap[hexHash] = true
 		}
 	}
-}
-
-// Helper to count true values in map
-func countTrue(m map[string]bool) int {
-	count := 0
-	for _, v := range m {
-		if v {
-			count++
-		}
-	}
-	return count
-}
-
-// Helper to count false values in map
-func countFalse(m map[string]bool) int {
-	count := 0
-	for _, v := range m {
-		if !v {
-			count++
-		}
-	}
-	return count
 }
 
 func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {

@@ -104,42 +104,65 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					continue
 				}
 
-				// Wait for pruner to complete with timeout
+				// Wait for pruner to complete with optional timeout
 				prunerTimeout := s.settings.Pruner.JobTimeout
-				timeoutTimer := time.NewTimer(prunerTimeout)
-				defer timeoutTimer.Stop()
 
-				select {
-				case status := <-doneCh:
-					if status != "completed" {
-						s.logger.Warnf("Pruner for height %d finished with status: %s", latestHeight, status)
-						prunerErrors.WithLabelValues("dah_pruner").Inc()
-					} else {
-						// Get job info to log records processed
-						recordsProcessed := int64(0)
-						if job := s.prunerService.GetJobByHeight(latestHeight); job != nil {
-							recordsProcessed = job.RecordsProcessed.Load()
-						}
-						s.logger.Infof("Pruner for height %d completed successfully, pruned %d records", latestHeight, recordsProcessed)
-						prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
-						prunerProcessed.Inc()
-					}
-				case <-timeoutTimer.C:
-					s.logger.Infof("Pruner for height %d exceeded coordinator timeout of %v - pruner continues in background, re-queuing immediately", latestHeight, prunerTimeout)
-					// Note: This is not an error - the pruner job continues processing in the background.
-					// The coordinator re-queues immediately to check again.
-					// Very large pruners may take longer than the timeout and require multiple iterations.
-
-					// Immediately re-queue to check again (non-blocking)
+				if prunerTimeout == 0 {
+					// Wait indefinitely (no timeout)
 					select {
-					case s.prunerCh <- latestHeight:
-						s.logger.Debugf("Re-queued pruner for height %d after timeout", latestHeight)
-					default:
-						// Channel full, will be retried when notifications trigger again
-						s.logger.Debugf("Pruner channel full, will retry on next notification")
+					case status := <-doneCh:
+						if status != "completed" {
+							s.logger.Warnf("Pruner for height %d finished with status: %s", latestHeight, status)
+							prunerErrors.WithLabelValues("dah_pruner").Inc()
+						} else {
+							// Get job info to log records processed
+							recordsProcessed := int64(0)
+							if job := s.prunerService.GetJobByHeight(latestHeight); job != nil {
+								recordsProcessed = job.RecordsProcessed.Load()
+							}
+							s.logger.Infof("Pruner for height %d completed successfully, pruned %d records", latestHeight, recordsProcessed)
+							prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
+							prunerProcessed.Inc()
+						}
+					case <-ctx.Done():
+						return
 					}
-				case <-ctx.Done():
-					return
+				} else {
+					// Use timeout
+					timeoutTimer := time.NewTimer(prunerTimeout)
+					defer timeoutTimer.Stop()
+
+					select {
+					case status := <-doneCh:
+						if status != "completed" {
+							s.logger.Warnf("Pruner for height %d finished with status: %s", latestHeight, status)
+							prunerErrors.WithLabelValues("dah_pruner").Inc()
+						} else {
+							// Get job info to log records processed
+							recordsProcessed := int64(0)
+							if job := s.prunerService.GetJobByHeight(latestHeight); job != nil {
+								recordsProcessed = job.RecordsProcessed.Load()
+							}
+							s.logger.Infof("Pruner for height %d completed successfully, pruned %d records", latestHeight, recordsProcessed)
+							prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
+							prunerProcessed.Inc()
+						}
+					case <-timeoutTimer.C:
+						s.logger.Infof("Pruner for height %d exceeded coordinator timeout of %v - pruner continues in background", latestHeight, prunerTimeout)
+						// Note: This is not an error - the pruner job continues processing in the background.
+						// Only re-queue if channel is empty (next trigger will catch up if channel has pending jobs).
+
+						// Only re-queue if channel is empty (non-blocking check)
+						select {
+						case s.prunerCh <- latestHeight:
+							s.logger.Debugf("Re-queued pruner for height %d (channel was empty)", latestHeight)
+						default:
+							// Channel has pending jobs, no need to re-queue
+							s.logger.Debugf("Pruner channel has pending jobs, skipping re-queue")
+						}
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 

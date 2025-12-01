@@ -26,11 +26,12 @@ func createTestSettings() *settings.Settings {
 			UtxoBatchSize: 128,
 		},
 		Pruner: settings.PrunerSettings{
-			UTXOParentUpdateBatcherSize:           100,
-			UTXOParentUpdateBatcherDurationMillis: 10,
-			UTXODeleteBatcherSize:                 256,
-			UTXODeleteBatcherDurationMillis:       10,
-			UTXOMaxConcurrentOperations:           1,
+			WorkerCount:                1,
+			JobTimeout:                 0,
+			UTXODefensiveEnabled:       false,
+			UTXODefensiveBatchReadSize: 10000,
+			UTXOChunkGroupLimit:        10,
+			UTXOProgressLogInterval:    30 * time.Second,
 		},
 	}
 }
