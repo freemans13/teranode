@@ -99,6 +99,7 @@ type Service struct {
 	blockHeightRetention   uint32
 	defensiveEnabled       bool
 	defensiveBatchReadSize int
+	chunkSize              int
 	chunkGroupLimit        int
 	progressLogInterval    time.Duration
 
@@ -195,6 +196,7 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		blockHeightRetention: tSettings.GetUtxoStoreBlockHeightRetention(),
 		defensiveEnabled:        tSettings.Pruner.UTXODefensiveEnabled,
 		defensiveBatchReadSize:  tSettings.Pruner.UTXODefensiveBatchReadSize,
+		chunkSize:               tSettings.Pruner.UTXOChunkSize,
 		chunkGroupLimit:         tSettings.Pruner.UTXOChunkGroupLimit,
 		progressLogInterval:     tSettings.Pruner.UTXOProgressLogInterval,
 		fieldTxID:               fields.TxID.String(),
@@ -381,13 +383,13 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	skippedCount := atomic.Int64{} // Records skipped due to defensive logic
 
 	// Process records in chunks for efficient batch verification of children
-	const chunkSize = 1000
-	chunk := make([]*aerospike.Result, 0, chunkSize)
+	// Chunk size configurable via pruner_utxoChunkSize setting (default: 1000)
+	chunk := make([]*aerospike.Result, 0, s.chunkSize)
 
 	// Use errgroup to process chunks in parallel with controlled concurrency
 	chunkGroup := &errgroup.Group{}
 	// Limit parallel chunk processing to avoid overwhelming the system
-	// Configurable via pruner_utxoChunkGroupLimit setting (default: 1)
+	// Configurable via pruner_utxoChunkGroupLimit setting (default: 10)
 	util.SafeSetLimit(chunkGroup, s.chunkGroupLimit)
 
 	// Log initial start
@@ -480,7 +482,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		chunk = append(chunk, rec)
 
 		// Process chunk when full (in parallel)
-		if len(chunk) >= chunkSize {
+		if len(chunk) >= s.chunkSize {
 			submitChunk(chunk)
 			chunk = chunk[:0] // Reset chunk
 		}

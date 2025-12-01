@@ -488,6 +488,7 @@ type PrunerSettings struct {
 	JobTimeout                 time.Duration // Timeout for waiting for pruner job completion (0 = wait indefinitely)
 	UTXODefensiveEnabled       bool          // Enable defensive checks before deleting UTXO transactions (verify children are mined > BlockHeightRetention blocks ago)
 	UTXODefensiveBatchReadSize int           // Batch size for reading child transactions during defensive UTXO pruning (default: 10000)
+	UTXOChunkSize              int           // Number of records to process in each chunk before batch flushing (default: 1000)
 	UTXOChunkGroupLimit        int           // Maximum parallel chunk processing during UTXO pruning (default: 10)
 	UTXOProgressLogInterval    time.Duration // Interval for logging progress during UTXO pruning (default: 30s)
 }
