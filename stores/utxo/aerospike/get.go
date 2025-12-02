@@ -1424,7 +1424,7 @@ func (s *Store) GetTxInpointsFromExternalStore(ctx context.Context, txHash chain
 	defer reader.Close()
 
 	// Parse only input references from stream, skipping all scripts and outputs
-	inputs, err := parseInputReferencesOnly(reader)
+	inputs, err := ParseInputReferencesOnly(reader)
 	if err != nil {
 		return subtree.TxInpoints{}, errors.NewTxInvalidError("[GetTxInpointsFromExternalStore][%s] could not parse input references", txHash.String(), err)
 	}
@@ -1434,11 +1434,11 @@ func (s *Store) GetTxInpointsFromExternalStore(ctx context.Context, txHash chain
 	return subtree.NewTxInpointsFromInputs(inputs)
 }
 
-// parseInputReferencesOnly parses Bitcoin wire format from a reader to extract only input references
+// ParseInputReferencesOnly parses Bitcoin wire format from a reader to extract only input references
 // (prevTxID + prevOutIndex), skipping all scripts to minimize memory usage.
 // This is used for TxInpoints computation where scripts are not needed.
 // The reader is consumed only up to the end of inputs - outputs are never read from disk/network.
-func parseInputReferencesOnly(reader io.Reader) ([]*bt.Input, error) {
+func ParseInputReferencesOnly(reader io.Reader) ([]*bt.Input, error) {
 
 	// Parse version (4 bytes)
 	var version uint32
