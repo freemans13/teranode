@@ -1440,10 +1440,10 @@ func (s *Store) GetTxInpointsFromExternalStore(ctx context.Context, txHash chain
 // The reader is consumed only up to the end of inputs - outputs are never read from disk/network.
 func ParseInputReferencesOnly(reader io.Reader) ([]*bt.Input, error) {
 
-	// Parse version (4 bytes)
-	var version uint32
-	if err := binary.Read(reader, binary.LittleEndian, &version); err != nil {
-		return nil, errors.NewTxInvalidError("failed to read transaction version", err)
+	// Skip version (4 bytes)
+	_, err := io.CopyN(io.Discard, reader, 4)
+	if err != nil {
+		return nil, errors.NewTxInvalidError("failed to skip version", err)
 	}
 
 	// Parse input count

@@ -471,10 +471,10 @@ func TestParseInputReferencesOnly(t *testing.T) {
 	t.Run("error on truncated input count", func(t *testing.T) {
 		// Just version, no input count
 		buf := bytes.NewBuffer(nil)
-		binary.Write(buf, binary.LittleEndian, uint32(1))
+		err := binary.Write(buf, binary.LittleEndian, uint32(1))
+		require.NoError(t, err)
 
-		_, err := teranode_aerospike.ParseInputReferencesOnly(buf)
-
+		_, err = teranode_aerospike.ParseInputReferencesOnly(buf)
 		require.Error(t, err)
 	})
 
