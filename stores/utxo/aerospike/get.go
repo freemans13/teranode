@@ -1410,7 +1410,7 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 
 // GetTxInpointsFromExternalStore efficiently extracts TxInpoints from an external transaction
 // by streaming and parsing only the input references (prevTxID + index), skipping all scripts and outputs.
-// This provides massive memory savings (99%+) by avoiding loading potentiallylarge output scripts into memory.
+// This provides massive memory savings (99%+) by avoiding loading potentially large output scripts into memory.
 func (s *Store) GetTxInpointsFromExternalStore(ctx context.Context, txHash chainhash.Hash) (subtree.TxInpoints, error) {
 	ctx, _, _ = tracing.Tracer("aerospike").Start(ctx, "GetTxInpointsFromExternalStore",
 		tracing.WithHistogram(prometheusTxMetaAerospikeMapGetExternal),
@@ -1443,13 +1443,13 @@ func parseInputReferencesOnly(reader io.Reader) ([]*bt.Input, error) {
 	// Parse version (4 bytes)
 	var version uint32
 	if err := binary.Read(reader, binary.LittleEndian, &version); err != nil {
-		return nil, err
+		return nil, errors.NewTxInvalidError("failed to read transaction version", err)
 	}
 
 	// Parse input count
 	var inputCountVarInt bt.VarInt
 	if _, err := inputCountVarInt.ReadFrom(reader); err != nil {
-		return nil, err
+		return nil, errors.NewTxInvalidError("failed to read input count", err)
 	}
 	inputCount := int(inputCountVarInt)
 
@@ -1459,29 +1459,29 @@ func parseInputReferencesOnly(reader io.Reader) ([]*bt.Input, error) {
 		// Read previous tx ID (32 bytes)
 		prevTxID := make([]byte, 32)
 		if _, err := io.ReadFull(reader, prevTxID); err != nil {
-			return nil, err
+			return nil, errors.NewTxInvalidError("failed to read prevTxID for input %d/%d", i, inputCount, err)
 		}
 
 		// Read previous output index (4 bytes)
 		var prevOutIndex uint32
 		if err := binary.Read(reader, binary.LittleEndian, &prevOutIndex); err != nil {
-			return nil, err
+			return nil, errors.NewTxInvalidError("failed to read prevOutIndex for input %d/%d", i, inputCount, err)
 		}
 
 		// Read script length but SKIP the script bytes (don't parse signatures)
 		var scriptLenVarInt bt.VarInt
 		if _, err := scriptLenVarInt.ReadFrom(reader); err != nil {
-			return nil, err
+			return nil, errors.NewTxInvalidError("failed to read script length for input %d/%d", i, inputCount, err)
 		}
 		scriptLen := int64(scriptLenVarInt)
 		// Discard script bytes without allocating memory
 		if _, err := io.CopyN(io.Discard, reader, scriptLen); err != nil {
-			return nil, err
+			return nil, errors.NewTxInvalidError("failed to skip script (%d bytes) for input %d/%d", scriptLen, i, inputCount, err)
 		}
 
 		// Skip sequence number (4 bytes) - not needed for TxInpoints
 		if _, err := io.CopyN(io.Discard, reader, 4); err != nil {
-			return nil, err
+			return nil, errors.NewTxInvalidError("failed to skip sequence for input %d/%d", i, inputCount, err)
 		}
 
 		// Create input with minimal data for TxInpoints
@@ -1492,10 +1492,10 @@ func parseInputReferencesOnly(reader io.Reader) ([]*bt.Input, error) {
 		// Set previous tx ID using the proper method
 		prevTxHash, err := chainhash.NewHash(prevTxID)
 		if err != nil {
-			return nil, err
+			return nil, errors.NewTxInvalidError("failed to create hash for input %d/%d", i, inputCount, err)
 		}
 		if err := input.PreviousTxIDAdd(prevTxHash); err != nil {
-			return nil, err
+			return nil, errors.NewTxInvalidError("failed to set prevTxID for input %d/%d", i, inputCount, err)
 		}
 
 		inputs[i] = input
