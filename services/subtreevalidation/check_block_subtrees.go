@@ -484,8 +484,9 @@ func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *sub
 	return nil
 }
 
-// processSubtreeDataStream processes subtreeData directly from HTTP stream while storing to disk
-// This avoids the inefficiency of writing to disk and immediately reading back
+// processSubtreeDataStream downloads subtreeData, stores it, then parses transactions
+// This avoids TeeReader double buffering by reading the stream once into storage,
+// then parsing transactions from the stored data.
 func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreepkg.Subtree,
 	body io.ReadCloser, allTransactions *[]*bt.Tx) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processSubtreeDataStream",
@@ -494,32 +495,43 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	)
 	defer deferFn()
 
-	// Create a buffer to capture the data for storage
+	// PHASE 1 OPTIMIZATION: Read entire stream into buffer ONCE
+	// Use pooled bufio.Reader for efficient reading
+	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+	bufferedReader.Reset(body)
+	defer func() {
+		bufferedReader.Reset(nil)
+		bufioReaderPool.Put(bufferedReader)
+	}()
+
+	// Read all bytes from stream into buffer
 	var buffer bytes.Buffer
-
-	// Use TeeReader to read from HTTP stream while writing to buffer
-	teeReader := io.TeeReader(body, &buffer)
-
-	// Read transactions directly into the shared collection from the stream
-	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, teeReader, allTransactions)
+	bytesRead, err := io.Copy(&buffer, bufferedReader)
 	if err != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to read transactions from stream", err)
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to read stream", err)
 	}
 
-	// make sure the subtree transaction count matches what we read from the stream
-	if txCount != subtree.Length() {
-		return errors.NewProcessingError("[processSubtreeDataStream] transaction count mismatch: expected %d, got %d", subtree.Length(), txCount)
-	}
-
-	// Now store the buffered data to disk
+	// Store the buffered data to disk immediately
 	// we not set a DAH as this is part of a block and will be permanently stored anyway
 	err = u.subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, buffer.Bytes())
 	if err != nil {
 		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", err)
 	}
 
-	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s directly from stream",
-		txCount, subtree.RootHash().String())
+	// PHASE 1 OPTIMIZATION: Parse transactions from the stored buffer
+	// This reuses existing parsing logic but avoids double-copy
+	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, bytes.NewReader(buffer.Bytes()), allTransactions)
+	if err != nil {
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to read transactions from buffer", err)
+	}
+
+	// Verify transaction count matches subtree
+	if txCount != subtree.Length() {
+		return errors.NewProcessingError("[processSubtreeDataStream] transaction count mismatch: expected %d, got %d", subtree.Length(), txCount)
+	}
+
+	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s (streamed %d bytes)",
+		txCount, subtree.RootHash().String(), bytesRead)
 
 	return nil
 }

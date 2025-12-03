@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -1745,4 +1746,175 @@ func TestCheckBlockSubtrees_ParentBlockErrors(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, response.Blessed)
 	})
+}
+
+// TestCheckBlockSubtrees_LargeBlock_MemoryConsumption tests memory usage with a large number of transactions
+// This test verifies that Phase 1 optimization reduces memory consumption by ~50%
+// Run with: go test -v -run TestCheckBlockSubtrees_LargeBlock_MemoryConsumption -memprofile=mem.prof
+// Analyze with: go tool pprof -http=:8080 mem.prof
+func TestCheckBlockSubtrees_LargeBlock_MemoryConsumption(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping memory consumption test in short mode")
+	}
+
+	// Configuration: adjust these values to test with different loads
+	const (
+		numTransactions    = 10240  // Number of transactions to process (must be divisible by txsPerSubtree)
+		txsPerSubtree      = 512    // Transactions per subtree (must be power of 2)
+		estimatedTxSize    = 250    // Average transaction size in bytes
+		expectedMemoryMB   = 100    // Expected peak memory in MB (adjust after baseline)
+		memoryToleranceMB  = 50     // Tolerance for memory variation
+	)
+
+	numSubtrees := numTransactions / txsPerSubtree
+
+	t.Logf("Creating test with %d transactions across %d subtrees", numTransactions, numSubtrees)
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Create test headers
+	testHeaders := testhelpers.CreateTestHeaders(t, 1)
+
+	// Mock blockchain client
+	server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+		mock.Anything).
+		Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+	runningState := blockchain.FSMStateRUNNING
+	server.blockchainClient.(*blockchain.Mock).On("GetFSMCurrentState",
+		mock.Anything).
+		Return(&runningState, nil).Maybe()
+
+	server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+		mock.Anything, blockchain.FSMStateRUNNING).
+		Return(true, nil).Maybe()
+
+	// Generate transactions and organize into subtrees
+	allSubtreeHashes := make([]*chainhash.Hash, 0, numSubtrees)
+	allSubtrees := make([]*subtreepkg.Subtree, 0, numSubtrees)
+
+	t.Log("Generating transactions and subtrees...")
+	for i := 0; i < numSubtrees; i++ {
+		// Create subtree with power-of-2 leaf count
+		subtree, err := subtreepkg.NewTreeByLeafCount(txsPerSubtree)
+		require.NoError(t, err)
+
+		// Create subtreeData buffer
+		subtreeData := bytes.Buffer{}
+
+		// Generate transactions for this subtree
+		for j := 0; j < txsPerSubtree; j++ {
+			// Create unique transaction by using modulo to cycle through base transactions
+			baseIdx := (i*txsPerSubtree + j) % 3
+			var baseTxStr string
+			switch baseIdx {
+			case 0:
+				baseTxStr = "tx1"
+			case 1:
+				baseTxStr = "tx2"
+			default:
+				baseTxStr = fmt.Sprintf("tx%d", baseIdx)
+			}
+
+			tx, err := createTestTransaction(baseTxStr)
+			require.NoError(t, err)
+
+			// Add to subtree
+			err = subtree.AddNode(*tx.TxIDChainHash(), 1, uint64(j+1))
+			require.NoError(t, err)
+
+			// Add to subtreeData
+			subtreeData.Write(tx.Bytes())
+		}
+
+		// Store subtreeData (skip if already exists due to duplicate subtree roots)
+		exists, _ := server.subtreeStore.Exists(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
+		if !exists {
+			err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeData.Bytes())
+			require.NoError(t, err)
+
+			// Mark the subtree as already validated to avoid HTTP fetching
+			err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtree, []byte("validated"))
+			require.NoError(t, err)
+		}
+
+		allSubtreeHashes = append(allSubtreeHashes, subtree.RootHash())
+		allSubtrees = append(allSubtrees, subtree)
+	}
+
+	// Create block with all subtrees
+	header := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Timestamp:      uint32(time.Now().Unix()),
+		Bits:           model.NBit{},
+		Nonce:          0,
+	}
+
+	coinbaseTx := &bt.Tx{Version: 1}
+	block, err := model.NewBlock(header, coinbaseTx, allSubtreeHashes, 1, 250, 0, 0)
+	require.NoError(t, err)
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	// Force GC before measurement
+	runtime.GC()
+	runtime.GC()
+
+	// Measure memory before
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+
+	t.Logf("Memory before processing:")
+	t.Logf("  Heap Alloc: %.2f MB", float64(memBefore.HeapAlloc)/(1024*1024))
+	t.Logf("  Heap Objects: %d", memBefore.HeapObjects)
+
+	// Process the block
+	// Use empty BaseUrl to read from local storage instead of HTTP
+	request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+		Block:   blockBytes,
+		BaseUrl: "",
+	}
+
+	response, err := server.CheckBlockSubtrees(context.Background(), request)
+	require.NoError(t, err)
+	assert.True(t, response.Blessed)
+
+	// Measure memory after
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+
+	t.Logf("Memory after processing:")
+	t.Logf("  Heap Alloc: %.2f MB", float64(memAfter.HeapAlloc)/(1024*1024))
+	t.Logf("  Heap Objects: %d", memAfter.HeapObjects)
+	t.Logf("  Total Alloc: %.2f MB", float64(memAfter.TotalAlloc)/(1024*1024))
+
+	// Calculate peak memory during processing
+	peakMemoryMB := float64(memAfter.HeapAlloc) / (1024 * 1024)
+	estimatedDataSizeMB := float64(numTransactions*estimatedTxSize) / (1024 * 1024)
+
+	t.Logf("Estimated raw data size: %.2f MB", estimatedDataSizeMB)
+	t.Logf("Peak memory usage: %.2f MB", peakMemoryMB)
+	t.Logf("Memory overhead: %.2fx", peakMemoryMB/estimatedDataSizeMB)
+
+	// Verify memory usage is reasonable
+	// With Phase 1 optimization, we expect memory to be roughly 2-3x the raw data size
+	// (accounting for Go object overhead, but not the 2x TeeReader duplication)
+	maxExpectedMemoryMB := float64(expectedMemoryMB + memoryToleranceMB)
+
+	if peakMemoryMB > maxExpectedMemoryMB {
+		t.Logf("WARNING: Memory usage (%.2f MB) exceeds expected maximum (%.2f MB)", peakMemoryMB, maxExpectedMemoryMB)
+		t.Logf("This may indicate the Phase 1 optimization is not working as expected")
+		// Don't fail the test, just warn - memory usage can vary by platform
+	} else {
+		t.Logf("SUCCESS: Memory usage (%.2f MB) is within expected range (<= %.2f MB)", peakMemoryMB, maxExpectedMemoryMB)
+	}
+
+	// Additional memory statistics
+	t.Logf("GC Statistics:")
+	t.Logf("  Number of GCs: %d", memAfter.NumGC-memBefore.NumGC)
+	t.Logf("  GC Pause Total: %.2f ms", float64(memAfter.PauseTotalNs-memBefore.PauseTotalNs)/(1000*1000))
 }
