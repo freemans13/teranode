@@ -405,8 +405,9 @@ func TestBatchDecorate(t *testing.T) {
 	require.NoError(t, err)
 
 	unresolved := utxo.UnresolvedMetaData{
-		Hash: *tx.TxIDChainHash(),
-		Idx:  0,
+		Hash:   *tx.TxIDChainHash(),
+		Idx:    0,
+		Fields: append(utxo.MetaFields, fields.Tx, fields.TxInpoints),
 	}
 
 	err = utxoStore.BatchDecorate(ctx, []*utxo.UnresolvedMetaData{&unresolved})

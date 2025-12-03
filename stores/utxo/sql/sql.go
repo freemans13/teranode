@@ -1707,7 +1707,13 @@ func (s *Store) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*ut
 				continue
 			}
 
-			data, err := s.Get(ctx, &unresolvedMetaData.Hash, fields...)
+			// Prioritize item.Fields over parameter fields (matches Aerospike behavior)
+			fieldsToUse := fields
+			if len(unresolvedMetaData.Fields) > 0 {
+				fieldsToUse = unresolvedMetaData.Fields
+			}
+
+			data, err := s.Get(ctx, &unresolvedMetaData.Hash, fieldsToUse...)
 			if err != nil {
 				unresolvedMetaData.Err = err
 			} else {

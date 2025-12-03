@@ -453,13 +453,6 @@ func (s *Store) addAbstractedBins(bins []fields.FieldName) []fields.FieldName {
 	newBins := append([]fields.FieldName{}, bins...)
 
 	// add missing bins
-	if slices.Contains(newBins, fields.TxInpoints) {
-		if !slices.Contains(newBins, fields.Inputs) {
-			newBins = append(newBins, fields.Inputs)
-			newBins = append(newBins, fields.External)
-		}
-	}
-
 	if slices.Contains(newBins, fields.Tx) {
 		if !slices.Contains(newBins, fields.Inputs) {
 			newBins = append(newBins, fields.Inputs)
@@ -536,7 +529,8 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 
 		// Default fields - optimized for common use cases without scripts
 		// Services that need full transaction (persister, API) explicitly request fields.Tx
-		bins := []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.BlockIDs, fields.IsCoinbase}
+		// TxInpoints requires Inputs and External fields to be fetched
+		bins := []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.Inputs, fields.External, fields.BlockIDs, fields.IsCoinbase}
 		if len(item.Fields) > 0 {
 			bins = item.Fields
 		} else if len(optionalFields) > 0 {

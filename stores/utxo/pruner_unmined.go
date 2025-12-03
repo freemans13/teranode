@@ -88,7 +88,7 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 // It preserves parent transactions by setting PreserveUntil flag. The unmined transaction itself is NOT deleted.
 func preserveSingleUnminedTransactionParents(ctx context.Context, s Store, txHash *chainhash.Hash, blockHeight uint32, settings *settings.Settings, logger ulogger.Logger) error {
 	// Get the transaction data to identify parent UTXOs (similar to ProcessConflicting)
-	txMeta, err := s.Get(ctx, txHash, fields.TxInpoints)
+	txMeta, err := s.Get(ctx, txHash, fields.TxInpoints, fields.Inputs, fields.External)
 	if err != nil {
 		return errors.NewProcessingError(errFailedToGetTransaction, txHash.String(), err)
 	}
