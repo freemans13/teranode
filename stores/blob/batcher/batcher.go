@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -49,6 +50,10 @@ type Batcher struct {
 	queue *lockfreequeue.LockFreeQ[BatchItem]
 	// done is the channel for signaling the background batch processing goroutine to stop
 	done chan struct{}
+	// notifyCh is used to notify the worker goroutine when new items are enqueued
+	notifyCh chan struct{}
+	// wg is used to wait for the background worker goroutine to complete during shutdown
+	wg sync.WaitGroup
 	// currentBatch holds the accumulated blob data for the current batch
 	currentBatch []byte
 	// currentBatchKeys holds the accumulated key data for the current batch (if writeKeys is true)
@@ -99,17 +104,32 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 		writeKeys:        writeKeys,
 		queue:            lockfreequeue.NewLockFreeQ[BatchItem](),
 		done:             make(chan struct{}),
+		notifyCh:         make(chan struct{}, 1),
 		currentBatch:     make([]byte, 0, sizeInBytes),
 		currentBatchKeys: make([]byte, 0, sizeInBytes),
 	}
 
+	b.wg.Add(1)
 	go func() {
+		defer b.wg.Done()
+
 		var (
 			batchItem *BatchItem
 			err       error
 		)
 
 		for {
+			// Try immediate dequeue (optimistic fast path)
+			batchItem = b.queue.Dequeue()
+			if batchItem != nil {
+				err = b.processBatchItem(batchItem)
+				if err != nil {
+					b.logger.Errorf("error processing batch item: %v", err)
+				}
+				continue
+			}
+
+			// Queue is empty - wait for notification or shutdown
 			select {
 			case <-b.done:
 				// Process remaining items before exiting
@@ -129,19 +149,11 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 						b.logger.Errorf("error writing final batch during shutdown: %v", err)
 					}
 				}
-
 				return
-			default:
-				batchItem = b.queue.Dequeue()
-				if batchItem == nil {
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
 
-				err = b.processBatchItem(batchItem)
-				if err != nil {
-					b.logger.Errorf("error processing batch item: %v", err)
-				}
+			case <-b.notifyCh:
+				// Item available, loop back to dequeue
+				continue
 			}
 		}
 	}()
@@ -231,7 +243,9 @@ func (b *Batcher) writeBatch(currentBatch []byte, batchKeys []byte) error {
 	binary.BigEndian.PutUint32(batchKey, timeUint32)
 	// add a random string as the next bytes, to prevent conflicting filenames from other pods
 	randBytes := make([]byte, 4)
-	_, _ = rand.Read(randBytes)
+	if _, err := rand.Read(randBytes); err != nil {
+		return errors.NewStorageError("failed to generate random bytes for batch key", err)
+	}
 	batchKey = append(batchKey, randBytes...)
 
 	g, gCtx := errgroup.WithContext(context.Background())
@@ -296,8 +310,14 @@ func (b *Batcher) Close(_ context.Context) error {
 	// Signal the background goroutine to stop
 	close(b.done)
 
-	// Wait a bit to ensure the goroutine has time to process remaining items
-	time.Sleep(100 * time.Millisecond)
+	// Wake up the worker if it's blocked on notifyCh
+	select {
+	case b.notifyCh <- struct{}{}:
+	default:
+	}
+
+	// Wait for the background goroutine to finish processing all remaining items
+	b.wg.Wait()
 
 	return nil
 }
@@ -346,6 +366,12 @@ func (b *Batcher) Set(_ context.Context, hash []byte, fileType fileformat.FileTy
 		fileType: fileType,
 		value:    value,
 	})
+
+	// Notify worker that new item is available (non-blocking)
+	select {
+	case b.notifyCh <- struct{}{}:
+	default: // Already notified, don't block
+	}
 
 	return nil
 }
