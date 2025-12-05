@@ -2,7 +2,6 @@ package subtreevalidation
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -189,8 +188,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		subtreeHash := subtreeHash
 		subtreeIdx := subtreeIdx
 
-		subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, 1024) // Pre-allocate space for transactions in this subtree
-
 		g.Go(func() (err error) {
 			subtreeToCheckExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 			if err != nil {
@@ -270,6 +267,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to store subtree", subtreeHash.String(), err)
 				}
 			}
+
+			// PHASE 2: Exact pre-allocation
+			subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
 
 			subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 			if err != nil {
@@ -489,9 +489,8 @@ func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *sub
 	return nil
 }
 
-// processSubtreeDataStream downloads subtreeData, stores it, then parses transactions
-// This avoids TeeReader double buffering by reading the stream once into storage,
-// then parsing transactions from the stored data.
+// processSubtreeDataStream downloads subtreeData, stores it directly to disk, then parses transactions.
+// PHASE 1: Streams data directly to storage without buffering in memory.
 func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreepkg.Subtree,
 	body io.ReadCloser, allTransactions *[]*bt.Tx) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processSubtreeDataStream",
@@ -500,43 +499,40 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	)
 	defer deferFn()
 
-	// PHASE 1 OPTIMIZATION: Read entire stream into buffer ONCE
-	// Use pooled bufio.Reader for efficient reading
+	// Stream directly to disk without intermediate buffering
+	err := u.subtreeStore.SetFromReader(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, body)
+	if err != nil {
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", err)
+	}
+
+	// Read back from storage for parsing
+	subtreeDataReader, err := u.subtreeStore.GetIoReader(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
+	if err != nil {
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to read back subtree data", err)
+	}
+	defer subtreeDataReader.Close()
+
+	// Use pooled bufio.Reader
 	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
-	bufferedReader.Reset(body)
+	bufferedReader.Reset(subtreeDataReader)
 	defer func() {
 		bufferedReader.Reset(nil)
 		bufioReaderPool.Put(bufferedReader)
 	}()
 
-	// Read all bytes from stream into buffer
-	var buffer bytes.Buffer
-	bytesRead, err := io.Copy(&buffer, bufferedReader)
+	// Parse transactions from stored data
+	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, allTransactions)
 	if err != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to read stream", err)
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to read transactions from storage", err)
 	}
 
-	// Store the buffered data to disk immediately
-	// we not set a DAH as this is part of a block and will be permanently stored anyway
-	err = u.subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, buffer.Bytes())
-	if err != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", err)
-	}
-
-	// PHASE 1 OPTIMIZATION: Parse transactions from the stored buffer
-	// This reuses existing parsing logic but avoids double-copy
-	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, bytes.NewReader(buffer.Bytes()), allTransactions)
-	if err != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to read transactions from buffer", err)
-	}
-
-	// Verify transaction count matches subtree
+	// Verify transaction count
 	if txCount != subtree.Length() {
 		return errors.NewProcessingError("[processSubtreeDataStream] transaction count mismatch: expected %d, got %d", subtree.Length(), txCount)
 	}
 
-	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s (streamed %d bytes)",
-		txCount, subtree.RootHash().String(), bytesRead)
+	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s (streamed to disk)",
+		txCount, subtree.RootHash().String())
 
 	return nil
 }
@@ -771,6 +767,9 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 // extendTxWithInBlockParents extends a transaction's inputs with parent output data
 // from transactions in the previous dependency level, avoiding Aerospike fetches for intra-block dependencies.
 // This is a critical optimization that eliminates ~500MB+ of UTXO store fetches per block.
+//
+// ALL-OR-NOTHING TEST: If we can't find ALL parent transactions in parentLevelTxs,
+// we don't extend ANY inputs to prevent partial extension.
 func extendTxWithInBlockParents(tx *bt.Tx, parentLevelTxs []missingTx) int {
 	if tx == nil || len(parentLevelTxs) == 0 {
 		return 0
@@ -789,14 +788,17 @@ func extendTxWithInBlockParents(tx *bt.Tx, parentLevelTxs []missingTx) int {
 		}
 	}
 
-	extendedCount := 0
+	// PHASE 1: Check if we CAN extend all inputs from this level
+	inputsNeedingExtension := 0
+	inputsWeCanExtend := 0
 
-	// Extend each input with parent output data if parent is in this level
 	for _, input := range tx.Inputs {
 		parentHash := input.PreviousTxIDChainHash()
 		if parentHash == nil {
-			continue
+			continue // Input doesn't need extension
 		}
+
+		inputsNeedingExtension++
 
 		// Check if parent is in previous level
 		parentTx, found := parentMap[*parentHash]
@@ -804,21 +806,34 @@ func extendTxWithInBlockParents(tx *bt.Tx, parentLevelTxs []missingTx) int {
 			continue
 		}
 
-		// Get the referenced output index
-		vout := input.PreviousTxOutIndex
-
 		// Validate output index is in range
+		vout := input.PreviousTxOutIndex
 		if int(vout) >= len(parentTx.Outputs) {
 			continue
 		}
 
-		// Extend the input with parent output data
-		output := parentTx.Outputs[vout]
-		input.PreviousTxSatoshis = output.Satoshis
-		input.PreviousTxScript = output.LockingScript
-
-		extendedCount++
+		inputsWeCanExtend++
 	}
 
-	return extendedCount
+	// All-or-nothing: If we can't extend ALL inputs, don't extend any
+	if inputsWeCanExtend < inputsNeedingExtension {
+		return 0
+	}
+
+	// PHASE 2: Now extend all inputs
+	for _, input := range tx.Inputs {
+		parentHash := input.PreviousTxIDChainHash()
+		if parentHash == nil {
+			continue
+		}
+
+		parentTx := parentMap[*parentHash]
+		vout := input.PreviousTxOutIndex
+		output := parentTx.Outputs[vout]
+
+		input.PreviousTxSatoshis = output.Satoshis
+		input.PreviousTxScript = output.LockingScript
+	}
+
+	return inputsWeCanExtend
 }
