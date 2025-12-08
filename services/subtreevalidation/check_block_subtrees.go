@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -193,6 +192,18 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 	txBatchSize := u.settings.SubtreeValidation.TxBatchSize
 
+	// Calculate intelligent fallback based on TxBatchSize and typical subtree size (2048 txs)
+	// This replaces the previous hardcoded value of 30
+	const typicalTxsPerSubtree = 2048
+	fallbackBatchSize := txBatchSize / typicalTxsPerSubtree
+	if fallbackBatchSize == 0 {
+		// If TxBatchSize is very small or not set, use 10% of total subtrees
+		fallbackBatchSize = totalSubtrees / 10
+		if fallbackBatchSize == 0 {
+			fallbackBatchSize = 1 // Minimum 1 subtree per batch
+		}
+	}
+
 	if txBatchSize == 0 {
 		// No batching - process all subtrees at once
 		subtreesBatchSize = totalSubtrees
@@ -205,17 +216,17 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		// Check if first subtree exists in store
 		subtreeToCheckExists, err := u.subtreeStore.Exists(ctx, firstSubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 		if err != nil {
-			u.logger.Warnf("[CheckBlockSubtrees] Failed to check if first subtree exists for batch size calculation, falling back to default: %v", err)
-			subtreesBatchSize = 30 // Fallback to default
+			u.logger.Warnf("[CheckBlockSubtrees] Failed to check if first subtree exists for batch size calculation, falling back to calculated default (%d subtrees): %v", fallbackBatchSize, err)
+			subtreesBatchSize = fallbackBatchSize
 		} else if !subtreeToCheckExists {
-			u.logger.Warnf("[CheckBlockSubtrees] First subtree doesn't exist in store for batch size calculation, falling back to default")
-			subtreesBatchSize = 30 // Fallback to default
+			u.logger.Warnf("[CheckBlockSubtrees] First subtree doesn't exist in store for batch size calculation, falling back to calculated default (%d subtrees)", fallbackBatchSize)
+			subtreesBatchSize = fallbackBatchSize
 		} else {
 			// Get first subtree structure to count transactions
 			subtreeReader, err := u.subtreeStore.GetIoReader(ctx, firstSubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 			if err != nil {
-				u.logger.Warnf("[CheckBlockSubtrees] Failed to read first subtree for batch size calculation, falling back to default: %v", err)
-				subtreesBatchSize = 30 // Fallback to default
+				u.logger.Warnf("[CheckBlockSubtrees] Failed to read first subtree for batch size calculation, falling back to calculated default (%d subtrees): %v", fallbackBatchSize, err)
+				subtreesBatchSize = fallbackBatchSize
 			} else {
 				bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
 				bufferedReader.Reset(subtreeReader)
@@ -225,8 +236,8 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				bufioReaderPool.Put(bufferedReader)
 
 				if err != nil {
-					u.logger.Warnf("[CheckBlockSubtrees] Failed to deserialize first subtree for batch size calculation, falling back to default: %v", err)
-					subtreesBatchSize = 30 // Fallback to default
+					u.logger.Warnf("[CheckBlockSubtrees] Failed to deserialize first subtree for batch size calculation, falling back to calculated default (%d subtrees): %v", fallbackBatchSize, err)
+					subtreesBatchSize = fallbackBatchSize
 				} else {
 					txsPerSubtree := firstSubtree.Length()
 
@@ -402,12 +413,21 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 
 		// Collect all transactions from this batch of subtrees
-		allTransactions := make([]*bt.Tx, 0, len(subtreeTxs))
+		// Calculate exact capacity needed across all subtrees in this batch to avoid reallocations
+		totalTxCapacity := 0
+		for _, txs := range subtreeTxs {
+			totalTxCapacity += len(txs)
+		}
+		allTransactions := make([]*bt.Tx, 0, totalTxCapacity)
 		for _, txs := range subtreeTxs {
 			if len(txs) > 0 {
 				allTransactions = append(allTransactions, txs...)
 			}
 		}
+
+		// Release 2D subtree transaction slice after consolidation
+		// All transactions now in allTransactions, original 2D structure no longer needed
+		subtreeTxs = nil //nolint:ineffassign // Intentional early GC hint
 
 		batchTxCount := len(allTransactions)
 		totalBatches := (totalSubtrees + subtreesBatchSize - 1) / subtreesBatchSize
@@ -419,10 +439,13 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in batch %d", batchNum, err)
 			}
 			totalProcessedTxs += batchTxCount
+
+			// Release transaction slice after processing completes
+			// Transactions are now in UTXO store and validator cache, original slice no longer needed
+			allTransactions = nil //nolint:ineffassign // Intentional early GC hint
 		}
 
-		// Force GC to reclaim memory from this batch before next iteration
-		runtime.GC()
+		batchSubtrees = nil //nolint:ineffassign // Intentional early GC hint for batch slice view
 		u.logger.Infof("[CheckBlockSubtrees] Batch %d/%d complete for block %s (%d txs processed, %d total), memory reclaimed", batchNum, totalBatches, block.Hash().String(), batchTxCount, totalProcessedTxs)
 	}
 
