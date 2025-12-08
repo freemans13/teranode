@@ -245,6 +245,11 @@ func TestCheckBlockSubtrees(t *testing.T) {
 			mock.Anything).
 			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Once()
 
+		// Mock GetBlockHeaderIDs which is now called early in CheckBlockSubtrees
+		server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
+			mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1, 2, 3}, nil)
+
 		// Create subtree hash that doesn't exist in store to trigger HTTP fetching
 		subtreeHash := chainhash.Hash{}
 		copy(subtreeHash[:], []byte("missing_subtree_hash_32_bytes_lng!"))
@@ -550,8 +555,8 @@ func TestProcessSubtreeDataStream(t *testing.T) {
 		mockBlobStore := &MockBlobStore{}
 		server.subtreeStore = mockBlobStore
 
-		// Set up the mock to return an error when storing
-		mockBlobStore.On("Set", mock.Anything, mock.Anything, fileformat.FileTypeSubtreeData, mock.Anything).
+		// Set up the mock to return an error when storing (SetFromReader is now used)
+		mockBlobStore.On("SetFromReader", mock.Anything, mock.Anything, fileformat.FileTypeSubtreeData, mock.Anything).
 			Return(errors.NewStorageError("failed to write to storage"))
 
 		// Create test transaction
@@ -577,8 +582,8 @@ func TestProcessSubtreeDataStream(t *testing.T) {
 		err = server.processSubtreeDataStream(context.Background(), subtree, body, &allTransactions)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to store subtree data")
-		// Verify transaction was still collected before storage error
-		assert.Len(t, allTransactions, 1)
+		// With streaming approach, if storage fails, no transactions are collected
+		assert.Len(t, allTransactions, 0)
 	})
 
 	t.Run("InvalidTransactionData", func(t *testing.T) {
@@ -1759,11 +1764,11 @@ func TestCheckBlockSubtrees_LargeBlock_MemoryConsumption(t *testing.T) {
 
 	// Configuration: adjust these values to test with different loads
 	const (
-		numTransactions    = 10240  // Number of transactions to process (must be divisible by txsPerSubtree)
-		txsPerSubtree      = 512    // Transactions per subtree (must be power of 2)
-		estimatedTxSize    = 250    // Average transaction size in bytes
-		expectedMemoryMB   = 100    // Expected peak memory in MB (adjust after baseline)
-		memoryToleranceMB  = 50     // Tolerance for memory variation
+		numTransactions   = 10240 // Number of transactions to process (must be divisible by txsPerSubtree)
+		txsPerSubtree     = 512   // Transactions per subtree (must be power of 2)
+		estimatedTxSize   = 250   // Average transaction size in bytes
+		expectedMemoryMB  = 100   // Expected peak memory in MB (adjust after baseline)
+		memoryToleranceMB = 50    // Tolerance for memory variation
 	)
 
 	numSubtrees := numTransactions / txsPerSubtree

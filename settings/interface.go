@@ -522,6 +522,7 @@ type SubtreeValidationSettings struct {
 	// Concurrency limits
 	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
 	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)
+	TxBatchSize                   int           // Transaction batch size for CheckBlockSubtrees (0 = no batching, default: 1000000)
 }
 
 type LegacySettings struct {
