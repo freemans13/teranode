@@ -579,8 +579,8 @@ func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *sub
 	return nil
 }
 
-// processSubtreeDataStream downloads subtreeData, stores it directly to disk, then parses transactions.
-// PHASE 1: Streams data directly to storage without buffering in memory.
+// processSubtreeDataStream downloads subtreeData and simultaneously stores to disk while parsing transactions.
+// PHASE 1: Single-pass streaming - avoids double I/O by using TeeReader to write and parse concurrently.
 func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreepkg.Subtree,
 	body io.ReadCloser, allTransactions *[]*bt.Tx) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processSubtreeDataStream",
@@ -589,31 +589,46 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	)
 	defer deferFn()
 
-	// Stream directly to disk without intermediate buffering
-	err := u.subtreeStore.SetFromReader(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, body)
-	if err != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", err)
-	}
+	// Create a pipe for concurrent storage write
+	pr, pw := io.Pipe()
 
-	// Read back from storage for parsing
-	subtreeDataReader, err := u.subtreeStore.GetIoReader(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
-	if err != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to read back subtree data", err)
-	}
-	defer subtreeDataReader.Close()
+	// Channel to capture storage errors
+	storeDone := make(chan error, 1)
 
-	// Use pooled bufio.Reader
+	// Goroutine to write to storage concurrently
+	go func() {
+		storeErr := u.subtreeStore.SetFromReader(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, pr)
+		storeDone <- storeErr
+		close(storeDone)
+	}()
+
+	// Use TeeReader to simultaneously write to storage (via pipe) and parse transactions
+	teeReader := io.TeeReader(body, pw)
+
+	// Use pooled bufio.Reader for parsing
 	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
-	bufferedReader.Reset(subtreeDataReader)
+	bufferedReader.Reset(teeReader)
 	defer func() {
 		bufferedReader.Reset(nil)
 		bufioReaderPool.Put(bufferedReader)
 	}()
 
-	// Parse transactions from stored data
-	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, allTransactions)
-	if err != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to read transactions from storage", err)
+	// Parse transactions while writing to storage
+	txCount, parseErr := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, allTransactions)
+
+	// Close the pipe writer to signal completion to storage goroutine
+	pw.Close()
+
+	// Wait for storage operation to complete
+	storeErr := <-storeDone
+
+	// Check for errors from both operations
+	if storeErr != nil {
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", storeErr)
+	}
+
+	if parseErr != nil {
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to parse transactions", parseErr)
 	}
 
 	// Verify transaction count
@@ -621,7 +636,7 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 		return errors.NewProcessingError("[processSubtreeDataStream] transaction count mismatch: expected %d, got %d", subtree.Length(), txCount)
 	}
 
-	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s (streamed to disk)",
+	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s (single-pass streaming)",
 		txCount, subtree.RootHash().String())
 
 	return nil
