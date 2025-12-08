@@ -580,7 +580,7 @@ func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *sub
 }
 
 // processSubtreeDataStream downloads subtreeData and simultaneously stores to disk while parsing transactions.
-// PHASE 1: Single-pass streaming - avoids double I/O by using TeeReader to write and parse concurrently.
+// PHASE 1: Concurrent streaming - eliminates storage read-back by writing to disk while parsing.
 func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreepkg.Subtree,
 	body io.ReadCloser, allTransactions *[]*bt.Tx) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processSubtreeDataStream",
@@ -602,7 +602,7 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 		close(storeDone)
 	}()
 
-	// Use TeeReader to simultaneously write to storage (via pipe) and parse transactions
+	// Use TeeReader to split network stream to storage and parser simultaneously
 	teeReader := io.TeeReader(body, pw)
 
 	// Use pooled bufio.Reader for parsing
