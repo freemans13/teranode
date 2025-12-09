@@ -859,8 +859,7 @@ func buildParentMapFromLevel(parentLevelTxs []missingTx) map[chainhash.Hash]*bt.
 // from a pre-built parent map, avoiding Aerospike fetches for intra-block dependencies.
 // This is a critical optimization that eliminates ~500MB+ of UTXO store fetches per block.
 //
-// ALL-OR-NOTHING TEST: If we can't find ALL parent transactions in the parentMap,
-// we don't extend ANY inputs to prevent partial extension.
+// Sets the transaction as extended only if ALL inputs are successfully extended.
 func extendTxWithInBlockParents(tx *bt.Tx, parentMap map[chainhash.Hash]*bt.Tx) int {
 	if tx == nil || len(parentMap) == 0 {
 		return 0
@@ -871,11 +870,8 @@ func extendTxWithInBlockParents(tx *bt.Tx, parentMap map[chainhash.Hash]*bt.Tx) 
 		return 0
 	}
 
-	// Parent map is pre-built and passed in - no need to build it here
-
-	// PHASE 1: Check if we CAN extend all inputs from this level
-	inputsNeedingExtension := 0
-	inputsWeCanExtend := 0
+	extendedCount := 0
+	allInputsExtended := true
 
 	for _, input := range tx.Inputs {
 		parentHash := input.PreviousTxIDChainHash()
@@ -883,42 +879,24 @@ func extendTxWithInBlockParents(tx *bt.Tx, parentMap map[chainhash.Hash]*bt.Tx) 
 			continue // Input doesn't need extension
 		}
 
-		inputsNeedingExtension++
-
-		// Check if parent is in previous level
+		// Try to extend this input
 		parentTx, found := parentMap[*parentHash]
-		if !found {
+		if !found || int(input.PreviousTxOutIndex) >= len(parentTx.Outputs) {
+			allInputsExtended = false
 			continue
 		}
 
-		// Validate output index is in range
-		vout := input.PreviousTxOutIndex
-		if int(vout) >= len(parentTx.Outputs) {
-			continue
-		}
-
-		inputsWeCanExtend++
-	}
-
-	// All-or-nothing: If we can't extend ALL inputs, don't extend any
-	if inputsWeCanExtend < inputsNeedingExtension {
-		return 0
-	}
-
-	// PHASE 2: Now extend all inputs
-	for _, input := range tx.Inputs {
-		parentHash := input.PreviousTxIDChainHash()
-		if parentHash == nil {
-			continue
-		}
-
-		parentTx := parentMap[*parentHash]
-		vout := input.PreviousTxOutIndex
-		output := parentTx.Outputs[vout]
-
+		// Extend this input
+		output := parentTx.Outputs[input.PreviousTxOutIndex]
 		input.PreviousTxSatoshis = output.Satoshis
 		input.PreviousTxScript = output.LockingScript
+		extendedCount++
 	}
 
-	return inputsWeCanExtend
+	// Only mark as fully extended if we successfully extended all inputs
+	if allInputsExtended && extendedCount > 0 {
+		tx.SetExtended(true)
+	}
+
+	return extendedCount
 }
