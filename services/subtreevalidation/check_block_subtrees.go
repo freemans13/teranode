@@ -192,66 +192,21 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 	txBatchSize := u.settings.SubtreeValidation.TxBatchSize
 
-	// Calculate intelligent fallback based on TxBatchSize and typical subtree size (2048 txs)
-	// This replaces the previous hardcoded value of 30
-	const typicalTxsPerSubtree = 2048
-	fallbackBatchSize := txBatchSize / typicalTxsPerSubtree
-	if fallbackBatchSize == 0 {
-		// If TxBatchSize is very small or not set, use 10% of total subtrees
-		fallbackBatchSize = totalSubtrees / 10
-		if fallbackBatchSize == 0 {
-			fallbackBatchSize = 1 // Minimum 1 subtree per batch
-		}
-	}
-
 	if txBatchSize == 0 {
 		// No batching - process all subtrees at once
 		subtreesBatchSize = totalSubtrees
-		u.logger.Infof("[CheckBlockSubtrees] Batching disabled (TxBatchSize=0), processing all %d subtrees in one batch", totalSubtrees)
-	} else {
-		// Peek at first subtree to determine transactions per subtree
-		// All subtrees in a block are the same size, so we only need to check one
-		firstSubtreeHash := missingSubtrees[0]
-
-		// Check if first subtree exists in store
-		subtreeToCheckExists, err := u.subtreeStore.Exists(ctx, firstSubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
-		if err != nil {
-			u.logger.Warnf("[CheckBlockSubtrees] Failed to check if first subtree exists for batch size calculation, falling back to calculated default (%d subtrees): %v", fallbackBatchSize, err)
-			subtreesBatchSize = fallbackBatchSize
-		} else if !subtreeToCheckExists {
-			u.logger.Warnf("[CheckBlockSubtrees] First subtree doesn't exist in store for batch size calculation, falling back to calculated default (%d subtrees)", fallbackBatchSize)
-			subtreesBatchSize = fallbackBatchSize
-		} else {
-			// Get first subtree structure to count transactions
-			subtreeReader, err := u.subtreeStore.GetIoReader(ctx, firstSubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
-			if err != nil {
-				u.logger.Warnf("[CheckBlockSubtrees] Failed to read first subtree for batch size calculation, falling back to calculated default (%d subtrees): %v", fallbackBatchSize, err)
-				subtreesBatchSize = fallbackBatchSize
-			} else {
-				bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
-				bufferedReader.Reset(subtreeReader)
-				firstSubtree, err := subtreepkg.NewSubtreeFromReader(bufferedReader)
-				subtreeReader.Close()
-				bufferedReader.Reset(nil)
-				bufioReaderPool.Put(bufferedReader)
-
-				if err != nil {
-					u.logger.Warnf("[CheckBlockSubtrees] Failed to deserialize first subtree for batch size calculation, falling back to calculated default (%d subtrees): %v", fallbackBatchSize, err)
-					subtreesBatchSize = fallbackBatchSize
-				} else {
-					txsPerSubtree := firstSubtree.Length()
-
-					// Calculate how many subtrees per batch to hit target transaction batch size
-					subtreesBatchSize = txBatchSize / txsPerSubtree
-					if subtreesBatchSize == 0 {
-						subtreesBatchSize = 1 // Minimum 1 subtree per batch
-					}
-
-					u.logger.Infof("[CheckBlockSubtrees] Configured TxBatchSize=%d, detected %d txs/subtree, using %d subtrees per batch",
-						txBatchSize, txsPerSubtree, subtreesBatchSize)
-				}
-			}
+	} else if block.TransactionCount > 0 && len(block.Subtrees) > 0 {
+		// Calculate exact txs per subtree using block metadata
+		txsPerSubtree := int(block.TransactionCount / uint64(len(block.Subtrees)))
+		subtreesBatchSize = txBatchSize / txsPerSubtree
+		if subtreesBatchSize == 0 {
+			subtreesBatchSize = 1 // Minimum 1 subtree per batch
 		}
+	} else {
+		// Fallback if metadata not available (shouldn't happen)
+		subtreesBatchSize = 1
+		u.logger.Warnf("[CheckBlockSubtrees] Block metadata incomplete (txs=%d, subtrees=%d), using 1 subtree per batch",
+			block.TransactionCount, len(block.Subtrees))
 	}
 
 	// Process subtrees in batches to limit memory usage
