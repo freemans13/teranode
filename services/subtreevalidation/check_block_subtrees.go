@@ -617,7 +617,12 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	txCount, parseErr := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, allTransactions)
 
 	// Close the pipe writer to signal completion to storage goroutine
-	pw.Close()
+	// Use CloseWithError if parsing failed to properly signal the storage goroutine
+	if parseErr != nil {
+		pw.CloseWithError(parseErr)
+	} else {
+		pw.Close()
+	}
 
 	// Wait for storage operation to complete
 	storeErr := <-storeDone
