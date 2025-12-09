@@ -454,8 +454,7 @@ func (s *Store) addAbstractedBins(bins []fields.FieldName) []fields.FieldName {
 
 	// add missing bins
 	if slices.Contains(newBins, fields.TxInpoints) {
-		if !slices.Contains(newBins, fields.Inputs) {
-			newBins = append(newBins, fields.Inputs)
+		if !slices.Contains(newBins, fields.External) {
 			newBins = append(newBins, fields.External)
 		}
 	}
