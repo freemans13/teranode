@@ -6,17 +6,17 @@ replace github.com/in-toto/in-toto-golang => github.com/in-toto/in-toto-golang v
 
 require (
 	github.com/IBM/sarama v1.45.1
-	github.com/aerospike/aerospike-client-go/v8 v8.2.0
+	github.com/aerospike/aerospike-client-go/v8 v8.4.2
 	github.com/aws/aws-sdk-go-v2 v1.36.3
 	github.com/aws/aws-sdk-go-v2/config v1.29.9
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.17.66
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.78.2
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.0-beta11
 	github.com/bitcoin-sv/go-sdk v1.1.21
-	github.com/bitcoin-sv/testcontainers-aerospike-go v0.2.2
 	github.com/bsv-blockchain/go-bt/v2 v2.5.1
 	github.com/bsv-blockchain/go-chaincfg v1.4.0
 	github.com/bsv-blockchain/go-subtree v1.1.2
+	github.com/bsv-blockchain/testcontainers-aerospike-go v0.3.2
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
 	github.com/centrifugal/centrifuge v0.33.2
@@ -85,7 +85,7 @@ require (
 	github.com/bsv-blockchain/go-bc v1.0.2 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/containerd/containerd/api v1.9.0 // indirect
-	github.com/containerd/containerd/v2 v2.1.4 // indirect
+	github.com/containerd/containerd/v2 v2.1.5 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/platforms v1.0.0-rc.2 // indirect
@@ -128,7 +128,6 @@ require (
 	github.com/moby/sys/userns v0.1.0 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/nxadm/tail v1.4.11 // indirect
-	github.com/onsi/gomega v1.36.3 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
 	github.com/pion/dtls/v2 v2.2.12 // indirect
@@ -173,13 +172,13 @@ require (
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/bitcoin-sv/alert-system v0.2.0
-	github.com/bsv-blockchain/go-batcher v1.1.0
+	github.com/bsv-blockchain/go-batcher v1.2.5
 	github.com/bsv-blockchain/go-bn v1.0.3
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.7
 	github.com/bsv-blockchain/go-safe-conversion v1.1.0
 	github.com/bsv-blockchain/go-sdk v1.2.11
-	github.com/bsv-blockchain/go-tx-map v1.2.0
+	github.com/bsv-blockchain/go-tx-map v1.2.1
 	github.com/bsv-blockchain/go-wire v1.0.6
 	github.com/felixge/fgprof v0.9.5
 	github.com/gocarina/gocsv v0.0.0-20240520201108-78e41c74b4b1
@@ -390,8 +389,8 @@ require (
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/theupdateframework/notary v0.7.0 // indirect
 	github.com/tilt-dev/fsnotify v1.4.8-0.20220602155310-fff9c274a375 // indirect
-	github.com/tklauser/go-sysconf v0.3.15 // indirect
-	github.com/tklauser/numcpus v0.10.0 // indirect
+	github.com/tklauser/go-sysconf v0.3.16 // indirect
+	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/tonistiigi/fsutil v0.0.0-20250605211040-586307ad452f // indirect
 	github.com/tonistiigi/units v0.0.0-20180711220420-6950e57a87ea // indirect
 	github.com/tonistiigi/vt100 v0.0.0-20240514184818-90bafcd6abab // indirect
