@@ -1478,6 +1478,13 @@ func (u *Server) prepareTxsPerLevel(ctx context.Context, transactions []missingT
 // prepareTxsPerLevelOrdered is an optimized version of prepareTxsPerLevel that assumes transactions
 // are already in topological order (parents before children), as guaranteed by the Bitcoin protocol.
 //
+// ORDERING GUARANTEE: The Bitcoin protocol mandates that transactions within a block must be ordered
+// such that parent transactions appear before their children. This is enforced during block construction
+// and validated during block processing. All callers of this function provide transactions from:
+//   - Block.Transactions() - guaranteed ordered by Bitcoin protocol
+//   - Subtree.Txs - maintains block ordering when constructed
+//   - processTransactionsInLevels - preserves original block/subtree ordering via indexed iteration
+//
 // This optimization reduces complexity from O(V*E + V²) to O(V*I) where:
 //   - V = number of transactions
 //   - E = number of dependencies
