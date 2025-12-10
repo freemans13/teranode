@@ -454,8 +454,14 @@ func (s *Store) addAbstractedBins(bins []fields.FieldName) []fields.FieldName {
 
 	// add missing bins
 	if slices.Contains(newBins, fields.TxInpoints) {
+		// Need External to determine if tx is external or stored in Aerospike
 		if !slices.Contains(newBins, fields.External) {
 			newBins = append(newBins, fields.External)
+		}
+		// Need Inputs for non-external transactions (stored in Aerospike)
+		// For external transactions, TxInpoints will be computed from blob store
+		if !slices.Contains(newBins, fields.Inputs) {
+			newBins = append(newBins, fields.Inputs)
 		}
 	}
 
