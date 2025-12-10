@@ -521,6 +521,8 @@ type SubtreeValidationSettings struct {
 	// Concurrency limits
 	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
 	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)
+	// Level algorithm optimization
+	UseOrderedLevelAlgorithm bool // When true, uses optimized O(V*I) algorithm assuming transactions are ordered (default: true)
 }
 
 type LegacySettings struct {
