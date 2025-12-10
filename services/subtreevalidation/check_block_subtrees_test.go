@@ -1361,8 +1361,19 @@ func (m *MockBlobStore) Del(ctx context.Context, key []byte, fileType fileformat
 }
 
 func (m *MockBlobStore) SetFromReader(ctx context.Context, key []byte, fileType fileformat.FileType, reader io.ReadCloser, opts ...options.FileOption) error {
-	args := m.Called(ctx, key, fileType, reader)
-	return args.Error(0)
+	// Call the mock first to get the configured error (if any)
+	// Don't pass the reader to avoid data races with testify's reflection-based argument matching
+	args := m.Called(ctx, key, fileType, mock.Anything)
+	err := args.Error(0)
+
+	// Only drain the reader if there's no error (simulating realistic storage behavior)
+	// In a real storage implementation, an error would stop reading from the reader
+	if err == nil {
+		_, _ = io.Copy(io.Discard, reader)
+	}
+	reader.Close()
+
+	return err
 }
 
 func (m *MockBlobStore) SetDAH(ctx context.Context, key []byte, fileType fileformat.FileType, dah uint32, opts ...options.FileOption) error {
