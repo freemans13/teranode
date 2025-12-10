@@ -549,12 +549,18 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 
 	// Channel to capture storage errors
 	storeDone := make(chan error, 1)
+	var storeErr error
 
 	// Goroutine to write to storage concurrently
 	go func() {
-		storeErr := u.subtreeStore.SetFromReader(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, pr)
-		storeDone <- storeErr
-		close(storeDone)
+		err := u.subtreeStore.SetFromReader(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, pr)
+		storeErr = err
+		storeDone <- err
+		// If storage failed, close pipe writer to unblock any pending writes
+		// This prevents deadlock when SetFromReader returns an error without fully draining the pipe reader
+		if err != nil {
+			pw.CloseWithError(err)
+		}
 	}()
 
 	// Use TeeReader to split network stream to storage and parser simultaneously
@@ -580,7 +586,7 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	}
 
 	// Wait for storage operation to complete
-	storeErr := <-storeDone
+	storeErr = <-storeDone
 
 	// Check for errors from both operations
 	if storeErr != nil {
