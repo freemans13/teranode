@@ -66,10 +66,12 @@ type Job struct {
 // and the subtree processor, including an error channel for asynchronous result reporting.
 
 type NewSubtreeRequest struct {
-	Subtree          *subtreepkg.Subtree                                     // The subtree to process
-	ParentTxMap      *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] // Map of parent transactions
-	SkipNotification bool                                                    // Whether to skip notification to the network
-	ErrChan          chan error                                              // Channel for error reporting
+	Subtree           *subtreepkg.Subtree                                     // The subtree to process
+	ParentTxMap       *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] // Map of parent transactions
+	DeletedTxs        *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] // Backup map for deleted transactions
+	SkipNotification  bool                                                    // Whether to skip notification to the network
+	ErrChan           chan error                                              // Channel for error reporting
+	OnStorageComplete func()                                                  // Called when storage completes to trigger cleanup
 }
 
 // moveBlockRequest represents a request to move a block in the chain.
@@ -224,6 +226,10 @@ type SubtreeProcessor struct {
 
 	// currentTxMap tracks transactions currently held in the subtree processor
 	currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]
+
+	// deletedTxs stores transaction parent info for recently deleted transactions
+	// This provides a backup/fallback for Server when transactions are deleted during async storage
+	deletedTxs *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]
 
 	// removeMap tracks transactions marked for removal
 	removeMap *txmap.SwissMap
@@ -388,6 +394,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 		batcher:                  NewTxIDAndFeeBatch(tSettings.BlockAssembly.SubtreeProcessorBatcherSize),
 		queue:                    queue,
 		currentTxMap:             txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints](),
+		deletedTxs:               txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints](),
 		removeMap:                txmap.NewSwissMap(0),
 		blockchainClient:         blockchainClient,
 		subtreeStore:             subtreeStore,
@@ -475,7 +482,11 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						send := NewSubtreeRequest{
 							Subtree:     incompleteSubtree,
 							ParentTxMap: stp.currentTxMap,
+							DeletedTxs:  stp.deletedTxs,
 							ErrChan:     make(chan error),
+							OnStorageComplete: func() {
+								stp.cleanupDeletedTxs(incompleteSubtree)
+							},
 						}
 
 						// Send announcement, respecting context cancellation
@@ -632,7 +643,11 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						send := NewSubtreeRequest{
 							Subtree:     incompleteSubtree,
 							ParentTxMap: stp.currentTxMap,
+							DeletedTxs:  stp.deletedTxs,
 							ErrChan:     make(chan error),
+							OnStorageComplete: func() {
+								stp.cleanupDeletedTxs(incompleteSubtree)
+							},
 						}
 
 						// Send announcement, but respect context cancellation
@@ -768,6 +783,24 @@ func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree,
 	incompleteSubtree.Fees = stp.currentSubtree.Load().Fees
 
 	return incompleteSubtree, nil
+}
+
+// cleanupDeletedTxs performs actual deletion from currentTxMap for transactions
+// that were previously soft-deleted. Called after subtree storage completes.
+// Only deletes if the transaction is still marked as deleted (not re-added).
+//
+// This function is called via the OnStorageComplete callback to safely remove
+// transactions that were marked for deletion while the subtree was being stored.
+//
+// Parameters:
+//   - subtree: The subtree whose soft-deleted transactions should be cleaned up
+func (stp *SubtreeProcessor) cleanupDeletedTxs(subtree *subtreepkg.Subtree) {
+	for _, node := range subtree.Nodes {
+		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			// Remove from deletedTxs backup map (transaction data no longer needed after storage)
+			stp.deletedTxs.Delete(node.Hash)
+		}
+	}
 }
 
 // GetCurrentRunningState returns the current operational state of the processor.
@@ -1421,8 +1454,12 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	stp.newSubtreeChan <- NewSubtreeRequest{
 		Subtree:          oldSubtree,
 		ParentTxMap:      stp.currentTxMap,
+		DeletedTxs:       stp.deletedTxs,
 		SkipNotification: skipNotification,
 		ErrChan:          errCh,
+		OnStorageComplete: func() {
+			stp.cleanupDeletedTxs(oldSubtree)
+		},
 	}
 
 	err = <-errCh
@@ -1527,7 +1564,10 @@ func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chai
 	}
 
 	if foundIndex >= 0 {
-		// remove tx from the currentTxMap
+		// Save to deleted backup map before removing (for Server fallback during async storage)
+		if txInpoints, found := stp.currentTxMap.Get(hash); found {
+			stp.deletedTxs.Set(hash, txInpoints)
+		}
 		stp.currentTxMap.Delete(hash)
 
 		// we found the transaction in a subtree
@@ -1591,7 +1631,10 @@ func (stp *SubtreeProcessor) removeTxsFromSubtrees(ctx context.Context, hashes [
 		}
 
 		if foundIndex >= 0 {
-			// remove tx from the currentTxMap
+			// Save to deleted backup map before removing (for Server fallback during async storage)
+			if txInpoints, found := stp.currentTxMap.Get(hash); found {
+				stp.deletedTxs.Set(hash, txInpoints)
+			}
 			stp.currentTxMap.Delete(hash)
 
 			// we found the transaction in a subtree
@@ -1676,13 +1719,19 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 				return errors.NewProcessingError("error getting txInpoints from currentTxMap for %s", node.Hash.String())
 			}
 
-			// Remove from currentTxMap so addNode won't skip it as a duplicate
+			// Save to deleted backup before removing (protects brief window during delete-and-readd)
+			stp.deletedTxs.Set(node.Hash, parents)
+
+			// Delete from currentTxMap so addNode won't skip it as a duplicate
 			stp.currentTxMap.Delete(node.Hash)
 
-			// Immediately re-add the node
+			// Re-add the node (adds back to currentTxMap)
 			if err = stp.addNode(node, &parents, true); err != nil {
 				return errors.NewProcessingError("error adding node to subtree", err)
 			}
+
+			// Clear from deletedTxs (transaction successfully re-added, no longer deleted)
+			stp.deletedTxs.Delete(node.Hash)
 		}
 	}
 
@@ -2036,7 +2085,15 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// this will also store it by the Server in the subtree store
 	for _, subtree := range stp.chainedSubtrees {
 		errCh := make(chan error)
-		stp.newSubtreeChan <- NewSubtreeRequest{Subtree: subtree, ParentTxMap: stp.currentTxMap, ErrChan: errCh}
+		stp.newSubtreeChan <- NewSubtreeRequest{
+			Subtree:     subtree,
+			ParentTxMap: stp.currentTxMap,
+			DeletedTxs:  stp.deletedTxs,
+			ErrChan:     errCh,
+			OnStorageComplete: func() {
+				stp.cleanupDeletedTxs(subtree)
+			},
+		}
 
 		if err = <-errCh; err != nil {
 			return errors.NewProcessingError("[reorgBlocks] error sending subtree to newSubtreeChan", err)

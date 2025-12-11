@@ -33,9 +33,11 @@ func Test_storeSubtree(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1_000)
 
 		require.NoError(t, server.storeSubtree(t.Context(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan))
 
 		subtreeBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree)
@@ -77,9 +79,11 @@ func Test_storeSubtree(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1_000)
 
 		require.NoError(t, server.storeSubtree(t.Context(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan))
 
 		// check that the meta data was not stored
@@ -921,10 +925,12 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:          subtree,
-			ParentTxMap:      txMap,
-			SkipNotification: true,
-			ErrChan:          nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			SkipNotification:  true,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 
 		assert.NoError(t, err)
@@ -946,9 +952,11 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 
 		assert.NoError(t, err)
@@ -967,9 +975,11 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 
 		assert.Error(t, err)
@@ -989,9 +999,11 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		err = server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 
 		// Should not error - should detect existing subtree and return early
@@ -1005,13 +1017,92 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 
 		// Test with valid scenario - this just ensures the path is covered
 		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 
 		// Should succeed in most cases
 		assert.NoError(t, err)
+	})
+}
+
+// TestStoreSubtree_RaceConditionFix tests that the deletedTxs backup map prevents
+// race condition errors when transactions are deleted during async subtree storage.
+// This test would FAIL without the fix (missing DeletedTxs fallback in Server.go).
+func TestStoreSubtree_RaceConditionFix(t *testing.T) {
+	t.Run("deletedTxs fallback prevents serialization errors", func(t *testing.T) {
+		server, subtreeStore, subtree, txMap := setup(t)
+		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
+
+		// Start with a full txMap (from setup) then simulate race condition
+		deletedTxsMap := txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+
+		// Simulate race: One transaction is deleted from ParentTxMap during async storage
+		// but saved to deletedTxsMap (this is what the fix does)
+		tx1Hash := subtree.Nodes[1].Hash // Use second node (first is coinbase)
+		tx1Inpoints, found := txMap.Get(tx1Hash)
+		require.True(t, found, "transaction should exist in txMap from setup")
+
+		// Move transaction from ParentTxMap to DeletedTxs (simulating deletion during storage)
+		deletedTxsMap.Set(tx1Hash, tx1Inpoints)
+		txMap.Delete(tx1Hash)
+
+		// Now tx1 is NOT in ParentTxMap but IS in DeletedTxs
+		// Without the fix, this would fail serialization
+		// With the fix, Server falls back to DeletedTxs and succeeds
+
+		err := server.storeSubtree(t.Context(), subtreeprocessor.NewSubtreeRequest{
+			Subtree:           subtree,
+			ParentTxMap:       txMap,         // Missing tx1!
+			DeletedTxs:        deletedTxsMap, // Has tx1 as backup
+			ErrChan:           nil,
+			OnStorageComplete: nil,
+		}, subtreeRetryChan)
+
+		// Should succeed because Server falls back to DeletedTxs
+		require.NoError(t, err)
+
+		// Verify subtree was stored
+		subtreeBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree)
+		require.NoError(t, err)
+		require.NotNil(t, subtreeBytes)
+
+		// Verify subtree meta was created successfully (using DeletedTxs fallback)
+		subtreeMetaBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta)
+		require.NoError(t, err)
+		require.NotNil(t, subtreeMetaBytes)
+	})
+
+	t.Run("without DeletedTxs fallback would fail", func(t *testing.T) {
+		server, subtreeStore, subtree, _ := setup(t)
+		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
+
+		// Create map without the deleted transaction
+		parentTxMap := txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+		// Don't add tx1 to parentTxMap - simulating it was deleted
+
+		err := server.storeSubtree(t.Context(), subtreeprocessor.NewSubtreeRequest{
+			Subtree:           subtree,
+			ParentTxMap:       parentTxMap, // Missing tx1
+			DeletedTxs:        nil,         // No backup!
+			ErrChan:           nil,
+			OnStorageComplete: nil,
+		}, subtreeRetryChan)
+
+		// Should succeed but subtree meta won't be created (missing parent info)
+		require.NoError(t, err)
+
+		// Subtree data should still be stored
+		subtreeBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree)
+		require.NoError(t, err)
+		require.NotNil(t, subtreeBytes)
+
+		// But subtree meta should NOT exist (couldn't create without parent info)
+		_, err = subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta)
+		require.Error(t, err) // Expect error - meta wasn't created
 	})
 }
 

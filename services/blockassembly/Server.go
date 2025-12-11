@@ -529,8 +529,12 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 		for idx, node := range subtreeRequest.Subtree.Nodes {
 			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 				txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
+				if !found && subtreeRequest.DeletedTxs != nil {
+					// Fallback: check if transaction was deleted during async storage
+					txInpoints, found = subtreeRequest.DeletedTxs.Get(node.Hash)
+				}
 				if !found {
-					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap or DeletedTxs", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
 
 					subtreeMetaMissingTxs = true
 
@@ -596,10 +600,19 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 			}
 		}
 
+		// Trigger cleanup of soft-deleted transactions
+		if subtreeRequest.OnStorageComplete != nil {
+			subtreeRequest.OnStorageComplete()
+		}
+
 		return nil
 	}
 
 	if subtreeRequest.SkipNotification {
+		// Trigger cleanup of soft-deleted transactions
+		if subtreeRequest.OnStorageComplete != nil {
+			subtreeRequest.OnStorageComplete()
+		}
 		return nil
 	}
 
@@ -625,6 +638,11 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 		}); err != nil {
 			return errors.NewServiceError("[BlockAssembly:storeSubtree][%s] failed to send subtree notification", subtree.RootHash().String(), err)
 		}
+	}
+
+	// Trigger cleanup of soft-deleted transactions
+	if subtreeRequest.OnStorageComplete != nil {
+		subtreeRequest.OnStorageComplete()
 	}
 
 	return nil
