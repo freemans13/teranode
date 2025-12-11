@@ -153,15 +153,21 @@ func NewRepository(logger ulogger.Logger, tSettings *settings.Settings, utxoStor
 	return repo, nil
 }
 
-// acquireSemaphorePermit attempts to acquire a permit from the given semaphore with a 30-second timeout.
+// acquireSemaphorePermit attempts to acquire a permit from the given semaphore.
 // If sem is nil (unlimited concurrency), returns immediately without error.
+// Respects the parent context's deadline; adds a 30-second fallback timeout only if no deadline is set.
 func acquireSemaphorePermit(ctx context.Context, sem *semaphore.Weighted, methodName string) error {
 	if sem == nil {
 		return nil // Unlimited concurrency
 	}
 
-	acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	// Only add a fallback timeout if the parent context has no deadline
+	acquireCtx := ctx
+	var cancel context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		acquireCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
 
 	if err := sem.Acquire(acquireCtx, 1); err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -169,7 +175,7 @@ func acquireSemaphorePermit(ctx context.Context, sem *semaphore.Weighted, method
 				fmt.Sprintf("[Repository:%s] operation canceled while waiting for semaphore permit", methodName), err)
 		} else if errors.Is(err, context.DeadlineExceeded) {
 			return errors.NewServiceUnavailableError(
-				fmt.Sprintf("[Repository:%s] operation timed out waiting for semaphore permit (30s)", methodName))
+				fmt.Sprintf("[Repository:%s] operation timed out waiting for semaphore permit", methodName))
 		}
 		return errors.NewProcessingError(
 			fmt.Sprintf("[Repository:%s] failed to acquire semaphore permit", methodName), err)
