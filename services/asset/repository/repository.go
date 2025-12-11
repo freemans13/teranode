@@ -710,6 +710,12 @@ func (repo *Repository) GetSubtreeData(ctx context.Context, hash *chainhash.Hash
 	}
 	defer releaseSemaphorePermit(repo.semGetSubtreeData)
 
+	return repo.getSubtreeDataInternal(ctx, hash)
+}
+
+// getSubtreeDataInternal contains the core logic for GetSubtreeData without semaphore protection.
+// This is used internally to avoid nested semaphore acquisition.
+func (repo *Repository) getSubtreeDataInternal(ctx context.Context, hash *chainhash.Hash) (*subtree.Data, error) {
 	ctx, _, _ = tracing.Tracer("repository").Start(ctx, "GetSubtreeData",
 		tracing.WithLogMessage(repo.logger, "[Repository] GetSubtreeData: %s", hash.String()),
 	)
@@ -749,7 +755,8 @@ func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainh
 		tracing.WithLogMessage(repo.logger, "[Repository] GetSubtreeTransactions: %s", hash.String()),
 	)
 
-	subtreeData, err := repo.GetSubtreeData(ctx, hash)
+	// Call internal method to avoid nested semaphore acquisition
+	subtreeData, err := repo.getSubtreeDataInternal(ctx, hash)
 	if err != nil {
 		// always return an empty map if no transactions are found
 		return make(map[chainhash.Hash]*bt.Tx), err
