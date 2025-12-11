@@ -157,6 +157,9 @@ type BlockAssembler struct {
 
 	// unminedTransactionsLoading indicates if unmined transactions are currently being loaded
 	unminedTransactionsLoading atomic.Bool
+
+	// wg tracks goroutines for proper cleanup
+	wg sync.WaitGroup
 }
 
 // BestBlockInfo holds both the block header and height atomically
@@ -291,7 +294,9 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 		return errors.NewProcessingError("[BlockAssembler] error subscribing to blockchain notifications: %v", err)
 	}
 
+	b.wg.Add(1)
 	go func() {
+		defer b.wg.Done()
 		// variables are defined here to prevent unnecessary allocations
 		b.setCurrentRunningState(StateRunning)
 
@@ -751,6 +756,13 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	prometheusBlockAssemblyCurrentBlockHeight.Set(float64(height))
 
 	return nil
+}
+
+// Wait blocks until all BlockAssembler goroutines have finished.
+// This should be called after the context passed to Start() is cancelled
+// to ensure proper cleanup before shutdown.
+func (b *BlockAssembler) Wait() {
+	b.wg.Wait()
 }
 
 func (b *BlockAssembler) initState(ctx context.Context) error {

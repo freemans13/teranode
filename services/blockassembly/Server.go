@@ -717,6 +717,11 @@ func (ba *BlockAssembly) Stop(_ context.Context) error {
 		if ba.blockAssembler != nil && ba.blockAssembler.subtreeProcessor != nil {
 			ba.blockAssembler.subtreeProcessor.Close()
 		}
+
+		// Wait for all blockAssembler goroutines to finish
+		if ba.blockAssembler != nil {
+			ba.blockAssembler.Wait()
+		}
 	})
 
 	return nil
