@@ -3473,6 +3473,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../topics/services/pruner/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../topics/services/legacy/" class="md-nav__link">
         
   
@@ -5038,6 +5066,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../references/services/pruner_reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../references/services/rpc_reference/" class="md-nav__link">
         
   
@@ -5700,6 +5756,34 @@
     
   
     Propagation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../references/settings/services/pruner_settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
   
 
     
@@ -6560,15 +6644,12 @@
 <p>This section will walk you through the commands and configurations needed to run your services locally for development purposes.</p>
 <h2 id="quickstart-run-all-services">🚀 Quickstart: Run All Services</h2>
 <h3 id="prerequisites">Prerequisites</h3>
-<p>Before running Teranode, ensure the required infrastructure services are started:</p>
-<div class="highlight"><pre><span></span><code><span class="c1"># Start Kafka in Docker</span>
-./scripts/kafka.sh
-
-<span class="c1"># Start PostgreSQL in Docker</span>
+<p>Start PostgreSQL before running Teranode:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Start PostgreSQL in Docker</span>
 ./scripts/postgres.sh
 </code></pre></div>
 <blockquote>
-<p><strong>Note:</strong> If you configure your settings to use Aerospike for UTXO storage, you'll also need to run:</p>
+<p><strong>Note</strong>: Development mode uses in-memory Kafka by default (no Docker setup required). For advanced testing with Docker-based Kafka, run <code>./scripts/kafka.sh</code> (requires adding <code>127.0.0.1 kafka-shared</code> to <code>/etc/hosts</code> first). If you configure your settings to use Aerospike for UTXO storage, you'll also need to run:</p>
 <div class="highlight"><pre><span></span><code><span class="c1"># Start Aerospike in Docker</span>
 ./scripts/aerospike.sh
 </code></pre></div>
@@ -6736,6 +6817,11 @@ utxostore.dev.<span class="o">[</span>YOUR_CONTEXT<span class="o">]</span><span 
 <td>Propagation</td>
 <td><code>-propagation=1</code></td>
 <td>Data propagation service</td>
+</tr>
+<tr>
+<td>Pruner</td>
+<td><code>-pruner=1</code></td>
+<td>UTXO data pruning service</td>
 </tr>
 <tr>
 <td>RPC</td>

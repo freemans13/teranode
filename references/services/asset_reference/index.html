@@ -3159,6 +3159,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../topics/services/pruner/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../topics/services/legacy/" class="md-nav__link">
         
   
@@ -5148,6 +5176,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#p2p-and-network-endpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        P2P and Network Endpoints
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#search-endpoints" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -5537,6 +5576,34 @@
     
   
     P2P Legacy Service
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pruner_reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
   
 
     
@@ -6225,6 +6292,34 @@
     
   
     Propagation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/services/pruner_settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
   
 
     
@@ -7504,6 +7599,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#p2p-and-network-endpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        P2P and Network Endpoints
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#search-endpoints" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -8283,6 +8389,25 @@
 </li>
 </ul>
 </li>
+</ul>
+</li>
+</ul>
+<h3 id="p2p-and-network-endpoints">P2P and Network Endpoints</h3>
+<ul>
+<li>
+<p><strong>GET <code>/api/p2p/peers</code></strong></p>
+<ul>
+<li>Purpose: Get peer registry information from P2P service</li>
+<li>Returns: Peer list (JSON) with reputation metrics, connection status, and catchup statistics</li>
+<li>Response includes: peer ID, client name, blockchain height, reputation score, catchup metrics, ban status</li>
+</ul>
+</li>
+<li>
+<p><strong>GET <code>/api/catchup/status</code></strong></p>
+<ul>
+<li>Purpose: Get current blockchain synchronization status</li>
+<li>Returns: Catchup status (JSON) with progress metrics and peer information</li>
+<li>Response includes: current/target heights, blocks fetched/validated, peer details, fork depth, previous attempt data</li>
 </ul>
 </li>
 </ul>
