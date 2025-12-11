@@ -366,12 +366,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MaxMinedBatchSize:                 getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment:    getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
 			DisableDAHCleaner:                 getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
-			// Pruner-specific settings optimized for multi-million record pruning operations
-			PrunerParentUpdateBatcherSize:           getInt("utxostore_prunerParentUpdateBatcherSize", 2000, alternativeContext...),
-			PrunerParentUpdateBatcherDurationMillis: getInt("utxostore_prunerParentUpdateBatcherDurationMillis", 100, alternativeContext...),
-			PrunerDeleteBatcherSize:                 getInt("utxostore_prunerDeleteBatcherSize", 5000, alternativeContext...),
-			PrunerDeleteBatcherDurationMillis:       getInt("utxostore_prunerDeleteBatcherDurationMillis", 100, alternativeContext...),
-			PrunerMaxConcurrentOperations:           getInt("utxostore_prunerMaxConcurrentOperations", 0, alternativeContext...),
 		},
 		P2P: P2PSettings{
 			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),
@@ -433,10 +427,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DistributorTimeout:          getDuration("distributor_timeout", 30*time.Second, alternativeContext...),
 		},
 		Pruner: PrunerSettings{
-			GRPCAddress:       getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
-			GRPCListenAddress: getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
-			WorkerCount:       getInt("pruner_workerCount", 4, alternativeContext...), // Default to 4 workers
-			JobTimeout:        getDuration("pruner_jobTimeout", 10*time.Minute, alternativeContext...),
+			GRPCAddress:                getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
+			GRPCListenAddress:          getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
+			UTXODefensiveEnabled:       getBool("pruner_utxoDefensiveEnabled", false, alternativeContext...),                 // Defensive mode off by default (production)
+			UTXODefensiveBatchReadSize: getInt("pruner_utxoDefensiveBatchReadSize", 10000, alternativeContext...),            // Batch size for child verification
+			UTXOChunkSize:              getInt("pruner_utxoChunkSize", 1000, alternativeContext...),                          // Chunk size for batch operations
+			UTXOChunkGroupLimit:        getInt("pruner_utxoChunkGroupLimit", 10, alternativeContext...),                      // Process 10 chunks in parallel
+			UTXOProgressLogInterval:    getDuration("pruner_utxoProgressLogInterval", 30*time.Second, alternativeContext...), // Progress every 30s
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
