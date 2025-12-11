@@ -169,6 +169,17 @@ type AssetSettings struct {
 	HTTPPort                int
 	SignHTTPResponses       bool
 	EchoDebug               bool
+
+	// Concurrency limits for repository methods (0 = unlimited)
+	ConcurrencyGetTransaction         int
+	ConcurrencyGetTransactionMeta     int
+	ConcurrencyGetSubtreeData         int
+	ConcurrencyGetSubtreeDataReader   int
+	ConcurrencyGetSubtreeTransactions int
+	ConcurrencyGetSubtreeExists       int
+	ConcurrencyGetSubtreeHead         int
+	ConcurrencyGetUtxo                int
+	ConcurrencyGetLegacyBlockReader   int
 }
 
 type BlockSettings struct {
@@ -520,6 +531,8 @@ type SubtreeValidationSettings struct {
 	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
 	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)
 	TxBatchSize                   int           // Transaction batch size for CheckBlockSubtrees (0 = no batching, default: 1000000)
+	// Level algorithm optimization
+	UseOrderedLevelAlgorithm bool // When true, uses optimized O(V*I) algorithm assuming transactions are ordered (default: true)
 }
 
 type LegacySettings struct {
