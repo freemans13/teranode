@@ -1,7 +1,11 @@
+// Package pruner provides a job management framework for background cleanup operations
+// based on blockchain height. It enables stores to automatically prune old data when
+// blocks reach a certain age, coordinating with block persistence to ensure data safety.
 package pruner
 
 import "context"
 
+// Service defines the interface for a pruner service that manages background cleanup jobs.
 type Service interface {
 	// Start starts the pruner service.
 	// This should not block.
@@ -21,6 +25,6 @@ type Service interface {
 // PrunerServiceProvider defines an interface for stores that can provide a pruner service.
 type PrunerServiceProvider interface {
 	// GetPrunerService returns a pruner service for the store.
-	// Returns nil if the store doesn't support pruner.
+	// Returns nil if the store doesn't support pruner functionality.
 	GetPrunerService() (Service, error)
 }
