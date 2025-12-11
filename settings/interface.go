@@ -169,6 +169,17 @@ type AssetSettings struct {
 	HTTPPort                int
 	SignHTTPResponses       bool
 	EchoDebug               bool
+
+	// Concurrency limits for repository methods (0 = unlimited)
+	ConcurrencyGetTransaction         int
+	ConcurrencyGetTransactionMeta     int
+	ConcurrencyGetSubtreeData         int
+	ConcurrencyGetSubtreeDataReader   int
+	ConcurrencyGetSubtreeTransactions int
+	ConcurrencyGetSubtreeExists       int
+	ConcurrencyGetSubtreeHead         int
+	ConcurrencyGetUtxo                int
+	ConcurrencyGetLegacyBlockReader   int
 }
 
 type BlockSettings struct {

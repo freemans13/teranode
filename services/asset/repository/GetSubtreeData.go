@@ -24,6 +24,11 @@ import (
 // - *io.PipeReader: A PipeReader that can be used to read the subtree data.
 // - error: An error if the retrieval fails, or nil if successful.
 func (repo *Repository) GetSubtreeDataReader(ctx context.Context, subtreeHash *chainhash.Hash) (io.ReadCloser, error) {
+	if err := acquireSemaphorePermit(ctx, repo.semGetSubtreeDataReader, "GetSubtreeDataReader"); err != nil {
+		return nil, err
+	}
+	defer releaseSemaphorePermit(repo.semGetSubtreeDataReader)
+
 	subtreeDataExists, err := repo.SubtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 	if err == nil && subtreeDataExists {
 		return repo.SubtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)

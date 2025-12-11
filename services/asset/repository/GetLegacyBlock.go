@@ -35,6 +35,11 @@ import (
 //   - *io.PipeReader: Reader for streaming block data
 //   - error: Any error encountered during retrieval
 func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhash.Hash, wireBlock ...bool) (*io.PipeReader, error) {
+	if err := acquireSemaphorePermit(ctx, repo.semGetLegacyBlockReader, "GetLegacyBlockReader"); err != nil {
+		return nil, err
+	}
+	defer releaseSemaphorePermit(repo.semGetLegacyBlockReader)
+
 	returnWireBlock := len(wireBlock) > 0 && wireBlock[0]
 
 	block, err := repo.GetBlockByHash(ctx, hash)
