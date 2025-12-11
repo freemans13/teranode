@@ -77,6 +77,28 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}()
 
+	// Check which subtrees are missing first to avoid unnecessary pause logic
+	missingSubtrees := make([]chainhash.Hash, 0, len(block.Subtrees))
+	for _, subtreeHash := range block.Subtrees {
+		subtreeExists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+		if err != nil {
+			return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to check if subtree exists in store", err)
+		}
+
+		if !subtreeExists {
+			missingSubtrees = append(missingSubtrees, *subtreeHash)
+		}
+	}
+
+	// Early return if all subtrees already exist - no need for pause logic
+	if len(missingSubtrees) == 0 {
+		return &subtreevalidation_api.CheckBlockSubtreesResponse{
+			Blessed: true,
+		}, nil
+	}
+
+	u.logger.Infof("[CheckBlockSubtrees] Found %d missing subtrees for block %s, proceeding with validation", len(missingSubtrees), block.Hash().String())
+
 	// Check if the block is on our chain or will become part of our chain
 	// Only pause subtree processing if this block is on our chain or extending our chain
 	shouldPauseProcessing := false
@@ -151,25 +173,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	} else {
 		u.logger.Infof("[CheckBlockSubtrees] Block %s is on a different fork - not pausing subtree processing", block.Hash().String())
-	}
-
-	// validate all the subtrees in the block
-	missingSubtrees := make([]chainhash.Hash, 0, len(block.Subtrees))
-	for _, subtreeHash := range block.Subtrees {
-		subtreeExists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
-		if err != nil {
-			return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to check if subtree exists in store", err)
-		}
-
-		if !subtreeExists {
-			missingSubtrees = append(missingSubtrees, *subtreeHash)
-		}
-	}
-
-	if len(missingSubtrees) == 0 {
-		return &subtreevalidation_api.CheckBlockSubtreesResponse{
-			Blessed: true,
-		}, nil
 	}
 
 	// BATCHED SUBTREE LOADING: Get blockIds once before batching

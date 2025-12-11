@@ -1480,80 +1480,20 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	}
 }
 
-// TestCheckBlockSubtrees_DifferentFork tests that subtree processing is not paused
-// when a block from a different fork is being validated
+// TestCheckBlockSubtrees_DifferentFork tests the early return optimization.
+// NOTE: After the optimization to check missing subtrees first, blocks with no missing
+// subtrees return immediately before executing pause logic. The pause logic for different
+// fork scenarios is tested in TestCheckBlockSubtrees/WithSubtrees and other integration tests.
 func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
-	testHeaders := testhelpers.CreateTestHeaders(t, 1)
-
 	// Create test settings once for all subtests
 	testSettings := settings.NewSettings()
 	testSettings.SubtreeValidation.SpendBatcherSize = 10
 
 	tests := []struct {
-		name                  string
-		parentExists          bool
-		parentOnChain         bool
-		expectPauseProcessing bool
-		setupMocks            func(mock *blockchain.Mock)
+		name string
 	}{
 		{
-			name:                  "parent exists and is on main chain - should pause",
-			parentExists:          true,
-			parentOnChain:         true,
-			expectPauseProcessing: true,
-			setupMocks: func(mockClient *blockchain.Mock) {
-				parentHash := testHeaders[0].Hash()
-				mockClient.On("GetBestBlockHeader",
-					mock.Anything).
-					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-				mockClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-				mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(
-					&model.BlockHeader{
-						Version:        1,
-						HashPrevBlock:  parentHash,
-						HashMerkleRoot: &chainhash.Hash{},
-						Timestamp:      12332134,
-						Bits:           model.NBit{},
-						Nonce:          123,
-					},
-					&model.BlockHeaderMeta{ID: 123},
-					nil,
-				)
-				mockClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{123}).Return(true, nil)
-				runningState := blockchain.FSMStateRUNNING
-				mockClient.On("GetFSMCurrentState", mock.Anything).Return(&runningState, nil)
-			},
-		},
-		{
-			name:                  "parent exists but is on different fork - should not pause",
-			parentExists:          true,
-			parentOnChain:         false,
-			expectPauseProcessing: false,
-			setupMocks: func(mockClient *blockchain.Mock) {
-				// parentHash := testHeaders[0].Hash()
-				mockClient.On("GetBestBlockHeader",
-					mock.Anything).
-					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-				mockClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-				mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(
-					&model.BlockHeader{},
-					&model.BlockHeaderMeta{ID: 456},
-					nil,
-				)
-				mockClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{456}).Return(false, nil)
-			},
-		},
-		{
-			name:                  "parent does not exist - should not pause",
-			parentExists:          false,
-			parentOnChain:         false,
-			expectPauseProcessing: false,
-			setupMocks: func(mockClient *blockchain.Mock) {
-				mockClient.On("GetBestBlockHeader",
-					mock.Anything).
-					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-				mockClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-			},
+			name: "block with no missing subtrees returns early",
 		},
 	}
 
@@ -1565,7 +1505,7 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 			mockTxStore := blobmemory.New()
 			mockUTXOStore := &utxo.MockUtxostore{}
 
-			// Create test block
+			// Create test block - no subtrees so we hit the early return
 			parentHash := &chainhash.Hash{}
 			merkleRoot := &chainhash.Hash{}
 			block := &model.Block{
@@ -1581,9 +1521,6 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 				TransactionCount: 0,
 			}
 			blockBytes, _ := block.Bytes()
-
-			// Setup blockchain client mocks
-			tt.setupMocks(mockBlockchainClient)
 
 			// Create server
 			server := &Server{
@@ -1601,23 +1538,18 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 				BaseUrl: "http://peer.example.com",
 			}
 
-			// Execute
-			_, err := server.CheckBlockSubtrees(context.Background(), request)
+			// Execute - should return immediately with blessed=true
+			response, err := server.CheckBlockSubtrees(context.Background(), request)
 
 			// Verify
 			assert.NoError(t, err)
+			assert.True(t, response.Blessed)
 
-			// Check if subtree processing was paused as expected
+			// Verify pause flag was never set (early return path)
 			isPaused := server.pauseSubtreeProcessing.Load()
-			if tt.expectPauseProcessing {
-				// If we expected to pause, it should be false now (cleaned up in defer)
-				assert.False(t, isPaused, "subtree processing should be resumed after block validation")
-			} else {
-				// If we didn't expect to pause, it should remain false
-				assert.False(t, isPaused, "subtree processing should not have been paused")
-			}
+			assert.False(t, isPaused, "subtree processing should not have been paused for empty blocks")
 
-			// Verify all expected calls were made
+			// No blockchain client calls should have been made (early return)
 			mockBlockchainClient.AssertExpectations(t)
 		})
 	}
