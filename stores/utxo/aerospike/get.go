@@ -1382,14 +1382,15 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 
 	tx := &bt.Tx{}
 
+	// Use buffered reader for all file types to reduce syscalls
+	bufferedReader := bufio.NewReader(reader)
+
 	if fileType == fileformat.FileTypeTx {
-		// Stream parse directly from reader - no intermediate buffer
-		if _, err = tx.ReadFrom(reader); err != nil {
+		// Stream parse directly from buffered reader
+		if _, err = tx.ReadFrom(bufferedReader); err != nil {
 			return nil, errors.NewTxInvalidError("[GetTxFromExternalStore][%s] could not read tx from stream", previousTxHash.String(), err)
 		}
 	} else {
-		bufferedReader := bufio.NewReader(reader)
-
 		uw, err := utxopersister.NewUTXOWrapperFromReader(ctx, bufferedReader)
 		if err != nil {
 			return nil, errors.NewTxInvalidError("[GetTxFromExternalStore][%s] could not read outputs from reader", previousTxHash.String(), err)
