@@ -515,17 +515,12 @@ func TestTombstoneAfterSpendAndUnspend(t *testing.T) {
 	_, err = utxoStore.Spend(ctx, spendTx01, utxoStore.GetBlockHeight()+1)
 	require.NoError(t, err)
 
-	doneCh := make(chan string, 1)
+	pruneCtx, pruneCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer pruneCancel()
 
-	err = cleanupService.UpdateBlockHeight(1, doneCh)
+	recordsProcessed, err := cleanupService.Prune(pruneCtx, 1)
 	require.NoError(t, err)
-
-	select {
-	case <-doneCh:
-		// Job completed successfully
-	case <-time.After(5 * time.Second):
-		require.Fail(t, "cleanup job did not complete within 5 seconds")
-	}
+	require.GreaterOrEqual(t, recordsProcessed, int64(0))
 
 	// With delete-at-height-safely feature:
 	// Since the spending child (spendTx01) is not stored in the database with block_ids,
@@ -570,17 +565,12 @@ func TestTombstoneAfterSpendAndUnspend(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run cleanup at height 21
-	doneCh = make(chan string, 1)
+	pruneCtx2, pruneCancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer pruneCancel2()
 
-	err = cleanupService.UpdateBlockHeight(21, doneCh)
+	recordsProcessed2, err := cleanupService.Prune(pruneCtx2, 21)
 	require.NoError(t, err)
-
-	select {
-	case <-doneCh:
-		// Job completed successfully
-	case <-time.After(5 * time.Second):
-		require.Fail(t, "cleanup job did not complete within 5 seconds")
-	}
+	require.GreaterOrEqual(t, recordsProcessed2, int64(0))
 
 	// Verify the transaction is still there (not tombstoned)
 	_, err = utxoStore.Get(ctx, tx.TxIDChainHash())

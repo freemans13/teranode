@@ -31,15 +31,6 @@ var _ pruner.Service = (*Service)(nil)
 
 var IndexName, _ = gocore.Config().Get("pruner_IndexName", "pruner_dah_index")
 
-// Constants for the pruner service
-const (
-	// DefaultWorkerCount is the default number of worker goroutines
-	DefaultWorkerCount = 4
-
-	// DefaultMaxJobsHistory is the default number of jobs to keep in history
-	DefaultMaxJobsHistory = 1000
-)
-
 var (
 	prometheusMetricsInitOnce  sync.Once
 	prometheusUtxoCleanupBatch prometheus.Histogram
@@ -68,12 +59,6 @@ type Options struct {
 	// Set is the Aerospike set to use
 	Set string
 
-	// WorkerCount is the number of worker goroutines to use
-	WorkerCount int
-
-	// MaxJobsHistory is the maximum number of jobs to keep in history
-	MaxJobsHistory int
-
 	// GetPersistedHeight returns the last block height processed by block persister
 	// Used to coordinate cleanup with block persister progress (can be nil)
 	GetPersistedHeight func() uint32
@@ -90,9 +75,9 @@ type Service struct {
 	external    blob.Store
 	namespace   string
 	set         string
-	jobManager  *pruner.JobManager
 	ctx         context.Context
 	indexWaiter IndexWaiter
+	indexReady  atomic.Bool
 
 	// Configuration values extracted from settings for performance
 	utxoBatchSize          int
@@ -210,63 +195,24 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		fieldBlockHeights:      fields.BlockHeights.String(),
 	}
 
-	// Create the job processor function
-	jobProcessor := func(job *pruner.Job, workerID int) {
-		service.processCleanupJob(job, workerID)
-	}
-
-	// Create the job manager
-	jobManager, err := pruner.NewJobManager(pruner.JobManagerOptions{
-		Logger:         opts.Logger,
-		WorkerCount:    opts.WorkerCount,
-		MaxJobsHistory: opts.MaxJobsHistory,
-		JobProcessor:   jobProcessor,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	service.jobManager = jobManager
-
 	return service, nil
 }
 
-// Start starts the cleanup service and creates the required index if this has not been done already.  This method
-// will return immediately but will not start the workers until the initialization is complete.
-//
-// The service will start a goroutine to initialize the service and create the required index if it does not exist.
-// Once the initialization is complete, the service will start the worker goroutines to process cleanup jobs.
-//
-// The service will also create a rotating queue of cleanup jobs, which will be processed as the block height
-// becomes available.  The rotating queue will always keep the most recent jobs and will drop older
-// jobs if the queue is full or there is a job with a higher height.
+// Start starts the cleanup service and waits for the required index to be ready.
+// This method returns immediately and starts a goroutine to wait for index readiness.
 func (s *Service) Start(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	go func() {
-		// All processes wait for the index to be built
 		if err := s.indexWaiter.WaitForIndexReady(ctx, IndexName); err != nil {
 			s.logger.Errorf("Timeout or error waiting for index to be built: %v", err)
+			return
 		}
-
-		// Only start job manager after index is built
-		s.jobManager.Start(ctx)
-
-		s.logger.Infof("[AerospikeCleanupService] started cleanup service")
+		s.indexReady.Store(true)
+		s.logger.Infof("[AerospikeCleanupService] index ready")
 	}()
-}
-
-// Stop stops the cleanup service and waits for all workers to exit.
-// This ensures all goroutines are properly terminated before returning.
-func (s *Service) Stop(ctx context.Context) error {
-	// Stop the job manager
-	s.jobManager.Stop()
-
-	s.logger.Infof("[AerospikeCleanupService] stopped cleanup service")
-
-	return nil
 }
 
 // SetPersistedHeightGetter sets the function used to get block persister progress.
@@ -275,31 +221,21 @@ func (s *Service) SetPersistedHeightGetter(getter func() uint32) {
 	s.getPersistedHeight = getter
 }
 
-// UpdateBlockHeight updates the block height and triggers a cleanup job
-func (s *Service) UpdateBlockHeight(blockHeight uint32, done ...chan string) error {
+// Prune removes transactions marked for deletion at or before the specified height.
+// Returns the number of records processed and any error encountered.
+// This method is synchronous and blocks until pruning completes or context is cancelled.
+func (s *Service) Prune(ctx context.Context, blockHeight uint32) (int64, error) {
 	if blockHeight == 0 {
-		return errors.NewProcessingError("block height cannot be zero")
+		return 0, errors.NewProcessingError("block height cannot be zero")
 	}
 
-	s.logger.Debugf("[AerospikeCleanupService] Updating block height to %d", blockHeight)
-
-	// Pass the done channel to the job manager
-	var doneChan chan string
-
-	if len(done) > 0 {
-		doneChan = done[0]
+	// Wait for index to be ready
+	if !s.indexReady.Load() {
+		return 0, errors.NewProcessingError("index not ready yet")
 	}
 
-	return s.jobManager.UpdateBlockHeight(blockHeight, doneChan)
-}
-
-// processCleanupJob processes a cleanup job
-func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
-	// Update job status to running
-	job.SetStatus(pruner.JobStatusRunning)
-	job.Started = time.Now()
-
-	s.logger.Infof("Worker %d starting cleanup job for block height %d", workerID, job.BlockHeight)
+	s.logger.Infof("Starting pruner for block height %d", blockHeight)
+	startTime := time.Now()
 
 	// BLOCK PERSISTER COORDINATION: Calculate safe cleanup height
 	//
@@ -323,7 +259,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	//
 	// HEIGHT=0 SPECIAL CASE: If persistedHeight=0, block persister isn't running or hasn't
 	// processed any blocks yet. Proceed with normal cleanup without coordination.
-	safeCleanupHeight := job.BlockHeight
+	safeCleanupHeight := blockHeight
 
 	if s.getPersistedHeight != nil {
 		persistedHeight := s.getPersistedHeight()
@@ -337,8 +273,8 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 			// Those transactions can be safely deleted after retention blocks.
 			maxSafeHeight := persistedHeight + retention
 			if maxSafeHeight < safeCleanupHeight {
-				s.logger.Infof("Worker %d: Limiting cleanup from height %d to %d (persisted: %d, retention: %d)",
-					workerID, job.BlockHeight, maxSafeHeight, persistedHeight, retention)
+				s.logger.Infof("Limiting cleanup from height %d to %d (persisted: %d, retention: %d)",
+					blockHeight, maxSafeHeight, persistedHeight, retention)
 				safeCleanupHeight = maxSafeHeight
 			}
 		}
@@ -359,21 +295,15 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	// This will automatically use the index since the filter is on the indexed bin
 	err := stmt.SetFilter(aerospike.NewRangeFilter(s.fieldDeleteAtHeight, 1, int64(safeCleanupHeight)))
 	if err != nil {
-		job.SetStatus(pruner.JobStatusFailed)
-		job.Error = err
-		job.Ended = time.Now()
-
-		s.logger.Errorf("Worker %d: failed to set filter for cleanup job %d: %v", workerID, job.BlockHeight, err)
-
-		return
+		s.logger.Errorf("Failed to set filter for cleanup at height %d: %v", blockHeight, err)
+		return 0, err
 	}
 
 	// iterate through the results, process each record individually using batchers
 	recordset, err := s.client.Query(s.queryPolicy, stmt)
 	if err != nil {
-		s.logger.Errorf("Worker %d: failed to execute query for cleanup job %d: %v", workerID, job.BlockHeight, err)
-		s.markJobAsFailed(job, err)
-		return
+		s.logger.Errorf("Failed to execute query for cleanup at height %d: %v", blockHeight, err)
+		return 0, err
 	}
 
 	defer recordset.Close()
@@ -393,8 +323,8 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 	util.SafeSetLimit(chunkGroup, s.chunkGroupLimit)
 
 	// Log initial start
-	s.logger.Infof("Worker %d: starting cleanup scan for height %d (delete_at_height <= %d)",
-		workerID, job.BlockHeight, safeCleanupHeight)
+	s.logger.Infof("Starting cleanup scan for height %d (delete_at_height <= %d)",
+		blockHeight, safeCleanupHeight)
 
 	// Start progress logging ticker if interval is configured
 	var progressTicker *time.Ticker
@@ -409,13 +339,13 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 				case <-progressTicker.C:
 					current := recordCount.Load()
 					skipped := skippedCount.Load()
-					elapsed := time.Since(job.Started)
+					elapsed := time.Since(startTime)
 					if s.defensiveEnabled {
-						s.logger.Infof("Worker %d: pruner progress at height %d: pruned %d records, skipped %d records (elapsed: %v)",
-							workerID, job.BlockHeight, current, skipped, elapsed)
+						s.logger.Infof("Pruner progress at height %d: pruned %d records, skipped %d records (elapsed: %v)",
+							blockHeight, current, skipped, elapsed)
 					} else {
-						s.logger.Infof("Worker %d: pruner progress at height %d: pruned %d records (elapsed: %v)",
-							workerID, job.BlockHeight, current, elapsed)
+						s.logger.Infof("Pruner progress at height %d: pruned %d records (elapsed: %v)",
+							blockHeight, current, elapsed)
 					}
 				case <-progressDone:
 					return
@@ -437,7 +367,7 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		copy(chunkCopy, chunkToProcess)
 
 		chunkGroup.Go(func() error {
-			processed, skipped, err := s.processRecordChunk(job, workerID, chunkCopy)
+			processed, skipped, err := s.processRecordChunk(ctx, blockHeight, chunkCopy)
 			if err != nil {
 				return err
 			}
@@ -447,15 +377,12 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 		})
 	}
 
-	// Get job context for cancellation support
-	jobCtx := job.Context()
-
 	// Process records and accumulate into chunks
 	for {
 		// Check for cancellation before processing next chunk
 		select {
-		case <-jobCtx.Done():
-			s.logger.Infof("Worker %d: cleanup job for height %d cancelled", workerID, job.BlockHeight)
+		case <-ctx.Done():
+			s.logger.Infof("Cleanup job for height %d cancelled", blockHeight)
 			recordset.Close()
 			// Process any accumulated chunk before exiting
 			if len(chunk) > 0 {
@@ -463,10 +390,9 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 			}
 			// Wait for submitted chunks to complete
 			if err := chunkGroup.Wait(); err != nil {
-				s.logger.Errorf("Worker %d: error in chunks during cancellation: %v", workerID, err)
+				s.logger.Errorf("Error in chunks during cancellation: %v", err)
 			}
-			s.markJobAsFailed(job, errors.NewProcessingError("Worker %d: cleanup job for height %d cancelled", workerID, job.BlockHeight))
-			return
+			return 0, errors.NewProcessingError("cleanup job for height %d cancelled", blockHeight)
 		default:
 		}
 
@@ -490,34 +416,31 @@ func (s *Service) processCleanupJob(job *pruner.Job, workerID int) {
 
 	// Wait for all parallel chunks to complete
 	if err := chunkGroup.Wait(); err != nil {
-		s.logger.Errorf("Worker %d: error processing chunks: %v", workerID, err)
-		s.markJobAsFailed(job, err)
-		return
+		s.logger.Errorf("Error processing chunks: %v", err)
+		return 0, err
 	}
 
 	finalRecordCount := recordCount.Load()
 	finalSkippedCount := skippedCount.Load()
 
-	// Set job status and record count
-	job.SetStatus(pruner.JobStatusCompleted)
-	job.RecordsProcessed.Store(finalRecordCount)
-	job.Ended = time.Now()
-
 	// Summary log: total pruned and total prevented by defensive logic
+	elapsed := time.Since(startTime)
 	if s.defensiveEnabled {
-		s.logger.Infof("Worker %d completed cleanup job for block height %d in %v: pruned %d records, skipped %d records (defensive logic)",
-			workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount, finalSkippedCount)
+		s.logger.Infof("Completed cleanup job for block height %d in %v: pruned %d records, skipped %d records (defensive logic)",
+			blockHeight, elapsed, finalRecordCount, finalSkippedCount)
 	} else {
-		s.logger.Infof("Worker %d completed cleanup job for block height %d in %v: pruned %d records",
-			workerID, job.BlockHeight, job.Ended.Sub(job.Started), finalRecordCount)
+		s.logger.Infof("Completed cleanup job for block height %d in %v: pruned %d records",
+			blockHeight, elapsed, finalRecordCount)
 	}
 
-	prometheusUtxoCleanupBatch.Observe(float64(time.Since(job.Started).Microseconds()) / 1_000_000)
+	prometheusUtxoCleanupBatch.Observe(float64(elapsed.Microseconds()) / 1_000_000)
+
+	return finalRecordCount, nil
 }
 
 // processRecordChunk processes a chunk of parent records with batched child verification
 // Returns: (processedCount, skippedCount, error)
-func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aerospike.Result) (int, int, error) {
+func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, chunk []*aerospike.Result) (int, int, error) {
 	if len(chunk) == 0 {
 		return 0, 0, nil
 	}
@@ -555,7 +478,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 						}
 					}
 				} else {
-					s.logger.Debugf("Worker %d: deletedChildren bin wrong type: %T", workerID, deletedChildrenRaw)
+					s.logger.Debugf("deletedChildren bin wrong type: %T", deletedChildrenRaw)
 				}
 			}
 
@@ -607,7 +530,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 
 		// Step 2: Batch verify all unique children (single BatchGet call for entire chunk)
 		if len(uniqueSpendingChildren) > 0 {
-			safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, job.BlockHeight, deletedChildren)
+			safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, blockHeight, deletedChildren)
 		} else {
 			safetyMap = make(map[string]bool)
 		}
@@ -660,7 +583,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 		}
 
 		// Safe to delete - get inputs for parent updates
-		inputs, err := s.getTxInputsFromBins(job, workerID, rec.Record.Bins, txHash)
+		inputs, err := s.getTxInputsFromBins(ctx, blockHeight, rec.Record.Bins, txHash)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -714,11 +637,7 @@ func (s *Service) processRecordChunk(job *pruner.Job, workerID int, chunk []*aer
 	}
 
 	// Flush all accumulated operations in one batch per chunk
-	ctx := s.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := s.flushCleanupBatches(ctx, workerID, job.BlockHeight, allParentUpdates, allDeletions, allExternalFiles); err != nil {
+	if err := s.flushCleanupBatches(ctx, allParentUpdates, allDeletions, allExternalFiles); err != nil {
 		return 0, 0, err
 	}
 
@@ -943,19 +862,19 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 	}
 }
 
-func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
+func (s *Service) getTxInputsFromBins(ctx context.Context, blockHeight uint32, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
 	var inputs []*bt.Input
 
 	external, ok := bins[s.fieldExternal].(bool)
 	if ok && external {
 		// transaction is external, we need to get the data from the external store
-		txBytes, err := s.external.Get(s.ctx, txHash.CloneBytes(), fileformat.FileTypeTx)
+		txBytes, err := s.external.Get(ctx, txHash.CloneBytes(), fileformat.FileTypeTx)
 		if err != nil {
 			if errors.Is(err, errors.ErrNotFound) {
 				// Check if outputs exist (sometimes only outputs are stored)
-				exists, err := s.external.Exists(s.ctx, txHash.CloneBytes(), fileformat.FileTypeOutputs)
+				exists, err := s.external.Exists(ctx, txHash.CloneBytes(), fileformat.FileTypeOutputs)
 				if err != nil {
-					return nil, errors.NewProcessingError("Worker %d: error checking existence of outputs for external tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+					return nil, errors.NewProcessingError("error checking existence of outputs for external tx %s at height %d: %v", txHash.String(), blockHeight, err)
 				}
 
 				if exists {
@@ -964,17 +883,17 @@ func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerosp
 				}
 
 				// External blob already deleted (by LocalDAH or previous cleanup), just need to delete Aerospike record
-				s.logger.Debugf("Worker %d: external tx %s already deleted from blob store for cleanup job %d, proceeding to delete Aerospike record",
-					workerID, txHash.String(), job.BlockHeight)
+				s.logger.Debugf("external tx %s already deleted from blob store at height %d, proceeding to delete Aerospike record",
+					txHash.String(), blockHeight)
 				return []*bt.Input{}, nil
 			}
 			// Other errors should still be reported
-			return nil, errors.NewProcessingError("Worker %d: error getting external tx %s for cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+			return nil, errors.NewProcessingError("error getting external tx %s at height %d: %v", txHash.String(), blockHeight, err)
 		}
 
 		tx, err := bt.NewTxFromBytes(txBytes)
 		if err != nil {
-			return nil, errors.NewProcessingError("Worker %d: invalid tx bytes for external tx %s in cleanup job %d: %v", workerID, txHash.String(), job.BlockHeight, err)
+			return nil, errors.NewProcessingError("invalid tx bytes for external tx %s at height %d: %v", txHash.String(), blockHeight, err)
 		}
 
 		inputs = tx.Inputs
@@ -989,8 +908,8 @@ func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerosp
 		inputInterfaces, ok := inputsValue.([]interface{})
 		if !ok {
 			// Log more helpful error with actual type
-			return nil, errors.NewProcessingError("Worker %d: inputs field has unexpected type %T (expected []interface{}) for record in cleanup job %d",
-				workerID, inputsValue, job.BlockHeight)
+			return nil, errors.NewProcessingError("inputs field has unexpected type %T (expected []interface{}) at height %d",
+				inputsValue, blockHeight)
 		}
 
 		inputs = make([]*bt.Input, len(inputInterfaces))
@@ -1000,7 +919,7 @@ func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerosp
 			inputs[i] = &bt.Input{}
 
 			if _, err := inputs[i].ReadFrom(bytes.NewReader(input)); err != nil {
-				return nil, errors.NewProcessingError("Worker %d: invalid input for record in cleanup job %d: %v", workerID, job.BlockHeight, err)
+				return nil, errors.NewProcessingError("invalid input for record at height %d: %v", blockHeight, err)
 			}
 		}
 	}
@@ -1008,31 +927,25 @@ func (s *Service) getTxInputsFromBins(job *pruner.Job, workerID int, bins aerosp
 	return inputs, nil
 }
 
-func (s *Service) markJobAsFailed(job *pruner.Job, err error) {
-	job.SetStatus(pruner.JobStatusFailed)
-	job.Error = err
-	job.Ended = time.Now()
-}
-
 // flushCleanupBatches flushes accumulated parent updates, external file deletions, and Aerospike deletions
-func (s *Service) flushCleanupBatches(ctx context.Context, workerID int, blockHeight uint32, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error {
+func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error {
 	// Execute parent updates first
 	if len(parentUpdates) > 0 {
-		if err := s.executeBatchParentUpdates(ctx, workerID, blockHeight, parentUpdates); err != nil {
+		if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
 			return err
 		}
 	}
 
 	// Delete external files before Aerospike records (fail-safe: if file deletion fails, we keep the record)
 	if len(externalFiles) > 0 {
-		if err := s.executeBatchExternalFileDeletions(ctx, workerID, blockHeight, externalFiles); err != nil {
+		if err := s.executeBatchExternalFileDeletions(ctx, externalFiles); err != nil {
 			return err
 		}
 	}
 
 	// Delete Aerospike records last
 	if len(deletions) > 0 {
-		if err := s.executeBatchDeletions(ctx, workerID, blockHeight, deletions); err != nil {
+		if err := s.executeBatchDeletions(ctx, deletions); err != nil {
 			return err
 		}
 	}
@@ -1056,12 +969,12 @@ func (s *Service) extractTxHash(bins aerospike.BinMap) (*chainhash.Hash, error) 
 }
 
 // extractInputs extracts the transaction inputs from record bins
-func (s *Service) extractInputs(job *pruner.Job, workerID int, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
-	return s.getTxInputsFromBins(job, workerID, bins, txHash)
+func (s *Service) extractInputs(ctx context.Context, blockHeight uint32, bins aerospike.BinMap, txHash *chainhash.Hash) ([]*bt.Input, error) {
+	return s.getTxInputsFromBins(ctx, blockHeight, bins, txHash)
 }
 
 // executeBatchParentUpdates executes a batch of parent update operations
-func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, blockHeight uint32, updates map[string]*parentUpdateInfo) error {
+func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[string]*parentUpdateInfo) error {
 	if len(updates) == 0 {
 		return nil
 	}
@@ -1085,14 +998,14 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, b
 	// Check context before expensive operation
 	select {
 	case <-ctx.Done():
-		s.logger.Infof("Worker %d: context cancelled, skipping parent update batch", workerID)
+		s.logger.Infof("Context cancelled, skipping parent update batch")
 		return ctx.Err()
 	default:
 	}
 
 	// Execute batch
 	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
-		s.logger.Errorf("Worker %d: batch parent update failed: %v", workerID, err)
+		s.logger.Errorf("Batch parent update failed: %v", err)
 		return errors.NewStorageError("batch parent update failed", err)
 	}
 
@@ -1109,7 +1022,7 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, b
 				continue
 			}
 			// Log other errors
-			s.logger.Errorf("Worker %d: parent update error for key %v: %v", workerID, rec.BatchRec().Key, rec.BatchRec().Err)
+			s.logger.Errorf("Parent update error for key %v: %v", rec.BatchRec().Key, rec.BatchRec().Err)
 			errorCount++
 		} else {
 			successCount++
@@ -1118,14 +1031,14 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, workerID int, b
 
 	// Return error if any individual record operations failed
 	if errorCount > 0 {
-		return errors.NewStorageError("Worker %d: %d parent update operations failed", workerID, errorCount)
+		return errors.NewStorageError("%d parent update operations failed", errorCount)
 	}
 
 	return nil
 }
 
 // executeBatchDeletions executes a batch of deletion operations
-func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, blockHeight uint32, keys []*aerospike.Key) error {
+func (s *Service) executeBatchDeletions(ctx context.Context, keys []*aerospike.Key) error {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -1140,14 +1053,14 @@ func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, block
 	// Check context before expensive operation
 	select {
 	case <-ctx.Done():
-		s.logger.Infof("Worker %d: context cancelled, skipping deletion batch", workerID)
+		s.logger.Infof("Context cancelled, skipping deletion batch")
 		return ctx.Err()
 	default:
 	}
 
 	// Execute batch
 	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
-		s.logger.Errorf("Worker %d: batch deletion failed for %d records: %v", workerID, len(keys), err)
+		s.logger.Errorf("Batch deletion failed for %d records: %v", len(keys), err)
 		return errors.NewStorageError("batch deletion failed", err)
 	}
 
@@ -1162,7 +1075,7 @@ func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, block
 				// Already deleted
 				alreadyDeletedCount++
 			} else {
-				s.logger.Errorf("Worker %d: deletion error for key %v: %v", workerID, rec.BatchRec().Key, rec.BatchRec().Err)
+				s.logger.Errorf("Deletion error for key %v: %v", rec.BatchRec().Key, rec.BatchRec().Err)
 				errorCount++
 			}
 		} else {
@@ -1172,14 +1085,14 @@ func (s *Service) executeBatchDeletions(ctx context.Context, workerID int, block
 
 	// Return error if any individual record operations failed
 	if errorCount > 0 {
-		return errors.NewStorageError("Worker %d: %d deletion operations failed", workerID, errorCount)
+		return errors.NewStorageError("%d deletion operations failed", errorCount)
 	}
 
 	return nil
 }
 
 // executeBatchExternalFileDeletions deletes external blob files for transactions being pruned
-func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, workerID int, blockHeight uint32, files []*externalFileInfo) error {
+func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, files []*externalFileInfo) error {
 	if len(files) == 0 {
 		return nil
 	}
@@ -1192,7 +1105,7 @@ func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, workerI
 		// Check context before each deletion
 		select {
 		case <-ctx.Done():
-			s.logger.Infof("Worker %d: context cancelled, stopping external file deletions", workerID)
+			s.logger.Infof("Context cancelled, stopping external file deletions")
 			return ctx.Err()
 		default:
 		}
@@ -1203,9 +1116,9 @@ func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, workerI
 			if errors.Is(err, errors.ErrNotFound) {
 				// Already deleted (by LocalDAH cleanup or previous pruning)
 				alreadyDeletedCount++
-				s.logger.Debugf("Worker %d: external file for tx %s (type %d) already deleted", workerID, fileInfo.txHash.String(), fileInfo.fileType)
+				s.logger.Debugf("External file for tx %s (type %d) already deleted", fileInfo.txHash.String(), fileInfo.fileType)
 			} else {
-				s.logger.Errorf("Worker %d: failed to delete external file for tx %s (type %d): %v", workerID, fileInfo.txHash.String(), fileInfo.fileType, err)
+				s.logger.Errorf("Failed to delete external file for tx %s (type %d): %v", fileInfo.txHash.String(), fileInfo.fileType, err)
 				errorCount++
 			}
 		} else {
@@ -1213,11 +1126,11 @@ func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, workerI
 		}
 	}
 
-	s.logger.Debugf("Worker %d: external file deletion batch - success: %d, already deleted: %d, errors: %d", workerID, successCount, alreadyDeletedCount, errorCount)
+	s.logger.Debugf("External file deletion batch - success: %d, already deleted: %d, errors: %d", successCount, alreadyDeletedCount, errorCount)
 
 	// Return error if any deletions failed
 	if errorCount > 0 {
-		return errors.NewStorageError("Worker %d: %d external file deletions failed", workerID, errorCount)
+		return errors.NewStorageError("%d external file deletions failed", errorCount)
 	}
 
 	return nil
@@ -1251,15 +1164,9 @@ func (s *Service) ProcessSingleRecord(txHash *chainhash.Hash, inputs []*bt.Input
 	}
 
 	// Execute parent updates synchronously
-	return s.executeBatchParentUpdates(s.ctx, 0, 0, parentUpdates)
-}
-
-// GetJobs returns a copy of the current jobs list (primarily for testing)
-func (s *Service) GetJobs() []*pruner.Job {
-	return s.jobManager.GetJobs()
-}
-
-// GetJobByHeight returns a job for the specified block height
-func (s *Service) GetJobByHeight(blockHeight uint32) *pruner.Job {
-	return s.jobManager.GetJobByHeight(blockHeight)
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.executeBatchParentUpdates(ctx, parentUpdates)
 }

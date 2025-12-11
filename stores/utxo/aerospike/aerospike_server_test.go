@@ -2252,8 +2252,6 @@ func TestAerospikeCleanupService(t *testing.T) {
 		Client:         client,
 		Namespace:      store.GetNamespace(),
 		Set:            store.GetName(),
-		MaxJobsHistory: 50,
-		WorkerCount:    2,
 		IndexWaiter:    &mockIndexWaiter{},
 	})
 	require.NoError(t, err)
@@ -2362,7 +2360,6 @@ func TestDeletedChildren(t *testing.T) {
 		ExternalStore:  memory.New(),
 		Namespace:      store.GetNamespace(),
 		Set:            store.GetName(),
-		MaxJobsHistory: 3,
 		IndexWaiter:    &mockIndexWaiter{},
 	}
 

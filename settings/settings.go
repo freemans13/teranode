@@ -429,8 +429,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 		Pruner: PrunerSettings{
 			GRPCAddress:                getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
 			GRPCListenAddress:          getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
-			WorkerCount:                getInt("pruner_workerCount", 1, alternativeContext...),                               // Single job at a time
-			JobTimeout:                 getDuration("pruner_jobTimeout", 0, alternativeContext...),                           // 0 = wait indefinitely
 			UTXODefensiveEnabled:       getBool("pruner_utxoDefensiveEnabled", false, alternativeContext...),                 // Defensive mode off by default (production)
 			UTXODefensiveBatchReadSize: getInt("pruner_utxoDefensiveBatchReadSize", 10000, alternativeContext...),            // Batch size for child verification
 			UTXOChunkSize:              getInt("pruner_utxoChunkSize", 1000, alternativeContext...),                          // Chunk size for batch operations
