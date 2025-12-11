@@ -599,7 +599,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	// Use the existing prepareTxsPerLevel logic to organize transactions by dependency levels
-	maxLevel, txsPerLevel, err := u.prepareTxsPerLevel(ctx, missingTxs)
+	maxLevel, txsPerLevel, err := u.selectPrepareTxsPerLevel(ctx, missingTxs)
 	if err != nil {
 		return errors.NewProcessingError("[processTransactionsInLevels] Failed to prepare transactions per level", err)
 	}
