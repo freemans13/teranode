@@ -967,6 +967,9 @@ func (m *MockBlockchainClient) SetState(ctx context.Context, key string, data []
 func (m *MockBlockchainClient) SetBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	return nil
 }
+func (m *MockBlockchainClient) ClearBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash) error {
+	return nil
+}
 func (m *MockBlockchainClient) GetBlockIsMined(ctx context.Context, blockHash *chainhash.Hash) (bool, error) {
 	return false, nil
 }

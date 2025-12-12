@@ -128,6 +128,29 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return err
 	}
 
+	// Step 3.5: If fork detected, reset mined_set on old blocks for transaction state consistency
+	if catchupCtx.forkDepth > 0 {
+		u.logger.Infof("[catchup][%s] Fork detected (depth %d), clearing mined_set on old blocks",
+			catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth)
+
+		currentHeight := catchupCtx.currentHeight
+		headers, _, err := u.blockchainClient.GetBlockHeadersByHeight(ctx,
+			catchupCtx.commonAncestorMeta.Height+1, currentHeight)
+		if err != nil {
+			u.logger.Errorf("[catchup][%s] Failed to get fork block headers: %v",
+				catchupCtx.blockUpTo.Hash().String(), err)
+		} else {
+			for _, header := range headers {
+				if err := u.blockchainClient.ClearBlockMinedSet(ctx, header.Hash()); err != nil {
+					u.logger.Errorf("[catchup][%s] Failed to clear mined_set for block %s: %v",
+						catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), err)
+				}
+			}
+			u.logger.Infof("[catchup][%s] Cleared mined_set on %d fork blocks",
+				catchupCtx.blockUpTo.Hash().String(), len(headers))
+		}
+	}
+
 	// Step 4: Validate fork depth against coinbase maturity
 	if err = u.validateForkDepth(catchupCtx); err != nil {
 		return err
