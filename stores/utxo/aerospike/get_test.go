@@ -26,6 +26,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/file"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blockchain"
 	teranode_aerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -526,8 +527,10 @@ func createTestTxWithInputs(t *testing.T, numInputs int, scriptSize int) *bt.Tx 
 }
 
 // TestParseInputReferencesOnlyWithExtendedFormat tests that ParseInputReferencesOnly correctly
-// parses external transactions that are stored in Extended Format (with PreviousTxSatoshis and PreviousTxScript).
+// parses external transactions using the ACTUAL production code path from create.go:869 and get.go:1432.
 func TestParseInputReferencesOnlyWithExtendedFormat(t *testing.T) {
+	ctx := context.Background()
+
 	// Create a transaction with multiple inputs and Extended Format metadata
 	tx := bt.NewTx()
 
@@ -567,41 +570,46 @@ func TestParseInputReferencesOnlyWithExtendedFormat(t *testing.T) {
 		Satoshis:      0,
 	})
 
-	// Store the transaction in Extended Format (as create.go does)
+	// Create external blob store
 	tempDir := t.TempDir()
 	u, err := url.Parse("file://" + tempDir)
 	require.NoError(t, err)
 
-	blobStore, err := file.New(ulogger.TestLogger{}, u)
+	externalStore, err := file.New(ulogger.TestLogger{}, u)
 	require.NoError(t, err)
 
-	txHash := tx.TxIDChainHash()
+	txHash := *tx.TxIDChainHash()
+
+	// Store using EXACT production code from create.go:869
+	// This is how external transactions are written in production
 	extendedBytes := tx.ExtendedBytes()
-
-	// Write with fileformat header
-	err = blobStore.Set(context.Background(), txHash[:], fileformat.FileTypeTx, extendedBytes)
+	err = externalStore.Set(ctx, txHash[:], fileformat.FileTypeTx, extendedBytes, options.WithDeleteAt(0))
 	require.NoError(t, err)
 
-	// Now read it back using GetIoReader (which skips the header)
-	reader, err := blobStore.GetIoReader(context.Background(), txHash[:], fileformat.FileTypeTx)
-	require.NoError(t, err)
-	defer reader.Close()
+	// Create a minimal Store with external store configured
+	store := &teranode_aerospike.Store{}
+	store.SetExternalStore(externalStore)
+	store.SetLogger(ulogger.TestLogger{})
 
-	// Parse using ParseInputReferencesOnly
-	inputs, err := teranode_aerospike.ParseInputReferencesOnly(reader)
-	require.NoError(t, err, "ParseInputReferencesOnly should successfully parse Extended Format")
+	// Use the EXACT production code path from get.go:1426 (GetTxInpointsFromExternalStore)
+	// This is how external transactions are read when loading unmined transactions
+	txInpoints, err := store.GetTxInpointsFromExternalStore(ctx, txHash)
+	require.NoError(t, err, "GetTxInpointsFromExternalStore should successfully parse Extended Format")
 
-	// Verify we got the correct number of inputs
-	require.Equal(t, 3, len(inputs), "Should parse all 3 inputs")
+	// Verify the TxInpoints has the correct parent tx hashes
+	parentHashes := txInpoints.GetParentTxHashes()
+	require.Equal(t, 3, len(parentHashes), "Should have 3 unique parent tx hashes")
 
-	// Verify each input's prevTxID and prevOutIndex match
-	for i, input := range inputs {
-		expectedPrevTxIDBytes := tx.Inputs[i].PreviousTxID()
-		actualPrevTxIDBytes := input.PreviousTxID()
-
-		require.Equal(t, expectedPrevTxIDBytes, actualPrevTxIDBytes,
-			"Input %d prevTxID should match", i)
-		require.Equal(t, tx.Inputs[i].PreviousTxOutIndex, input.PreviousTxOutIndex,
-			"Input %d prevOutIndex should match", i)
+	// Verify each parent tx hash matches the original inputs
+	for i := 0; i < 3; i++ {
+		expectedHash := tx.Inputs[i].PreviousTxID()
+		found := false
+		for _, hash := range parentHashes {
+			if bytes.Equal(expectedHash, hash[:]) {
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "Input %d prevTxID should be in parent hashes", i)
 	}
 }
