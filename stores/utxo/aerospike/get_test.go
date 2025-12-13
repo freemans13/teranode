@@ -524,3 +524,84 @@ func createTestTxWithInputs(t *testing.T, numInputs int, scriptSize int) *bt.Tx 
 
 	return tx
 }
+
+// TestParseInputReferencesOnlyWithExtendedFormat tests that ParseInputReferencesOnly correctly
+// parses external transactions that are stored in Extended Format (with PreviousTxSatoshis and PreviousTxScript).
+func TestParseInputReferencesOnlyWithExtendedFormat(t *testing.T) {
+	// Create a transaction with multiple inputs and Extended Format metadata
+	tx := bt.NewTx()
+
+	// Add 3 inputs with Extended Format fields populated
+	for i := 0; i < 3; i++ {
+		prevTxIDBytes := make([]byte, 32)
+		for j := range prevTxIDBytes {
+			prevTxIDBytes[j] = byte(i*10 + j)
+		}
+		prevTxID, err := chainhash.NewHash(prevTxIDBytes)
+		require.NoError(t, err)
+
+		unlockingScript, err := bscript.NewFromASM("OP_1 OP_2")
+		require.NoError(t, err)
+
+		previousTxScript, err := bscript.NewFromASM("OP_DUP OP_HASH160 OP_3 OP_EQUALVERIFY OP_CHECKSIG")
+		require.NoError(t, err)
+
+		input := &bt.Input{
+			PreviousTxOutIndex:  uint32(i),
+			UnlockingScript:     unlockingScript,
+			SequenceNumber:      0xffffffff,
+			PreviousTxSatoshis:  uint64(1000 * (i + 1)), // Extended Format field
+			PreviousTxScript:    previousTxScript,        // Extended Format field
+		}
+		err = input.PreviousTxIDAdd(prevTxID)
+		require.NoError(t, err)
+
+		tx.Inputs = append(tx.Inputs, input)
+	}
+
+	// Add a dummy output so the transaction is complete
+	script, err := bscript.NewFromASM("OP_FALSE OP_RETURN")
+	require.NoError(t, err)
+	tx.Outputs = append(tx.Outputs, &bt.Output{
+		LockingScript: script,
+		Satoshis:      0,
+	})
+
+	// Store the transaction in Extended Format (as create.go does)
+	tempDir := t.TempDir()
+	u, err := url.Parse("file://" + tempDir)
+	require.NoError(t, err)
+
+	blobStore, err := file.New(ulogger.TestLogger{}, u)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+	extendedBytes := tx.ExtendedBytes()
+
+	// Write with fileformat header
+	err = blobStore.Set(context.Background(), txHash[:], fileformat.FileTypeTx, extendedBytes)
+	require.NoError(t, err)
+
+	// Now read it back using GetIoReader (which skips the header)
+	reader, err := blobStore.GetIoReader(context.Background(), txHash[:], fileformat.FileTypeTx)
+	require.NoError(t, err)
+	defer reader.Close()
+
+	// Parse using ParseInputReferencesOnly
+	inputs, err := teranode_aerospike.ParseInputReferencesOnly(reader)
+	require.NoError(t, err, "ParseInputReferencesOnly should successfully parse Extended Format")
+
+	// Verify we got the correct number of inputs
+	require.Equal(t, 3, len(inputs), "Should parse all 3 inputs")
+
+	// Verify each input's prevTxID and prevOutIndex match
+	for i, input := range inputs {
+		expectedPrevTxIDBytes := tx.Inputs[i].PreviousTxID()
+		actualPrevTxIDBytes := input.PreviousTxID()
+
+		require.Equal(t, expectedPrevTxIDBytes, actualPrevTxIDBytes,
+			"Input %d prevTxID should match", i)
+		require.Equal(t, tx.Inputs[i].PreviousTxOutIndex, input.PreviousTxOutIndex,
+			"Input %d prevOutIndex should match", i)
+	}
+}
