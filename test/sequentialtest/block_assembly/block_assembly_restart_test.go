@@ -178,8 +178,8 @@ func testBlockAssemblyRestartWithExternalTx(t *testing.T, utxoStoreType string) 
 
 	// Create new daemon instance, reusing the existing container to preserve Aerospike data
 	td = daemon.NewTestDaemon(t, daemon.TestOptions{
-		ContainerManager:  containerManager,
-		SkipRemoveDataDir: true,
+		ContainerManager:     containerManager,
+		SkipRemoveDataDir:    true,
 		SkipContainerCleanup: true,
 		SettingsOverrideFunc: test.ComposeSettings(
 			test.SystemTestSettings(),
