@@ -406,7 +406,7 @@ func fetchTransaction(ctx context.Context, txStore blob.Store, b *bitcoin.Bitcoi
 func TestParseInputReferencesOnly(t *testing.T) {
 	t.Run("parses single input correctly", func(t *testing.T) {
 		tx := createTestTxWithInputs(t, 1, 100)
-		txBytes := tx.Bytes()
+		txBytes := tx.ExtendedBytes() // External transactions use Extended Format
 
 		inputs, err := teranode_aerospike.ParseInputReferencesOnly(bytes.NewReader(txBytes))
 
@@ -419,7 +419,7 @@ func TestParseInputReferencesOnly(t *testing.T) {
 
 	t.Run("parses multiple inputs", func(t *testing.T) {
 		tx := createTestTxWithInputs(t, 10, 50)
-		txBytes := tx.Bytes()
+		txBytes := tx.ExtendedBytes() // External transactions use Extended Format
 
 		inputs, err := teranode_aerospike.ParseInputReferencesOnly(bytes.NewReader(txBytes))
 
@@ -434,7 +434,7 @@ func TestParseInputReferencesOnly(t *testing.T) {
 
 	t.Run("skips large scripts without allocation", func(t *testing.T) {
 		tx := createTestTxWithInputs(t, 2, 1024*100)
-		txBytes := tx.Bytes()
+		txBytes := tx.ExtendedBytes() // External transactions use Extended Format
 
 		inputs, err := teranode_aerospike.ParseInputReferencesOnly(bytes.NewReader(txBytes))
 
@@ -448,7 +448,7 @@ func TestParseInputReferencesOnly(t *testing.T) {
 			Inputs:  []*bt.Input{},
 			Outputs: []*bt.Output{{Satoshis: 100, LockingScript: &bscript.Script{0x76}}},
 		}
-		txBytes := tx.Bytes()
+		txBytes := tx.ExtendedBytes() // External transactions use Extended Format
 
 		inputs, err := teranode_aerospike.ParseInputReferencesOnly(bytes.NewReader(txBytes))
 
@@ -458,10 +458,10 @@ func TestParseInputReferencesOnly(t *testing.T) {
 
 	t.Run("error on truncated prevTxID", func(t *testing.T) {
 		tx := createTestTxWithInputs(t, 1, 10)
-		txBytes := tx.Bytes()
+		txBytes := tx.ExtendedBytes() // External transactions use Extended Format
 
 		// Truncate in middle of first input's prevTxID
-		truncated := txBytes[:10]
+		truncated := txBytes[:20] // Adjusted for Extended Format marker
 
 		_, err := teranode_aerospike.ParseInputReferencesOnly(bytes.NewReader(truncated))
 
@@ -486,7 +486,7 @@ func TestParseInputReferencesOnly(t *testing.T) {
 		largeScript := make(bscript.Script, 1024*1024*5)
 		tx.Outputs = []*bt.Output{{Satoshis: 100, LockingScript: &largeScript}}
 
-		txBytes := tx.Bytes()
+		txBytes := tx.ExtendedBytes() // External transactions use Extended Format
 
 		// Should complete without reading the 5MB output
 		inputs, err := teranode_aerospike.ParseInputReferencesOnly(bytes.NewReader(txBytes))
@@ -550,11 +550,11 @@ func TestParseInputReferencesOnlyWithExtendedFormat(t *testing.T) {
 		require.NoError(t, err)
 
 		input := &bt.Input{
-			PreviousTxOutIndex:  uint32(i),
-			UnlockingScript:     unlockingScript,
-			SequenceNumber:      0xffffffff,
-			PreviousTxSatoshis:  uint64(1000 * (i + 1)), // Extended Format field
-			PreviousTxScript:    previousTxScript,        // Extended Format field
+			PreviousTxOutIndex: uint32(i),
+			UnlockingScript:    unlockingScript,
+			SequenceNumber:     0xffffffff,
+			PreviousTxSatoshis: uint64(1000 * (i + 1)), // Extended Format field
+			PreviousTxScript:   previousTxScript,       // Extended Format field
 		}
 		err = input.PreviousTxIDAdd(prevTxID)
 		require.NoError(t, err)
