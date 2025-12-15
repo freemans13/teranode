@@ -193,6 +193,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockPersisterConcurrency:               getInt("blockpersister_concurrency", 8, alternativeContext...),
 			BatchMissingTransactions:                getBool("blockpersister_batchMissingTransactions", true, alternativeContext...),
 			ProcessTxMetaUsingStoreBatchSize:        getInt("blockvalidation_processTxMetaUsingStore_BatchSize", 1024, alternativeContext...),
+			ProcessTxMetaChunkSize:                  getInt("blockpersister_processTxMeta_chunkSize", 100000, alternativeContext...),
 			SkipUTXODelete:                          getBool("blockpersister_skipUTXODelete", false, alternativeContext...),
 			UTXOPersisterBufferSize:                 getString("utxoPersister_buffer_size", "4KB", alternativeContext...),
 			UTXOPersisterDirect:                     getBool("direct", true, alternativeContext...),

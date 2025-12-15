@@ -58,6 +58,14 @@ var (
 	// prometheusBlockPersisterSubtreeBatch measures the time taken to process a batch of subtrees
 	// in the block persister service, in milliseconds, helping optimize batch size configurations.
 	prometheusBlockPersisterSubtreeBatch prometheus.Histogram
+
+	// prometheusBlockPersisterChunkProcessing tracks the duration of processing transaction chunks
+	// in milliseconds, helping monitor the impact of chunked processing on performance.
+	prometheusBlockPersisterChunkProcessing prometheus.Histogram
+
+	// prometheusBlockPersisterTxsPerChunk tracks the number of transactions processed per chunk,
+	// helping monitor chunk utilization and optimize chunk size configuration.
+	prometheusBlockPersisterTxsPerChunk prometheus.Histogram
 )
 
 var (
@@ -184,6 +192,26 @@ func _initPrometheusMetrics() {
 			Name:      "subtree_batch_duration",
 			Help:      "Duration of a subtree batch processing by the block persister service",
 			Buckets:   util.MetricsBucketsMilliSeconds,
+		},
+	)
+
+	prometheusBlockPersisterChunkProcessing = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "blockpersister",
+			Name:      "chunk_processing_duration",
+			Help:      "Duration of transaction chunk processing in milliseconds",
+			Buckets:   util.MetricsBucketsMilliSeconds,
+		},
+	)
+
+	prometheusBlockPersisterTxsPerChunk = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "blockpersister",
+			Name:      "txs_per_chunk",
+			Help:      "Number of transactions processed per chunk",
+			Buckets:   prometheus.ExponentialBuckets(100, 10, 7), // 100, 1K, 10K, 100K, 1M, 10M, 100M
 		},
 	)
 }

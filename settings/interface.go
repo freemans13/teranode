@@ -200,6 +200,7 @@ type BlockSettings struct {
 	BlockPersisterConcurrency               int
 	BatchMissingTransactions                bool
 	ProcessTxMetaUsingStoreBatchSize        int
+	ProcessTxMetaChunkSize                  int
 	SkipUTXODelete                          bool
 	UTXOPersisterBufferSize                 string
 	TxStore                                 *url.URL

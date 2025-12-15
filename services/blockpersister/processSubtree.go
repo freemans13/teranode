@@ -4,6 +4,8 @@ package blockpersister
 
 import (
 	"context"
+	"io"
+	"runtime"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -12,6 +14,8 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/utxopersister"
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 )
@@ -56,67 +60,201 @@ func (u *Server) ProcessSubtree(pCtx context.Context, subtreeHash chainhash.Hash
 		return errors.NewStorageError("[BlockPersister] error checking if subtree data exists for %s", subtreeHash.String(), err)
 	}
 
-	var subtreeData *subtreepkg.Data
-
 	if subtreeDataExists {
-		// Subtree data already exists, load it to process UTXOs
-		u.logger.Debugf("[BlockPersister] Subtree data for %s already exists, loading for UTXO processing", subtreeHash.String())
+		// Subtree data already exists, stream and process in chunks
+		u.logger.Debugf("[BlockPersister] Subtree data for %s already exists, streaming for UTXO processing", subtreeHash.String())
 
-		subtreeData, err = u.readSubtreeData(ctx, subtreeHash)
+		// Get subtree structure
+		subtree, err := u.readSubtree(ctx, subtreeHash)
 		if err != nil {
 			return err
 		}
+
+		// Open SubtreeData file for streaming read
+		reader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData)
+		if err != nil {
+			return errors.NewStorageError("[BlockPersister] error getting subtree data reader for %s", subtreeHash.String(), err)
+		}
+		defer reader.Close()
 
 		// Update DAH (Delete-At-Height) to persist the file
 		err = u.subtreeStore.SetDAH(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, 0)
 		if err != nil {
 			return errors.NewStorageError("[BlockPersister] error setting subtree data DAH for %s", subtreeHash.String(), err)
 		}
-	} else {
-		// Subtree data doesn't exist, create it
-		u.logger.Debugf("[BlockPersister] Subtree data for %s does not exist, creating", subtreeHash.String())
 
-		// 1. get the subtree from the subtree store
+		chunkSize := u.settings.Block.ProcessTxMetaChunkSize
+		subtreeLen := subtree.Length()
+
+		for chunkStart := 0; chunkStart < subtreeLen; chunkStart += chunkSize {
+			// READ and VALIDATE: Get chunk of transactions from disk with validation
+			txs, err := subtreepkg.ReadTransactionChunk(reader, subtree, chunkStart, chunkSize)
+			if err != nil {
+				return errors.NewProcessingError("[BlockPersister] error reading transaction chunk from disk", err)
+			}
+
+			// PROCESS: Process chunk through UTXO diff
+			if _, err := u.processTransactionChunk(ctx, txs, utxoDiff); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	} else {
+		// Subtree data doesn't exist, create it with chunked loading and processing
+		u.logger.Debugf("[BlockPersister] Subtree data for %s does not exist, creating with chunked loading", subtreeHash.String())
+
+		// Get the subtree structure
 		subtree, err := u.readSubtree(ctx, subtreeHash)
 		if err != nil {
 			return err
 		}
 
-		subtreeData = subtreepkg.NewSubtreeData(subtree)
-		if subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			if err = subtreeData.AddTx(coinbaseTx, 0); err != nil {
-				return errors.NewProcessingError("[BlockPersister] error adding coinbase tx to subtree data", err)
+		// Stream to disk using pipe for memory efficiency
+		chunkSize := u.settings.Block.ProcessTxMetaChunkSize
+		subtreeLen := subtree.Length()
+
+		// Create pipe for streaming serialization
+		pipeReader, pipeWriter := io.Pipe()
+
+		// Goroutine: load, stream, process in chunks
+		go func() {
+			defer pipeWriter.Close()
+
+			// Handle coinbase if needed
+			if subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				if err := subtreepkg.WriteTransactionChunk(pipeWriter, []*bt.Tx{coinbaseTx}); err != nil {
+					_ = pipeWriter.CloseWithError(err)
+					return
+				}
+				if _, err := u.processTransactionChunk(ctx, []*bt.Tx{coinbaseTx}, utxoDiff); err != nil {
+					_ = pipeWriter.CloseWithError(err)
+					return
+				}
 			}
-		}
 
-		// 2. ...then attempt to load the txMeta from the store (i.e - aerospike in production)
-		if err = u.processTxMetaUsingStore(ctx, subtree, subtreeData); err != nil {
-			return errors.NewServiceError("[ValidateSubtreeInternal][%s] failed to get tx meta from store", subtreeHash.String(), err)
-		}
+			startIdx := 0
+			if subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				startIdx = 1 // Skip coinbase, already processed
+			}
 
-		// add support for writing the subtree data from a reader
-		subtreeDataBytes, err := subtreeData.Serialize()
-		if err != nil {
-			return errors.NewProcessingError("[BlockPersister] error serializing subtree data for %s", subtreeHash.String(), err)
-		}
+			for chunkStart := startIdx; chunkStart < subtreeLen; chunkStart += chunkSize {
+				txs, err := u.loadTransactionChunkToSlice(ctx, subtree, chunkStart, chunkSize)
+				if err != nil {
+					_ = pipeWriter.CloseWithError(err)
+					return
+				}
 
-		err = u.subtreeStore.Set(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, subtreeDataBytes)
+				if err := subtreepkg.WriteTransactionChunk(pipeWriter, txs); err != nil {
+					_ = pipeWriter.CloseWithError(err)
+					return
+				}
+
+				if _, err := u.processTransactionChunk(ctx, txs, utxoDiff); err != nil {
+					_ = pipeWriter.CloseWithError(err)
+					return
+				}
+			}
+		}()
+
+		// Store SubtreeData from pipe reader (streaming)
+		err = u.subtreeStore.SetFromReader(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, pipeReader)
 		if err != nil {
 			return errors.NewStorageError("[BlockPersister] error storing subtree data for %s", subtreeHash.String(), err)
 		}
-	}
 
-	// 3. Process all transactions through UTXO diff to track additions and deletions
-	// This always happens regardless of whether subtreeData already existed
-	for _, tx := range subtreeData.Txs {
+		return nil
+	}
+}
+
+// processTransactionChunk processes a chunk of transactions through UTXO diff.
+//
+// This function processes a slice of transactions through the UTXO diff tracker. After processing,
+// the slice goes out of scope and is garbage collected. GC is explicitly triggered for large chunks
+// to reclaim memory more aggressively.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - txs: Slice of transactions to process
+//   - utxoDiff: UTXO set difference tracker
+//
+// Returns the number of transactions processed and any error encountered.
+func (u *Server) processTransactionChunk(ctx context.Context, txs []*bt.Tx, utxoDiff *utxopersister.UTXOSet) (int, error) {
+	// Track chunk processing time
+	_, _, deferFn := tracing.Tracer("blockpersister").Start(ctx, "ProcessChunk",
+		tracing.WithHistogram(prometheusBlockPersisterChunkProcessing),
+	)
+	defer deferFn()
+
+	txsProcessed := 0
+	for _, tx := range txs {
 		if tx != nil {
 			if err := utxoDiff.ProcessTx(tx); err != nil {
-				return errors.NewProcessingError("error processing tx for UTXO", err)
+				return txsProcessed, errors.NewProcessingError("error processing tx for UTXO", err)
 			}
+			txsProcessed++
 		}
 	}
 
-	return nil
+	// Record metrics
+	prometheusBlockPersisterTxsPerChunk.Observe(float64(txsProcessed))
+
+	// Trigger GC for significant chunks to reclaim memory
+	// Slice will go out of scope after this function returns
+	if txsProcessed > 10000 {
+		runtime.GC()
+	}
+
+	return txsProcessed, nil
+}
+
+// loadTransactionChunkToSlice loads transactions from UTXO store and returns them as a slice.
+//
+// Returns transactions directly rather than populating a SubtreeData structure.
+// Useful for streaming workflows.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - subtree: Subtree structure containing transaction hashes
+//   - startIdx: Starting index of transactions to load
+//   - count: Number of transactions to load
+//
+// Returns a slice of loaded transactions.
+func (u *Server) loadTransactionChunkToSlice(ctx context.Context, subtree *subtreepkg.Subtree, startIdx, count int) ([]*bt.Tx, error) {
+	batchSize := u.settings.Block.ProcessTxMetaUsingStoreBatchSize
+	endIdx := subtreepkg.Min(startIdx+count, subtree.Length())
+
+	txs := make([]*bt.Tx, endIdx-startIdx)
+
+	// Batch load transactions
+	for i := startIdx; i < endIdx; i += batchSize {
+		batchEnd := subtreepkg.Min(i+batchSize, endIdx)
+
+		missingTxHashes := make([]*utxo.UnresolvedMetaData, 0, batchEnd-i)
+		for j := i; j < batchEnd; j++ {
+			if subtree.Nodes[j].Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+				continue
+			}
+
+			missingTxHashes = append(missingTxHashes, &utxo.UnresolvedMetaData{
+				Hash: subtree.Nodes[j].Hash,
+				Idx:  j,
+			})
+		}
+
+		if err := u.utxoStore.BatchDecorate(ctx, missingTxHashes, fields.Tx); err != nil {
+			return nil, err
+		}
+
+		for _, data := range missingTxHashes {
+			if data.Data == nil || data.Err != nil {
+				return nil, errors.NewProcessingError("failed to retrieve tx %s", data.Hash, data.Err)
+			}
+			txs[data.Idx-startIdx] = data.Data.Tx
+		}
+	}
+
+	return txs, nil
 }
 
 // readSubtreeData retrieves and deserializes subtree data from the subtree store.
