@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/tracing"
+	"golang.org/x/sync/errgroup"
 )
 
 // ProcessSubtree processes a subtree of transactions, validating and storing them.
@@ -110,26 +111,29 @@ func (u *Server) ProcessSubtree(pCtx context.Context, subtreeHash chainhash.Hash
 			return err
 		}
 
-		// Stream to disk using pipe for memory efficiency
+		// Stream to disk using pipe with proper error handling
 		chunkSize := u.settings.Block.ProcessTxMetaChunkSize
 		subtreeLen := subtree.Length()
 
 		// Create pipe for streaming serialization
 		pipeReader, pipeWriter := io.Pipe()
 
+		// Use errgroup for proper error coordination
+		g, gCtx := errgroup.WithContext(ctx)
+
 		// Goroutine: load, stream, process in chunks
-		go func() {
+		g.Go(func() error {
 			defer pipeWriter.Close()
 
 			// Handle coinbase if needed
 			if subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 				if err := subtreepkg.WriteTransactionChunk(pipeWriter, []*bt.Tx{coinbaseTx}); err != nil {
 					_ = pipeWriter.CloseWithError(err)
-					return
+					return errors.NewProcessingError("error writing coinbase", err)
 				}
-				if _, err := u.processTransactionChunk(ctx, []*bt.Tx{coinbaseTx}, utxoDiff); err != nil {
+				if _, err := u.processTransactionChunk(gCtx, []*bt.Tx{coinbaseTx}, utxoDiff); err != nil {
 					_ = pipeWriter.CloseWithError(err)
-					return
+					return err
 				}
 			}
 
@@ -139,28 +143,35 @@ func (u *Server) ProcessSubtree(pCtx context.Context, subtreeHash chainhash.Hash
 			}
 
 			for chunkStart := startIdx; chunkStart < subtreeLen; chunkStart += chunkSize {
-				txs, err := u.loadTransactionChunkToSlice(ctx, subtree, chunkStart, chunkSize)
+				txs, err := u.loadTransactionChunkToSlice(gCtx, subtree, chunkStart, chunkSize)
 				if err != nil {
 					_ = pipeWriter.CloseWithError(err)
-					return
+					return err
 				}
 
 				if err := subtreepkg.WriteTransactionChunk(pipeWriter, txs); err != nil {
 					_ = pipeWriter.CloseWithError(err)
-					return
+					return errors.NewProcessingError("error streaming transactions", err)
 				}
 
-				if _, err := u.processTransactionChunk(ctx, txs, utxoDiff); err != nil {
+				if _, err := u.processTransactionChunk(gCtx, txs, utxoDiff); err != nil {
 					_ = pipeWriter.CloseWithError(err)
-					return
+					return err
 				}
 			}
-		}()
+
+			return nil
+		})
 
 		// Store SubtreeData from pipe reader (streaming)
 		err = u.subtreeStore.SetFromReader(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, pipeReader)
 		if err != nil {
 			return errors.NewStorageError("[BlockPersister] error storing subtree data for %s", subtreeHash.String(), err)
+		}
+
+		// Wait for goroutine and check for errors
+		if err := g.Wait(); err != nil {
+			return errors.NewProcessingError("[BlockPersister] error in streaming goroutine for %s", subtreeHash.String(), err)
 		}
 
 		return nil
