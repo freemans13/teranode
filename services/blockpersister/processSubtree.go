@@ -121,7 +121,7 @@ func (u *Server) ProcessSubtree(pCtx context.Context, subtreeHash chainhash.Hash
 		// Use errgroup for proper error coordination
 		g, gCtx := errgroup.WithContext(ctx)
 
-		// Goroutine: load, stream, process in chunks
+		// Goroutine 1: Write to pipe (producer)
 		g.Go(func() error {
 			defer pipeWriter.Close()
 
@@ -163,15 +163,18 @@ func (u *Server) ProcessSubtree(pCtx context.Context, subtreeHash chainhash.Hash
 			return nil
 		})
 
-		// Store SubtreeData from pipe reader (streaming)
-		err = u.subtreeStore.SetFromReader(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, pipeReader)
-		if err != nil {
-			return errors.NewStorageError("[BlockPersister] error storing subtree data for %s", subtreeHash.String(), err)
-		}
+		// Goroutine 2: Read from pipe and store (consumer)
+		g.Go(func() error {
+			err := u.subtreeStore.SetFromReader(gCtx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeData, pipeReader)
+			if err != nil {
+				return errors.NewStorageError("[BlockPersister] error storing subtree data for %s", subtreeHash.String(), err)
+			}
+			return nil
+		})
 
-		// Wait for goroutine and check for errors
+		// Wait for both goroutines and check for errors
 		if err := g.Wait(); err != nil {
-			return errors.NewProcessingError("[BlockPersister] error in streaming goroutine for %s", subtreeHash.String(), err)
+			return err
 		}
 
 		return nil
