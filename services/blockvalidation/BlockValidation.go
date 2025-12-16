@@ -327,21 +327,34 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 
 							// IMPORTANT: We listen for BlockSubtreesSet, NOT NotificationType_Block.
 							//
-							// BlockSubtreesSet is sent AFTER:
-							// 1. Block validation completes (including quickValidateBlock during catchup)
-							// 2. All goroutines that write to block.SubtreeSlices have finished
-							// 3. updateSubtreesDAH() has updated the DAH values for all subtrees
-							// 4. blockchainClient.SetBlockSubtreesSet() has been called
+							// HOW THIS NOTIFICATION IS TRIGGERED:
+							// Both validation paths call updateSubtreesDAH() after validation completes:
 							//
-							// This ordering is critical to avoid a data race where:
+							// Normal Validation (ValidateBlock):
+							//   ValidateBlock() → updateSubtreesDAH() → SetBlockSubtreesSet() → notification
+							//
+							// Quick Validation (Catchup):
+							//   quickValidateBlock() → goroutines complete via errgroup.Wait()
+							//   → updateSubtreesDAH() → SetBlockSubtreesSet() → notification
+							//
+							// TIMING GUARANTEES:
+							// BlockSubtreesSet is sent AFTER:
+							// 1. Block validation completes (all consensus rules checked)
+							// 2. All goroutines that write to block.SubtreeSlices have finished (errgroup.Wait)
+							// 3. updateSubtreesDAH() has updated the DAH values for all subtrees
+							// 4. blockchainClient.SetBlockSubtreesSet() is called and sends this notification
+							//
+							// WHY THIS PREVENTS DATA RACES:
+							// Using NotificationType_Block (sent when block is added to chain) would trigger
+							// setTxMined too early, before validation goroutines complete. This caused:
 							// - Thread A (validation): Spawns goroutines writing to block.SubtreeSlices
 							// - Thread A: Caches the block with SubtreeSlices populated
 							// - Thread B (setTxMined): Retrieves the SAME block instance from cache
 							// - Thread B: Reads/modifies block.SubtreeSlices while Thread A's goroutines are still writing
+							// - Result: Data race on block.SubtreeSlices access (detected by race detector)
 							//
-							// Using NotificationType_Block (sent when block is added to chain) would trigger
-							// setTxMined too early, before validation goroutines complete, causing races on
-							// block.SubtreeSlices access.
+							// By using BlockSubtreesSet (sent after goroutines complete), we ensure sequential
+							// access to block.SubtreeSlices without needing expensive locks everywhere.
 							if notification.Type == model.NotificationType_BlockSubtreesSet {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
