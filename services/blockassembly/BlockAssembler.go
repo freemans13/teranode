@@ -404,8 +404,16 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 //
 // Returns:
 //   - error: Any error encountered during reset
+//
+// Note: This function uses context.Background() internally to ensure all operations
+// complete even if the calling context is canceled. This is critical for data consistency.
 func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
-	bestBlockchainBlockHeader, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+	// Use context.Background() for all critical operations to ensure data consistency
+	// even if the calling context is canceled. This follows the pattern from
+	// SubtreeProcessor.reset() (line 820, 847).
+	resetCtx := context.Background()
+
+	bestBlockchainBlockHeader, meta, err := b.blockchainClient.GetBestBlockHeader(resetCtx)
 	if err != nil {
 		return errors.NewProcessingError("[Reset] error getting best block header", err)
 	}
@@ -414,12 +422,12 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 	hash, h := b.CurrentBlock()
 	b.logger.Warnf("[BlockAssembler][Reset] resetting: %d: %s -> %d: %s", h, hash.Hash(), meta.Height, bestBlockchainBlockHeader.String())
 
-	moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
+	moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(resetCtx, bestBlockchainBlockHeader, meta.Height)
 	if err != nil {
 		return errors.NewProcessingError("[Reset] error getting reorg blocks", err)
 	}
 
-	isLegacySync, err := b.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateLEGACYSYNCING)
+	isLegacySync, err := b.blockchainClient.IsFSMCurrentState(resetCtx, blockchain.FSMStateLEGACYSYNCING)
 	if err != nil {
 		b.logger.Errorf("[BlockAssembler][Reset] error getting FSM state: %v", err)
 
@@ -442,7 +450,7 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 	b.logger.Warnf("[BlockAssembler][Reset] resetting to new best block header: %d", meta.Height)
 
 	// make sure we have processed all pending blocks before resetting
-	if err = b.subtreeProcessor.WaitForPendingBlocks(ctx); err != nil {
+	if err = b.subtreeProcessor.WaitForPendingBlocks(resetCtx); err != nil {
 		return errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
 	}
 
@@ -478,7 +486,7 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 			}
 
 			block := blockWithMeta.block
-			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
+			blockSubtrees, err := block.GetSubtrees(resetCtx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
 			if err != nil {
 				continue
 			}
@@ -503,7 +511,7 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 			}
 
 			block := blockWithMeta.block
-			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
+			blockSubtrees, err := block.GetSubtrees(resetCtx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
 			if err != nil {
 				b.logger.Warnf("[BlockAssembler][Reset] error getting subtrees for moveBack block %s: %v (will skip)", block.Hash().String(), err)
 				continue
@@ -523,7 +531,7 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 
 		// Mark net unmined transactions as NOT on longest chain (set unmined_since)
 		if len(moveBackTxs) > 0 {
-			if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, moveBackTxs, false); err != nil {
+			if err = b.utxoStore.MarkTransactionsOnLongestChain(resetCtx, moveBackTxs, false); err != nil {
 				b.logger.Errorf("[BlockAssembler][Reset] error marking moveBack transactions as unmined: %v", err)
 			} else {
 				b.logger.Infof("[BlockAssembler][Reset] marked %d net unmined transactions (moveBack minus moveForward)", len(moveBackTxs))
@@ -535,7 +543,7 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 	// in the for/select in the subtreeprocessor
 	postProcessFn := func() error {
 		// reload the unmined transactions
-		if err = b.loadUnminedTransactions(ctx, fullScan); err != nil {
+		if err = b.loadUnminedTransactions(resetCtx, fullScan); err != nil {
 			return errors.NewProcessingError("[Reset] error loading unmined transactions", err)
 		}
 
@@ -551,7 +559,7 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 		// same as the subtree processor's best block header
 		bestBlockchainBlockHeader = b.subtreeProcessor.GetCurrentBlockHeader()
 
-		_, bestBlockchainBlockHeaderMeta, err := b.blockchainClient.GetBlockHeader(ctx, bestBlockchainBlockHeader.Hash())
+		_, bestBlockchainBlockHeaderMeta, err := b.blockchainClient.GetBlockHeader(resetCtx, bestBlockchainBlockHeader.Hash())
 		if err != nil {
 			return errors.NewProcessingError("[Reset] error getting best block header meta", err)
 		}
@@ -562,7 +570,7 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 
 	b.setBestBlockHeader(bestBlockchainBlockHeader, currentHeight)
 
-	if err = b.SetState(ctx); err != nil {
+	if err = b.SetState(resetCtx); err != nil {
 		return errors.NewProcessingError("[Reset] error setting state", err)
 	}
 

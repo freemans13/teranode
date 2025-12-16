@@ -2318,11 +2318,17 @@ func TestResetCoverage(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // Cancel immediately
 
-		// Test reset with cancelled context
-		_ = ba.reset(ctx, false)
+		// Test reset with cancelled context - reset() uses context.Background() internally
+		// so it will attempt to complete even though the calling context is canceled.
+		// In this test environment with no real blockchain data, it will fail trying to
+		// get blocks, but the important thing is it's NOT failing due to "context canceled"
+		err := ba.reset(ctx, false)
 
-		// Should handle cancelled context gracefully
-		assert.True(t, true, "reset should handle cancelled context")
+		// Should fail with blockchain data error, NOT context canceled error
+		if err != nil {
+			assert.NotContains(t, err.Error(), "context canceled",
+				"reset should not fail due to context cancellation")
+		}
 	})
 
 	t.Run("reset with force flag", func(t *testing.T) {
