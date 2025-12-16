@@ -1341,8 +1341,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// Update subtrees DAH now that we know the block is valid
 				if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
 					u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
-					// Don't cache the block - let the retry worker (processSubtreesNotSet) handle it
-					// Calling ReValidateBlock here could interfere with reorg/invalidation flows
+					// Trigger revalidation to ensure block is retried
+					// This is consistent with other error handling in this goroutine
+					u.ReValidateBlock(block, baseURL)
 					return
 				}
 
