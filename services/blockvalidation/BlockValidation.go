@@ -1341,6 +1341,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// Update subtrees DAH now that we know the block is valid
 				if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
 					u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
+					// Trigger revalidation since we can't return error from goroutine
+					u.ReValidateBlock(block, baseURL)
+					return
 				}
 
 				// Block validation succeeded - now cache it with subtrees loaded
@@ -1452,7 +1455,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		if !useOptimisticMining {
 			// it's critical that we call updateSubtreesDAH() only when we know the block is valid
 			if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
-				u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
+				return errors.NewProcessingError("[ValidateBlock][%s] failed to update subtrees DAH", block.Hash().String(), err)
 			}
 		}
 

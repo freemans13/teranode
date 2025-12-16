@@ -131,8 +131,7 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 	// 2. BlockSubtreesSet notification is sent to trigger setMinedChan
 	// 3. Transactions are marked as mined in the UTXO store
 	if err = u.updateSubtreesDAH(ctx, block); err != nil {
-		u.logger.Errorf("[quickValidateBlock][%s] failed to update subtrees DAH: %s", block.Hash().String(), err)
-		// Don't return error - this is a background operation that can be retried
+		return errors.NewProcessingError("[quickValidateBlock][%s] failed to update subtrees DAH", block.Hash().String(), err)
 	}
 
 	// Mark block as existing in cache
