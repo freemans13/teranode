@@ -416,11 +416,15 @@ func (u *BlockValidation) start(ctx context.Context) error {
 		}
 	}
 
-	// start a ticker that checks every minute whether there are subtrees/mined that need to be set
+	// start a ticker that checks periodically whether there are subtrees/mined that need to be set
 	// this is a light routine for periodic cleanup and handling of invalidated blocks
 	go func() {
-		u.logger.Infof("[BlockValidation:start] starting periodic block processing goroutine")
-		ticker := time.NewTicker(1 * time.Minute)
+		interval := u.settings.BlockValidation.PeriodicProcessingInterval
+		if interval == 0 {
+			interval = 1 * time.Minute // default to 1 minute if not set
+		}
+		u.logger.Infof("[BlockValidation:start] starting periodic block processing goroutine (interval: %v)", interval)
+		ticker := time.NewTicker(interval)
 
 		for {
 			select {

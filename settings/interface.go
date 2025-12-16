@@ -302,6 +302,7 @@ type BlockValidationSettings struct {
 	SecretMiningThreshold                     uint32
 	PreviousBlockHeaderCount                  uint64
 	MaxBlocksBehindBlockAssembly              int
+	PeriodicProcessingInterval                time.Duration // Interval for periodic processing of blocks with mined_set=false (default: 1 minute)
 	// Catchup configuration
 	CatchupMaxRetries            int // Maximum number of retries for catchup operations
 	CatchupIterationTimeout      int // Timeout in seconds for each catchup iteration

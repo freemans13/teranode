@@ -23,12 +23,14 @@ func setupLongestChainTest(t *testing.T, utxoStoreType string) (td *daemon.TestD
 	}
 
 	td = daemon.NewTestDaemon(t, daemon.TestOptions{
-		// EnableFullLogging: true,
 		UTXOStoreType: utxoStoreType,
 		SettingsOverrideFunc: test.ComposeSettings(
 			test.SystemTestSettings(),
 			func(tSettings *settings.Settings) {
 				tSettings.ChainCfgParams.CoinbaseMaturity = 2
+				// Set fast periodic processing for tests (100ms instead of 1 minute)
+				// This allows BlockValidation to quickly process setTxMined on blocks
+				tSettings.BlockValidation.PeriodicProcessingInterval = 100 * time.Millisecond
 			},
 		),
 	})
