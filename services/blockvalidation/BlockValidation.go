@@ -325,7 +325,24 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 								continue
 							}
 
-							if notification.Type == model.NotificationType_Block {
+							// IMPORTANT: We listen for BlockSubtreesSet, NOT NotificationType_Block.
+							//
+							// BlockSubtreesSet is sent AFTER:
+							// 1. Block validation completes (including quickValidateBlock during catchup)
+							// 2. All goroutines that write to block.SubtreeSlices have finished
+							// 3. updateSubtreesDAH() has updated the DAH values for all subtrees
+							// 4. blockchainClient.SetBlockSubtreesSet() has been called
+							//
+							// This ordering is critical to avoid a data race where:
+							// - Thread A (validation): Spawns goroutines writing to block.SubtreeSlices
+							// - Thread A: Caches the block with SubtreeSlices populated
+							// - Thread B (setTxMined): Retrieves the SAME block instance from cache
+							// - Thread B: Reads/modifies block.SubtreeSlices while Thread A's goroutines are still writing
+							//
+							// Using NotificationType_Block (sent when block is added to chain) would trigger
+							// setTxMined too early, before validation goroutines complete, causing races on
+							// block.SubtreeSlices access.
+							if notification.Type == model.NotificationType_BlockSubtreesSet {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
 								// push block hash to the setMinedChan
