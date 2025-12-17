@@ -613,3 +613,51 @@ func TestParseInputReferencesOnlyWithExtendedFormat(t *testing.T) {
 		require.True(t, found, "Input %d prevTxID should be in parent hashes", i)
 	}
 }
+
+// TestParseInputReferencesOnlyRejectsNonExtendedFormat verifies that ParseInputReferencesOnly
+// returns an error when the transaction is not in extended format.
+func TestParseInputReferencesOnlyRejectsNonExtendedFormat(t *testing.T) {
+	// Create a simple transaction
+	tx := bt.NewTx()
+
+	// Add a single input
+	prevTxIDBytes := make([]byte, 32)
+	for j := range prevTxIDBytes {
+		prevTxIDBytes[j] = byte(j)
+	}
+	prevTxID, err := chainhash.NewHash(prevTxIDBytes)
+	require.NoError(t, err)
+
+	unlockingScript, err := bscript.NewFromASM("OP_1 OP_2")
+	require.NoError(t, err)
+
+	input := &bt.Input{
+		PreviousTxOutIndex: 0,
+		UnlockingScript:    unlockingScript,
+		SequenceNumber:     0xffffffff,
+	}
+	err = input.PreviousTxIDAdd(prevTxID)
+	require.NoError(t, err)
+
+	tx.Inputs = append(tx.Inputs, input)
+
+	// Add a dummy output
+	script, err := bscript.NewFromASM("OP_FALSE OP_RETURN")
+	require.NoError(t, err)
+	tx.Outputs = append(tx.Outputs, &bt.Output{
+		LockingScript: script,
+		Satoshis:      0,
+	})
+
+	// Use standard Bytes() instead of ExtendedBytes() - this is NOT extended format
+	txBytes := tx.Bytes()
+
+	// Attempt to parse - should fail because it's not in extended format
+	reader := bytes.NewReader(txBytes)
+	inputs, err := teranode_aerospike.ParseInputReferencesOnly(reader)
+
+	// Verify that we get an error about not being extended format
+	require.Error(t, err, "ParseInputReferencesOnly should reject non-extended format transactions")
+	require.Nil(t, inputs, "Should return nil inputs on error")
+	require.Contains(t, err.Error(), "transaction is not in extended format", "Error message should indicate the transaction is not in extended format")
+}

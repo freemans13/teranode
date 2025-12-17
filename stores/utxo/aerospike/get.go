@@ -1459,11 +1459,18 @@ func ParseInputReferencesOnly(reader io.Reader) ([]*bt.Input, error) {
 		return nil, errors.NewTxInvalidError("failed to skip version", err)
 	}
 
-	// Extended Format: Skip the extended format marker (6 bytes: 0x00 0x00 0x00 0x00 0x00 0xEF)
+	// Extended Format: Verify the extended format marker (6 bytes: 0x00 0x00 0x00 0x00 0x00 0xEF)
 	// External transactions are stored with ExtendedBytes() which includes this marker after version
-	_, err = io.CopyN(io.Discard, reader, 6)
-	if err != nil {
-		return nil, errors.NewTxInvalidError("failed to skip extended format marker", err)
+	extendedMarker := make([]byte, 6)
+	if _, err := io.ReadFull(reader, extendedMarker); err != nil {
+		return nil, errors.NewTxInvalidError("failed to read extended format marker", err)
+	}
+
+	// Verify the marker matches the expected extended format
+	expectedMarker := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0xEF}
+	if !bytes.Equal(extendedMarker, expectedMarker) {
+		return nil, errors.NewTxInvalidError("transaction is not in extended format (expected marker 0x00 0x00 0x00 0x00 0x00 0xEF, got 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x)",
+			extendedMarker[0], extendedMarker[1], extendedMarker[2], extendedMarker[3], extendedMarker[4], extendedMarker[5])
 	}
 
 	// Parse input count
