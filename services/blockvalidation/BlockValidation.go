@@ -361,6 +361,15 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 								// push block hash to the setMinedChan
 								bv.setMinedChan <- &cHash
 							}
+
+							// Listen for BlockMinedUnset notifications (sent by InvalidateBlock RPC)
+							// This triggers immediate processing instead of waiting for periodic job
+							if notification.Type == model.NotificationType_BlockMinedUnset {
+								cHash := chainhash.Hash(notification.Hash)
+								bv.logger.Infof("[BlockValidation:setMined] received BlockMinedUnset notification: %s", cHash.String())
+								// push block hash to the setMinedChan for immediate processing
+								bv.setMinedChan <- &cHash
+							}
 						}
 					}
 				}
