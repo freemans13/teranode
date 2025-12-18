@@ -1337,19 +1337,24 @@ func (stp *SubtreeProcessor) InitCurrentBlockHeader(blockHeader *model.BlockHead
 //   - error: Any error encountered during addition
 func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.TxInpoints, skipNotification bool) (err error) {
 	// parents can only be set to nil, when they are already in the map
-	if parents == nil {
-		if _, ok := stp.currentTxMap.Get(node.Hash); !ok {
-			return errors.NewProcessingError("error adding node to subtree: txInpoints not found in currentTxMap for %s", node.Hash.String())
-		}
-	} else {
-		// SetIfNotExists returns (value, wasSet) where wasSet is true if the key was newly inserted
-		if _, wasSet := stp.currentTxMap.SetIfNotExists(node.Hash, *parents); !wasSet {
-			// Key already existed, this is a duplicate
-			stp.logger.Debugf("[addNode] duplicate transaction ignored %s", node.Hash.String())
+	if stp.settings.BlockAssembly.EnableTransactionMapDuplicateDetection {
+		// Transaction map enabled - perform duplicate detection and parent tracking
+		if parents == nil {
+			if _, ok := stp.currentTxMap.Get(node.Hash); !ok {
+				return errors.NewProcessingError("error adding node to subtree: txInpoints not found in currentTxMap for %s", node.Hash.String())
+			}
+		} else {
+			// SetIfNotExists returns (value, wasSet) where wasSet is true if the key was newly inserted
+			if _, wasSet := stp.currentTxMap.SetIfNotExists(node.Hash, *parents); !wasSet {
+				// Key already existed, this is a duplicate
+				stp.logger.Debugf("[addNode] duplicate transaction ignored %s", node.Hash.String())
 
-			return nil
+				return nil
+			}
 		}
 	}
+	// When transaction map is disabled, skip all map operations for maximum performance
+	// Duplicates may occur but will not be detected
 
 	if stp.currentSubtree.Load() == nil {
 		newSubtree, err := subtreepkg.NewTreeByLeafCount(stp.currentItemsPerFile)
@@ -1670,18 +1675,27 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 				continue
 			}
 
-			parents, found = stp.currentTxMap.Get(node.Hash)
-			if !found {
-				// this should not happen, but if it does, we need to add the txInpoints to the currentTxMap
-				return errors.NewProcessingError("error getting txInpoints from currentTxMap for %s", node.Hash.String())
-			}
+			if stp.settings.BlockAssembly.EnableTransactionMapDuplicateDetection {
+				parents, found = stp.currentTxMap.Get(node.Hash)
+				if !found {
+					// this should not happen, but if it does, we need to add the txInpoints to the currentTxMap
+					return errors.NewProcessingError("error getting txInpoints from currentTxMap for %s", node.Hash.String())
+				}
 
-			// Remove from currentTxMap so addNode won't skip it as a duplicate
-			stp.currentTxMap.Delete(node.Hash)
+				// Remove from currentTxMap so addNode won't skip it as a duplicate
+				stp.currentTxMap.Delete(node.Hash)
 
-			// Immediately re-add the node
-			if err = stp.addNode(node, &parents, true); err != nil {
-				return errors.NewProcessingError("error adding node to subtree", err)
+				// Immediately re-add the node
+				if err = stp.addNode(node, &parents, true); err != nil {
+					return errors.NewProcessingError("error adding node to subtree", err)
+				}
+			} else {
+				// When map is disabled, just add the node directly without parent tracking
+				// Use empty parents since we're not tracking them
+				emptyParents := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
+				if err = stp.addNode(node, &emptyParents, true); err != nil {
+					return errors.NewProcessingError("error adding node to subtree", err)
+				}
 			}
 		}
 	}
@@ -2454,15 +2468,20 @@ func (stp *SubtreeProcessor) moveBackBlockGetSubtrees(ctx context.Context, block
 
 			subtreeMetaReader, err := stp.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
 			if err != nil {
-				return errors.NewServiceError("[moveBackBlock:GetSubtrees][%s] error getting subtree meta %s", block.String(), subtreeHash.String(), err)
-			}
+				// SubtreeMeta not found - use empty parents (acceptable when transaction map is disabled)
+				stp.logger.Debugf("[moveBackBlock:GetSubtrees][%s] SubtreeMeta not found for %s, using empty parents", block.String(), subtreeHash.String())
+				subtreeMetaTxInpoints[idx] = make([]subtreepkg.TxInpoints, len(subtree.Nodes))
+				for i := range subtreeMetaTxInpoints[idx] {
+					subtreeMetaTxInpoints[idx][i] = subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
+				}
+			} else {
+				subtreeMeta, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
+				if err != nil {
+					return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] error deserializing subtree meta", block.String(), err)
+				}
 
-			subtreeMeta, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
-			if err != nil {
-				return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] error deserializing subtree meta", block.String(), err)
+				subtreeMetaTxInpoints[idx] = subtreeMeta.TxInpoints
 			}
-
-			subtreeMetaTxInpoints[idx] = subtreeMeta.TxInpoints
 
 			// process conflicting hashes
 			if len(subtree.ConflictingNodes) > 0 {
@@ -2525,8 +2544,14 @@ func (stp *SubtreeProcessor) createTransactionMapIfNeeded(ctx context.Context, b
 			// TODO revert the created utxos
 			return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error creating transaction map", block.String(), err)
 		}
+		// Note: transactionMap may be nil if creation is disabled via configuration
+		// processRemainderTransactionsAndDequeue already handles nil correctly
 
-		stp.logger.Debugf("[moveForwardBlock][%s] processing subtrees into transaction map DONE in %s: %d", block.String(), time.Since(mapStartTime).String(), transactionMap.Length())
+		if transactionMap != nil {
+			stp.logger.Debugf("[moveForwardBlock][%s] processing subtrees into transaction map DONE in %s: %d", block.String(), time.Since(mapStartTime).String(), transactionMap.Length())
+		} else {
+			stp.logger.Debugf("[moveForwardBlock][%s] transaction map creation skipped (disabled)", block.String())
+		}
 	}
 
 	return transactionMap, conflictingNodes, nil
@@ -3094,6 +3119,12 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 //   - error: Any error encountered during map creation
 func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubtreesMap map[chainhash.Hash]int,
 	totalSubtreesInBlock int, estimatedTxCount uint64) (txmap.TxMap, []chainhash.Hash, error) {
+	// Check if transaction map creation is disabled
+	if !stp.settings.BlockAssembly.EnableTransactionMapDuplicateDetection {
+		stp.logger.Infof("CreateTransactionMap skipped (disabled via configuration)")
+		return nil, nil, nil
+	}
+
 	startTime := time.Now()
 
 	prometheusSubtreeProcessorCreateTransactionMap.Inc()

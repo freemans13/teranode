@@ -736,3 +736,144 @@ func setupSubtreeProcessorForBenchB(b *testing.B, itemsPerSubtree int) (*Subtree
 
 	return stp, cleanup
 }
+
+// BenchmarkDuplicateDetectionComparison compares performance with duplicate detection enabled vs disabled
+// This benchmark runs both configurations automatically for direct comparison
+func BenchmarkDuplicateDetectionComparison(b *testing.B) {
+	testCases := []struct {
+		name            string
+		itemsPerSubtree int
+	}{
+		{name: "1M_per_subtree", itemsPerSubtree: 1024 * 1024}, // 1,048,576
+	}
+
+	for _, tc := range testCases {
+		// Test with duplicate detection DISABLED
+		b.Run(tc.name+"/disabled", func(b *testing.B) {
+			t := &testing.T{}
+			settings := test.CreateBaseTestSettings(t)
+			settings.BlockAssembly.InitialMerkleItemsPerSubtree = tc.itemsPerSubtree
+			settings.BlockAssembly.UseDynamicSubtreeSize = false
+			settings.BlockAssembly.EnableTransactionMapDuplicateDetection = false
+
+			newSubtreeChan := make(chan NewSubtreeRequest, 1000)
+			done := make(chan struct{})
+
+			go func() {
+				for {
+					select {
+					case req := <-newSubtreeChan:
+						if req.ErrChan != nil {
+							req.ErrChan <- nil
+						}
+					case <-done:
+						return
+					}
+				}
+			}()
+
+			subtreeStore := blob_memory.New()
+			ctx := context.Background()
+			logger := ulogger.TestLogger{}
+
+			utxoStoreURL, _ := url.Parse("sqlitememory:///test")
+			utxoStore, _ := sql.New(ctx, logger, settings, utxoStoreURL)
+
+			mockBlockchainClient := &blockchain.Mock{}
+
+			stp, err := NewSubtreeProcessor(
+				ctx,
+				ulogger.TestLogger{},
+				settings,
+				subtreeStore,
+				mockBlockchainClient,
+				utxoStore,
+				newSubtreeChan,
+			)
+			if err != nil {
+				b.Fatalf("Failed to create SubtreeProcessor: %v", err)
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				_ = stp.addNode(
+					subtreepkg.Node{Hash: benchmarkTxHashPool[i%benchmarkTxPoolSize], Fee: uint64(i), SizeInBytes: 250},
+					&subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}},
+					true,
+				)
+			}
+
+			b.StopTimer()
+			close(done)
+			subtreeCount := len(stp.chainedSubtrees)
+			b.ReportMetric(float64(subtreeCount), "subtrees")
+			b.ReportMetric(float64(tc.itemsPerSubtree), "items/subtree")
+		})
+
+		// Test with duplicate detection ENABLED
+		b.Run(tc.name+"/enabled", func(b *testing.B) {
+			t := &testing.T{}
+			settings := test.CreateBaseTestSettings(t)
+			settings.BlockAssembly.InitialMerkleItemsPerSubtree = tc.itemsPerSubtree
+			settings.BlockAssembly.UseDynamicSubtreeSize = false
+			settings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+
+			newSubtreeChan := make(chan NewSubtreeRequest, 1000)
+			done := make(chan struct{})
+
+			go func() {
+				for {
+					select {
+					case req := <-newSubtreeChan:
+						if req.ErrChan != nil {
+							req.ErrChan <- nil
+						}
+					case <-done:
+						return
+					}
+				}
+			}()
+
+			subtreeStore := blob_memory.New()
+			ctx := context.Background()
+			logger := ulogger.TestLogger{}
+
+			utxoStoreURL, _ := url.Parse("sqlitememory:///test")
+			utxoStore, _ := sql.New(ctx, logger, settings, utxoStoreURL)
+
+			mockBlockchainClient := &blockchain.Mock{}
+
+			stp, err := NewSubtreeProcessor(
+				ctx,
+				ulogger.TestLogger{},
+				settings,
+				subtreeStore,
+				mockBlockchainClient,
+				utxoStore,
+				newSubtreeChan,
+			)
+			if err != nil {
+				b.Fatalf("Failed to create SubtreeProcessor: %v", err)
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				_ = stp.addNode(
+					subtreepkg.Node{Hash: benchmarkTxHashPool[i%benchmarkTxPoolSize], Fee: uint64(i), SizeInBytes: 250},
+					&subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}},
+					true,
+				)
+			}
+
+			b.StopTimer()
+			close(done)
+			subtreeCount := len(stp.chainedSubtrees)
+			b.ReportMetric(float64(subtreeCount), "subtrees")
+			b.ReportMetric(float64(tc.itemsPerSubtree), "items/subtree")
+		})
+	}
+}

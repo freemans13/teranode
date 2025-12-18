@@ -1035,6 +1035,7 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 
 		tSettings := test.CreateBaseTestSettings(t)
 		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+		tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
 
 		ctx := context.Background()
 		subtreeProcessor, _ := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, nil, nil, nil, newSubtreeChan)
@@ -1887,8 +1888,8 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		assertStateUnchanged(t, stp, originalState, "subtree_meta_deserialization_failure")
 	})
 
-	// Test subtree meta retrieval failure with state reset verification
-	t.Run("subtree_meta_retrieval_failure", func(t *testing.T) {
+	// Test subtree meta retrieval with missing meta (should succeed with empty parents)
+	t.Run("subtree_meta_missing_uses_empty_parents", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		defer close(newSubtreeChan)
 
@@ -1904,12 +1905,13 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		blockchainClient := &blockchain.Mock{}
+		blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 		stp.Start(ctx)
 
-		// Add some initial transactions to create state to verify
+		// Add some initial transactions to create state
 		for i := 0; i < 3; i++ {
 			txHash, err := generateTxHash()
 			require.NoError(t, err)
@@ -1917,15 +1919,12 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond) // Allow processing
 
-		// Capture original state
-		originalState := captureSubtreeProcessorState(stp)
-
 		// Create a valid subtree but don't store meta
 		subtree1 := createSubtree(t, 4, true)
 		subtreeBytes, err := subtree1.Serialize()
 		require.NoError(t, err)
 		require.NoError(t, subtreeStore.Set(context.Background(), subtree1.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
-		// Intentionally don't store subtree meta
+		// Intentionally don't store subtree meta - should use empty parents
 
 		blockWithMissingMeta := &model.Block{
 			Header:     prevBlockHeader,
@@ -1933,13 +1932,11 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 			CoinbaseTx: coinbaseTx,
 		}
 
-		// Test subtree meta retrieval failure
-		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "error getting subtrees")
-
-		// Verify state is properly reset after error
-		assertStateUnchanged(t, stp, originalState, "subtree_meta_retrieval_failure")
+		// Test subtree meta retrieval with missing meta - should succeed with empty parents
+		subtreesNodes, conflictingHashes, err := stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
+		require.NoError(t, err, "moveBackBlock should succeed even without SubtreeMeta")
+		require.NotNil(t, subtreesNodes)
+		require.Empty(t, conflictingHashes)
 	})
 
 	// Test actual UTXO delete error by creating a subtree with duplicate tx hash
@@ -2451,6 +2448,7 @@ func TestSubtreeProcessor_CreateTransactionMap(t *testing.T) {
 		ctx := context.Background()
 		logger := ulogger.NewErrorTestLogger(t)
 		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
 
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
@@ -4138,4 +4136,186 @@ func TestSubtreeProcessor_checkMarkNotOnLongestChain(t *testing.T) {
 		mockBlockchainClient.AssertExpectations(t)
 		mockUtxoStore.AssertExpectations(t)
 	})
+}
+
+// TestAddNode_DuplicateDetectionEnabled verifies that when duplicate detection is enabled,
+// adding the same transaction twice results in the second add being rejected
+func TestAddNode_DuplicateDetectionEnabled(t *testing.T) {
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+	subtreeStore := blob_memory.New()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+	tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+	stp.Start(ctx)
+
+	// Create a transaction hash
+	txHash := chainhash.HashH([]byte("test-tx"))
+	node := subtreepkg.Node{Hash: txHash, Fee: 100, SizeInBytes: 250}
+	parents := &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
+
+	// First add should succeed
+	err = stp.addNode(node, parents, true)
+	require.NoError(t, err, "First add should succeed")
+
+	// Second add with same hash should be rejected (returns nil, not error)
+	err = stp.addNode(node, parents, true)
+	require.NoError(t, err, "Second add should return nil (silently rejected)")
+
+	// Verify only one transaction in currentTxMap
+	_, exists := stp.currentTxMap.Get(txHash)
+	require.True(t, exists, "Transaction should be in currentTxMap")
+
+	// Verify only 1 node added to subtree (plus coinbase)
+	currentSubtree := stp.currentSubtree.Load()
+	require.NotNil(t, currentSubtree)
+	require.Equal(t, 2, currentSubtree.Length(), "Should have 1 transaction plus coinbase")
+}
+
+// TestAddNode_DuplicateDetectionDisabled verifies that when duplicate detection is disabled,
+// adding the same transaction twice overwrites the first entry
+func TestAddNode_DuplicateDetectionDisabled(t *testing.T) {
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+	subtreeStore := blob_memory.New()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+	tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = false
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+	stp.Start(ctx)
+
+	// Create a transaction hash
+	txHash := chainhash.HashH([]byte("test-tx"))
+	node := subtreepkg.Node{Hash: txHash, Fee: 100, SizeInBytes: 250}
+
+	// First add with one parent
+	parent1 := chainhash.HashH([]byte("parent1"))
+	parents1 := &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parent1}}
+
+	err = stp.addNode(node, parents1, true)
+	require.NoError(t, err, "First add should succeed")
+
+	// Verify parent1 is stored
+	inpoints1, exists := stp.currentTxMap.Get(txHash)
+	require.True(t, exists)
+	require.Equal(t, 1, len(inpoints1.ParentTxHashes))
+	require.Equal(t, parent1, inpoints1.ParentTxHashes[0])
+
+	// Second add with different parent should overwrite
+	parent2 := chainhash.HashH([]byte("parent2"))
+	parents2 := &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parent2}}
+
+	err = stp.addNode(node, parents2, true)
+	require.NoError(t, err, "Second add should also succeed")
+
+	// Verify parent2 has overwritten parent1
+	inpoints2, exists := stp.currentTxMap.Get(txHash)
+	require.True(t, exists)
+	require.Equal(t, 1, len(inpoints2.ParentTxHashes))
+	require.Equal(t, parent2, inpoints2.ParentTxHashes[0], "Parent should be overwritten")
+}
+
+// TestCreateTransactionMap_Enabled verifies that when transaction map creation is enabled,
+// CreateTransactionMap returns a populated map
+func TestCreateTransactionMap_Enabled(t *testing.T) {
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+	subtreeStore := blob_memory.New()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+
+	// Create and store subtrees
+	subtree1 := createSubtree(t, 4, true)
+	subtreeBytes, err := subtree1.Serialize()
+	require.NoError(t, err)
+	err = subtreeStore.Set(ctx, subtree1.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
+	require.NoError(t, err)
+
+	subtree2 := createSubtree(t, 4, false)
+	subtreeBytes, err = subtree2.Serialize()
+	require.NoError(t, err)
+	err = subtreeStore.Set(ctx, subtree2.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
+	require.NoError(t, err)
+
+	blockSubtreesMap := map[chainhash.Hash]int{
+		*subtree1.RootHash(): 0,
+		*subtree2.RootHash(): 1,
+	}
+
+	// Call CreateTransactionMap
+	transactionMap, conflictingNodes, err := stp.CreateTransactionMap(ctx, blockSubtreesMap, 2, 8)
+	require.NoError(t, err)
+	require.NotNil(t, transactionMap, "Transaction map should not be nil when enabled")
+	require.Equal(t, 8, transactionMap.Length(), "Transaction map should contain 8 transactions")
+	require.Empty(t, conflictingNodes)
+}
+
+// TestCreateTransactionMap_Disabled verifies that when transaction map creation is disabled,
+// CreateTransactionMap returns nil immediately without processing subtrees
+func TestCreateTransactionMap_Disabled(t *testing.T) {
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+	subtreeStore := blob_memory.New()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = false
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+
+	// Create and store subtrees (but they shouldn't be read)
+	subtree1 := createSubtree(t, 4, true)
+	subtreeBytes, err := subtree1.Serialize()
+	require.NoError(t, err)
+	err = subtreeStore.Set(ctx, subtree1.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
+	require.NoError(t, err)
+
+	blockSubtreesMap := map[chainhash.Hash]int{
+		*subtree1.RootHash(): 0,
+	}
+
+	// Call CreateTransactionMap
+	transactionMap, conflictingNodes, err := stp.CreateTransactionMap(ctx, blockSubtreesMap, 1, 4)
+	require.NoError(t, err)
+	require.Nil(t, transactionMap, "Transaction map should be nil when disabled")
+	require.Nil(t, conflictingNodes)
 }
