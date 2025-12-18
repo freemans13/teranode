@@ -1934,11 +1934,53 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 			CoinbaseTx: coinbaseTx,
 		}
 
-		// Test subtree meta retrieval with missing meta - should succeed with empty parents
+		// Test subtree meta retrieval with missing meta - should succeed with nil parents when toggle disabled
 		subtreesNodes, conflictingHashes, err := stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
-		require.NoError(t, err, "moveBackBlock should succeed even without SubtreeMeta")
+		require.NoError(t, err, "moveBackBlock should succeed even without SubtreeMeta when defensive checks disabled")
 		require.NotNil(t, subtreesNodes)
 		require.Empty(t, conflictingHashes)
+	})
+
+	// Test that missing SubtreeMeta causes error when defensive checks are ENABLED
+	t.Run("subtree_meta_missing_with_defensive_checks_enabled", func(t *testing.T) {
+		newSubtreeChan := make(chan NewSubtreeRequest)
+		defer close(newSubtreeChan)
+
+		subtreeStore := blob_memory.New()
+		ctx := context.Background()
+		logger := ulogger.NewErrorTestLogger(t)
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = true // Defensive checks ENABLED
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+
+		blockchainClient := &blockchain.Mock{}
+
+		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+		stp.Start(ctx)
+
+		// Create a valid subtree but don't store meta
+		subtree1 := createSubtree(t, 4, true)
+		subtreeBytes, err := subtree1.Serialize()
+		require.NoError(t, err)
+		require.NoError(t, subtreeStore.Set(context.Background(), subtree1.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
+		// Intentionally don't store subtree meta
+
+		blockWithMissingMeta := &model.Block{
+			Header:     prevBlockHeader,
+			Subtrees:   []*chainhash.Hash{subtree1.RootHash()},
+			CoinbaseTx: coinbaseTx,
+		}
+
+		// When defensive checks enabled, missing SubtreeMeta should ERROR
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
+		require.Error(t, err, "moveBackBlock should fail when SubtreeMeta missing and defensive checks enabled")
+		assert.Contains(t, err.Error(), "error getting subtree meta")
 	})
 
 	// Test actual UTXO delete error by creating a subtree with duplicate tx hash
