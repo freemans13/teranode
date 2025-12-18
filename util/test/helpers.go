@@ -36,5 +36,9 @@ func CreateBaseTestSettings(t TestingT) *settings.Settings {
 	tSettings.UtxoStore.BlockHeightRetentionAdjustment = 0
 	tSettings.SubtreeValidation.BlockHeightRetentionAdjustment = 0
 
+	// Enable defensive tx checks for tests by default (existing tests expect this behavior)
+	// Tests that specifically test the disabled case will override this to false
+	tSettings.BlockAssembly.DefensiveTxChecksEnabled = true
+
 	return tSettings
 }

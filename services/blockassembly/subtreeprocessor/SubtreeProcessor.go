@@ -1741,6 +1741,13 @@ func (stp *SubtreeProcessor) CheckSubtreeProcessor() error {
 
 // checkSubtreeProcessor performs a check on the subtree processor's state.
 func (stp *SubtreeProcessor) checkSubtreeProcessor(errCh chan error) {
+	// Skip validation when defensive checks are disabled (currentTxMap not used)
+	if !stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
+		stp.logger.Debugf("[SubtreeProcessor] skipping check (defensive tx checks disabled)")
+		errCh <- nil
+		return
+	}
+
 	stp.logger.Infof("[SubtreeProcessor] checking subtree processor")
 
 	// check all the transactions in the currentTxMap are in the subtrees

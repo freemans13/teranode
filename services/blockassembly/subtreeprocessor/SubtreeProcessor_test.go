@@ -446,6 +446,7 @@ func TestGetMerkleProofForCoinbase(t *testing.T) {
 		}()
 
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		settings.BlockAssembly.InitialMerkleItemsPerSubtree = 8
 
 		ctx := context.Background()
@@ -579,6 +580,7 @@ func TestMoveForwardBlock(t *testing.T) {
 	require.NoError(t, err)
 
 	settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 	settings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
 
 	blockchainClient := &blockchain.Mock{}
@@ -2254,6 +2256,7 @@ func Test_removeMap(t *testing.T) {
 	t.Run("when adding from queue", func(t *testing.T) {
 		settings := test.CreateBaseTestSettings(t)
 		settings.BlockAssembly.InitialMerkleItemsPerSubtree = 128
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 
 		newSubtreeChan := make(chan NewSubtreeRequest, 100)
 		done := make(chan struct{})
