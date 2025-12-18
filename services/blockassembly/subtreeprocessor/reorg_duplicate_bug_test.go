@@ -35,7 +35,7 @@ func setupTestSubtreeProcessor(t *testing.T) *SubtreeProcessor {
 	// Setup settings with small subtrees to trigger multiple subtrees
 	settings := test.CreateBaseTestSettings(t)
 	settings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
-	settings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+	settings.BlockAssembly.DefensiveTxChecksEnabled = true
 
 	// Setup new subtree channel
 	newSubtreeChan := make(chan NewSubtreeRequest, 10)

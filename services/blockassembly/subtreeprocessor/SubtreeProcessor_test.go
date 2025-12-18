@@ -1035,7 +1035,7 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 
 		tSettings := test.CreateBaseTestSettings(t)
 		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
-		tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = true
 
 		ctx := context.Background()
 		subtreeProcessor, _ := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, nil, nil, nil, newSubtreeChan)
@@ -1839,6 +1839,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		ctx := context.Background()
 		logger := ulogger.NewErrorTestLogger(t)
 		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = true
 
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
@@ -1847,6 +1848,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		blockchainClient := &blockchain.Mock{}
+		blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
@@ -2448,7 +2450,7 @@ func TestSubtreeProcessor_CreateTransactionMap(t *testing.T) {
 		ctx := context.Background()
 		logger := ulogger.NewErrorTestLogger(t)
 		tSettings := test.CreateBaseTestSettings(t)
-		tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = true
 
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
@@ -4148,7 +4150,7 @@ func TestAddNode_DuplicateDetectionEnabled(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
-	tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+	tSettings.BlockAssembly.DefensiveTxChecksEnabled = true
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
@@ -4193,7 +4195,7 @@ func TestAddNode_DuplicateDetectionDisabled(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
-	tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = false
+	tSettings.BlockAssembly.DefensiveTxChecksEnabled = false
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
@@ -4245,7 +4247,7 @@ func TestCreateTransactionMap_Enabled(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
-	tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+	tSettings.BlockAssembly.DefensiveTxChecksEnabled = true
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
@@ -4291,7 +4293,7 @@ func TestCreateTransactionMap_Disabled(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
-	tSettings.BlockAssembly.EnableTransactionMapDuplicateDetection = false
+	tSettings.BlockAssembly.DefensiveTxChecksEnabled = false
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)

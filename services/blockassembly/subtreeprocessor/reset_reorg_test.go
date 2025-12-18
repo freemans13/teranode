@@ -31,6 +31,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -63,6 +64,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		// Create a target block header
@@ -111,6 +113,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -152,6 +155,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -184,6 +188,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		// Create block headers for reset scenario
@@ -354,6 +359,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -627,6 +633,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -652,6 +659,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -700,6 +708,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -733,6 +742,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -778,6 +788,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -895,6 +906,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
@@ -1124,6 +1136,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
+		settings.BlockAssembly.DefensiveTxChecksEnabled = true
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}

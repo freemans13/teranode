@@ -1337,7 +1337,7 @@ func (stp *SubtreeProcessor) InitCurrentBlockHeader(blockHeader *model.BlockHead
 //   - error: Any error encountered during addition
 func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.TxInpoints, skipNotification bool) (err error) {
 	// parents can only be set to nil, when they are already in the map
-	if stp.settings.BlockAssembly.EnableTransactionMapDuplicateDetection {
+	if stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
 		// Transaction map enabled - perform duplicate detection and parent tracking
 		if parents == nil {
 			if _, ok := stp.currentTxMap.Get(node.Hash); !ok {
@@ -1675,7 +1675,7 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 				continue
 			}
 
-			if stp.settings.BlockAssembly.EnableTransactionMapDuplicateDetection {
+			if stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
 				parents, found = stp.currentTxMap.Get(node.Hash)
 				if !found {
 					// this should not happen, but if it does, we need to add the txInpoints to the currentTxMap
@@ -1691,9 +1691,8 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 				}
 			} else {
 				// When map is disabled, just add the node directly without parent tracking
-				// Use empty parents since we're not tracking them
-				emptyParents := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
-				if err = stp.addNode(node, &emptyParents, true); err != nil {
+				// Use nil parents - addNode ignores them when map is disabled
+				if err = stp.addNode(node, nil, true); err != nil {
 					return errors.NewProcessingError("error adding node to subtree", err)
 				}
 			}
@@ -2350,13 +2349,21 @@ func (stp *SubtreeProcessor) moveBackBlockCreateNewSubtrees(ctx context.Context,
 			if idx == 0 {
 				// skip the first transaction of the first subtree (coinbase)
 				for i := 1; i < len(subtreeNodes); i++ {
-					if err = stp.addNode(subtreeNodes[i], &subtreeMetaTxInpoints[idx][i], true); err != nil {
+					var parents *subtreepkg.TxInpoints
+					if subtreeMetaTxInpoints[idx] != nil {
+						parents = &subtreeMetaTxInpoints[idx][i]
+					}
+					if err = stp.addNode(subtreeNodes[i], parents, true); err != nil {
 						return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s][%s] error adding node to subtree", block.String(), subtreeHash.String(), err)
 					}
 				}
 			} else {
 				for i, node := range subtreeNodes {
-					if err = stp.addNode(node, &subtreeMetaTxInpoints[idx][i], true); err != nil {
+					var parents *subtreepkg.TxInpoints
+					if subtreeMetaTxInpoints[idx] != nil {
+						parents = &subtreeMetaTxInpoints[idx][i]
+					}
+					if err = stp.addNode(node, parents, true); err != nil {
 						return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s][%s] error adding node to subtree", block.String(), subtreeHash.String(), err)
 					}
 				}
@@ -2466,28 +2473,30 @@ func (stp *SubtreeProcessor) moveBackBlockGetSubtrees(ctx context.Context, block
 				return nil
 			}
 
-			subtreeMetaReader, err := stp.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
-			if err != nil {
-				// SubtreeMeta not found - use empty parents (acceptable when transaction map is disabled)
-				stp.logger.Debugf("[moveBackBlock:GetSubtrees][%s] SubtreeMeta not found for %s, using empty parents", block.String(), subtreeHash.String())
-				subtreeMetaTxInpoints[idx] = make([]subtreepkg.TxInpoints, len(subtree.Nodes))
-				for i := range subtreeMetaTxInpoints[idx] {
-					subtreeMetaTxInpoints[idx][i] = subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
-				}
+			// Process conflicting hashes from subtree (independent of SubtreeMeta)
+			if len(subtree.ConflictingNodes) > 0 {
+				conflictingHashesMu.Lock()
+				conflictingHashes = append(conflictingHashes, subtree.ConflictingNodes...)
+				conflictingHashesMu.Unlock()
+			}
+
+			// Check if transaction map is disabled - skip reading SubtreeMeta entirely
+			if !stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
+				stp.logger.Debugf("[moveBackBlock:GetSubtrees][%s] skipping SubtreeMeta read for %s (transaction map disabled)", block.String(), subtreeHash.String())
+				subtreeMetaTxInpoints[idx] = nil
 			} else {
+				// Transaction map is enabled - SubtreeMeta must exist
+				subtreeMetaReader, err := stp.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
+				if err != nil {
+					return errors.NewServiceError("[moveBackBlock:GetSubtrees][%s] error getting subtree meta %s", block.String(), subtreeHash.String(), err)
+				}
+
 				subtreeMeta, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
 				if err != nil {
 					return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] error deserializing subtree meta", block.String(), err)
 				}
 
 				subtreeMetaTxInpoints[idx] = subtreeMeta.TxInpoints
-			}
-
-			// process conflicting hashes
-			if len(subtree.ConflictingNodes) > 0 {
-				conflictingHashesMu.Lock()
-				conflictingHashes = append(conflictingHashes, subtree.ConflictingNodes...)
-				conflictingHashesMu.Unlock()
 			}
 
 			return nil
@@ -3120,7 +3129,7 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubtreesMap map[chainhash.Hash]int,
 	totalSubtreesInBlock int, estimatedTxCount uint64) (txmap.TxMap, []chainhash.Hash, error) {
 	// Check if transaction map creation is disabled
-	if !stp.settings.BlockAssembly.EnableTransactionMapDuplicateDetection {
+	if !stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
 		stp.logger.Infof("CreateTransactionMap skipped (disabled via configuration)")
 		return nil, nil, nil
 	}

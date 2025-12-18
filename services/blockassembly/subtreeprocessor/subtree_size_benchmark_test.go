@@ -754,7 +754,7 @@ func BenchmarkDuplicateDetectionComparison(b *testing.B) {
 			settings := test.CreateBaseTestSettings(t)
 			settings.BlockAssembly.InitialMerkleItemsPerSubtree = tc.itemsPerSubtree
 			settings.BlockAssembly.UseDynamicSubtreeSize = false
-			settings.BlockAssembly.EnableTransactionMapDuplicateDetection = false
+			settings.BlockAssembly.DefensiveTxChecksEnabled = false
 
 			newSubtreeChan := make(chan NewSubtreeRequest, 1000)
 			done := make(chan struct{})
@@ -818,7 +818,7 @@ func BenchmarkDuplicateDetectionComparison(b *testing.B) {
 			settings := test.CreateBaseTestSettings(t)
 			settings.BlockAssembly.InitialMerkleItemsPerSubtree = tc.itemsPerSubtree
 			settings.BlockAssembly.UseDynamicSubtreeSize = false
-			settings.BlockAssembly.EnableTransactionMapDuplicateDetection = true
+			settings.BlockAssembly.DefensiveTxChecksEnabled = true
 
 			newSubtreeChan := make(chan NewSubtreeRequest, 1000)
 			done := make(chan struct{})
