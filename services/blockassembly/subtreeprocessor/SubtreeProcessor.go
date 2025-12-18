@@ -474,7 +474,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						// store (and announce) new incomplete subtree to other miners
 						send := NewSubtreeRequest{
 							Subtree:     incompleteSubtree,
-							ParentTxMap: stp.currentTxMap,
+							ParentTxMap: stp.getParentTxMapForRequest(),
 							ErrChan:     make(chan error),
 						}
 
@@ -631,7 +631,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 
 						send := NewSubtreeRequest{
 							Subtree:     incompleteSubtree,
-							ParentTxMap: stp.currentTxMap,
+							ParentTxMap: stp.getParentTxMapForRequest(),
 							ErrChan:     make(chan error),
 						}
 
@@ -1060,6 +1060,15 @@ func (stp *SubtreeProcessor) GetCurrentTxMap() *txmap.SyncedMap[chainhash.Hash, 
 	return stp.currentTxMap
 }
 
+// getParentTxMapForRequest returns the parent tx map to send in NewSubtreeRequest
+// Returns nil when defensive checks are disabled to skip SubtreeMeta creation
+func (stp *SubtreeProcessor) getParentTxMapForRequest() *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] {
+	if stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
+		return stp.currentTxMap
+	}
+	return nil
+}
+
 // GetRemoveMap returns the map of transactions marked for removal.
 // This map is used to track transactions that should be excluded from processing.
 //
@@ -1428,9 +1437,15 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	// Send the subtree to the newSubtreeChan, including a reference to the parent transactions map
 	errCh := make(chan error)
 
+	// Send currentTxMap only if defensive checks are enabled, otherwise nil
+	var parentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]
+	if stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
+		parentTxMap = stp.currentTxMap
+	}
+
 	stp.newSubtreeChan <- NewSubtreeRequest{
 		Subtree:          oldSubtree,
-		ParentTxMap:      stp.currentTxMap,
+		ParentTxMap:      parentTxMap,
 		SkipNotification: skipNotification,
 		ErrChan:          errCh,
 	}
@@ -2056,7 +2071,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// this will also store it by the Server in the subtree store
 	for _, subtree := range stp.chainedSubtrees {
 		errCh := make(chan error)
-		stp.newSubtreeChan <- NewSubtreeRequest{Subtree: subtree, ParentTxMap: stp.currentTxMap, ErrChan: errCh}
+		stp.newSubtreeChan <- NewSubtreeRequest{Subtree: subtree, ParentTxMap: stp.getParentTxMapForRequest(), ErrChan: errCh}
 
 		if err = <-errCh; err != nil {
 			return errors.NewProcessingError("[reorgBlocks] error sending subtree to newSubtreeChan", err)
@@ -2725,13 +2740,20 @@ func (stp *SubtreeProcessor) processOwnBlockSubtreeNodes(block *model.Block, nod
 				stp.logger.Errorf("[moveForwardBlock][%s] error removing tx from remove map: %s", block.String(), err.Error())
 			}
 		} else {
-			nodeParents, found := currentTxMap.Get(node.Hash)
-			if !found {
-				return errors.NewProcessingError("[moveForwardBlock][%s] error getting node txInpoints from currentTxMap for %s", block.String(), node.Hash.String())
-			}
+			if stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
+				nodeParents, found := currentTxMap.Get(node.Hash)
+				if !found {
+					return errors.NewProcessingError("[moveForwardBlock][%s] error getting node txInpoints from currentTxMap for %s", block.String(), node.Hash.String())
+				}
 
-			if err := stp.addNode(node, &nodeParents, skipNotification); err != nil {
-				return errors.NewProcessingError("[moveForwardBlock][%s] error adding node %s to subtree", block.String(), node.Hash.String(), err)
+				if err := stp.addNode(node, &nodeParents, skipNotification); err != nil {
+					return errors.NewProcessingError("[moveForwardBlock][%s] error adding node %s to subtree", block.String(), node.Hash.String(), err)
+				}
+			} else {
+				// When defensive checks disabled, add node without parent tracking
+				if err := stp.addNode(node, nil, skipNotification); err != nil {
+					return errors.NewProcessingError("[moveForwardBlock][%s] error adding node %s to subtree", block.String(), node.Hash.String(), err)
+				}
 			}
 		}
 	}
@@ -3110,12 +3132,17 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 	// add all found tx hashes to the final list, in order
 	for _, subtreeNodes := range remainderSubtrees {
 		for _, node := range subtreeNodes {
-			parents, ok := currentTxMap.Get(node.Hash)
-			if !ok {
-				return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", node.Hash.String())
-			}
+			if stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
+				parents, ok := currentTxMap.Get(node.Hash)
+				if !ok {
+					return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", node.Hash.String())
+				}
 
-			_ = stp.addNode(node, &parents, skipNotification)
+				_ = stp.addNode(node, &parents, skipNotification)
+			} else {
+				// When defensive checks disabled, add node without parent tracking
+				_ = stp.addNode(node, nil, skipNotification)
+			}
 		}
 	}
 
