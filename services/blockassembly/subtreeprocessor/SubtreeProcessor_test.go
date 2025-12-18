@@ -1901,6 +1901,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		ctx := context.Background()
 		logger := ulogger.NewErrorTestLogger(t)
 		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = false // Test the disabled case
 
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
@@ -1928,7 +1929,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		subtreeBytes, err := subtree1.Serialize()
 		require.NoError(t, err)
 		require.NoError(t, subtreeStore.Set(context.Background(), subtree1.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
-		// Intentionally don't store subtree meta - should use empty parents
+		// Intentionally don't store subtree meta - should use nil parents
 
 		blockWithMissingMeta := &model.Block{
 			Header:     prevBlockHeader,
