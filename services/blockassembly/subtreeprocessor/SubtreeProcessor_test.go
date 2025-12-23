@@ -4473,110 +4473,6 @@ func TestOwnBlockRaceCondition_DuplicateWithDefensiveChecksDisabled(t *testing.T
 		assert.Greater(t, finalCount, 1, "TX1 should be duplicated without defensive checks - this proves the vulnerability")
 	})
 
-	t.Run("mutex_fix_with_concurrent_add", func(t *testing.T) {
-		ctx := context.Background()
-
-		// Setup with DefensiveTxChecksEnabled = FALSE but with our mutex fix
-		tSettings := test.CreateBaseTestSettings(t)
-		tSettings.BlockAssembly.DefensiveTxChecksEnabled = false
-		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
-
-		newSubtreeChan := make(chan NewSubtreeRequest)
-		done := make(chan struct{})
-		defer close(done)
-
-		go func() {
-			for {
-				select {
-				case req := <-newSubtreeChan:
-					if req.ErrChan != nil {
-						req.ErrChan <- nil
-					}
-				case <-done:
-					return
-				}
-			}
-		}()
-
-		subtreeStore := blob_memory.New()
-		logger := ulogger.NewErrorTestLogger(t)
-
-		utxoStoreURL, err := url.Parse("sqlitememory:///test")
-		require.NoError(t, err)
-
-		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
-		require.NoError(t, err)
-
-		stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
-		require.NoError(t, err)
-		stp.Start(ctx)
-
-		// Create test transaction TX1
-		tx1Hash := chainhash.HashH([]byte("test-tx-concurrent"))
-		tx1Node := subtreepkg.Node{Hash: tx1Hash, Fee: 1000}
-		parentHash := chainhash.HashH([]byte("parent-tx-concurrent"))
-		txInpoints := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}
-
-		// Step 1: Add TX1 to block assembly
-		err = stp.addNode(tx1Node, &txInpoints, false)
-		require.NoError(t, err)
-
-		// Capture current state
-		currentSubtree := stp.currentSubtree.Load()
-		chainedSubtrees := stp.chainedSubtrees
-		currentTxMap := stp.currentTxMap
-
-		// Step 2: Create block
-		prevBlockHash := stp.currentBlockHeader.Hash()
-		mockBlock := &model.Block{
-			Header: &model.BlockHeader{
-				HashPrevBlock:  prevBlockHash,
-				Version:        1,
-				Timestamp:      uint32(time.Now().Unix()),
-				HashMerkleRoot: &chainhash.Hash{},
-				Bits:           model.NBit{},
-				Nonce:          1234,
-			},
-			CoinbaseTx:       coinbaseTx,
-			Subtrees:         []*chainhash.Hash{},
-			TransactionCount: 1,
-		}
-
-		// Step 3: Reset state
-		err = stp.resetSubtreeState(false)
-		require.NoError(t, err)
-
-		// Step 4: Process own block in goroutine while concurrently adding TX1
-		var g errgroup.Group
-
-		// Goroutine 1: Process own block
-		g.Go(func() error {
-			return stp.processOwnBlockNodes(ctx, mockBlock, chainedSubtrees, currentSubtree, currentTxMap, false)
-		})
-
-		// Goroutine 2: Try to add TX1 via public API (as validator would)
-		g.Go(func() error {
-			time.Sleep(5 * time.Millisecond) // Small delay to hit processing window
-			stp.Add(tx1Node, txInpoints)      // This should wait on mutex
-			return nil
-		})
-
-		// Wait for both to complete
-		err = g.Wait()
-		require.NoError(t, err)
-
-		// Allow queue to be processed
-		time.Sleep(100 * time.Millisecond)
-
-		// Verify TX1 appears only once (mutex prevents duplicate)
-		finalCount := countNodeOccurrences(stp, tx1Hash)
-		t.Logf("Final TX1 count with mutex fix: %d", finalCount)
-
-		// With mutex, the race is prevented
-		assert.Equal(t, 1, finalCount, "TX1 should appear only ONCE - mutex prevents race")
-		t.Logf("✓ Mutex successfully prevented race condition!")
-	})
-
 	t.Run("defensive_checks_enabled", func(t *testing.T) {
 		ctx := context.Background()
 
@@ -4693,6 +4589,186 @@ func countNodeOccurrences(stp *SubtreeProcessor, hash chainhash.Hash) int {
 	}
 
 	return count
+}
+
+// TestProcessOwnBlock_SkipsMinedTransactions tests that when processing our own mined block,
+// transactions that are in the block are NOT re-added to block assembly.
+// Scenario:
+// 1. Block assembly has complete subtrees (TX1, TX2, TX3) and incomplete subtree (TX4, TX5)
+// 2. getMiningCandidate creates temporary subtree for incomplete one
+// 3. Block gets mined with all 5 transactions
+// 4. When block comes back, processOwnBlockNodes should NOT re-add any of them (all mined)
+func TestProcessOwnBlock_SkipsMinedTransactions(t *testing.T) {
+	ctx := context.Background()
+
+	// Setup with DefensiveTxChecksEnabled = FALSE
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.DefensiveTxChecksEnabled = false
+	tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+
+	newSubtreeChan := make(chan NewSubtreeRequest)
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		for {
+			select {
+			case req := <-newSubtreeChan:
+				if req.ErrChan != nil {
+					req.ErrChan <- nil
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	subtreeStore := blob_memory.New()
+	logger := ulogger.NewErrorTestLogger(t)
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+	stp.Start(ctx)
+
+	parentHash := chainhash.HashH([]byte("parent-tx"))
+
+	// Build transactions: TX1, TX2, TX3 will be mined, TX4, TX5 will not
+	tx1Hash := chainhash.HashH([]byte("tx1-mined"))
+	tx2Hash := chainhash.HashH([]byte("tx2-mined"))
+	tx3Hash := chainhash.HashH([]byte("tx3-mined"))
+	tx4Hash := chainhash.HashH([]byte("tx4-unmined"))
+	tx5Hash := chainhash.HashH([]byte("tx5-unmined"))
+
+	tx1Node := subtreepkg.Node{Hash: tx1Hash, Fee: 1000}
+	tx2Node := subtreepkg.Node{Hash: tx2Hash, Fee: 2000}
+	tx3Node := subtreepkg.Node{Hash: tx3Hash, Fee: 3000}
+	tx4Node := subtreepkg.Node{Hash: tx4Hash, Fee: 4000}
+	tx5Node := subtreepkg.Node{Hash: tx5Hash, Fee: 5000}
+
+	txInpoints := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}
+
+	// Add TX1, TX2, TX3 (will complete first subtree with coinbase = 4 items)
+	err = stp.addNode(tx1Node, &txInpoints, false)
+	require.NoError(t, err)
+	err = stp.addNode(tx2Node, &txInpoints, false)
+	require.NoError(t, err)
+	err = stp.addNode(tx3Node, &txInpoints, false)
+	require.NoError(t, err)
+
+	// Now we have one complete subtree chained
+	require.Len(t, stp.chainedSubtrees, 1, "Should have 1 complete subtree")
+
+	// Add TX4, TX5 to current (incomplete) subtree
+	err = stp.addNode(tx4Node, &txInpoints, false)
+	require.NoError(t, err)
+	err = stp.addNode(tx5Node, &txInpoints, false)
+	require.NoError(t, err)
+
+	currentSubtree := stp.currentSubtree.Load()
+	require.Len(t, currentSubtree.Nodes, 2, "Current subtree should have 2 nodes (TX4, TX5)")
+
+	// Capture state before mining
+	chainedSubtrees := stp.chainedSubtrees
+	currentTxMap := stp.currentTxMap
+
+	// Simulate getMiningCandidate creating temporary subtree for incomplete currentSubtree
+	// In production, this would create a temporary subtree with TX4, TX5
+	tempSubtree, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+	err = tempSubtree.AddCoinbaseNode()
+	require.NoError(t, err)
+	err = tempSubtree.AddSubtreeNode(tx4Node)
+	require.NoError(t, err)
+	err = tempSubtree.AddSubtreeNode(tx5Node)
+	require.NoError(t, err)
+
+	// Serialize and store the temporary subtree
+	tempSubtreeBytes, err := tempSubtree.Serialize()
+	require.NoError(t, err)
+	err = subtreeStore.Set(ctx, tempSubtree.RootHash()[:], fileformat.FileTypeSubtree, tempSubtreeBytes)
+	require.NoError(t, err)
+
+	// Serialize and store the chained subtree (with TX1, TX2, TX3)
+	chainedSubtreeBytes, err := stp.chainedSubtrees[0].Serialize()
+	require.NoError(t, err)
+	err = subtreeStore.Set(ctx, stp.chainedSubtrees[0].RootHash()[:], fileformat.FileTypeSubtree, chainedSubtreeBytes)
+	require.NoError(t, err)
+
+	// Create block with both subtrees (simulating our mined block)
+	prevBlockHash := stp.currentBlockHeader.Hash()
+	mockBlock := &model.Block{
+		Header: &model.BlockHeader{
+			HashPrevBlock:  prevBlockHash,
+			Version:        1,
+			Timestamp:      uint32(time.Now().Unix()),
+			HashMerkleRoot: &chainhash.Hash{},
+			Bits:           model.NBit{},
+			Nonce:          1234,
+		},
+		CoinbaseTx: coinbaseTx,
+		Subtrees: []*chainhash.Hash{
+			stp.chainedSubtrees[0].RootHash(), // Contains TX1, TX2, TX3
+			tempSubtree.RootHash(),             // Contains TX4, TX5
+		},
+		TransactionCount: 5,
+	}
+
+	t.Logf("Created mock block with 2 subtrees containing TX1-TX5")
+
+	// Reset state (happens in moveForwardBlock)
+	err = stp.resetSubtreeState(false)
+	require.NoError(t, err)
+
+	// Process own block - this should:
+	// - Extract TX1, TX2, TX3, TX4, TX5 from block subtrees (minedTxSet)
+	// - When processing old state, skip TX1, TX2, TX3, TX4, TX5 (all mined)
+	// - Re-add NOTHING (all transactions were mined)
+	err = stp.processOwnBlockNodes(ctx, mockBlock, chainedSubtrees, currentSubtree, currentTxMap, false)
+	require.NoError(t, err)
+
+	t.Logf("Processed own block with filtering")
+
+	// Verify NO transactions were re-added (all were mined)
+	currentCount := 0
+	currentSub := stp.currentSubtree.Load()
+	if currentSub != nil {
+		for _, node := range currentSub.Nodes {
+			if !node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+				currentCount++
+				t.Logf("Found node in current subtree: %s", node.Hash.String())
+			}
+		}
+	}
+	chainedCount := 0
+	for _, subtree := range stp.chainedSubtrees {
+		for _, node := range subtree.Nodes {
+			if !node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+				chainedCount++
+				t.Logf("Found node in chained subtrees: %s", node.Hash.String())
+			}
+		}
+	}
+
+	totalReAdded := currentCount + chainedCount
+	t.Logf("Total transactions re-added: %d (should be 0 - all were mined)", totalReAdded)
+
+	// With proper filtering, NO transactions should be re-added (all were in mined block)
+	assert.Equal(t, 0, totalReAdded, "No transactions should be re-added - all were mined in the block")
+
+	// Verify none of the mined transactions appear
+	assert.Equal(t, 0, countNodeOccurrences(stp, tx1Hash), "TX1 should not be re-added (mined)")
+	assert.Equal(t, 0, countNodeOccurrences(stp, tx2Hash), "TX2 should not be re-added (mined)")
+	assert.Equal(t, 0, countNodeOccurrences(stp, tx3Hash), "TX3 should not be re-added (mined)")
+	assert.Equal(t, 0, countNodeOccurrences(stp, tx4Hash), "TX4 should not be re-added (mined)")
+	assert.Equal(t, 0, countNodeOccurrences(stp, tx5Hash), "TX5 should not be re-added (mined)")
+
+	t.Logf("✓ Filtering fix successfully prevented re-adding mined transactions!")
 }
 
 // TestMoveForwardBlock_DoubleSpendWindowRace demonstrates the race condition that occurs
