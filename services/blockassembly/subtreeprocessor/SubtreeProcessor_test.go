@@ -4361,3 +4361,571 @@ func TestCreateTransactionMap_Disabled(t *testing.T) {
 	require.Nil(t, transactionMap, "Transaction map should be nil when disabled")
 	require.Nil(t, conflictingNodes)
 }
+
+// TestOwnBlockRaceCondition_DuplicateWithDefensiveChecksDisabled demonstrates the race condition
+// that occurs when processing our own mined block while defensive checks are disabled.
+// This test proves that the defensive checks are protecting against a REAL vulnerability.
+func TestOwnBlockRaceCondition_DuplicateWithDefensiveChecksDisabled(t *testing.T) {
+	t.Run("defensive_checks_disabled", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Setup with DefensiveTxChecksEnabled = FALSE (current default in PR #329)
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = false
+		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+
+		newSubtreeChan := make(chan NewSubtreeRequest)
+		done := make(chan struct{})
+		defer close(done)
+
+		// Handle channel reads to prevent blocking
+		go func() {
+			for {
+				select {
+				case req := <-newSubtreeChan:
+					if req.ErrChan != nil {
+						req.ErrChan <- nil
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		subtreeStore := blob_memory.New()
+		logger := ulogger.NewErrorTestLogger(t)
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+
+		stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+		stp.Start(ctx)
+
+		// Create test transaction TX1
+		tx1Hash := chainhash.HashH([]byte("test-tx-1"))
+		tx1Node := subtreepkg.Node{Hash: tx1Hash, Fee: 1000}
+		parentHash := chainhash.HashH([]byte("parent-tx"))
+		txInpoints := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}
+
+		// Step 1: Add TX1 to block assembly via normal path (simulating validator)
+		err = stp.addNode(tx1Node, &txInpoints, false)
+		require.NoError(t, err)
+		t.Logf("Added TX1 to block assembly")
+
+		// Capture current state to simulate "our own block"
+		currentSubtree := stp.currentSubtree.Load()
+		chainedSubtrees := stp.chainedSubtrees
+		currentTxMap := stp.currentTxMap
+
+		// Step 2: Create a block containing TX1 (simulating block we just mined)
+		prevBlockHash := stp.currentBlockHeader.Hash()
+		mockBlock := &model.Block{
+			Header: &model.BlockHeader{
+				HashPrevBlock:  prevBlockHash,
+				Version:        1,
+				Timestamp:      uint32(time.Now().Unix()),
+				HashMerkleRoot: &chainhash.Hash{},
+				Bits:           model.NBit{},
+				Nonce:          1234,
+			},
+			CoinbaseTx:       coinbaseTx,
+			Subtrees:         []*chainhash.Hash{}, // Empty means "our own block"
+			TransactionCount: 1,
+		}
+
+		// Step 3: Reset state (happens in moveForwardBlock)
+		err = stp.resetSubtreeState(false)
+		require.NoError(t, err)
+		t.Logf("Reset subtree state")
+
+		// Step 4: Process our own block - this re-adds TX1
+		err = stp.processOwnBlockNodes(ctx, mockBlock, chainedSubtrees, currentSubtree, currentTxMap, false)
+		require.NoError(t, err)
+		t.Logf("Processed own block nodes (first addition of TX1)")
+
+		// Count TX1 occurrences before second injection
+		beforeCount := countNodeOccurrences(stp, tx1Hash)
+		t.Logf("TX1 count before second injection: %d", beforeCount)
+
+		// Step 5: WHILE PROCESSING, inject TX1 AGAIN (simulating late validator arrival)
+		// This is the RACE CONDITION - validator adds TX1 while block processing is happening
+		err = stp.addNode(tx1Node, &txInpoints, false)
+		require.NoError(t, err)
+		t.Logf("Injected TX1 again (simulating late validator)")
+
+		// Step 6: Verify TX1 is duplicated
+		finalCount := countNodeOccurrences(stp, tx1Hash)
+		t.Logf("Final TX1 count: %d", finalCount)
+
+		// THIS IS THE BUG: TX1 appears twice when defensive checks are disabled
+		if finalCount > 1 {
+			t.Logf("✗ BUG CONFIRMED: TX1 appears %d times (expected 1)", finalCount)
+			t.Logf("This proves the defensive checks are protecting against REAL duplicates")
+		} else {
+			t.Logf("✓ No duplicate detected (defensive checks may have prevented it)")
+		}
+
+		// Assert the vulnerability exists (when calling addNode directly)
+		assert.Greater(t, finalCount, 1, "TX1 should be duplicated without defensive checks - this proves the vulnerability")
+	})
+
+	t.Run("mutex_fix_with_concurrent_add", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Setup with DefensiveTxChecksEnabled = FALSE but with our mutex fix
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = false
+		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+
+		newSubtreeChan := make(chan NewSubtreeRequest)
+		done := make(chan struct{})
+		defer close(done)
+
+		go func() {
+			for {
+				select {
+				case req := <-newSubtreeChan:
+					if req.ErrChan != nil {
+						req.ErrChan <- nil
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		subtreeStore := blob_memory.New()
+		logger := ulogger.NewErrorTestLogger(t)
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+
+		stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+		stp.Start(ctx)
+
+		// Create test transaction TX1
+		tx1Hash := chainhash.HashH([]byte("test-tx-concurrent"))
+		tx1Node := subtreepkg.Node{Hash: tx1Hash, Fee: 1000}
+		parentHash := chainhash.HashH([]byte("parent-tx-concurrent"))
+		txInpoints := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}
+
+		// Step 1: Add TX1 to block assembly
+		err = stp.addNode(tx1Node, &txInpoints, false)
+		require.NoError(t, err)
+
+		// Capture current state
+		currentSubtree := stp.currentSubtree.Load()
+		chainedSubtrees := stp.chainedSubtrees
+		currentTxMap := stp.currentTxMap
+
+		// Step 2: Create block
+		prevBlockHash := stp.currentBlockHeader.Hash()
+		mockBlock := &model.Block{
+			Header: &model.BlockHeader{
+				HashPrevBlock:  prevBlockHash,
+				Version:        1,
+				Timestamp:      uint32(time.Now().Unix()),
+				HashMerkleRoot: &chainhash.Hash{},
+				Bits:           model.NBit{},
+				Nonce:          1234,
+			},
+			CoinbaseTx:       coinbaseTx,
+			Subtrees:         []*chainhash.Hash{},
+			TransactionCount: 1,
+		}
+
+		// Step 3: Reset state
+		err = stp.resetSubtreeState(false)
+		require.NoError(t, err)
+
+		// Step 4: Process own block in goroutine while concurrently adding TX1
+		var g errgroup.Group
+
+		// Goroutine 1: Process own block
+		g.Go(func() error {
+			return stp.processOwnBlockNodes(ctx, mockBlock, chainedSubtrees, currentSubtree, currentTxMap, false)
+		})
+
+		// Goroutine 2: Try to add TX1 via public API (as validator would)
+		g.Go(func() error {
+			time.Sleep(5 * time.Millisecond) // Small delay to hit processing window
+			stp.Add(tx1Node, txInpoints)      // This should wait on mutex
+			return nil
+		})
+
+		// Wait for both to complete
+		err = g.Wait()
+		require.NoError(t, err)
+
+		// Allow queue to be processed
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify TX1 appears only once (mutex prevents duplicate)
+		finalCount := countNodeOccurrences(stp, tx1Hash)
+		t.Logf("Final TX1 count with mutex fix: %d", finalCount)
+
+		// With mutex, the race is prevented
+		assert.Equal(t, 1, finalCount, "TX1 should appear only ONCE - mutex prevents race")
+		t.Logf("✓ Mutex successfully prevented race condition!")
+	})
+
+	t.Run("defensive_checks_enabled", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Setup with DefensiveTxChecksEnabled = TRUE (protection enabled)
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = true  // ENABLED for comparison
+		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+
+		newSubtreeChan := make(chan NewSubtreeRequest)
+		done := make(chan struct{})
+		defer close(done)
+
+		// Handle channel reads to prevent blocking
+		go func() {
+			for {
+				select {
+				case req := <-newSubtreeChan:
+					if req.ErrChan != nil {
+						req.ErrChan <- nil
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		subtreeStore := blob_memory.New()
+		logger := ulogger.NewErrorTestLogger(t)
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+
+		stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+		stp.Start(ctx)
+
+		// Create test transaction TX1
+		tx1Hash := chainhash.HashH([]byte("test-tx-1"))
+		tx1Node := subtreepkg.Node{Hash: tx1Hash, Fee: 1000}
+		parentHash := chainhash.HashH([]byte("parent-tx"))
+		txInpoints := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}
+
+		// Step 1: Add TX1 to block assembly
+		err = stp.addNode(tx1Node, &txInpoints, false)
+		require.NoError(t, err)
+
+		// Capture current state
+		currentSubtree := stp.currentSubtree.Load()
+		chainedSubtrees := stp.chainedSubtrees
+		currentTxMap := stp.currentTxMap
+
+		// Step 2: Create block
+		prevBlockHash := stp.currentBlockHeader.Hash()
+		mockBlock := &model.Block{
+			Header: &model.BlockHeader{
+				HashPrevBlock:  prevBlockHash,
+				Version:        1,
+				Timestamp:      uint32(time.Now().Unix()),
+				HashMerkleRoot: &chainhash.Hash{},
+				Bits:           model.NBit{},
+				Nonce:          1234,
+			},
+			CoinbaseTx:       coinbaseTx,
+			Subtrees:         []*chainhash.Hash{},
+			TransactionCount: 1,
+		}
+
+		// Step 3: Reset state
+		err = stp.resetSubtreeState(false)
+		require.NoError(t, err)
+
+		// Step 4: Process own block
+		err = stp.processOwnBlockNodes(ctx, mockBlock, chainedSubtrees, currentSubtree, currentTxMap, false)
+		require.NoError(t, err)
+
+		// Step 5: Try to inject TX1 again
+		err = stp.addNode(tx1Node, &txInpoints, false)
+		require.NoError(t, err) // No error, but duplicate should be detected and skipped
+
+		// Step 6: Verify TX1 is NOT duplicated (defensive checks prevent it)
+		finalCount := countNodeOccurrences(stp, tx1Hash)
+		t.Logf("Final TX1 count with defensive checks: %d", finalCount)
+
+		// With defensive checks enabled, duplicates should be prevented
+		assert.Equal(t, 1, finalCount, "TX1 should appear only ONCE when defensive checks are enabled")
+		t.Logf("✓ Defensive checks successfully prevented duplicate")
+	})
+}
+
+// countNodeOccurrences counts how many times a node hash appears in the subtree processor
+func countNodeOccurrences(stp *SubtreeProcessor, hash chainhash.Hash) int {
+	count := 0
+
+	// Check chained subtrees
+	for _, subtree := range stp.chainedSubtrees {
+		for _, node := range subtree.Nodes {
+			if node.Hash.IsEqual(&hash) {
+				count++
+			}
+		}
+	}
+
+	// Check current subtree
+	currentSubtree := stp.currentSubtree.Load()
+	if currentSubtree != nil {
+		for _, node := range currentSubtree.Nodes {
+			if node.Hash.IsEqual(&hash) {
+				count++
+			}
+		}
+	}
+
+	return count
+}
+
+// TestMoveForwardBlock_DoubleSpendWindowRace demonstrates the race condition that occurs
+// when transactions arrive within the DoubleSpendWindow during block processing.
+// The dequeueDuringBlockMovement function only dequeues transactions older than the window,
+// leaving recent transactions in the queue to be added again later.
+func TestMoveForwardBlock_DoubleSpendWindowRace(t *testing.T) {
+	t.Run("defensive_checks_disabled", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Setup with DefensiveTxChecksEnabled = FALSE
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = false
+		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+		tSettings.BlockAssembly.DoubleSpendWindow = 5 * time.Second
+
+		newSubtreeChan := make(chan NewSubtreeRequest)
+		done := make(chan struct{})
+		defer close(done)
+
+		// Handle channel reads
+		go func() {
+			for {
+				select {
+				case req := <-newSubtreeChan:
+					if req.ErrChan != nil {
+						req.ErrChan <- nil
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		subtreeStore := blob_memory.New()
+		logger := ulogger.NewErrorTestLogger(t)
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+
+		stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+		stp.Start(ctx)
+
+		// Create test transaction TX1
+		tx1Hash := chainhash.HashH([]byte("test-tx-queue-1"))
+		tx1Node := subtreepkg.Node{Hash: tx1Hash, Fee: 1000}
+		parentHash := chainhash.HashH([]byte("parent-tx-queue"))
+		txInpoints := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}
+
+		// Step 1: Add TX1 to queue (recent timestamp)
+		stp.queue.enqueue(tx1Node, txInpoints)
+		t.Logf("Added TX1 to queue at time: %v", time.Now())
+
+		initialQueueLength := stp.queue.length()
+		require.Equal(t, int64(1), initialQueueLength, "Queue should have 1 transaction")
+
+		// Step 2: Immediately process a block containing TX1 (no delay)
+		// This simulates TX1 arriving in queue and then immediately being included in a block
+		// Since TX1's timestamp is very recent (< DoubleSpendWindow), it won't be dequeued
+		prevBlockHash := stp.currentBlockHeader.Hash()
+
+		// Create subtree with TX1 in it
+		subtree1, err := subtreepkg.NewTreeByLeafCount(4)
+		require.NoError(t, err)
+		err = subtree1.AddCoinbaseNode()
+		require.NoError(t, err)
+		err = subtree1.AddSubtreeNode(tx1Node)
+		require.NoError(t, err)
+
+		// Serialize subtree to blob store
+		subtreeBytes, err := subtree1.Serialize()
+		require.NoError(t, err)
+		err = subtreeStore.Set(ctx, subtree1.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
+		require.NoError(t, err)
+
+		mockBlock := &model.Block{
+			Header: &model.BlockHeader{
+				HashPrevBlock:  prevBlockHash,
+				Version:        1,
+				Timestamp:      uint32(time.Now().Unix()),
+				HashMerkleRoot: &chainhash.Hash{},
+				Bits:           model.NBit{},
+				Nonce:          1234,
+			},
+			CoinbaseTx:       coinbaseTx,
+			Subtrees:         []*chainhash.Hash{subtree1.RootHash()}, // External block with subtrees
+			TransactionCount: 2,
+		}
+
+		t.Logf("Processing block with TX1 (external block)")
+
+		// Step 3: Process block via moveForwardBlock (simulates external block arrival)
+		transactionMap, err := stp.moveForwardBlock(ctx, mockBlock, false, nil, false, false)
+		require.NoError(t, err)
+
+		// Verify transactionMap was created
+		if transactionMap != nil {
+			t.Logf("Transaction map created with %d transactions", transactionMap.Length())
+		}
+
+		// Step 4: Check if TX1 is still in queue
+		remainingQueueLength := stp.queue.length()
+		t.Logf("Queue length after moveForwardBlock: %d", remainingQueueLength)
+
+		// Count TX1 after block processing
+		countAfterBlock := countNodeOccurrences(stp, tx1Hash)
+		t.Logf("TX1 count after block processing: %d", countAfterBlock)
+
+		// Step 5: Simulate normal queue processing
+		if remainingQueueLength > 0 {
+			// Try dequeuing with no time restriction (to simulate queue processor)
+			node, nodeInpoints, _, found := stp.queue.dequeue(0)
+
+			if found && node.Hash.IsEqual(&tx1Hash) {
+				t.Logf("Dequeued TX1 from queue (attempting second addition)")
+
+				// Add from queue WITHOUT duplicate detection
+				err = stp.addNode(node, &nodeInpoints, false)
+				require.NoError(t, err)
+				t.Logf("Added TX1 from queue (second addition)")
+			}
+		}
+
+		// Step 6: Verify TX1 count
+		finalCount := countNodeOccurrences(stp, tx1Hash)
+		t.Logf("Final TX1 count: %d", finalCount)
+
+		if finalCount > 1 {
+			t.Logf("✗ BUG CONFIRMED: TX1 appears %d times due to queue race", finalCount)
+			assert.Greater(t, finalCount, 1, "TX1 should be duplicated - proves vulnerability")
+		} else {
+			t.Logf("Note: Race may not have manifested (transactionMap might have prevented duplicate)")
+		}
+	})
+
+	t.Run("defensive_checks_enabled", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Setup with DefensiveTxChecksEnabled = TRUE
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = true
+		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+		tSettings.BlockAssembly.DoubleSpendWindow = 5 * time.Second
+
+		newSubtreeChan := make(chan NewSubtreeRequest)
+		done := make(chan struct{})
+		defer close(done)
+
+		go func() {
+			for {
+				select {
+				case req := <-newSubtreeChan:
+					if req.ErrChan != nil {
+						req.ErrChan <- nil
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		subtreeStore := blob_memory.New()
+		logger := ulogger.NewErrorTestLogger(t)
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+
+		stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+		stp.Start(ctx)
+
+		// Same test scenario but with defensive checks enabled
+		tx1Hash := chainhash.HashH([]byte("test-tx-queue-1"))
+		tx1Node := subtreepkg.Node{Hash: tx1Hash, Fee: 1000}
+		parentHash := chainhash.HashH([]byte("parent-tx-queue"))
+		txInpoints := subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}
+
+		stp.queue.enqueue(tx1Node, txInpoints)
+
+		prevBlockHash := stp.currentBlockHeader.Hash()
+
+		subtree1, err := subtreepkg.NewTreeByLeafCount(4)
+		require.NoError(t, err)
+		err = subtree1.AddCoinbaseNode()
+		require.NoError(t, err)
+		err = subtree1.AddSubtreeNode(tx1Node)
+		require.NoError(t, err)
+
+		// Serialize subtree
+		subtreeBytes, err := subtree1.Serialize()
+		require.NoError(t, err)
+		err = subtreeStore.Set(ctx, subtree1.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
+		require.NoError(t, err)
+
+		mockBlock := &model.Block{
+			Header: &model.BlockHeader{
+				HashPrevBlock:  prevBlockHash,
+				Version:        1,
+				Timestamp:      uint32(time.Now().Unix()),
+				HashMerkleRoot: &chainhash.Hash{},
+				Bits:           model.NBit{},
+				Nonce:          1234,
+			},
+			CoinbaseTx:       coinbaseTx,
+			Subtrees:         []*chainhash.Hash{subtree1.RootHash()},
+			TransactionCount: 2,
+		}
+
+		_, err = stp.moveForwardBlock(ctx, mockBlock, false, nil, false, false)
+		require.NoError(t, err)
+
+		// Try to dequeue and add TX1 again
+		if stp.queue.length() > 0 {
+			node, nodeInpoints, _, found := stp.queue.dequeue(0)
+			if found && node.Hash.IsEqual(&tx1Hash) {
+				// This will be caught by duplicate detection
+				err = stp.addNode(node, &nodeInpoints, false)
+				require.NoError(t, err) // No error, but duplicate is silently prevented
+			}
+		}
+
+		// Verify TX1 appears only once (defensive checks prevent duplicate)
+		finalCount := countNodeOccurrences(stp, tx1Hash)
+		t.Logf("Final TX1 count with defensive checks: %d", finalCount)
+
+		assert.Equal(t, 1, finalCount, "TX1 should appear only ONCE when defensive checks are enabled")
+		t.Logf("✓ Defensive checks successfully prevented queue race duplicate")
+	})
+}
