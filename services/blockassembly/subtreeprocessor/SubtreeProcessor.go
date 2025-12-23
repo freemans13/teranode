@@ -67,7 +67,8 @@ type Job struct {
 
 type NewSubtreeRequest struct {
 	Subtree          *subtreepkg.Subtree                                     // The subtree to process
-	ParentTxMap      *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] // Map of parent transactions
+	ParentTxMap      *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] // Map of parent transactions (for defensive checks if enabled)
+	ParentTxSlice    []subtreepkg.TxInpoints                                 // Slice of parent transactions (for SubtreeMeta creation, always used)
 	SkipNotification bool                                                    // Whether to skip notification to the network
 	ErrChan          chan error                                              // Channel for error reporting
 }
@@ -142,6 +143,16 @@ type RemainderTransactionParams struct {
 //   - Managing transaction conflicts
 //   - Optimizing subtree sizes based on transaction volume
 //   - Providing transaction sets for block candidates
+
+// subtreeParentsPool provides a pool for reusing large parent data slices.
+// This reduces GC pressure and allocation overhead at high transaction rates (>1M TPS).
+// Pre-allocates slices with 1M capacity to match typical subtree sizes.
+var subtreeParentsPool = sync.Pool{
+	New: func() interface{} {
+		s := make([]subtreepkg.TxInpoints, 0, 1_000_000)
+		return &s
+	},
+}
 
 type SubtreeProcessor struct {
 	// settings contains the configuration parameters for the processor
@@ -221,6 +232,10 @@ type SubtreeProcessor struct {
 
 	// queue manages the transaction processing queue
 	queue *LockFreeQueue
+
+	// currentSubtreeParents tracks parent data for current subtree (for SubtreeMeta creation)
+	// Uses slice instead of map for performance (no hashing, no locks, sequential access)
+	currentSubtreeParents []subtreepkg.TxInpoints
 
 	// currentTxMap tracks transactions currently held in the subtree processor
 	currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]
@@ -355,6 +370,10 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 
 	queue := NewLockFreeQueue()
 
+	// Get initial slice from pool for parent tracking
+	parentsPtr := subtreeParentsPool.Get().(*[]subtreepkg.TxInpoints)
+	currentSubtreeParents := (*parentsPtr)[:0] // Reset length to 0, keep pre-allocated capacity
+
 	// Calculate subtree sample size based on expected block time
 	// With ~10 min blocks, 18 samples = ~3 hours of history
 	// This provides good stability without excessive memory usage
@@ -387,6 +406,7 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 		chainedSubtreeCount:      atomic.Int32{},
 		batcher:                  NewTxIDAndFeeBatch(tSettings.BlockAssembly.SubtreeProcessorBatcherSize),
 		queue:                    queue,
+		currentSubtreeParents:    currentSubtreeParents,
 		currentTxMap:             txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints](),
 		removeMap:                txmap.NewSwissMap(0),
 		blockchainClient:         blockchainClient,
@@ -1345,12 +1365,18 @@ func (stp *SubtreeProcessor) InitCurrentBlockHeader(blockHeader *model.BlockHead
 // Returns:
 //   - error: Any error encountered during addition
 func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.TxInpoints, skipNotification bool) (err error) {
-	// Defensive transaction checks (duplicate detection, parent tracking) can be toggled via configuration
-	// Historical context: These checks were added to protect against duplicate transactions.
-	// Root cause was traced to other services (now fixed), not block assembly itself.
-	// Production data shows duplicates no longer occur - these checks are now redundant overhead.
-	// When disabled: 48.9% performance improvement with no issues observed.
-	// Toggle can be re-enabled if duplicate issues resurface.
+	// ALWAYS append to slice for SubtreeMeta creation (cheap, no locks, sequential)
+	// Slice maintains parallel array structure with subtree nodes (accessed by index)
+	if parents != nil {
+		stp.currentSubtreeParents = append(stp.currentSubtreeParents, *parents)
+	} else {
+		// Empty TxInpoints for nodes without parents (e.g., coinbase placeholder)
+		stp.currentSubtreeParents = append(stp.currentSubtreeParents, subtreepkg.TxInpoints{})
+	}
+
+	// OPTIONAL: Defensive transaction checks (duplicate detection) - expensive, configurable
+	// These checks add 48.9% overhead due to map operations, hashing, and lock contention
+	// Only needed if duplicate transaction issues occur in production
 	if stp.settings.BlockAssembly.DefensiveTxChecksEnabled {
 		// Transaction map enabled - perform duplicate detection and parent tracking
 		if parents == nil {
@@ -1446,6 +1472,7 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	stp.newSubtreeChan <- NewSubtreeRequest{
 		Subtree:          oldSubtree,
 		ParentTxMap:      parentTxMap,
+		ParentTxSlice:    stp.currentSubtreeParents,
 		SkipNotification: skipNotification,
 		ErrChan:          errCh,
 	}
@@ -1454,6 +1481,16 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	if err != nil {
 		return errors.NewProcessingError("[%s] error sending subtree to newSubtreeChan", oldSubtreeHash.String(), err)
 	}
+
+	// Return slice to pool and get fresh one for next subtree
+	// Only pool large slices (>=1M capacity) to avoid pooling small allocations
+	if cap(stp.currentSubtreeParents) >= 1_000_000 {
+		subtreeParentsPool.Put(&stp.currentSubtreeParents)
+	}
+
+	// Get new slice from pool for next subtree
+	parentsPtr := subtreeParentsPool.Get().(*[]subtreepkg.TxInpoints)
+	stp.currentSubtreeParents = (*parentsPtr)[:0] // Reset length to 0, keep capacity
 
 	// Reset the announcement timer since we just announced a complete subtree
 	if !skipNotification {
@@ -2639,6 +2676,13 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool) (err error) {
 	// Save current state
 	stp.currentTxMap = txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+
+	// Reset parent slice for new subtree - return old slice to pool if large enough
+	if cap(stp.currentSubtreeParents) >= 1_000_000 {
+		subtreeParentsPool.Put(&stp.currentSubtreeParents)
+	}
+	parentsPtr := subtreeParentsPool.Get().(*[]subtreepkg.TxInpoints)
+	stp.currentSubtreeParents = (*parentsPtr)[:0] // Reset length to 0, keep capacity
 
 	subtreeSize := stp.currentItemsPerFile
 	if !createProperlySizedSubtrees {

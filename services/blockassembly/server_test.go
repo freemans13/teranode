@@ -10,7 +10,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
@@ -28,14 +27,14 @@ import (
 
 func Test_storeSubtree(t *testing.T) {
 	t.Run("Test storeSubtree", func(t *testing.T) {
-		server, subtreeStore, subtree, txMap := setup(t)
+		server, subtreeStore, subtree, parentSlice := setup(t)
 
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1_000)
 
 		require.NoError(t, server.storeSubtree(t.Context(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:       subtree,
+			ParentTxSlice: parentSlice,
+			ErrChan:       nil,
 		}, subtreeRetryChan))
 
 		subtreeBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree)
@@ -70,16 +69,14 @@ func Test_storeSubtree(t *testing.T) {
 	})
 
 	t.Run("Test storeSubtree - meta missing", func(t *testing.T) {
-		server, subtreeStore, subtree, txMap := setup(t)
-
-		txMap.Clear()
+		server, subtreeStore, subtree, _ := setup(t)
 
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1_000)
 
 		require.NoError(t, server.storeSubtree(t.Context(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:       subtree,
+			ParentTxSlice: nil,
+			ErrChan:       nil,
 		}, subtreeRetryChan))
 
 		// check that the meta data was not stored
@@ -213,13 +210,13 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 	})
 }
 
-func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]) {
+func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, []subtreepkg.TxInpoints) {
 	s, subtreeStore := setupServer(t)
 
 	subtree, err := subtreepkg.NewTreeByLeafCount(16)
 	require.NoError(t, err)
 
-	txMap := txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+	parentSlice := make([]subtreepkg.TxInpoints, 0, 16)
 
 	previousHash := chainhash.HashH([]byte("previousHash"))
 
@@ -227,11 +224,11 @@ func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, *
 		txHash := chainhash.HashH([]byte(fmt.Sprintf("tx%d", i)))
 		_ = subtree.AddNode(txHash, i, i)
 
-		txMap.Set(txHash, subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{previousHash}, Idxs: [][]uint32{{0, 1}}})
+		parentSlice = append(parentSlice, subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{previousHash}, Idxs: [][]uint32{{0, 1}}})
 		previousHash = txHash
 	}
 
-	return s, subtreeStore, subtree, txMap
+	return s, subtreeStore, subtree, parentSlice
 }
 
 func setupServer(t *testing.T) (*BlockAssembly, *memory.Memory) {
@@ -925,12 +922,12 @@ func TestInitIntensive(t *testing.T) {
 // TestStoreSubtreeIntensive tests the storeSubtree method comprehensively
 func TestStoreSubtreeIntensive(t *testing.T) {
 	t.Run("storeSubtree with SkipNotification", func(t *testing.T) {
-		server, subtreeStore, subtree, txMap := setup(t)
+		server, subtreeStore, subtree, parentSlice := setup(t)
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
 			Subtree:          subtree,
-			ParentTxMap:      txMap,
+			ParentTxSlice:    parentSlice,
 			SkipNotification: true,
 			ErrChan:          nil,
 		}, subtreeRetryChan)
@@ -944,7 +941,7 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 	})
 
 	t.Run("storeSubtree with FSM not running", func(t *testing.T) {
-		server, _, subtree, txMap := setup(t)
+		server, _, subtree, parentSlice := setup(t)
 
 		// Mock blockchain client to return FSM not running
 		mockClient := &blockchain.Mock{}
@@ -954,9 +951,9 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:       subtree,
+			ParentTxSlice: parentSlice,
+			ErrChan:       nil,
 		}, subtreeRetryChan)
 
 		assert.NoError(t, err)
@@ -964,7 +961,7 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 	})
 
 	t.Run("storeSubtree with notification error", func(t *testing.T) {
-		server, _, subtree, txMap := setup(t)
+		server, _, subtree, parentSlice := setup(t)
 
 		// Mock blockchain client to return error on notification
 		mockClient := &blockchain.Mock{}
@@ -975,9 +972,9 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:       subtree,
+			ParentTxSlice: parentSlice,
+			ErrChan:       nil,
 		}, subtreeRetryChan)
 
 		assert.Error(t, err)
@@ -986,7 +983,7 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 	})
 
 	t.Run("storeSubtree with store already exists error", func(t *testing.T) {
-		server, subtreeStore, subtree, txMap := setup(t)
+		server, subtreeStore, subtree, parentSlice := setup(t)
 
 		// Pre-store the subtree to trigger "already exists" path
 		subtreeBytes, err := subtree.Serialize()
@@ -997,9 +994,9 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		err = server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:       subtree,
+			ParentTxSlice: parentSlice,
+			ErrChan:       nil,
 		}, subtreeRetryChan)
 
 		// Should not error - should detect existing subtree and return early
@@ -1007,15 +1004,15 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 	})
 
 	t.Run("storeSubtree handles errors gracefully", func(t *testing.T) {
-		server, _, subtree, txMap := setup(t)
+		server, _, subtree, parentSlice := setup(t)
 
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		// Test with valid scenario - this just ensures the path is covered
 		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:       subtree,
+			ParentTxSlice: parentSlice,
+			ErrChan:       nil,
 		}, subtreeRetryChan)
 
 		// Should succeed in most cases

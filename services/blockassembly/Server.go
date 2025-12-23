@@ -521,24 +521,28 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 
 	dah := ba.blockAssembler.utxoStore.GetBlockHeight() + ba.settings.GlobalBlockHeightRetention
 
-	if subtreeRequest.ParentTxMap != nil {
+	// Prefer ParentTxSlice (fast path) over ParentTxMap (slow path with defensive checks)
+	// ParentTxSlice uses direct index access - no hashing, no locks, cache-friendly
+	if subtreeRequest.ParentTxSlice != nil && len(subtreeRequest.ParentTxSlice) > 0 {
 		// create and store the subtree meta
 		subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
 		subtreeMetaMissingTxs := false
 
 		for idx, node := range subtreeRequest.Subtree.Nodes {
 			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
-				if !found {
-					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+				// Direct array access - no hash lookup needed!
+				// Nodes and parents are in same order (parallel arrays)
+				if idx < len(subtreeRequest.ParentTxSlice) {
+					txInpoints := subtreeRequest.ParentTxSlice[idx]
+					if err = subtreeMeta.SetTxInpoints(idx, txInpoints); err != nil {
+						ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
 
-					subtreeMetaMissingTxs = true
+						subtreeMetaMissingTxs = true
 
-					break
-				}
-
-				if err = subtreeMeta.SetTxInpoints(idx, txInpoints); err != nil {
-					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
+						break
+					}
+				} else {
+					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] index out of bounds for ParentTxSlice: idx=%d, len=%d", node.Hash.String(), idx, len(subtreeRequest.ParentTxSlice))
 
 					subtreeMetaMissingTxs = true
 
