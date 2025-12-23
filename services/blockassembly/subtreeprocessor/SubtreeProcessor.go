@@ -2711,19 +2711,52 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 }
 
 // processOwnBlockNodes processes nodes when this was most likely our own block
-func (stp *SubtreeProcessor) processOwnBlockNodes(_ context.Context, block *model.Block, chainedSubtrees []*subtreepkg.Subtree, currentSubtree *subtreepkg.Subtree, currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints], skipNotification bool) error {
+func (stp *SubtreeProcessor) processOwnBlockNodes(ctx context.Context, block *model.Block, chainedSubtrees []*subtreepkg.Subtree, currentSubtree *subtreepkg.Subtree, currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints], skipNotification bool) error {
+	// CRITICAL FIX: Build set of transactions that are actually IN the mined block
+	// We should NOT re-add these (they're mined!), only re-add transactions that were
+	// building but didn't make it into this block (e.g., from incomplete subtree).
+	// This prevents duplicate transactions without needing expensive defensive checks.
+	// Performance impact: Negligible - one-time set creation per own block (~1% of blocks)
+	minedTxSet := make(map[chainhash.Hash]struct{}, block.TransactionCount)
+
+	// Extract all transaction hashes from the mined block's subtrees
+	for _, subtreeHash := range block.Subtrees {
+		subtreeReader, err := stp.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+		if err != nil {
+			stp.logger.Warnf("[processOwnBlockNodes] Could not read subtree %s from block: %v", subtreeHash.String(), err)
+			continue
+		}
+
+		subtree := &subtreepkg.Subtree{}
+		if err = subtree.DeserializeFromReader(subtreeReader); err != nil {
+			_ = subtreeReader.Close()
+			stp.logger.Warnf("[processOwnBlockNodes] Could not deserialize subtree %s: %v", subtreeHash.String(), err)
+			continue
+		}
+		_ = subtreeReader.Close()
+
+		// Add all transaction hashes from this subtree to the mined set
+		for _, node := range subtree.Nodes {
+			if !node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+				minedTxSet[node.Hash] = struct{}{}
+			}
+		}
+	}
+
+	stp.logger.Debugf("[processOwnBlockNodes] Built mined tx set with %d transactions from block", len(minedTxSet))
+
 	removeMapLength := stp.removeMap.Length()
 	coinbaseID := block.CoinbaseTx.TxIDChainHash()
 
-	// Process nodes from chained subtrees
+	// Process nodes from chained subtrees, filtering out mined transactions
 	for _, subtree := range chainedSubtrees {
-		if err := stp.processOwnBlockSubtreeNodes(block, subtree.Nodes, currentTxMap, removeMapLength, nil, skipNotification); err != nil {
+		if err := stp.processOwnBlockSubtreeNodes(block, subtree.Nodes, currentTxMap, removeMapLength, nil, skipNotification, minedTxSet); err != nil {
 			return err
 		}
 	}
 
-	// Process nodes from current subtree
-	if err := stp.processOwnBlockSubtreeNodes(block, currentSubtree.Nodes, currentTxMap, removeMapLength, coinbaseID, skipNotification); err != nil {
+	// Process nodes from current subtree, filtering out mined transactions
+	if err := stp.processOwnBlockSubtreeNodes(block, currentSubtree.Nodes, currentTxMap, removeMapLength, coinbaseID, skipNotification, minedTxSet); err != nil {
 		return err
 	}
 
@@ -2731,7 +2764,7 @@ func (stp *SubtreeProcessor) processOwnBlockNodes(_ context.Context, block *mode
 }
 
 // processOwnBlockSubtreeNodes processes nodes from a subtree for our own block
-func (stp *SubtreeProcessor) processOwnBlockSubtreeNodes(block *model.Block, nodes []subtreepkg.Node, currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints], removeMapLength int, coinbaseID *chainhash.Hash, skipNotification bool) error {
+func (stp *SubtreeProcessor) processOwnBlockSubtreeNodes(block *model.Block, nodes []subtreepkg.Node, currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints], removeMapLength int, coinbaseID *chainhash.Hash, skipNotification bool, minedTxSet map[chainhash.Hash]struct{}) error {
 	for _, node := range nodes {
 		if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
 			continue
@@ -2739,6 +2772,13 @@ func (stp *SubtreeProcessor) processOwnBlockSubtreeNodes(block *model.Block, nod
 
 		// Skip coinbase if provided
 		if coinbaseID != nil && coinbaseID.Equal(node.Hash) {
+			continue
+		}
+
+		// CRITICAL FIX: Skip transactions that are in the mined block
+		// These transactions are already mined and should NOT be re-added to block assembly
+		if _, isMined := minedTxSet[node.Hash]; isMined {
+			stp.logger.Debugf("[processOwnBlockNodes] Skipping mined transaction %s", node.Hash.String())
 			continue
 		}
 

@@ -580,7 +580,7 @@ func TestMoveForwardBlock(t *testing.T) {
 	require.NoError(t, err)
 
 	settings := test.CreateBaseTestSettings(t)
-		settings.BlockAssembly.DefensiveTxChecksEnabled = true
+	settings.BlockAssembly.DefensiveTxChecksEnabled = true
 	settings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
 
 	blockchainClient := &blockchain.Mock{}
@@ -4478,7 +4478,7 @@ func TestOwnBlockRaceCondition_DuplicateWithDefensiveChecksDisabled(t *testing.T
 
 		// Setup with DefensiveTxChecksEnabled = TRUE (protection enabled)
 		tSettings := test.CreateBaseTestSettings(t)
-		tSettings.BlockAssembly.DefensiveTxChecksEnabled = true  // ENABLED for comparison
+		tSettings.BlockAssembly.DefensiveTxChecksEnabled = true // ENABLED for comparison
 		tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
 
 		newSubtreeChan := make(chan NewSubtreeRequest)
@@ -4714,7 +4714,7 @@ func TestProcessOwnBlock_SkipsMinedTransactions(t *testing.T) {
 		CoinbaseTx: coinbaseTx,
 		Subtrees: []*chainhash.Hash{
 			stp.chainedSubtrees[0].RootHash(), // Contains TX1, TX2, TX3
-			tempSubtree.RootHash(),             // Contains TX4, TX5
+			tempSubtree.RootHash(),            // Contains TX4, TX5
 		},
 		TransactionCount: 5,
 	}
@@ -4771,10 +4771,6 @@ func TestProcessOwnBlock_SkipsMinedTransactions(t *testing.T) {
 	t.Logf("✓ Filtering fix successfully prevented re-adding mined transactions!")
 }
 
-// TestMoveForwardBlock_DoubleSpendWindowRace demonstrates the race condition that occurs
-// when transactions arrive within the DoubleSpendWindow during block processing.
-// The dequeueDuringBlockMovement function only dequeues transactions older than the window,
-// leaving recent transactions in the queue to be added again later.
 func TestMoveForwardBlock_DoubleSpendWindowRace(t *testing.T) {
 	t.Run("defensive_checks_disabled", func(t *testing.T) {
 		ctx := context.Background()
