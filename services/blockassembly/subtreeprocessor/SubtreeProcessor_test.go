@@ -1378,6 +1378,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp.InitCurrentBlockHeader(blockHeader)
 
+		// Stop event loop before calling moveBackBlock directly to avoid race condition
+		stp.Stop(t.Context())
+		time.Sleep(50 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), &model.Block{
 			Header: prevBlockHeader,
 			Subtrees: []*chainhash.Hash{
@@ -1445,6 +1449,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		// Capture original state
 		originalState := captureSubtreeProcessorState(stp)
 
+		// Stop event loop before calling moveBackBlock directly to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(50 * time.Millisecond) // Wait for event loop to fully stop
+
 		// Test nil block
 		_, _, err = stp.moveBackBlock(context.Background(), nil, true)
 		require.Error(t, err)
@@ -1489,6 +1497,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test empty block processing
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
 		require.NoError(t, err)
 
@@ -1542,6 +1554,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree store error
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
@@ -1595,6 +1611,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test coinbase placeholder handling
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder, true)
 		require.NoError(t, err)
 
@@ -1639,6 +1659,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test SetBlockProcessedAt error (should not cause overall failure)
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
 		require.NoError(t, err) // Error in SetBlockProcessedAt should not fail the operation
 	})
@@ -1716,6 +1740,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test single subtree processing
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), singleSubtreeBlock, true)
 		require.NoError(t, err)
 
@@ -1824,6 +1852,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree deserialization failure
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
@@ -1884,6 +1916,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta deserialization failure
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
@@ -1914,15 +1950,15 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
 
-		// Add some initial transactions to create state
+		// Add some initial transactions to create state WITHOUT starting event loop
+		// Call addNode directly to avoid race condition with moveBackBlock
 		for i := 0; i < 3; i++ {
 			txHash, err := generateTxHash()
 			require.NoError(t, err)
-			stp.Add(subtreepkg.Node{Hash: txHash, Fee: 1}, subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}})
+			err = stp.addNode(subtreepkg.Node{Hash: txHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, false)
+			require.NoError(t, err)
 		}
-		time.Sleep(100 * time.Millisecond) // Allow processing
 
 		// Create a valid subtree but don't store meta
 		subtree1 := createSubtree(t, 4, true)
@@ -1938,6 +1974,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta retrieval with missing meta - should succeed with nil parents when toggle disabled
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		subtreesNodes, conflictingHashes, err := stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
 		require.NoError(t, err, "moveBackBlock should succeed even without SubtreeMeta when defensive checks disabled")
 		require.NotNil(t, subtreesNodes)
@@ -1981,6 +2021,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// When defensive checks enabled, missing SubtreeMeta should ERROR
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
 		require.Error(t, err, "moveBackBlock should fail when SubtreeMeta missing and defensive checks enabled")
 		assert.Contains(t, err.Error(), "error getting subtree meta")
@@ -2062,6 +2106,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// This should succeed since the UTXO exists and can be deleted
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase, true)
 		require.NoError(t, err) // This will pass, but we've tested the delete path
 
@@ -2151,6 +2199,10 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// This should succeed because addNode with skipNotification=true will handle duplicates gracefully
+		// Stop event loop to avoid race condition
+		stp.Stop(ctx)
+		time.Sleep(200 * time.Millisecond) // Wait for event loop to fully stop
+
 		_, _, err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx, true)
 		require.NoError(t, err) // addNode with skipNotification doesn't fail on duplicates
 
