@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../../../topics/architecture/img/bsvblockchain_blue_logo.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.1">
     
     
       
@@ -27,7 +27,7 @@
       
     
     
-      <link rel="stylesheet" href="../../../../assets/stylesheets/main.618322db.min.css">
+      <link rel="stylesheet" href="../../../../assets/stylesheets/main.484c7ddc.min.css">
       
       
 
@@ -6080,24 +6080,32 @@
 </li>
 <li>
 <p><strong>Update Docker Images</strong></p>
-</li>
-</ol>
 <p>Pull the latest versions of all images:</p>
-<p><div class="highlight"><pre><span></span><code>docker compose pull
+<div class="highlight"><pre><span></span><code>docker compose pull
 </code></pre></div>
-3. <strong>Stop the Current Stack</strong></p>
-<p><div class="highlight"><pre><span></span><code>docker compose down
+</li>
+<li>
+<p><strong>Stop the Current Stack</strong></p>
+<div class="highlight"><pre><span></span><code>docker compose down
 </code></pre></div>
-4. <strong>Start the Updated Stack</strong></p>
-<p><div class="highlight"><pre><span></span><code>docker compose up -d
+</li>
+<li>
+<p><strong>Start the Updated Stack</strong></p>
+<div class="highlight"><pre><span></span><code>docker compose up -d
 </code></pre></div>
-5. <strong>Verify the Update</strong></p>
+</li>
+<li>
+<p><strong>Verify the Update</strong></p>
 <p>Check that all services are running and healthy:</p>
-<p><div class="highlight"><pre><span></span><code>docker compose ps
+<div class="highlight"><pre><span></span><code>docker compose ps
 </code></pre></div>
-6. <strong>Check Logs for Any Issues</strong></p>
+</li>
+<li>
+<p><strong>Check Logs for Any Issues</strong></p>
 <div class="highlight"><pre><span></span><code>docker compose logs
 </code></pre></div>
+</li>
+</ol>
 <p><strong>Important Considerations:</strong></p>
 <ul>
 <li><strong>Data Persistence</strong>: The update process should not affect data stored in volumes (./data directory). However, it's always good practice to backup important data before updating.</li>
@@ -6181,10 +6189,10 @@
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../../assets/javascripts/workers/search.7a47a382.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../../../assets/javascripts/bundle.e71a0d61.min.js"></script>
+      <script src="../../../../assets/javascripts/bundle.79ae519e.min.js"></script>
       
         <script src="../../../../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
       
