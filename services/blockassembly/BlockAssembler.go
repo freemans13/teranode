@@ -751,6 +751,24 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions: %v", err)
 	}
 
+	// Preserve parents of unmined transactions during catchup startup
+	// This prevents the pruner from deleting parent txs before block validation processes child txs
+	// During RUNNING state, per-block preservation happens in BlockValidation after UpdateTxMinedStatus
+	fsmState, fsmErr := b.blockchainClient.GetFSMCurrentState(ctx)
+	if fsmErr != nil {
+		b.logger.Warnf("[BlockAssembler] Failed to get blockchain FSM state for parent preservation: %v", fsmErr)
+		// Continue - best effort
+	} else if fsmState != nil && *fsmState == blockchain.FSMStateCATCHINGBLOCKS {
+		b.logger.Infof("[BlockAssembler][Catchup] Block Assembly starting during catchup, preserving parents of unmined transactions")
+		_, height := b.CurrentBlock()
+		if count, preserveErr := utxo.PreserveParentsOfOldUnminedTransactions(ctx, b.utxoStore, height, b.settings, b.logger); preserveErr != nil {
+			b.logger.Errorf("[BlockAssembler][Catchup] CRITICAL: Failed to preserve parents during catchup startup: %v", preserveErr)
+			// Continue - best effort, but log as critical since this could cause validation failures
+		} else {
+			b.logger.Infof("[BlockAssembler][Catchup] Preserved parents for %d unmined transactions before catchup validation begins", count)
+		}
+	}
+
 	// Start SubtreeProcessor goroutine after loading unmined transactions to avoid race conditions
 	b.subtreeProcessor.Start(ctx)
 

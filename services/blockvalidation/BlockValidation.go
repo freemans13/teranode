@@ -927,6 +927,23 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
 	}
 
+	// Preserve parents of old unmined transactions (only during RUNNING state, not during catchup)
+	// During catchup, this is handled once at Block Assembly startup to avoid per-block overhead
+	if len(unsetMined) == 0 || !unsetMined[0] {
+		// Only preserve when setting mined (not when unsetting during invalidation)
+		fsmState, fsmErr := u.blockchainClient.GetFSMCurrentState(ctx)
+		if fsmErr != nil {
+			u.logger.Warnf("[setTxMined][%s] Failed to get blockchain FSM state for parent preservation: %v", block.Hash().String(), fsmErr)
+			// Continue - best effort
+		} else if fsmState != nil && *fsmState == blockchain.FSMStateRUNNING {
+			// Only preserve during normal operation (catchup is handled at Block Assembly startup)
+			if _, preserveErr := utxo.PreserveParentsOfOldUnminedTransactions(ctx, u.utxoStore, block.Height, u.settings, u.logger); preserveErr != nil {
+				u.logger.Errorf("[setTxMined][%s] Failed to preserve parents at height %d: %v", block.Hash().String(), block.Height, preserveErr)
+				// Continue - best effort, pruner will still run
+			}
+		}
+	}
+
 	// Clear subtrees to free memory - they're no longer needed after UpdateTxMinedStatus
 	// This prevents memory retention in the blockchain store cache if block came from there and was mutated
 	// Note: lastValidatedBlocks cache was already cleared at line 799 when we retrieved the block
