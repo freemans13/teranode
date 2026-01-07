@@ -927,8 +927,21 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
 	}
 
-	// Preserve parents of old unmined transactions (only during RUNNING state, not during catchup)
-	// During catchup, this is handled once at Block Assembly startup to avoid per-block overhead
+	// Preserve parents of old unmined transactions to protect them from pruning.
+	//
+	// When a transaction sits unmined beyond UnminedTxRetention, its parents may be fully spent
+	// and eligible for DAH pruning. We preserve those parents by setting PreserveUntil so they
+	// remain available if the child is later mined or resubmitted.
+	//
+	// FSM STATE DETERMINES WHEN TO RUN:
+	// - FSMStateRUNNING: Run on every block (normal operation, unmined pool is stable)
+	// - FSMStateCATCHINGBLOCKS: Skip (Block Assembly handles at startup as one-time batch operation)
+	//
+	// WHY DIFFERENT BEHAVIOR FOR CATCHINGBLOCKS:
+	// During catchup, child txs transition from unmined→mined rapidly. By the time we execute this
+	// code, the child's UnminedSince is already cleared (no longer in unmined query results).
+	// Block Assembly startup runs before any txs are mined, catching all unmined txs while they're
+	// still in the pool. This eliminates the timing window and is more efficient (one batch vs per-block).
 	if len(unsetMined) == 0 || !unsetMined[0] {
 		// Only preserve when setting mined (not when unsetting during invalidation)
 		fsmState, fsmErr := u.blockchainClient.GetFSMCurrentState(ctx)

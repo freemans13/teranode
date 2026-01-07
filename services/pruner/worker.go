@@ -26,17 +26,23 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 
 // prunerProcessor processes pruner requests from the pruner channel.
 // It drains the channel to get the latest height (deduplication), then performs
-// Delete-at-height (DAH) pruning.
+// Delete-at-height (DAH) pruning to remove old transaction records from storage.
 //
-// Parent preservation has been moved to Block Assembly (where unmined txs are managed):
-// - During RUNNING state: Preserved per-block in BlockValidation after UpdateTxMinedStatus
-// - During CATCHINGBLOCKS state: Preserved once at Block Assembly startup
+// PARENT PRESERVATION:
+// Parent preservation of unmined transactions is handled in Block Assembly/Validation, not here:
+// - During FSMStateRUNNING: Preserved per-block in BlockValidation after UpdateTxMinedStatus
+// - During FSMStateCATCHINGBLOCKS: Preserved once at Block Assembly startup
 //
-// Safety checks (block assembly state) are performed immediately before pruning
-// to prevent race conditions where state could change between queueing and execution.
+// This separation keeps the pruner focused on deletion while Block Assembly manages the
+// unmined transaction lifecycle (where parent preservation logically belongs).
 //
-// This goroutine ensures only one pruner operation runs at a time by processing
-// from a buffered channel (size 1).
+// SAFETY CHECKS:
+// Block assembly state is checked before pruning to ensure it's safe to proceed. This prevents
+// pruning during reorgs or other state transitions.
+//
+// DEDUPLICATION:
+// Only one pruner operation runs at a time. The channel is drained to process only the latest
+// height, which is important during catchup when multiple heights may be queued.
 func (s *Server) prunerProcessor(ctx context.Context) {
 	s.logger.Infof("Starting pruner processor")
 

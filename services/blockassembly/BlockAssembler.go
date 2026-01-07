@@ -751,9 +751,21 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions: %v", err)
 	}
 
-	// Preserve parents of unmined transactions during catchup startup
-	// This prevents the pruner from deleting parent txs before block validation processes child txs
-	// During RUNNING state, per-block preservation happens in BlockValidation after UpdateTxMinedStatus
+	// Preserve parents of unmined transactions during catchup.
+	//
+	// During catchup, unmined txs from the mempool will be marked as mined when processing blocks.
+	// Once marked mined (UnminedSince cleared), they're no longer in the unmined tx pool. If their
+	// parent txs are past retention, the pruner could delete them before block validation completes.
+	//
+	// We preserve parents at startup (while unmined pool is intact) rather than per-block to avoid
+	// overhead during catchup. This is a one-time batch operation that protects all parents before
+	// any blocks are validated.
+	//
+	// FSM STATE DETERMINES WHEN TO RUN:
+	// - FSMStateCATCHINGBLOCKS: Run once at startup (efficient batch operation)
+	// - FSMStateRUNNING: Skip (handled per-block in BlockValidation after UpdateTxMinedStatus)
+	//
+	// TIMING: Executes after loadUnminedTransactions() but before Block Validation processes blocks.
 	fsmState, fsmErr := b.blockchainClient.GetFSMCurrentState(ctx)
 	if fsmErr != nil {
 		b.logger.Warnf("[BlockAssembler] Failed to get blockchain FSM state for parent preservation: %v", fsmErr)
