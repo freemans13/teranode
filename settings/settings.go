@@ -418,6 +418,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Full/pruned node selection configuration
 			AllowPrunedNodeFallback:                   getBool("p2p_allow_pruned_node_fallback", true, alternativeContext...),
 			SyncCoordinatorPeriodicEvaluationInterval: getDuration("p2p_sync_coordinator_periodic_evaluation_interval", 30*time.Second, alternativeContext...),
+			// On-demand peer health checking (uses built-in 2s timeout)
+			HealthCheckEnabled: getBool("p2p_healthCheckEnabled", true, alternativeContext...),
 		},
 		Coinbase: CoinbaseSettings{
 			DB:                          getString("coinbaseDB", "", alternativeContext...),
