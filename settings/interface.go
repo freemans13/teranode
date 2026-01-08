@@ -467,6 +467,9 @@ type P2PSettings struct {
 
 	// This is the time we trigger a periodic evaluation in the sync coordinator
 	SyncCoordinatorPeriodicEvaluationInterval time.Duration
+
+	// On-demand HTTP health checking for peer availability
+	HealthCheckEnabled bool // Enable HTTP availability checking during peer selection (uses 2s timeout)
 }
 
 type CoinbaseSettings struct {
