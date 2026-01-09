@@ -92,7 +92,6 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 
 					return errors.NewProcessingError("[GetLegacyBlockReader] error getting subtree %s from store", subtreeHash.String(), err)
 				}
-				defer subtreeDataReader.Close()
 
 				// make sure we include the coinbase tx in the first subtree
 				if subtreeIdx == 0 && block.CoinbaseTx != nil {
