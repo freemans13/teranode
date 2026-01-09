@@ -1038,7 +1038,7 @@ func (UnimplementedBlockchainAPIServer) SetBlockMinedSet(context.Context, *SetBl
 	return nil, status.Error(codes.Unimplemented, "method SetBlockMinedSet not implemented")
 }
 func (UnimplementedBlockchainAPIServer) ClearBlockMinedSet(context.Context, *ClearBlockMinedSetRequest) (*emptypb.Empty, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ClearBlockMinedSet not implemented")
+	return nil, status.Error(codes.Unimplemented, "method ClearBlockMinedSet not implemented")
 }
 func (UnimplementedBlockchainAPIServer) GetBlocksMinedNotSet(context.Context, *emptypb.Empty) (*GetBlocksMinedNotSetResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetBlocksMinedNotSet not implemented")
