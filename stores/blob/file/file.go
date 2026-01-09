@@ -285,8 +285,8 @@ func InitSemaphores(readLimit, writeLimit int) error {
 // acquireReadPermit acquires a single read permit with a timeout.
 // This prevents goroutines from blocking indefinitely if the semaphore is full.
 func acquireReadPermit(ctx context.Context) error {
-	// Create a context with 30 second timeout
-	acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Create a context with 25 second timeout
+	acquireCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
 	if err := readSemaphore.Acquire(acquireCtx, 1); err != nil {
@@ -311,8 +311,8 @@ func releaseReadPermit() {
 // acquireWritePermit acquires a single write permit with a timeout.
 // This prevents goroutines from blocking indefinitely if the semaphore is full.
 func acquireWritePermit(ctx context.Context) error {
-	// Create a context with 30 second timeout
-	acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Create a context with 25 second timeout
+	acquireCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
 	if err := writeSemaphore.Acquire(acquireCtx, 1); err != nil {
