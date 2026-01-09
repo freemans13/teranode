@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
 	"github.com/bsv-blockchain/teranode/util/blockassemblyutil"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -144,9 +145,20 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 				if err := u.blockchainClient.ClearBlockMinedSet(ctx, header.Hash()); err != nil {
 					u.logger.Errorf("[catchup][%s] Failed to clear mined_set for block %s: %v",
 						catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), err)
+				} else {
+					// Send BlockMinedUnset notification to trigger immediate transaction status update
+					// This ensures BlockValidation processes the block immediately instead of waiting
+					// for the periodic job (which runs every 1 minute). Same pattern as InvalidateBlock RPC.
+					if err := u.blockchainClient.SendNotification(ctx, &blockchain_api.Notification{
+						Type: model.NotificationType_BlockMinedUnset,
+						Hash: header.Hash().CloneBytes(),
+					}); err != nil {
+						u.logger.Errorf("[catchup][%s] Failed to send BlockMinedUnset notification for %s: %v",
+							catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), err)
+					}
 				}
 			}
-			u.logger.Infof("[catchup][%s] Cleared mined_set on %d fork blocks",
+			u.logger.Infof("[catchup][%s] Cleared mined_set on %d fork blocks and sent notifications",
 				catchupCtx.blockUpTo.Hash().String(), len(headers))
 		}
 	}
