@@ -20,8 +20,8 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
-	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -473,9 +473,13 @@ type MockBlockchainClient struct {
 	getBestBlockHeaderCalls     int
 	getBlockByHeightCalls       int
 	waitUntilFSMTransitionCalls int
+	getBlocksNotPersistedCalls  int
 
 	// Expected calls for verification
 	expectedGetBlockByHeightHeight uint32
+
+	// Blocks to return from GetBlocksNotPersisted
+	blocksNotPersisted []*model.Block
 }
 
 func NewMockBlockchainClient() *MockBlockchainClient {
@@ -553,10 +557,10 @@ func (m *MockBlockchainClient) SetFSMTransitionWaitTime(duration time.Duration) 
 }
 
 // GetCallCounts returns the number of times methods were called
-func (m *MockBlockchainClient) GetCallCounts() (health, bestHeader, blockByHeight, fsmTransition int) {
+func (m *MockBlockchainClient) GetCallCounts() (health, bestHeader, blockByHeight, fsmTransition, getBlocksNotPersisted int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.healthCalls, m.getBestBlockHeaderCalls, m.getBlockByHeightCalls, m.waitUntilFSMTransitionCalls
+	return m.healthCalls, m.getBestBlockHeaderCalls, m.getBlockByHeightCalls, m.waitUntilFSMTransitionCalls, m.getBlocksNotPersistedCalls
 }
 
 // Health implements blockchain.ClientI
@@ -800,7 +804,22 @@ func (m *MockBlockchainClient) ReportPeerFailure(ctx context.Context, hash *chai
 	return nil
 }
 func (m *MockBlockchainClient) GetBlocksNotPersisted(ctx context.Context, limit int) ([]*model.Block, error) {
-	return nil, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getBlocksNotPersistedCalls++
+
+	if len(m.blocksNotPersisted) == 0 {
+		return []*model.Block{}, nil
+	}
+
+	// Return up to 'limit' blocks
+	if limit > len(m.blocksNotPersisted) {
+		limit = len(m.blocksNotPersisted)
+	}
+
+	result := make([]*model.Block, limit)
+	copy(result, m.blocksNotPersisted[:limit])
+	return result, nil
 }
 func (m *MockBlockchainClient) SetBlockPersistedAt(ctx context.Context, blockHash *chainhash.Hash) error {
 	return nil
@@ -1172,10 +1191,9 @@ func TestStart_BlockProcessingLoop(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	// Verify that blockchain client methods were called
-	_, bestHeaderCalls, _, fsmTransitionCalls := mockClient.GetCallCounts()
+	_, _, _, fsmTransitionCalls, getBlocksNotPersistedCalls := mockClient.GetCallCounts()
 	assert.Equal(t, 1, fsmTransitionCalls)
-	assert.GreaterOrEqual(t, bestHeaderCalls, 1) // Should have been called at least once
-	// Note: blockByHeightCalls might be 0 or 1 depending on timing of the processing loop
+	assert.GreaterOrEqual(t, getBlocksNotPersistedCalls, 1) // Should have been called at least once
 }
 
 // TestStart_BlockProcessingNoBlocks tests processing loop when no blocks need processing
@@ -1200,7 +1218,6 @@ func TestStart_BlockProcessingNoBlocks(t *testing.T) {
 	mockClient.SetBestBlockHeight(20) // Set tip but not high enough to process
 
 	server := New(ctx, logger, tSettings, nil, nil, nil, mockClient)
-
 
 	// Channel to signal when ready
 	readyCh := make(chan struct{})
@@ -1227,10 +1244,9 @@ func TestStart_BlockProcessingNoBlocks(t *testing.T) {
 	// Wait for server to stop
 	time.Sleep(10 * time.Millisecond)
 
-	// Verify that blockchain client was called but no blocks were retrieved
-	_, bestHeaderCalls, blockByHeightCalls, _ := mockClient.GetCallCounts()
-	assert.GreaterOrEqual(t, bestHeaderCalls, 1) // Should have been called
-	assert.Equal(t, 0, blockByHeightCalls)       // Should not retrieve blocks
+	// Verify that blockchain client was called
+	_, _, _, _, getBlocksNotPersistedCalls := mockClient.GetCallCounts()
+	assert.GreaterOrEqual(t, getBlocksNotPersistedCalls, 1) // Should have been called
 }
 
 // TestStart_ContextCancellation tests proper context cancellation handling
@@ -1386,8 +1402,8 @@ func TestStart_ProcessingLoopErrorHandling(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// Verify that blockchain client was called multiple times (retries)
-	_, bestHeaderCalls, _, _ := mockClient.GetCallCounts()
-	assert.GreaterOrEqual(t, bestHeaderCalls, 1)
+	_, _, _, _, getBlocksNotPersistedCalls := mockClient.GetCallCounts()
+	assert.GreaterOrEqual(t, getBlocksNotPersistedCalls, 1)
 
 	// The processing loop should handle errors and continue running until context is cancelled
 }
