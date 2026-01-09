@@ -52,6 +52,7 @@ type Settings struct {
 	Alert                        AlertSettings
 	Asset                        AssetSettings
 	Block                        BlockSettings
+	BlockPersister               BlockPersisterSettings
 	BlockAssembly                BlockAssemblySettings
 	BlockChain                   BlockChainSettings
 	BlockValidation              BlockValidationSettings
@@ -132,6 +133,7 @@ type KafkaSettings struct {
 	TLSKeyFile    string
 	// Debug logging
 	EnableDebugLogging bool
+	Scheme             string
 }
 
 type AerospikeSettings struct {
@@ -183,34 +185,25 @@ type AssetSettings struct {
 }
 
 type BlockSettings struct {
-	MinedCacheMaxMB                         int
-	PersisterStore                          *url.URL
-	PersisterHTTPListenAddress              string
-	StateFile                               string
-	CheckDuplicateTransactionsConcurrency   int
-	GetAndValidateSubtreesConcurrency       int
-	KafkaWorkers                            int
-	ValidOrderAndBlessedConcurrency         int
-	MaxSize                                 int
-	BlockStore                              *url.URL
-	FailFastValidation                      bool
-	FinalizeBlockValidationConcurrency      int
-	GetMissingTransactions                  int
-	QuorumTimeout                           time.Duration
-	BlockPersisterConcurrency               int
-	BatchMissingTransactions                bool
-	ProcessTxMetaUsingStoreBatchSize        int
-	SkipUTXODelete                          bool
-	UTXOPersisterBufferSize                 string
-	TxStore                                 *url.URL
-	UTXOPersisterDirect                     bool
-	BlockPersisterPersistAge                uint32
-	BlockPersisterPersistSleep              time.Duration
-	BlockPersisterEnableDefensiveReorgCheck bool
-	UtxoStore                               *url.URL
-	FileStoreReadConcurrency                int
-	FileStoreWriteConcurrency               int
-	FileStoreUseSystemLimits                bool
+	MinedCacheMaxMB                       int
+	CheckDuplicateTransactionsConcurrency int
+	GetAndValidateSubtreesConcurrency     int
+	KafkaWorkers                          int
+	ValidOrderAndBlessedConcurrency       int
+	MaxSize                               int
+	BlockStore                            *url.URL
+	FailFastValidation                    bool
+	FinalizeBlockValidationConcurrency    int
+	GetMissingTransactions                int
+	QuorumTimeout                         time.Duration
+	ProcessTxMetaUsingStoreBatchSize      int
+	UTXOPersisterBufferSize               string
+	TxStore                               *url.URL
+	UTXOPersisterDirect                   bool
+	UtxoStore                             *url.URL
+	FileStoreReadConcurrency              int
+	FileStoreWriteConcurrency             int
+	FileStoreUseSystemLimits              bool
 }
 
 type BlockChainSettings struct {
@@ -302,6 +295,7 @@ type BlockValidationSettings struct {
 	SecretMiningThreshold                     uint32
 	PreviousBlockHeaderCount                  uint64
 	MaxBlocksBehindBlockAssembly              int
+	PeriodicProcessingInterval                time.Duration // Interval for periodic processing of blocks with mined_set=false (default: 1 minute)
 	// Catchup configuration
 	CatchupMaxRetries            int // Maximum number of retries for catchup operations
 	CatchupIterationTimeout      int // Timeout in seconds for each catchup iteration
@@ -494,13 +488,17 @@ type CoinbaseSettings struct {
 }
 
 type PrunerSettings struct {
-	GRPCListenAddress          string
-	GRPCAddress                string
-	UTXODefensiveEnabled       bool          // Enable defensive checks before deleting UTXO transactions (verify children are mined > BlockHeightRetention blocks ago)
-	UTXODefensiveBatchReadSize int           // Batch size for reading child transactions during defensive UTXO pruning (default: 10000)
-	UTXOChunkSize              int           // Number of records to process in each chunk before batch flushing (default: 1000)
-	UTXOChunkGroupLimit        int           // Maximum parallel chunk processing during UTXO pruning (default: 10)
-	UTXOProgressLogInterval    time.Duration // Interval for logging progress during UTXO pruning (default: 30s)
+	GRPCListenAddress               string
+	GRPCAddress                     string
+	BlockAssemblyWaitTimeout        time.Duration // Maximum time to wait for Block Assembly to be in "running" state before skipping pruning (default: 10m)
+	ConnectionPoolWarningThreshold  float64       // Threshold (0.0-1.0) for connection pool utilization warnings and auto-adjustment (default: 0.7)
+	ForceIgnoreBlockPersisterHeight bool          // Force ignore block persister height and use Block notifications (default: false)
+	UTXODefensiveEnabled            bool          // Enable defensive checks before deleting UTXO transactions (verify children are mined > BlockHeightRetention blocks ago)
+	UTXODefensiveBatchReadSize      int           // Batch size for reading child transactions during defensive UTXO pruning (default: 10000)
+	UTXOChunkSize                   int           // Number of records to process in each chunk before batch flushing (default: 1000)
+	UTXOChunkGroupLimit             int           // Maximum parallel chunk processing during UTXO pruning (default: 10)
+	UTXOProgressLogInterval         time.Duration // Interval for logging progress during UTXO pruning (default: 30s)
+	UTXOPartitionQueries            int           // Number of parallel Aerospike partition queries for UTXO pruning (0 = auto-detect based on CPU cores and query-threads-limit)
 }
 
 type SubtreeValidationSettings struct {
@@ -586,4 +584,14 @@ type RPCSettings struct {
 
 type FaucetSettings struct {
 	HTTPListenAddress string
+}
+
+type BlockPersisterSettings struct {
+	Store                    *url.URL
+	HTTPListenAddress        string
+	Concurrency              int
+	BatchMissingTransactions bool
+	SkipUTXODelete           bool
+	PersistSleep             time.Duration
+	ProcessUTXOFiles         bool
 }

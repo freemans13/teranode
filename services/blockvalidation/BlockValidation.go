@@ -361,6 +361,15 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 								// push block hash to the setMinedChan
 								bv.setMinedChan <- &cHash
 							}
+
+							// Listen for BlockMinedUnset notifications (sent by InvalidateBlock RPC)
+							// This triggers immediate processing instead of waiting for periodic job
+							if notification.Type == model.NotificationType_BlockMinedUnset {
+								cHash := chainhash.Hash(notification.Hash)
+								bv.logger.Infof("[BlockValidation:setMined] received BlockMinedUnset notification: %s", cHash.String())
+								// push block hash to the setMinedChan for immediate processing
+								bv.setMinedChan <- &cHash
+							}
 						}
 					}
 				}
@@ -416,11 +425,15 @@ func (u *BlockValidation) start(ctx context.Context) error {
 		}
 	}
 
-	// start a ticker that checks every minute whether there are subtrees/mined that need to be set
+	// start a ticker that checks periodically whether there are subtrees/mined that need to be set
 	// this is a light routine for periodic cleanup and handling of invalidated blocks
 	go func() {
-		u.logger.Infof("[BlockValidation:start] starting periodic block processing goroutine")
-		ticker := time.NewTicker(1 * time.Minute)
+		interval := u.settings.BlockValidation.PeriodicProcessingInterval
+		if interval == 0 {
+			interval = 1 * time.Minute // default to 1 minute if not set
+		}
+		u.logger.Infof("[BlockValidation:start] starting periodic block processing goroutine (interval: %v)", interval)
+		ticker := time.NewTicker(interval)
 
 		for {
 			select {
@@ -912,6 +925,36 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		}
 
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
+	}
+
+	// Preserve parents of old unmined transactions to protect them from pruning.
+	//
+	// When a transaction sits unmined beyond UnminedTxRetention, its parents may be fully spent
+	// and eligible for DAH pruning. We preserve those parents by setting PreserveUntil so they
+	// remain available if the child is later mined or resubmitted.
+	//
+	// FSM STATE DETERMINES WHEN TO RUN:
+	// - FSMStateRUNNING: Run on every block (normal operation, unmined pool is stable)
+	// - FSMStateCATCHINGBLOCKS: Skip (Block Assembly handles at startup as one-time batch operation)
+	//
+	// WHY DIFFERENT BEHAVIOR FOR CATCHINGBLOCKS:
+	// During catchup, child txs transition from unmined→mined rapidly. By the time we execute this
+	// code, the child's UnminedSince is already cleared (no longer in unmined query results).
+	// Block Assembly startup runs before any txs are mined, catching all unmined txs while they're
+	// still in the pool. This eliminates the timing window and is more efficient (one batch vs per-block).
+	if len(unsetMined) == 0 || !unsetMined[0] {
+		// Only preserve when setting mined (not when unsetting during invalidation)
+		fsmState, fsmErr := u.blockchainClient.GetFSMCurrentState(ctx)
+		if fsmErr != nil {
+			u.logger.Warnf("[setTxMined][%s] Failed to get blockchain FSM state for parent preservation: %v", block.Hash().String(), fsmErr)
+			// Continue - best effort
+		} else if fsmState != nil && *fsmState == blockchain.FSMStateRUNNING {
+			// Only preserve during normal operation (catchup is handled at Block Assembly startup)
+			if _, preserveErr := utxo.PreserveParentsOfOldUnminedTransactions(ctx, u.utxoStore, block.Height, u.settings, u.logger); preserveErr != nil {
+				u.logger.Errorf("[setTxMined][%s] Failed to preserve parents at height %d: %v", block.Hash().String(), block.Height, preserveErr)
+				// Continue - best effort, pruner will still run
+			}
+		}
 	}
 
 	// Clear subtrees to free memory - they're no longer needed after UpdateTxMinedStatus
