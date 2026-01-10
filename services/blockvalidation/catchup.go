@@ -34,6 +34,7 @@ type CatchupContext struct {
 	blockUpTo               *model.Block
 	baseURL                 string
 	peerID                  string
+	availablePeers          []PeerForCatchup // Pool of peers for load distribution and retry
 	startTime               time.Time
 	commonAncestorHash      *chainhash.Hash
 	commonAncestorMeta      *model.BlockHeaderMeta
@@ -104,6 +105,23 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		baseURL:   baseURL,
 		peerID:    peerID,
 		startTime: time.Now(),
+	}
+
+	// Populate peer pool for load distribution and retry
+	numPeers := u.settings.BlockValidation.FetchNumPeers
+	if numPeers > 0 {
+		peers, err := u.selectBestPeersForCatchup(ctx, blockUpTo.Height)
+		if err != nil {
+			u.logger.Warnf("[catchup][%s] Failed to get peer pool: %v, using single peer", blockUpTo.Hash().String(), err)
+			// Continue with just the provided peer
+		} else if len(peers) > 0 {
+			// Limit to configured number of peers
+			if len(peers) > numPeers {
+				peers = peers[:numPeers]
+			}
+			catchupCtx.availablePeers = peers
+			u.logger.Infof("[catchup][%s] Populated peer pool with %d peers for load distribution", blockUpTo.Hash().String(), len(peers))
+		}
 	}
 
 	// Step 1: Acquire exclusive catchup lock

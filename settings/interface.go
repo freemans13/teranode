@@ -306,10 +306,13 @@ type BlockValidationSettings struct {
 	CircuitBreakerSuccessThreshold int // Number of consecutive successes before closing circuit
 	CircuitBreakerTimeoutSeconds   int // Timeout in seconds before transitioning from open to half-open
 	// Block fetching configuration
-	FetchLargeBatchSize     int // Large batches for maximum HTTP efficiency (default: 100, peer limit)
-	FetchNumWorkers         int // Number of worker goroutines for parallel processing (default: 16)
-	FetchBufferSize         int // Buffer size for channels (default: 50)
-	SubtreeFetchConcurrency int // Concurrent subtree fetches per block (default: 8)
+	FetchLargeBatchSize          int // DEPRECATED: No longer used with channel-based fetching (previously: 100)
+	FetchBlockWorkers            int // Number of concurrent block fetch workers (default: 10)
+	FetchNumPeers                int // Number of peers in pool for load distribution (default: 5)
+	FetchNumWorkers              int // DEPRECATED: Subtree workers now handled by block workers (previously: 16)
+	FetchBufferSize              int // Buffer size for request channel (default: 50)
+	SubtreeFetchConcurrency      int // Concurrent subtree fetches per block (default: 8)
+	SubtreeFetchTimeoutPerBlock  int // Timeout in seconds for fetching all subtrees for a single block (default: 120)
 	// Transaction extension timeout
 	ExtendTransactionTimeout time.Duration // Timeout for extending transactions (default: 120s)
 	// Concurrency limits

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -53,8 +54,6 @@ type resultItem struct {
 //   - error: If fetching fails
 func (u *Server) fetchBlocksConcurrently(ctx context.Context, catchupCtx *CatchupContext, validateBlocksChan chan *model.Block, size *atomic.Int64) error {
 	blockUpTo := catchupCtx.blockUpTo
-	baseURL := catchupCtx.baseURL
-	peerID := catchupCtx.peerID
 	blockHeaders := catchupCtx.blockHeaders
 
 	if len(blockHeaders) == 0 {
@@ -65,51 +64,37 @@ func (u *Server) fetchBlocksConcurrently(ctx context.Context, catchupCtx *Catchu
 	// Start tracing span for the entire operation
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "fetchBlocksConcurrently",
 		tracing.WithParentStat(u.stats),
-		tracing.WithDebugLogMessage(u.logger, "[catchup:fetchBlocksConcurrently][%s] starting high-performance pipeline for %d blocks from %s", blockUpTo.Hash().String(), len(blockHeaders), baseURL),
+		tracing.WithDebugLogMessage(u.logger, "[catchup:fetchBlocksConcurrently][%s] starting channel-based pipeline for %d blocks with %d workers", blockUpTo.Hash().String(), len(blockHeaders), u.settings.BlockValidation.FetchBlockWorkers),
 	)
 	defer deferFn()
 
-	// Configuration for high-performance pipeline
-	// All values come from settings with sensible defaults:
-	// - FetchLargeBatchSize (100): Blocks per HTTP request for efficiency
-	// - FetchNumWorkers (16): Parallel workers for subtree fetching
-	// - FetchBufferSize (50): Channel buffer size - keeps workers ~100-150 blocks ahead max
-	largeBatchSize := u.settings.BlockValidation.FetchLargeBatchSize
-	numWorkers := u.settings.BlockValidation.FetchNumWorkers
+	// Configuration for channel-based pipeline
+	// - FetchBlockWorkers (10): Concurrent block fetch workers
+	// - FetchNumPeers (5): Peers in pool for load distribution
+	// - FetchBufferSize (50): Channel buffer size for backpressure
 	bufferSize := u.settings.BlockValidation.FetchBufferSize
 
-	// Channels for pipeline stages
-	workQueue := make(chan workItem, bufferSize)
+	// Channel for pipeline results
 	resultQueue := make(chan resultItem, bufferSize)
 
 	// Create local error group for better error handling and cancellation
 	g, gCtx := errgroup.WithContext(ctx)
-
-	// Start worker pool for parallel subtree data fetching
-	for i := 0; i < numWorkers; i++ {
-		workerID := i
-		g.Go(func() error {
-			return u.blockWorker(gCtx, workerID, workQueue, resultQueue, peerID, baseURL, blockUpTo)
-		})
-	}
 
 	// Start ordered delivery goroutine
 	g.Go(func() error {
 		return u.orderedDelivery(gCtx, resultQueue, validateBlocksChan, len(blockHeaders), blockUpTo, size)
 	})
 
-	// Start batch fetching and work distribution
+	// Start channel-based fetching (feeder + worker pool)
 	g.Go(func() error {
-		defer close(workQueue)
-		return u.batchFetchAndDistribute(gCtx, blockHeaders, workQueue, peerID, baseURL, blockUpTo, largeBatchSize)
+		defer close(resultQueue)
+		return u.channelBasedFetchAndDistribute(gCtx, catchupCtx, resultQueue)
 	})
 
 	// Wait for all goroutines to complete
-	// Note: resultQueue is not closed explicitly; termination is orchestrated by:
-	// 1. Context cancellation propagates to all goroutines
-	// 2. orderedDelivery returns when all totalBlocks are processed or on error
-	// 3. Workers naturally terminate when workQueue is closed and drained
-	// 4. Any error in the pipeline cancels the context, stopping all producers/workers
+	// Note: resultQueue is closed explicitly by channelBasedFetchAndDistribute
+	// orderedDelivery returns when all totalBlocks are processed or on error
+	// Any error in the pipeline cancels the context, stopping all goroutines
 	return g.Wait()
 }
 
@@ -190,8 +175,11 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				return nil
 			}
 
-			// Fetch subtree data for this block
-			err := u.fetchSubtreeDataForBlock(ctx, work.block, peerID, baseURL)
+			// Fetch subtree data for this block with per-block timeout
+			blockFetchTimeout := time.Duration(u.settings.BlockValidation.SubtreeFetchTimeoutPerBlock) * time.Second
+			blockCtx, cancel := context.WithTimeout(ctx, blockFetchTimeout)
+			err := u.fetchSubtreeDataForBlock(blockCtx, work.block, peerID, baseURL)
+			cancel() // Always cancel to release resources
 			if err != nil {
 				// Send result (even if error occurred)
 				result := resultItem{
@@ -240,6 +228,10 @@ func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan result
 	nextIndex := 0
 	receivedCount := 0
 
+	// Deadlock detection: track when nextIndex last progressed
+	lastProgressTime := time.Now()
+	waitTimeout := 3 * time.Minute // If nextIndex doesn't advance for 3 minutes, it's likely deadlocked
+
 	for receivedCount < totalBlocks {
 		select {
 		case result, ok := <-resultQueue:
@@ -250,7 +242,12 @@ func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan result
 			receivedCount++
 
 			if result.err != nil {
-				return errors.NewProcessingError("[catchup:orderedDelivery][%s] worker failed for block %s", blockUpTo.Hash().String(), result.block.Hash().String(), result.err)
+				// Worker failed - get block hash from result if available, otherwise use index
+				blockInfo := "unknown"
+				if result.block != nil {
+					blockInfo = result.block.Hash().String()
+				}
+				return errors.NewProcessingError("[catchup:orderedDelivery][%s] worker failed for block %s at index %d", blockUpTo.Hash().String(), blockInfo, result.index, result.err)
 			}
 
 			// Store result for ordered delivery
@@ -265,12 +262,19 @@ func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan result
 					case validateBlocksChan <- orderedResult.block:
 						delete(results, nextIndex)
 						nextIndex++
+						lastProgressTime = time.Now() // Update progress time when nextIndex advances
 						// Note: size counter is decremented by validateBlocksOnChannel after processing
 					case <-ctx.Done():
 						return ctx.Err()
 					}
 				} else {
 					u.logger.Debugf("[catchup:orderedDelivery][%s] received result for block %s at index %d, processing later (received %d/%d)", blockUpTo.Hash().String(), result.block.Hash().String(), result.index, receivedCount, totalBlocks)
+
+					// Log progress for early blocks or every 100 blocks to help identify bottlenecks
+					if nextIndex < 10 || (nextIndex%100 == 0 && len(results) > 0) {
+						u.logger.Infof("[catchup:orderedDelivery][%s] Waiting for block index %d, have %d blocks ready (received %d/%d)",
+							blockUpTo.Hash().String(), nextIndex, len(results), receivedCount, totalBlocks)
+					}
 
 					break
 				}
@@ -280,6 +284,14 @@ func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan result
 			if nextIndex == totalBlocks {
 				u.logger.Debugf("[catchup:orderedDelivery][%s] completed ordered delivery of %d blocks", blockUpTo.Hash().String(), totalBlocks)
 				return nil
+			}
+		case <-time.After(30 * time.Second):
+			// Periodic deadlock detection check
+			if len(results) > 0 && time.Since(lastProgressTime) > waitTimeout {
+				u.logger.Errorf("[catchup:orderedDelivery][%s] DEADLOCK DETECTED: Waiting for block index %d for %v, have %d blocks ready (received %d/%d)",
+					blockUpTo.Hash().String(), nextIndex, time.Since(lastProgressTime), len(results), receivedCount, totalBlocks)
+				return errors.NewProcessingError("[catchup:orderedDelivery][%s] deadlock: no progress for %v while waiting for block index %d",
+					blockUpTo.Hash().String(), time.Since(lastProgressTime), nextIndex)
 			}
 		case <-ctx.Done():
 			return ctx.Err()
