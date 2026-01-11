@@ -1422,6 +1422,10 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	mockUtxoStore.On("BatchDecorate",
 		mock.Anything, mock.Anything, mock.Anything).
 		Return(nil).Maybe()
+	// Set up default mock for PreviousOutputsDecorate method (for prefetching)
+	mockUtxoStore.On("PreviousOutputsDecorate",
+		mock.Anything, mock.Anything).
+		Return(nil).Maybe()
 	// Set up default mock for GetBlockHeight method
 	mockUtxoStore.On("GetBlockHeight").
 		Return(uint32(100)).Maybe()

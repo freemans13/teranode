@@ -530,6 +530,7 @@ type SubtreeValidationSettings struct {
 	OrphanageMaxSize               int // Maximum number of transactions that can be stored in the orphanage
 	// Concurrency limits
 	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
+	Level0PrefetchConcurrency     int           // Concurrency limit for Level 0 parent prefetching (default: 128)
 	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)
 	TxBatchSize                   int           // Transaction batch size for CheckBlockSubtrees (0 = no batching, default: 1000000)
 	// Level algorithm optimization
