@@ -700,19 +700,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	u.logger.Infof("[processTransactionsInLevels] Processing transactions across %d levels", maxLevel+1)
 
-	// Prefetch parent output data for Level 0 transactions
-	// Level 0 transactions have NO parents in the current block, so ALL inputs require UTXO store fetches.
-	// By prefetching concurrently, all outpoints enter the UTXO store's internal batcher simultaneously,
-	// resulting in a single Aerospike BatchOperate call instead of many sequential fetches.
-	if len(txsPerLevel[0]) > 0 {
-		u.logger.Debugf("[processTransactionsInLevels] Prefetching parent data for %d Level 0 transactions", len(txsPerLevel[0]))
-		err = prefetchLevel0Parents(ctx, txsPerLevel[0], u.utxoStore, u.settings)
-		if err != nil {
-			return errors.NewProcessingError("[processTransactionsInLevels] Failed to prefetch Level 0 parent data", err)
-		}
-		u.logger.Debugf("[processTransactionsInLevels] Successfully prefetched parent data for Level 0 transactions")
-	}
-
 	validatorOptions := []validator.Option{
 		validator.WithSkipPolicyChecks(true),
 		validator.WithCreateConflicting(true),

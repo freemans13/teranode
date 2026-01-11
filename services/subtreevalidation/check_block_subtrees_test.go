@@ -1422,7 +1422,7 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	mockUtxoStore.On("BatchDecorate",
 		mock.Anything, mock.Anything, mock.Anything).
 		Return(nil).Maybe()
-	// Set up default mock for PreviousOutputsDecorate method (for prefetching)
+	// Set up default mock for PreviousOutputsDecorate method
 	mockUtxoStore.On("PreviousOutputsDecorate",
 		mock.Anything, mock.Anything).
 		Return(nil).Maybe()
