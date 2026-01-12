@@ -7,6 +7,16 @@ validation operations.
 */
 package validator
 
+import (
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+)
+
+// ParentTxMetadata holds metadata about a parent transaction needed for validation
+// This allows the validator to skip UTXO store lookups for in-block parents
+type ParentTxMetadata struct {
+	BlockHeight uint32 // The block height where this transaction was mined
+}
+
 // Options defines the configuration options for validation operations
 type Options struct {
 	// SkipUtxoCreation determines whether UTXO creation should be skipped
@@ -30,6 +40,20 @@ type Options struct {
 
 	// IgnoreLocked determines whether to ignore transactions marked as locked when spending
 	IgnoreLocked bool
+
+	// SkipUtxoStoreSpending skips spending parent UTXOs in UTXO store
+	// Used for validate-only mode (CPU-intensive validation without I/O)
+	SkipUtxoStoreSpending bool
+
+	// SkipScriptValidation skips script execution and signature verification
+	// Used for store-only mode (I/O operations without CPU-intensive validation)
+	SkipScriptValidation bool
+
+	// ParentMetadata provides pre-fetched metadata for parent transactions
+	// When provided, the validator will check this map before calling utxoStore.Get()
+	// This allows validation of Level N while Level N-1 is still storing
+	// Key: parent transaction hash, Value: metadata (block height, block IDs)
+	ParentMetadata map[chainhash.Hash]*ParentTxMetadata
 }
 
 // Option defines a function type for setting options
@@ -136,6 +160,47 @@ func WithIgnoreConflicting(ignore bool) Option {
 func WithIgnoreLocked(ignoreLocked bool) Option {
 	return func(o *Options) {
 		o.IgnoreLocked = ignoreLocked
+	}
+}
+
+// WithSkipUtxoStoreSpending creates an option to skip UTXO store spending
+// Used for validate-only mode (CPU-intensive validation without I/O operations)
+// Parameters:
+//   - skip: When true, utxoStore.Spend() will be skipped
+//
+// Returns:
+//   - Option: Function that sets the SkipUtxoStoreSpending option
+func WithSkipUtxoStoreSpending(skip bool) Option {
+	return func(o *Options) {
+		o.SkipUtxoStoreSpending = skip
+	}
+}
+
+// WithSkipScriptValidation creates an option to skip script validation
+// Used for store-only mode (I/O operations without CPU-intensive validation)
+// Parameters:
+//   - skip: When true, script execution and signature verification will be skipped
+//
+// Returns:
+//   - Option: Function that sets the SkipScriptValidation option
+func WithSkipScriptValidation(skip bool) Option {
+	return func(o *Options) {
+		o.SkipScriptValidation = skip
+	}
+}
+
+// WithParentMetadata creates an option to provide pre-fetched parent transaction metadata
+// This allows the validator to skip UTXO store lookups for in-block parents, enabling
+// validation of Level N transactions while Level N-1 is still storing to the UTXO store.
+//
+// Parameters:
+//   - metadata: Map of parent transaction hashes to their metadata (block height, block IDs)
+//
+// Returns:
+//   - Option: Function that sets the ParentMetadata option
+func WithParentMetadata(metadata map[chainhash.Hash]*ParentTxMetadata) Option {
+	return func(o *Options) {
+		o.ParentMetadata = metadata
 	}
 }
 
