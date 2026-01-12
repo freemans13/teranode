@@ -794,6 +794,12 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		validator.WithSkipUtxoStoreSpending(true), // Skip Spend during validation (storage phase does it)
 	)
 
+	// Track validation results
+	var (
+		errorsFound      atomic.Uint64
+		addedToOrphanage atomic.Uint64
+	)
+
 	// Pipeline: Store level N-1 (background) while processing level N
 	var storageGroup *errgroup.Group
 
@@ -858,8 +864,34 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 						return nil
 					}
 
-					// FAIL FAST: Return error immediately to stop processing
-					return errors.NewProcessingError("[processTransactionsInLevels] Failed to validate transaction %s at level %d", tx.TxIDChainHash().String(), level+1, err)
+					// Count error
+					errorsFound.Add(1)
+
+					// Handle missing parent transactions by adding to orphanage
+					if errors.Is(err, errors.ErrTxMissingParent) {
+						isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(vCtx, blockchain.FSMStateRUNNING)
+						if runningErr == nil && isRunning {
+							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
+							if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
+								addedToOrphanage.Add(1)
+							} else {
+								u.logger.Warnf("[processTransactionsInLevels] Failed to add transaction %s to orphanage - orphanage is full", tx.TxIDChainHash().String())
+							}
+						} else {
+							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
+						}
+					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
+						// Log truly invalid transactions
+						u.logger.Warnf("[processTransactionsInLevels] Invalid transaction detected: %s: %v", tx.TxIDChainHash().String(), err)
+
+						if errors.Is(err, errors.ErrTxInvalid) {
+							return err
+						}
+					} else {
+						u.logger.Errorf("[processTransactionsInLevels] Processing error for transaction %s: %v", tx.TxIDChainHash().String(), err)
+					}
+
+					return nil // Don't fail the entire level
 				}
 
 				u.logger.Debugf("[processTransactionsInLevels] Successfully validated transaction %s", tx.TxIDChainHash().String())
@@ -951,6 +983,10 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			return errors.NewProcessingError("[processTransactionsInLevels] Final level storage failed", err)
 		}
 		u.logger.Debugf("[processTransactionsInLevels] Final level storage complete")
+	}
+
+	if errorsFound.Load() > 0 {
+		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
 	}
 
 	u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions across %d levels", totalTxCount, maxLevel+1)
