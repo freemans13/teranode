@@ -110,7 +110,27 @@ func (m *MockValidatorClient) ValidateWithOptions(ctx context.Context, tx *bt.Tx
 		return nil, err
 	}
 
-	return m.UtxoStore.Create(context.Background(), tx, 0)
+	// If SkipUtxoCreation is true (validation-only phase), return empty metadata without storing
+	if validationOptions.SkipUtxoCreation {
+		return &meta.Data{}, nil
+	}
+
+	// Extend transaction if needed (real validator does this automatically)
+	// Only extend if transaction isn't already extended
+	if len(tx.Inputs) > 0 && tx.Inputs[0].PreviousTxScript == nil {
+		for _, input := range tx.Inputs {
+			parentHash := input.PreviousTxIDChainHash()
+			if parentHash != nil {
+				parentMeta, err := m.UtxoStore.Get(ctx, parentHash, utxo.MetaFieldsWithTx...)
+				if err == nil && parentMeta.Tx != nil && len(parentMeta.Tx.Outputs) > int(input.PreviousTxOutIndex) {
+					input.PreviousTxSatoshis = parentMeta.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
+					input.PreviousTxScript = parentMeta.Tx.Outputs[input.PreviousTxOutIndex].LockingScript
+				}
+			}
+		}
+	}
+
+	return m.UtxoStore.Create(context.Background(), tx, blockHeight)
 }
 
 // TriggerBatcher implements the batcher trigger interface for testing.

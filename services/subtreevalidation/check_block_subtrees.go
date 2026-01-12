@@ -787,24 +787,12 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	// Pre-process validation options
-	// Add skip options for validation phase (CPU only, no UTXO operations)
+	// Validation phase: Skip UTXO operations - CPU-only validation
+	// Transaction extension ALWAYS happens regardless of Skip flags (needed for storage phase)
 	validationOnlyOptions := append(validatorOptions,
-		validator.WithSkipUtxoCreation(true),
-		validator.WithSkipUtxoStoreSpending(true),
+		validator.WithSkipUtxoCreation(true),      // Skip Create during validation (storage phase does it)
+		validator.WithSkipUtxoStoreSpending(true), // Skip Spend during validation (storage phase does it)
 	)
-
-	// Storage-only options: Use validator options from caller but skip script validation
-	// This allows the validator to handle Spend/Create with proper ignore flags from validatorOpts
-	storageOnlyOptions := []validator.Option{
-		validator.WithSkipPolicyChecks(validatorOpts.SkipPolicyChecks),
-		validator.WithCreateConflicting(validatorOpts.CreateConflicting),
-		validator.WithIgnoreLocked(validatorOpts.IgnoreLocked),
-		validator.WithIgnoreConflicting(validatorOpts.IgnoreConflicting),
-		validator.WithSkipScriptValidation(true),   // Skip CPU-intensive script validation
-		validator.WithSkipUtxoCreation(false),      // DO create UTXOs
-		validator.WithSkipUtxoStoreSpending(false), // DO spend UTXOs
-		validator.WithAddTXToBlockAssembly(false),  // Don't add to block assembly during storage
-	}
 
 	// Pipeline: Store level N-1 (background) while processing level N
 	var storageGroup *errgroup.Group
@@ -905,8 +893,18 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		storageWorkers := u.settings.SubtreeValidation.SpendBatcherSize * 6
 		util.SafeSetLimit(newStorageGroup, storageWorkers)
 
-		// Process storage-only options for this level
-		processedStorageOptions := validator.ProcessOptions(storageOnlyOptions...)
+		// Build storage-phase validator options
+		// Skip script validation (already done in validation phase), but perform UTXO operations
+		storageOptions := &validator.Options{
+			SkipScriptValidation:  true,  // Skip CPU work (already done)
+			SkipUtxoCreation:      false, // DO create UTXOs
+			SkipUtxoStoreSpending: false, // DO spend parent UTXOs
+			SkipPolicyChecks:      validatorOpts.SkipPolicyChecks,
+			CreateConflicting:     validatorOpts.CreateConflicting,
+			IgnoreConflicting:     validatorOpts.IgnoreConflicting,
+			IgnoreLocked:          validatorOpts.IgnoreLocked,
+			AddTXToBlockAssembly:  false, // Don't add to block assembly (blocks already mined)
+		}
 
 		for _, mTx := range levelTxs {
 			tx := mTx.tx
@@ -915,17 +913,16 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 
 			newStorageGroup.Go(func() error {
-				// Store: Use validator with SkipScriptValidation to perform UTXO operations
-				// This leverages validator's existing logic for Spend/Create with proper ignore flags
-				_, storageErr := u.validatorClient.ValidateWithOptions(sCtx, tx, blockHeight, processedStorageOptions)
-				if storageErr != nil {
-					// Transaction already exists - not an error
-					if errors.Is(storageErr, errors.ErrTxExists) || errors.Is(storageErr, errors.ErrTxConflicting) {
-						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping storage", tx.TxIDChainHash().String())
+				// Store: Call validator with SkipScriptValidation=true to perform UTXO operations only
+				// This is consistent with main branch approach of always going through validator
+				_, storeErr := u.validatorClient.ValidateWithOptions(sCtx, tx, blockHeight, storageOptions)
+				if storeErr != nil {
+					if errors.Is(storeErr, errors.ErrTxExists) {
+						// Transaction already exists - not an error
 						return nil
 					}
 					// FAIL FAST: Return storage error immediately
-					return errors.NewProcessingError("[processTransactionsInLevels] Storage failed for tx %s at level %d", tx.TxIDChainHash().String(), level+1, storageErr)
+					return errors.NewProcessingError("[processTransactionsInLevels] Storage failed for tx %s at level %d", tx.TxIDChainHash().String(), level+1, storeErr)
 				}
 
 				return nil

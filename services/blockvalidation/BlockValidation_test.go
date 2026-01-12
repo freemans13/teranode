@@ -123,16 +123,12 @@ func newTx(random uint32, parentTxHash ...*chainhash.Hash) *bt.Tx {
 	if len(parentTxHash) > 0 {
 		tx.Inputs = []*bt.Input{{
 			PreviousTxSatoshis: uint64(random),
-			PreviousTxOutIndex: 0, // Always reference output index 0 for simplicity
+			PreviousTxOutIndex: random,
 			UnlockingScript:    bscript.NewFromBytes([]byte{}),
 		}}
 
 		_ = tx.Inputs[0].PreviousTxIDAdd(parentTxHash[0])
 	}
-
-	// Add an output at index 0 so this transaction can be a parent
-	// This is needed for the validator to extend child transactions with PreviousTxScript
-	_ = tx.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", uint64(random))
 
 	return tx
 }
@@ -343,7 +339,7 @@ func TestBlockValidationValidateBlockSmall(t *testing.T) {
 	require.NoError(t, err)
 
 	coinbase.Outputs = nil
-	_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000+300)
+	_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000)
 
 	subtreeHashes := make([]*chainhash.Hash, 0)
 	subtreeHashes = append(subtreeHashes, subtree.RootHash())
@@ -559,7 +555,7 @@ func TestBlockValidationShouldNotAllowDuplicateCoinbasePlaceholder(t *testing.T)
 	require.NoError(t, err)
 
 	coinbase.Outputs = nil
-	_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000+300)
+	_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000)
 
 	require.True(t, coinbase.IsCoinbase())
 
@@ -647,7 +643,7 @@ func TestBlockValidationShouldNotAllowDuplicateCoinbaseTx(t *testing.T) {
 	require.NoError(t, err)
 
 	coinbase.Outputs = nil
-	_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000+300)
+	_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000)
 
 	require.True(t, coinbase.IsCoinbase())
 
@@ -783,7 +779,7 @@ func TestInvalidBlockWithoutGenesisBlock(t *testing.T) {
 
 	coinbase.Outputs = nil
 
-	_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000+300)
+	_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000)
 
 	subtreeBytes, err := subtree.Serialize()
 	require.NoError(t, err)
@@ -904,7 +900,7 @@ func TestInvalidChainWithoutGenesisBlock(t *testing.T) {
 
 		coinbase.Outputs = nil
 
-		_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000+300)
+		_ = coinbase.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000)
 
 		subtreeBytes, err := subtree.Serialize()
 		require.NoError(t, err)
@@ -1200,7 +1196,7 @@ func TestBlockValidationRequestMissingTransaction(t *testing.T) {
 	}
 
 	// Create block header
-	nBits, _ := model.NewNBitFromString("2000ffff")
+	nBits, _ := model.NewNBitFromString("207fffff")
 	hashPrevBlock := chaincfg.RegressionNetParams.GenesisBlock.BlockHash()
 
 	// Calculate merkle root using coinbase and subtree

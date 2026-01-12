@@ -1429,6 +1429,15 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	mockUtxoStore.On("GetMeta",
 		mock.Anything, mock.Anything).
 		Return(&utxometa.Data{}, nil).Maybe()
+	// Set up default mock for Get method (used by mock validator to extend transactions)
+	// Return a transaction with multiple outputs to support any output index
+	parentTxForExtension := bt.NewTx()
+	for i := 0; i < 20; i++ { // Create 20 outputs to handle any test case
+		_ = parentTxForExtension.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000)
+	}
+	mockUtxoStore.On("Get",
+		mock.Anything, mock.Anything, mock.Anything).
+		Return(&utxometa.Data{Tx: parentTxForExtension, BlockHeights: []uint32{100}}, nil).Maybe()
 	// Set up default mock for Spend method
 	mockUtxoStore.On("Spend",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything).
