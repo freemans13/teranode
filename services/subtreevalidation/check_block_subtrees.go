@@ -787,35 +787,13 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
 	}
 
-	// Pre-process validation options once for all levels to reduce allocations
+	// Pre-process validation options for all levels
 	// Validation phase: Skip UTXO operations - CPU-only validation
 	// Transaction extension ALWAYS happens regardless of Skip flags (needed for storage phase)
 	validationOnlyOptions := append(validatorOptions,
 		validator.WithSkipUtxoCreate(true), // Skip Create during validation (storage phase does it)
 		validator.WithSkipUtxoSpend(true),  // Skip Spend during validation (storage phase does it)
 	)
-	// Process the base validation options once (ParentMetadata will be set per level)
-	baseValidationOptions := validator.ProcessOptions(validationOnlyOptions...)
-
-	// Pre-create storage options once for all levels to reduce allocations
-	// Build storage-phase validator options
-	// Skip validation (already done in validation phase), but perform UTXO operations
-	storageOptions := &validator.Options{
-		SkipValidation:       true,  // Skip validation work (already done)
-		SkipUtxoCreate:       false, // DO create UTXOs
-		SkipUtxoSpend:        false, // DO spend parent UTXOs
-		SkipPolicyChecks:     validatorOpts.SkipPolicyChecks,
-		CreateConflicting:    validatorOpts.CreateConflicting,
-		IgnoreConflicting:    validatorOpts.IgnoreConflicting,
-		IgnoreLocked:         validatorOpts.IgnoreLocked,
-		AddTXToBlockAssembly: false, // Don't add to block assembly (blocks already mined)
-	}
-
-	// Pre-calculate worker limits once for all levels to reduce repeated calculations
-	// CPU-bound validation workers
-	validationWorkers := u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency
-	// I/O-bound storage workers (higher multiplier for network latency tolerance)
-	storageWorkers := u.settings.SubtreeValidation.SpendBatcherSize * 6
 
 	// Track validation results
 	var (
@@ -849,23 +827,25 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			parentMap = nil //nolint:ineffassign // Intentional early GC hint
 		}
 
-		// Step 2: Set parent metadata for Level 1+ (enables pipeline overlap)
-		// Reuse base validation options, only update ParentMetadata per level
+		// Step 2: Process validation options and add parent metadata for Level 1+ (enables pipeline overlap)
+		processedValidationOptions := validator.ProcessOptions(validationOnlyOptions...)
+
+		// For Level 1+, collect metadata from Level N-1 transactions and add directly to options
 		// For Level 0, parents are external (not in this block), so no metadata to collect
 		if level > 0 {
 			parentMetadata := buildParentMetadata(txsPerLevel[level-1], blockHeight)
 			if len(parentMetadata) > 0 {
-				baseValidationOptions.ParentMetadata = parentMetadata
+				processedValidationOptions.ParentMetadata = parentMetadata
 				u.logger.Debugf("[processTransactionsInLevels] Level %d: Providing metadata for %d parent transactions from level %d", level, len(parentMetadata), level-1)
 			}
-		} else {
-			// Clear metadata for Level 0 (in case this is a subsequent batch)
-			baseValidationOptions.ParentMetadata = nil
 		}
 
 		// Step 3: Validate concurrently (CPU-intensive, can overlap with previous level storage!)
-		// Use pre-calculated CPU-based worker limit for CPU-bound validation work
+		// Use CPU-based worker limit for CPU-bound validation work
 		validationGroup, vCtx := errgroup.WithContext(ctx)
+		// CPU-bound: Use existing CheckBlockSubtreesConcurrency setting
+		// This controls CPU-intensive script execution and signature validation
+		validationWorkers := u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency
 		util.SafeSetLimit(validationGroup, validationWorkers)
 
 		for _, mTx := range levelTxs {
@@ -877,7 +857,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			validationGroup.Go(func() error {
 				// Validate: CPU only (scripts + signatures), skip Spend/Create
 				// Uses parent metadata from Level N-1, so no UTXO store lookup needed for in-block parents
-				_, err := u.blessMissingTransaction(vCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, baseValidationOptions)
+				_, err := u.blessMissingTransaction(vCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidationOptions)
 				if err != nil {
 					// TX_EXISTS is not an error - transaction was already validated
 					if errors.Is(err, errors.ErrTxExists) {
@@ -939,11 +919,26 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		}
 
 		// Step 5: Start storage for current level (runs in background)
-		// Use pre-calculated worker limit for I/O-bound storage work (Aerospike network calls)
+		// Use higher worker limit for I/O-bound storage work (Aerospike network calls)
 		newStorageGroup, sCtx := errgroup.WithContext(ctx)
+		// I/O-bound: Use higher multiplier for network latency tolerance
+		// SpendBatcherSize controls batch size; multiply by 6 for I/O concurrency
+		storageWorkers := u.settings.SubtreeValidation.SpendBatcherSize * 6
 		util.SafeSetLimit(newStorageGroup, storageWorkers)
 
-		// Use pre-created storage options (already configured with all necessary flags)
+		// Build storage-phase validator options
+		// Skip validation (already done in validation phase), but perform UTXO operations
+		storageOptions := &validator.Options{
+			SkipValidation:       true,  // Skip validation work (already done)
+			SkipUtxoCreate:       false, // DO create UTXOs
+			SkipUtxoSpend:        false, // DO spend parent UTXOs
+			SkipPolicyChecks:     validatorOpts.SkipPolicyChecks,
+			CreateConflicting:    validatorOpts.CreateConflicting,
+			IgnoreConflicting:    validatorOpts.IgnoreConflicting,
+			IgnoreLocked:         validatorOpts.IgnoreLocked,
+			AddTXToBlockAssembly: false, // Don't add to block assembly (blocks already mined)
+		}
+
 		for _, mTx := range levelTxs {
 			tx := mTx.tx
 			if tx == nil {
