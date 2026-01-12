@@ -281,13 +281,15 @@ func readBlockFromReader(block *Block, buf io.Reader) (*Block, error) {
 		return nil, errors.NewBlockInvalidError("block subtree length mismatch, expected %d, actual %d", block.subtreeLength, block.Subtrees)
 	}
 
-	coinbaseTx := new(bt.Tx)
+	var coinbaseTx bt.Tx
 	if _, err = coinbaseTx.ReadFrom(buf); err != nil {
 		return nil, errors.NewBlockInvalidError("error reading coinbase tx", err)
 	}
 
-	// Always set the coinbase tx (even if empty) to avoid nil pointer issues during validation
-	block.CoinbaseTx = coinbaseTx
+	// If the coinbaseTx is all zeros (empty), then we should not set it
+	if !coinbaseTx.TxIDChainHash().Equal(*emptyTX.TxIDChainHash()) {
+		block.CoinbaseTx = &coinbaseTx
+	}
 
 	// Read in the block height
 	blockHeight64, err := wire.ReadVarInt(buf, 0)
