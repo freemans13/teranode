@@ -949,8 +949,9 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 				// This is consistent with main branch approach of always going through validator
 				_, storeErr := u.validatorClient.ValidateWithOptions(sCtx, tx, blockHeight, storageOptions)
 				if storeErr != nil {
-					if errors.Is(storeErr, errors.ErrTxExists) {
-						// Transaction already exists - not an error
+					// These are success cases - transaction was stored
+					if errors.Is(storeErr, errors.ErrTxExists) || errors.Is(storeErr, errors.ErrTxConflicting) {
+						// Transaction already exists or was stored as conflicting - both are success
 						return nil
 					}
 					// FAIL FAST: Return storage error immediately
