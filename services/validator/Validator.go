@@ -460,7 +460,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	}
 
 	// validate the transaction scripts and signatures
-	if !validationOptions.SkipScriptValidation {
+	if !validationOptions.SkipValidation {
 		if err = v.validateTransactionScripts(ctx, tx, blockHeight, utxoHeights, validationOptions); err != nil {
 			err = errors.NewProcessingError("[Validate][%s] error validating transaction scripts", txID, err)
 			span.RecordError(err)

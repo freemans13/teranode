@@ -926,9 +926,9 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		util.SafeSetLimit(newStorageGroup, storageWorkers)
 
 		// Build storage-phase validator options
-		// Skip script validation (already done in validation phase), but perform UTXO operations
+		// Skip validation (already done in validation phase), but perform UTXO operations
 		storageOptions := &validator.Options{
-			SkipScriptValidation:  true,  // Skip CPU work (already done)
+			SkipValidation:        true,  // Skip validation work (already done)
 			SkipUtxoCreation:      false, // DO create UTXOs
 			SkipUtxoStoreSpending: false, // DO spend parent UTXOs
 			SkipPolicyChecks:      validatorOpts.SkipPolicyChecks,
@@ -945,7 +945,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 
 			newStorageGroup.Go(func() error {
-				// Store: Call validator with SkipScriptValidation=true to perform UTXO operations only
+				// Store: Call validator with SkipValidation=true to perform UTXO operations only
 				// This is consistent with main branch approach of always going through validator
 				_, storeErr := u.validatorClient.ValidateWithOptions(sCtx, tx, blockHeight, storageOptions)
 				if storeErr != nil {

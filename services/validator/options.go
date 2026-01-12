@@ -45,9 +45,9 @@ type Options struct {
 	// Used for validate-only mode (CPU-intensive validation without I/O)
 	SkipUtxoStoreSpending bool
 
-	// SkipScriptValidation skips script execution and signature verification
+	// SkipValidation skips script execution and signature verification
 	// Used for store-only mode (I/O operations without CPU-intensive validation)
-	SkipScriptValidation bool
+	SkipValidation bool
 
 	// ParentMetadata provides pre-fetched metadata for parent transactions
 	// When provided, the validator will check this map before calling utxoStore.Get()
@@ -176,16 +176,16 @@ func WithSkipUtxoStoreSpending(skip bool) Option {
 	}
 }
 
-// WithSkipScriptValidation creates an option to skip script validation
+// WithSkipValidation creates an option to skip script validation
 // Used for store-only mode (I/O operations without CPU-intensive validation)
 // Parameters:
 //   - skip: When true, script execution and signature verification will be skipped
 //
 // Returns:
-//   - Option: Function that sets the SkipScriptValidation option
-func WithSkipScriptValidation(skip bool) Option {
+//   - Option: Function that sets the SkipValidation option
+func WithSkipValidation(skip bool) Option {
 	return func(o *Options) {
-		o.SkipScriptValidation = skip
+		o.SkipValidation = skip
 	}
 }
 
