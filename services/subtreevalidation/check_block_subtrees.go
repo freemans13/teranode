@@ -18,7 +18,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
-	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
@@ -454,7 +453,17 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 		// Process transactions for this batch
 		if batchTxCount > 0 {
-			if err = u.processTransactionsInLevels(ctx, allTransactions, *block.Hash(), chainhash.Hash{}, block.Height, blockIds); err != nil {
+			// Build validator options for block validation context
+			// Peer-supplied blocks can have conflicting transactions that miners legitimately included
+			validatorOptions := []validator.Option{
+				validator.WithSkipPolicyChecks(true),  // Blocks bypass policy checks
+				validator.WithCreateConflicting(true), // Allow conflicting in blocks
+				validator.WithIgnoreLocked(true),      // Ignore locked UTXOs
+				validator.WithIgnoreConflicting(true), // Peer blocks can have conflicts
+			}
+			processedOpts := validator.ProcessOptions(validatorOptions...)
+
+			if err = u.processTransactionsInLevels(ctx, allTransactions, *block.Hash(), chainhash.Hash{}, block.Height, blockIds, processedOpts); err != nil {
 				return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in batch %d", batchNum, err)
 			}
 			totalProcessedTxs += batchTxCount
@@ -718,7 +727,7 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 
 // processTransactionsInLevels processes all transactions from all subtrees using level-based validation
 // This ensures transactions are processed in dependency order while maximizing parallelism
-func (u *Server) processTransactionsInLevels(ctx context.Context, allTransactions []*bt.Tx, blockHash chainhash.Hash, subtreeHash chainhash.Hash, blockHeight uint32, blockIds map[uint32]bool) error {
+func (u *Server) processTransactionsInLevels(ctx context.Context, allTransactions []*bt.Tx, blockHash chainhash.Hash, subtreeHash chainhash.Hash, blockHeight uint32, blockIds map[uint32]bool, validatorOpts *validator.Options) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processTransactionsInLevels",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[processTransactionsInLevels] Processing %d transactions at block height %d", len(allTransactions), blockHeight),
@@ -783,6 +792,19 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		validator.WithSkipUtxoCreation(true),
 		validator.WithSkipUtxoStoreSpending(true),
 	)
+
+	// Storage-only options: Use validator options from caller but skip script validation
+	// This allows the validator to handle Spend/Create with proper ignore flags from validatorOpts
+	storageOnlyOptions := []validator.Option{
+		validator.WithSkipPolicyChecks(validatorOpts.SkipPolicyChecks),
+		validator.WithCreateConflicting(validatorOpts.CreateConflicting),
+		validator.WithIgnoreLocked(validatorOpts.IgnoreLocked),
+		validator.WithIgnoreConflicting(validatorOpts.IgnoreConflicting),
+		validator.WithSkipScriptValidation(true),   // Skip CPU-intensive script validation
+		validator.WithSkipUtxoCreation(false),      // DO create UTXOs
+		validator.WithSkipUtxoStoreSpending(false), // DO spend UTXOs
+		validator.WithAddTXToBlockAssembly(false),  // Don't add to block assembly during storage
+	}
 
 	// Pipeline: Store level N-1 (background) while processing level N
 	var storageGroup *errgroup.Group
@@ -883,6 +905,9 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		storageWorkers := u.settings.SubtreeValidation.SpendBatcherSize * 6
 		util.SafeSetLimit(newStorageGroup, storageWorkers)
 
+		// Process storage-only options for this level
+		processedStorageOptions := validator.ProcessOptions(storageOnlyOptions...)
+
 		for _, mTx := range levelTxs {
 			tx := mTx.tx
 			if tx == nil {
@@ -890,30 +915,17 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 
 			newStorageGroup.Go(func() error {
-				// Store: Direct UTXO operations (Spend + Create)
-				// Spend parent UTXOs
-				_, spendErr := u.utxoStore.Spend(sCtx, tx, blockHeight, utxo.IgnoreFlags{
-					IgnoreConflicting: false,
-					IgnoreLocked:      true,
-				})
-				if spendErr != nil {
-					if errors.Is(spendErr, errors.ErrTxExists) {
-						// Transaction already exists - not an error
+				// Store: Use validator with SkipScriptValidation to perform UTXO operations
+				// This leverages validator's existing logic for Spend/Create with proper ignore flags
+				_, storageErr := u.validatorClient.ValidateWithOptions(sCtx, tx, blockHeight, processedStorageOptions)
+				if storageErr != nil {
+					// Transaction already exists - not an error
+					if errors.Is(storageErr, errors.ErrTxExists) || errors.Is(storageErr, errors.ErrTxConflicting) {
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping storage", tx.TxIDChainHash().String())
 						return nil
 					}
-					// FAIL FAST: Return spend error immediately
-					return errors.NewProcessingError("[processTransactionsInLevels] Spend failed for tx %s at level %d", tx.TxIDChainHash().String(), level+1, spendErr)
-				}
-
-				// Create new UTXOs
-				_, createErr := u.utxoStore.Create(sCtx, tx, blockHeight)
-				if createErr != nil {
-					if errors.Is(createErr, errors.ErrTxExists) {
-						// Transaction already exists - not an error
-						return nil
-					}
-					// FAIL FAST: Return create error immediately
-					return errors.NewProcessingError("[processTransactionsInLevels] Create failed for tx %s at level %d", tx.TxIDChainHash().String(), level+1, createErr)
+					// FAIL FAST: Return storage error immediately
+					return errors.NewProcessingError("[processTransactionsInLevels] Storage failed for tx %s at level %d", tx.TxIDChainHash().String(), level+1, storageErr)
 				}
 
 				return nil

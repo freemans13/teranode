@@ -123,12 +123,16 @@ func newTx(random uint32, parentTxHash ...*chainhash.Hash) *bt.Tx {
 	if len(parentTxHash) > 0 {
 		tx.Inputs = []*bt.Input{{
 			PreviousTxSatoshis: uint64(random),
-			PreviousTxOutIndex: random,
+			PreviousTxOutIndex: 0, // Always reference output index 0 for simplicity
 			UnlockingScript:    bscript.NewFromBytes([]byte{}),
 		}}
 
 		_ = tx.Inputs[0].PreviousTxIDAdd(parentTxHash[0])
 	}
+
+	// Add an output at index 0 so this transaction can be a parent
+	// This is needed for the validator to extend child transactions with PreviousTxScript
+	_ = tx.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", uint64(random))
 
 	return tx
 }
@@ -378,7 +382,7 @@ func TestBlockValidationValidateBlockSmall(t *testing.T) {
 		subtreeHashes,            // should be the subtree with placeholder
 		uint64(subtree.Length()), // nolint:gosec
 		123123,
-		0, 0)
+		1, 0)
 	require.NoError(t, err)
 
 	blockChainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, tSettings)
@@ -1247,7 +1251,7 @@ func TestBlockValidationRequestMissingTransaction(t *testing.T) {
 
 			return uint64(totalSize)
 		}(),
-		0, 0)
+		1, 0)
 
 	require.NoError(t, err)
 
@@ -1833,6 +1837,7 @@ func TestBlockValidation_DoubleSpendInBlock(t *testing.T) {
 
 	err = blockValidation.ValidateBlock(context.Background(), block, "http://localhost", model.NewBloomStats())
 	require.Error(t, err)
+	// With validator-based storage, double spend is caught during validation phase
 	require.ErrorContains(t, err, "BLOCK_INVALID")
 	require.ErrorContains(t, err, "has duplicate inputs")
 }
