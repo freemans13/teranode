@@ -136,7 +136,7 @@ type ValidateTransactionRequest struct {
 	TransactionData []byte                 `protobuf:"bytes,1,opt,name=transaction_data,json=transactionData,proto3" json:"transaction_data,omitempty"` // Raw transaction data to validate
 	BlockHeight     uint32                 `protobuf:"varint,2,opt,name=block_height,json=blockHeight,proto3" json:"block_height,omitempty"`            // Block height for validation context
 	// validation options
-	SkipUtxoCreation     *bool `protobuf:"varint,3,opt,name=skip_utxo_creation,json=skipUtxoCreation,proto3,oneof" json:"skip_utxo_creation,omitempty"`                 // Skip UTXO creation for validation
+	SkipUtxoCreate       *bool `protobuf:"varint,3,opt,name=skip_utxo_create,json=skipUtxoCreate,proto3,oneof" json:"skip_utxo_create,omitempty"`                       // Skip UTXO creation for validation
 	AddTxToBlockAssembly *bool `protobuf:"varint,4,opt,name=add_tx_to_block_assembly,json=addTxToBlockAssembly,proto3,oneof" json:"add_tx_to_block_assembly,omitempty"` // Add transaction to block assembly
 	SkipPolicyChecks     *bool `protobuf:"varint,5,opt,name=skip_policy_checks,json=skipPolicyChecks,proto3,oneof" json:"skip_policy_checks,omitempty"`                 // Skip policy checks
 	CreateConflicting    *bool `protobuf:"varint,6,opt,name=create_conflicting,json=createConflicting,proto3,oneof" json:"create_conflicting,omitempty"`                // Create conflicting transaction
@@ -188,9 +188,9 @@ func (x *ValidateTransactionRequest) GetBlockHeight() uint32 {
 	return 0
 }
 
-func (x *ValidateTransactionRequest) GetSkipUtxoCreation() bool {
-	if x != nil && x.SkipUtxoCreation != nil {
-		return *x.SkipUtxoCreation
+func (x *ValidateTransactionRequest) GetSkipUtxoCreate() bool {
+	if x != nil && x.SkipUtxoCreate != nil {
+		return *x.SkipUtxoCreate
 	}
 	return false
 }
@@ -495,15 +495,15 @@ const file_services_validator_validator_api_validator_api_proto_rawDesc = "" +
 	"\x0eHealthResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\adetails\x18\x02 \x01(\tR\adetails\x128\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xa3\x03\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\x9d\x03\n" +
 	"\x1aValidateTransactionRequest\x12)\n" +
 	"\x10transaction_data\x18\x01 \x01(\fR\x0ftransactionData\x12!\n" +
-	"\fblock_height\x18\x02 \x01(\rR\vblockHeight\x121\n" +
-	"\x12skip_utxo_creation\x18\x03 \x01(\bH\x00R\x10skipUtxoCreation\x88\x01\x01\x12;\n" +
+	"\fblock_height\x18\x02 \x01(\rR\vblockHeight\x12-\n" +
+	"\x10skip_utxo_create\x18\x03 \x01(\bH\x00R\x0eskipUtxoCreate\x88\x01\x01\x12;\n" +
 	"\x18add_tx_to_block_assembly\x18\x04 \x01(\bH\x01R\x14addTxToBlockAssembly\x88\x01\x01\x121\n" +
 	"\x12skip_policy_checks\x18\x05 \x01(\bH\x02R\x10skipPolicyChecks\x88\x01\x01\x122\n" +
-	"\x12create_conflicting\x18\x06 \x01(\bH\x03R\x11createConflicting\x88\x01\x01B\x15\n" +
-	"\x13_skip_utxo_creationB\x1b\n" +
+	"\x12create_conflicting\x18\x06 \x01(\bH\x03R\x11createConflicting\x88\x01\x01B\x13\n" +
+	"\x11_skip_utxo_createB\x1b\n" +
 	"\x19_add_tx_to_block_assemblyB\x15\n" +
 	"\x13_skip_policy_checksB\x15\n" +
 	"\x13_create_conflicting\"{\n" +

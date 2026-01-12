@@ -19,9 +19,9 @@ type ParentTxMetadata struct {
 
 // Options defines the configuration options for validation operations
 type Options struct {
-	// SkipUtxoCreation determines whether UTXO creation should be skipped
+	// SkipUtxoCreate determines whether UTXO creation should be skipped
 	// When true, the validator won't create new UTXOs for transaction outputs
-	SkipUtxoCreation bool
+	SkipUtxoCreate bool
 
 	// AddTXToBlockAssembly determines whether transactions should be added to block assembly
 	// When true, validated transactions are forwarded to the block assembly process
@@ -41,9 +41,9 @@ type Options struct {
 	// IgnoreLocked determines whether to ignore transactions marked as locked when spending
 	IgnoreLocked bool
 
-	// SkipUtxoStoreSpending skips spending parent UTXOs in UTXO store
+	// SkipUtxoSpend skips spending parent UTXOs in UTXO store
 	// Used for validate-only mode (CPU-intensive validation without I/O)
-	SkipUtxoStoreSpending bool
+	SkipUtxoSpend bool
 
 	// SkipValidation skips script execution and signature verification
 	// Used for store-only mode (I/O operations without CPU-intensive validation)
@@ -62,14 +62,14 @@ type Option func(*Options)
 
 // NewDefaultOptions creates a new Options instance with default settings
 // Default configuration:
-//   - skipUtxoCreation: false (UTXOs will be created)
+//   - SkipUtxoCreate: false (UTXOs will be created)
 //   - addTXToBlockAssembly: true (transactions will be added to block assembly)
 //
 // Returns:
 //   - *Options: New options instance with default settings
 func NewDefaultOptions() *Options {
 	return &Options{
-		SkipUtxoCreation:     false,
+		SkipUtxoCreate:       false,
 		AddTXToBlockAssembly: true,
 		SkipPolicyChecks:     false,
 		CreateConflicting:    false,
@@ -91,15 +91,15 @@ func ProcessOptions(opts ...Option) *Options {
 	return options
 }
 
-// WithSkipUtxoCreation creates an option to control UTXO creation
+// WithSkipUtxoCreate creates an option to control UTXO creation
 // Parameters:
 //   - skip: When true, UTXO creation will be skipped
 //
 // Returns:
-//   - Option: Function that sets the skipUtxoCreation option
-func WithSkipUtxoCreation(skip bool) Option {
+//   - Option: Function that sets the skipUtxoCreate option
+func WithSkipUtxoCreate(skip bool) Option {
 	return func(o *Options) {
-		o.SkipUtxoCreation = skip
+		o.SkipUtxoCreate = skip
 	}
 }
 
@@ -163,16 +163,16 @@ func WithIgnoreLocked(ignoreLocked bool) Option {
 	}
 }
 
-// WithSkipUtxoStoreSpending creates an option to skip UTXO store spending
+// WithSkipUtxoSpend creates an option to skip UTXO store spending
 // Used for validate-only mode (CPU-intensive validation without I/O operations)
 // Parameters:
 //   - skip: When true, utxoStore.Spend() will be skipped
 //
 // Returns:
-//   - Option: Function that sets the SkipUtxoStoreSpending option
-func WithSkipUtxoStoreSpending(skip bool) Option {
+//   - Option: Function that sets the SkipUtxoSpend option
+func WithSkipUtxoSpend(skip bool) Option {
 	return func(o *Options) {
-		o.SkipUtxoStoreSpending = skip
+		o.SkipUtxoSpend = skip
 	}
 }
 

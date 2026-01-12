@@ -203,7 +203,7 @@ func (c *Client) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight
 		response, err := c.client.ValidateTransaction(ctx, &validator_api.ValidateTransactionRequest{
 			TransactionData:      tx.SerializeBytes(),
 			BlockHeight:          blockHeight,
-			SkipUtxoCreation:     &validationOptions.SkipUtxoCreation,
+			SkipUtxoCreate:       &validationOptions.SkipUtxoCreate,
 			AddTxToBlockAssembly: &validationOptions.AddTXToBlockAssembly,
 			SkipPolicyChecks:     &validationOptions.SkipPolicyChecks,
 			CreateConflicting:    &validationOptions.CreateConflicting,
@@ -229,7 +229,7 @@ func (c *Client) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight
 		req: &validator_api.ValidateTransactionRequest{
 			TransactionData:      tx.SerializeBytes(),
 			BlockHeight:          blockHeight,
-			SkipUtxoCreation:     &validationOptions.SkipUtxoCreation,
+			SkipUtxoCreate:       &validationOptions.SkipUtxoCreate,
 			AddTxToBlockAssembly: &validationOptions.AddTXToBlockAssembly,
 			SkipPolicyChecks:     &validationOptions.SkipPolicyChecks,
 			CreateConflicting:    &validationOptions.CreateConflicting,
@@ -336,7 +336,7 @@ func (c *Client) handleBatchHTTPFallback(ctx context.Context, batch []*batchItem
 
 		// Create options from the request
 		options := &Options{
-			SkipUtxoCreation:     *txReq.SkipUtxoCreation,
+			SkipUtxoCreate:       *txReq.SkipUtxoCreate,
 			AddTXToBlockAssembly: *txReq.AddTxToBlockAssembly,
 			SkipPolicyChecks:     *txReq.SkipPolicyChecks,
 			CreateConflicting:    *txReq.CreateConflicting,
@@ -393,8 +393,8 @@ func (c *Client) validateTransactionViaHTTP(ctx context.Context, tx *bt.Tx, bloc
 
 	// Add validation options as query parameters
 	queryParams := url.Values{}
-	if validationOptions.SkipUtxoCreation {
-		queryParams.Add("skipUtxoCreation", "true")
+	if validationOptions.SkipUtxoCreate {
+		queryParams.Add("SkipUtxoCreate", "true")
 	}
 
 	if validationOptions.AddTXToBlockAssembly {

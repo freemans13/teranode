@@ -489,7 +489,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	)
 
 	// this will reverse the spends if there is an error
-	if !validationOptions.SkipUtxoStoreSpending {
+	if !validationOptions.SkipUtxoSpend {
 		if spentUtxos, err = v.spendUtxos(decoupledCtx, tx, blockHeight, validationOptions.IgnoreLocked); err != nil {
 			if errors.Is(err, errors.ErrUtxoError) {
 				saveAsConflicting := false
@@ -565,7 +565,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	blockAssemblyEnabled := !v.settings.BlockAssembly.Disabled
 	addToBlockAssembly := blockAssemblyEnabled && validationOptions.AddTXToBlockAssembly
 
-	if !validationOptions.SkipUtxoCreation {
+	if !validationOptions.SkipUtxoCreate {
 		// store the transaction in the UTXO store, marking it as locked if we are going to add it to the block assembly
 		txMetaData, err = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, false, addToBlockAssembly)
 		if err != nil {

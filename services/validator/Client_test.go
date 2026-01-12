@@ -360,7 +360,7 @@ func TestBatchValidation(t *testing.T) {
 			req: &validator_api.ValidateTransactionRequest{
 				TransactionData:      txBytes,
 				BlockHeight:          100,
-				SkipUtxoCreation:     boolPtr(false),
+				SkipUtxoCreate:       boolPtr(false),
 				AddTxToBlockAssembly: boolPtr(true),
 				SkipPolicyChecks:     boolPtr(false),
 				CreateConflicting:    boolPtr(false),
@@ -371,7 +371,7 @@ func TestBatchValidation(t *testing.T) {
 			req: &validator_api.ValidateTransactionRequest{
 				TransactionData:      txBytes,
 				BlockHeight:          100,
-				SkipUtxoCreation:     boolPtr(false),
+				SkipUtxoCreate:       boolPtr(false),
 				AddTxToBlockAssembly: boolPtr(true),
 				SkipPolicyChecks:     boolPtr(false),
 				CreateConflicting:    boolPtr(false),
@@ -418,7 +418,7 @@ func TestBatchValidation_ResourceExhausted(t *testing.T) {
 			req: &validator_api.ValidateTransactionRequest{
 				TransactionData:      txBytes,
 				BlockHeight:          100,
-				SkipUtxoCreation:     boolPtr(false),
+				SkipUtxoCreate:       boolPtr(false),
 				AddTxToBlockAssembly: boolPtr(true),
 				SkipPolicyChecks:     boolPtr(false),
 				CreateConflicting:    boolPtr(false),

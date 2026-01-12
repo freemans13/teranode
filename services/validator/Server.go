@@ -349,7 +349,7 @@ func (v *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		height := kafkaMsg.Height
 
 		options := &Options{
-			SkipUtxoCreation:     kafkaMsg.Options.SkipUtxoCreation,
+			SkipUtxoCreate:       kafkaMsg.Options.SkipUtxoCreate,
 			AddTXToBlockAssembly: kafkaMsg.Options.AddTXToBlockAssembly,
 			SkipPolicyChecks:     kafkaMsg.Options.SkipPolicyChecks,
 			CreateConflicting:    kafkaMsg.Options.CreateConflicting,
@@ -467,8 +467,8 @@ func (v *Server) validateTransaction(ctx context.Context, req *validator_api.Val
 	tx.SetTxHash(tx.TxIDChainHash())
 
 	validationOptions := NewDefaultOptions()
-	if req.SkipUtxoCreation != nil {
-		validationOptions.SkipUtxoCreation = *req.SkipUtxoCreation
+	if req.SkipUtxoCreate != nil {
+		validationOptions.SkipUtxoCreate = *req.SkipUtxoCreate
 	}
 
 	if req.AddTxToBlockAssembly != nil {
@@ -636,7 +636,7 @@ func (v *Server) GetMedianBlockTime(ctx context.Context, _ *validator_api.EmptyM
 // extractValidationParams extracts validation parameters from HTTP query string parameters.
 // This utility function parses and converts various query parameters into validation options
 // for transaction processing. It handles both numeric parameters (like blockHeight) and
-// boolean flags (like skipUtxoCreation, addTxToBlockAssembly) that control validation behavior.
+// boolean flags (like SkipUtxoCreate, addTxToBlockAssembly) that control validation behavior.
 //
 // The function recognizes boolean values as either 'true' or '1' strings in the query parameters.
 // If parameters are not provided or cannot be parsed, default values are used.
@@ -665,9 +665,9 @@ func extractValidationParams(c echo.Context) (uint32, *Options) {
 	}
 
 	// Extract boolean parameters
-	if skipUtxoCreationStr := c.QueryParam("skipUtxoCreation"); skipUtxoCreationStr != "" {
-		boolVal := skipUtxoCreationStr == trueString || skipUtxoCreationStr == "1"
-		options.SkipUtxoCreation = boolVal
+	if SkipUtxoCreateStr := c.QueryParam("SkipUtxoCreate"); SkipUtxoCreateStr != "" {
+		boolVal := SkipUtxoCreateStr == trueString || SkipUtxoCreateStr == "1"
+		options.SkipUtxoCreate = boolVal
 	}
 
 	if addTxToBlockAssemblyStr := c.QueryParam("addTxToBlockAssembly"); addTxToBlockAssemblyStr != "" {
@@ -696,7 +696,7 @@ func extractValidationParams(c echo.Context) (uint32, *Options) {
 //
 // The handler supports several validation options through query parameters:
 // - blockHeight: The blockchain height to validate against
-// - skipUtxoCreation: Whether to skip UTXO creation (useful for testing/dry-runs)
+// - SkipUtxoCreate: Whether to skip UTXO creation (useful for testing/dry-runs)
 // - addTxToBlockAssembly: Whether to include the transaction in block templates
 // - skipPolicyChecks: Whether to skip non-consensus policy validation checks
 // - createConflicting: Whether to allow creating conflicting UTXOs
@@ -724,7 +724,7 @@ func (v *Server) handleSingleTx(ctx context.Context) echo.HandlerFunc {
 		req := &validator_api.ValidateTransactionRequest{
 			TransactionData:      body,
 			BlockHeight:          blockHeight,
-			SkipUtxoCreation:     &options.SkipUtxoCreation,
+			SkipUtxoCreate:       &options.SkipUtxoCreate,
 			AddTxToBlockAssembly: &options.AddTXToBlockAssembly,
 			SkipPolicyChecks:     &options.SkipPolicyChecks,
 			CreateConflicting:    &options.CreateConflicting,
@@ -792,7 +792,7 @@ func (v *Server) handleMultipleTx(ctx context.Context) echo.HandlerFunc {
 			req := &validator_api.ValidateTransactionRequest{
 				TransactionData:      tx.SerializeBytes(),
 				BlockHeight:          blockHeight,
-				SkipUtxoCreation:     &options.SkipUtxoCreation,
+				SkipUtxoCreate:       &options.SkipUtxoCreate,
 				AddTxToBlockAssembly: &options.AddTXToBlockAssembly,
 				SkipPolicyChecks:     &options.SkipPolicyChecks,
 				CreateConflicting:    &options.CreateConflicting,

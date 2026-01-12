@@ -413,7 +413,7 @@ func (x *KafkaTxValidationTopicMessage) GetOptions() *KafkaTxValidationOptions {
 
 type KafkaTxValidationOptions struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
-	SkipUtxoCreation     bool                   `protobuf:"varint,1,opt,name=skipUtxoCreation,proto3" json:"skipUtxoCreation,omitempty"`
+	SkipUtxoCreate       bool                   `protobuf:"varint,1,opt,name=skipUtxoCreate,proto3" json:"skipUtxoCreate,omitempty"`
 	AddTXToBlockAssembly bool                   `protobuf:"varint,2,opt,name=addTXToBlockAssembly,proto3" json:"addTXToBlockAssembly,omitempty"`
 	SkipPolicyChecks     bool                   `protobuf:"varint,3,opt,name=skipPolicyChecks,proto3" json:"skipPolicyChecks,omitempty"`
 	CreateConflicting    bool                   `protobuf:"varint,4,opt,name=createConflicting,proto3" json:"createConflicting,omitempty"`
@@ -451,9 +451,9 @@ func (*KafkaTxValidationOptions) Descriptor() ([]byte, []int) {
 	return file_util_kafka_kafka_message_kafka_messages_proto_rawDescGZIP(), []int{5}
 }
 
-func (x *KafkaTxValidationOptions) GetSkipUtxoCreation() bool {
+func (x *KafkaTxValidationOptions) GetSkipUtxoCreate() bool {
 	if x != nil {
-		return x.SkipUtxoCreation
+		return x.SkipUtxoCreate
 	}
 	return false
 }
@@ -810,9 +810,9 @@ const file_util_kafka_kafka_message_kafka_messages_proto_rawDesc = "" +
 	"\x1dKafkaTxValidationTopicMessage\x12\x0e\n" +
 	"\x02tx\x18\x01 \x01(\fR\x02tx\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\x12@\n" +
-	"\aoptions\x18\x03 \x01(\v2&.kafkamessage.KafkaTxValidationOptionsR\aoptions\"\xd4\x01\n" +
-	"\x18KafkaTxValidationOptions\x12*\n" +
-	"\x10skipUtxoCreation\x18\x01 \x01(\bR\x10skipUtxoCreation\x122\n" +
+	"\aoptions\x18\x03 \x01(\v2&.kafkamessage.KafkaTxValidationOptionsR\aoptions\"\xd0\x01\n" +
+	"\x18KafkaTxValidationOptions\x12&\n" +
+	"\x0eskipUtxoCreate\x18\x01 \x01(\bR\x0eskipUtxoCreate\x122\n" +
 	"\x14addTXToBlockAssembly\x18\x02 \x01(\bR\x14addTXToBlockAssembly\x12*\n" +
 	"\x10skipPolicyChecks\x18\x03 \x01(\bR\x10skipPolicyChecks\x12,\n" +
 	"\x11createConflicting\x18\x04 \x01(\bR\x11createConflicting\"f\n" +

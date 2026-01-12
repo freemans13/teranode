@@ -110,8 +110,8 @@ func (m *MockValidatorClient) ValidateWithOptions(ctx context.Context, tx *bt.Tx
 		return nil, err
 	}
 
-	// If SkipUtxoCreation is true (validation-only phase), return empty metadata without storing
-	if validationOptions.SkipUtxoCreation {
+	// If SkipUtxoCreate is true (validation-only phase), return empty metadata without storing
+	if validationOptions.SkipUtxoCreate {
 		return &meta.Data{}, nil
 	}
 

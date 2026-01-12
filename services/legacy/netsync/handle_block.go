@@ -631,7 +631,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 			_, err = sm.validationClient.Validate(gCtx,
 				txWrapper.Tx,
 				blockHeight,
-				validator.WithSkipUtxoCreation(true),
+				validator.WithSkipUtxoCreate(true),
 				validator.WithAddTXToBlockAssembly(false),
 				validator.WithSkipPolicyChecks(true),
 			)

@@ -1057,7 +1057,7 @@ func (ps *PropagationServer) validateTransactionViaKafka(btTx *bt.Tx) error {
 		Tx:     btTx.SerializeBytes(),
 		Height: 0,
 		Options: &kafkamessage.KafkaTxValidationOptions{
-			SkipUtxoCreation:     validationOptions.SkipUtxoCreation,
+			SkipUtxoCreate:       validationOptions.SkipUtxoCreate,
 			AddTXToBlockAssembly: validationOptions.AddTXToBlockAssembly,
 			SkipPolicyChecks:     validationOptions.SkipPolicyChecks,
 			CreateConflicting:    validationOptions.CreateConflicting,
