@@ -44,10 +44,10 @@ type CatchupContext struct {
 	currentHeight           uint32
 	blockHeaders            []*model.BlockHeader
 	headersFetchResult      *catchup.Result
-	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
-	highestCheckpointHeight uint32 // Highest checkpoint height for validation checks
-	catchupError            error  // Any error encountered during catchup
-	workerWG                sync.WaitGroup // Track active worker goroutines for clean shutdown
+	useQuickValidation      bool               // Whether to use quick validation for checkpointed blocks
+	highestCheckpointHeight uint32             // Highest checkpoint height for validation checks
+	catchupError            error              // Any error encountered during catchup
+	workerWG                sync.WaitGroup     // Track active worker goroutines for clean shutdown
 	cancelFunc              context.CancelFunc // Cancel function to stop worker goroutines
 }
 
