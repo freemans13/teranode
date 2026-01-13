@@ -720,9 +720,12 @@ func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context,
 
 	// OPTIMIZATION: Check if parent metadata is provided in options (for in-block parents)
 	// This allows validation without UTXO store lookups for in-block parent transactions
+	// SAFETY: Parent metadata only includes transactions that successfully validated AND created UTXOs
+	// (see check_block_subtrees.go:buildParentMetadata which filters by successful validations)
 	if validationOptions.ParentMetadata != nil {
 		if parentMeta, found := validationOptions.ParentMetadata[parentTxHash]; found {
 			// Use pre-fetched metadata instead of UTXO store lookup
+			// Safe because metadata only includes transactions that completed full validation+storage
 			for _, idx := range idxs {
 				utxoHeights[idx] = parentMeta.BlockHeight
 			}
