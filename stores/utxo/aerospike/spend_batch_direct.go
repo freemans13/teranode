@@ -180,19 +180,32 @@ func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpen
 		batchGroupKeys = append(batchGroupKeys, gKey)
 	}
 
-	// PHASE 3: Execute single Aerospike batch operation
+	// PHASE 3: Execute Aerospike batch operations (split into chunks if needed)
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
+
 	startBatch := time.Now()
-	s.logger.Infof("[SPEND_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations", len(batchRecords))
-	err := s.client.BatchOperate(batchPolicy, batchRecords)
-	s.logger.Infof("[SPEND_BATCH_DIRECT] Aerospike BatchOperate completed in %v", time.Since(startBatch))
-	if err != nil {
-		// Batch-level failure - record for circuit breaker
-		if s.spendCircuitBreaker != nil {
-			s.spendCircuitBreaker.RecordFailure()
+	s.logger.Infof("[SPEND_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch)", len(batchRecords), maxBatchSize)
+
+	// Split into chunks if needed
+	for i := 0; i < len(batchRecords); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(batchRecords) {
+			end = len(batchRecords)
 		}
-		return nil, errors.NewStorageError("[SPEND_BATCH_DIRECT] failed to batch spend aerospike", err)
+
+		chunk := batchRecords[i:end]
+		err := s.client.BatchOperate(batchPolicy, chunk)
+		if err != nil {
+			// Batch-level failure - record for circuit breaker
+			if s.spendCircuitBreaker != nil {
+				s.spendCircuitBreaker.RecordFailure()
+			}
+			return nil, errors.NewStorageError("[SPEND_BATCH_DIRECT] failed to batch spend aerospike (chunk %d-%d)", i, end, err)
+		}
 	}
+
+	s.logger.Infof("[SPEND_BATCH_DIRECT] Aerospike BatchOperate completed in %v", time.Since(startBatch))
 
 	// PHASE 4: Parse Lua responses and distribute errors
 	// Reuse error parsing logic from spend.go:580-790

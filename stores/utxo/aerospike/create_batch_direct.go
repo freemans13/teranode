@@ -170,11 +170,24 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 		batchRecords[i] = aerospike.NewBatchWrite(batchWritePolicy, key, putOps...)
 	}
 
-	// PHASE 3: Execute single Aerospike batch operation
+	// PHASE 3: Execute Aerospike batch operations (split into chunks if needed)
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
-	err := s.client.BatchOperate(batchPolicy, batchRecords)
-	if err != nil {
-		return nil, errors.NewStorageError("[CREATE_BATCH_DIRECT] failed to batch create", err)
+	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
+
+	s.logger.Infof("[CREATE_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch)", len(batchRecords), maxBatchSize)
+
+	// Split into chunks if needed
+	for i := 0; i < len(batchRecords); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(batchRecords) {
+			end = len(batchRecords)
+		}
+
+		chunk := batchRecords[i:end]
+		err := s.client.BatchOperate(batchPolicy, chunk)
+		if err != nil {
+			return nil, errors.NewStorageError("[CREATE_BATCH_DIRECT] failed to batch create (chunk %d-%d)", i, end, err)
+		}
 	}
 
 	// PHASE 4: Process results

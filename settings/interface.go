@@ -387,6 +387,7 @@ type UtxoStoreSettings struct {
 	MaxMinedBatchSize                 int
 	BlockHeightRetentionAdjustment    int32 // Adjustment to GlobalBlockHeightRetention (can be positive or negative)
 	DisableDAHCleaner                 bool  // Disable the DAH cleaner process completely
+	MaxAerospikeBatchSize             int   // Maximum operations per Aerospike BatchOperate call (default 5000)
 }
 
 type P2PSettings struct {
