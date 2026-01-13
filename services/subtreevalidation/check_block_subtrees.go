@@ -936,9 +936,14 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 				// This is consistent with main branch approach of always going through validator
 				_, storeErr := u.validatorClient.ValidateWithOptions(sCtx, tx, blockHeight, storageOptions)
 				if storeErr != nil {
-					// TX_EXISTS is not an error - transaction was already validated
-					if errors.Is(err, errors.ErrTxExists) {
+					// These are success cases - transaction was already stored
+					if errors.Is(storeErr, errors.ErrTxExists) {
 						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping", tx.TxIDChainHash().String())
+						return nil
+					}
+
+					if errors.Is(storeErr, errors.ErrTxExists) || errors.Is(storeErr, errors.ErrTxConflicting) {
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s is conflicting, skipping", tx.TxIDChainHash().String())
 						return nil
 					}
 
