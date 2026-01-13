@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +47,8 @@ type CatchupContext struct {
 	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
 	highestCheckpointHeight uint32 // Highest checkpoint height for validation checks
 	catchupError            error  // Any error encountered during catchup
+	workerWG                sync.WaitGroup // Track active worker goroutines for clean shutdown
+	cancelFunc              context.CancelFunc // Cancel function to stop worker goroutines
 }
 
 // catchup orchestrates the complete blockchain synchronization process.
@@ -254,6 +257,18 @@ func (u *Server) acquireCatchupLock(ctx *CatchupContext) error {
 //   - ctx: Catchup context containing operation state
 //   - err: Pointer to error from catchup operation
 func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
+	// Cancel goroutines and wait for them to complete before releasing lock
+	// This prevents race conditions where a new catchup session starts while
+	// old goroutines are still running and accessing shared state
+	if ctx != nil && ctx.cancelFunc != nil {
+		u.logger.Debugf("[catchup][%s] Cancelling worker goroutines", ctx.blockUpTo.Hash().String())
+		ctx.cancelFunc()
+
+		u.logger.Debugf("[catchup][%s] Waiting for worker goroutines to complete", ctx.blockUpTo.Hash().String())
+		ctx.workerWG.Wait()
+		u.logger.Debugf("[catchup][%s] All worker goroutines completed", ctx.blockUpTo.Hash().String())
+	}
+
 	u.isCatchingUp.Store(false)
 	if prometheusCatchupActive != nil {
 		prometheusCatchupActive.Set(0)
