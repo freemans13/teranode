@@ -186,7 +186,16 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 		chunk := batchRecords[i:end]
 		err := s.client.BatchOperate(batchPolicy, chunk)
 		if err != nil {
-			return nil, errors.NewStorageError("[CREATE_BATCH_DIRECT] failed to batch create (chunk %d-%d)", i, end, err)
+			// Check if this is KEY_EXISTS_ERROR - this happens when ANY record in the batch
+			// already exists with CREATE_ONLY policy. This is not a fatal error - individual
+			// records will have their own errors set which we handle in Phase 4.
+			aErr, ok := err.(*aerospike.AerospikeError)
+			if !ok || aErr.ResultCode != types.KEY_EXISTS_ERROR {
+				// True batch-level failure (connection error, etc.)
+				return nil, errors.NewStorageError("[CREATE_BATCH_DIRECT] failed to batch create (chunk %d-%d)", i, end, err)
+			}
+			// KEY_EXISTS_ERROR - continue to Phase 4 to handle per-record results
+			s.logger.Debugf("[CREATE_BATCH_DIRECT] Batch chunk %d-%d contains existing keys, will handle per-record in Phase 4", i, end)
 		}
 	}
 
