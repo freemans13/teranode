@@ -90,13 +90,12 @@ func (u *Server) fetchBlocksConcurrently(ctx context.Context, catchupCtx *Catchu
 	// Create local error group for better error handling and cancellation
 	g, gCtx := errgroup.WithContext(gCtx)
 
-	// Track all goroutines in WaitGroup for clean shutdown
-	// We have: numWorkers + 1 (orderedDelivery) + 1 (batchFetchAndDistribute)
-	catchupCtx.workerWG.Add(numWorkers + 2)
-
 	// Start worker pool for parallel subtree data fetching
+	// Add to WaitGroup immediately before each goroutine starts to ensure
+	// the counter only increments for goroutines that actually start
 	for i := 0; i < numWorkers; i++ {
 		workerID := i
+		catchupCtx.workerWG.Add(1)
 		g.Go(func() error {
 			defer catchupCtx.workerWG.Done()
 			return u.blockWorker(gCtx, workerID, workQueue, resultQueue, peerID, baseURL, blockUpTo)
@@ -104,12 +103,14 @@ func (u *Server) fetchBlocksConcurrently(ctx context.Context, catchupCtx *Catchu
 	}
 
 	// Start ordered delivery goroutine
+	catchupCtx.workerWG.Add(1)
 	g.Go(func() error {
 		defer catchupCtx.workerWG.Done()
 		return u.orderedDelivery(gCtx, resultQueue, validateBlocksChan, len(blockHeaders), blockUpTo, size)
 	})
 
 	// Start batch fetching and work distribution
+	catchupCtx.workerWG.Add(1)
 	g.Go(func() error {
 		defer catchupCtx.workerWG.Done()
 		defer close(workQueue)
