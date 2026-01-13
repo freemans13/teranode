@@ -937,6 +937,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			IgnoreConflicting:    validatorOpts.IgnoreConflicting,
 			IgnoreLocked:         validatorOpts.IgnoreLocked,
 			AddTXToBlockAssembly: false, // Don't add to block assembly (blocks already mined)
+			ParentMetadata:       processedValidationOptions.ParentMetadata, // Reuse parent metadata from validation phase
 		}
 
 		for _, mTx := range levelTxs {

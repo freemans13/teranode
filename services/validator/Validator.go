@@ -386,81 +386,80 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		}()
 	}
 
-	var spentUtxos []*utxo.Spend
-
-	// Get atomic block state to prevent race conditions between height and median time reads
-	blockState := v.GetBlockState()
-
-	if blockHeight == 0 {
-		blockHeight = blockState.Height + 1
-	}
-
-	// We do not check IsFinal for transactions before BIP113 change (block height 419328)
-	// This is an exception for transactions before the media block time was used
-	if blockHeight > v.settings.ChainCfgParams.CSVHeight {
-
-		utxoStoreMedianBlockTime := blockState.MedianTime
-		if utxoStoreMedianBlockTime == 0 {
-			err = errors.NewProcessingError("utxo store not ready, block height: %d, median block time: %d", blockHeight, utxoStoreMedianBlockTime)
-			span.RecordError(err)
-
-			return nil, err
-		}
-
-		// this function should be moved into go-bt
-		if err = util.IsTransactionFinal(tx, blockHeight, utxoStoreMedianBlockTime); err != nil {
-			err = errors.NewUtxoNonFinalError("[Validate][%s] transaction is not final", txID, err)
-			span.RecordError(err)
-
-			return nil, err
-		}
-	}
-
-	if tx.IsCoinbase() {
-		err = errors.NewProcessingError("[Validate][%s] coinbase transactions are not supported", txID)
-		span.RecordError(err)
-
-		return nil, err
-	}
-
-	var utxoHeights []uint32
-
-	// check whether the transaction is extended, extend it if not
-	// we also get the block heights of the inputs of the transaction since we are doing a DB lookup
-	if !tx.IsExtended() {
-		// get the block heights of all inputs of the transaction and extend the inputs of not extended transaction.
-		// utxoHeights is a slice of block heights for each input
-		// txInpoints is a struct containing the parent tx hashes and the vout indexes of each input
-		if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
-			err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
-			span.RecordError(err)
-
-			return nil, err
-		}
-	}
-
-	// validate the transaction format, consensus rules etc.
-	// this does not validate the signatures in the transaction yet
-	if err = v.validateTransaction(ctx, tx, blockHeight, utxoHeights, validationOptions); err != nil {
-		err = errors.NewProcessingError("[Validate][%s] error validating transaction", txID, err)
-		span.RecordError(err)
-
-		return nil, err
-	}
-
-	// if the transaction was extended, we still need to get the block heights of the inputs
-	// since that processing did not happen before the validateTransaction step
-	if len(utxoHeights) == 0 {
-		if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
-			err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
-			span.RecordError(err)
-
-			return nil, err
-		}
-	}
-
-	// validate the transaction scripts and signatures
+	// Skip all validation when SkipValidation=true (already validated in previous phase)
 	if !validationOptions.SkipValidation {
+		// Get atomic block state to prevent race conditions between height and median time reads
+		blockState := v.GetBlockState()
+
+		if blockHeight == 0 {
+			blockHeight = blockState.Height + 1
+		}
+
+		// We do not check IsFinal for transactions before BIP113 change (block height 419328)
+		// This is an exception for transactions before the media block time was used
+		if blockHeight > v.settings.ChainCfgParams.CSVHeight {
+
+			utxoStoreMedianBlockTime := blockState.MedianTime
+			if utxoStoreMedianBlockTime == 0 {
+				err = errors.NewProcessingError("utxo store not ready, block height: %d, median block time: %d", blockHeight, utxoStoreMedianBlockTime)
+				span.RecordError(err)
+
+				return nil, err
+			}
+
+			// this function should be moved into go-bt
+			if err = util.IsTransactionFinal(tx, blockHeight, utxoStoreMedianBlockTime); err != nil {
+				err = errors.NewUtxoNonFinalError("[Validate][%s] transaction is not final", txID, err)
+				span.RecordError(err)
+
+				return nil, err
+			}
+		}
+
+		if tx.IsCoinbase() {
+			err = errors.NewProcessingError("[Validate][%s] coinbase transactions are not supported", txID)
+			span.RecordError(err)
+
+			return nil, err
+		}
+
+		var utxoHeights []uint32
+
+		// check whether the transaction is extended, extend it if not
+		// we also get the block heights of the inputs of the transaction since we are doing a DB lookup
+		if !tx.IsExtended() {
+			// get the block heights of all inputs of the transaction and extend the inputs of not extended transaction.
+			// utxoHeights is a slice of block heights for each input
+			// txInpoints is a struct containing the parent tx hashes and the vout indexes of each input
+			if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
+				err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
+				span.RecordError(err)
+
+				return nil, err
+			}
+		}
+
+		// validate the transaction format, consensus rules etc.
+		// this does not validate the signatures in the transaction yet
+		if err = v.validateTransaction(ctx, tx, blockHeight, utxoHeights, validationOptions); err != nil {
+			err = errors.NewProcessingError("[Validate][%s] error validating transaction", txID, err)
+			span.RecordError(err)
+
+			return nil, err
+		}
+
+		// if the transaction was extended, we still need to get the block heights of the inputs
+		// since that processing did not happen before the validateTransaction step
+		if len(utxoHeights) == 0 {
+			if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
+				err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
+				span.RecordError(err)
+
+				return nil, err
+			}
+		}
+
+		// validate the transaction scripts and signatures
 		if err = v.validateTransactionScripts(ctx, tx, blockHeight, utxoHeights, validationOptions); err != nil {
 			err = errors.NewProcessingError("[Validate][%s] error validating transaction scripts", txID, err)
 			span.RecordError(err)
@@ -484,6 +483,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	*/
 
 	var (
+		spentUtxos []*utxo.Spend
 		tErr       *errors.Error
 		utxoMapErr error
 	)
