@@ -756,6 +756,14 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 					u.logger.Debugf("[processTransactionsInLevels] Extended %d inputs from previous level for level %d", totalExtended, level)
 				}
 			}
+
+			// Build parent metadata for Level 1+ to enable UTXO store skip
+			// This allows the validator to avoid UTXO lookups for in-block parents
+			parentMetadata := buildParentMetadata(txsPerLevel[level-1], blockHeight)
+			if len(parentMetadata) > 0 {
+				processedValidatorOptions.ParentMetadata = parentMetadata
+				u.logger.Debugf("[processTransactionsInLevels] Level %d: Providing metadata for %d parent transactions from level %d", level, len(parentMetadata), level-1)
+			}
 		}
 
 		// Process all transactions at this level in parallel
@@ -860,6 +868,28 @@ func buildParentMapFromLevel(parentLevelTxs []missingTx) map[chainhash.Hash]*bt.
 		}
 	}
 	return parentMap
+}
+
+// buildParentMetadata creates a map of parent transaction metadata for use by the validator.
+// This allows the validator to skip UTXO store lookups for in-block parents.
+//
+// The metadata includes block height (where the parent will be mined) which is needed
+// for coinbase maturity checks and other validation rules.
+func buildParentMetadata(parentLevelTxs []missingTx, blockHeight uint32) map[chainhash.Hash]*validator.ParentTxMetadata {
+	if len(parentLevelTxs) == 0 {
+		return nil
+	}
+
+	metadata := make(map[chainhash.Hash]*validator.ParentTxMetadata, len(parentLevelTxs))
+	for _, mTx := range parentLevelTxs {
+		if mTx.tx != nil {
+			txHash := *mTx.tx.TxIDChainHash()
+			metadata[txHash] = &validator.ParentTxMetadata{
+				BlockHeight: blockHeight,
+			}
+		}
+	}
+	return metadata
 }
 
 // extendTxWithInBlockParents extends a transaction's inputs with parent output data
