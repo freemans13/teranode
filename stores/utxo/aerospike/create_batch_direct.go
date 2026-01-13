@@ -3,6 +3,7 @@ package aerospike
 
 import (
 	"context"
+	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/aerospike/aerospike-client-go/v8/types"
@@ -58,6 +59,9 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 			}
 		}
 	}
+
+	// Track async operations for multi-record transactions
+	asyncOps := make(map[int]chan error)
 
 	// PHASE 2: Prepare batch records
 	batchRecords := make([]aerospike.BatchRecordIfc, len(requests))
@@ -121,6 +125,7 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 		if len(bins) > 1 {
 			// Multi-record transaction - delegate to existing StoreTransactionExternally
 			// This preserves the two-phase commit protocol with creating flag
+			// NOTE: We'll launch async but track the done channel to wait for completion
 			item := &BatchStoreItem{
 				txHash:       req.Tx.TxIDChainHash(),
 				isCoinbase:   req.Tx.IsCoinbase(),
@@ -140,6 +145,9 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 			} else {
 				go s.StoreTransactionExternally(ctx, item, bins)
 			}
+
+			// Store the done channel for later waiting
+			asyncOps[i] = item.done
 
 			// Mark as NOOP in this batch
 			batchRecords[i] = aerospike.NewBatchRead(nil, placeholderKey, nil)
@@ -202,6 +210,77 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 			txMeta.Locked = requests[i].Locked
 			results[i].TxMeta = txMeta
 
+			prometheusUtxostoreCreate.Inc()
+		}
+	}
+
+	// PHASE 5: Wait for async operations to complete (multi-record transactions)
+	// This prevents TX_CREATING errors when next level tries to spend
+	for i, doneChan := range asyncOps {
+		err := <-doneChan
+
+		// Handle errors
+		if err != nil && !errors.Is(err, errors.ErrTxExists) {
+			results[i].Err = errors.NewProcessingError("[CREATE_BATCH_DIRECT][%s] async create failed", requests[i].Tx.TxID(), err)
+			results[i].Success = false
+			continue
+		}
+
+		// Transaction created successfully (or already exists)
+		// Now verify creating flag is actually cleared to prevent TX_CREATING errors
+		// StoreTransactionExternally may return success even if clearCreatingFlag failed
+		// (by design for recovery), but for immediate level-based processing we need
+		// the flag actually cleared
+
+		txHash := requests[i].Tx.TxIDChainHash()
+		cleared := false
+		maxRetries := 3
+		retryDelay := 10 * time.Millisecond
+
+		for retry := 0; retry < maxRetries; retry++ {
+			// Check if creating flag is set on master record
+			key, keyErr := aerospike.NewKey(s.namespace, s.setName, txHash[:])
+			if keyErr != nil {
+				break
+			}
+
+			record, getErr := s.client.Get(nil, key, fields.Creating.String())
+			if getErr != nil || record == nil {
+				// Transaction doesn't exist or error reading - treat as cleared
+				cleared = true
+				break
+			}
+
+			// Check if creating bin exists and is true
+			if creating, exists := record.Bins[fields.Creating.String()]; !exists || creating != true {
+				// Creating flag not set or false - cleared!
+				cleared = true
+				break
+			}
+
+			// Creating flag still set, retry after delay
+			if retry < maxRetries-1 {
+				time.Sleep(retryDelay)
+				retryDelay *= 2 // Exponential backoff
+			}
+		}
+
+		if !cleared {
+			// Creating flag still set after retries
+			// Log warning but return success - transaction is persisted, will auto-recover
+			s.logger.Warnf("[CREATE_BATCH_DIRECT][%s] creating flag still set after %d retries, may cause TX_CREATING errors (auto-recovery will fix)", txHash, maxRetries)
+		}
+
+		// Create metadata
+		results[i].Success = true
+		txMeta, metaErr := util.TxMetaDataFromTx(requests[i].Tx)
+		if metaErr != nil {
+			results[i].Err = errors.NewProcessingError("[CREATE_BATCH_DIRECT][%s] failed to create metadata", requests[i].Tx.TxID(), metaErr)
+			results[i].Success = false
+		} else {
+			txMeta.Conflicting = requests[i].Conflicting
+			txMeta.Locked = requests[i].Locked
+			results[i].TxMeta = txMeta
 			prometheusUtxostoreCreate.Inc()
 		}
 	}
