@@ -771,29 +771,13 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	u.logger.Infof("[processTransactionsInLevels] Processing transactions across %d levels", maxLevel+1)
 
-	validatorOptions := []validator.Option{
+	validationOnlyOptions := []validator.Option{
 		validator.WithSkipPolicyChecks(true),
 		validator.WithCreateConflicting(true),
 		validator.WithIgnoreLocked(true),
-	}
-
-	currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
-	if err != nil {
-		return errors.NewProcessingError("[processTransactionsInLevels] Failed to get FSM current state", err)
-	}
-
-	// During legacy syncing or catching up, disable adding transactions to block assembly
-	if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
-		validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
-	}
-
-	// Pre-process validation options for all levels
-	// Validation phase: Skip UTXO operations - CPU-only validation
-	// Transaction extension ALWAYS happens regardless of Skip flags (needed for storage phase)
-	validationOnlyOptions := append(validatorOptions,
 		validator.WithSkipUtxoCreate(true), // Skip Create during validation (storage phase does it)
 		validator.WithSkipUtxoSpend(true),  // Skip Spend during validation (storage phase does it)
-	)
+	}
 
 	// Track validation results
 	var (
@@ -859,12 +843,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 				// Uses parent metadata from Level N-1, so no UTXO store lookup needed for in-block parents
 				_, err := u.blessMissingTransaction(vCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidationOptions)
 				if err != nil {
-					// TX_EXISTS is not an error - transaction was already validated
-					if errors.Is(err, errors.ErrTxExists) {
-						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping", tx.TxIDChainHash().String())
-						return nil
-					}
-
 					// Count error
 					errorsFound.Add(1)
 
@@ -926,6 +904,13 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		storageWorkers := u.settings.SubtreeValidation.SpendBatcherSize * 6
 		util.SafeSetLimit(newStorageGroup, storageWorkers)
 
+		currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
+		if err != nil {
+			return errors.NewProcessingError("[processTransactionsInLevels] Failed to get FSM current state", err)
+		}
+
+		skipBlockAssembly := *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS
+
 		// Build storage-phase validator options
 		// Skip validation (already done in validation phase), but perform UTXO operations
 		storageOptions := &validator.Options{
@@ -936,7 +921,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			CreateConflicting:    validatorOpts.CreateConflicting,
 			IgnoreConflicting:    validatorOpts.IgnoreConflicting,
 			IgnoreLocked:         validatorOpts.IgnoreLocked,
-			AddTXToBlockAssembly: false, // Don't add to block assembly (blocks already mined)
+			AddTXToBlockAssembly: !skipBlockAssembly,                        // Don't add to block assembly (blocks already mined)
 			ParentMetadata:       processedValidationOptions.ParentMetadata, // Reuse parent metadata from validation phase
 		}
 
@@ -951,11 +936,12 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 				// This is consistent with main branch approach of always going through validator
 				_, storeErr := u.validatorClient.ValidateWithOptions(sCtx, tx, blockHeight, storageOptions)
 				if storeErr != nil {
-					// These are success cases - transaction was stored
-					if errors.Is(storeErr, errors.ErrTxExists) || errors.Is(storeErr, errors.ErrTxConflicting) {
-						// Transaction already exists or was stored as conflicting - both are success
+					// TX_EXISTS is not an error - transaction was already validated
+					if errors.Is(err, errors.ErrTxExists) {
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping", tx.TxIDChainHash().String())
 						return nil
 					}
+
 					// FAIL FAST: Return storage error immediately
 					return errors.NewProcessingError("[processTransactionsInLevels] Storage failed for tx %s at level %d", tx.TxIDChainHash().String(), level+1, storeErr)
 				}
