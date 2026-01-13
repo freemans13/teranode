@@ -17,11 +17,11 @@ import (
 // spendBatchDirectItem tracks a single spend operation within the batch
 // Maps back to the original transaction and spend index for error distribution
 type spendBatchDirectItem struct {
-	spend           *utxo.Spend
-	requestIdx      int // Index in original requests slice
-	spendIdx        int // Index within transaction's spends
+	spend             *utxo.Spend
+	requestIdx        int // Index in original requests slice
+	spendIdx          int // Index within transaction's spends
 	ignoreConflicting bool
-	ignoreLocked    bool
+	ignoreLocked      bool
 }
 
 // SpendBatchDirect performs batch spending for multiple transactions in a single operation.

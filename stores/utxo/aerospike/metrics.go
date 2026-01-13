@@ -74,9 +74,9 @@ var (
 	prometheusUtxoSpendBatch      prometheus.Histogram
 	prometheusUtxoSpendBatchSize  prometheus.Histogram
 
-	prometheusUtxoSpendBatchDirect     prometheus.Histogram
-	prometheusUtxoSpendBatchDirectSize prometheus.Histogram
-	prometheusUtxoCreateBatchDirect    prometheus.Histogram
+	prometheusUtxoSpendBatchDirect      prometheus.Histogram
+	prometheusUtxoSpendBatchDirectSize  prometheus.Histogram
+	prometheusUtxoCreateBatchDirect     prometheus.Histogram
 	prometheusUtxoCreateBatchDirectSize prometheus.Histogram
 
 	prometheusTxMetaAerospikeMapGet                   prometheus.Counter
