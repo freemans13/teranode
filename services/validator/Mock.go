@@ -28,6 +28,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // MockValidatorClient implements a test double for the validator client interface.
@@ -116,3 +117,33 @@ func (m *MockValidatorClient) ValidateWithOptions(ctx context.Context, tx *bt.Tx
 // TriggerBatcher implements the batcher trigger interface for testing.
 // This is a no-op in the mock implementation as no actual batching occurs.
 func (m *MockValidatorClient) TriggerBatcher() {}
+
+// ValidateLevelBatch implements mock level batch validation for testing.
+// Returns success for all transactions without performing actual validation.
+// If errors are queued, applies them to corresponding transactions.
+func (m *MockValidatorClient) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {
+	m.ErrorsMu.Lock()
+	defer m.ErrorsMu.Unlock()
+
+	results := make([]*LevelValidationResult, len(txs))
+	for i, tx := range txs {
+		result := &LevelValidationResult{
+			TxHash:  tx.TxIDChainHash(),
+			Success: true,
+		}
+
+		// Apply queued errors if available
+		if i < len(m.Errors) && m.Errors[i] != nil {
+			result.Err = m.Errors[i]
+			result.Success = false
+		} else {
+			// Create metadata for successful validation
+			txMeta, _ := util.TxMetaDataFromTx(tx)
+			result.TxMeta = txMeta
+		}
+
+		results[i] = result
+	}
+
+	return results, nil
+}

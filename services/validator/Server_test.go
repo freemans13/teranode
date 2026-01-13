@@ -465,3 +465,25 @@ func (m *TestMockValidator) GetMedianBlockTime() uint32 {
 func (m *TestMockValidator) TriggerBatcher() {
 	// No-op implementation for testing
 }
+
+func (m *TestMockValidator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {
+	results := make([]*LevelValidationResult, len(txs))
+	for i, tx := range txs {
+		var txMeta *meta.Data
+		var err error
+
+		if m.validateTxFunc != nil {
+			txMeta, err = m.validateTxFunc(ctx, tx)
+		} else {
+			txMeta = &meta.Data{}
+		}
+
+		results[i] = &LevelValidationResult{
+			TxHash:  tx.TxIDChainHash(),
+			TxMeta:  txMeta,
+			Success: err == nil,
+			Err:     err,
+		}
+	}
+	return results, nil
+}

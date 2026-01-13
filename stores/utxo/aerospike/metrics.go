@@ -74,6 +74,11 @@ var (
 	prometheusUtxoSpendBatch      prometheus.Histogram
 	prometheusUtxoSpendBatchSize  prometheus.Histogram
 
+	prometheusUtxoSpendBatchDirect     prometheus.Histogram
+	prometheusUtxoSpendBatchDirectSize prometheus.Histogram
+	prometheusUtxoCreateBatchDirect    prometheus.Histogram
+	prometheusUtxoCreateBatchDirectSize prometheus.Histogram
+
 	prometheusTxMetaAerospikeMapGet                   prometheus.Counter
 	prometheusUtxostoreCreate                         prometheus.Counter
 	prometheusTxMetaAerospikeMapErrors                *prometheus.CounterVec
@@ -296,6 +301,46 @@ func _initPrometheusMetrics() {
 			Name:      "utxo_spend_batch_size",
 			Help:      "Size of utxo spend batch",
 			Buckets:   util.MetricsBucketsSizeSmall,
+		},
+	)
+
+	prometheusUtxoSpendBatchDirect = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "aerospike",
+			Name:      "utxo_spend_batch_direct",
+			Help:      "Duration of utxo spend batch direct (level-wide batching)",
+			Buckets:   util.MetricsBucketsMilliSeconds,
+		},
+	)
+
+	prometheusUtxoSpendBatchDirectSize = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "aerospike",
+			Name:      "utxo_spend_batch_direct_size",
+			Help:      "Number of transactions in spend batch direct call",
+			Buckets:   []float64{1, 10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000},
+		},
+	)
+
+	prometheusUtxoCreateBatchDirect = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "aerospike",
+			Name:      "utxo_create_batch_direct",
+			Help:      "Duration of utxo create batch direct (level-wide batching)",
+			Buckets:   util.MetricsBucketsMilliSeconds,
+		},
+	)
+
+	prometheusUtxoCreateBatchDirectSize = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "aerospike",
+			Name:      "utxo_create_batch_direct_size",
+			Help:      "Number of transactions in create batch direct call",
+			Buckets:   []float64{1, 10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000},
 		},
 	)
 

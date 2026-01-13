@@ -984,6 +984,14 @@ func (m *MockUTXOStore) GetBlockState() utxo.BlockState {
 	}
 }
 
+func (m *MockUTXOStore) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	return nil, nil
+}
+
+func (m *MockUTXOStore) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	return nil, nil
+}
+
 // Comprehensive tests for Start method
 
 // TestStart_FSMTransitionError tests error handling when FSM transition fails

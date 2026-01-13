@@ -2764,3 +2764,15 @@ func isLockError(err error) bool {
 		strings.Contains(errStr, "deadlock") ||
 		strings.Contains(errStr, "lock timeout")
 }
+
+// SpendBatchDirect is not implemented for SQL store.
+// This method is only used for high-performance block validation with Aerospike.
+func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	return nil, errors.NewProcessingError("SpendBatchDirect not implemented for SQL store")
+}
+
+// CreateBatchDirect is not implemented for SQL store.
+// This method is only used for high-performance block validation with Aerospike.
+func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	return nil, errors.NewProcessingError("CreateBatchDirect not implemented for SQL store")
+}

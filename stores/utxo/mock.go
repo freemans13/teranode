@@ -245,3 +245,11 @@ func (m *MockUnminedTxIterator) Err() error {
 func (m *MockUnminedTxIterator) Close() error {
 	return nil
 }
+
+func (m *MockUtxostore) SpendBatchDirect(ctx context.Context, requests []*BatchSpendRequest) ([]*BatchSpendResult, error) {
+	return nil, nil
+}
+
+func (m *MockUtxostore) CreateBatchDirect(ctx context.Context, requests []*BatchCreateRequest) ([]*BatchCreateResult, error) {
+	return nil, nil
+}

@@ -194,3 +194,11 @@ func (m *NullStore) PreserveTransactions(ctx context.Context, txIDs []chainhash.
 func (m *NullStore) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
 	return nil
 }
+
+func (m *NullStore) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	return nil, nil
+}
+
+func (m *NullStore) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	return nil, nil
+}

@@ -223,6 +223,44 @@ type MinedBlockInfo struct {
 	UnsetMined     bool // if true, the mined info will be removed from the tx
 }
 
+// BatchSpendRequest represents a request to spend UTXOs for a transaction in batch mode.
+// Used by SpendBatchDirect for level-wide batch processing in block validation.
+type BatchSpendRequest struct {
+	Tx          *bt.Tx      // Transaction whose inputs should be spent
+	BlockHeight uint32      // Current block height for validation
+	IgnoreFlags IgnoreFlags // Flags controlling which checks to bypass
+}
+
+// BatchSpendResult represents the result of spending UTXOs for a single transaction in batch mode.
+// Contains per-UTXO error details and overall transaction success status.
+type BatchSpendResult struct {
+	TxHash          *chainhash.Hash // Transaction hash
+	Spends          []*Spend        // Per-UTXO spend results with individual errors
+	Success         bool            // Overall success for this transaction
+	Err             error           // Transaction-level error (conflicting, locked, creating, etc.)
+	ConflictingTxID *chainhash.Hash // If conflicting, the hash of the counter-conflicting transaction
+}
+
+// BatchCreateRequest represents a request to create UTXOs for a transaction in batch mode.
+// Used by CreateBatchDirect for level-wide batch processing in block validation.
+type BatchCreateRequest struct {
+	Tx           *bt.Tx   // Transaction whose outputs should be created
+	BlockHeight  uint32   // Current block height
+	Conflicting  bool     // Create as conflicting transaction (sets DAH, marks as conflicting)
+	Locked       bool     // Create as locked (for block assembly two-phase commit)
+	BlockIDs     []uint32 // Block IDs where this transaction appears
+	BlockHeights []uint32 // Block heights where this transaction appears
+	SubtreeIdxs  []int    // Subtree indices where this transaction appears
+}
+
+// BatchCreateResult represents the result of creating UTXOs for a single transaction in batch mode.
+type BatchCreateResult struct {
+	TxHash  *chainhash.Hash // Transaction hash
+	TxMeta  *meta.Data      // Created transaction metadata
+	Success bool            // Overall success
+	Err     error           // Creation error (KEY_EXISTS, validation error, etc.)
+}
+
 // Store defines the interface for UTXO management operations.
 // Implementations must be thread-safe as they will be accessed concurrently.
 type Store interface {
@@ -333,4 +371,16 @@ type Store interface {
 	// This prevents race conditions that could occur when reading these values separately,
 	// ensuring consistency during validation operations.
 	GetBlockState() BlockState
+
+	// SpendBatchDirect performs batch spending for multiple transactions in a single operation.
+	// This bypasses the batcher queue and executes a direct Aerospike BatchOperate, providing
+	// significant performance improvements for level-based block validation while preserving
+	// all safety checks (frozen, locked, conflicting, creating, coinbase maturity).
+	// Returns per-transaction results with individual UTXO error details.
+	SpendBatchDirect(ctx context.Context, requests []*BatchSpendRequest) ([]*BatchSpendResult, error)
+
+	// CreateBatchDirect performs batch creation for multiple transactions in a single operation.
+	// This bypasses the batcher queue and executes a direct Aerospike BatchOperate.
+	// Returns per-transaction creation results.
+	CreateBatchDirect(ctx context.Context, requests []*BatchCreateRequest) ([]*BatchCreateResult, error)
 }

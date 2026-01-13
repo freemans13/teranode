@@ -443,3 +443,10 @@ func (c *Client) validateTransactionViaHTTP(ctx context.Context, tx *bt.Tx, bloc
 
 	return nil
 }
+
+// ValidateLevelBatch is not implemented for the gRPC validator client.
+// This method is only used for block validation in-process with direct UTXO store access.
+// For remote validator services, use ValidateWithOptions in a loop.
+func (c *Client) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {
+	return nil, errors.NewProcessingError("ValidateLevelBatch not implemented for gRPC client - use in-process validator")
+}

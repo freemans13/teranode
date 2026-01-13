@@ -167,6 +167,22 @@ func (m *MockStore) ProcessExpiredPreservations(ctx context.Context, currentHeig
 	return args.Error(0)
 }
 
+func (m *MockStore) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	args := m.Called(ctx, requests)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*utxo.BatchSpendResult), args.Error(1)
+}
+
+func (m *MockStore) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	args := m.Called(ctx, requests)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*utxo.BatchCreateResult), args.Error(1)
+}
+
 // MockIterator implements utxo.UnminedTxIterator for testing
 type MockIterator struct {
 	mock.Mock

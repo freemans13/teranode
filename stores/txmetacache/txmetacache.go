@@ -1019,3 +1019,15 @@ func (t *TxMetaCache) PreserveTransactions(ctx context.Context, txIDs []chainhas
 func (t *TxMetaCache) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
 	return t.utxoStore.ProcessExpiredPreservations(ctx, currentHeight)
 }
+
+// SpendBatchDirect forwards the request to the underlying UTXO store.
+// The cache layer passes through batch operations directly to enable maximum performance.
+func (t *TxMetaCache) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	return t.utxoStore.SpendBatchDirect(ctx, requests)
+}
+
+// CreateBatchDirect forwards the request to the underlying UTXO store.
+// The cache layer passes through batch operations directly to enable maximum performance.
+func (t *TxMetaCache) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	return t.utxoStore.CreateBatchDirect(ctx, requests)
+}

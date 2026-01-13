@@ -28,6 +28,7 @@ import (
 	"context"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 )
@@ -112,6 +113,35 @@ type Interface interface {
 	// This method does not return any values and executes asynchronously. The actual
 	// batch processing results can be monitored through metrics and logging systems.
 	TriggerBatcher()
+
+	// ValidateLevelBatch validates multiple transactions in batch mode for level-based processing.
+	// This method is optimized for block validation where transactions are organized by dependency
+	// levels and can be validated together with minimal coordination overhead.
+	//
+	// Safety: Preserves all validation semantics including script execution, conflict detection,
+	// and parent metadata tracking. Each transaction is validated individually, but storage
+	// operations are batched at the level granularity for maximum throughput.
+	//
+	// Parameters:
+	//   - ctx: Context for the validation operation
+	//   - txs: Slice of transactions to validate (should all be from the same dependency level)
+	//   - blockHeight: Current block height for validation
+	//   - opts: Validation options (CreateConflicting, IgnoreLocked, etc.)
+	//
+	// Returns:
+	//   - []*LevelValidationResult: Per-transaction validation results
+	//   - error: Batch-level error if entire operation fails
+	ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error)
+}
+
+// LevelValidationResult represents the validation result for a single transaction in batch mode.
+// Contains all information needed to track transaction success, conflicts, and metadata.
+type LevelValidationResult struct {
+	TxHash          *chainhash.Hash // Transaction hash
+	TxMeta          *meta.Data      // Transaction metadata if validation succeeded
+	ConflictingTxID *chainhash.Hash // Hash of counter-conflicting transaction if double-spend detected
+	Success         bool            // Overall validation success
+	Err             error           // Validation error if failed
 }
 
 // Type assertion to ensure MockValidator implements Interface
@@ -183,3 +213,18 @@ func (mv *MockValidator) GetMedianBlockTime() uint32 {
 // TriggerBatcher implements mock batch triggering
 // No-op implementation that does nothing
 func (mv *MockValidator) TriggerBatcher() {}
+
+// ValidateLevelBatch implements mock level batch validation
+// Always returns success for all transactions without performing actual validation
+func (mv *MockValidator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {
+	results := make([]*LevelValidationResult, len(txs))
+	for i, tx := range txs {
+		txMeta, _ := util.TxMetaDataFromTx(tx)
+		results[i] = &LevelValidationResult{
+			TxHash:  tx.TxIDChainHash(),
+			TxMeta:  txMeta,
+			Success: true,
+		}
+	}
+	return results, nil
+}

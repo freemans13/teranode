@@ -740,7 +740,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 		// Initialize success tracking for this level
 		successfulTxsByLevel[level] = make(map[chainhash.Hash]bool, len(levelTxs))
-		var successfulTxsMutex sync.Mutex
 
 		// PHASE 2 OPTIMIZATION: Extend transactions with in-block parent outputs
 		// This avoids Aerospike fetches for intra-block dependencies (~500MB+ savings)
@@ -775,80 +774,78 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 		}
 
-		// Process all transactions at this level in parallel
-		g, gCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
-
-		for _, mTx := range levelTxs {
-			tx := mTx.tx
-			if tx == nil {
-				return errors.NewProcessingError("[processTransactionsInLevels] transaction is nil at level %d", level)
+		// Extract transactions from missingTx wrappers for batch validation
+		txs := make([]*bt.Tx, len(levelTxs))
+		for i, mTx := range levelTxs {
+			if mTx.tx == nil {
+				return errors.NewProcessingError("[processTransactionsInLevels] transaction is nil at level %d index %d", level, i)
 			}
-
-			g.Go(func() error {
-				// Use existing blessMissingTransaction logic for validation
-				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
-				if err != nil {
-					u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
-
-					// TX_EXISTS is not an error - transaction was already validated
-					if errors.Is(err, errors.ErrTxExists) {
-						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping", tx.TxIDChainHash().String())
-						// Mark as successful since it already exists
-						successfulTxsMutex.Lock()
-						successfulTxsByLevel[level][*tx.TxIDChainHash()] = true
-						successfulTxsMutex.Unlock()
-						return nil
-					}
-
-					// Count all other errors
-					errorsFound.Add(1)
-
-					// Handle missing parent transactions by adding to orphanage
-					if errors.Is(err, errors.ErrTxMissingParent) {
-						isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(gCtx, blockchain.FSMStateRUNNING)
-						if runningErr == nil && isRunning {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
-							if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
-								addedToOrphanage.Add(1)
-							} else {
-								u.logger.Warnf("[processTransactionsInLevels] Failed to add transaction %s to orphanage - orphanage is full", tx.TxIDChainHash().String())
-							}
-						} else {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
-						}
-					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
-						// Log truly invalid transactions
-						u.logger.Warnf("[processTransactionsInLevels] Invalid transaction detected: %s: %v", tx.TxIDChainHash().String(), err)
-
-						if errors.Is(err, errors.ErrTxInvalid) {
-							return err
-						}
-					} else {
-						u.logger.Errorf("[processTransactionsInLevels] Processing error for transaction %s: %v", tx.TxIDChainHash().String(), err)
-					}
-
-					return nil // Don't fail the entire level
-				}
-
-				// Validation succeeded - mark transaction as successful
-				successfulTxsMutex.Lock()
-				successfulTxsByLevel[level][*tx.TxIDChainHash()] = true
-				successfulTxsMutex.Unlock()
-
-				if txMeta == nil {
-					u.logger.Debugf("[processTransactionsInLevels] Transaction metadata is nil for %s", tx.TxIDChainHash().String())
-				} else {
-					u.logger.Debugf("[processTransactionsInLevels] Successfully validated transaction %s", tx.TxIDChainHash().String())
-				}
-
-				return nil
-			})
+			txs[i] = mTx.tx
 		}
 
-		// Fail early if we get an actual tx error thrown
-		if err = g.Wait(); err != nil {
-			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level+1, err)
+		// BATCH VALIDATION: Validate entire level at once
+		results, err := u.validatorClient.ValidateLevelBatch(ctx, txs, blockHeight, processedValidatorOptions)
+		if err != nil {
+			return errors.NewProcessingError("[processTransactionsInLevels] Level %d batch validation failed", level+1, err)
+		}
+
+		// Process results and update success tracking
+		for i, result := range results {
+			tx := txs[i]
+
+			if result.Err != nil {
+				u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), result.Err)
+
+				// TX_EXISTS is not an error - transaction was already validated
+				if errors.Is(result.Err, errors.ErrTxExists) {
+					u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, marking as successful", tx.TxIDChainHash().String())
+					successfulTxsByLevel[level][*tx.TxIDChainHash()] = true
+					continue
+				}
+
+				// Count all other errors
+				errorsFound.Add(1)
+
+				// Handle missing parent transactions by adding to orphanage
+				if errors.Is(result.Err, errors.ErrTxMissingParent) {
+					isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
+					if runningErr == nil && isRunning {
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
+						if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
+							addedToOrphanage.Add(1)
+						} else {
+							u.logger.Warnf("[processTransactionsInLevels] Failed to add transaction %s to orphanage - orphanage is full", tx.TxIDChainHash().String())
+						}
+					} else {
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
+					}
+				} else if errors.Is(result.Err, errors.ErrTxInvalid) && !errors.Is(result.Err, errors.ErrTxPolicy) {
+					// Log truly invalid transactions
+					u.logger.Warnf("[processTransactionsInLevels] Invalid transaction detected: %s: %v", tx.TxIDChainHash().String(), result.Err)
+
+					// Truly invalid transaction - fail the level
+					if errors.Is(result.Err, errors.ErrTxInvalid) {
+						return result.Err
+					}
+				} else if errors.Is(result.Err, errors.ErrTxConflicting) {
+					// Transaction is conflicting but was successfully created as such
+					u.logger.Debugf("[processTransactionsInLevels] Transaction %s is conflicting", tx.TxIDChainHash().String())
+					// Don't mark as successful - conflicts don't go in parent metadata
+				} else {
+					u.logger.Errorf("[processTransactionsInLevels] Processing error for transaction %s: %v", tx.TxIDChainHash().String(), result.Err)
+				}
+
+				continue
+			}
+
+			// Validation succeeded - mark transaction as successful
+			successfulTxsByLevel[level][*tx.TxIDChainHash()] = true
+
+			if result.TxMeta == nil {
+				u.logger.Debugf("[processTransactionsInLevels] Transaction metadata is nil for %s", tx.TxIDChainHash().String())
+			} else {
+				u.logger.Debugf("[processTransactionsInLevels] Successfully validated transaction %s", tx.TxIDChainHash().String())
+			}
 		}
 
 		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))
