@@ -1375,6 +1375,11 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 
 		reader, err = s.externalStore.GetIoReader(ctx, previousTxHash[:], fileType)
 		if err != nil {
+			// If the transaction is not found in external store, return ErrTxNotFound
+			// This allows callers to distinguish between "not found" and other storage errors
+			if errors.Is(err, errors.ErrNotFound) {
+				return nil, errors.ErrTxNotFound
+			}
 			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] could not get tx from external store", previousTxHash.String(), err)
 		}
 	}
