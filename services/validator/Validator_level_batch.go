@@ -237,8 +237,8 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 
 			} else if errors.Is(spendResult.Err, errors.ErrTxNotFound) {
 				// Parent DAH'd - check if tx already exists (reuse from validateInternal:575-585)
-			txMeta := &meta.Data{}
-			if err := v.utxoStore.GetMeta(ctx, txs[resultIdx].TxIDChainHash(), txMeta); err == nil {
+				txMeta := &meta.Data{}
+				if err := v.utxoStore.GetMeta(ctx, txs[resultIdx].TxIDChainHash(), txMeta); err == nil {
 					v.logger.Warnf("[ValidateLevelBatch][%s] parent tx not found, but tx already exists in store, assuming already blessed", txs[resultIdx].TxID())
 					results[resultIdx].TxMeta = txMeta
 					results[resultIdx].Success = true
