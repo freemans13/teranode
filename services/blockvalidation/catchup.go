@@ -261,12 +261,10 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 	// This prevents race conditions where a new catchup session starts while
 	// old goroutines are still running and accessing shared state
 	if ctx != nil && ctx.cancelFunc != nil {
-		u.logger.Debugf("[catchup][%s] Cancelling worker goroutines", ctx.blockUpTo.Hash().String())
+		u.logger.Debugf("[catchup][%s] Cancelling worker goroutines and waiting for completion", ctx.blockUpTo.Hash().String())
 		ctx.cancelFunc()
-
-		u.logger.Debugf("[catchup][%s] Waiting for worker goroutines to complete", ctx.blockUpTo.Hash().String())
 		ctx.workerWG.Wait()
-		u.logger.Debugf("[catchup][%s] All worker goroutines completed", ctx.blockUpTo.Hash().String())
+		u.logger.Debugf("[catchup][%s] All worker goroutines completed successfully", ctx.blockUpTo.Hash().String())
 	}
 
 	u.isCatchingUp.Store(false)

@@ -90,12 +90,16 @@ func (u *Server) fetchBlocksConcurrently(ctx context.Context, catchupCtx *Catchu
 	// Create local error group for better error handling and cancellation
 	g, gCtx := errgroup.WithContext(gCtx)
 
+	// Calculate total goroutines and add them to WaitGroup BEFORE starting any goroutines
+	// This is critical to prevent race conditions where releaseCatchupLock could call Wait()
+	// before all Add() calls complete. Go documentation requires: "Calls to Add should execute
+	// before the statement creating the goroutine or other event to be waited for."
+	totalGoroutines := numWorkers + 2 // workers + orderedDelivery + batchFetchAndDistribute
+	catchupCtx.workerWG.Add(totalGoroutines)
+
 	// Start worker pool for parallel subtree data fetching
-	// Add to WaitGroup immediately before each goroutine starts to ensure
-	// the counter only increments for goroutines that actually start
 	for i := 0; i < numWorkers; i++ {
 		workerID := i
-		catchupCtx.workerWG.Add(1)
 		g.Go(func() error {
 			defer catchupCtx.workerWG.Done()
 			return u.blockWorker(gCtx, workerID, workQueue, resultQueue, peerID, baseURL, blockUpTo)
@@ -103,14 +107,12 @@ func (u *Server) fetchBlocksConcurrently(ctx context.Context, catchupCtx *Catchu
 	}
 
 	// Start ordered delivery goroutine
-	catchupCtx.workerWG.Add(1)
 	g.Go(func() error {
 		defer catchupCtx.workerWG.Done()
 		return u.orderedDelivery(gCtx, resultQueue, validateBlocksChan, len(blockHeaders), blockUpTo, size)
 	})
 
 	// Start batch fetching and work distribution
-	catchupCtx.workerWG.Add(1)
 	g.Go(func() error {
 		defer catchupCtx.workerWG.Done()
 		defer close(workQueue)
