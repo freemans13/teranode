@@ -388,6 +388,7 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 		chainedSubtreeCount:      atomic.Int32{},
 		queue:                    queue,
 		currentTxMap:             NewSplitTxInpointsMap(splitMapBuckets),
+		deletedTxs:               txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints](),
 		removeMap:                txmap.NewSplitSwissMap(256, 16),
 		blockchainClient:         blockchainClient,
 		subtreeStore:             subtreeStore,
@@ -876,6 +877,9 @@ func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree,
 // Parameters:
 //   - subtree: The subtree whose soft-deleted transactions should be cleaned up
 func (stp *SubtreeProcessor) cleanupDeletedTxs(subtree *subtreepkg.Subtree) {
+	if stp.deletedTxs == nil {
+		return
+	}
 	for _, node := range subtree.Nodes {
 		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 			// Remove from deletedTxs backup map (transaction data no longer needed after storage)
