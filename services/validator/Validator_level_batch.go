@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
@@ -236,8 +237,8 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 
 			} else if errors.Is(spendResult.Err, errors.ErrTxNotFound) {
 				// Parent DAH'd - check if tx already exists (reuse from validateInternal:575-585)
-				txMeta, err := v.utxoStore.GetMeta(ctx, txs[resultIdx].TxIDChainHash())
-				if err == nil {
+			txMeta := &meta.Data{}
+			if err := v.utxoStore.GetMeta(ctx, txs[resultIdx].TxIDChainHash(), txMeta); err == nil {
 					v.logger.Warnf("[ValidateLevelBatch][%s] parent tx not found, but tx already exists in store, assuming already blessed", txs[resultIdx].TxID())
 					results[resultIdx].TxMeta = txMeta
 					results[resultIdx].Success = true
