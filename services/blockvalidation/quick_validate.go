@@ -28,7 +28,7 @@ import (
 // while dramatically reducing memory pressure and GC overhead (16x reduction from previous 512KB).
 var bufioReaderPool = sync.Pool{
 	New: func() interface{} {
-		return bufio.NewReaderSize(nil, 32*1024) // 32KB buffer - optimized for sequential I/O
+		return bufio.NewReaderSize(nil, 1024*1024) // Temp changed to 1MB buffer for scaling env - 32KB buffer - optimized for sequential I/O
 	},
 }
 
@@ -123,6 +123,15 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		if err = u.utxoStore.SetLocked(ctx, txHashes, false); err != nil {
 			return errors.NewProcessingError("[quickValidateBlock][%s] failed to unlock UTXOs", block.Hash().String(), err)
 		}
+	}
+
+	// Update subtrees DAH and send BlockSubtreesSet notification
+	// This matches the normal validation flow and ensures:
+	// 1. Subtree retention periods are properly managed
+	// 2. BlockSubtreesSet notification is sent to trigger setMinedChan
+	// 3. Transactions are marked as mined in the UTXO store
+	if err = u.updateSubtreesDAH(ctx, block); err != nil {
+		return errors.NewProcessingError("[quickValidateBlock][%s] failed to update subtrees DAH", block.Hash().String(), err)
 	}
 
 	// Mark block as existing in cache
