@@ -285,8 +285,8 @@ func InitSemaphores(readLimit, writeLimit int) error {
 // acquireReadPermit acquires a single read permit with a timeout.
 // This prevents goroutines from blocking indefinitely if the semaphore is full.
 func acquireReadPermit(ctx context.Context) error {
-	// Create a context with 30 second timeout
-	acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Create a context with 25 second timeout
+	acquireCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
 	if err := readSemaphore.Acquire(acquireCtx, 1); err != nil {
@@ -311,8 +311,8 @@ func releaseReadPermit() {
 // acquireWritePermit acquires a single write permit with a timeout.
 // This prevents goroutines from blocking indefinitely if the semaphore is full.
 func acquireWritePermit(ctx context.Context) error {
-	// Create a context with 30 second timeout
-	acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Create a context with 25 second timeout
+	acquireCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
 	if err := writeSemaphore.Acquire(acquireCtx, 1); err != nil {
@@ -398,6 +398,13 @@ func newStore(logger ulogger.Logger, storeURL *url.URL, opts ...options.StoreOpt
 		}
 
 		options.HashPrefix = -int(val)
+	}
+
+	// Parse disableDAH URL parameter
+	// This can be set via URL (?disableDAH=true/false) or via StoreOption (WithDisableDAH(true/false))
+	// URL parameter takes precedence over StoreOption (bidirectional override)
+	if disableDAH := storeURL.Query().Get("disableDAH"); disableDAH != "" {
+		options.DisableDAH = disableDAH == "true"
 	}
 
 	if len(options.SubDirectory) > 0 {
@@ -531,6 +538,56 @@ func (s *File) loadDAHs() error {
 
 		if cleaned > 0 {
 			s.logger.Infof("[File] Cleaned up %d leftover .dah.tmp files (older than %v)", cleaned, cleanupThreshold)
+		}
+	}
+
+	// Clean up any leftover general .tmp files from incomplete SetFromReader writes
+	// Only remove files older than 10 minutes to avoid interfering with active writes
+	generalTmpFiles, err := findFilesByExtension(s.path, ".tmp")
+	if err == nil && len(generalTmpFiles) > 0 {
+		now := time.Now()
+		cleanupThreshold := 10 * time.Minute
+		var cleaned int
+
+		for _, tmpFile := range generalTmpFiles {
+			// Skip .dah.tmp files (already handled above) and .sha256.tmp files (hash temp files)
+			if strings.HasSuffix(tmpFile, ".dah.tmp") || strings.HasSuffix(tmpFile, ".sha256.tmp") {
+				continue
+			}
+
+			func() {
+				ctx := context.Background()
+				if err := acquireReadPermit(ctx); err != nil {
+					s.logger.Warnf("[File] failed to acquire read permit for stat: %v", err)
+					return
+				}
+				defer releaseReadPermit()
+
+				info, err := os.Stat(tmpFile)
+				if err != nil {
+					return
+				}
+
+				// Check if file is older than the threshold
+				if now.Sub(info.ModTime()) > cleanupThreshold {
+					if err := acquireWritePermit(ctx); err != nil {
+						s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
+						return
+					}
+					defer releaseWritePermit()
+
+					err := os.Remove(tmpFile)
+					if err != nil && !os.IsNotExist(err) {
+						s.logger.Warnf("[File] failed to remove leftover tmp file: %s", tmpFile)
+					} else {
+						cleaned++
+					}
+				}
+			}()
+		}
+
+		if cleaned > 0 {
+			s.logger.Infof("[File] Cleaned up %d leftover .tmp files (older than %v)", cleaned, cleanupThreshold)
 		}
 	}
 
@@ -975,7 +1032,19 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 	if err != nil {
 		return errors.NewStorageError("[File][SetFromReader] [%s] failed to create file", filename, err)
 	}
-	defer file.Close()
+
+	// Track whether we should clean up the temp file on exit.
+	// Default to true (cleanup); only set to false on success path after rename.
+	cleanupTmpFile := true
+	defer func() {
+		file.Close()
+		if cleanupTmpFile {
+			// Remove temp file on any error path to prevent incomplete files
+			if removeErr := os.Remove(tmpFilename); removeErr != nil && !os.IsNotExist(removeErr) {
+				s.logger.Warnf("[File][SetFromReader] failed to remove temp file %s: %v", tmpFilename, removeErr)
+			}
+		}
+	}()
 
 	// Set up the hasher; keep destination as the raw *os.File so io.Copy can use the ReadFrom fast path
 	hasher := sha256.New()
@@ -999,12 +1068,19 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 		return errors.NewStorageError("[File][SetFromReader] [%s] reader provided zero bytes of data", filename)
 	}
 
+	// Success path - don't cleanup temp file, we're about to rename it
+	cleanupTmpFile = false
+
 	// rename the file to remove the .tmp extension
 	if err = os.Rename(tmpFilename, filename); err != nil {
 		// check is some other process has created this file before us
 		if _, statErr := os.Stat(filename); statErr != nil {
+			// Rename failed and file doesn't exist - clean up temp file
+			_ = os.Remove(tmpFilename)
 			return errors.NewStorageError("[File][SetFromReader] [%s] failed to rename file from tmp", filename, err)
 		} else {
+			// Another process created the file - clean up our temp file
+			_ = os.Remove(tmpFilename)
 			s.logger.Warnf("[File][SetFromReader] [%s] already exists so another process created it first", filename)
 		}
 	}
@@ -1085,6 +1161,12 @@ func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts 
 		return "", err
 	}
 
+	// Skip DAH functionality entirely if disabled for this store
+	// Lifecycle is managed externally (e.g., by Aerospike pruner)
+	if merged.DisableDAH {
+		return fileName, nil
+	}
+
 	dah := merged.DAH
 
 	// If the dah is not set and the block height retention is set, set the dah to the current block height plus the block height retention
@@ -1120,6 +1202,9 @@ func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts 
 // This implementation stores the DAH value in a separate file with the same name as the blob
 // but with a .dah extension, and also maintains an in-memory map of DAH values for quick access.
 //
+// If the store has DisableDAH=true, this method returns immediately without error, as DAH
+// functionality is disabled for this store (lifecycle managed externally).
+//
 // Parameters:
 //   - ctx: Context for the operation (unused in this implementation)
 //   - key: The key identifying the blob
@@ -1130,6 +1215,12 @@ func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts 
 // Returns:
 //   - error: Any error that occurred during the operation, including if the blob doesn't exist
 func (s *File) SetDAH(ctx context.Context, key []byte, fileType fileformat.FileType, newDAH uint32, opts ...options.FileOption) error {
+	// If DAH is disabled for this store, return immediately
+	// This store's lifecycle is managed externally (e.g., by Aerospike pruner)
+	if s.options.DisableDAH {
+		return nil
+	}
+
 	if err := acquireWritePermit(ctx); err != nil {
 		return errors.NewStorageError("[File][SetDAH] failed to acquire write permit", err)
 	}

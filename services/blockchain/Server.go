@@ -2056,7 +2056,7 @@ func (b *Blockchain) SendNotification(ctx context.Context, req *blockchain_api.N
 	_, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "RevalidateBlock",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainSendNotification),
-		tracing.WithDebugLogMessage(b.logger, "[SendNotification] called"),
+		tracing.WithLogMessage(b.logger, "[SendNotification] called for %s notification type %s", utils.ReverseAndHexEncodeSlice(req.Hash), req.Type.String()),
 	)
 	defer deferFn()
 
@@ -2098,6 +2098,18 @@ func (b *Blockchain) SetBlockMinedSet(ctx context.Context, req *blockchain_api.S
 	blockHash := chainhash.Hash(req.BlockHash)
 
 	err := b.store.SetBlockMinedSet(ctx, &blockHash)
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+// ClearBlockMinedSet resets the mined_set flag to false for a block.
+func (b *Blockchain) ClearBlockMinedSet(ctx context.Context, req *blockchain_api.ClearBlockMinedSetRequest) (*emptypb.Empty, error) {
+	blockHash := chainhash.Hash(req.BlockHash)
+
+	err := b.store.ClearBlockMinedSet(ctx, &blockHash)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
 	}

@@ -57,14 +57,20 @@ func NewSettings(alternativeContext ...string) *Settings {
 		UseDatadogProfiler:           getBool("use_datadog_profiler", false, alternativeContext...),
 		LocalTestStartFromState:      getString("local_test_start_from_state", "", alternativeContext...),
 		PostgresCheckAddress:         getString("postgres_check_address", "localhost:5432", alternativeContext...),
-		UseCgoVerifier:               getBool("use_cgo_verifier", true, alternativeContext...),
-		GRPCResolver:                 getString("grpc_resolver", "", alternativeContext...),
-		GRPCMaxRetries:               getInt("grpc_max_retries", 40, alternativeContext...),
-		GRPCRetryBackoff:             getDuration("grpc_retry_backoff", 250*time.Millisecond, alternativeContext...),
-		SecurityLevelGRPC:            getInt("security_level_grpc", 0, alternativeContext...),
-		UsePrometheusGRPCMetrics:     getBool("use_prometheus_grpc_metrics", true, alternativeContext...),
-		GRPCAdminAPIKey:              getString("grpc_admin_api_key", "", alternativeContext...),
-		GlobalBlockHeightRetention:   globalBlockHeightRetention,
+		Postgres: PostgresSettings{
+			MaxOpenConns:    getInt("postgres_maxOpenConns", 50, alternativeContext...),
+			MaxIdleConns:    getInt("postgres_maxIdleConns", 10, alternativeContext...),
+			ConnMaxLifetime: getDuration("postgres_connMaxLifetime", 5*time.Minute, alternativeContext...),
+			ConnMaxIdleTime: getDuration("postgres_connMaxIdleTime", 1*time.Minute, alternativeContext...),
+		},
+		UseCgoVerifier:             getBool("use_cgo_verifier", true, alternativeContext...),
+		GRPCResolver:               getString("grpc_resolver", "", alternativeContext...),
+		GRPCMaxRetries:             getInt("grpc_max_retries", 40, alternativeContext...),
+		GRPCRetryBackoff:           getDuration("grpc_retry_backoff", 250*time.Millisecond, alternativeContext...),
+		SecurityLevelGRPC:          getInt("security_level_grpc", 0, alternativeContext...),
+		UsePrometheusGRPCMetrics:   getBool("use_prometheus_grpc_metrics", true, alternativeContext...),
+		GRPCAdminAPIKey:            getString("grpc_admin_api_key", "", alternativeContext...),
+		GlobalBlockHeightRetention: globalBlockHeightRetention,
 
 		ChainCfgParams: params,
 		Policy: &PolicySettings{
@@ -132,18 +138,22 @@ func NewSettings(alternativeContext ...string) *Settings {
 			Scheme:             getString("KAFKA_SCHEMA", "http", alternativeContext...),
 		},
 		Aerospike: AerospikeSettings{
-			Debug:                  getBool("aerospike_debug", false, alternativeContext...),
-			Host:                   getString("aerospike_host", "localhost", alternativeContext...),
-			BatchPolicyURL:         getURL("aerospike_batchPolicy", "defaultBatchPolicy", alternativeContext...),
-			ReadPolicyURL:          getURL("aerospike_readPolicy", "defaultReadPolicy", alternativeContext...),
-			WritePolicyURL:         getURL("aerospike_writePolicy", "defaultWritePolicy", alternativeContext...),
-			QueryPolicyURL:         getURL("aerospike_queryPolicy", "defaultQueryPolicy", alternativeContext...),
-			Port:                   getInt("aerospike_port", 3000, alternativeContext...),
-			UseDefaultBasePolicies: getBool("aerospike_useDefaultBasePolicies", false, alternativeContext...),
-			UseDefaultPolicies:     getBool("aerospike_useDefaultPolicies", false, alternativeContext...),
-			WarmUp:                 getBool("aerospike_warmUp", true, alternativeContext...),
-			StoreBatcherDuration:   getDuration("aerospike_storeBatcherDuration", 10*time.Millisecond, alternativeContext...),
-			StatsRefreshDuration:   getDuration("aerospike_statsRefresh", 5*time.Second, alternativeContext...),
+			Debug:                           getBool("aerospike_debug", false, alternativeContext...),
+			Host:                            getString("aerospike_host", "localhost", alternativeContext...),
+			BatchPolicyURL:                  getURL("aerospike_batchPolicy", "defaultBatchPolicy", alternativeContext...),
+			ReadPolicyURL:                   getURL("aerospike_readPolicy", "defaultReadPolicy", alternativeContext...),
+			WritePolicyURL:                  getURL("aerospike_writePolicy", "defaultWritePolicy", alternativeContext...),
+			QueryPolicyURL:                  getURL("aerospike_queryPolicy", "defaultQueryPolicy", alternativeContext...),
+			Port:                            getInt("aerospike_port", 3000, alternativeContext...),
+			UseDefaultBasePolicies:          getBool("aerospike_useDefaultBasePolicies", false, alternativeContext...),
+			UseDefaultPolicies:              getBool("aerospike_useDefaultPolicies", false, alternativeContext...),
+			WarmUp:                          getBool("aerospike_warmUp", true, alternativeContext...),
+			StoreBatcherDuration:            getDuration("aerospike_storeBatcherDuration", 10*time.Millisecond, alternativeContext...),
+			StatsRefreshDuration:            getDuration("aerospike_statsRefresh", 5*time.Second, alternativeContext...),
+			EnableSpendFilterExpressions:    getBool("aerospike_enable_spend_filter_expressions", false, alternativeContext...),
+			EnableSetMinedFilterExpressions: getBool("aerospike_enable_setmined_filter_expressions", false, alternativeContext...),
+			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
+			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
 		},
 		Alert: AlertSettings{
 			GenesisKeys:   getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
@@ -175,11 +185,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ConcurrencyGetSubtreeHead:         getInt("asset_concurrency_get_subtree_head", 0, alternativeContext...),
 			ConcurrencyGetUtxo:                getInt("asset_concurrency_get_utxo", 0, alternativeContext...),
 			ConcurrencyGetLegacyBlockReader:   getInt("asset_concurrency_get_legacy_block_reader", -1, alternativeContext...), // -1 = NumCPU()
+
+			// Streaming configuration
+			SubtreeDataStreamingChunkSize:   getInt("asset_subtreeDataStreamingChunkSize", 10000, alternativeContext...),
+			SubtreeDataStreamingConcurrency: getInt("asset_subtreeDataStreamingConcurrency", 4, alternativeContext...),
 		},
 		Block: BlockSettings{
 			MinedCacheMaxMB:                       getInt("blockMinedCacheMaxMB", 256, alternativeContext...),
-			PersisterStore:                        getURL("blockPersisterStore", "file://./data/blockstore", alternativeContext...),
-			PersisterHTTPListenAddress:            getString("blockPersister_httpListenAddress", ":8083", alternativeContext...),
 			CheckDuplicateTransactionsConcurrency: getInt("block_checkDuplicateTransactionsConcurrency", -1, alternativeContext...),
 			GetAndValidateSubtreesConcurrency:     getInt("block_getAndValidateSubtreesConcurrency", -1, alternativeContext...),
 			KafkaWorkers:                          getInt("block_kafkaWorkers", 0, alternativeContext...),
@@ -190,19 +202,23 @@ func NewSettings(alternativeContext ...string) *Settings {
 			FinalizeBlockValidationConcurrency:    getInt("blockvalidation_finalizeBlockValidationConcurrency", 8, alternativeContext...),
 			GetMissingTransactions:                getInt("blockvalidation_getMissingTransactions", 32, alternativeContext...),
 			QuorumTimeout:                         getDuration("block_quorum_timeout", 10*time.Second, alternativeContext...),
-			BlockPersisterConcurrency:             getInt("blockpersister_concurrency", 8, alternativeContext...),
-			BatchMissingTransactions:              getBool("blockpersister_batchMissingTransactions", true, alternativeContext...),
 			ProcessTxMetaUsingStoreBatchSize:      getInt("blockvalidation_processTxMetaUsingStore_BatchSize", 1024, alternativeContext...),
-			SkipUTXODelete:                        getBool("blockpersister_skipUTXODelete", false, alternativeContext...),
 			UTXOPersisterBufferSize:               getString("utxoPersister_buffer_size", "4KB", alternativeContext...),
 			UTXOPersisterDirect:                   getBool("direct", true, alternativeContext...),
 			TxStore:                               getURL("txstore", "", alternativeContext...),
-			BlockPersisterPersistSleep:            getDuration("blockPersister_persistSleep", time.Minute, alternativeContext...),
-			BlockPersisterProcessUTXOFiles:        getBool("blockpersister_processUTXOFiles", true, alternativeContext...),
 			UtxoStore:                             getURL("txmeta_store", "", alternativeContext...),
 			FileStoreReadConcurrency:              getInt("filestore_read_concurrency", 768, alternativeContext...),
 			FileStoreWriteConcurrency:             getInt("filestore_write_concurrency", 256, alternativeContext...),
 			FileStoreUseSystemLimits:              getBool("filestore_use_system_limits", true, alternativeContext...),
+		},
+		BlockPersister: BlockPersisterSettings{
+			Store:                    getURL("blockpersister_store", "file://./data/blockstore", alternativeContext...),
+			HTTPListenAddress:        getString("blockpersister_httpListenAddress", ":8083", alternativeContext...),
+			Concurrency:              getInt("blockpersister_concurrency", 8, alternativeContext...),
+			BatchMissingTransactions: getBool("blockpersister_batchMissingTransactions", true, alternativeContext...),
+			SkipUTXODelete:           getBool("blockpersister_skipUTXODelete", false, alternativeContext...),
+			PersistSleep:             getDuration("blockpersister_persistSleep", 10*time.Second, alternativeContext...),
+			ProcessUTXOFiles:         getBool("blockpersister_processUTXOFiles", true, alternativeContext...),
 		},
 		BlockAssembly: BlockAssemblySettings{
 			Disabled:                             getBool("blockassembly_disabled", false, alternativeContext...),
@@ -221,6 +237,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SubtreeProcessorConcurrentReads:      getInt("blockassembly_subtreeProcessorConcurrentReads", 375, alternativeContext...),
 			NewSubtreeChanBuffer:                 getInt("blockassembly_newSubtreeChanBuffer", 1_000, alternativeContext...),
 			SubtreeRetryChanBuffer:               getInt("blockassembly_subtreeRetryChanBuffer", 1_000, alternativeContext...),
+			SubtreeStorageWorkers:                getInt("blockassembly_subtreeStorageWorkers", 4, alternativeContext...),
 			SubmitMiningSolutionWaitForResponse:  getBool("blockassembly_SubmitMiningSolution_waitForResponse", true, alternativeContext...),
 			InitialMerkleItemsPerSubtree:         getInt("initial_merkle_items_per_subtree", 1_048_576, alternativeContext...),
 			MinimumMerkleItemsPerSubtree:         getInt("minimum_merkle_items_per_subtree", 1024, alternativeContext...),
@@ -236,10 +253,16 @@ func NewSettings(alternativeContext ...string) *Settings {
 			OnRestartValidateParentChain:         getBool("blockassembly_onRestartValidateParentChain", true, alternativeContext...),
 			ParentValidationBatchSize:            getInt("blockassembly_parentValidationBatchSize", 1000, alternativeContext...),
 			OnRestartRemoveInvalidParentChainTxs: getBool("blockassembly_onRestartRemoveInvalidParentChainTxs", false, alternativeContext...),
+			UseColumnarBatch:                     getBool("blockassembly_useColumnarBatch", false, alternativeContext...),
+			UnminedTxDiskSortPath:                getString("blockassembly_unminedTxDiskSortPath", "", alternativeContext...),
+			UnminedTxDiskSortEnabled:             getBool("blockassembly_unminedTxDiskSortEnabled", false, alternativeContext...),
+			UnminedLoadingBatchSize:              getInt("blockassembly_unminedLoadingBatchSize", 1024*1024*10, alternativeContext...), // 10 million
 			// getMiningCandidate timeout settings
 			GetMiningCandidateSendTimeout:     getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
 			GetMiningCandidateResponseTimeout: getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
 			SubtreeAnnouncementInterval:       getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
+			ParallelSetIfNotExistsThreshold:   getInt("blockassembly_parallelSetIfNotExistsThreshold", 10_000, alternativeContext...),
+			StoreTxInpointsForSubtreeMeta:     getBool("blockassembly_storeTxInpointsForSubtreeMeta", false, alternativeContext...), // memory optimization
 		},
 
 		BlockChain: BlockChainSettings{
@@ -253,9 +276,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			FSMStateChangeDelay:   getDuration("fsm_state_change_delay", 0, alternativeContext...),
 			StoreDBTimeoutMillis:  getInt("blockchain_store_dbTimeoutMillis", 5000, alternativeContext...),
 			InitializeNodeInState: getString("blockchain_initializeNodeInState", "", alternativeContext...),
+			PostgresPool:          getPostgresPoolSettings("blockchain", alternativeContext...),
 		},
 		BlockValidation: BlockValidationSettings{
-			MaxRetries:                                getInt("blockV	alidationMaxRetries", 3, alternativeContext...),
+			MaxRetries:                                getInt("blockValidationMaxRetries", 3, alternativeContext...),
 			RetrySleep:                                getDuration("blockValidationRetrySleep", 1*time.Second, alternativeContext...),
 			GRPCAddress:                               getString("blockvalidation_grpcAddress", "localhost:8088", alternativeContext...),
 			GRPCListenAddress:                         getString("blockvalidation_grpcListenAddress", ":8088", alternativeContext...),
@@ -266,8 +290,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ProcessTxMetaUsingCacheBatchSize:          getInt("blockvalidation_processTxMetaUsingCache_BatchSize", 1024, alternativeContext...),
 			ProcessTxMetaUsingCacheConcurrency:        getInt("blockvalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
 			ProcessTxMetaUsingCacheMissingTxThreshold: getInt("blockvalidation_processTxMetaUsingCache_MissingTxThreshold", 1, alternativeContext...),
-			ProcessTxMetaUsingStoreBatchSize:          getInt("blockvalidation_processTxMetaUsingStore_BatchSize", max(4, runtime.NumCPU()/2), alternativeContext...),
-			ProcessTxMetaUsingStoreConcurrency:        getInt("blockvalidation_processTxMetaUsingStore_Concurrency", 32, alternativeContext...),
+			ProcessTxMetaUsingStoreBatchSize:          getInt("blockvalidation_processTxMetaUsingStore_BatchSize", 1024, alternativeContext...),
+			ProcessTxMetaUsingStoreConcurrency:        getInt("blockvalidation_processTxMetaUsingStore_Concurrency", max(4, runtime.NumCPU()/2), alternativeContext...),
 			ProcessTxMetaUsingStoreMissingTxThreshold: getInt("blockvalidation_processTxMetaUsingStore_MissingTxThreshold", 1, alternativeContext...),
 			SkipCheckParentMined:                      getBool("blockvalidation_skipCheckParentMined", false, alternativeContext...),
 			SubtreeFoundChConcurrency:                 getInt("blockvalidation_subtreeFoundChConcurrency", 1, alternativeContext...),
@@ -304,7 +328,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CircuitBreakerTimeoutSeconds:   getInt("blockvalidation_circuit_breaker_timeout_seconds", 30, alternativeContext...),
 			// Block fetching configuration
 			FetchLargeBatchSize:             getInt("blockvalidation_fetch_large_batch_size", 100, alternativeContext...),
-			FetchNumWorkers:                 getInt("blockvalidation_fetch_num_workers", 16, alternativeContext...),
+			FetchNumWorkers:                 getInt("blockvalidation_fetch_num_workers", 1, alternativeContext...),
 			FetchBufferSize:                 getInt("blockvalidation_fetch_buffer_size", 50, alternativeContext...),
 			SubtreeFetchConcurrency:         getInt("blockvalidation_subtree_fetch_concurrency", 8, alternativeContext...),
 			ExtendTransactionTimeout:        getDuration("blockvalidation_extend_transaction_timeout", 120*time.Second, alternativeContext...),
@@ -330,6 +354,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HTTPRateLimit:             getInt("validator_httpRateLimit", 1024, alternativeContext...),
 			KafkaMaxMessageBytes:      getInt("validator_kafka_maxMessageBytes", 1024*1024, alternativeContext...), // Default 1MB
 			UseLocalValidator:         getBool("useLocalValidator", false, alternativeContext...),
+			TxMetaKafkaBatchSize:      getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
+			TxMetaKafkaBatchTimeoutMs: getInt("validator_txmeta_kafka_batchTimeoutMs", 5, alternativeContext...),
 		},
 		Region: RegionSettings{
 			Name: getString("regionName", "defaultRegionName", alternativeContext...),
@@ -369,8 +395,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseExternalTxCache:                getBool("utxostore_useExternalTxCache", true, alternativeContext...),
 			ExternalizeAllTransactions:        getBool("utxostore_externalizeAllTransactions", false, alternativeContext...),
 			ExternalStoreConcurrency:          getInt("utxostore_externalStoreConcurrency", 16, alternativeContext...),
-			PostgresMaxIdleConns:              getInt("utxostore_utxo_postgresMaxIdleConns", 10, alternativeContext...),
-			PostgresMaxOpenConns:              getInt("utxostore_utxo_postgresMaxOpenConns", 80, alternativeContext...),
+			PostgresPool:                      getPostgresPoolSettings("utxostore", alternativeContext...),
 			VerboseDebug:                      getBool("utxostore_verbose_debug", false, alternativeContext...),
 			UpdateTxMinedStatus:               getBool("utxostore_updateTxMinedStatus", true, alternativeContext...),
 			MaxMinedRoutines:                  getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
@@ -440,13 +465,17 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DistributorTimeout:          getDuration("distributor_timeout", 30*time.Second, alternativeContext...),
 		},
 		Pruner: PrunerSettings{
-			GRPCAddress:                getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
-			GRPCListenAddress:          getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
-			UTXODefensiveEnabled:       getBool("pruner_utxoDefensiveEnabled", false, alternativeContext...),                 // Defensive mode off by default (production)
-			UTXODefensiveBatchReadSize: getInt("pruner_utxoDefensiveBatchReadSize", 10000, alternativeContext...),            // Batch size for child verification
-			UTXOChunkSize:              getInt("pruner_utxoChunkSize", 1000, alternativeContext...),                          // Chunk size for batch operations
-			UTXOChunkGroupLimit:        getInt("pruner_utxoChunkGroupLimit", 10, alternativeContext...),                      // Process 10 chunks in parallel
-			UTXOProgressLogInterval:    getDuration("pruner_utxoProgressLogInterval", 30*time.Second, alternativeContext...), // Progress every 30s
+			GRPCAddress:                     getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
+			GRPCListenAddress:               getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
+			BlockAssemblyWaitTimeout:        getDuration("pruner_blockAssemblyWaitTimeout", 10*time.Minute, alternativeContext...), // Wait up to 10 minutes for BA to be ready
+			ConnectionPoolWarningThreshold:  getFloat64("pruner_connectionPoolWarningThreshold", 0.7, alternativeContext...),       // Warn/adjust when exceeding 70% of connection pool
+			ForceIgnoreBlockPersisterHeight: getBool("pruner_force_ignore_block_persister_height", false, alternativeContext...),   // Force ignore block persister (default: false)
+			UTXODefensiveEnabled:            getBool("pruner_utxoDefensiveEnabled", false, alternativeContext...),                  // Defensive mode off by default (production)
+			UTXODefensiveBatchReadSize:      getInt("pruner_utxoDefensiveBatchReadSize", 10000, alternativeContext...),             // Batch size for child verification
+			UTXOChunkSize:                   getInt("pruner_utxoChunkSize", 1000, alternativeContext...),                           // Chunk size for batch operations
+			UTXOChunkGroupLimit:             getInt("pruner_utxoChunkGroupLimit", 10, alternativeContext...),                       // Process 10 chunks in parallel
+			UTXOProgressLogInterval:         getDuration("pruner_utxoProgressLogInterval", 30*time.Second, alternativeContext...),  // Progress every 30s
+			UTXOPartitionQueries:            getInt("pruner_utxoPartitionQueries", 0, alternativeContext...),                       // 0 = auto-detect based on CPU cores
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
@@ -458,7 +487,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ProcessTxMetaUsingCacheBatchSize:          getInt("subtreevalidation_processTxMetaUsingCache_BatchSize", 1024, alternativeContext...),
 			ProcessTxMetaUsingCacheConcurrency:        getInt("subtreevalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
 			ProcessTxMetaUsingCacheMissingTxThreshold: getInt("subtreevalidation_processTxMetaUsingCache_MissingTxThreshold", 1, alternativeContext...),
-			SubtreeBlockHeightRetention:               getUint32("subtreevalidation_subtreeBlockHeightRetention", globalBlockHeightRetention),
 			SubtreeDAHConcurrency:                     getInt("subtreevalidation_subtreeDAHConcurrency", 8, alternativeContext...),
 			TxMetaCacheEnabled:                        getBool("subtreevalidation_txMetaCacheEnabled", true, alternativeContext...),
 			TxMetaCacheMaxMB:                          getInt("txMetaCacheMaxMB", 256, alternativeContext...),
