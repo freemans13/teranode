@@ -129,8 +129,8 @@ func (s *SQL) GetBlockHeadersFromOldest(ctx context.Context, chainTipHash, targe
 				)
 				SELECT id FROM ChainBlocks
 			)
-		)				        
-		  AND id >= (SELECT id from blocks WHERE hash = $2)
+		)
+		  AND id > (SELECT id from blocks WHERE hash = $2)
 		ORDER BY height ASC
 		LIMIT $3
 	`

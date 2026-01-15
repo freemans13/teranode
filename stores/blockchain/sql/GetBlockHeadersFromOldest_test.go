@@ -39,12 +39,11 @@ func TestSQLGetBlockHeadersFromOldest(t *testing.T) {
 
 		genesisHash := tSettings.ChainCfgParams.GenesisHash
 
+		// When starting from genesis and target is also genesis, no headers should be returned (excluding the target)
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), genesisHash, genesisHash, 1)
 		require.NoError(t, err)
-		assert.Equal(t, 1, len(headers))
-		assert.Equal(t, 1, len(metas))
-		assert.Equal(t, genesisHash.String(), headers[0].Hash().String())
-		assert.Equal(t, uint32(0), metas[0].Height)
+		assert.Equal(t, 0, len(headers))
+		assert.Equal(t, 0, len(metas))
 	})
 
 	t.Run("single block chain - from block1", func(t *testing.T) {
@@ -57,17 +56,16 @@ func TestSQLGetBlockHeadersFromOldest(t *testing.T) {
 		_, _, err = s.StoreBlock(context.Background(), block1, "test_peer")
 		require.NoError(t, err)
 
+		// Starting from genesis (excluded) to block1, should return only block1
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), block1.Hash(), tSettings.ChainCfgParams.GenesisHash, 2)
 		require.NoError(t, err)
-		assert.Equal(t, 2, len(headers))
-		assert.Equal(t, 2, len(metas))
+		assert.Equal(t, 1, len(headers))
+		assert.Equal(t, 1, len(metas))
 
-		// Should return in ascending order: genesis first, then block1
-		assert.Equal(t, "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206", headers[0].Hash().String())
-		assert.Equal(t, uint32(0), metas[0].Height)
-		assert.Equal(t, block1.Header.Hash(), headers[1].Hash())
-		assert.Equal(t, uint32(1), metas[1].Height)
-		assert.Equal(t, "test_peer", metas[1].PeerID)
+		// Should return only block1 (genesis is the target/common ancestor and is excluded)
+		assert.Equal(t, block1.Header.Hash(), headers[0].Hash())
+		assert.Equal(t, uint32(1), metas[0].Height)
+		assert.Equal(t, "test_peer", metas[0].PeerID)
 	})
 
 	t.Run("multiple block chain - ascending order", func(t *testing.T) {
@@ -83,19 +81,18 @@ func TestSQLGetBlockHeadersFromOldest(t *testing.T) {
 		_, _, err = s.StoreBlock(context.Background(), block2, "test_peer")
 		require.NoError(t, err)
 
+		// Starting from genesis (excluded) to block2, should return block1 and block2
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), block2.Hash(), tSettings.ChainCfgParams.GenesisHash, 3)
 		require.NoError(t, err)
-		assert.Equal(t, 3, len(headers))
-		assert.Equal(t, 3, len(metas))
+		assert.Equal(t, 2, len(headers))
+		assert.Equal(t, 2, len(metas))
 
-		// Should return in ascending order: genesis, block1, block2
-		assert.Equal(t, "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206", headers[0].Hash().String())
-		assert.Equal(t, uint32(0), metas[0].Height)
-		assert.Equal(t, block1.Header.Hash(), headers[1].Hash())
-		assert.Equal(t, uint32(1), metas[1].Height)
-		assert.Equal(t, block2.Header.Hash(), headers[2].Hash())
-		assert.Equal(t, uint32(2), metas[2].Height)
-		assert.Equal(t, "test_peer", metas[2].PeerID)
+		// Should return in ascending order: block1, block2 (genesis is excluded as it's the target)
+		assert.Equal(t, block1.Header.Hash(), headers[0].Hash())
+		assert.Equal(t, uint32(1), metas[0].Height)
+		assert.Equal(t, block2.Header.Hash(), headers[1].Hash())
+		assert.Equal(t, uint32(2), metas[1].Height)
+		assert.Equal(t, "test_peer", metas[1].PeerID)
 	})
 
 	t.Run("limited headers - request fewer than available", func(t *testing.T) {
@@ -111,16 +108,15 @@ func TestSQLGetBlockHeadersFromOldest(t *testing.T) {
 		_, _, err = s.StoreBlock(context.Background(), block2, "test_peer")
 		require.NoError(t, err)
 
+		// Starting from block1 (excluded) to block2, should return only block2
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), block2.Hash(), block1.Hash(), 2)
 		require.NoError(t, err)
-		assert.Equal(t, 2, len(headers))
-		assert.Equal(t, 2, len(metas))
+		assert.Equal(t, 1, len(headers))
+		assert.Equal(t, 1, len(metas))
 
-		// Should return in ascending order: block1, block2 (starting from block1)
-		assert.Equal(t, block1.Header.Hash(), headers[0].Hash())
-		assert.Equal(t, uint32(1), metas[0].Height)
-		assert.Equal(t, block2.Header.Hash(), headers[1].Hash())
-		assert.Equal(t, uint32(2), metas[1].Height)
+		// Should return only block2 (block1 is the target/common ancestor and is excluded)
+		assert.Equal(t, block2.Header.Hash(), headers[0].Hash())
+		assert.Equal(t, uint32(2), metas[0].Height)
 	})
 
 	t.Run("fork scenario - alternative chain", func(t *testing.T) {
@@ -156,17 +152,16 @@ func TestSQLGetBlockHeadersFromOldest(t *testing.T) {
 		_, _, err = s.StoreBlock(context.Background(), block2Alt, "test_peer")
 		require.NoError(t, err)
 
+		// Starting from genesis (excluded) to block2Alt, should return block1 and block2Alt
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), block2Alt.Hash(), tSettings.ChainCfgParams.GenesisHash, 3)
 		require.NoError(t, err)
-		assert.Equal(t, 3, len(headers))
+		assert.Equal(t, 2, len(headers))
 
-		// Should return in ascending order: genesis, block1, block2Alt
-		assert.Equal(t, "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206", headers[0].Hash().String())
-		assert.Equal(t, uint32(0), metas[0].Height)
-		assert.Equal(t, block1.Header.Hash(), headers[1].Hash())
-		assert.Equal(t, uint32(1), metas[1].Height)
-		assert.Equal(t, block2Alt.Header.Hash(), headers[2].Hash())
-		assert.Equal(t, uint32(2), metas[2].Height)
+		// Should return in ascending order: block1, block2Alt (genesis is excluded as it's the target)
+		assert.Equal(t, block1.Header.Hash(), headers[0].Hash())
+		assert.Equal(t, uint32(1), metas[0].Height)
+		assert.Equal(t, block2Alt.Header.Hash(), headers[1].Hash())
+		assert.Equal(t, uint32(2), metas[1].Height)
 	})
 
 	t.Run("request more headers than available", func(t *testing.T) {
@@ -179,15 +174,14 @@ func TestSQLGetBlockHeadersFromOldest(t *testing.T) {
 		_, _, err = s.StoreBlock(context.Background(), block1, "test_peer")
 		require.NoError(t, err)
 
+		// Starting from genesis (excluded) to block1, should return only block1
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), block1.Hash(), tSettings.ChainCfgParams.GenesisHash, 10)
 		require.NoError(t, err)
-		assert.Equal(t, 2, len(headers)) // Only genesis and block1 available
+		assert.Equal(t, 1, len(headers)) // Only block1 (genesis is excluded)
 
-		// Should return in ascending order: genesis, block1
-		assert.Equal(t, "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206", headers[0].Hash().String())
-		assert.Equal(t, uint32(0), metas[0].Height)
-		assert.Equal(t, block1.Header.Hash(), headers[1].Hash())
-		assert.Equal(t, uint32(1), metas[1].Height)
+		// Should return only block1 (genesis is the target and is excluded)
+		assert.Equal(t, block1.Header.Hash(), headers[0].Hash())
+		assert.Equal(t, uint32(1), metas[0].Height)
 	})
 
 	t.Run("invalid block hash", func(t *testing.T) {
@@ -255,18 +249,17 @@ func TestSQLGetBlockHeadersFromOldestPostgreSQL(t *testing.T) {
 		storeTestBlocksForOldest(t, s)
 
 		tSettings := test.CreateBaseTestSettings(t)
+		// Starting from genesis (excluded) to block2, should return block1 and block2
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), block2.Hash(), tSettings.ChainCfgParams.GenesisHash, 3)
 		require.NoError(t, err)
-		require.Len(t, headers, 3)
-		require.Len(t, metas, 3)
+		require.Len(t, headers, 2)
+		require.Len(t, metas, 2)
 
-		// Should return in ascending order: genesis, block1, block2
-		assert.Equal(t, "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206", headers[0].Hash().String())
-		assert.Equal(t, uint32(0), metas[0].Height)
-		assert.Equal(t, block1.Header.Hash(), headers[1].Hash())
-		assert.Equal(t, uint32(1), metas[1].Height)
-		assert.Equal(t, block2.Header.Hash(), headers[2].Hash())
-		assert.Equal(t, uint32(2), metas[2].Height)
+		// Should return in ascending order: block1, block2 (genesis is excluded as it's the target)
+		assert.Equal(t, block1.Header.Hash(), headers[0].Hash())
+		assert.Equal(t, uint32(1), metas[0].Height)
+		assert.Equal(t, block2.Header.Hash(), headers[1].Hash())
+		assert.Equal(t, uint32(2), metas[1].Height)
 	})
 
 	t.Run("postgres container - fork scenario", func(t *testing.T) {
@@ -296,18 +289,17 @@ func TestSQLGetBlockHeadersFromOldestPostgreSQL(t *testing.T) {
 		require.NoError(t, err)
 
 		tSettings := test.CreateBaseTestSettings(t)
+		// Starting from genesis (excluded) to block2Alt, should return block1 and block2Alt
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), block2Alt.Hash(), tSettings.ChainCfgParams.GenesisHash, 3)
 		require.NoError(t, err)
-		require.Len(t, headers, 3)
-		require.Len(t, metas, 3)
+		require.Len(t, headers, 2)
+		require.Len(t, metas, 2)
 
-		// Should return in ascending order: genesis, block1, block2Alt
-		assert.Equal(t, "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206", headers[0].Hash().String())
-		assert.Equal(t, uint32(0), metas[0].Height)
-		assert.Equal(t, block1.Header.Hash(), headers[1].Hash())
-		assert.Equal(t, uint32(1), metas[1].Height)
-		assert.Equal(t, block2Alt.Header.Hash(), headers[2].Hash())
-		assert.Equal(t, uint32(2), metas[2].Height)
+		// Should return in ascending order: block1, block2Alt (genesis is excluded as it's the target)
+		assert.Equal(t, block1.Header.Hash(), headers[0].Hash())
+		assert.Equal(t, uint32(1), metas[0].Height)
+		assert.Equal(t, block2Alt.Header.Hash(), headers[1].Hash())
+		assert.Equal(t, uint32(2), metas[1].Height)
 	})
 
 	t.Run("postgres container - large locator array", func(t *testing.T) {
@@ -317,14 +309,15 @@ func TestSQLGetBlockHeadersFromOldestPostgreSQL(t *testing.T) {
 		// Generate a longer chain for stress testing
 		generatedBlocks := generateBlockHeaders(t, s, 10)
 
-		// Test retrieving from a block that allows getting 5 headers forward
-		// Use the last block as chain tip, and start from 5 blocks before the end
+		// Test retrieving headers starting from a block (excluded) up to the last block
+		// Use the last block as chain tip, and start from 5 blocks before the end (excluded)
+		// This should return 4 headers (the 4 blocks after startBlock, up to lastBlock)
 		lastBlock := generatedBlocks[len(generatedBlocks)-1]
-		startBlock := generatedBlocks[len(generatedBlocks)-5] // 5 blocks from the end
+		startBlock := generatedBlocks[len(generatedBlocks)-5] // 5 blocks from the end (excluded as common ancestor)
 		headers, metas, err := s.GetBlockHeadersFromOldest(context.Background(), lastBlock.Hash(), startBlock.Hash(), 5)
 		require.NoError(t, err)
-		require.Len(t, headers, 5)
-		require.Len(t, metas, 5)
+		require.Len(t, headers, 4) // Should return 4 headers (startBlock is excluded)
+		require.Len(t, metas, 4)
 
 		// Verify ascending order
 		for i := 1; i < len(headers); i++ {
@@ -365,6 +358,7 @@ func BenchmarkGetBlockHeadersFromOldest(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// Starting from genesis (excluded) to block2, fetches block1 and block2
 		_, _, err = s.GetBlockHeadersFromOldest(ctx, block2.Hash(), tSettings.ChainCfgParams.GenesisHash, 3)
 		require.NoError(b, err)
 	}

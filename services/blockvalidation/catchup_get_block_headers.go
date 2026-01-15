@@ -331,13 +331,22 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 			break
 		}
 
-		// Append new headers to our collection
+		// Append new headers to our collection (with deduplication for buggy peers)
 		if len(blockHeaders) > 0 {
-			allCatchupHeaders = append(allCatchupHeaders, blockHeaders...)
-			totalHeadersFetched += len(blockHeaders)
+			startIdx := 0
+			// Skip first header if it duplicates the last accumulated header (handles peers with old buggy code)
+			if len(allCatchupHeaders) > 0 && blockHeaders[0].Hash().IsEqual(allCatchupHeaders[len(allCatchupHeaders)-1].Hash()) {
+				startIdx = 1
+				u.logger.Debugf("[catchup][%s] skipping duplicate header %s at start of batch %d (peer sent overlapping results)", chainTipHash.String(), blockHeaders[0].Hash().String(), iteration)
+			}
+
+			if startIdx < len(blockHeaders) {
+				allCatchupHeaders = append(allCatchupHeaders, blockHeaders[startIdx:]...)
+				totalHeadersFetched += len(blockHeaders) - startIdx
+			}
 
 			// Check if we've reached the target block
-			for _, header := range blockHeaders {
+			for _, header := range blockHeaders[startIdx:] {
 				if header.Hash().IsEqual(blockUpTo.Hash()) {
 					reachedTarget = true
 					stopReason = "Reached target block"
