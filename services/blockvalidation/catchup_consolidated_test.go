@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,7 +15,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
-	"github.com/stretchr/testify/require"
 )
 
 // ============================================================================
@@ -111,13 +111,13 @@ func TestCatchup_CrashDuringBlockValidation(t *testing.T) {
 	})
 }
 
-// TestCatchup_ConcurrentCatchupLock tests the catchup lock mechanism
-func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
-	t.Run("OnlyOneCatchupAllowed", func(t *testing.T) {
+// TestCatchup_ConcurrentCatchupSessions tests that multiple catchup sessions can run concurrently
+func TestCatchup_ConcurrentCatchupSessions(t *testing.T) {
+	t.Run("MultipleCatchupsAllowed", func(t *testing.T) {
 		server, _, _, cleanup := setupTestCatchupServer(t)
 		defer cleanup()
 
-		// First catchup acquires lock
+		// First catchup registers session
 		header1 := testhelpers.CreateTestHeaders(t, 1)[0]
 		ctx1 := &CatchupContext{
 			blockUpTo: &model.Block{
@@ -126,10 +126,11 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 			},
 		}
 
-		err1 := server.acquireCatchupLock(ctx1)
-		assert.NoError(t, err1, "First catchup should acquire lock")
+		ctx1.sessionID = "session1"
+		ctx1.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+		server.registerCatchupSession(ctx1)
 
-		// Second catchup should fail
+		// Second catchup should also succeed (concurrent sessions allowed)
 		header2 := testhelpers.CreateTestHeaders(t, 1)[0]
 		ctx2 := &CatchupContext{
 			blockUpTo: &model.Block{
@@ -138,14 +139,23 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 			},
 		}
 
-		err2 := server.acquireCatchupLock(ctx2)
-		assert.Error(t, err2, "Second catchup should fail to acquire lock")
-		assert.Contains(t, err2.Error(), "another catchup is currently in progress")
+		ctx2.sessionID = "session2"
+		ctx2.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+		server.registerCatchupSession(ctx2)
 
-		// Release first lock
-		server.releaseCatchupLock(ctx1, &err1)
+		// Verify both sessions are active
+		server.activeCatchupSessionsMu.RLock()
+		assert.Len(t, server.activeCatchupSessions, 2, "Both sessions should be active")
+		assert.Contains(t, server.activeCatchupSessions, "session1")
+		assert.Contains(t, server.activeCatchupSessions, "session2")
+		server.activeCatchupSessionsMu.RUnlock()
 
-		// Third catchup should now succeed
+		// Release both sessions
+		var noErr error = nil
+		server.unregisterCatchupSession(ctx1, &noErr)
+		server.unregisterCatchupSession(ctx2, &noErr)
+
+		// Third catchup should succeed after releases
 		header3 := testhelpers.CreateTestHeaders(t, 1)[0]
 		ctx3 := &CatchupContext{
 			blockUpTo: &model.Block{
@@ -154,11 +164,12 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 			},
 		}
 
-		err3 := server.acquireCatchupLock(ctx3)
-		assert.NoError(t, err3, "Third catchup should acquire lock after release")
+		ctx3.sessionID = "session3"
+		ctx3.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+		server.registerCatchupSession(ctx3)
 
 		// Clean up
-		server.releaseCatchupLock(ctx3, &err3)
+		server.unregisterCatchupSession(ctx3, &noErr)
 	})
 
 	t.Run("ConcurrentCatchupAttempts", func(t *testing.T) {
@@ -167,13 +178,12 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 
 		numGoroutines := 10
 		successCount := 0
-		failureCount := 0
 		mu := sync.Mutex{}
 
 		var wg sync.WaitGroup
 		wg.Add(numGoroutines)
 
-		// Start multiple goroutines trying to acquire catchup lock
+		// Start multiple goroutines registering catchup sessions
 		for i := 0; i < numGoroutines; i++ {
 			go func(id int) {
 				defer wg.Done()
@@ -186,34 +196,31 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 					},
 				}
 
-				err := server.acquireCatchupLock(ctx)
+				ctx.sessionID = fmt.Sprintf("session%d", id)
+				ctx.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+				server.registerCatchupSession(ctx)
 				mu.Lock()
-				if err == nil {
-					successCount++
-					// Hold lock briefly
-					time.Sleep(10 * time.Millisecond)
-					server.releaseCatchupLock(ctx, &err)
-				} else {
-					failureCount++
-				}
+				successCount++
+				// Hold session briefly
+				time.Sleep(10 * time.Millisecond)
+				var noErr error = nil
+				server.unregisterCatchupSession(ctx, &noErr)
 				mu.Unlock()
 			}(i)
 		}
 
 		wg.Wait()
 
-		// Exactly one should succeed
-		assert.Equal(t, 1, successCount,
-			"Exactly one goroutine should acquire lock")
-		assert.Equal(t, numGoroutines-1, failureCount,
-			"All other goroutines should fail")
+		// All should succeed since concurrent sessions are allowed
+		assert.Equal(t, numGoroutines, successCount,
+			"All goroutines should successfully register sessions")
 	})
 
-	t.Run("LockReleasedOnPanic", func(t *testing.T) {
+	t.Run("SessionUnregisteredOnPanic", func(t *testing.T) {
 		server, _, _, cleanup := setupTestCatchupServer(t)
 		defer cleanup()
 
-		// Function that panics but defers lock release
+		// Function that panics but defers session unregister
 		runCatchupWithPanic := func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -229,11 +236,13 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 				},
 			}
 
-			err := server.acquireCatchupLock(ctx)
-			require.NoError(t, err)
+			ctx.sessionID = "panic-session"
+			ctx.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+			server.registerCatchupSession(ctx)
 
-			// Ensure lock is released even on panic
-			defer server.releaseCatchupLock(ctx, &err)
+			// Ensure session is unregistered even on panic
+			var err error
+			defer server.unregisterCatchupSession(ctx, &err)
 
 			// Simulate panic during catchup
 			panic("simulated catchup failure")
@@ -242,7 +251,13 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 		// Run the function that panics
 		runCatchupWithPanic()
 
-		// Lock should be released, so new catchup should succeed
+		// Session should be unregistered, verify by checking active sessions
+		server.activeCatchupSessionsMu.RLock()
+		assert.NotContains(t, server.activeCatchupSessions, "panic-session",
+			"Session should be unregistered after panic")
+		server.activeCatchupSessionsMu.RUnlock()
+
+		// New catchup should succeed
 		header2 := testhelpers.CreateTestHeaders(t, 1)[0]
 		ctx2 := &CatchupContext{
 			blockUpTo: &model.Block{
@@ -251,9 +266,11 @@ func TestCatchup_ConcurrentCatchupLock(t *testing.T) {
 			},
 		}
 
-		err := server.acquireCatchupLock(ctx2)
-		assert.NoError(t, err, "Lock should be released after panic")
-		server.releaseCatchupLock(ctx2, &err)
+		ctx2.sessionID = "session2"
+		ctx2.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+		server.registerCatchupSession(ctx2)
+		var noErr error = nil
+		server.unregisterCatchupSession(ctx2, &noErr)
 	})
 }
 
@@ -266,26 +283,29 @@ func TestCatchup_HeaderCacheCorruption(t *testing.T) {
 		// Create test headers
 		testHeaders := testhelpers.CreateTestHeaders(t, 10)
 
+		// Create a session-specific cache (each session has its own)
+		sessionCache := catchup.NewHeaderChainCache(server.logger)
+
 		// Build initial cache
-		err := server.headerChainCache.BuildFromHeaders(
+		err := sessionCache.BuildFromHeaders(
 			testHeaders, server.settings.BlockValidation.PreviousBlockHeaderCount)
 		assert.NoError(t, err, "Initial cache build should succeed")
 
 		// Simulate cache corruption by clearing it
-		server.headerChainCache.Clear()
+		sessionCache.Clear()
 
 		// Try to get validation headers - should return nil for non-existent entry
-		cachedHeaders, exists := server.headerChainCache.GetValidationHeaders(testHeaders[5].Hash())
+		cachedHeaders, exists := sessionCache.GetValidationHeaders(testHeaders[5].Hash())
 		assert.False(t, exists, "Should not find headers in cleared cache")
 		assert.Nil(t, cachedHeaders, "Should return nil for missing cache entry")
 
 		// Rebuild cache
-		err = server.headerChainCache.BuildFromHeaders(
+		err = sessionCache.BuildFromHeaders(
 			testHeaders, server.settings.BlockValidation.PreviousBlockHeaderCount)
 		assert.NoError(t, err, "Cache rebuild should succeed")
 
 		// Verify cache is working again
-		cachedHeaders, exists = server.headerChainCache.GetValidationHeaders(testHeaders[5].Hash())
+		cachedHeaders, exists = sessionCache.GetValidationHeaders(testHeaders[5].Hash())
 		assert.True(t, exists, "Should find headers after rebuild")
 		assert.NotNil(t, cachedHeaders, "Should return headers after rebuild")
 	})
@@ -304,21 +324,22 @@ func TestCatchup_HeaderCacheCorruption(t *testing.T) {
 			},
 			blockHeaders:       testHeaders,
 			commonAncestorHash: genesisHash, // Set common ancestor
+			headerChainCache:   catchup.NewHeaderChainCache(server.logger),
 		}
 
 		// Build cache
 		err := server.buildHeaderCache(catchupCtx)
 		assert.NoError(t, err)
 
-		// Verify cache has data
-		_, exists := server.headerChainCache.GetValidationHeaders(testHeaders[2].Hash())
+		// Verify cache has data (use session-specific cache)
+		_, exists := catchupCtx.headerChainCache.GetValidationHeaders(testHeaders[2].Hash())
 		assert.True(t, exists, "Cache should have data before cleanup")
 
 		// Cleanup should clear cache
 		server.cleanup(catchupCtx)
 
-		// Verify cache is cleared
-		_, exists = server.headerChainCache.GetValidationHeaders(testHeaders[2].Hash())
+		// Verify cache is cleared (use session-specific cache)
+		_, exists = catchupCtx.headerChainCache.GetValidationHeaders(testHeaders[2].Hash())
 		assert.False(t, exists, "Cache should be cleared after cleanup")
 	})
 }
@@ -438,21 +459,24 @@ func TestCatchup_MetricsAndTracking(t *testing.T) {
 
 		// Simulate multiple catchup attempts after crashes
 		for i := 0; i < 3; i++ {
+			header := testhelpers.CreateTestHeaders(t, 1)[0]
 			ctx := &CatchupContext{
 				blockUpTo: &model.Block{
-					Header: &model.BlockHeader{Nonce: uint32(i)},
+					Header: header,
 					Height: uint32(1000 + i),
 				},
 			}
 
-			err := server.acquireCatchupLock(ctx)
-			require.NoError(t, err)
+			ctx.sessionID = fmt.Sprintf("crash-session-%d", i)
+			ctx.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+			server.registerCatchupSession(ctx)
 
 			// Simulate catchup work
 			time.Sleep(10 * time.Millisecond)
 
-			// Release lock (simulating completion or crash recovery)
-			server.releaseCatchupLock(ctx, &err)
+			// Release session (simulating completion or crash recovery)
+			var noErr error = nil
+			server.unregisterCatchupSession(ctx, &noErr)
 		}
 
 		finalAttempts := server.catchupAttempts.Load()
@@ -477,12 +501,13 @@ func TestCatchup_MetricsAndTracking(t *testing.T) {
 			startTime: time.Now(),
 		}
 
-		err1 := server.acquireCatchupLock(ctx1)
-		require.NoError(t, err1)
+		ctx1.sessionID = "session1"
+		ctx1.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+		server.registerCatchupSession(ctx1)
 
 		// Simulate successful completion
 		var nilErr error = nil
-		server.releaseCatchupLock(ctx1, &nilErr)
+		server.unregisterCatchupSession(ctx1, &nilErr)
 
 		assert.Equal(t, initialSuccesses+1, server.catchupSuccesses.Load(),
 			"Should increment success counter")
@@ -495,15 +520,17 @@ func TestCatchup_MetricsAndTracking(t *testing.T) {
 				Height: 1001,
 			},
 			baseURL:   "http://peer2",
+			peerID:    "peer-2",
 			startTime: time.Now(),
 		}
 
-		err2 := server.acquireCatchupLock(ctx2)
-		require.NoError(t, err2)
+		ctx2.sessionID = "session2"
+		ctx2.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+		server.registerCatchupSession(ctx2)
 
 		// Simulate failure
 		failErr := assert.AnError
-		server.releaseCatchupLock(ctx2, &failErr)
+		server.unregisterCatchupSession(ctx2, &failErr)
 
 		// Success count should not change for failure
 		assert.Equal(t, initialSuccesses+1, server.catchupSuccesses.Load(),
@@ -553,6 +580,7 @@ func TestCatchup_ContextStateConsistency(t *testing.T) {
 			headersFetchResult: &catchup.Result{
 				Headers: testHeaders[1:], // Headers to be filtered
 			},
+			headerChainCache: catchup.NewHeaderChainCache(server.logger),
 		}
 
 		// Verify context consistency after various operations
@@ -589,8 +617,9 @@ func TestCatchup_ContextStateConsistency(t *testing.T) {
 				Header: header,
 				Height: 1000,
 			},
-			baseURL:   "http://test-peer",
-			startTime: time.Now(),
+			baseURL:          "http://test-peer",
+			startTime:        time.Now(),
+			headerChainCache: catchup.NewHeaderChainCache(server.logger),
 		}
 
 		// Should handle cleanup gracefully even with nil fields
@@ -641,20 +670,27 @@ func TestCatchup_ErrorPropagation(t *testing.T) {
 				Height: 1000,
 			},
 			baseURL:   "http://test-peer",
+			peerID:    "test-peer-1",
 			startTime: time.Now(),
 		}
 
-		// Acquire lock
-		err := server.acquireCatchupLock(catchupCtx)
-		require.NoError(t, err)
+		// Register session
+		catchupCtx.sessionID = "error-session"
+		catchupCtx.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+		server.registerCatchupSession(catchupCtx)
 
 		// Simulate error during catchup
 		catchupErr := assert.AnError
 
-		// Cleanup should still release lock on error
-		server.releaseCatchupLock(catchupCtx, &catchupErr)
+		// Cleanup should still unregister session on error
+		server.unregisterCatchupSession(catchupCtx, &catchupErr)
 
-		// Verify lock is released by trying to acquire again
+		// Verify session is unregistered by checking active sessions
+		server.activeCatchupSessionsMu.RLock()
+		assert.NotContains(t, server.activeCatchupSessions, "error-session")
+		server.activeCatchupSessionsMu.RUnlock()
+
+		// New session should succeed
 		header2 := testhelpers.CreateTestHeaders(t, 1)[0]
 		ctx2 := &CatchupContext{
 			blockUpTo: &model.Block{
@@ -663,8 +699,10 @@ func TestCatchup_ErrorPropagation(t *testing.T) {
 			},
 		}
 
-		err2 := server.acquireCatchupLock(ctx2)
-		assert.NoError(t, err2, "Lock should be released after error")
-		server.releaseCatchupLock(ctx2, &err2)
+		ctx2.sessionID = "session2"
+		ctx2.headerChainCache = catchup.NewHeaderChainCache(server.logger)
+		server.registerCatchupSession(ctx2)
+		var noErr error = nil
+		server.unregisterCatchupSession(ctx2, &noErr)
 	})
 }

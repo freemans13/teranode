@@ -256,3 +256,19 @@ func (m *MockUnminedTxIterator) Close() error {
 	args := m.Called()
 	return args.Error(0)
 }
+
+func (m *MockUtxostore) SpendBatchDirect(ctx context.Context, requests []*BatchSpendRequest) ([]*BatchSpendResult, error) {
+	args := m.Called(ctx, requests)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*BatchSpendResult), args.Error(1)
+}
+
+func (m *MockUtxostore) CreateBatchDirect(ctx context.Context, requests []*BatchCreateRequest) ([]*BatchCreateResult, error) {
+	args := m.Called(ctx, requests)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*BatchCreateResult), args.Error(1)
+}

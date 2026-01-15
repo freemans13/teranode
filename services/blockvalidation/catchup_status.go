@@ -88,20 +88,32 @@ type CatchupStatus struct {
 }
 
 // getCatchupStatusInternal returns the current catchup status for API/dashboard consumption.
+// When multiple sessions are active, returns the status of the most recent session.
 // This method is thread-safe and can be called from HTTP handlers.
 //
 // Returns:
 //   - *CatchupStatus: Current catchup status, or a status with IsCatchingUp=false if no catchup is active
 func (u *Server) getCatchupStatusInternal() *CatchupStatus {
-	status := &CatchupStatus{
-		IsCatchingUp: u.isCatchingUp.Load(),
+	// Get the active catchup sessions and previous attempt (thread-safe)
+	u.activeCatchupSessionsMu.RLock()
+	var ctx *CatchupContext
+	var latestStartTime time.Time
+
+	// Find the most recent session (latest startTime)
+	for _, session := range u.activeCatchupSessions {
+		if session.startTime.After(latestStartTime) {
+			latestStartTime = session.startTime
+			ctx = session
+		}
 	}
 
-	// Get the active catchup context and previous attempt (thread-safe)
-	u.activeCatchupCtxMu.RLock()
-	ctx := u.activeCatchupCtx
 	previousAttempt := u.previousCatchupAttempt
-	u.activeCatchupCtxMu.RUnlock()
+	isCatchingUp := len(u.activeCatchupSessions) > 0
+	u.activeCatchupSessionsMu.RUnlock()
+
+	status := &CatchupStatus{
+		IsCatchingUp: isCatchingUp,
+	}
 
 	// Include previous attempt if available (whether currently catching up or not)
 	if previousAttempt != nil {
@@ -113,21 +125,21 @@ func (u *Server) getCatchupStatusInternal() *CatchupStatus {
 		return status
 	}
 
-	// If context is nil (race condition or clearing), return not catching up
+	// If context is nil (no sessions found), return not catching up
 	if ctx == nil {
 		status.IsCatchingUp = false
 		return status
 	}
 
-	// Populate status from catchup context
+	// Populate status from most recent catchup session
 	status.PeerID = ctx.peerID
 	status.PeerURL = ctx.baseURL
 	status.TargetBlockHash = ctx.blockUpTo.Hash().String()
 	status.TargetBlockHeight = ctx.blockUpTo.Height
 	status.CurrentHeight = ctx.currentHeight
 	status.TotalBlocks = len(ctx.blockHeaders)
-	status.BlocksFetched = u.blocksFetched.Load()
-	status.BlocksValidated = u.blocksValidated.Load()
+	status.BlocksFetched = ctx.blocksFetched.Load()
+	status.BlocksValidated = ctx.blocksValidated.Load()
 	status.StartTime = ctx.startTime.UnixMilli()
 	status.DurationMs = time.Since(ctx.startTime).Milliseconds()
 	status.ForkDepth = ctx.forkDepth

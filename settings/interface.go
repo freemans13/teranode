@@ -401,6 +401,7 @@ type UtxoStoreSettings struct {
 	StoreBatcherDurationMillis        int
 	StoreBatcherSize                  int
 	UtxoBatchSize                     int
+	MaxAerospikeBatchSize             int // Maximum batch size for Aerospike batch operations (default: 1024)
 	IncrementBatcherSize              int
 	IncrementBatcherDurationMillis    int
 	SetDAHBatcherSize                 int

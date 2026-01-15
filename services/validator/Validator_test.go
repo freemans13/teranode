@@ -821,7 +821,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 			BlockHeights: make([]uint32, 0),
 		}, nil)
 
-		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID())
+		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID(), nil)
 		require.NoError(t, err)
 
 		expected := []uint32{1001, 1001, 1001}
@@ -859,7 +859,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 			BlockHeights: []uint32{768, 769},
 		}, nil).Once()
 
-		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID())
+		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID(), nil)
 		require.NoError(t, err)
 
 		expected := []uint32{125, 1001, 768}
@@ -926,7 +926,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 			},
 		}, nil).Once()
 
-		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, txNonExtended, txNonExtended.TxID())
+		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, txNonExtended, txNonExtended.TxID(), nil)
 		require.NoError(t, err)
 
 		expected := []uint32{125, 1001, 768}

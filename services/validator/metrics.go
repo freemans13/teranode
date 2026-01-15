@@ -64,6 +64,22 @@ var (
 	// analysis of batch processing efficiency and optimization opportunities. Units: seconds.
 	prometheusTransactionValidateBatch prometheus.Histogram
 
+	// prometheusValidatorLevelBatch measures the time spent validating an entire level of transactions in batch mode.
+	// This histogram tracks level-by-level batch validation performance for block validation with transaction dependencies.
+	prometheusValidatorLevelBatch prometheus.Histogram
+
+	// prometheusValidatorLevelBatchSize tracks the number of transactions in each level batch validation call.
+	// This histogram provides insights into level sizes during block validation and helps optimize batch sizing.
+	prometheusValidatorLevelBatchSize prometheus.Histogram
+
+	// prometheusValidatorLevelBatchSuccess counts the number of transactions that successfully validated in level batch mode.
+	// This counter tracks successful transaction validations when using level-based batch processing.
+	prometheusValidatorLevelBatchSuccess prometheus.Counter
+
+	// prometheusValidatorLevelBatchConflicts counts the number of conflicting transactions detected in level batch mode.
+	// This counter tracks double-spend conflicts found during level-based batch validation.
+	prometheusValidatorLevelBatchConflicts prometheus.Counter
+
 	// prometheusTransactionSpendUtxos measures the time spent processing UTXO spending operations.
 	// This histogram tracks database operations for retrieving, validating, and marking UTXOs as spent
 	// during transaction validation. High values may indicate database performance issues. Units: seconds.
@@ -196,6 +212,45 @@ func _initPrometheusMetrics() {
 			Name:      "transactions_validate_batch",
 			Help:      "Histogram of transaction batch validation",
 			Buckets:   util.MetricsBucketsMilliSeconds,
+		},
+	)
+
+	// Level batch validation metrics
+	prometheusValidatorLevelBatch = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "level_batch_duration",
+			Help:      "Duration of level batch validation operations",
+			Buckets:   util.MetricsBucketsMilliSeconds,
+		},
+	)
+
+	prometheusValidatorLevelBatchSize = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "level_batch_size",
+			Help:      "Number of transactions in level batch validation call",
+			Buckets:   util.MetricsBucketsSizeSmall,
+		},
+	)
+
+	prometheusValidatorLevelBatchSuccess = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "level_batch_success_total",
+			Help:      "Total number of transactions successfully validated in level batch mode",
+		},
+	)
+
+	prometheusValidatorLevelBatchConflicts = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "level_batch_conflicts_total",
+			Help:      "Total number of conflicting transactions detected in level batch mode",
 		},
 	)
 

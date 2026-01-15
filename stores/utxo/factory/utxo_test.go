@@ -146,6 +146,14 @@ func (m *MockUTXOStore) MarkTransactionsOnLongestChain(ctx context.Context, txHa
 	return args.Error(0)
 }
 
+func (m *MockUTXOStore) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	return nil, nil
+}
+
+func (m *MockUTXOStore) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	return nil, nil
+}
+
 // TestNewStore_UnknownScheme tests handling of unknown database scheme
 func TestNewStore_UnknownScheme(t *testing.T) {
 	ctx := context.Background()

@@ -980,6 +980,12 @@ func (m *MockUTXOStore) SetBlockHeight(height uint32) error     { return nil }
 func (m *MockUTXOStore) GetBlockHeight() uint32                 { return 0 }
 func (m *MockUTXOStore) SetMedianBlockTime(height uint32) error { return nil }
 func (m *MockUTXOStore) GetMedianBlockTime() uint32             { return 0 }
+func (m *MockUTXOStore) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	return nil, nil
+}
+func (m *MockUTXOStore) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	return nil, nil
+}
 
 func (m *MockUTXOStore) GetBlockState() utxo.BlockState {
 	return utxo.BlockState{

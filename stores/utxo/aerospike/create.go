@@ -896,7 +896,14 @@ func (s *Store) storeExternallyWithLock(
 	}
 
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
-	_ = s.client.BatchOperate(batchPolicy, batchRecords)
+	batchErr := s.client.BatchOperate(batchPolicy, batchRecords)
+
+	// CRITICAL FIX: Check for batch-level errors that were previously ignored
+	if batchErr != nil {
+		s.logger.Errorf("[%s] Aerospike BatchOperate FAILED for tx %s: %v", funcName, bItem.txHash, batchErr)
+		utils.SafeSend[error](bItem.done, errors.NewStorageError("[%s] Aerospike batch operation failed for tx %s", funcName, bItem.txHash.String(), batchErr))
+		return
+	}
 
 	// Check results - KEY_EXISTS_ERROR means recovery (completing previous attempt)
 	hasFailures := false

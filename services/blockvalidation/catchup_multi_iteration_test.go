@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jarcoal/httpmock"
@@ -433,8 +434,8 @@ func TestCatchup_HeaderChainCacheWithMultiIteration(t *testing.T) {
 
 	// Verify chain can be validated by building cache
 	// This tests the original error scenario
-	cache := server.headerChainCache
-	cache.Clear()
+	// Create a new cache (each session has its own cache)
+	cache := catchup.NewHeaderChainCache(server.logger)
 
 	err = cache.BuildFromHeaders(result.Headers, 10)
 	assert.NoError(t, err, "Header chain cache should build successfully without chain breaks")

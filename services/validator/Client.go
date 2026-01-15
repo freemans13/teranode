@@ -33,6 +33,7 @@ import (
 
 	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/validator/validator_api"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -442,4 +443,59 @@ func (c *Client) validateTransactionViaHTTP(ctx context.Context, tx *bt.Tx, bloc
 	c.logger.Debugf("[ValidateWithOptions][%s] successfully validated using validator /tx endpoint", tx.TxID())
 
 	return nil
+}
+
+// ValidateMultiple validates multiple transactions with automatic dependency ordering via gRPC
+// TODO: This is a stub implementation that calls the validator service via gRPC
+func (c *Client) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
+	// TODO: Implement gRPC call to validator service's ValidateMultiple method
+	// For now, fall back to sequential validation
+	results := make(map[chainhash.Hash]*TxValidationResult)
+
+	for _, tx := range txs {
+		txHash := *tx.TxIDChainHash()
+		result := &TxValidationResult{
+			Success: false,
+		}
+
+		txMeta, err := c.ValidateWithOptions(ctx, tx, blockHeight, opts)
+		if err != nil {
+			result.Err = err
+		} else {
+			result.Success = true
+			result.TxMeta = txMeta
+		}
+
+		results[txHash] = result
+	}
+
+	return &MultiValidationResult{Results: results}, nil
+}
+
+// ValidateLevelBatch validates a batch of transactions at the same dependency level via gRPC
+// TODO: This is a stub implementation that calls the validator service via gRPC
+func (c *Client) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {
+	// TODO: Implement gRPC call to validator service's ValidateLevelBatch method
+	// For now, fall back to sequential validation
+	results := make([]*LevelValidationResult, len(txs))
+
+	for i, tx := range txs {
+		txHash := tx.TxIDChainHash()
+		result := &LevelValidationResult{
+			TxHash:  txHash,
+			Success: false,
+		}
+
+		txMeta, err := c.ValidateWithOptions(ctx, tx, blockHeight, opts)
+		if err != nil {
+			result.Err = err
+		} else {
+			result.Success = true
+			result.TxMeta = txMeta
+		}
+
+		results[i] = result
+	}
+
+	return results, nil
 }

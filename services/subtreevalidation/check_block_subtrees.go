@@ -643,238 +643,102 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		}
 	}
 
-	u.logger.Infof("[processTransactionsInLevels] Organizing %d transactions into dependency levels", len(allTransactions))
+	u.logger.Infof("[processTransactionsInLevels] Preparing to validate %d transactions using Validator.ValidateMultiple", len(allTransactions))
 
-	// Use the existing prepareTxsPerLevel logic to organize transactions by dependency levels
-	maxLevel, txsPerLevel, err := u.selectPrepareTxsPerLevel(ctx, missingTxs)
-	if err != nil {
-		return errors.NewProcessingError("[processTransactionsInLevels] Failed to prepare transactions per level", err)
-	}
-
-	// PHASE 2 OPTIMIZATION: Track total count before clearing slices
-	totalTxCount := len(allTransactions)
-
-	// PHASE 2 OPTIMIZATION: Clear original slices to allow GC
-	// Transactions are now organized in txsPerLevel, original slices no longer needed
-	// These explicit nils help GC reclaim memory earlier rather than waiting for function scope end
-	allTransactions = nil //nolint:ineffassign // Intentional early GC hint
-	missingTxs = nil      //nolint:ineffassign // Intentional early GC hint
-
-	u.logger.Infof("[processTransactionsInLevels] Processing transactions across %d levels", maxLevel+1)
-
-	validatorOptions := []validator.Option{
-		validator.WithSkipPolicyChecks(true),
-		validator.WithCreateConflicting(true),
-		validator.WithIgnoreLocked(true),
-	}
-
+	// Get FSM state to determine block assembly flag
 	currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
 	if err != nil {
 		return errors.NewProcessingError("[processTransactionsInLevels] Failed to get FSM current state", err)
 	}
 
-	// During legacy syncing or catching up, disable adding transactions to block assembly
-	if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
-		validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
+	// Build validator options for ValidateMultiple
+	opts := &validator.Options{
+		AutoExtendTransactions: true, // Enable automatic transaction extension
+		SkipPolicyChecks:       true,
+		CreateConflicting:      true,
+		IgnoreLocked:           true,
+		ParentMetadata:         make(map[chainhash.Hash]*validator.ParentTxMetadata),
+		AddTXToBlockAssembly:   true,
 	}
 
-	// Pre-process validation options
-	processedValidatorOptions := validator.ProcessOptions(validatorOptions...)
+	// During legacy syncing or catching up, disable adding transactions to block assembly
+	if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
+		opts.AddTXToBlockAssembly = false
+	}
+
+	// ⭐ NEW: Use ValidateMultiple for batch validation with automatic level organization
+	multiResult, err := u.validatorClient.ValidateMultiple(ctx, allTransactions, blockHeight, opts)
+	if err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] ValidateMultiple failed: %v", err)
+	}
 
 	// Track validation results
 	var (
-		errorsFound      atomic.Uint64
-		addedToOrphanage atomic.Uint64
+		successCount     int
+		errorsFound      int
+		addedToOrphanage int
 	)
 
-	// Process each level in series, but all transactions within a level in parallel
-	for level := uint32(0); level <= maxLevel; level++ {
-		levelTxs := txsPerLevel[level]
-		if len(levelTxs) == 0 {
-			continue
-		}
+	// Process results from ValidateMultiple
+	for txHash, txResult := range multiResult.Results {
+		if txResult.Success {
+			successCount++
+			u.logger.Debugf("[processTransactionsInLevels] Successfully validated transaction %s", txHash.String())
+		} else {
+			// Handle validation errors
+			err := txResult.Err
+			u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", txHash.String(), err)
 
-		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions", level+1, maxLevel+1, len(levelTxs))
-
-		// PHASE 2 OPTIMIZATION: Extend transactions with in-block parent outputs
-		// This avoids Aerospike fetches for intra-block dependencies (~500MB+ savings)
-		// Build parent map ONCE per level and reuse for all children (O(n) instead of O(n²))
-		if level > 0 {
-			// Build parent map once for the entire level
-			parentMap := buildParentMapFromLevel(txsPerLevel[level-1])
-
-			if len(parentMap) > 0 {
-				u.logger.Debugf("[processTransactionsInLevels] Built parent map with %d transactions for level %d extension", len(parentMap), level)
-
-				totalExtended := 0
-				for _, mTx := range levelTxs {
-					if mTx.tx != nil {
-						extendedCount := extendTxWithInBlockParents(mTx.tx, parentMap)
-						totalExtended += extendedCount
-					}
-				}
-
-				if totalExtended > 0 {
-					u.logger.Debugf("[processTransactionsInLevels] Extended %d inputs from previous level for level %d", totalExtended, level)
-				}
-			}
-		}
-
-		// Process all transactions at this level in parallel
-		g, gCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
-
-		for _, mTx := range levelTxs {
-			tx := mTx.tx
-			if tx == nil {
-				return errors.NewProcessingError("[processTransactionsInLevels] transaction is nil at level %d", level)
+			// TX_EXISTS is not an error - transaction was already validated
+			if errors.Is(err, errors.ErrTxExists) {
+				u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping", txHash.String())
+				continue
 			}
 
-			// Skip transactions that were already validated (found in cache or UTXO store)
-			if txMetaSlice[mTx.idx].isSet {
-				u.logger.Debugf("[processTransactionsInLevels] Transaction %s already validated (pre-check), skipping", tx.TxIDChainHash().String())
-				return nil
-			}
+			// Count all other errors
+			errorsFound++
 
-			g.Go(func() error {
-				// Use existing blessMissingTransaction logic for validation
-				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
-				if err != nil {
-					u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
-
-					// TX_EXISTS is not an error - transaction was already validated
-					if errors.Is(err, errors.ErrTxExists) {
-						u.logger.Debugf("[processTransactionsInLevels] Transaction %s already exists, skipping", tx.TxIDChainHash().String())
-						return nil
-					}
-
-					// Count all other errors
-					errorsFound.Add(1)
-
-					// Handle missing parent transactions by adding to orphanage
-					if errors.Is(err, errors.ErrTxMissingParent) {
-						isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(gCtx, blockchain.FSMStateRUNNING)
-						if runningErr == nil && isRunning {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
-							if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
-								addedToOrphanage.Add(1)
+			// Handle missing parent transactions by adding to orphanage
+			if errors.Is(err, errors.ErrTxMissingParent) {
+				isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
+				if runningErr == nil && isRunning {
+					u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", txHash.String())
+					// Find the transaction in allTransactions to add to orphanage
+					for _, tx := range allTransactions {
+						if tx != nil && *tx.TxIDChainHash() == txHash {
+							if u.orphanage.Set(txHash, tx) {
+								addedToOrphanage++
 							} else {
-								u.logger.Warnf("[processTransactionsInLevels] Failed to add transaction %s to orphanage - orphanage is full", tx.TxIDChainHash().String())
+								u.logger.Warnf("[processTransactionsInLevels] Failed to add transaction %s to orphanage - orphanage is full", txHash.String())
 							}
-						} else {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
+							break
 						}
-					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
-						// Log truly invalid transactions
-						u.logger.Warnf("[processTransactionsInLevels] Invalid transaction detected: %s: %v", tx.TxIDChainHash().String(), err)
-
-						if errors.Is(err, errors.ErrTxInvalid) {
-							return err
-						}
-					} else {
-						u.logger.Errorf("[processTransactionsInLevels] Processing error for transaction %s: %v", tx.TxIDChainHash().String(), err)
 					}
-
-					return nil // Don't fail the entire level
-				}
-
-				if txMeta == nil {
-					u.logger.Debugf("[processTransactionsInLevels] Transaction metadata is nil for %s", tx.TxIDChainHash().String())
 				} else {
-					u.logger.Debugf("[processTransactionsInLevels] Successfully validated transaction %s", tx.TxIDChainHash().String())
+					u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", txHash.String())
 				}
-
-				return nil
-			})
-		}
-
-		// Fail early if we get an actual tx error thrown
-		if err = g.Wait(); err != nil {
-			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level+1, err)
-		}
-
-		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))
-
-		// PHASE 2 OPTIMIZATION: Release grandparent level (level-2) after current level succeeds
-		// Keep current level (being processed) and parent level (level-1) for safety
-		// This ensures we always hold at most 2 levels: current + parents
-		// Level-2 (grandparents) is safe to release because their outputs are in UTXO store
-		if level > 1 {
-			txsPerLevel[level-2] = nil
-			u.logger.Debugf("[processTransactionsInLevels] Released memory for level %d (grandparent level)", level-2)
+			} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
+				// Log truly invalid transactions and fail
+				u.logger.Warnf("[processTransactionsInLevels] Invalid transaction detected: %s: %v", txHash.String(), err)
+				return err
+			} else {
+				u.logger.Errorf("[processTransactionsInLevels] Processing error for transaction %s: %v", txHash.String(), err)
+			}
 		}
 	}
 
-	if errorsFound.Load() > 0 {
-		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
+	if errorsFound > 0 {
+		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound, addedToOrphanage)
 	}
 
-	u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions", totalTxCount)
+	u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions (validated: %d)", len(allTransactions), successCount)
 
 	txMetaSlice = nil //nolint:ineffassign // Intentional early GC hint
 
 	return nil
 }
 
-// buildParentMapFromLevel builds a hash map of all transactions in a level for quick parent lookups.
-// This map is built ONCE per level and reused for all child transactions in the next level,
-// avoiding O(n²) complexity from rebuilding the map for every child transaction.
-func buildParentMapFromLevel(parentLevelTxs []missingTx) map[chainhash.Hash]*bt.Tx {
-	if len(parentLevelTxs) == 0 {
-		return nil
-	}
-
-	parentMap := make(map[chainhash.Hash]*bt.Tx, len(parentLevelTxs))
-	for _, mTx := range parentLevelTxs {
-		if mTx.tx != nil {
-			parentMap[*mTx.tx.TxIDChainHash()] = mTx.tx
-		}
-	}
-	return parentMap
-}
-
-// extendTxWithInBlockParents extends a transaction's inputs with parent output data
-// from a pre-built parent map, avoiding Aerospike fetches for intra-block dependencies.
-// This is a critical optimization that eliminates ~500MB+ of UTXO store fetches per block.
-//
-// Sets the transaction as extended only if ALL inputs are successfully extended.
-func extendTxWithInBlockParents(tx *bt.Tx, parentMap map[chainhash.Hash]*bt.Tx) int {
-	if tx == nil || len(parentMap) == 0 {
-		return 0
-	}
-
-	// Skip if already extended
-	if tx.IsExtended() {
-		return 0
-	}
-
-	extendedCount := 0
-	allInputsExtended := true
-
-	for _, input := range tx.Inputs {
-		parentHash := input.PreviousTxIDChainHash()
-		if parentHash == nil {
-			continue // Input doesn't need extension
-		}
-
-		// Try to extend this input
-		parentTx, found := parentMap[*parentHash]
-		if !found || int(input.PreviousTxOutIndex) >= len(parentTx.Outputs) {
-			allInputsExtended = false
-			continue
-		}
-
-		// Extend this input
-		output := parentTx.Outputs[input.PreviousTxOutIndex]
-		input.PreviousTxSatoshis = output.Satoshis
-		input.PreviousTxScript = output.LockingScript
-		extendedCount++
-	}
-
-	// Only mark as fully extended if we successfully extended all inputs
-	if allInputsExtended && extendedCount > 0 {
-		tx.SetExtended(true)
-	}
-
-	return extendedCount
-}
+// NOTE: buildParentMapFromLevel and extendTxWithInBlockParents functions have been moved
+// to services/validator/tx_extender.go as part of the ValidateMultiple refactoring.
+// These optimizations are now handled automatically by Validator.ValidateMultiple when
+// AutoExtendTransactions option is enabled.

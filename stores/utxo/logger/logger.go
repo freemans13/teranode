@@ -324,3 +324,17 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 
 	return err
 }
+
+func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	results, err := s.store.SpendBatchDirect(ctx, requests)
+	s.logger.Debugf("[UTXOStore][logger][SpendBatchDirect] requests count %d err %v : %s", len(requests), err, caller())
+
+	return results, err
+}
+
+func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	results, err := s.store.CreateBatchDirect(ctx, requests)
+	s.logger.Debugf("[UTXOStore][logger][CreateBatchDirect] requests count %d err %v : %s", len(requests), err, caller())
+
+	return results, err
+}

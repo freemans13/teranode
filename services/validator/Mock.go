@@ -26,6 +26,7 @@ import (
 	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
@@ -116,3 +117,55 @@ func (m *MockValidatorClient) ValidateWithOptions(ctx context.Context, tx *bt.Tx
 // TriggerBatcher implements the batcher trigger interface for testing.
 // This is a no-op in the mock implementation as no actual batching occurs.
 func (m *MockValidatorClient) TriggerBatcher() {}
+
+// ValidateMultiple implements mock multi-transaction validation with error injection support.
+// If errors are queued, they are popped and applied to transactions in order.
+func (m *MockValidatorClient) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
+	m.ErrorsMu.Lock()
+	defer m.ErrorsMu.Unlock()
+
+	results := make(map[chainhash.Hash]*TxValidationResult)
+	for _, tx := range txs {
+		txHash := *tx.TxIDChainHash()
+
+		// Check if we have queued errors to inject
+		if len(m.Errors) > 0 {
+			// Pop error from queue
+			err := m.Errors[0]
+			m.Errors = m.Errors[1:]
+
+			results[txHash] = &TxValidationResult{
+				Success: false,
+				TxMeta:  nil,
+				Err:     err,
+			}
+			continue
+		}
+
+		// No error - create UTXO and return success
+		txMeta, err := m.UtxoStore.Create(context.Background(), tx, 0)
+		results[txHash] = &TxValidationResult{
+			Success: err == nil,
+			TxMeta:  txMeta,
+			Err:     err,
+		}
+	}
+	return &MultiValidationResult{Results: results}, nil
+}
+
+// ValidateLevelBatch implements mock level-based batch validation
+// Always returns success for all transactions without performing any actual validation
+func (m *MockValidatorClient) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {
+	results := make([]*LevelValidationResult, len(txs))
+	for i, tx := range txs {
+		txHash := tx.TxIDChainHash()
+		txMeta, err := m.UtxoStore.Create(context.Background(), tx, 0)
+		results[i] = &LevelValidationResult{
+			TxHash:  txHash,
+			TxMeta:  txMeta,
+			Success: err == nil,
+			Err:     err,
+		}
+	}
+	return results, nil
+}

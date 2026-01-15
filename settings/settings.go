@@ -407,6 +407,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UpdateTxMinedStatus:               getBool("utxostore_updateTxMinedStatus", true, alternativeContext...),
 			MaxMinedRoutines:                  getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
 			MaxMinedBatchSize:                 getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
+			MaxAerospikeBatchSize:             getInt("utxostore_maxAerospikeBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment:    getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
 			DisableDAHCleaner:                 getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 		},

@@ -2743,6 +2743,108 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	return nil
 }
 
+// SpendBatchDirect performs batch spending of UTXOs for multiple transactions.
+// For the SQL store (typically used in tests), this is implemented as a simple loop
+// over individual Spend() calls. Performance is not critical for test environments.
+func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	if len(requests) == 0 {
+		return nil, nil
+	}
+
+	results := make([]*utxo.BatchSpendResult, len(requests))
+
+	for i, req := range requests {
+		result := &utxo.BatchSpendResult{
+			TxHash:  req.Tx.TxIDChainHash(),
+			Success: false,
+		}
+		results[i] = result
+
+		// Call the regular Spend method
+		spends, err := s.Spend(ctx, req.Tx, req.BlockHeight, req.IgnoreFlags)
+		if err != nil {
+			result.Err = err
+			result.Spends = spends // Include partial results if any
+
+			// Extract conflicting transaction ID if it's a conflict error
+			if errors.Is(err, errors.ErrTxConflicting) {
+				// Parse the conflicting transaction ID from spend results
+				for _, spend := range spends {
+					if spend != nil && spend.ConflictingTxID != nil {
+						result.ConflictingTxID = spend.ConflictingTxID
+						break
+					}
+				}
+			}
+			continue
+		}
+
+		// Success
+		result.Success = true
+		result.Spends = spends
+	}
+
+	return results, nil
+}
+
+// CreateBatchDirect performs batch creation of UTXOs for multiple transactions.
+// For the SQL store (typically used in tests), this is implemented as a simple loop
+// over individual Create() calls. Performance is not critical for test environments.
+func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	if len(requests) == 0 {
+		return nil, nil
+	}
+
+	results := make([]*utxo.BatchCreateResult, len(requests))
+
+	for i, req := range requests {
+		result := &utxo.BatchCreateResult{
+			TxHash:  req.Tx.TxIDChainHash(),
+			Success: false,
+		}
+		results[i] = result
+
+		// Build CreateOptions from the request
+		var opts []utxo.CreateOption
+		if req.Conflicting {
+			opts = append(opts, utxo.WithConflicting(true))
+		}
+		if req.Locked {
+			opts = append(opts, utxo.WithLocked(true))
+		}
+		if len(req.BlockIDs) > 0 {
+			// Build MinedBlockInfo from the request
+			minedBlockInfos := make([]utxo.MinedBlockInfo, len(req.BlockIDs))
+			for j, blockID := range req.BlockIDs {
+				info := utxo.MinedBlockInfo{
+					BlockID: blockID,
+				}
+				if j < len(req.BlockHeights) {
+					info.BlockHeight = req.BlockHeights[j]
+				}
+				if j < len(req.SubtreeIdxs) {
+					info.SubtreeIdx = req.SubtreeIdxs[j]
+				}
+				minedBlockInfos[j] = info
+			}
+			opts = append(opts, utxo.WithMinedBlockInfo(minedBlockInfos...))
+		}
+
+		// Call the regular Create method
+		txMeta, err := s.Create(ctx, req.Tx, req.BlockHeight, opts...)
+		if err != nil {
+			result.Err = err
+			continue
+		}
+
+		// Success
+		result.Success = true
+		result.TxMeta = txMeta
+	}
+
+	return results, nil
+}
+
 // RawDB returns the underlying *usql.DB connection. For test/debug use only.
 func (s *Store) RawDB() *usql.DB {
 	return s.db

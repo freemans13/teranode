@@ -182,6 +182,36 @@ func (v *TopologicalOrderValidator) GetMedianBlockTime() uint32 {
 // TriggerBatcher implements validator.Interface (no-op).
 func (v *TopologicalOrderValidator) TriggerBatcher() {}
 
+// ValidateMultiple validates multiple transactions sequentially, checking topological order.
+func (v *TopologicalOrderValidator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *validator.Options) (*validator.MultiValidationResult, error) {
+	results := make(map[chainhash.Hash]*validator.TxValidationResult)
+	for _, tx := range txs {
+		txMeta, err := v.ValidateWithOptions(ctx, tx, blockHeight, opts)
+		results[*tx.TxIDChainHash()] = &validator.TxValidationResult{
+			Success: err == nil,
+			TxMeta:  txMeta,
+			Err:     err,
+		}
+	}
+	return &validator.MultiValidationResult{Results: results}, nil
+}
+
+// ValidateLevelBatch validates a batch of transactions at the same dependency level.
+func (v *TopologicalOrderValidator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *validator.Options) ([]*validator.LevelValidationResult, error) {
+	results := make([]*validator.LevelValidationResult, len(txs))
+	for i, tx := range txs {
+		txHash := tx.TxIDChainHash()
+		txMeta, err := v.ValidateWithOptions(ctx, tx, blockHeight, opts)
+		results[i] = &validator.LevelValidationResult{
+			TxHash:  txHash,
+			TxMeta:  txMeta,
+			Success: err == nil,
+			Err:     err,
+		}
+	}
+	return results, nil
+}
+
 // TestCheckBlockSubtreesLevelBasedLargeBlock benchmarks CheckBlockSubtrees with level-based processor
 // using 10 million transactions across 10 subtrees.
 func TestCheckBlockSubtreesLevelBasedLargeBlock(t *testing.T) {

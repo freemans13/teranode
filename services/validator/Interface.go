@@ -28,9 +28,59 @@ import (
 	"context"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 )
+
+// TxValidationResult contains the validation result for a single transaction
+// in a multi-transaction validation operation
+type TxValidationResult struct {
+	// Success indicates whether the transaction validated successfully
+	Success bool
+
+	// TxMeta contains the transaction metadata if validation was successful
+	// This field is nil if validation failed
+	TxMeta *meta.Data
+
+	// ConflictingTxID contains the hash of the conflicting transaction if
+	// validation failed due to a double-spend conflict. This field is nil
+	// if there was no conflict or if validation failed for another reason
+	ConflictingTxID *chainhash.Hash
+
+	// Err contains the validation error if validation failed
+	// This field is nil if validation was successful
+	Err error
+}
+
+// MultiValidationResult contains the validation results for multiple transactions
+type MultiValidationResult struct {
+	// Results maps transaction hashes to their validation results
+	// Each entry contains success status, metadata, conflict info, and any errors
+	Results map[chainhash.Hash]*TxValidationResult
+}
+
+// LevelValidationResult contains the validation result for a single transaction
+// in a level-based batch validation operation
+type LevelValidationResult struct {
+	// TxHash is the transaction hash
+	TxHash *chainhash.Hash
+
+	// TxMeta contains the transaction metadata if validation succeeded
+	// This field is nil if validation failed
+	TxMeta *meta.Data
+
+	// ConflictingTxID contains the hash of the conflicting transaction if
+	// validation failed due to a double-spend conflict
+	ConflictingTxID *chainhash.Hash
+
+	// Success indicates whether the transaction validated successfully
+	Success bool
+
+	// Err contains the validation error if validation failed
+	// This field is nil if validation was successful
+	Err error
+}
 
 // Interface defines the core validation functionality required for Bitcoin transaction validation.
 // Any implementation of this interface must provide comprehensive transaction validation
@@ -87,6 +137,45 @@ type Interface interface {
 	//   - *meta.Data: Transaction metadata including validation results and processing information
 	//   - error: Validation errors if transaction violates consensus rules or policy constraints
 	ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight uint32, validationOptions *Options) (*meta.Data, error)
+
+	// ValidateMultiple validates multiple transactions with automatic dependency ordering
+	// and batch processing. This method organizes transactions by dependency levels (DAG)
+	// and processes each level in sequence, enabling efficient validation of transaction
+	// sets with complex dependencies.
+	//
+	// The validation process includes:
+	// - Automatic transaction dependency analysis and level organization
+	// - Optional transaction extension with in-block parent outputs (when AutoExtendTransactions is true)
+	// - Batch UTXO operations (single database roundtrip per dependency level)
+	// - Memory-efficient processing with optional batch size limits
+	// - Parent metadata optimization to skip UTXO fetches for in-block parents
+	//
+	// Parameters:
+	//   - ctx: Context for the validation operation, supports cancellation and timeouts
+	//   - txs: Slice of Bitcoin transactions to validate, can have interdependencies
+	//   - blockHeight: Current block height for validation context and consensus rule application
+	//   - opts: Validation options including AutoExtendTransactions, MaxBatchSize, and ParentMetadata
+	//
+	// Returns:
+	//   - *MultiValidationResult: Per-transaction results including success, metadata, conflicts, and errors
+	//   - error: Critical errors that prevent validation (e.g., internal failures), not individual tx failures
+	ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error)
+
+	// ValidateLevelBatch validates a batch of transactions at the same dependency level
+	// This method assumes all transactions in the batch are at the same level in the dependency
+	// graph (i.e., they don't depend on each other). It performs optimized batch operations
+	// for UTXO spend/create operations.
+	//
+	// Parameters:
+	//   - ctx: Context for the validation operation, supports cancellation and timeouts
+	//   - txs: Slice of Bitcoin transactions at the same dependency level
+	//   - blockHeight: Current block height for validation context
+	//   - opts: Validation options including ParentMetadata for optimization
+	//
+	// Returns:
+	//   - []*LevelValidationResult: Validation results for each transaction in the batch
+	//   - error: Critical errors that prevent batch validation
+	ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error)
 
 	// GetBlockHeight returns the current block height known to the validator service.
 	// This height is used for validation context and consensus rule application, and should
@@ -162,6 +251,56 @@ func (mv *MockValidator) Validate(ctx context.Context, tx *bt.Tx, blockHeight ui
 //   - error: Always returns nil
 func (mv *MockValidator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight uint32, validationOptions *Options) (*meta.Data, error) {
 	return util.TxMetaDataFromTx(tx)
+}
+
+// ValidateMultiple implements mock multi-transaction validation
+// Always returns success for all transactions without performing any actual validation
+// Parameters:
+//   - ctx: Context for validation (unused in mock)
+//   - txs: Transactions to validate (unused in mock)
+//   - blockHeight: Block height for validation context (unused in mock)
+//   - opts: Validation options (unused in mock)
+//
+// Returns:
+//   - *MultiValidationResult: Mock results with all transactions marked as successful
+//   - error: Always returns nil
+func (mv *MockValidator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
+	results := make(map[chainhash.Hash]*TxValidationResult)
+	for _, tx := range txs {
+		txMeta, _ := util.TxMetaDataFromTx(tx)
+		results[*tx.TxIDChainHash()] = &TxValidationResult{
+			Success: true,
+			TxMeta:  txMeta,
+			Err:     nil,
+		}
+	}
+	return &MultiValidationResult{Results: results}, nil
+}
+
+// ValidateLevelBatch implements mock level-based batch validation
+// Always returns success for all transactions without performing any actual validation
+// Parameters:
+//   - ctx: Context for validation (unused in mock)
+//   - txs: Transactions to validate (unused in mock)
+//   - blockHeight: Block height for validation context (unused in mock)
+//   - opts: Validation options (unused in mock)
+//
+// Returns:
+//   - []*LevelValidationResult: Mock results with all transactions marked as successful
+//   - error: Always returns nil
+func (mv *MockValidator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {
+	results := make([]*LevelValidationResult, len(txs))
+	for i, tx := range txs {
+		txHash := tx.TxIDChainHash()
+		txMeta, _ := util.TxMetaDataFromTx(tx)
+		results[i] = &LevelValidationResult{
+			TxHash:  txHash,
+			TxMeta:  txMeta,
+			Success: true,
+			Err:     nil,
+		}
+	}
+	return results, nil
 }
 
 // GetBlockHeight implements mock block height retrieval

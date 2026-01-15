@@ -7,6 +7,16 @@ validation operations.
 */
 package validator
 
+import (
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+)
+
+// ParentTxMetadata holds metadata about a parent transaction needed for validation
+// This allows the validator to skip UTXO store lookups for in-block parents
+type ParentTxMetadata struct {
+	BlockHeight uint32 // The block height where this transaction was mined
+}
+
 // Options defines the configuration options for validation operations
 type Options struct {
 	// SkipUtxoCreation determines whether UTXO creation should be skipped
@@ -30,6 +40,24 @@ type Options struct {
 
 	// IgnoreLocked determines whether to ignore transactions marked as locked when spending
 	IgnoreLocked bool
+
+	// ParentMetadata provides pre-fetched metadata for parent transactions
+	// When provided, the validator will check this map before calling utxoStore.Get()
+	// This enables validation to proceed without UTXO store lookups for in-block parents
+	// Key: parent transaction hash, Value: metadata (block height)
+	ParentMetadata map[chainhash.Hash]*ParentTxMetadata
+
+	// AutoExtendTransactions determines whether transactions should be automatically extended
+	// with in-block parent output data. When true, the validator will use ParentMetadata
+	// to pre-populate transaction inputs with parent output information, eliminating the
+	// need for UTXO store fetches for in-block dependencies (~500MB+ savings per block)
+	AutoExtendTransactions bool
+
+	// MaxBatchSize limits the maximum number of transactions to process in a single batch
+	// When set to 0 (default), all transactions are processed in one batch
+	// For large transaction sets, setting this value helps control memory usage by
+	// processing transactions in smaller batches sequentially
+	MaxBatchSize int
 }
 
 // Option defines a function type for setting options

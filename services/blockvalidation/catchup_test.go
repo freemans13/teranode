@@ -1055,9 +1055,10 @@ func TestCatchup(t *testing.T) {
 		utxoStore:          mockUTXOStore,
 		forkManager:        NewForkManager(ulogger.TestLogger{}, tSettings),
 		processBlockNotify: ttlcache.New[chainhash.Hash, bool](),
-		stats:              gocore.NewStat("test"),
-		isCatchingUp:       atomic.Bool{},
-		catchupAttempts:    atomic.Int64{},
+		stats:                   gocore.NewStat("test"),
+		validationSemaphore:     make(chan struct{}, 1),
+		activeCatchupSessions:   make(map[string]*CatchupContext),
+		catchupAttempts:         atomic.Int64{},
 		catchupSuccesses:   atomic.Int64{},
 	}
 
@@ -1229,8 +1230,7 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 			stats:               gocore.NewStat("test"),
 			peerCircuitBreakers: catchup.NewPeerCircuitBreakers(cbConfig),
-			headerChainCache:    catchup.NewHeaderChainCache(ulogger.TestLogger{}),
-			isCatchingUp:        atomic.Bool{},
+			activeCatchupSessions:   make(map[string]*CatchupContext),
 			catchupAttempts:     atomic.Int64{},
 			catchupSuccesses:    atomic.Int64{},
 		}
@@ -2251,22 +2251,39 @@ func TestCatchup_MemoryLimitPreCheck(t *testing.T) {
 	})
 }
 
-// TestCatchup_PreventsConcurrentOperations tests that only one catchup can run at a time
-func TestCatchup_PreventsConcurrentOperations(t *testing.T) {
+// TestCatchup_AllowsConcurrentDownloads tests that multiple catchup sessions can download concurrently
+// but validate sequentially
+func TestCatchup_AllowsConcurrentDownloads(t *testing.T) {
 	server, _, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
 
-	ctx := context.Background()
+	// Verify that multiple sessions can be registered (they'll validate sequentially via semaphore)
+	ctx1 := &CatchupContext{
+		sessionID:        "session1",
+		blockUpTo:        createTestBlock(t),
+		headerChainCache: catchup.NewHeaderChainCache(ulogger.TestLogger{}),
+	}
+	ctx2 := &CatchupContext{
+		sessionID:        "session2",
+		blockUpTo:        createTestBlock(t),
+		headerChainCache: catchup.NewHeaderChainCache(ulogger.TestLogger{}),
+	}
 
-	// Start first catchup (simulate by setting the flag)
-	server.isCatchingUp.Store(true)
+	// Register both sessions - this should work fine
+	server.registerCatchupSession(ctx1)
+	server.registerCatchupSession(ctx2)
 
-	// Try to start second catchup
-	block := createTestBlock(t)
-	err := server.catchup(ctx, block, "", "http://peer1:8080")
+	// Verify both are registered
+	server.activeCatchupSessionsMu.RLock()
+	assert.Len(t, server.activeCatchupSessions, 2)
+	assert.Contains(t, server.activeCatchupSessions, "session1")
+	assert.Contains(t, server.activeCatchupSessions, "session2")
+	server.activeCatchupSessionsMu.RUnlock()
 
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "another catchup is currently in progress")
+	// Clean up
+	var noErr error
+	server.unregisterCatchupSession(ctx1, &noErr)
+	server.unregisterCatchupSession(ctx2, &noErr)
 }
 
 // TestCatchup_MetricsTracking tests that catchup metrics are properly tracked
@@ -3087,8 +3104,8 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 		stats:               gocore.NewStat("test"),
 		peerCircuitBreakers: catchup.NewPeerCircuitBreakers(catchup.DefaultCircuitBreakerConfig()),
-		headerChainCache:    catchup.NewHeaderChainCache(ulogger.TestLogger{}),
-		isCatchingUp:        atomic.Bool{},
+		validationSemaphore:     make(chan struct{}, 1),
+		activeCatchupSessions:   make(map[string]*CatchupContext),
 		catchupAttempts:     atomic.Int64{},
 		catchupSuccesses:    atomic.Int64{},
 		catchupStatsMu:      sync.RWMutex{},
@@ -3183,8 +3200,8 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 		stats:               gocore.NewStat("test"),
 		peerCircuitBreakers: circuitBreakers,
-		headerChainCache:    catchup.NewHeaderChainCache(ulogger.TestLogger{}),
-		isCatchingUp:        atomic.Bool{},
+		validationSemaphore:     make(chan struct{}, 1),
+		activeCatchupSessions:   make(map[string]*CatchupContext),
 		catchupAttempts:     atomic.Int64{},
 		catchupSuccesses:    atomic.Int64{},
 		catchupStatsMu:      sync.RWMutex{},
@@ -3611,5 +3628,133 @@ func TestSuboptimalCommonAncestorCausesHeightCalculationIssue(t *testing.T) {
 		t.Logf("With the fix, checkpoint validation should work correctly")
 	} else {
 		t.Logf("Checkpoint validation passed - the fix works!")
+	}
+}
+
+// TestCatchup_MemoryLimitAfterDuplicateRemoval tests that the memory limit check
+// happens AFTER duplicate removal, not before. This prevents premature termination
+// when the raw header count exceeds the limit but the actual headers to append
+// (after removing duplicates) would fit within the limit.
+//
+// Bug scenario:
+// - allCatchupHeaders has 10,000 headers (from iteration 1)
+// - maxAccumulatedHeaders is 10,001
+// - Iteration 2 returns [header9999, header10000] (2 headers, first is duplicate)
+// - BUGGY: 10,000 + 2 = 10,002 > 10,001 → truncates to 1, appends DUPLICATE header9999
+// - FIXED: After duplicate removal, only header10000 is new → 10,000 + 1 = 10,001 → appends correctly
+func TestCatchup_MemoryLimitAfterDuplicateRemoval(t *testing.T) {
+	ctx := context.Background()
+
+	// Create test server
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	// Set memory limit to 10,001 - just enough for 10,000 + 1 new header after duplicate removal
+	// But with the bug, 10,000 + 2 = 10,002 > 10,001 triggers premature truncation
+	const maxHeaders = 10_001
+	server.settings.BlockValidation.CatchupMaxAccumulatedHeaders = maxHeaders
+
+	// Build a chain of 10,002 headers (indices 0-10001)
+	// Iteration 1: returns 10,000 headers (0-9999)
+	// Iteration 2: returns 2 headers (9999 duplicate, 10000 new)
+	numHeaders := 10_002
+	allHeaders := testhelpers.CreateTestHeaders(t, numHeaders)
+
+	// Create target block (last header in chain)
+	targetBlock := &model.Block{
+		Header: allHeaders[numHeaders-1],
+		Height: uint32(numHeaders),
+	}
+
+	// Create "best block" - the starting point for catchup
+	bestBlock := &model.Block{
+		Header: allHeaders[0],
+		Height: 1,
+	}
+
+	// Mock blockchain client calls
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Header.Hash()).Return(false, nil)
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
+
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		bestBlock.Header,
+		&model.BlockHeaderMeta{Height: bestBlock.Height, ID: 1},
+		nil,
+	)
+
+	locatorHashes := []*chainhash.Hash{bestBlock.Header.Hash()}
+	mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, errors.NewServiceError("not found")).Maybe()
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	// Track which iteration we're on
+	callCount := 0
+
+	httpmock.RegisterResponder(
+		"GET",
+		`=~^http://test-peer/headers_from_common_ancestor/.*`,
+		func(req *http.Request) (*http.Response, error) {
+			callCount++
+
+			var headers []*model.BlockHeader
+
+			if callCount == 1 {
+				// First iteration: return exactly 10,000 headers (0-9999)
+				// This is maxBlockHeadersPerRequest, so it will continue to iteration 2
+				headers = allHeaders[0:10_000]
+			} else {
+				// Second iteration: return headers 9999-10000 (2 headers)
+				// First header (9999) is a duplicate of last from iteration 1
+				// Header 10000 is new
+				// With bug: 10,000 + 2 = 10,002 > 10,001 → truncates to 1, appends duplicate
+				// With fix: After removing duplicate, 10,000 + 1 = 10,001 ≤ 10,001 → appends new header
+				headers = allHeaders[9999:10001]
+			}
+
+			headerBytes := testhelpers.HeadersToBytes(headers)
+			return httpmock.NewBytesResponse(200, headerBytes), nil
+		},
+	)
+
+	// Execute catchup
+	result, _, err := server.catchupGetBlockHeaders(ctx, targetBlock, "peer-test-001", "http://test-peer")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	t.Logf("Result: %d headers, stop reason: %s, iterations: %d", len(result.Headers), result.StopReason, callCount)
+
+	// Check for duplicates in the result - this is the key bug indicator
+	seenHashes := make(map[chainhash.Hash]int)
+	for i, h := range result.Headers {
+		hash := *h.Hash()
+		if prevIdx, exists := seenHashes[hash]; exists {
+			t.Errorf("BUG DETECTED: Duplicate header at indices %d and %d (hash: %s)",
+				prevIdx, i, hash.String())
+		}
+		seenHashes[hash] = i
+	}
+
+	// Verify we have the expected number of headers
+	assert.Equal(t, maxHeaders, len(result.Headers),
+		"Should have exactly %d headers after memory limit enforcement", maxHeaders)
+
+	// Verify headers are sequential (no gaps, no duplicates)
+	for i := 0; i < len(result.Headers) && i < len(allHeaders); i++ {
+		expectedHash := allHeaders[i].Hash()
+		actualHash := result.Headers[i].Hash()
+		assert.True(t, expectedHash.IsEqual(actualHash),
+			"Header at index %d should be allHeaders[%d], got different hash", i, i)
+	}
+
+	// The last header should be header 10000 (index 10000), not header 9999 repeated
+	if len(result.Headers) > 0 {
+		lastHeader := result.Headers[len(result.Headers)-1]
+		expectedLastHeader := allHeaders[10000] // With fix, should be header 10000
+
+		assert.True(t, lastHeader.Hash().IsEqual(expectedLastHeader.Hash()),
+			"Last header should be header 10000 (unique), not a duplicate of header 9999")
 	}
 }

@@ -37,7 +37,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/blockvalidation_api"
-	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
@@ -543,7 +542,8 @@ func TestServer_catchup(t *testing.T) {
 			utxoStore:           utxoStore,
 			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
-			headerChainCache:    catchup.NewHeaderChainCache(logger),
+			validationSemaphore:     make(chan struct{}, 1),
+		activeCatchupSessions:   make(map[string]*CatchupContext),
 			subtreeStore:        subtreeStore,
 		}
 
@@ -1739,7 +1739,10 @@ func TestHealth_IncludesCatchupStatus(t *testing.T) {
 	server.lastCatchupResult = true
 	server.catchupStatsMu.Unlock()
 
-	server.isCatchingUp.Store(false)
+	// No active sessions means not catching up
+	server.activeCatchupSessionsMu.Lock()
+	server.activeCatchupSessions = make(map[string]*CatchupContext)
+	server.activeCatchupSessionsMu.Unlock()
 
 	status, details, err := server.Health(ctx, false)
 

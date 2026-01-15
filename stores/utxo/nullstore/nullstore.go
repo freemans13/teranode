@@ -203,3 +203,27 @@ func (m *NullStore) PreserveTransactions(ctx context.Context, txIDs []chainhash.
 func (m *NullStore) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
 	return nil
 }
+
+func (m *NullStore) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpendRequest) ([]*utxo.BatchSpendResult, error) {
+	results := make([]*utxo.BatchSpendResult, len(requests))
+	for i, req := range requests {
+		results[i] = &utxo.BatchSpendResult{
+			TxHash:  req.Tx.TxIDChainHash(),
+			Success: true,
+			Spends:  []*utxo.Spend{},
+		}
+	}
+	return results, nil
+}
+
+func (m *NullStore) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCreateRequest) ([]*utxo.BatchCreateResult, error) {
+	results := make([]*utxo.BatchCreateResult, len(requests))
+	for i, req := range requests {
+		results[i] = &utxo.BatchCreateResult{
+			TxHash:  req.Tx.TxIDChainHash(),
+			Success: true,
+			TxMeta:  &meta.Data{},
+		}
+	}
+	return results, nil
+}

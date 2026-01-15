@@ -3,6 +3,7 @@ package blockvalidation
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -31,6 +32,8 @@ const (
 )
 
 // CatchupContext holds all the state needed during a catchup operation
+// This context is session-specific, allowing multiple concurrent catchup sessions
+// to download blocks in parallel while maintaining sequential validation.
 type CatchupContext struct {
 	blockUpTo               *model.Block
 	baseURL                 string
@@ -46,6 +49,12 @@ type CatchupContext struct {
 	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
 	highestCheckpointHeight uint32 // Highest checkpoint height for validation checks
 	catchupError            error  // Any error encountered during catchup
+
+	// Session-specific state (moved from Server to enable concurrent sessions)
+	sessionID        string                      // Unique identifier for this catchup session
+	headerChainCache *catchup.HeaderChainCache   // Per-session header cache for validation
+	blocksFetched    atomic.Int64                // Number of blocks fetched in this session
+	blocksValidated  atomic.Int64                // Number of blocks validated in this session
 }
 
 // catchup orchestrates the complete blockchain synchronization process.
@@ -100,18 +109,22 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 	// Report catchup attempt to P2P service
 	u.reportCatchupAttempt(ctx, peerID)
 
+	// Generate unique session ID for tracking
+	sessionID := fmt.Sprintf("%s_%d", peerID, time.Now().UnixNano())
+
+	// Create session-specific context with isolated state
 	catchupCtx := &CatchupContext{
-		blockUpTo: blockUpTo,
-		baseURL:   baseURL,
-		peerID:    peerID,
-		startTime: time.Now(),
+		blockUpTo:        blockUpTo,
+		baseURL:          baseURL,
+		peerID:           peerID,
+		startTime:        time.Now(),
+		sessionID:        sessionID,
+		headerChainCache: catchup.NewHeaderChainCache(u.logger),
 	}
 
-	// Step 1: Acquire exclusive catchup lock
-	if err = u.acquireCatchupLock(catchupCtx); err != nil {
-		return err
-	}
-	defer u.releaseCatchupLock(catchupCtx, &err)
+	// Step 1: Register session and acquire validation lock (when needed)
+	u.registerCatchupSession(catchupCtx)
+	defer u.unregisterCatchupSession(catchupCtx, &err)
 
 	// Step 2: Fetch block headers from peer
 	if err = u.fetchHeaders(ctx, catchupCtx); err != nil {
@@ -215,52 +228,40 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 	return nil
 }
 
-// acquireCatchupLock ensures only one catchup runs at a time.
-// Sets the catchup flag and initializes metrics.
+// registerCatchupSession registers a new catchup session and initializes metrics.
+// Multiple sessions can be active simultaneously (downloading concurrently).
 //
 // Parameters:
-//   - ctx: Catchup context containing operation state
-//
-// Returns:
-//   - error: If another catchup is already in progress
-func (u *Server) acquireCatchupLock(ctx *CatchupContext) error {
-	if !u.isCatchingUp.CompareAndSwap(false, true) {
-		return errors.NewCatchupInProgressError("[catchup][%s] another catchup is currently in progress", ctx.blockUpTo.Hash().String())
-	}
-
+//   - ctx: Catchup context containing session state
+func (u *Server) registerCatchupSession(ctx *CatchupContext) {
 	// Initialize metrics (check for nil in tests)
 	if prometheusCatchupActive != nil {
 		prometheusCatchupActive.Set(1)
 	}
 	u.catchupAttempts.Add(1)
 
-	// Store the active catchup context for status reporting
-	u.activeCatchupCtxMu.Lock()
-	u.activeCatchupCtx = ctx
-	u.activeCatchupCtxMu.Unlock()
+	// Register this session for status reporting
+	u.activeCatchupSessionsMu.Lock()
+	u.activeCatchupSessions[ctx.sessionID] = ctx
+	u.activeCatchupSessionsMu.Unlock()
 
-	// Reset progress counters
-	u.blocksFetched.Store(0)
-	u.blocksValidated.Store(0)
-
-	return nil
+	u.logger.Infof("[catchup][%s][session:%s] registered catchup session", ctx.blockUpTo.Hash().String(), ctx.sessionID)
 }
 
-// releaseCatchupLock releases the catchup lock and records metrics.
+// unregisterCatchupSession unregisters a catchup session and records metrics.
 // Updates health check tracking and records success/failure metrics.
 // If catchup failed, stores details in previousCatchupAttempt for dashboard display.
 //
 // Parameters:
-//   - ctx: Catchup context containing operation state
+//   - ctx: Catchup context containing session state
 //   - err: Pointer to error from catchup operation
-func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
-	u.isCatchingUp.Store(false)
+func (u *Server) unregisterCatchupSession(ctx *CatchupContext, err *error) {
 	if prometheusCatchupActive != nil {
 		prometheusCatchupActive.Set(0)
 	}
 
 	// Capture failure details for dashboard before clearing context
-	u.activeCatchupCtxMu.Lock()
+	u.activeCatchupSessionsMu.Lock()
 	if *err != nil && ctx != nil {
 		// Determine error type based on error characteristics
 		errorType := "unknown_error"
@@ -302,7 +303,7 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			ErrorType:         errorType,
 			AttemptTime:       time.Now().UnixMilli(),
 			DurationMs:        time.Since(ctx.startTime).Milliseconds(),
-			BlocksValidated:   u.blocksValidated.Load(),
+			BlocksValidated:   ctx.blocksValidated.Load(),
 		}
 
 		// Only store the error in the peer registry if it's a peer-related error
@@ -314,9 +315,9 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 		}
 	}
 
-	// Clear the active catchup context
-	u.activeCatchupCtx = nil
-	u.activeCatchupCtxMu.Unlock()
+	// Remove this session from active sessions
+	delete(u.activeCatchupSessions, ctx.sessionID)
+	u.activeCatchupSessionsMu.Unlock()
 
 	// Update catchup tracking for health checks
 	u.catchupStatsMu.Lock()
@@ -335,6 +336,8 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 	if prometheusCatchupDuration != nil {
 		prometheusCatchupDuration.WithLabelValues(ctx.baseURL, success).Observe(time.Since(ctx.startTime).Seconds())
 	}
+
+	u.logger.Infof("[catchup][%s][session:%s] unregistered catchup session", ctx.blockUpTo.Hash().String(), ctx.sessionID)
 }
 
 // fetchHeaders retrieves block headers from the peer using block locator pattern.
@@ -550,8 +553,8 @@ func (u *Server) buildHeaderCache(catchupCtx *CatchupContext) error {
 		}
 	}
 
-	// Build the cache
-	if err := u.headerChainCache.BuildFromHeaders(catchupCtx.blockHeaders, u.settings.BlockValidation.PreviousBlockHeaderCount); err != nil {
+	// Build the cache (using session-specific cache)
+	if err := catchupCtx.headerChainCache.BuildFromHeaders(catchupCtx.blockHeaders, u.settings.BlockValidation.PreviousBlockHeaderCount); err != nil {
 		return errors.NewProcessingError("[catchup][%s] failed to build header chain cache: %v", catchupCtx.blockUpTo.Hash().String(), err)
 	}
 
@@ -720,14 +723,27 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	// Create error group for concurrent operations
 	errorGroup, gCtx := errgroup.WithContext(ctx)
 
-	// Start fetching blocks
+	// Start fetching blocks (can run concurrently with other sessions)
 	errorGroup.Go(func() error {
 		return u.fetchBlocksConcurrently(gCtx, catchupCtx, validateBlocksChan, &size)
 	})
 
-	// Start validation in parallel
+	// Start validation with sequential ordering enforced across sessions
 	errorGroup.Go(func() error {
-		return u.validateBlocksOnChannel(validateBlocksChan, gCtx, catchupCtx, &size)
+		// Acquire validation semaphore to ensure sequential validation across sessions
+		// This blocks until the previous session's validation completes
+		u.logger.Infof("[catchup][%s][session:%s] waiting for validation semaphore", catchupCtx.blockUpTo.Hash().String(), catchupCtx.sessionID)
+		select {
+		case u.validationSemaphore <- struct{}{}:
+			u.logger.Infof("[catchup][%s][session:%s] acquired validation semaphore, starting validation", catchupCtx.blockUpTo.Hash().String(), catchupCtx.sessionID)
+			defer func() {
+				<-u.validationSemaphore
+				u.logger.Infof("[catchup][%s][session:%s] released validation semaphore", catchupCtx.blockUpTo.Hash().String(), catchupCtx.sessionID)
+			}()
+			return u.validateBlocksOnChannel(validateBlocksChan, gCtx, catchupCtx, &size)
+		case <-gCtx.Done():
+			return gCtx.Err()
+		}
 	})
 
 	// Wait for both operations to complete
@@ -740,15 +756,15 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 }
 
 // cleanup cleans up resources after catchup.
-// Clears the header chain cache to free memory.
+// Clears the session-specific header chain cache to free memory.
 //
 // Parameters:
 //   - catchupCtx: Catchup context for logging
 func (u *Server) cleanup(catchupCtx *CatchupContext) {
 	u.logger.Debugf("[catchup][%s] Step 9: Cleaning up resources", catchupCtx.blockUpTo.Hash().String())
 
-	// Clear the header chain cache
-	u.headerChainCache.Clear()
+	// Clear the session-specific header chain cache
+	catchupCtx.headerChainCache.Clear()
 
 	u.logger.Infof("[catchup][%s] Catchup completed successfully", catchupCtx.blockUpTo.Hash().String())
 }
@@ -921,8 +937,8 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan *model.Block, g
 				return errors.NewProcessingError("[catchup:validateBlocksOnChannel][%s] failed to wait for block assembly for block %s: %v", blockUpTo.Hash().String(), block.Hash().String(), err)
 			}
 
-			// Get cached headers for validation
-			cachedHeaders, _ := u.headerChainCache.GetValidationHeaders(block.Hash())
+			// Get cached headers for validation (from session-specific cache)
+			cachedHeaders, _ := catchupCtx.headerChainCache.GetValidationHeaders(block.Hash())
 
 			// Try quick validation if applicable
 			tryNormalValidation, err := u.tryQuickValidation(gCtx, block, catchupCtx, baseURL)
@@ -970,8 +986,8 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan *model.Block, g
 				u.logger.Infof("[catchup:validateBlocksOnChannel][%s] %d blocks remaining", blockUpTo.Hash().String(), remaining)
 			}
 
-			// Update validated counter for progress tracking
-			u.blocksValidated.Add(1)
+			// Update validated counter for progress tracking (session-specific)
+			catchupCtx.blocksValidated.Add(1)
 		}
 	}
 

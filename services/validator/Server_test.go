@@ -465,3 +465,44 @@ func (m *TestMockValidator) GetMedianBlockTime() uint32 {
 func (m *TestMockValidator) TriggerBatcher() {
 	// No-op implementation for testing
 }
+
+func (m *TestMockValidator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
+	results := make(map[chainhash.Hash]*TxValidationResult)
+	for _, tx := range txs {
+		txMeta := &meta.Data{}
+		if m.validateTxFunc != nil {
+			var err error
+			txMeta, err = m.validateTxFunc(ctx, tx)
+			results[*tx.TxIDChainHash()] = &TxValidationResult{
+				Success: err == nil,
+				TxMeta:  txMeta,
+				Err:     err,
+			}
+		} else {
+			results[*tx.TxIDChainHash()] = &TxValidationResult{
+				Success: true,
+				TxMeta:  txMeta,
+			}
+		}
+	}
+	return &MultiValidationResult{Results: results}, nil
+}
+
+func (m *TestMockValidator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {
+	results := make([]*LevelValidationResult, len(txs))
+	for i, tx := range txs {
+		txHash := tx.TxIDChainHash()
+		txMeta := &meta.Data{}
+		var err error
+		if m.validateTxFunc != nil {
+			txMeta, err = m.validateTxFunc(ctx, tx)
+		}
+		results[i] = &LevelValidationResult{
+			TxHash:  txHash,
+			TxMeta:  txMeta,
+			Success: err == nil,
+			Err:     err,
+		}
+	}
+	return results, nil
+}
