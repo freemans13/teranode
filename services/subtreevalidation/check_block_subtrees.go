@@ -514,7 +514,23 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	storeErr := <-storeDone
 
 	// Check for errors from both operations
-	if storeErr != nil {
+	if errors.Is(storeErr, errors.ErrBlobAlreadyExists) {
+		// If subtree data already exists (race condition: another process stored it first),
+		// parsing from the network stream will have failed because the pipe closed early.
+		// In this case, load transactions from storage instead.
+		u.logger.Debugf("[processSubtreeDataStream] Subtree data already exists for %s, loading from storage", subtree.RootHash().String())
+
+		// Clear any parsing errors and load from storage
+		parseErr = nil
+
+		// Extract transactions from stored file
+		if err := u.extractAndCollectTransactions(ctx, subtree, allTransactions); err != nil {
+			return errors.NewProcessingError("[processSubtreeDataStream] failed to extract transactions from storage", err)
+		}
+
+		txCount = len(*allTransactions)
+		u.logger.Debugf("[processSubtreeDataStream] Loaded %d transactions from storage for subtree %s", txCount, subtree.RootHash().String())
+	} else if storeErr != nil {
 		return errors.NewProcessingError("[processSubtreeDataStream] failed to store subtree data", storeErr)
 	}
 
@@ -772,7 +788,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 		}
 
-		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))
+		u.logger.Infof("[processTransactionsInLevels] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))
 
 		// PHASE 2 OPTIMIZATION: Release grandparent level (level-2) after current level succeeds
 		// Keep current level (being processed) and parent level (level-1) for safety
