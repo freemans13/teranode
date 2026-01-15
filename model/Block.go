@@ -681,21 +681,33 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 		parentSpendsMap:             NewSplitSyncedParentMap(4096),
 	}
 
-	concurrency := b.getValidationConcurrency(validOrderAndBlessedConcurrency)
-	g, gCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(g, concurrency)
+	// Calculate optimal worker count for I/O-bound subtree validation
+	numWorkers := getOptimalSubtreeWorkerCount(len(b.SubtreeSlices), validOrderAndBlessedConcurrency)
 
+	// Create worker pool with parent context for proper cancellation/tracing
+	pool := newSubtreeWorkerPool(ctx, b, numWorkers, len(b.SubtreeSlices), logger, deps, validationCtx)
+	pool.Start()
+
+	// Submit all subtrees as jobs to the worker pool
 	for sIdx := 0; sIdx < len(b.SubtreeSlices); sIdx++ {
-		subtree := b.SubtreeSlices[sIdx]
-		sIdx := sIdx
-
-		g.Go(func() error {
-			return b.validateSubtree(gCtx, logger, deps, validationCtx, subtree, sIdx)
+		pool.Submit(subtreeValidationJob{
+			subtreeIndex: sIdx,
+			subtree:      b.SubtreeSlices[sIdx],
 		})
 	}
 
-	// do not wrap the error again, the error is already wrapped
-	return g.Wait()
+	// Wait for all validations to complete
+	pool.Close()
+
+	// Check for validation errors
+	for _, result := range pool.results {
+		if result.err != nil {
+			// Do not wrap the error again, the error is already wrapped
+			return result.err
+		}
+	}
+
+	return nil
 }
 
 func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps *validationDependencies,

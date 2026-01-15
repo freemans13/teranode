@@ -75,86 +75,27 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 	// Level 0 uses getTransactionInputBlockHeightsAndExtendTx which leverages batchers
 	// ParentMetadata prevents UTXO fetches for in-block parents (Validator.go:725-740)
 
-	type validationResult struct {
-		utxoHeights []uint32
-		err         error
-	}
+	// Calculate optimal worker count based on CPU cores and transaction count
+	// Default: 2x CPU cores for CPU-bound script validation
+	numWorkers := getOptimalWorkerCount(len(txs), opts.WorkerPoolSize)
 
-	validationResults := make([]validationResult, len(txs))
+	// Create worker pool with parent context for proper cancellation/tracing
+	pool := newValidationWorkerPool(ctx, v, numWorkers, len(txs), blockHeight, blockState, opts)
+	pool.Start()
 
-	g, gCtx := errgroup.WithContext(ctx)
-	// Use high concurrency for CPU-bound script validation
-	util.SafeSetLimit(g, 512)
-
+	// Submit all transactions as jobs to the worker pool
 	for i, tx := range txs {
-		i, tx := i, tx
-		g.Go(func() error {
-			tx.SetTxHash(tx.TxIDChainHash())
-			txID := tx.TxIDChainHash().String()
-
-			// Check IsFinal (consensus rule - cannot skip)
-			if blockHeight > v.settings.ChainCfgParams.CSVHeight {
-				if blockState.MedianTime == 0 {
-					validationResults[i].err = errors.NewProcessingError("utxo store not ready, median block time: 0")
-					return nil
-				}
-				if err := util.IsTransactionFinal(tx, blockHeight, blockState.MedianTime); err != nil {
-					validationResults[i].err = errors.NewUtxoNonFinalError("[ValidateLevelBatch][%s] transaction is not final", txID, err)
-					return nil
-				}
-			}
-
-			// Check coinbase (consensus rule - cannot skip)
-			if tx.IsCoinbase() {
-				validationResults[i].err = errors.NewProcessingError("[ValidateLevelBatch][%s] coinbase transactions are not supported", txID)
-				return nil
-			}
-
-			var utxoHeights []uint32
-
-			// Get UTXO heights and extend if needed
-			// Uses ParentMetadata optimization for level 1+ (no UTXO fetch)
-			// Uses batchers for level 0 (unavoidable UTXO fetch, but batched)
-			if !tx.IsExtended() {
-				var err error
-				utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(gCtx, tx, txID, opts)
-				if err != nil {
-					validationResults[i].err = errors.NewProcessingError("[ValidateLevelBatch][%s] error getting transaction input block heights", txID, err)
-					return nil
-				}
-			}
-
-			// Validate transaction format and consensus rules
-			if err := v.validateTransaction(gCtx, tx, blockHeight, utxoHeights, opts); err != nil {
-				validationResults[i].err = errors.NewProcessingError("[ValidateLevelBatch][%s] error validating transaction", txID, err)
-				return nil
-			}
-
-			// Get utxo heights if not already fetched (transaction was pre-extended)
-			if len(utxoHeights) == 0 {
-				var err error
-				utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(gCtx, tx, txID, opts)
-				if err != nil {
-					validationResults[i].err = errors.NewProcessingError("[ValidateLevelBatch][%s] error getting transaction input block heights", txID, err)
-					return nil
-				}
-			}
-
-			// Validate scripts and signatures
-			if err := v.validateTransactionScripts(gCtx, tx, blockHeight, utxoHeights, opts); err != nil {
-				validationResults[i].err = errors.NewProcessingError("[ValidateLevelBatch][%s] error validating transaction scripts", txID, err)
-				return nil
-			}
-
-			validationResults[i].utxoHeights = utxoHeights
-			return nil
+		pool.Submit(validationJob{
+			txIndex: i,
+			tx:      tx,
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		span.RecordError(err)
-		return nil, errors.NewProcessingError("[ValidateLevelBatch] validation failed", err)
-	}
+	// Wait for all validations to complete
+	pool.Close()
+
+	// Get results from the worker pool
+	validationResults := pool.results
 
 	// Check for validation failures
 	for i, valResult := range validationResults {
@@ -491,17 +432,31 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		}
 	}
 
-	// PHASE 7: Kafka Notifications
-	// =============================
-	// Send TxMeta to Kafka for successful transactions (reuse from validateInternal:656-658)
+	// PHASE 7: Kafka Notifications (concurrent worker pool)
+	// ====================================================
+	// Send TxMeta to Kafka for successful transactions using worker pool for parallelization
 	if v.txmetaKafkaProducerClient != nil {
+		// Create lightweight Kafka notification worker pool
+		numKafkaWorkers := 100 // Fixed concurrency to prevent overwhelming batcher
+		if numKafkaWorkers > len(successfulTxs) {
+			numKafkaWorkers = len(successfulTxs)
+		}
+
+		kafkaPool := newKafkaNotificationWorkerPool(v, numKafkaWorkers, len(successfulTxs))
+		kafkaPool.Start()
+
+		// Submit all Kafka notification jobs
 		for _, cat := range successfulTxs {
 			if results[cat.resultIdx].Success && results[cat.resultIdx].TxMeta != nil {
-				if err := v.sendTxMetaToKafka(results[cat.resultIdx].TxMeta, cat.tx.TxIDChainHash()); err != nil {
-					v.logger.Errorf("[ValidateLevelBatch][%s] error sending to Kafka: %v", cat.tx.TxID(), err)
-				}
+				kafkaPool.Submit(kafkaNotificationJob{
+					tx:     cat.tx,
+					txMeta: results[cat.resultIdx].TxMeta,
+				})
 			}
 		}
+
+		// Wait for all Kafka notifications to complete
+		kafkaPool.Close()
 	}
 
 	// PHASE 8: Two-Phase Commit (unlock locked transactions)

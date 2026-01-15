@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestValidateMultiple_EmptySlice tests ValidateMultiple with empty transaction slice
-func TestValidateMultiple_EmptySlice(t *testing.T) {
+// TestValidateMulti_EmptySlice tests ValidateMulti with empty transaction slice
+func TestValidateMulti_EmptySlice(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
 	mockUtxoStore := &utxo.MockUtxostore{}
@@ -20,7 +20,7 @@ func TestValidateMultiple_EmptySlice(t *testing.T) {
 	v, err := New(context.Background(), logger, tSettings, mockUtxoStore, nil, nil, nil, nil)
 	require.NoError(t, err)
 
-	result, err := v.ValidateMultiple(context.Background(), []*bt.Tx{}, 100, nil)
+	result, err := v.ValidateMulti(context.Background(), []*bt.Tx{}, 100, nil)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Equal(t, 0, len(result.Results))

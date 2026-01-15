@@ -643,7 +643,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		}
 	}
 
-	u.logger.Infof("[processTransactionsInLevels] Preparing to validate %d transactions using Validator.ValidateMultiple", len(allTransactions))
+	u.logger.Infof("[processTransactionsInLevels] Preparing to validate %d transactions using Validator.ValidateMulti", len(allTransactions))
 
 	// Get FSM state to determine block assembly flag
 	currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
@@ -651,7 +651,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		return errors.NewProcessingError("[processTransactionsInLevels] Failed to get FSM current state", err)
 	}
 
-	// Build validator options for ValidateMultiple
+	// Build validator options for ValidateMulti
 	opts := &validator.Options{
 		AutoExtendTransactions: true, // Enable automatic transaction extension
 		SkipPolicyChecks:       true,
@@ -666,10 +666,10 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		opts.AddTXToBlockAssembly = false
 	}
 
-	// ⭐ NEW: Use ValidateMultiple for batch validation with automatic level organization
-	multiResult, err := u.validatorClient.ValidateMultiple(ctx, allTransactions, blockHeight, opts)
+	// ⭐ NEW: Use ValidateMulti for batch validation with automatic level organization
+	multiResult, err := u.validatorClient.ValidateMulti(ctx, allTransactions, blockHeight, opts)
 	if err != nil {
-		return errors.NewProcessingError("[processTransactionsInLevels] ValidateMultiple failed: %v", err)
+		return errors.NewProcessingError("[processTransactionsInLevels] ValidateMulti failed: %v", err)
 	}
 
 	// Track validation results
@@ -679,7 +679,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		addedToOrphanage int
 	)
 
-	// Process results from ValidateMultiple
+	// Process results from ValidateMulti
 	for txHash, txResult := range multiResult.Results {
 		if txResult.Success {
 			successCount++
@@ -739,6 +739,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 }
 
 // NOTE: buildParentMapFromLevel and extendTxWithInBlockParents functions have been moved
-// to services/validator/tx_extender.go as part of the ValidateMultiple refactoring.
-// These optimizations are now handled automatically by Validator.ValidateMultiple when
+// to services/validator/tx_extender.go as part of the ValidateMulti refactoring.
+// These optimizations are now handled automatically by Validator.ValidateMulti when
 // AutoExtendTransactions option is enabled.

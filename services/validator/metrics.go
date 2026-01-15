@@ -124,6 +124,16 @@ var (
 	// This histogram tracks database operations for storing and updating transaction metadata,
 	// including validation status, processing timestamps, and related transaction information. Units: seconds.
 	prometheusValidatorSetTxMeta prometheus.Histogram
+
+	// prometheusValidatorWorkerPoolSize tracks the number of workers used in the validation worker pool.
+	// This histogram provides insights into worker pool sizing decisions based on CPU cores and transaction count.
+	// Lower values indicate fewer workers for CPU-bound efficiency, higher values indicate more parallelism.
+	prometheusValidatorWorkerPoolSize prometheus.Histogram
+
+	// prometheusValidatorWorkerPoolJobLatency tracks the time spent processing individual jobs in the worker pool.
+	// This histogram measures per-transaction processing time within workers, helping identify validation bottlenecks
+	// and optimize worker pool performance. Units: microseconds.
+	prometheusValidatorWorkerPoolJobLatency prometheus.Histogram
 )
 
 // Synchronization primitives
@@ -350,6 +360,27 @@ func _initPrometheusMetrics() {
 			Name:      "set_tx_meta",
 			Help:      "Histogram of validator set tx meta",
 			Buckets:   util.MetricsBucketsMilliSeconds,
+		},
+	)
+
+	// Worker pool metrics
+	prometheusValidatorWorkerPoolSize = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "worker_pool_size",
+			Help:      "Number of workers in the validation worker pool",
+			Buckets:   []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512},
+		},
+	)
+
+	prometheusValidatorWorkerPoolJobLatency = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "worker_pool_job_latency",
+			Help:      "Per-transaction job processing latency in worker pool",
+			Buckets:   util.MetricsBucketsMicroSeconds,
 		},
 	)
 }

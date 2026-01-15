@@ -466,7 +466,7 @@ func (m *TestMockValidator) TriggerBatcher() {
 	// No-op implementation for testing
 }
 
-func (m *TestMockValidator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
+func (m *TestMockValidator) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiResult, error) {
 	results := make(map[chainhash.Hash]*TxValidationResult)
 	for _, tx := range txs {
 		txMeta := &meta.Data{}
@@ -485,7 +485,7 @@ func (m *TestMockValidator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, 
 			}
 		}
 	}
-	return &MultiValidationResult{Results: results}, nil
+	return &MultiResult{Results: results}, nil
 }
 
 func (m *TestMockValidator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) ([]*LevelValidationResult, error) {

@@ -9,7 +9,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
-// ValidateMultiple validates multiple transactions with automatic dependency ordering and batch processing.
+// ValidateMulti validates multiple transactions with automatic dependency ordering and batch processing.
 // This method organizes transactions by dependency levels (DAG) and processes each level in sequence,
 // enabling efficient validation of transaction sets with complex dependencies.
 //
@@ -41,14 +41,14 @@ import (
 //   - opts: Validation options (AutoExtendTransactions, MaxBatchSize, ParentMetadata, etc.)
 //
 // Returns:
-//   - *MultiValidationResult: Per-transaction results with success, metadata, conflicts, errors
+//   - *MultiResult: Per-transaction results with success, metadata, conflicts, errors
 //   - error: Critical errors preventing validation (not per-transaction failures)
-func (v *Validator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
-	ctx, span, deferFn := tracing.Tracer("validator").Start(ctx, "ValidateMultiple")
+func (v *Validator) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiResult, error) {
+	ctx, span, deferFn := tracing.Tracer("validator").Start(ctx, "ValidateMulti")
 	defer deferFn()
 
 	if len(txs) == 0 {
-		return &MultiValidationResult{Results: make(map[chainhash.Hash]*TxValidationResult)}, nil
+		return &MultiResult{Results: make(map[chainhash.Hash]*TxValidationResult)}, nil
 	}
 
 	// Handle nil options
@@ -147,5 +147,5 @@ func (v *Validator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHei
 		}
 	}
 
-	return &MultiValidationResult{Results: results}, nil
+	return &MultiResult{Results: results}, nil
 }

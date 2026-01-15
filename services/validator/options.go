@@ -58,6 +58,20 @@ type Options struct {
 	// For large transaction sets, setting this value helps control memory usage by
 	// processing transactions in smaller batches sequentially
 	MaxBatchSize int
+
+	// WorkerPoolSize sets the number of validation workers for parallel processing
+	// When set to 0 (default), uses runtime.GOMAXPROCS(0) * 64 workers (~512 on 8-core)
+	//
+	// Validation is I/O-heavy (UTXO fetches via Aerospike), requiring high concurrency
+	// to saturate UTXO batchers and maintain throughput.
+	//
+	// Tuning guidelines:
+	//   - Pure CPU work (no UTXO lookups): 2-4x CPU cores
+	//   - Mixed CPU/I/O (typical blocks): 16-64x CPU cores
+	//   - I/O-heavy (many UTXO lookups): 64-128x CPU cores
+	//
+	// Monitor: teranode_validator_worker_pool_job_latency for bottlenecks
+	WorkerPoolSize int
 }
 
 // Option defines a function type for setting options

@@ -182,8 +182,8 @@ func (v *TopologicalOrderValidator) GetMedianBlockTime() uint32 {
 // TriggerBatcher implements validator.Interface (no-op).
 func (v *TopologicalOrderValidator) TriggerBatcher() {}
 
-// ValidateMultiple validates multiple transactions sequentially, checking topological order.
-func (v *TopologicalOrderValidator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *validator.Options) (*validator.MultiValidationResult, error) {
+// ValidateMulti validates multiple transactions sequentially, checking topological order.
+func (v *TopologicalOrderValidator) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *validator.Options) (*validator.MultiResult, error) {
 	results := make(map[chainhash.Hash]*validator.TxValidationResult)
 	for _, tx := range txs {
 		txMeta, err := v.ValidateWithOptions(ctx, tx, blockHeight, opts)
@@ -193,7 +193,7 @@ func (v *TopologicalOrderValidator) ValidateMultiple(ctx context.Context, txs []
 			Err:     err,
 		}
 	}
-	return &validator.MultiValidationResult{Results: results}, nil
+	return &validator.MultiResult{Results: results}, nil
 }
 
 // ValidateLevelBatch validates a batch of transactions at the same dependency level.

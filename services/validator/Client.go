@@ -445,10 +445,10 @@ func (c *Client) validateTransactionViaHTTP(ctx context.Context, tx *bt.Tx, bloc
 	return nil
 }
 
-// ValidateMultiple validates multiple transactions with automatic dependency ordering via gRPC
+// ValidateMulti validates multiple transactions with automatic dependency ordering via gRPC
 // TODO: This is a stub implementation that calls the validator service via gRPC
-func (c *Client) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
-	// TODO: Implement gRPC call to validator service's ValidateMultiple method
+func (c *Client) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiResult, error) {
+	// TODO: Implement gRPC call to validator service's ValidateMulti method
 	// For now, fall back to sequential validation
 	results := make(map[chainhash.Hash]*TxValidationResult)
 
@@ -469,7 +469,7 @@ func (c *Client) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight
 		results[txHash] = result
 	}
 
-	return &MultiValidationResult{Results: results}, nil
+	return &MultiResult{Results: results}, nil
 }
 
 // ValidateLevelBatch validates a batch of transactions at the same dependency level via gRPC

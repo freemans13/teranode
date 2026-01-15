@@ -53,8 +53,8 @@ type TxValidationResult struct {
 	Err error
 }
 
-// MultiValidationResult contains the validation results for multiple transactions
-type MultiValidationResult struct {
+// MultiResult contains the validation results for multiple transactions
+type MultiResult struct {
 	// Results maps transaction hashes to their validation results
 	// Each entry contains success status, metadata, conflict info, and any errors
 	Results map[chainhash.Hash]*TxValidationResult
@@ -138,7 +138,7 @@ type Interface interface {
 	//   - error: Validation errors if transaction violates consensus rules or policy constraints
 	ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight uint32, validationOptions *Options) (*meta.Data, error)
 
-	// ValidateMultiple validates multiple transactions with automatic dependency ordering
+	// ValidateMulti validates multiple transactions with automatic dependency ordering
 	// and batch processing. This method organizes transactions by dependency levels (DAG)
 	// and processes each level in sequence, enabling efficient validation of transaction
 	// sets with complex dependencies.
@@ -157,9 +157,9 @@ type Interface interface {
 	//   - opts: Validation options including AutoExtendTransactions, MaxBatchSize, and ParentMetadata
 	//
 	// Returns:
-	//   - *MultiValidationResult: Per-transaction results including success, metadata, conflicts, and errors
+	//   - *MultiResult: Per-transaction results including success, metadata, conflicts, and errors
 	//   - error: Critical errors that prevent validation (e.g., internal failures), not individual tx failures
-	ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error)
+	ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiResult, error)
 
 	// ValidateLevelBatch validates a batch of transactions at the same dependency level
 	// This method assumes all transactions in the batch are at the same level in the dependency
@@ -253,7 +253,7 @@ func (mv *MockValidator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blo
 	return util.TxMetaDataFromTx(tx)
 }
 
-// ValidateMultiple implements mock multi-transaction validation
+// ValidateMulti implements mock multi-transaction validation
 // Always returns success for all transactions without performing any actual validation
 // Parameters:
 //   - ctx: Context for validation (unused in mock)
@@ -262,9 +262,9 @@ func (mv *MockValidator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blo
 //   - opts: Validation options (unused in mock)
 //
 // Returns:
-//   - *MultiValidationResult: Mock results with all transactions marked as successful
+//   - *MultiResult: Mock results with all transactions marked as successful
 //   - error: Always returns nil
-func (mv *MockValidator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
+func (mv *MockValidator) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiResult, error) {
 	results := make(map[chainhash.Hash]*TxValidationResult)
 	for _, tx := range txs {
 		txMeta, _ := util.TxMetaDataFromTx(tx)
@@ -274,7 +274,7 @@ func (mv *MockValidator) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blo
 			Err:     nil,
 		}
 	}
-	return &MultiValidationResult{Results: results}, nil
+	return &MultiResult{Results: results}, nil
 }
 
 // ValidateLevelBatch implements mock level-based batch validation

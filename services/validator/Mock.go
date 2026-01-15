@@ -118,9 +118,9 @@ func (m *MockValidatorClient) ValidateWithOptions(ctx context.Context, tx *bt.Tx
 // This is a no-op in the mock implementation as no actual batching occurs.
 func (m *MockValidatorClient) TriggerBatcher() {}
 
-// ValidateMultiple implements mock multi-transaction validation with error injection support.
+// ValidateMulti implements mock multi-transaction validation with error injection support.
 // If errors are queued, they are popped and applied to transactions in order.
-func (m *MockValidatorClient) ValidateMultiple(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiValidationResult, error) {
+func (m *MockValidatorClient) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts *Options) (*MultiResult, error) {
 	m.ErrorsMu.Lock()
 	defer m.ErrorsMu.Unlock()
 
@@ -150,7 +150,7 @@ func (m *MockValidatorClient) ValidateMultiple(ctx context.Context, txs []*bt.Tx
 			Err:     err,
 		}
 	}
-	return &MultiValidationResult{Results: results}, nil
+	return &MultiResult{Results: results}, nil
 }
 
 // ValidateLevelBatch implements mock level-based batch validation
