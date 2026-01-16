@@ -205,10 +205,9 @@ func getOptimalWorkerCount(numTransactions int, configuredSize int, opts *Option
 
 	// PHASE 5 OPTIMIZATION: During catchup with script verification skipped, increase parallelism
 	// With no script validation, workload becomes pure I/O
-	// However, too many workers (1024) causes Go scheduler thrashing (67% CPU on pthread_cond_signal)
-	// Optimal range: 64-128 workers for I/O-bound workload to balance concurrency vs scheduler overhead
+	// Need high concurrency to saturate Aerospike batchers and keep throughput high
 	if opts != nil && opts.SkipScriptVerification {
-		multiplier = 8 // 16 cores * 8 = 128 workers (reduced from 64 to eliminate scheduler thrashing)
+		multiplier = 32 // 16 cores * 32 = 512 workers (testing if throughput improves with more parallelism)
 	}
 
 	numWorkers := runtime.GOMAXPROCS(0) * multiplier

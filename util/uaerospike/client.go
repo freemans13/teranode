@@ -71,7 +71,7 @@ func NewClient(hostname string, port int) (*Client, error) {
 
 	return &Client{
 		Client:        client,
-		connSemaphore: make(chan struct{}, queueSize),
+		connSemaphore: make(chan struct{}, queueSize*2),
 		stats:         NewClientStats(),
 	}, nil
 }
