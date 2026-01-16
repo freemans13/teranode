@@ -191,17 +191,27 @@ func (p *validationWorkerPool) Shutdown() {
 
 // getOptimalWorkerCount calculates the optimal number of workers based on
 // available CPU cores and the number of transactions to process
-func getOptimalWorkerCount(numTransactions int, configuredSize int) int {
+func getOptimalWorkerCount(numTransactions int, configuredSize int, opts *Options) int {
 	// If explicitly configured, use that value
 	if configuredSize > 0 {
 		return configuredSize
 	}
 
-	// Default: 8x CPU cores for I/O-heavy workload
+	// Base multiplier for I/O-heavy workload
 	// Validation is ~60% I/O (UTXO fetches, Aerospike calls) and ~40% CPU (script validation)
 	// High concurrency needed for I/O operations to keep UTXO batchers saturated
-	// On 8-core machine: 64 workers
-	numWorkers := runtime.GOMAXPROCS(0) * 12
+	// Reduced from 32 to 4 to avoid scheduler thrashing (512 workers was too many)
+	multiplier := 4 // Default: On 16-core machine = 64 workers
+
+	// PHASE 5 OPTIMIZATION: During catchup with script verification skipped, increase parallelism
+	// With no script validation, workload becomes pure I/O
+	// However, too many workers (1024) causes Go scheduler thrashing (67% CPU on pthread_cond_signal)
+	// Optimal range: 64-128 workers for I/O-bound workload to balance concurrency vs scheduler overhead
+	if opts != nil && opts.SkipScriptVerification {
+		multiplier = 8 // 16 cores * 8 = 128 workers (reduced from 64 to eliminate scheduler thrashing)
+	}
+
+	numWorkers := runtime.GOMAXPROCS(0) * multiplier
 
 	// Don't create more workers than transactions
 	if numWorkers > numTransactions {

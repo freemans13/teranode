@@ -21,6 +21,8 @@ import (
 //    c. Validate entire level using ValidateLevelBatch
 //    d. Track successful validations for next level's parent metadata
 //    e. Release grandparent level memory (keep only 2 levels in memory)
+//    f. Check for context cancellation before starting next level
+// 3. Update previousLevelCache with successful transactions from this ValidateMulti call
 //
 // Performance optimizations:
 // - Single UTXO batch operation per level (not per transaction)
@@ -38,7 +40,7 @@ import (
 //   - ctx: Context for cancellation and tracing
 //   - txs: Slice of transactions to validate (can have interdependencies)
 //   - blockHeight: Current block height for validation
-//   - opts: Validation options (AutoExtendTransactions, MaxBatchSize, ParentMetadata, etc.)
+//   - opts: Validation options (AutoExtendTransactions, MaxBatchSize, ParentBlockHeights, etc.)
 //
 // Returns:
 //   - *MultiResult: Per-transaction results with success, metadata, conflicts, errors
@@ -56,9 +58,9 @@ func (v *Validator) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight
 		opts = NewDefaultOptions()
 	}
 
-	// Initialize ParentMetadata if not provided
-	if opts.ParentMetadata == nil {
-		opts.ParentMetadata = make(map[chainhash.Hash]*ParentTxMetadata)
+	// Initialize ParentBlockHeights if not provided
+	if opts.ParentBlockHeights == nil {
+		opts.ParentBlockHeights = make(map[chainhash.Hash]uint32)
 	}
 
 	// Step 1: Organize transactions by dependency level
@@ -88,10 +90,10 @@ func (v *Validator) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight
 		if level > 0 {
 			prevLevel := level - 1
 			if successfulTxs, exists := successfulTxsByLevel[prevLevel]; exists && len(successfulTxs) > 0 {
-				parentMetadata := buildParentMetadata(txsPerLevel[prevLevel], blockHeight, successfulTxs)
-				// Merge with existing parent metadata
-				for hash, meta := range parentMetadata {
-					opts.ParentMetadata[hash] = meta
+				parentBlockHeights := buildParentMetadata(txsPerLevel[prevLevel], blockHeight, successfulTxs)
+				// Merge with existing parent block heights
+				for hash, height := range parentBlockHeights {
+					opts.ParentBlockHeights[hash] = height
 				}
 			}
 		}
@@ -145,7 +147,62 @@ func (v *Validator) ValidateMulti(ctx context.Context, txs []*bt.Tx, blockHeight
 			delete(successfulTxsByLevel, grandparentLevel)
 			// Note: txsPerLevel is read-only so we don't need to clear it
 		}
+
+		// Step 2f: Check for context cancellation before starting next level
+		// This allows graceful exit between levels without leaving partial state
+		select {
+		case <-ctx.Done():
+			// Context cancelled - return partial results processed so far
+			v.logger.Infof("[ValidateMulti] Context cancelled after completing level %d of %d, returning partial results (%d transactions processed)",
+				level, len(txsPerLevel)-1, len(results))
+
+			// Update cache with partial results before returning
+			v.updatePreviousLevelCache(txs, results)
+
+			// Return partial results with context error
+			span.RecordError(ctx.Err())
+			return nil, errors.NewProcessingError("context cancelled after level %d: %w", level, ctx.Err())
+		default:
+			// Context still active, continue to next level
+		}
 	}
 
+	// Step 3: Update previousLevelCache with successful transactions from this ValidateMulti call
+	// This allows the next ValidateMulti call to look up these transactions without UTXO store access
+	v.updatePreviousLevelCache(txs, results)
+
 	return &MultiResult{Results: results}, nil
+}
+
+// updatePreviousLevelCache updates the cache with successful transactions from the current ValidateMulti call
+// Simple replacement strategy: entire cache replaced with current successful transactions
+// No eviction logic needed - keeps only the previous call's transactions
+// OPTIMIZATION: Heavy work done outside lock, only pointer swap under lock
+func (v *Validator) updatePreviousLevelCache(txs []*bt.Tx, results map[chainhash.Hash]*TxValidationResult) {
+	// Build a txHash -> tx map first for O(1) lookups (avoid O(N²) nested loop)
+	// Done OUTSIDE lock to avoid blocking readers
+	txMap := make(map[chainhash.Hash]*bt.Tx, len(txs))
+	for _, tx := range txs {
+		if tx != nil {
+			txMap[*tx.TxIDChainHash()] = tx
+		}
+	}
+
+	// Build new cache with current successful transactions (OUTSIDE lock)
+	newCache := make(map[chainhash.Hash]*bt.Tx, len(results))
+	for txHash, result := range results {
+		if result.Success && result.TxMeta != nil {
+			// O(1) lookup instead of O(N) scan
+			if tx, found := txMap[txHash]; found {
+				newCache[txHash] = tx
+			}
+		}
+	}
+
+	// ONLY hold lock for pointer swap (microseconds, not milliseconds)
+	v.previousValidateMultiCacheMu.Lock()
+	v.previousValidateMultiCache = newCache
+	v.previousValidateMultiCacheMu.Unlock()
+
+	v.logger.Debugf("[updatePreviousLevelCache] Replaced cache with %d successful transactions", len(newCache))
 }

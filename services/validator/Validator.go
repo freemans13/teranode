@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-batcher"
@@ -137,6 +138,15 @@ type Validator struct {
 
 	// txmetaKafkaBatcher batches TxMeta Kafka messages for efficient publishing
 	txmetaKafkaBatcher *batcher.Batcher[txmetaBatchItem]
+
+	// previousValidateMultiCache caches transactions from the previous ValidateMulti call
+	// This allows the next ValidateMulti call to look up parents without UTXO store access
+	// Simple map replacement (no eviction needed) - entire cache replaced on each update
+	// Key: transaction hash, Value: transaction
+	previousValidateMultiCache map[chainhash.Hash]*bt.Tx
+
+	// previousValidateMultiCacheMu protects concurrent access to previousValidateMultiCache
+	previousValidateMultiCacheMu sync.RWMutex
 }
 
 // New creates a new Validator instance with the provided configuration.
@@ -163,6 +173,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		txmetaKafkaProducerClient:     txMetaKafkaProducerClient,
 		rejectedTxKafkaProducerClient: rejectedTxKafkaProducerClient,
 		blockchainClient:              blockchainClient,
+		previousValidateMultiCache:    make(map[chainhash.Hash]*bt.Tx),
 	}
 
 	txmetaKafkaURL := v.settings.Kafka.TxMetaConfig
@@ -723,6 +734,29 @@ func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.T
 
 	extend := !tx.IsExtended() // if the tx is not extended, we need to extend it with the parent tx hashes
 
+	// OPTIMIZATION: If transaction is already extended AND we have ParentBlockHeights for all parents,
+	// we can extract heights from ParentBlockHeights without any UTXO store lookups
+	if !extend && validationOptions != nil && validationOptions.ParentBlockHeights != nil {
+		allParentsInMetadata := true
+		for parentTxHash := range parentTxHashes {
+			if _, found := validationOptions.ParentBlockHeights[parentTxHash]; !found {
+				allParentsInMetadata = false
+				break
+			}
+		}
+
+		// If all parents are in block heights map, extract heights directly (no UTXO lookups needed)
+		if allParentsInMetadata {
+			for parentTxHash, inputIdxs := range parentTxHashes {
+				parentBlockHeight := validationOptions.ParentBlockHeights[parentTxHash]
+				for _, idx := range inputIdxs {
+					utxoHeights[idx] = parentBlockHeight
+				}
+			}
+			return utxoHeights, nil
+		}
+	}
+
 	for parentTxHash, idxs := range parentTxHashes {
 		parentTxHash := parentTxHash
 		inputIdxs := idxs
@@ -752,20 +786,61 @@ func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.T
 func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context, parentTxHash chainhash.Hash, idxs []int,
 	utxoHeights []uint32, tx *bt.Tx, extend bool, validationOptions *Options) error {
 
-	// OPTIMIZATION: Check if parent metadata is provided in options (for in-block parents)
+	// OPTIMIZATION 1: Check PrefetchedParents first (from ValidateLevelBatch prefetch)
+	// This contains full metadata for ALL level 0 external parents, fetched in a single batch
+	// This is the highest priority check as it has complete data (heights + transaction)
+	if validationOptions != nil && validationOptions.PrefetchedParents != nil {
+		if prefetchedMeta, found := validationOptions.PrefetchedParents[parentTxHash]; found {
+			// Use prefetched data from upfront batch query
+			v.logger.Debugf("[getUtxoBlockHeightAndExtendForParentTx] Using PREFETCHED parent %s", parentTxHash.String())
+
+			if len(prefetchedMeta.BlockHeights) > 0 {
+				for _, idx := range idxs {
+					utxoHeights[idx] = prefetchedMeta.BlockHeights[0]
+				}
+			} else {
+				// No block heights - parent is from current block
+				blockState := v.utxoStore.GetBlockState()
+				for _, idx := range idxs {
+					utxoHeights[idx] = blockState.Height + 1
+				}
+			}
+
+			if extend {
+				// Extend the transaction inputs with prefetched parent tx outputs
+				for _, idx := range idxs {
+					if idx >= len(tx.Inputs) {
+						return errors.NewProcessingError("[Validate][%s] input index %d out of bounds", tx.TxIDChainHash().String(), idx)
+					}
+
+					prevOutIdx := tx.Inputs[idx].PreviousTxOutIndex
+					if prefetchedMeta.Tx == nil || prefetchedMeta.Tx.Outputs == nil || int(prevOutIdx) >= len(prefetchedMeta.Tx.Outputs) || prefetchedMeta.Tx.Outputs[prevOutIdx] == nil {
+						return errors.NewProcessingError("[Validate][%s] prefetched parent %s missing output at index %d", tx.TxIDChainHash().String(), parentTxHash.String(), prevOutIdx)
+					}
+
+					tx.Inputs[idx].PreviousTxSatoshis = prefetchedMeta.Tx.Outputs[prevOutIdx].Satoshis
+					tx.Inputs[idx].PreviousTxScript = prefetchedMeta.Tx.Outputs[prevOutIdx].LockingScript
+				}
+			}
+
+			return nil // Successfully used prefetched parent
+		}
+	}
+
+	// OPTIMIZATION 2: Check if parent block height is provided in options (for in-block parents)
 	// This allows validation without UTXO store lookups for in-block parent transactions
-	// SAFETY: Parent metadata only includes transactions that successfully validated AND created UTXOs
+	// SAFETY: Parent block heights only includes transactions that successfully validated AND created UTXOs
 	// (see check_block_subtrees.go:buildParentMetadata which filters by successful validations)
-	if validationOptions != nil && validationOptions.ParentMetadata != nil {
-		if parentMeta, found := validationOptions.ParentMetadata[parentTxHash]; found {
-			// Use pre-fetched metadata instead of UTXO store lookup
-			// Safe because metadata only includes transactions that completed full validation+storage
+	if validationOptions != nil && validationOptions.ParentBlockHeights != nil {
+		if parentBlockHeight, found := validationOptions.ParentBlockHeights[parentTxHash]; found {
+			// Use pre-fetched block height instead of UTXO store lookup
+			// Safe because map only includes transactions that completed full validation+storage
 			for _, idx := range idxs {
-				utxoHeights[idx] = parentMeta.BlockHeight
+				utxoHeights[idx] = parentBlockHeight
 			}
 
 			// If transaction is already extended, we have all the data we need
-			// The parent metadata optimization works best with pre-extended transactions
+			// The parent block heights optimization works best with pre-extended transactions
 			if !extend {
 				return nil
 			}
@@ -773,6 +848,48 @@ func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context,
 		}
 	}
 
+	// OPTIMIZATION 3: Check previousValidateMultiCache for parent transaction (from previous ValidateMulti call)
+	// Simple O(1) map lookup - no iteration needed
+	v.previousValidateMultiCacheMu.RLock()
+	cachedParentTx, foundInCache := v.previousValidateMultiCache[parentTxHash]
+	v.previousValidateMultiCacheMu.RUnlock()
+
+	if foundInCache && cachedParentTx != nil {
+		// Parent found in cache from previous ValidateMulti call - use it directly
+		v.logger.Debugf("[getUtxoBlockHeightAndExtendForParentTx] CACHE HIT for parent %s", parentTxHash.String())
+
+		blockState := v.utxoStore.GetBlockState()
+		for _, idx := range idxs {
+			utxoHeights[idx] = blockState.Height + 1 // Parent is from current block being validated
+		}
+
+		if extend {
+			// Extend the transaction inputs with the cached parent tx outputs
+			for _, idx := range idxs {
+				if idx >= len(tx.Inputs) {
+					return errors.NewProcessingError("[Validate][%s] input index %d out of bounds for transaction with %d inputs",
+						tx.TxIDChainHash().String(), idx, len(tx.Inputs))
+				}
+
+				prevOutIdx := tx.Inputs[idx].PreviousTxOutIndex
+				if cachedParentTx.Outputs == nil || int(prevOutIdx) >= len(cachedParentTx.Outputs) || cachedParentTx.Outputs[prevOutIdx] == nil {
+					return errors.NewProcessingError("[Validate][%s] cached parent transaction %s does not have output at index %d",
+						tx.TxIDChainHash().String(), parentTxHash.String(), prevOutIdx)
+				}
+
+				// Extend the input with the cached parent tx outputs
+				tx.Inputs[idx].PreviousTxSatoshis = cachedParentTx.Outputs[prevOutIdx].Satoshis
+				tx.Inputs[idx].PreviousTxScript = cachedParentTx.Outputs[prevOutIdx].LockingScript
+			}
+		}
+
+		return nil // Successfully used cached parent
+	}
+
+	// Cache miss - log for debugging
+	v.logger.Debugf("[getUtxoBlockHeightAndExtendForParentTx] CACHE MISS for parent %s, falling back to UTXO store", parentTxHash.String())
+
+	// Cache miss - fall back to UTXO store lookup
 	f := []fields.FieldName{fields.BlockIDs, fields.BlockHeights}
 
 	if extend {

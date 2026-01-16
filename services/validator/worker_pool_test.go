@@ -73,7 +73,7 @@ func TestGetOptimalWorkerCount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getOptimalWorkerCount(tt.numTxs, tt.configuredSize)
+			result := getOptimalWorkerCount(tt.numTxs, tt.configuredSize, nil)
 			require.Equal(t, tt.expected, result)
 		})
 	}

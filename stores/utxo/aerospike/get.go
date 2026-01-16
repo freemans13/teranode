@@ -600,7 +600,7 @@ NEXT_BATCH_RECORD:
 		// TxInpoints can be computed without scripts using optimized parser
 		needsFullExternalTx := false
 		for _, field := range items[idx].Fields {
-			if field == fields.Tx || field == fields.Inputs {
+			if field == fields.Tx || field == fields.Inputs || field == fields.Outputs {
 				needsFullExternalTx = true
 				break
 			}
@@ -659,6 +659,38 @@ NEXT_BATCH_RECORD:
 							_, err = tx.Inputs[i].ReadFromExtended(bytes.NewReader(input))
 							if err != nil {
 								return errors.NewTxInvalidError("could not read input", err)
+							}
+						}
+					}
+
+					items[idx].Data.Tx = tx
+				}
+
+			case fields.Outputs:
+				// check that we are not also getting the tx, as this will be handled above
+				if slices.Contains(items[idx].Fields, fields.Tx) {
+					continue
+				}
+
+				// If the tx is external, we already have it, otherwise we need to build it from the bins.
+				if external {
+					items[idx].Data.Tx = externalTx
+				} else {
+					tx := &bt.Tx{}
+
+					if outputInterfaces, ok := bins[fields.Outputs.String()].([]interface{}); ok {
+						tx.Outputs = make([]*bt.Output, len(outputInterfaces))
+
+						for i, outputInterface := range outputInterfaces {
+							if outputInterface == nil {
+								continue
+							}
+
+							tx.Outputs[i] = &bt.Output{}
+
+							_, err = tx.Outputs[i].ReadFrom(bytes.NewReader(outputInterface.([]byte)))
+							if err != nil {
+								return errors.NewTxInvalidError("could not read output", err)
 							}
 						}
 					}

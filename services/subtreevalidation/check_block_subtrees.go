@@ -657,13 +657,19 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		SkipPolicyChecks:       true,
 		CreateConflicting:      true,
 		IgnoreLocked:           true,
-		ParentMetadata:         make(map[chainhash.Hash]*validator.ParentTxMetadata),
+		ParentBlockHeights:     make(map[chainhash.Hash]uint32),
 		AddTXToBlockAssembly:   true,
 	}
 
 	// During legacy syncing or catching up, disable adding transactions to block assembly
 	if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
 		opts.AddTXToBlockAssembly = false
+
+		// Skip CPU-intensive script verification during catchup if setting is enabled
+		if u.settings.Validator.SkipScriptVerificationDuringCatchup {
+			opts.SkipScriptVerification = true
+			u.logger.Infof("[processTransactionsInLevels] Skipping script verification during catchup for block %s (setting enabled)", blockHash.String())
+		}
 	}
 
 	// ⭐ NEW: Use ValidateMulti for batch validation with automatic level organization

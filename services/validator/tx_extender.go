@@ -59,14 +59,14 @@ func buildParentMapFromSuccessful(parentLevelTxs []txWithIndex, successfulTxs ma
 	return parentMap
 }
 
-// buildParentMetadata creates a map of parent transaction metadata for use by the validator.
+// buildParentMetadata creates a map of parent transaction block heights for use by the validator.
 // This allows the validator to skip UTXO store lookups for in-block parents.
 //
 // CRITICAL: Only includes transactions that successfully validated (present in successfulTxs).
 // This prevents validation bypass where child references a failed parent transaction.
 //
-// The metadata includes block height (where the parent will be mined) which is needed
-// for coinbase maturity checks and other validation rules.
+// The block height (where the parent will be mined) is needed for coinbase maturity checks
+// and other validation rules.
 //
 // Parameters:
 //   - parentLevelTxs: Transactions from the parent level
@@ -74,25 +74,23 @@ func buildParentMapFromSuccessful(parentLevelTxs []txWithIndex, successfulTxs ma
 //   - successfulTxs: Map of successfully validated transaction hashes
 //
 // Returns:
-//   - map[chainhash.Hash]*ParentTxMetadata: Metadata map for successful parent transactions
-func buildParentMetadata(parentLevelTxs []txWithIndex, blockHeight uint32, successfulTxs map[chainhash.Hash]bool) map[chainhash.Hash]*ParentTxMetadata {
+//   - map[chainhash.Hash]uint32: Block height map for successful parent transactions
+func buildParentMetadata(parentLevelTxs []txWithIndex, blockHeight uint32, successfulTxs map[chainhash.Hash]bool) map[chainhash.Hash]uint32 {
 	if len(parentLevelTxs) == 0 || len(successfulTxs) == 0 {
 		return nil
 	}
 
-	metadata := make(map[chainhash.Hash]*ParentTxMetadata, len(successfulTxs))
+	blockHeights := make(map[chainhash.Hash]uint32, len(successfulTxs))
 	for _, txWithIdx := range parentLevelTxs {
 		if txWithIdx.tx != nil {
 			txHash := *txWithIdx.tx.TxIDChainHash()
 			// Only include transactions that successfully validated
 			if successfulTxs[txHash] {
-				metadata[txHash] = &ParentTxMetadata{
-					BlockHeight: blockHeight,
-				}
+				blockHeights[txHash] = blockHeight
 			}
 		}
 	}
-	return metadata
+	return blockHeights
 }
 
 // extendTxWithParentMap extends a transaction's inputs with parent output data

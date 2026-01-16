@@ -356,23 +356,24 @@ type BlockValidationSettings struct {
 }
 
 type ValidatorSettings struct {
-	GRPCAddress               string
-	GRPCListenAddress         string
-	KafkaWorkers              int
-	SendBatchSize             int
-	SendBatchTimeout          int
-	SendBatchWorkers          int
-	BlockValidationDelay      int
-	BlockValidationMaxRetries int
-	BlockValidationRetrySleep string
-	VerboseDebug              bool
-	HTTPListenAddress         string
-	HTTPAddress               *url.URL
-	HTTPRateLimit             int
-	KafkaMaxMessageBytes      int // Maximum Kafka message size in bytes for transaction validation
-	UseLocalValidator         bool
-	TxMetaKafkaBatchSize      int // Batch size for TxMeta Kafka messages (0 = disabled)
-	TxMetaKafkaBatchTimeoutMs int // Batch timeout in milliseconds for TxMeta Kafka messages
+	GRPCAddress                         string
+	GRPCListenAddress                   string
+	KafkaWorkers                        int
+	SendBatchSize                       int
+	SendBatchTimeout                    int
+	SendBatchWorkers                    int
+	BlockValidationDelay                int
+	BlockValidationMaxRetries           int
+	BlockValidationRetrySleep           string
+	VerboseDebug                        bool
+	HTTPListenAddress                   string
+	HTTPAddress                         *url.URL
+	HTTPRateLimit                       int
+	KafkaMaxMessageBytes                int // Maximum Kafka message size in bytes for transaction validation
+	UseLocalValidator                   bool
+	TxMetaKafkaBatchSize                int  // Batch size for TxMeta Kafka messages (0 = disabled)
+	TxMetaKafkaBatchTimeoutMs           int  // Batch timeout in milliseconds for TxMeta Kafka messages
+	SkipScriptVerificationDuringCatchup bool // Skip CPU-intensive script verification when catching up blocks
 }
 
 type RegionSettings struct {

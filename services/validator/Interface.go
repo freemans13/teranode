@@ -154,7 +154,7 @@ type Interface interface {
 	//   - ctx: Context for the validation operation, supports cancellation and timeouts
 	//   - txs: Slice of Bitcoin transactions to validate, can have interdependencies
 	//   - blockHeight: Current block height for validation context and consensus rule application
-	//   - opts: Validation options including AutoExtendTransactions, MaxBatchSize, and ParentMetadata
+	//   - opts: Validation options including AutoExtendTransactions, MaxBatchSize, and ParentBlockHeights
 	//
 	// Returns:
 	//   - *MultiResult: Per-transaction results including success, metadata, conflicts, and errors
@@ -170,7 +170,7 @@ type Interface interface {
 	//   - ctx: Context for the validation operation, supports cancellation and timeouts
 	//   - txs: Slice of Bitcoin transactions at the same dependency level
 	//   - blockHeight: Current block height for validation context
-	//   - opts: Validation options including ParentMetadata for optimization
+	//   - opts: Validation options including ParentBlockHeights for optimization
 	//
 	// Returns:
 	//   - []*LevelValidationResult: Validation results for each transaction in the batch

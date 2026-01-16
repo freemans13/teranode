@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
+	"golang.org/x/sync/errgroup"
 )
 
 // CreateBatchDirect performs batch creation for multiple transactions in a single operation.
@@ -222,27 +223,41 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 
 	s.logger.Debugf("[CREATE_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch)", len(batchRecords), maxBatchSize)
 
-	// Split into chunks if needed
+	// PHASE 2 OPTIMIZATION: Parallelize chunk processing for high throughput
+	// Split into chunks and execute them in parallel using errgroup
+	// This is safe because each chunk operates on disjoint transaction keys
+	g, _ := errgroup.WithContext(ctx)
+
 	for i := 0; i < len(batchRecords); i += maxBatchSize {
+		i := i // Capture loop variable for goroutine
 		end := i + maxBatchSize
 		if end > len(batchRecords) {
 			end = len(batchRecords)
 		}
 
 		chunk := batchRecords[i:end]
-		err := s.client.BatchOperate(batchPolicy, chunk)
-		if err != nil {
-			// Check if this is KEY_EXISTS_ERROR - this happens when ANY record in the batch
-			// already exists with CREATE_ONLY policy. This is not a fatal error - individual
-			// records will have their own errors set which we handle in Phase 4.
-			aErr, ok := err.(*aerospike.AerospikeError)
-			if !ok || aErr.ResultCode != types.KEY_EXISTS_ERROR {
-				// True batch-level failure (connection error, etc.)
-				return nil, errors.NewStorageError("[CREATE_BATCH_DIRECT] failed to batch create (chunk %d-%d)", i, end, err)
+
+		g.Go(func() error {
+			err := s.client.BatchOperate(batchPolicy, chunk)
+			if err != nil {
+				// Check if this is KEY_EXISTS_ERROR - this happens when ANY record in the batch
+				// already exists with CREATE_ONLY policy. This is not a fatal error - individual
+				// records will have their own errors set which we handle in Phase 4.
+				aErr, ok := err.(*aerospike.AerospikeError)
+				if !ok || aErr.ResultCode != types.KEY_EXISTS_ERROR {
+					// True batch-level failure (connection error, etc.)
+					return errors.NewStorageError("[CREATE_BATCH_DIRECT] failed to batch create (chunk %d-%d)", i, end, err)
+				}
+				// KEY_EXISTS_ERROR - continue to Phase 4 to handle per-record results
+				s.logger.Debugf("[CREATE_BATCH_DIRECT] Batch chunk %d-%d contains existing keys, will handle per-record in Phase 4", i, end)
 			}
-			// KEY_EXISTS_ERROR - continue to Phase 4 to handle per-record results
-			s.logger.Debugf("[CREATE_BATCH_DIRECT] Batch chunk %d-%d contains existing keys, will handle per-record in Phase 4", i, end)
-		}
+			return nil
+		})
+	}
+
+	// Wait for all chunks to complete
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	// PHASE 4: Process results

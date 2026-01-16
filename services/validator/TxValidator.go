@@ -255,6 +255,12 @@ func (tv *TxValidator) ValidateTransactionScripts(tx *bt.Tx, blockHeight uint32,
 		return errors.NewTxInvalidError("tx interpreter is nil, available interpreters: %v", TxScriptInterpreterFactory)
 	}
 
+	// Skip script verification entirely if requested (e.g., during block catchup)
+	if validationOptions != nil && validationOptions.SkipScriptVerification {
+		// Skip CPU-intensive script verification - transactions are already confirmed on-chain
+		return nil
+	}
+
 	// SkipPolicy is equivalent to execute the script with consensus = true
 	// https://github.com/bsv-blockchain/teranode/issues/2367
 	consensus := true

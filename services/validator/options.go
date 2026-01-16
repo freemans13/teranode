@@ -9,13 +9,8 @@ package validator
 
 import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
-
-// ParentTxMetadata holds metadata about a parent transaction needed for validation
-// This allows the validator to skip UTXO store lookups for in-block parents
-type ParentTxMetadata struct {
-	BlockHeight uint32 // The block height where this transaction was mined
-}
 
 // Options defines the configuration options for validation operations
 type Options struct {
@@ -41,14 +36,20 @@ type Options struct {
 	// IgnoreLocked determines whether to ignore transactions marked as locked when spending
 	IgnoreLocked bool
 
-	// ParentMetadata provides pre-fetched metadata for parent transactions
+	// ParentBlockHeights provides pre-fetched block heights for parent transactions
 	// When provided, the validator will check this map before calling utxoStore.Get()
 	// This enables validation to proceed without UTXO store lookups for in-block parents
-	// Key: parent transaction hash, Value: metadata (block height)
-	ParentMetadata map[chainhash.Hash]*ParentTxMetadata
+	// Key: parent transaction hash, Value: block height where parent was mined
+	ParentBlockHeights map[chainhash.Hash]uint32
+
+	// PrefetchedParents provides pre-fetched full transaction metadata for level 0 parents
+	// This is populated by ValidateLevelBatch before processing workers start
+	// Workers check this map first, eliminating individual Get() calls to UTXO store
+	// Key: parent transaction hash, Value: full metadata (block heights, transaction data)
+	PrefetchedParents map[chainhash.Hash]*meta.Data
 
 	// AutoExtendTransactions determines whether transactions should be automatically extended
-	// with in-block parent output data. When true, the validator will use ParentMetadata
+	// with in-block parent output data. When true, the validator will use ParentBlockHeights
 	// to pre-populate transaction inputs with parent output information, eliminating the
 	// need for UTXO store fetches for in-block dependencies (~500MB+ savings per block)
 	AutoExtendTransactions bool
@@ -72,6 +73,11 @@ type Options struct {
 	//
 	// Monitor: teranode_validator_worker_pool_job_latency for bottlenecks
 	WorkerPoolSize int
+
+	// SkipScriptVerification determines whether to skip CPU-intensive script verification
+	// When true, the validator will skip script execution/validation entirely
+	// This is useful during block catchup where transactions are already confirmed on-chain
+	SkipScriptVerification bool
 }
 
 // Option defines a function type for setting options
@@ -178,6 +184,18 @@ func WithIgnoreConflicting(ignore bool) Option {
 func WithIgnoreLocked(ignoreLocked bool) Option {
 	return func(o *Options) {
 		o.IgnoreLocked = ignoreLocked
+	}
+}
+
+// WithSkipScriptVerification creates an option to control whether script verification should be skipped
+// Parameters:
+//   - skip: When true, CPU-intensive script verification will be skipped
+//
+// Returns:
+//   - Option: Function that sets the skipScriptVerification option
+func WithSkipScriptVerification(skip bool) Option {
+	return func(o *Options) {
+		o.SkipScriptVerification = skip
 	}
 }
 
