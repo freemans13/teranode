@@ -2412,6 +2412,17 @@ func (b *Blockchain) SendFSMEvent(ctx context.Context, eventReq *blockchain_api.
 
 	priorState := b.finiteStateMachine.Current()
 
+	// Prevent manual transitions from CATCHINGBLOCKS state
+	// The state should only exit CATCHINGBLOCKS programmatically when catchup completes
+	if priorState == blockchain_api.FSMStateType_CATCHINGBLOCKS.String() {
+		// Only allow RUN event (catchup completion) to exit CATCHINGBLOCKS
+		if eventReq.Event != blockchain_api.FSMEventType_RUN {
+			errMsg := "cannot manually transition from CATCHINGBLOCKS state - catchup must complete first"
+			b.logger.Warnf("[Blockchain Server] %s (attempted event: %v)", errMsg, eventReq.Event)
+			return nil, errors.NewInvalidArgumentError(errMsg)
+		}
+	}
+
 	err := b.finiteStateMachine.Event(ctx, eventReq.Event.String())
 	if err != nil {
 		b.logger.Debugf("[Blockchain Server] Error sending event to FSM, state has not changed.")
