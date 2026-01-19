@@ -430,6 +430,7 @@ func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
 
 	start := time.Now()
 	stat := gocore.NewStat("sendSpendBatchLua")
+	// s.logger.Debugf("[BATCHER] sendSpendBatchLua called with %d items", len(batch))
 
 	ctx, _, deferFn := tracing.Tracer("aerospike").Start(s.ctx, "sendSpendBatchLua",
 		tracing.WithParentStat(stat),
@@ -543,6 +544,8 @@ func (s *Store) createBatchRecords(batchesByKey map[keyIgnoreLocked][]aerospike.
 	batchRecordKeys := make([]keyIgnoreLocked, 0, len(batchesByKey))
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 
+	// s.logger.Debugf("[BATCHER] createBatchRecords: Grouped into %d parent groups", len(batchesByKey))
+
 	for batchKey, batchItems := range batchesByKey {
 		useLuaPackage := LuaPackage
 		if s.settings.Aerospike.SeparateSpendUDFModuleCount > 0 {
@@ -566,7 +569,9 @@ func (s *Store) createBatchRecords(batchesByKey map[keyIgnoreLocked][]aerospike.
 // executeSpendBatch executes the batch operation
 func (s *Store) executeSpendBatch(batchRecords []aerospike.BatchRecordIfc, batch []*batchSpend, batchID uint64) error {
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	// aeroStart := time.Now()
 	err := s.client.BatchOperate(batchPolicy, batchRecords)
+	// s.logger.Debugf("[BATCHER] Aerospike BatchOperate(%d groups) took %v", len(batchRecords), time.Since(aeroStart))
 	if err != nil {
 		for idx, bItem := range batch {
 			bItem.errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] failed to batch spend aerospike map utxo in batchId %d: %d - %w", bItem.spend.TxID.String(), batchID, idx, err)

@@ -221,12 +221,8 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
 
-	numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
-	s.logger.Debugf("[CREATE_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
-
-	// Log connection pool usage before starting
-	connsBefore := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[CREATE_BATCH_DIRECT] Aerospike connections before chunks: %d (pool size: %d)", connsBefore, s.client.GetConnectionQueueSize())
+	// numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
+	// s.logger.Debugf("[CREATE_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
 
 	// PHASE 2 OPTIMIZATION: Parallelize chunk processing for high throughput
 	// Split into chunks and execute them in parallel using errgroup
@@ -263,18 +259,10 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 		})
 	}
 
-	// Give goroutines a moment to all launch and make their requests
-	time.Sleep(10 * time.Millisecond)
-	connsPeak := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[CREATE_BATCH_DIRECT] Aerospike connections during chunk execution (peak): %d", connsPeak)
-
 	// Wait for all chunks to complete
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-
-	connsAfter := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[CREATE_BATCH_DIRECT] Aerospike connections after chunks complete: %d", connsAfter)
 
 	// PHASE 4: Process results
 	for i, record := range batchRecords {
@@ -289,12 +277,6 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 				// This is a NOOP record (pagination handled externally) - skip
 				results[i].Success = false
 			} else {
-				// DEBUG: Log if target parent fails to create
-				targetParent := "b4d259564fe04d69f4e3a5be2d38045820c2daedccc612ce24224717c68577e7"
-				if requests[i].Tx.TxID() == targetParent {
-					s.logger.Errorf("[CREATE_BATCH_DIRECT][DEBUG] Target parent %s: BatchWrite FAILED with error: %v", targetParent, batchErr)
-				}
-
 				results[i].Err = errors.NewStorageError("[CREATE_BATCH_DIRECT][%s] failed to create", requests[i].Tx.TxID(), batchErr)
 				results[i].Success = false
 			}
@@ -311,7 +293,7 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 			// 	key, _ := aerospike.NewKey(s.namespace, s.setName, requests[i].Tx.TxIDChainHash()[:])
 			// 	verifyRecord, verifyErr := s.client.Get(nil, key)
 			// 	if verifyErr != nil || verifyRecord == nil {
-			// 		s.logger.Errorf("[CREATE_BATCH_DIRECT][DEBUG] Target parent %s: VERIFICATION FAILED - record not found in Aerospike after BatchWrite success! Error: %v", targetParent, verifyErr)
+			// 		s.logger.Debugf("[CREATE_BATCH_DIRECT][DEBUG] Target parent %s: VERIFICATION FAILED - record not found in Aerospike after BatchWrite success! Error: %v", targetParent, verifyErr)
 			// 	} else {
 			// 		s.logger.Infof("[CREATE_BATCH_DIRECT][DEBUG] Target parent %s: Verification OK - record exists with %d bins", targetParent, len(verifyRecord.Bins))
 			// 	}
@@ -341,7 +323,7 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 
 		// Handle errors
 		if err != nil && !errors.Is(err, errors.ErrTxExists) {
-			s.logger.Errorf("[CREATE_BATCH_DIRECT][DEBUG] Transaction %s async create returned error: %v", requests[i].Tx.TxID(), err)
+			// s.logger.Debugf("[CREATE_BATCH_DIRECT][DEBUG] Transaction %s async create returned error: %v", requests[i].Tx.TxID(), err)
 			results[i].Err = errors.NewProcessingError("[CREATE_BATCH_DIRECT][%s] async create failed", requests[i].Tx.TxID(), err)
 			results[i].Success = false
 			continue
@@ -370,7 +352,7 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 				// CRITICAL BUG FIX: Transaction doesn't exist - async create FAILED!
 				// This should NOT be treated as "cleared" - the tx was never created
 				// Treating this as success causes children to fail with "parent not found"
-				s.logger.Errorf("[CREATE_BATCH_DIRECT][%s] async create verification failed - transaction not found in store (async create likely failed)", txHash)
+				s.logger.Debugf("[CREATE_BATCH_DIRECT][%s] async create verification failed - transaction not found in store (async create likely failed)", txHash)
 				// Leave cleared=false to trigger error reporting below
 				break
 			}
@@ -393,7 +375,7 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 			// CRITICAL: Either creating flag still set OR transaction doesn't exist
 			// Both cases mean the transaction is not accessible and should be treated as failure
 			// Returning success here causes children to fail with "parent not found" errors
-			s.logger.Errorf("[CREATE_BATCH_DIRECT][%s] async create FAILED: transaction not accessible after %d retries", txHash, maxRetries)
+			// s.logger.Debugf("[CREATE_BATCH_DIRECT][%s] async create FAILED: transaction not accessible after %d retries", txHash, maxRetries)
 			results[i].Success = false
 			results[i].Err = errors.NewProcessingError("[CREATE_BATCH_DIRECT][%s] async create failed - transaction not accessible", requests[i].Tx.TxID())
 			continue

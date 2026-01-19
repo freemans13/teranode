@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -79,13 +78,9 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 
 	// Chunk and parallelize batch operations to match Create/Spend/BatchDecorate pattern
 	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
-	numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
+	// numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
 
-	s.logger.Debugf("[setLockedBatch] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
-
-	// Log connection pool usage before starting
-	connsBefore := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[setLockedBatch] Aerospike connections before chunks: %d (pool size: %d)", connsBefore, s.client.GetConnectionQueueSize())
+	// s.logger.Debugf("[setLockedBatch] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
 
 	// Split into chunks and execute in parallel with concurrency limit
 	g := errgroup.Group{}
@@ -105,11 +100,6 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 		})
 	}
 
-	// Give goroutines a moment to launch and make requests
-	time.Sleep(10 * time.Millisecond)
-	connsPeak := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[setLockedBatch] Aerospike connections during chunk execution (peak): %d", connsPeak)
-
 	// Wait for all chunks to complete
 	if err := g.Wait(); err != nil {
 		for _, batchItem := range batch {
@@ -117,9 +107,6 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 		}
 		return
 	}
-
-	connsAfter := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[setLockedBatch] Aerospike connections after chunks complete: %d", connsAfter)
 
 	// Now we need to get totalRecords and do all the child records if necessary...
 	for idx, batchRecord := range batchRecords {

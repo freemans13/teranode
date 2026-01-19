@@ -3,7 +3,6 @@ package aerospike
 
 import (
 	"context"
-	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -144,7 +143,7 @@ func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpen
 		return results, nil
 	}
 
-	s.logger.Debugf("[SPEND_BATCH_DIRECT] Grouped %d requests into %d parent transaction groups", len(requests), len(groups))
+	// s.logger.Debugf("[SPEND_BATCH_DIRECT] Grouped %d requests into %d parent transaction groups", len(requests), len(groups))
 
 	// PHASE 2: Create Aerospike batch operations
 	// Reuse pattern from spend.go:540-564
@@ -185,13 +184,9 @@ func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpen
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
 
-	startBatch := time.Now()
-	numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
-	s.logger.Debugf("[SPEND_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
-
-	// Log connection pool usage before starting
-	connsBefore := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[SPEND_BATCH_DIRECT] Aerospike connections before chunks: %d (pool size: %d)", connsBefore, s.client.GetConnectionQueueSize())
+	// startBatch := time.Now()
+	// numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
+	// s.logger.Debugf("[SPEND_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
 
 	// PHASE 2 OPTIMIZATION: Parallelize chunk processing for high throughput
 	// Split into chunks and execute them in parallel using errgroup
@@ -223,20 +218,12 @@ func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpen
 		})
 	}
 
-	// Give goroutines a moment to all launch and make their requests
-	time.Sleep(10 * time.Millisecond)
-	connsPeak := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[SPEND_BATCH_DIRECT] Aerospike connections during chunk execution (peak): %d", connsPeak)
-
 	// Wait for all chunks to complete
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
 
-	connsAfter := s.client.GetActiveConnectionCount()
-	s.logger.Infof("[SPEND_BATCH_DIRECT] Aerospike connections after chunks complete: %d", connsAfter)
-
-	s.logger.Debugf("[SPEND_BATCH_DIRECT] Aerospike BatchOperate completed in %v", time.Since(startBatch))
+	// s.logger.Debugf("[SPEND_BATCH_DIRECT] Aerospike BatchOperate completed in %v", time.Since(startBatch))
 
 	// PHASE 4: Parse Lua responses and distribute errors
 	// Reuse error parsing logic from spend.go:580-790
@@ -356,7 +343,7 @@ func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpen
 			// Rollback successful spends (maintains atomicity)
 			if len(successfulSpends) > 0 {
 				if unspendErr := s.Unspend(ctx, successfulSpends); unspendErr != nil {
-					s.logger.Errorf("[SPEND_BATCH_DIRECT][%s] failed to rollback spends: %v", result.TxHash.String(), unspendErr)
+					s.logger.Debugf("[SPEND_BATCH_DIRECT][%s] failed to rollback spends: %v", result.TxHash.String(), unspendErr)
 				}
 			}
 

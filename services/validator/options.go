@@ -78,6 +78,42 @@ type Options struct {
 	// When true, the validator will skip script execution/validation entirely
 	// This is useful during block catchup where transactions are already confirmed on-chain
 	SkipScriptVerification bool
+
+	// ReuseWorkerPool allows reusing an existing worker pool across multiple levels
+	// When set, ValidateLevelBatch will use this pool instead of creating a new one
+	// This significantly reduces overhead by avoiding repeated goroutine creation/teardown
+	// Internal use only - set by ValidateMulti to enable worker pool reuse optimization
+	ReuseWorkerPool *validationWorkerPool
+
+	// SkipLevelOrganization bypasses DAG construction and processes all transactions as a single level
+	// When true, ValidateMulti will not organize transactions by dependency levels
+	// Use this when transactions are already known to be at the same level or when
+	// level organization overhead needs to be eliminated for benchmarking
+	SkipLevelOrganization bool
+
+	// UseIndividualBatchedCalls uses individual Spend/Create calls (through batchers) instead of
+	// SpendBatchDirect/CreateBatchDirect. This allows natural pipelining where Create operations
+	// can start before all Spend operations complete.
+	UseIndividualBatchedCalls bool
+
+	// ConcurrentLevels allows processing multiple dependency levels in parallel
+	// When > 1, ValidateMulti will process this many levels concurrently (with proper dependency management)
+	// This increases CPU utilization and throughput by reducing idle time between levels
+	// Default: 1 (sequential processing)
+	ConcurrentLevels int
+
+	// ChunkSize splits each level into smaller chunks for concurrent processing
+	// When > 0, each level is divided into chunks of this size and processed concurrently
+	// This improves CPU utilization by allowing multiple batch operations to run in parallel
+	// Default: 0 (process entire level as one batch)
+	ChunkSize int
+
+	// MaxConcurrentChunks limits how many chunks can process simultaneously
+	// Prevents overwhelming Aerospike connection pool when ChunkSize creates many chunks
+	// Each chunk runs SpendBatchDirect and CreateBatchDirect, both using connection pool
+	// Default: 0 (auto-calculated as 8, safe for typical ConnectionQueueSize=64)
+	// Recommended: 8-16 for stable operation, tune upward if no connection warnings
+	MaxConcurrentChunks int
 }
 
 // Option defines a function type for setting options

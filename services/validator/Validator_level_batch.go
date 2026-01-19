@@ -2,6 +2,7 @@ package validator
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -73,12 +74,19 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 	// TIMING: Track each phase duration
 	phaseStart := time.Now()
 
-	// PHASE 0: Pre-fetch Parent Transactions (Level 0 Only)
+	// PHASE 0: Pre-fetch Parent Transactions (SKIP if all txs extended!)
 	// ======================================================
-	// Pre-fetch ALL unique parent transactions for the entire level in a single BatchDecorate call
-	// This replaces ~25 individual BatchDecorate calls (via getBatcher) with ONE upfront query
-	// Saves ~3.7 seconds per level by reducing Aerospike roundtrips from 25 to 1
-	if opts != nil {
+	// OPTIMIZATION: If all transactions are already extended, skip prefetch entirely
+	// Extended txs already have parent data, no need to fetch from UTXO store
+	allExtended := true
+	for _, tx := range txs {
+		if tx != nil && !tx.IsExtended() {
+			allExtended = false
+			break
+		}
+	}
+
+	if !allExtended && opts != nil {
 		parentMap, err := v.prefetchParentsForLevel(ctx, txs, opts)
 		if err != nil {
 			span.RecordError(err)
@@ -87,41 +95,135 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		// Store in opts for workers to use (avoids individual Get() calls)
 		opts.PrefetchedParents = parentMap
 	}
-	v.logger.Infof("[ValidateLevelBatch] PHASE 0 (prefetch) completed in %v", time.Since(phaseStart))
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 0 (prefetch) completed in %v (skipped: %v)", time.Since(phaseStart), allExtended)
 
-	// PHASE 1: Validation Checks (parallel, uses ParentBlockHeights + batchers)
+	// PHASE 1: Validation + Collect Spend Requests (PARALLEL - optimized!)
 	phaseStart = time.Now()
 	// =======================================================================
-	// Transactions already extended by extendTxWithInBlockParents for level 1+
-	// Level 0 uses getTransactionInputBlockHeightsAndExtendTx which leverages batchers
-	// ParentBlockHeights prevents UTXO fetches for in-block parents (Validator.go:725-740)
+	// OPTIMIZATION: Do validation AND collect spend requests in one pass
+	// This eliminates the extra PHASE 2 collection loop
 
-	// Calculate optimal worker count based on CPU cores and transaction count
-	// Default: 2x CPU cores for CPU-bound script validation
-	numWorkers := getOptimalWorkerCount(len(txs), opts.WorkerPoolSize, opts)
+	validationResults := make([]validationResult, len(txs))
 
-	// Create worker pool with parent context for proper cancellation/tracing
-	pool := newValidationWorkerPool(ctx, v, numWorkers, len(txs), blockHeight, blockState, opts)
-	pool.Start()
+	// Pre-allocate for spend requests (will collect during validation)
+	spendRequests := make([]*utxo.BatchSpendRequest, len(txs))
 
-	// Submit all transactions as jobs to the worker pool
+	// Collect timings for aggregate metrics (report once per batch, not per tx)
+	timings := make([]time.Duration, len(txs))
+
+	// Use errgroup for parallel processing
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(len(txs)) // No limit - let all goroutines run concurrently
+
 	for i, tx := range txs {
-		pool.Submit(validationJob{
-			txIndex: i,
-			tx:      tx,
+		idx := i
+		transaction := tx
+
+		g.Go(func() error {
+			startTime := time.Now()
+			defer func() {
+				// Collect timing instead of reporting per-tx
+				timings[idx] = time.Since(startTime)
+			}()
+
+			transaction.SetTxHash(transaction.TxIDChainHash())
+			txID := transaction.TxIDChainHash().String()
+
+			result := &validationResults[idx]
+
+			// Check IsFinal (consensus rule - cannot skip)
+			if blockHeight > v.settings.ChainCfgParams.CSVHeight {
+				if blockState.MedianTime == 0 {
+					result.err = errors.NewProcessingError("utxo store not ready, median block time: 0")
+					return nil
+				}
+				if err := util.IsTransactionFinal(transaction, blockHeight, blockState.MedianTime); err != nil {
+					result.err = errors.NewUtxoNonFinalError("[ValidateLevelBatch][%s] transaction is not final", txID, err)
+					return nil
+				}
+			}
+
+			// Check coinbase (consensus rule - cannot skip)
+			if transaction.IsCoinbase() {
+				result.err = errors.NewProcessingError("[ValidateLevelBatch][%s] coinbase transactions are not supported", txID)
+				return nil
+			}
+
+			var utxoHeights []uint32
+
+			// Get UTXO heights and extend if needed
+			if !transaction.IsExtended() {
+				var err error
+				utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(gctx, transaction, txID, opts)
+				if err != nil {
+					result.err = errors.NewProcessingError("[ValidateLevelBatch][%s] error getting transaction input block heights", txID, err)
+					return nil
+				}
+			}
+
+			// Validate transaction format and consensus rules
+			if err := v.validateTransaction(gctx, transaction, blockHeight, utxoHeights, opts); err != nil {
+				result.err = errors.NewProcessingError("[ValidateLevelBatch][%s] error validating transaction", txID, err)
+				return nil
+			}
+
+			// Get utxo heights if not already fetched
+			if len(utxoHeights) == 0 {
+				var err error
+				utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(gctx, transaction, txID, opts)
+				if err != nil {
+					result.err = errors.NewProcessingError("[ValidateLevelBatch][%s] error getting transaction input block heights", txID, err)
+					return nil
+				}
+			}
+
+			// Validate scripts and signatures
+			if err := v.validateTransactionScripts(gctx, transaction, blockHeight, utxoHeights, opts); err != nil {
+				result.err = errors.NewProcessingError("[ValidateLevelBatch][%s] error validating transaction scripts", txID, err)
+				return nil
+			}
+
+			result.utxoHeights = utxoHeights
+
+			// OPTIMIZATION: Collect spend request during validation (no extra loop!)
+			spendRequests[idx] = &utxo.BatchSpendRequest{
+				Tx:          transaction,
+				BlockHeight: blockHeight,
+				IgnoreFlags: utxo.IgnoreFlags{
+					IgnoreConflicting: false,
+					IgnoreLocked:      opts.IgnoreLocked,
+				},
+			}
+
+			return nil
 		})
 	}
 
 	// Wait for all validations to complete
-	pool.Close()
+	_ = g.Wait()
 
-	// Get results from the worker pool
-	validationResults := pool.results
+	// AGGREGATE METRICS: Report average timing for the batch instead of per-tx
+	// This reduces metric overhead from N observations to 1 per batch
+	if len(timings) > 0 {
+		var totalTime time.Duration
+		for _, t := range timings {
+			totalTime += t
+		}
+		avgLatency := totalTime / time.Duration(len(timings))
+		prometheusValidatorWorkerPoolJobLatency.Observe(float64(avgLatency.Microseconds()))
+	}
 
-	// Check for validation failures
+	// Check for validation failures and build final spend request list
+	finalSpendRequests := make([]*utxo.BatchSpendRequest, 0, len(txs))
+	spendIndexMap := make(map[int]int) // spendRequestIdx -> resultsIdx
+
 	for i, valResult := range validationResults {
 		if valResult.err != nil {
 			results[i].Err = valResult.err
+		} else {
+			// Validation succeeded - include in batch spend
+			spendIndexMap[len(finalSpendRequests)] = i
+			finalSpendRequests = append(finalSpendRequests, spendRequests[i])
 		}
 	}
 
@@ -185,47 +287,90 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		prometheusValidatorSendToP2PKafka.Observe(float64(time.Since(startKafka).Microseconds()) / 1_000_000)
 		v.logger.Debugf("[ValidateLevelBatch] published %d rejected txs to Kafka", len(rejectedTxs))
 	}
-	v.logger.Infof("[ValidateLevelBatch] PHASE 1 (validation) completed in %v", time.Since(phaseStart))
+	phase1Time := time.Since(phaseStart)
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 1 (validation + collect) completed in %v", phase1Time)
 
-	// PHASE 2: Batch Spend Operations
+	// PHASE 2: UTXO Operations - Use batchers or BatchDirect based on option
 	phaseStart = time.Now()
 	// ================================
-	// Collect spend requests for transactions that passed validation
-	spendRequests := make([]*utxo.BatchSpendRequest, 0, len(txs))
-	spendIndexMap := make(map[int]int) // spendRequestIdx -> resultsIdx
 
-	for i, tx := range txs {
-		// Skip transactions that failed validation
-		if validationResults[i].err != nil {
-			continue
+	if opts.UseIndividualBatchedCalls {
+		// PIPELINING APPROACH: Use individual Spend/Create calls through batchers
+		// This allows natural overlap between Spend and Create operations
+		v.logger.Errorf("[ValidateLevelBatch] Using individual batched calls (pipelining enabled)")
+
+		var utxoWg sync.WaitGroup
+		resultsMutex := sync.Mutex{}
+
+		for i := range finalSpendRequests {
+			reqIdx := i
+			request := finalSpendRequests[i]
+			txIdx := spendIndexMap[reqIdx]
+
+			utxoWg.Add(1)
+			go func() {
+				defer utxoWg.Done()
+
+				// Spend (through spendBatcher)
+				spends, spendErr := v.utxoStore.Spend(ctx, request.Tx, request.BlockHeight, request.IgnoreFlags)
+
+				resultsMutex.Lock()
+				defer resultsMutex.Unlock()
+
+				// Check spend result
+				if spendErr != nil {
+					results[txIdx].Err = spendErr
+					return
+				}
+
+				// Check if any individual spend failed
+				for _, spend := range spends {
+					if spend.Err != nil {
+						results[txIdx].Err = spend.Err
+						if spend.ConflictingTxID != nil {
+							results[txIdx].ConflictingTxID = spend.ConflictingTxID
+						}
+						return
+					}
+				}
+
+				// Spend succeeded - Create (through storeBatcher)
+				// This can start while other goroutines are still spending!
+				txMeta, createErr := v.CreateInUtxoStore(ctx, request.Tx, request.BlockHeight, false, false)
+				if createErr != nil {
+					results[txIdx].Err = createErr
+					return
+				}
+
+				// Success!
+				results[txIdx].Success = true
+				results[txIdx].TxMeta = txMeta
+			}()
 		}
 
-		// Cache tx hash
-		tx.SetTxHash(tx.TxIDChainHash())
-
-		spendIndexMap[len(spendRequests)] = i
-		spendRequests = append(spendRequests, &utxo.BatchSpendRequest{
-			Tx:          tx,
-			BlockHeight: blockHeight,
-			IgnoreFlags: utxo.IgnoreFlags{
-				IgnoreConflicting: false,
-				IgnoreLocked:      opts.IgnoreLocked,
-			},
-		})
+		utxoWg.Wait()
+		v.logger.Debugf("[ValidateLevelBatch] PHASE 2 (pipelined spend+create) completed in %v", time.Since(phaseStart))
+		return results, nil
 	}
 
-	// Execute batch spend
+	// ORIGINAL APPROACH: Sequential BatchDirect operations
 	var spendResults []*utxo.BatchSpendResult
 	var spendErr error
 
-	if len(spendRequests) > 0 {
-		spendResults, spendErr = v.utxoStore.SpendBatchDirect(ctx, spendRequests)
+	if len(finalSpendRequests) > 0 {
+		spendResults, spendErr = v.utxoStore.SpendBatchDirect(ctx, finalSpendRequests)
 		if spendErr != nil {
 			span.RecordError(spendErr)
 			return nil, errors.NewProcessingError("[ValidateLevelBatch] batch spend failed", spendErr)
 		}
 	}
-	v.logger.Infof("[ValidateLevelBatch] PHASE 2 (spend) completed in %v", time.Since(phaseStart))
+	phase2Time := time.Since(phaseStart)
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 2 (spend) completed in %v", phase2Time)
+
+	// LOG BREAKDOWN
+	if len(txs) == 1000 {
+		v.logger.Errorf("[TIMING] Level with 1000 txs: Phase1=%v, Phase2(Spend)=%v", phase1Time, phase2Time)
+	}
 
 	// PHASE 3: Partition Results by Type
 	phaseStart = time.Now()
@@ -284,7 +429,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 	}
 
 	v.logger.Debugf("[ValidateLevelBatch] Partition phase: %d successful, %d conflicting, %d failed", len(successfulTxs), len(conflictingTxs), len(txs)-len(successfulTxs)-len(conflictingTxs))
-	v.logger.Infof("[ValidateLevelBatch] PHASE 3 (partition) completed in %v", time.Since(phaseStart))
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 3 (partition) completed in %v", time.Since(phaseStart))
 
 	// PHASE 4: Batch Create Successful Transactions
 	phaseStart = time.Now()
@@ -384,7 +529,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			}
 		}
 	}
-	v.logger.Infof("[ValidateLevelBatch] PHASE 4 (create successful) completed in %v (%d txs)", time.Since(phaseStart), len(successfulTxs))
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 4 (create successful) completed in %v (%d txs)", time.Since(phaseStart), len(successfulTxs))
 
 	// PHASE 5: Create Conflicting Transactions
 	phaseStart = time.Now()
@@ -419,7 +564,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			}
 		}
 	}
-	v.logger.Infof("[ValidateLevelBatch] PHASE 5 (create conflicting) completed in %v (%d txs)", time.Since(phaseStart), len(conflictingTxs))
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 5 (create conflicting) completed in %v (%d txs)", time.Since(phaseStart), len(conflictingTxs))
 
 	// PHASE 6: Block Assembly Integration
 	phaseStart = time.Now()
@@ -478,7 +623,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			}
 		}
 	}
-	v.logger.Infof("[ValidateLevelBatch] PHASE 6 (block assembly + unlock) completed in %v", time.Since(phaseStart))
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 6 (block assembly + unlock) completed in %v", time.Since(phaseStart))
 
 	// PHASE 7: Kafka Notifications (concurrent worker pool)
 	phaseStart = time.Now()
@@ -507,7 +652,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		// Wait for all Kafka notifications to complete
 		kafkaPool.Close()
 	}
-	v.logger.Infof("[ValidateLevelBatch] PHASE 7 (kafka notifications) completed in %v", time.Since(phaseStart))
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 7 (kafka notifications) completed in %v", time.Since(phaseStart))
 
 	// PHASE 8: Two-Phase Commit (unlock locked transactions)
 	phaseStart = time.Now()
@@ -527,7 +672,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			}
 		}
 	}
-	v.logger.Infof("[ValidateLevelBatch] PHASE 8 (unlock) completed in %v", time.Since(phaseStart))
+	v.logger.Debugf("[ValidateLevelBatch] PHASE 8 (unlock) completed in %v", time.Since(phaseStart))
 
 	// Count successes for metrics
 	successCount := 0

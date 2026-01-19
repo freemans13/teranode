@@ -42,6 +42,11 @@ type validationWorkerPool struct {
 
 	// Results storage (each worker writes to different index, no locking needed)
 	results []validationResult
+
+	// Batch tracking for reusable pool
+	batchWg       sync.WaitGroup
+	batchMutex    sync.Mutex
+	trackingBatch bool
 }
 
 // newValidationWorkerPool creates a worker pool with the specified number of workers
@@ -106,6 +111,10 @@ func (p *validationWorkerPool) processJob(job validationJob) {
 		// Convert to microseconds for the metric
 		latencyMicros := float64(time.Since(startTime).Microseconds())
 		prometheusValidatorWorkerPoolJobLatency.Observe(latencyMicros)
+		// Signal batch completion if tracking batches
+		if p.trackingBatch {
+			p.batchWg.Done()
+		}
 	}()
 
 	tx := job.tx
@@ -182,6 +191,47 @@ func (p *validationWorkerPool) Close() {
 	p.wg.Wait()
 }
 
+// ProcessBatch processes a batch of transactions using the existing worker pool
+// This method allows reusing the worker pool across multiple batches without
+// recreating goroutines, which significantly reduces overhead.
+func (p *validationWorkerPool) ProcessBatch(txs []*bt.Tx) []validationResult {
+	p.batchMutex.Lock()
+
+	// Resize results slice if needed
+	if cap(p.results) < len(txs) {
+		p.results = make([]validationResult, len(txs))
+	} else {
+		p.results = p.results[:len(txs)]
+		// Clear existing results
+		for i := range p.results {
+			p.results[i] = validationResult{}
+		}
+	}
+
+	// Enable batch tracking
+	p.trackingBatch = true
+	p.batchWg.Add(len(txs))
+	p.batchMutex.Unlock()
+
+	// Submit all jobs
+	for i, tx := range txs {
+		p.jobs <- validationJob{
+			txIndex: i,
+			tx:      tx,
+		}
+	}
+
+	// Wait for all jobs in this batch to complete
+	p.batchWg.Wait()
+
+	// Disable batch tracking for next batch
+	p.batchMutex.Lock()
+	p.trackingBatch = false
+	p.batchMutex.Unlock()
+
+	return p.results
+}
+
 // Shutdown gracefully stops all workers by cancelling the context
 func (p *validationWorkerPool) Shutdown() {
 	p.cancel()
@@ -197,20 +247,14 @@ func getOptimalWorkerCount(numTransactions int, configuredSize int, opts *Option
 		return configuredSize
 	}
 
-	// Base multiplier for I/O-heavy workload
-	// Validation is ~60% I/O (UTXO fetches, Aerospike calls) and ~40% CPU (script validation)
-	// High concurrency needed for I/O operations to keep UTXO batchers saturated
-	// Reduced from 32 to 4 to avoid scheduler thrashing (512 workers was too many)
-	multiplier := 4 // Default: On 16-core machine = 64 workers
+	numCPU := runtime.GOMAXPROCS(0)
 
-	// PHASE 5 OPTIMIZATION: During catchup with script verification skipped, increase parallelism
-	// With no script validation, workload becomes pure I/O
-	// Need high concurrency to saturate Aerospike batchers and keep throughput high
-	if opts != nil && opts.SkipScriptVerification {
-		multiplier = 32 // 16 cores * 32 = 512 workers (testing if throughput improves with more parallelism)
-	}
+	// Use a fixed 4x multiplier for balanced CPU/I/O workload
+	// This gives 64 workers on a 16-core machine
+	// Adaptive scaling made things worse in testing, so keeping it simple
+	multiplier := 4
 
-	numWorkers := runtime.GOMAXPROCS(0) * multiplier
+	numWorkers := numCPU * multiplier
 
 	// Don't create more workers than transactions
 	if numWorkers > numTransactions {
