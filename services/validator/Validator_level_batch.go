@@ -70,6 +70,9 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		blockHeight = blockState.Height + 1
 	}
 
+	// TIMING: Track each phase duration
+	phaseStart := time.Now()
+
 	// PHASE 0: Pre-fetch Parent Transactions (Level 0 Only)
 	// ======================================================
 	// Pre-fetch ALL unique parent transactions for the entire level in a single BatchDecorate call
@@ -84,8 +87,10 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		// Store in opts for workers to use (avoids individual Get() calls)
 		opts.PrefetchedParents = parentMap
 	}
+	v.logger.Infof("[ValidateLevelBatch] PHASE 0 (prefetch) completed in %v", time.Since(phaseStart))
 
 	// PHASE 1: Validation Checks (parallel, uses ParentBlockHeights + batchers)
+	phaseStart = time.Now()
 	// =======================================================================
 	// Transactions already extended by extendTxWithInBlockParents for level 1+
 	// Level 0 uses getTransactionInputBlockHeightsAndExtendTx which leverages batchers
@@ -180,8 +185,10 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		prometheusValidatorSendToP2PKafka.Observe(float64(time.Since(startKafka).Microseconds()) / 1_000_000)
 		v.logger.Debugf("[ValidateLevelBatch] published %d rejected txs to Kafka", len(rejectedTxs))
 	}
+	v.logger.Infof("[ValidateLevelBatch] PHASE 1 (validation) completed in %v", time.Since(phaseStart))
 
 	// PHASE 2: Batch Spend Operations
+	phaseStart = time.Now()
 	// ================================
 	// Collect spend requests for transactions that passed validation
 	spendRequests := make([]*utxo.BatchSpendRequest, 0, len(txs))
@@ -218,8 +225,10 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			return nil, errors.NewProcessingError("[ValidateLevelBatch] batch spend failed", spendErr)
 		}
 	}
+	v.logger.Infof("[ValidateLevelBatch] PHASE 2 (spend) completed in %v", time.Since(phaseStart))
 
 	// PHASE 3: Partition Results by Type
+	phaseStart = time.Now()
 	// ===================================
 	// Successful: All spends succeeded, ready for create
 	// Conflicting: Spent by another tx, create as conflicting if CreateConflicting=true
@@ -275,8 +284,10 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 	}
 
 	v.logger.Debugf("[ValidateLevelBatch] Partition phase: %d successful, %d conflicting, %d failed", len(successfulTxs), len(conflictingTxs), len(txs)-len(successfulTxs)-len(conflictingTxs))
+	v.logger.Infof("[ValidateLevelBatch] PHASE 3 (partition) completed in %v", time.Since(phaseStart))
 
 	// PHASE 4: Batch Create Successful Transactions
+	phaseStart = time.Now()
 	// ==============================================
 	blockAssemblyEnabled := !v.settings.BlockAssembly.Disabled
 	addToBlockAssembly := blockAssemblyEnabled && opts.AddTXToBlockAssembly
@@ -373,8 +384,10 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			}
 		}
 	}
+	v.logger.Infof("[ValidateLevelBatch] PHASE 4 (create successful) completed in %v (%d txs)", time.Since(phaseStart), len(successfulTxs))
 
 	// PHASE 5: Create Conflicting Transactions
+	phaseStart = time.Now()
 	// =========================================
 	// Reuse pattern from validateInternal:550-574
 	if len(conflictingTxs) > 0 {
@@ -406,8 +419,10 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			}
 		}
 	}
+	v.logger.Infof("[ValidateLevelBatch] PHASE 5 (create conflicting) completed in %v (%d txs)", time.Since(phaseStart), len(conflictingTxs))
 
 	// PHASE 6: Block Assembly Integration
+	phaseStart = time.Now()
 	// ====================================
 	// Only send successful transactions to block assembly (reuse from validateInternal:628-664)
 	if addToBlockAssembly && v.blockAssembler != nil {
@@ -448,7 +463,25 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		}
 	}
 
+	// Unlock transactions (two-phase commit completion)
+	if addToBlockAssembly {
+		lockedTxHashes := make([]chainhash.Hash, 0, len(successfulTxs))
+		for _, cat := range successfulTxs {
+			if results[cat.resultIdx].Success {
+				lockedTxHashes = append(lockedTxHashes, *cat.tx.TxIDChainHash())
+			}
+		}
+
+		if len(lockedTxHashes) > 0 {
+			if err := v.twoPhaseCommitTransactions(ctx, lockedTxHashes); err != nil {
+				v.logger.Errorf("[ValidateLevelBatch] failed to unlock transactions: %v", err)
+			}
+		}
+	}
+	v.logger.Infof("[ValidateLevelBatch] PHASE 6 (block assembly + unlock) completed in %v", time.Since(phaseStart))
+
 	// PHASE 7: Kafka Notifications (concurrent worker pool)
+	phaseStart = time.Now()
 	// ====================================================
 	// Send TxMeta to Kafka for successful transactions using worker pool for parallelization
 	if v.txmetaKafkaProducerClient != nil {
@@ -474,8 +507,10 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 		// Wait for all Kafka notifications to complete
 		kafkaPool.Close()
 	}
+	v.logger.Infof("[ValidateLevelBatch] PHASE 7 (kafka notifications) completed in %v", time.Since(phaseStart))
 
 	// PHASE 8: Two-Phase Commit (unlock locked transactions)
+	phaseStart = time.Now()
 	// =======================================================
 	// Reuse pattern from validateInternal:662-667
 	if addToBlockAssembly {
@@ -492,6 +527,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			}
 		}
 	}
+	v.logger.Infof("[ValidateLevelBatch] PHASE 8 (unlock) completed in %v", time.Since(phaseStart))
 
 	// Count successes for metrics
 	successCount := 0
@@ -598,12 +634,44 @@ func (v *Validator) prefetchParentsForLevel(ctx context.Context, txs []*bt.Tx, o
 		})
 	}
 
-	// Step 3: Call BatchDecorate ONCE for all parents (single Aerospike roundtrip)
+	// Step 3: Call BatchDecorate with chunking for large batches
 	startBatch := time.Now()
-	err := v.utxoStore.BatchDecorate(ctx, items)
-	if err != nil {
-		return nil, errors.NewProcessingError("[prefetchParentsForLevel] failed to batch fetch parents", err)
+
+	// For large parent sets, chunk the BatchDecorate call to prevent overwhelming Aerospike
+	// Use same batch size as Create/Spend operations for consistency
+	maxBatchSize := 5000 // Match settings.conf utxostore_maxAerospikeBatchSize
+
+	if len(items) <= maxBatchSize {
+		// Small batch - single call
+		err := v.utxoStore.BatchDecorate(ctx, items)
+		if err != nil {
+			return nil, errors.NewProcessingError("[prefetchParentsForLevel] failed to batch fetch parents", err)
+		}
+	} else {
+		// Large batch - chunk and parallelize
+		g, _ := errgroup.WithContext(ctx)
+		// g.SetLimit(1)
+		g.SetLimit(64)
+
+		for i := 0; i < len(items); i += maxBatchSize {
+			i := i
+			end := i + maxBatchSize
+			if end > len(items) {
+				end = len(items)
+			}
+
+			chunk := items[i:end]
+
+			g.Go(func() error {
+				return v.utxoStore.BatchDecorate(ctx, chunk)
+			})
+		}
+
+		if err := g.Wait(); err != nil {
+			return nil, errors.NewProcessingError("[prefetchParentsForLevel] failed to batch fetch parents", err)
+		}
 	}
+
 	v.logger.Debugf("[prefetchParentsForLevel] BatchDecorate completed in %v for %d parents", time.Since(startBatch), len(items))
 
 	// Step 4: Build result map for O(1) lookup by workers

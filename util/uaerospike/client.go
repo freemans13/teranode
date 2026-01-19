@@ -9,6 +9,7 @@ import (
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/aerospike/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/ordishs/gocore"
 )
 
@@ -51,11 +52,13 @@ func NewClientStats() *ClientStats {
 	}
 }
 
-// Client is a wrapper around aerospike.Client that provides a semaphore to limit concurrent connections.
+// Client is a wrapper around aerospike.Client that provides retry logic for connection pool exhaustion.
+// Operations will retry with exponential backoff when the Aerospike connection pool is exhausted.
 type Client struct {
 	*aerospike.Client
-	connSemaphore chan struct{} // Simple channel-based semaphore
-	stats         *ClientStats  // Always initialized, never nil
+	stats               *ClientStats   // Always initialized, never nil
+	connectionQueueSize int            // Aerospike connection pool size for monitoring
+	logger              ulogger.Logger // Logger for retry diagnostics
 }
 
 // NewClient creates a new Aerospike client with the specified hostname and port.
@@ -70,14 +73,14 @@ func NewClient(hostname string, port int) (*Client, error) {
 	queueSize := getConnectionQueueSize(policy)
 
 	return &Client{
-		Client:        client,
-		connSemaphore: make(chan struct{}, queueSize*2),
-		stats:         NewClientStats(),
+		Client:              client,
+		stats:               NewClientStats(),
+		connectionQueueSize: queueSize,
 	}, nil
 }
 
 // NewClientWithPolicyAndHost creates a new Aerospike client with the specified policy and hosts.
-func NewClientWithPolicyAndHost(policy *aerospike.ClientPolicy, hosts ...*aerospike.Host) (*Client, aerospike.Error) {
+func NewClientWithPolicyAndHost(logger ulogger.Logger, policy *aerospike.ClientPolicy, hosts ...*aerospike.Host) (*Client, aerospike.Error) {
 	var (
 		client *aerospike.Client
 		err    aerospike.Error
@@ -129,28 +132,21 @@ func NewClientWithPolicyAndHost(policy *aerospike.ClientPolicy, hosts ...*aerosp
 	queueSize := getConnectionQueueSize(policy)
 
 	return &Client{
-		Client:        client,
-		connSemaphore: make(chan struct{}, queueSize),
-		stats:         NewClientStats(),
+		Client:              client,
+		stats:               NewClientStats(),
+		connectionQueueSize: queueSize,
+		logger:              logger,
 	}, nil
 }
 
-// Put is a wrapper around aerospike.Client.Put that uses semaphore to limit concurrent connections.
+// Put is a wrapper around aerospike.Client.Put that retries on connection pool exhaustion.
 func (c *Client) Put(policy *aerospike.WritePolicy, key *aerospike.Key, binMap aerospike.BinMap) aerospike.Error {
-	if err := c.acquirePermit(policy); err != nil {
-		return err
-	}
-	defer c.releasePermit()
-
 	start := gocore.CurrentTime()
 
 	defer func() {
-
 		// Extract keys from binMap
 		keys := make([]string, len(binMap))
-
 		var i int
-
 		for k := range binMap {
 			keys[i] = k
 			i++
@@ -161,34 +157,27 @@ func (c *Client) Put(policy *aerospike.WritePolicy, key *aerospike.Key, binMap a
 
 		// Build the query string with sorted keys
 		var sb strings.Builder
-
 		sb.WriteString("Put: ")
-
 		for i, k := range keys {
 			if i > 0 {
 				sb.WriteString(",")
 			}
-
 			sb.WriteString(k)
 		}
 
 		c.stats.stat.NewStat(sb.String()).AddTime(start)
 	}()
 
-	return c.Client.Put(policy, key, binMap)
+	return retryOnPoolExhaustion(c.logger, "Put", func() aerospike.Error {
+		return c.Client.Put(policy, key, binMap)
+	})
 }
 
-// PutBins is a wrapper around aerospike.Client.PutBins that uses semaphore to limit concurrent connections.
+// PutBins is a wrapper around aerospike.Client.PutBins that retries on connection pool exhaustion.
 func (c *Client) PutBins(policy *aerospike.WritePolicy, key *aerospike.Key, bins ...*aerospike.Bin) aerospike.Error {
-	if err := c.acquirePermit(policy); err != nil {
-		return err
-	}
-	defer c.releasePermit()
-
 	start := gocore.CurrentTime()
 
 	defer func() {
-
 		// Extract keys from binMap
 		keys := make([]string, len(bins))
 		for i, bin := range bins {
@@ -197,161 +186,173 @@ func (c *Client) PutBins(policy *aerospike.WritePolicy, key *aerospike.Key, bins
 
 		// Build the query string with sorted keys
 		var sb strings.Builder
-
 		sb.WriteString("PutBins: ")
-
 		for i, k := range keys {
 			if i > 0 {
 				sb.WriteString(",")
 			}
-
 			sb.WriteString(k)
 		}
 
 		c.stats.stat.NewStat(sb.String()).AddTime(start)
 	}()
 
-	return c.Client.PutBins(policy, key, bins...)
+	return retryOnPoolExhaustion(c.logger, "PutBins", func() aerospike.Error {
+		return c.Client.PutBins(policy, key, bins...)
+	})
 }
 
-// Delete is a wrapper around aerospike.Client.Delete that uses semaphore to limit concurrent connections.
+// Delete is a wrapper around aerospike.Client.Delete that retries on connection pool exhaustion.
 func (c *Client) Delete(policy *aerospike.WritePolicy, key *aerospike.Key) (bool, aerospike.Error) {
-	if err := c.acquirePermit(policy); err != nil {
-		return false, err
-	}
-	defer c.releasePermit()
-
 	start := gocore.CurrentTime()
 
 	defer func() {
 		c.stats.stat.NewStat("Delete").AddTime(start)
 	}()
 
-	return c.Client.Delete(policy, key)
+	var deleted bool
+	err := retryOnPoolExhaustion(c.logger, "Delete", func() aerospike.Error {
+		var e aerospike.Error
+		deleted, e = c.Client.Delete(policy, key)
+		return e
+	})
+
+	return deleted, err
 }
 
-// Get is a wrapper around aerospike.Client.Get that uses semaphore to limit concurrent connections.
+// Get is a wrapper around aerospike.Client.Get that retries on connection pool exhaustion.
 func (c *Client) Get(policy *aerospike.BasePolicy, key *aerospike.Key, binNames ...string) (*aerospike.Record, aerospike.Error) {
-	if err := c.acquirePermit(policy); err != nil {
-		return nil, err
-	}
-	defer c.releasePermit()
-
 	start := gocore.CurrentTime()
 
 	defer func() {
-
 		// Build the query string with sorted keys
 		var sb strings.Builder
-
 		sb.WriteString("Get: ")
-
 		for i, k := range binNames {
 			if i > 0 {
 				sb.WriteString(",")
 			}
-
 			sb.WriteString(k)
 		}
 
 		c.stats.stat.NewStat(sb.String()).AddTime(start)
 	}()
 
-	return c.Client.Get(policy, key, binNames...)
+	var record *aerospike.Record
+	err := retryOnPoolExhaustion(c.logger, "Get", func() aerospike.Error {
+		var e aerospike.Error
+		record, e = c.Client.Get(policy, key, binNames...)
+		return e
+	})
+
+	return record, err
 }
 
-// Operate is a wrapper around aerospike.Client.Operate that uses semaphore to limit concurrent connections.
+// Operate is a wrapper around aerospike.Client.Operate that retries on connection pool exhaustion.
 func (c *Client) Operate(policy *aerospike.WritePolicy, key *aerospike.Key, operations ...*aerospike.Operation) (*aerospike.Record, aerospike.Error) {
-	if err := c.acquirePermit(policy); err != nil {
-		return nil, err
-	}
-	defer c.releasePermit()
-
 	start := gocore.CurrentTime()
 	defer func() {
 		c.stats.operateStat.AddTimeForRange(start, len(operations))
 	}()
 
-	return c.Client.Operate(policy, key, operations...)
+	var record *aerospike.Record
+	err := retryOnPoolExhaustion(c.logger, "Operate", func() aerospike.Error {
+		var e aerospike.Error
+		record, e = c.Client.Operate(policy, key, operations...)
+		return e
+	})
+
+	return record, err
 }
 
-// BatchOperate is a wrapper around aerospike.Client.BatchOperate that uses semaphore to limit concurrent connections.
+// BatchOperate is a wrapper around aerospike.Client.BatchOperate that retries on connection pool exhaustion.
 func (c *Client) BatchOperate(policy *aerospike.BatchPolicy, records []aerospike.BatchRecordIfc) aerospike.Error {
-	if err := c.acquirePermit(policy); err != nil {
-		return err
-	}
-	defer c.releasePermit()
-
 	start := gocore.CurrentTime()
 	defer func() {
 		c.stats.batchOperateStat.AddTimeForRange(start, len(records))
 	}()
 
-	return c.Client.BatchOperate(policy, records)
+	return retryOnPoolExhaustion(c.logger, "BatchOperate", func() aerospike.Error {
+		return c.Client.BatchOperate(policy, records)
+	})
 }
 
-// GetConnectionQueueSize returns the size of the connection semaphore.
-// This represents the maximum number of concurrent Aerospike operations allowed.
+// GetConnectionQueueSize returns the Aerospike connection pool size.
+// This is used for monitoring and validating that concurrent operations won't exhaust the pool.
 func (c *Client) GetConnectionQueueSize() int {
-	return cap(c.connSemaphore)
+	return c.connectionQueueSize
 }
 
-// acquirePermit attempts to acquire a permit from the connection semaphore with an optional timeout.
-// The policy parameter can be nil, in which case no timeout is used (blocks until available).
-// If the policy has a TotalTimeout > 0, a fraction of that timeout (semaphoreTimeoutFraction)
-// is used for permit acquisition to ensure the total operation time stays within bounds.
-// Returns an error if the timeout expires before a permit becomes available.
-//
-// Accepts any Aerospike policy type (BasePolicy, WritePolicy, BatchPolicy) as they all
-// embed BasePolicy which contains TotalTimeout.
-func (c *Client) acquirePermit(policy any) aerospike.Error {
-	totalTimeout := time.Duration(0)
+// GetActiveConnectionCount returns the current number of open connections across all nodes.
+// This is useful for monitoring actual connection pool usage during batch operations.
+func (c *Client) GetActiveConnectionCount() int {
+	stats, err := c.Client.Stats()
+	if err != nil {
+		return -1 // Error getting stats
+	}
 
-	// Extract timeout from policy if available
-	if policy != nil {
-		switch p := policy.(type) {
-		case *aerospike.BasePolicy:
-			if p != nil && p.TotalTimeout > 0 {
-				totalTimeout = p.TotalTimeout
+	if openConns, ok := stats["open-connections"].(int64); ok {
+		return int(openConns)
+	}
+	if openConns, ok := stats["open-connections"].(int); ok {
+		return openConns
+	}
+
+	return -1 // Field not found or wrong type
+}
+
+// retryOnPoolExhaustion retries an Aerospike operation when the connection pool is exhausted.
+// With ExitFastOnExhaustedConnectionPool=true, operations fail immediately on pool exhaustion.
+// This function implements exponential backoff retry logic to handle transient pool saturation.
+//
+// The retry strategy:
+//   - Starts with 5ms backoff, doubles up to 50ms max
+//   - Retries up to 50 times (fast when connections free up)
+//   - Only retries on NO_AVAILABLE_CONNECTIONS_TO_NODE error
+//   - Other errors (timeouts, server errors) fail immediately
+//
+// Parameters:
+//   - operation: Function that executes the Aerospike operation
+//
+// Returns:
+//   - aerospike.Error: nil if operation succeeded, error if max retries exceeded or non-pool error
+func retryOnPoolExhaustion(logger ulogger.Logger, operationName string, operation func() aerospike.Error) aerospike.Error {
+	const maxRetries = 50
+	backoff := 5 * time.Millisecond
+	const maxBackoff = 50 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err := operation()
+
+		if err == nil {
+			if attempt > 0 {
+				logger.Warnf("[RETRY] %s succeeded after %d retries", operationName, attempt)
 			}
-		case *aerospike.WritePolicy:
-			if p != nil && p.TotalTimeout > 0 {
-				totalTimeout = p.TotalTimeout
-			}
-		case *aerospike.BatchPolicy:
-			if p != nil && p.TotalTimeout > 0 {
-				totalTimeout = p.TotalTimeout
+			return nil // Success
+		}
+
+		// Only retry on connection pool exhaustion
+		if !err.Matches(types.NO_AVAILABLE_CONNECTIONS_TO_NODE) {
+			return err // Other errors (timeouts, server errors) fail immediately
+		}
+
+		// Pool exhausted - log and retry
+		if attempt == 0 {
+			logger.Warnf("[RETRY] %s hit pool exhaustion (NO_AVAILABLE_CONNECTIONS_TO_NODE), starting retries...", operationName)
+		}
+
+		if attempt > 0 {
+			logger.Debugf("[RETRY] %s attempt %d failed, sleeping %v", operationName, attempt, backoff)
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
 			}
 		}
 	}
 
-	if totalTimeout <= 0 {
-		// No timeout - block until available
-		c.connSemaphore <- struct{}{}
-		return nil
-	}
-
-	// Calculate semaphore timeout as a fraction of total timeout
-	// This ensures total operation time (semaphore wait + actual operation) stays within bounds
-	semaphoreTimeout := time.Duration(float64(totalTimeout) * semaphoreTimeoutFraction)
-	if semaphoreTimeout < minSemaphoreTimeout {
-		semaphoreTimeout = minSemaphoreTimeout
-	}
-
-	timer := time.NewTimer(semaphoreTimeout)
-	defer timer.Stop()
-
-	select {
-	case c.connSemaphore <- struct{}{}:
-		return nil
-	case <-timer.C:
-		return aerospike.ErrTimeout
-	}
-}
-
-// releasePermit releases a permit back to the connection semaphore.
-func (c *Client) releasePermit() {
-	<-c.connSemaphore
+	logger.Errorf("[RETRY] %s exhausted all %d retries", operationName, maxRetries)
+	return aerospike.ErrConnectionPoolExhausted
 }
 
 // CalculateKeySource generates a key source based on the transaction hash, vout, and batch size.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -76,13 +77,49 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 		))
 	}
 
-	if err := s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords); err != nil {
+	// Chunk and parallelize batch operations to match Create/Spend/BatchDecorate pattern
+	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
+	numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
+
+	s.logger.Debugf("[setLockedBatch] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
+
+	// Log connection pool usage before starting
+	connsBefore := s.client.GetActiveConnectionCount()
+	s.logger.Infof("[setLockedBatch] Aerospike connections before chunks: %d (pool size: %d)", connsBefore, s.client.GetConnectionQueueSize())
+
+	// Split into chunks and execute in parallel with concurrency limit
+	g := errgroup.Group{}
+	g.SetLimit(s.client.GetConnectionQueueSize())
+
+	for i := 0; i < len(batchRecords); i += maxBatchSize {
+		i := i // Capture loop variable
+		end := i + maxBatchSize
+		if end > len(batchRecords) {
+			end = len(batchRecords)
+		}
+
+		chunk := batchRecords[i:end]
+
+		g.Go(func() error {
+			return s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), chunk)
+		})
+	}
+
+	// Give goroutines a moment to launch and make requests
+	time.Sleep(10 * time.Millisecond)
+	connsPeak := s.client.GetActiveConnectionCount()
+	s.logger.Infof("[setLockedBatch] Aerospike connections during chunk execution (peak): %d", connsPeak)
+
+	// Wait for all chunks to complete
+	if err := g.Wait(); err != nil {
 		for _, batchItem := range batch {
 			batchItem.errCh <- errors.NewProcessingError("could not batch write locked flag", err)
 		}
-
 		return
 	}
+
+	connsAfter := s.client.GetActiveConnectionCount()
+	s.logger.Infof("[setLockedBatch] Aerospike connections after chunks complete: %d", connsAfter)
 
 	// Now we need to get totalRecords and do all the child records if necessary...
 	for idx, batchRecord := range batchRecords {

@@ -356,7 +356,7 @@ func getAerospikeClient(logger ulogger.Logger, url *url.URL, tSettings *settings
 	logger.Debugf("url %s policy %#v\n", url, policy)
 
 	// policy = aerospike.NewClientPolicy()
-	client, err := uaerospike.NewClientWithPolicyAndHost(policy, hosts...)
+	client, err := uaerospike.NewClientWithPolicyAndHost(logger, policy, hosts...)
 	if err != nil {
 		return nil, err
 	}

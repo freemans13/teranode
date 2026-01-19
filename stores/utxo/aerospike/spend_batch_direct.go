@@ -186,12 +186,20 @@ func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpen
 	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
 
 	startBatch := time.Now()
-	s.logger.Debugf("[SPEND_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch)", len(batchRecords), maxBatchSize)
+	numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
+	s.logger.Debugf("[SPEND_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
+
+	// Log connection pool usage before starting
+	connsBefore := s.client.GetActiveConnectionCount()
+	s.logger.Infof("[SPEND_BATCH_DIRECT] Aerospike connections before chunks: %d (pool size: %d)", connsBefore, s.client.GetConnectionQueueSize())
 
 	// PHASE 2 OPTIMIZATION: Parallelize chunk processing for high throughput
 	// Split into chunks and execute them in parallel using errgroup
+	// Limit concurrency to ConnectionQueueSize to prevent overwhelming Aerospike
 	// This is safe because each chunk operates on disjoint UTXO keys
 	g, _ := errgroup.WithContext(ctx)
+	// g.SetLimit(1)
+	g.SetLimit(s.client.GetConnectionQueueSize())
 
 	for i := 0; i < len(batchRecords); i += maxBatchSize {
 		i := i // Capture loop variable for goroutine
@@ -215,10 +223,18 @@ func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpen
 		})
 	}
 
+	// Give goroutines a moment to all launch and make their requests
+	time.Sleep(10 * time.Millisecond)
+	connsPeak := s.client.GetActiveConnectionCount()
+	s.logger.Infof("[SPEND_BATCH_DIRECT] Aerospike connections during chunk execution (peak): %d", connsPeak)
+
 	// Wait for all chunks to complete
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+
+	connsAfter := s.client.GetActiveConnectionCount()
+	s.logger.Infof("[SPEND_BATCH_DIRECT] Aerospike connections after chunks complete: %d", connsAfter)
 
 	s.logger.Debugf("[SPEND_BATCH_DIRECT] Aerospike BatchOperate completed in %v", time.Since(startBatch))
 

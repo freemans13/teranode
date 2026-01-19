@@ -7,50 +7,12 @@ import (
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/aerospike/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/util/test/mocklogger"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestClient_Put(t *testing.T) {
-	// Create a test client with mocked semaphore behavior
-	client := &Client{
-		Client:        nil,                    // We'll test semaphore behavior without actual client
-		connSemaphore: make(chan struct{}, 2), // Small buffer for testing
-	}
-
-	t.Run("semaphore acquire and release", func(t *testing.T) {
-		// Fill the semaphore
-		client.connSemaphore <- struct{}{}
-		client.connSemaphore <- struct{}{}
-
-		// Start a goroutine that will block trying to acquire
-		blocked := make(chan bool)
-		go func() {
-			select {
-			case client.connSemaphore <- struct{}{}:
-				blocked <- false
-			case <-time.After(10 * time.Millisecond):
-				blocked <- true
-			}
-		}()
-
-		// Should be blocked
-		assert.True(t, <-blocked)
-
-		// Release one slot
-		<-client.connSemaphore
-
-		// Now it should succeed
-		go func() {
-			select {
-			case client.connSemaphore <- struct{}{}:
-				blocked <- false
-			case <-time.After(10 * time.Millisecond):
-				blocked <- true
-			}
-		}()
-
-		assert.False(t, <-blocked)
-	})
+	t.Skip("Semaphore tests disabled - semaphore removed in favor of retry logic")
 }
 
 func TestCalculateKeySource(t *testing.T) {
@@ -201,36 +163,37 @@ func TestGetConnectionQueueSize(t *testing.T) {
 }
 
 func TestClient_ConcurrentOperations(t *testing.T) {
-	client := &Client{
-		Client:        nil,
-		connSemaphore: make(chan struct{}, 2), // Allow 2 concurrent operations
-	}
+	t.Skip("Semaphore tests disabled - semaphore removed in favor of retry logic")
+	// client := &Client{
+	// 	Client:        nil,
+	// 	connSemaphore: make(chan struct{}, 2), // Allow 2 concurrent operations
+	// }
 
-	t.Run("concurrent semaphore usage", func(t *testing.T) {
-		// Test that multiple goroutines can acquire and release semaphore correctly
-		const numGoroutines = 10
-		done := make(chan bool, numGoroutines)
+	// t.Run("concurrent semaphore usage", func(t *testing.T) {
+	// 	// Test that multiple goroutines can acquire and release semaphore correctly
+	// 	const numGoroutines = 10
+	// 	done := make(chan bool, numGoroutines)
 
-		for i := 0; i < numGoroutines; i++ {
-			go func() {
-				// Simulate acquiring semaphore
-				client.connSemaphore <- struct{}{}
-				time.Sleep(1 * time.Millisecond) // Simulate work
-				<-client.connSemaphore           // Release
-				done <- true
-			}()
-		}
+	// 	for i := 0; i < numGoroutines; i++ {
+	// 		go func() {
+	// 			// Simulate acquiring semaphore
+	// 			client.connSemaphore <- struct{}{}
+	// 			time.Sleep(1 * time.Millisecond) // Simulate work
+	// 			<-client.connSemaphore           // Release
+	// 			done <- true
+	// 		}()
+	// 	}
 
-		// Wait for all goroutines to complete
-		for i := 0; i < numGoroutines; i++ {
-			select {
-			case <-done:
-				// Success
-			case <-time.After(1 * time.Second):
-				t.Fatal("Timeout waiting for goroutines to complete")
-			}
-		}
-	})
+	// 	// Wait for all goroutines to complete
+	// 	for i := 0; i < numGoroutines; i++ {
+	// 		select {
+	// 		case <-done:
+	// 			// Success
+	// 		case <-time.After(1 * time.Second):
+	// 			t.Fatal("Timeout waiting for goroutines to complete")
+	// 		}
+	// 	}
+	// })
 }
 
 // BenchmarkCalculateKeySource benchmarks the key source calculation
@@ -250,21 +213,21 @@ func BenchmarkCalculateKeySource(b *testing.B) {
 	})
 }
 
-// Helper function to test semaphore behavior
-func testSemaphoreBlocking(t *testing.T, client *Client, expectedBlocked bool) {
-	blocked := make(chan bool)
-	go func() {
-		select {
-		case client.connSemaphore <- struct{}{}:
-			blocked <- false
-			<-client.connSemaphore // Clean up
-		case <-time.After(10 * time.Millisecond):
-			blocked <- true
-		}
-	}()
-
-	assert.Equal(t, expectedBlocked, <-blocked)
-}
+// Helper function to test semaphore behavior - DISABLED (semaphore removed)
+// func testSemaphoreBlocking(t *testing.T, client *Client, expectedBlocked bool) {
+// 	blocked := make(chan bool)
+// 	go func() {
+// 		select {
+// 		case client.connSemaphore <- struct{}{}:
+// 			blocked <- false
+// 			<-client.connSemaphore // Clean up
+// 		case <-time.After(10 * time.Millisecond):
+// 			blocked <- true
+// 		}
+// 	}()
+//
+// 	assert.Equal(t, expectedBlocked, <-blocked)
+// }
 
 func TestClientStats(t *testing.T) {
 	t.Run("NewClientStats creates valid stats", func(t *testing.T) {
@@ -277,9 +240,8 @@ func TestClientStats(t *testing.T) {
 
 	t.Run("client always has stats", func(t *testing.T) {
 		client := &Client{
-			Client:        nil,
-			connSemaphore: make(chan struct{}, 1),
-			stats:         NewClientStats(),
+			Client: nil,
+			stats:  NewClientStats(),
 		}
 		assert.NotNil(t, client.stats)
 	})
@@ -312,7 +274,7 @@ func TestNewClientWithPolicyAndHost_CompleteCoverage(t *testing.T) {
 		host := aerospike.NewHost("127.0.0.1", 99999) // Use localhost with invalid port for faster failure
 
 		start := time.Now()
-		client, err := NewClientWithPolicyAndHost(policy, host)
+		client, err := NewClientWithPolicyAndHost(mocklogger.NewTestLogger(), policy, host)
 		elapsed := time.Since(start)
 
 		assert.Error(t, err)
@@ -328,7 +290,7 @@ func TestNewClientWithPolicyAndHost_CompleteCoverage(t *testing.T) {
 		host := aerospike.NewHost("127.0.0.1", 99999) // Use localhost with invalid port
 
 		start := time.Now()
-		client, err := NewClientWithPolicyAndHost(policy, host)
+		client, err := NewClientWithPolicyAndHost(mocklogger.NewTestLogger(), policy, host)
 		elapsed := time.Since(start)
 
 		assert.Error(t, err)
@@ -340,7 +302,7 @@ func TestNewClientWithPolicyAndHost_CompleteCoverage(t *testing.T) {
 	t.Run("with nil policy", func(t *testing.T) {
 		host := aerospike.NewHost("127.0.0.1", 99999)
 
-		client, err := NewClientWithPolicyAndHost(nil, host)
+		client, err := NewClientWithPolicyAndHost(mocklogger.NewTestLogger(), nil, host)
 
 		assert.Error(t, err)
 		assert.Nil(t, client)
@@ -379,7 +341,7 @@ func TestClientWrapperMethods_WithLocalAerospike(t *testing.T) {
 	policy.Timeout = 100 * time.Millisecond
 	host := aerospike.NewHost("127.0.0.1", 3000) // Standard aerospike port
 
-	client, err := NewClientWithPolicyAndHost(policy, host)
+	client, err := NewClientWithPolicyAndHost(mocklogger.NewTestLogger(), policy, host)
 	if err != nil {
 		// No aerospike running locally - skip wrapper tests
 		t.Skip("No local aerospike server available for wrapper method testing")
@@ -439,102 +401,7 @@ func TestClientWrapperMethods_WithLocalAerospike(t *testing.T) {
 
 // TestClient_AcquirePermitTimeout verifies that semaphore timeout is a fraction of TotalTimeout
 func TestClient_AcquirePermitTimeout(t *testing.T) {
-	t.Run("semaphore timeout with BasePolicy", func(t *testing.T) {
-		client := &Client{
-			connSemaphore: make(chan struct{}, 1),
-			stats:         NewClientStats(),
-		}
-
-		// Fill the semaphore so next acquire will block
-		client.connSemaphore <- struct{}{}
-
-		policy := &aerospike.BasePolicy{
-			TotalTimeout: 1000 * time.Millisecond,
-		}
-
-		start := time.Now()
-		err := client.acquirePermit(policy)
-		elapsed := time.Since(start)
-
-		// Should timeout after semaphoreTimeoutFraction * TotalTimeout (10% of 1000ms = 100ms)
-		assert.Error(t, err)
-		assert.True(t, elapsed >= minSemaphoreTimeout && elapsed < 200*time.Millisecond,
-			"Expected timeout around %v, got %v", minSemaphoreTimeout, elapsed)
-	})
-
-	t.Run("semaphore timeout with WritePolicy", func(t *testing.T) {
-		client := &Client{
-			connSemaphore: make(chan struct{}, 1),
-			stats:         NewClientStats(),
-		}
-
-		client.connSemaphore <- struct{}{}
-
-		policy := aerospike.NewWritePolicy(0, 0)
-		policy.TotalTimeout = 2000 * time.Millisecond
-
-		start := time.Now()
-		err := client.acquirePermit(policy)
-		elapsed := time.Since(start)
-
-		// Should timeout after 10% of 2000ms = 200ms
-		assert.Error(t, err)
-		assert.True(t, elapsed >= 200*time.Millisecond && elapsed < 400*time.Millisecond,
-			"Expected timeout around 200ms, got %v", elapsed)
-	})
-
-	t.Run("semaphore timeout with BatchPolicy", func(t *testing.T) {
-		client := &Client{
-			connSemaphore: make(chan struct{}, 1),
-			stats:         NewClientStats(),
-		}
-
-		client.connSemaphore <- struct{}{}
-
-		policy := aerospike.NewBatchPolicy()
-		policy.TotalTimeout = 500 * time.Millisecond
-
-		start := time.Now()
-		err := client.acquirePermit(policy)
-		elapsed := time.Since(start)
-
-		// Should timeout after max(10% of 500ms, 100ms) = 100ms (minimum threshold)
-		assert.Error(t, err)
-		assert.True(t, elapsed >= minSemaphoreTimeout && elapsed < 200*time.Millisecond,
-			"Expected timeout around %v, got %v", minSemaphoreTimeout, elapsed)
-	})
-
-	t.Run("no timeout when policy is nil", func(t *testing.T) {
-		client := &Client{
-			connSemaphore: make(chan struct{}, 1),
-			stats:         NewClientStats(),
-		}
-
-		// Try to acquire with nil policy - should succeed immediately
-		err := client.acquirePermit(nil)
-		assert.NoError(t, err)
-
-		// Release for cleanup
-		client.releasePermit()
-	})
-
-	t.Run("successful acquire within timeout", func(t *testing.T) {
-		client := &Client{
-			connSemaphore: make(chan struct{}, 1),
-			stats:         NewClientStats(),
-		}
-
-		policy := &aerospike.BasePolicy{
-			TotalTimeout: 1000 * time.Millisecond,
-		}
-
-		// Should succeed immediately as semaphore is available
-		err := client.acquirePermit(policy)
-		assert.NoError(t, err)
-
-		// Release for cleanup
-		client.releasePermit()
-	})
+	t.Skip("Semaphore tests disabled - semaphore removed in favor of retry logic")
 }
 
 // Test mock functionality separately
