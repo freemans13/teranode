@@ -52,7 +52,9 @@ type Options struct {
 	// ParentMetadata provides pre-fetched metadata for parent transactions
 	// When provided, the validator will check this map before calling utxoStore.Get()
 	// This allows validation of Level N while Level N-1 is still storing
-	// Key: parent transaction hash, Value: metadata (block height, block IDs)
+	// SAFETY: Only includes transactions that successfully validated AND created UTXOs
+	// This prevents validation bypass when child references a failed parent transaction
+	// Key: parent transaction hash, Value: metadata (block height)
 	ParentMetadata map[chainhash.Hash]*ParentTxMetadata
 }
 
@@ -192,9 +194,10 @@ func WithSkipValidation(skip bool) Option {
 // WithParentMetadata creates an option to provide pre-fetched parent transaction metadata
 // This allows the validator to skip UTXO store lookups for in-block parents, enabling
 // validation of Level N transactions while Level N-1 is still storing to the UTXO store.
+// SAFETY: Only provide metadata for transactions that successfully validated
 //
 // Parameters:
-//   - metadata: Map of parent transaction hashes to their metadata (block height, block IDs)
+//   - metadata: Map of parent transaction hashes to their metadata (block height)
 //
 // Returns:
 //   - Option: Function that sets the ParentMetadata option
