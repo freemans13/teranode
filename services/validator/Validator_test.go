@@ -813,6 +813,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 		v := &Validator{
 			settings:  tSettings,
 			utxoStore: &mockUtxoStore,
+			logger:    ulogger.TestLogger{},
 		}
 
 		mockUtxoStore.On("GetBlockState").Return(utxostore.BlockState{Height: 1000, MedianTime: 1000000000})
@@ -837,6 +838,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 		v := &Validator{
 			settings:  tSettings,
 			utxoStore: &mockUtxoStore,
+			logger:    ulogger.TestLogger{},
 		}
 
 		mockUtxoStore.On("GetBlockState").Return(utxostore.BlockState{Height: 1000, MedianTime: 1000000000})
@@ -875,6 +877,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 		v := &Validator{
 			settings:  tSettings,
 			utxoStore: &mockUtxoStore,
+			logger:    ulogger.TestLogger{},
 		}
 
 		expectedOutputs := make(map[string][]*bt.Output)
