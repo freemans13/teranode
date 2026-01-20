@@ -13,6 +13,12 @@ const (
 	ListenModeListenOnly = "listen_only"
 )
 
+// Pruner block trigger mode constants
+const (
+	PrunerBlockTriggerOnBlockPersisted = "OnBlockPersisted" // Trigger on BlockPersisted notifications (default)
+	PrunerBlockTriggerOnBlockMined     = "OnBlockMined"     // Trigger on Block notifications with mined_set=true
+)
+
 type Settings struct {
 	Commit                       string
 	Version                      string
@@ -31,6 +37,7 @@ type Settings struct {
 	LogLevel                     string
 	PrettyLogs                   bool
 	JSONLogging                  bool
+	Debug                        DebugSettings
 	ProfilerAddr                 string
 	StatsPrefix                  string
 	PrometheusEndpoint           string
@@ -71,6 +78,14 @@ type Settings struct {
 	Dashboard                    DashboardSettings
 	Pruner                       PrunerSettings
 	GlobalBlockHeightRetention   uint32
+}
+
+// DebugSettings configures subsystem-specific debug toggles.
+type DebugSettings struct {
+	All       bool
+	File      bool
+	Blobstore bool
+	UTXOStore bool
 }
 
 // GetUtxoStoreBlockHeightRetention calculates the effective block height retention for UTXO store
@@ -138,18 +153,22 @@ type KafkaSettings struct {
 }
 
 type AerospikeSettings struct {
-	Debug                  bool
-	Host                   string
-	BatchPolicyURL         *url.URL
-	ReadPolicyURL          *url.URL
-	WritePolicyURL         *url.URL
-	QueryPolicyURL         *url.URL
-	Port                   int
-	UseDefaultBasePolicies bool
-	UseDefaultPolicies     bool
-	WarmUp                 bool
-	StoreBatcherDuration   time.Duration
-	StatsRefreshDuration   time.Duration
+	Debug                           bool
+	Host                            string
+	BatchPolicyURL                  *url.URL
+	ReadPolicyURL                   *url.URL
+	WritePolicyURL                  *url.URL
+	QueryPolicyURL                  *url.URL
+	Port                            int
+	UseDefaultBasePolicies          bool
+	UseDefaultPolicies              bool
+	WarmUp                          bool
+	StoreBatcherDuration            time.Duration
+	StatsRefreshDuration            time.Duration
+	EnableSetMinedFilterExpressions bool
+	EnableSpendFilterExpressions    bool
+	UseSeparateUDFMinedModule       bool
+	SeparateSpendUDFModuleCount     int
 }
 
 type AlertSettings struct {
@@ -183,6 +202,10 @@ type AssetSettings struct {
 	ConcurrencyGetSubtreeHead         int
 	ConcurrencyGetUtxo                int
 	ConcurrencyGetLegacyBlockReader   int
+
+	// Streaming configuration
+	SubtreeDataStreamingChunkSize   int // Number of transactions to process per chunk when streaming subtree data (default: 10000)
+	SubtreeDataStreamingConcurrency int // Number of concurrent chunks to fetch in parallel when streaming subtree data (default: 4)
 }
 
 type BlockSettings struct {
@@ -238,6 +261,7 @@ type BlockAssemblySettings struct {
 	SubtreeProcessorConcurrentReads      int
 	NewSubtreeChanBuffer                 int
 	SubtreeRetryChanBuffer               int
+	SubtreeStorageWorkers                int
 	SubmitMiningSolutionWaitForResponse  bool
 	InitialMerkleItemsPerSubtree         int
 	MinimumMerkleItemsPerSubtree         int
@@ -253,10 +277,24 @@ type BlockAssemblySettings struct {
 	OnRestartValidateParentChain         bool
 	ParentValidationBatchSize            int
 	OnRestartRemoveInvalidParentChainTxs bool
+	UseColumnarBatch                     bool
+	// UnminedTxDiskSortPath is the base path for temporary storage during disk-based sorting
+	// of unmined transactions. If empty, os.TempDir() is used.
+	UnminedTxDiskSortPath string
+	// UnminedTxDiskSortEnabled enables disk-based sorting to reduce RAM usage when loading
+	// unmined transactions. When disabled or when OnRestartValidateParentChain is enabled,
+	// the original in-memory approach is used.
+	UnminedTxDiskSortEnabled bool
+	UnminedLoadingBatchSize  int
 	// GetMiningCandidate timeouts
 	GetMiningCandidateSendTimeout     time.Duration // Timeout when sending request on internal channel (default: 1s)
 	GetMiningCandidateResponseTimeout time.Duration // Timeout waiting for mining candidate response (default: 10s)
 	SubtreeAnnouncementInterval       time.Duration
+	// ParallelSetIfNotExistsThreshold is the minimum number of nodes required to trigger
+	// parallel processing of Get and SetIfNotExists operations in processOwnBlockSubtreeNodes
+	// and processRemainderTxHashes. Below this threshold, sequential processing is used.
+	ParallelSetIfNotExistsThreshold int
+	StoreTxInpointsForSubtreeMeta   bool
 }
 
 type BlockValidationSettings struct {
@@ -298,6 +336,7 @@ type BlockValidationSettings struct {
 	PreviousBlockHeaderCount                  uint64
 	MaxBlocksBehindBlockAssembly              int
 	PeriodicProcessingInterval                time.Duration // Interval for periodic processing of blocks with mined_set=false (default: 1 minute)
+	RecentBlockIDsLimit                       uint64        // Maximum number of recent block IDs to load for double-spend checking (default: 50000)
 	// Catchup configuration
 	CatchupMaxRetries            int // Maximum number of retries for catchup operations
 	CatchupIterationTimeout      int // Timeout in seconds for each catchup iteration
@@ -338,6 +377,8 @@ type ValidatorSettings struct {
 	HTTPRateLimit             int
 	KafkaMaxMessageBytes      int // Maximum Kafka message size in bytes for transaction validation
 	UseLocalValidator         bool
+	TxMetaKafkaBatchSize      int // Batch size for TxMeta Kafka messages (0 = disabled)
+	TxMetaKafkaBatchTimeoutMs int // Batch timeout in milliseconds for TxMeta Kafka messages
 }
 
 type RegionSettings struct {
@@ -462,6 +503,9 @@ type P2PSettings struct {
 
 	// This is the time we trigger a periodic evaluation in the sync coordinator
 	SyncCoordinatorPeriodicEvaluationInterval time.Duration
+
+	// On-demand HTTP health checking for peer availability
+	HealthCheckEnabled bool // Enable HTTP availability checking during peer selection (uses 2s timeout)
 }
 
 type CoinbaseSettings struct {
@@ -489,17 +533,17 @@ type CoinbaseSettings struct {
 }
 
 type PrunerSettings struct {
-	GRPCListenAddress               string
-	GRPCAddress                     string
-	BlockAssemblyWaitTimeout        time.Duration // Maximum time to wait for Block Assembly to be in "running" state before skipping pruning (default: 10m)
-	ConnectionPoolWarningThreshold  float64       // Threshold (0.0-1.0) for connection pool utilization warnings and auto-adjustment (default: 0.7)
-	ForceIgnoreBlockPersisterHeight bool          // Force ignore block persister height and use Block notifications (default: false)
-	UTXODefensiveEnabled            bool          // Enable defensive checks before deleting UTXO transactions (verify children are mined > BlockHeightRetention blocks ago)
-	UTXODefensiveBatchReadSize      int           // Batch size for reading child transactions during defensive UTXO pruning (default: 10000)
-	UTXOChunkSize                   int           // Number of records to process in each chunk before batch flushing (default: 1000)
-	UTXOChunkGroupLimit             int           // Maximum parallel chunk processing during UTXO pruning (default: 10)
-	UTXOProgressLogInterval         time.Duration // Interval for logging progress during UTXO pruning (default: 30s)
-	UTXOPartitionQueries            int           // Number of parallel Aerospike partition queries for UTXO pruning (0 = auto-detect based on CPU cores and query-threads-limit)
+	GRPCListenAddress              string
+	GRPCAddress                    string
+	BlockAssemblyWaitTimeout       time.Duration // Maximum time to wait for Block Assembly to be in "running" state before skipping pruning (default: 10m)
+	ConnectionPoolWarningThreshold float64       // Threshold (0.0-1.0) for connection pool utilization warnings and auto-adjustment (default: 0.7)
+	BlockTrigger                   string        // When to trigger pruning: "OnBlockPersisted" (default) or "OnBlockMined"
+	UTXODefensiveEnabled           bool          // Enable defensive checks before deleting UTXO transactions (verify children are mined > BlockHeightRetention blocks ago)
+	UTXODefensiveBatchReadSize     int           // Batch size for reading child transactions during defensive UTXO pruning (default: 10000)
+	UTXOChunkSize                  int           // Number of records to process in each chunk before batch flushing (default: 1000)
+	UTXOChunkGroupLimit            int           // Maximum parallel chunk processing during UTXO pruning (default: 10)
+	UTXOProgressLogInterval        time.Duration // Interval for logging progress during UTXO pruning (default: 30s)
+	UTXOPartitionQueries           int           // Number of parallel Aerospike partition queries for UTXO pruning (0 = auto-detect based on CPU cores and query-threads-limit)
 }
 
 type SubtreeValidationSettings struct {

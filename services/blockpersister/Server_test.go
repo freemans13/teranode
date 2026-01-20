@@ -765,6 +765,10 @@ func (m *MockBlockchainClient) CheckBlockIsInCurrentChain(ctx context.Context, b
 	// Default to true - blocks are on the current chain unless specifically testing reorg scenarios
 	return true, nil
 }
+func (m *MockBlockchainClient) CheckBlockIsAncestorOfBlock(ctx context.Context, blockIDs []uint32, blockHash *chainhash.Hash) (bool, error) {
+	// Default to false - blocks are not ancestors unless specifically testing reorg scenarios
+	return false, nil
+}
 func (m *MockBlockchainClient) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 	return nil, nil
 }
@@ -922,8 +926,8 @@ func (m *MockUTXOStore) Delete(ctx context.Context, hash *chainhash.Hash) error 
 func (m *MockUTXOStore) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
 	return nil, nil
 }
-func (m *MockUTXOStore) GetMeta(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error) {
-	return nil, nil
+func (m *MockUTXOStore) GetMeta(ctx context.Context, hash *chainhash.Hash, txMeta *meta.Data) error {
+	return nil
 }
 func (m *MockUTXOStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	return nil, nil
