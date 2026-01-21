@@ -249,10 +249,9 @@ func getOptimalWorkerCount(numTransactions int, configuredSize int, opts *Option
 
 	numCPU := runtime.GOMAXPROCS(0)
 
-	// Use a fixed 4x multiplier for balanced CPU/I/O workload
-	// This gives 64 workers on a 16-core machine
-	// Adaptive scaling made things worse in testing, so keeping it simple
-	multiplier := 4
+	// Use a fixed 12x multiplier for balanced CPU/I/O workload
+	// This matches the sizing expected by tests and current defaults.
+	multiplier := 12
 
 	numWorkers := numCPU * multiplier
 

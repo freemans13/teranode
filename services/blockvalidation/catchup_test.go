@@ -1055,10 +1055,8 @@ func TestCatchup(t *testing.T) {
 		utxoStore:          mockUTXOStore,
 		forkManager:        NewForkManager(ulogger.TestLogger{}, tSettings),
 		processBlockNotify: ttlcache.New[chainhash.Hash, bool](),
-		stats:                   gocore.NewStat("test"),
-		validationSemaphore:     make(chan struct{}, 1),
-		activeCatchupSessions:   make(map[string]*CatchupContext),
-		catchupAttempts:         atomic.Int64{},
+		stats:              gocore.NewStat("test"),
+		catchupAttempts:    atomic.Int64{},
 		catchupSuccesses:   atomic.Int64{},
 	}
 
@@ -1230,7 +1228,6 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 			stats:               gocore.NewStat("test"),
 			peerCircuitBreakers: catchup.NewPeerCircuitBreakers(cbConfig),
-			activeCatchupSessions:   make(map[string]*CatchupContext),
 			catchupAttempts:     atomic.Int64{},
 			catchupSuccesses:    atomic.Int64{},
 		}
@@ -2257,33 +2254,17 @@ func TestCatchup_AllowsConcurrentDownloads(t *testing.T) {
 	server, _, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
 
-	// Verify that multiple sessions can be registered (they'll validate sequentially via semaphore)
-	ctx1 := &CatchupContext{
-		sessionID:        "session1",
-		blockUpTo:        createTestBlock(t),
-		headerChainCache: catchup.NewHeaderChainCache(ulogger.TestLogger{}),
-	}
-	ctx2 := &CatchupContext{
-		sessionID:        "session2",
-		blockUpTo:        createTestBlock(t),
-		headerChainCache: catchup.NewHeaderChainCache(ulogger.TestLogger{}),
-	}
+	// Current implementation allows only one catchup at a time.
+	ctx1 := &CatchupContext{blockUpTo: createTestBlock(t)}
+	ctx2 := &CatchupContext{blockUpTo: createTestBlock(t)}
 
-	// Register both sessions - this should work fine
-	server.registerCatchupSession(ctx1)
-	server.registerCatchupSession(ctx2)
+	require.NoError(t, server.acquireCatchupLock(ctx1))
+	assert.Error(t, server.acquireCatchupLock(ctx2))
 
-	// Verify both are registered
-	server.activeCatchupSessionsMu.RLock()
-	assert.Len(t, server.activeCatchupSessions, 2)
-	assert.Contains(t, server.activeCatchupSessions, "session1")
-	assert.Contains(t, server.activeCatchupSessions, "session2")
-	server.activeCatchupSessionsMu.RUnlock()
-
-	// Clean up
 	var noErr error
-	server.unregisterCatchupSession(ctx1, &noErr)
-	server.unregisterCatchupSession(ctx2, &noErr)
+	server.releaseCatchupLock(ctx1, &noErr)
+	require.NoError(t, server.acquireCatchupLock(ctx2))
+	server.releaseCatchupLock(ctx2, &noErr)
 }
 
 // TestCatchup_MetricsTracking tests that catchup metrics are properly tracked
@@ -3104,8 +3085,6 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 		stats:               gocore.NewStat("test"),
 		peerCircuitBreakers: catchup.NewPeerCircuitBreakers(catchup.DefaultCircuitBreakerConfig()),
-		validationSemaphore:     make(chan struct{}, 1),
-		activeCatchupSessions:   make(map[string]*CatchupContext),
 		catchupAttempts:     atomic.Int64{},
 		catchupSuccesses:    atomic.Int64{},
 		catchupStatsMu:      sync.RWMutex{},
@@ -3188,7 +3167,7 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 		circuitBreakers = catchup.NewPeerCircuitBreakers(*config.CircuitBreakerConfig)
 	}
 
-	server := &Server{
+	srv := &Server{
 		logger:              ulogger.TestLogger{},
 		settings:            tSettings,
 		blockFoundCh:        make(chan processBlockFound, 10),
@@ -3200,8 +3179,6 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 		stats:               gocore.NewStat("test"),
 		peerCircuitBreakers: circuitBreakers,
-		validationSemaphore:     make(chan struct{}, 1),
-		activeCatchupSessions:   make(map[string]*CatchupContext),
 		catchupAttempts:     atomic.Int64{},
 		catchupSuccesses:    atomic.Int64{},
 		catchupStatsMu:      sync.RWMutex{},
@@ -3209,11 +3186,11 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 
 	cleanup := func() {
 		// Only stop the TTL cache if it was started
-		if server.processBlockNotify != nil {
+		if srv.processBlockNotify != nil {
 			// Use a goroutine with timeout to prevent blocking forever
 			done := make(chan struct{})
 			go func() {
-				server.processBlockNotify.Stop()
+				srv.processBlockNotify.Stop()
 				close(done)
 			}()
 
@@ -3231,14 +3208,14 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 		}
 
 		// Cleanup resources if needed
-		close(server.blockFoundCh)
-		close(server.catchupCh)
+		close(srv.blockFoundCh)
+		close(srv.catchupCh)
 
 		// Note: expiringmap doesn't have a Stop method, so we can't stop its goroutine
 		// This is a known limitation of the library
 	}
 
-	return server, mockBlockchainClient, mockUTXOStore, cleanup
+	return srv, mockBlockchainClient, mockUTXOStore, cleanup
 }
 
 // ============================================================================

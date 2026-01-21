@@ -175,11 +175,10 @@ type Server struct {
 	// BlockValidation is running in the same process as the P2P service.
 	p2pClient P2PClientI
 
-	// validationSemaphore ensures sequential block validation across catchup sessions.
-	// Multiple sessions can download blocks concurrently, but validation must be ordered
-	// to maintain blockchain state consistency (UTXO store, block height, etc.).
-	// Buffer size of 1 allows one session to validate at a time.
-	validationSemaphore chan struct{}
+	// isCatchingUp is an atomic flag to prevent concurrent catchup operations.
+	// When true, indicates that a catchup operation is currently in progress.
+	// This flag ensures only one catchup can run at a time to prevent resource contention.
+	isCatchingUp atomic.Bool
 
 	// catchupStatsMu protects concurrent access to lastCatchupTime and lastCatchupResult.
 	// Always acquire this mutex when reading or writing these fields.
@@ -207,12 +206,18 @@ type Server struct {
 	// The value persists for the lifetime of the server and is never reset.
 	catchupSuccesses atomic.Int64
 
-	// activeCatchupSessions stores all active catchup sessions for status reporting to the dashboard.
-	// Multiple sessions can be active simultaneously (downloading concurrently, validating sequentially).
-	// Sessions are added when catchup starts and removed when it completes.
-	// Protected by activeCatchupSessionsMu for thread-safe access.
-	activeCatchupSessions   map[string]*CatchupContext
-	activeCatchupSessionsMu sync.RWMutex
+	// activeCatchupCtx stores the current catchup context for status reporting to the dashboard.
+	// This is updated when a catchup operation starts and cleared when it completes.
+	// Protected by activeCatchupCtxMu for thread-safe access.
+	activeCatchupCtx   *CatchupContext
+	activeCatchupCtxMu sync.RWMutex
+
+	// catchupProgress tracks the current progress through block headers during catchup.
+	// blocksFetched and blocksValidated are updated as blocks are processed.
+	// These counters are reset at the start of each catchup operation.
+	// Protected by activeCatchupCtxMu for thread-safe access.
+	blocksFetched   atomic.Int64
+	blocksValidated atomic.Int64
 
 	// previousCatchupAttempt stores details about the last failed catchup attempt.
 	// This is used to display in the dashboard why we switched from one peer to another.
@@ -275,27 +280,25 @@ func New(
 	})
 
 	bVal := &Server{
-		logger:                  logger,
-		settings:                tSettings,
-		subtreeStore:            subtreeStore,
-		blockchainClient:        blockchainClient,
-		txStore:                 txStore,
-		utxoStore:               utxoStore,
-		validatorClient:         validatorClient,
-		blockAssemblyClient:     blockAssemblyClient,
-		blockFoundCh:            make(chan processBlockFound, tSettings.BlockValidation.BlockFoundChBufferSize),
-		blockPriorityQueue:      pq,
-		blockClassifier:         NewBlockClassifier(logger, nearForkThreshold, blockchainClient),
-		forkManager:             fm,
-		catchupCh:               make(chan processBlockCatchup, tSettings.BlockValidation.CatchupChBufferSize),
-		processBlockNotify:      ttlcache.New[chainhash.Hash, bool](),
-		catchupAlternatives:     ttlcache.New[chainhash.Hash, []processBlockCatchup](ttlcache.WithTTL[chainhash.Hash, []processBlockCatchup](10 * time.Minute)),
-		stats:                   gocore.NewStat("blockvalidation"),
-		kafkaConsumerClient:     kafkaConsumerClient,
-		peerCircuitBreakers:     catchup.NewPeerCircuitBreakers(*cbConfig),
-		validationSemaphore:     make(chan struct{}, 1), // Buffer of 1 allows one validation at a time
-		activeCatchupSessions:   make(map[string]*CatchupContext),
-		p2pClient:               p2pClient,
+		logger:              logger,
+		settings:            tSettings,
+		subtreeStore:        subtreeStore,
+		blockchainClient:    blockchainClient,
+		txStore:             txStore,
+		utxoStore:           utxoStore,
+		validatorClient:     validatorClient,
+		blockAssemblyClient: blockAssemblyClient,
+		blockFoundCh:        make(chan processBlockFound, tSettings.BlockValidation.BlockFoundChBufferSize),
+		blockPriorityQueue:  pq,
+		blockClassifier:     NewBlockClassifier(logger, nearForkThreshold, blockchainClient),
+		forkManager:         fm,
+		catchupCh:           make(chan processBlockCatchup, tSettings.BlockValidation.CatchupChBufferSize),
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](ttlcache.WithTTL[chainhash.Hash, []processBlockCatchup](10 * time.Minute)),
+		stats:               gocore.NewStat("blockvalidation"),
+		kafkaConsumerClient: kafkaConsumerClient,
+		peerCircuitBreakers: catchup.NewPeerCircuitBreakers(*cbConfig),
+		p2pClient:           p2pClient,
 	}
 
 	return bVal
@@ -393,10 +396,10 @@ func (u *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 				timeStr = lastTime.Format(time.RFC3339)
 			}
 
-			// Check if any sessions are active
-			u.activeCatchupSessionsMu.RLock()
-			isCatchingUp := len(u.activeCatchupSessions) > 0
-			u.activeCatchupSessionsMu.RUnlock()
+			// Check if catchup is active
+			u.activeCatchupCtxMu.RLock()
+			isCatchingUp := u.activeCatchupCtx != nil
+			u.activeCatchupCtxMu.RUnlock()
 
 			status := fmt.Sprintf("active=%v, last_time=%s, last_success=%v, attempts=%d, successes=%d, rate=%.2f",
 				isCatchingUp,

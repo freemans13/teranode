@@ -420,8 +420,17 @@ func (c *KafkaAsyncProducer) Publish(msg *Message) {
 	ch := c.publishChannel
 	c.channelMu.RUnlock()
 
+	defer func() {
+		if r := recover(); r != nil {
+			// Channel was closed, ignore during shutdown
+		}
+	}()
+
 	if ch != nil {
-		ch <- msg
+		select {
+		case ch <- msg:
+		default:
+		}
 	}
 }
 

@@ -51,10 +51,10 @@ type CatchupContext struct {
 	catchupError            error  // Any error encountered during catchup
 
 	// Session-specific state (moved from Server to enable concurrent sessions)
-	sessionID        string                      // Unique identifier for this catchup session
-	headerChainCache *catchup.HeaderChainCache   // Per-session header cache for validation
-	blocksFetched    atomic.Int64                // Number of blocks fetched in this session
-	blocksValidated  atomic.Int64                // Number of blocks validated in this session
+	sessionID        string                    // Unique identifier for this catchup session
+	headerChainCache *catchup.HeaderChainCache // Per-session header cache for validation
+	blocksFetched    atomic.Int64              // Number of blocks fetched in this session
+	blocksValidated  atomic.Int64              // Number of blocks validated in this session
 }
 
 // catchup orchestrates the complete blockchain synchronization process.
@@ -123,8 +123,10 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 	}
 
 	// Step 1: Register session and acquire validation lock (when needed)
-	u.registerCatchupSession(catchupCtx)
-	defer u.unregisterCatchupSession(catchupCtx, &err)
+	if err = u.acquireCatchupLock(catchupCtx); err != nil {
+		return err
+	}
+	defer u.releaseCatchupLock(catchupCtx, &err)
 
 	// Step 2: Fetch block headers from peer
 	if err = u.fetchHeaders(ctx, catchupCtx); err != nil {
@@ -228,40 +230,52 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 	return nil
 }
 
-// registerCatchupSession registers a new catchup session and initializes metrics.
-// Multiple sessions can be active simultaneously (downloading concurrently).
+// acquireCatchupLock ensures only one catchup runs at a time.
+// Sets the catchup flag and initializes metrics.
 //
 // Parameters:
-//   - ctx: Catchup context containing session state
-func (u *Server) registerCatchupSession(ctx *CatchupContext) {
+//   - ctx: Catchup context containing operation state
+//
+// Returns:
+//   - error: If another catchup is already in progress
+func (u *Server) acquireCatchupLock(ctx *CatchupContext) error {
+	if !u.isCatchingUp.CompareAndSwap(false, true) {
+		return errors.NewCatchupInProgressError("[catchup][%s] another catchup is currently in progress", ctx.blockUpTo.Hash().String())
+	}
+
 	// Initialize metrics (check for nil in tests)
 	if prometheusCatchupActive != nil {
 		prometheusCatchupActive.Set(1)
 	}
 	u.catchupAttempts.Add(1)
 
-	// Register this session for status reporting
-	u.activeCatchupSessionsMu.Lock()
-	u.activeCatchupSessions[ctx.sessionID] = ctx
-	u.activeCatchupSessionsMu.Unlock()
+	// Store the active catchup context for status reporting
+	u.activeCatchupCtxMu.Lock()
+	u.activeCatchupCtx = ctx
+	u.activeCatchupCtxMu.Unlock()
 
-	u.logger.Infof("[catchup][%s][session:%s] registered catchup session", ctx.blockUpTo.Hash().String(), ctx.sessionID)
+	// Reset progress counters
+	u.blocksFetched.Store(0)
+	u.blocksValidated.Store(0)
+
+	return nil
 }
 
-// unregisterCatchupSession unregisters a catchup session and records metrics.
+// releaseCatchupLock releases the catchup lock and records metrics.
 // Updates health check tracking and records success/failure metrics.
 // If catchup failed, stores details in previousCatchupAttempt for dashboard display.
 //
 // Parameters:
-//   - ctx: Catchup context containing session state
+//   - ctx: Catchup context containing operation state
 //   - err: Pointer to error from catchup operation
-func (u *Server) unregisterCatchupSession(ctx *CatchupContext, err *error) {
+func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
+	u.isCatchingUp.Store(false)
 	if prometheusCatchupActive != nil {
 		prometheusCatchupActive.Set(0)
 	}
 
 	// Capture failure details for dashboard before clearing context
-	u.activeCatchupSessionsMu.Lock()
+	u.activeCatchupCtxMu.Lock()
 	if *err != nil && ctx != nil {
 		// Determine error type based on error characteristics
 		errorType := "unknown_error"
@@ -303,7 +317,7 @@ func (u *Server) unregisterCatchupSession(ctx *CatchupContext, err *error) {
 			ErrorType:         errorType,
 			AttemptTime:       time.Now().UnixMilli(),
 			DurationMs:        time.Since(ctx.startTime).Milliseconds(),
-			BlocksValidated:   ctx.blocksValidated.Load(),
+			BlocksValidated:   u.blocksValidated.Load(),
 		}
 
 		// Only store the error in the peer registry if it's a peer-related error
@@ -315,9 +329,9 @@ func (u *Server) unregisterCatchupSession(ctx *CatchupContext, err *error) {
 		}
 	}
 
-	// Remove this session from active sessions
-	delete(u.activeCatchupSessions, ctx.sessionID)
-	u.activeCatchupSessionsMu.Unlock()
+	// Clear the active catchup context
+	u.activeCatchupCtx = nil
+	u.activeCatchupCtxMu.Unlock()
 
 	// Update catchup tracking for health checks
 	u.catchupStatsMu.Lock()
@@ -336,8 +350,6 @@ func (u *Server) unregisterCatchupSession(ctx *CatchupContext, err *error) {
 	if prometheusCatchupDuration != nil {
 		prometheusCatchupDuration.WithLabelValues(ctx.baseURL, success).Observe(time.Since(ctx.startTime).Seconds())
 	}
-
-	u.logger.Infof("[catchup][%s][session:%s] unregistered catchup session", ctx.blockUpTo.Hash().String(), ctx.sessionID)
 }
 
 // fetchHeaders retrieves block headers from the peer using block locator pattern.
@@ -728,22 +740,9 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 		return u.fetchBlocksConcurrently(gCtx, catchupCtx, validateBlocksChan, &size)
 	})
 
-	// Start validation with sequential ordering enforced across sessions
+	// Start validation in parallel
 	errorGroup.Go(func() error {
-		// Acquire validation semaphore to ensure sequential validation across sessions
-		// This blocks until the previous session's validation completes
-		u.logger.Infof("[catchup][%s][session:%s] waiting for validation semaphore", catchupCtx.blockUpTo.Hash().String(), catchupCtx.sessionID)
-		select {
-		case u.validationSemaphore <- struct{}{}:
-			u.logger.Infof("[catchup][%s][session:%s] acquired validation semaphore, starting validation", catchupCtx.blockUpTo.Hash().String(), catchupCtx.sessionID)
-			defer func() {
-				<-u.validationSemaphore
-				u.logger.Infof("[catchup][%s][session:%s] released validation semaphore", catchupCtx.blockUpTo.Hash().String(), catchupCtx.sessionID)
-			}()
-			return u.validateBlocksOnChannel(validateBlocksChan, gCtx, catchupCtx, &size)
-		case <-gCtx.Done():
-			return gCtx.Err()
-		}
+		return u.validateBlocksOnChannel(validateBlocksChan, gCtx, catchupCtx, &size)
 	})
 
 	// Wait for both operations to complete

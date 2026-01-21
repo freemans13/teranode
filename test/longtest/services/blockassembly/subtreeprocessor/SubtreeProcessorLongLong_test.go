@@ -66,9 +66,11 @@ func TestMoveForwardBlockLarge(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	wg.Add(4) // we are expecting 4 subtrees
+	expect := make(chan int, 1)
+	expect <- 4 // first phase: we are expecting 4 subtrees
 
 	go func() {
+		remaining := 0
 		for {
 			// just read the subtrees of the processor
 			subtreeRequest := <-newSubtreeChan
@@ -78,7 +80,13 @@ func TestMoveForwardBlockLarge(t *testing.T) {
 				subtreeRequest.ErrChan <- nil
 			}
 
-			wg.Done()
+			if remaining == 0 {
+				remaining = <-expect
+			}
+			if remaining > 0 {
+				wg.Done()
+				remaining--
+			}
 		}
 	}()
 
@@ -139,7 +147,8 @@ func TestMoveForwardBlockLarge(t *testing.T) {
 	//nolint:gosec
 	_ = stp.GetUtxoStore().SetMedianBlockTime(uint32(time.Now().Unix()))
 
-	wg.Add(8) // we are expecting 4 subtrees
+	wg.Add(8)
+	expect <- 8
 
 	stp.InitCurrentBlockHeader(prevBlockHeader)
 

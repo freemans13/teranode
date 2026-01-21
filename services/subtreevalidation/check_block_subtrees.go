@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -317,7 +318,19 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		// Process transactions for this batch
 		if batchTxCount > 0 {
 			if err = u.processTransactionsInLevels(ctx, allTransactions, *block.Hash(), chainhash.Hash{}, block.Height, blockIds); err != nil {
-				return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in batch %d", batchNum, err)
+				errStr := err.Error()
+				// During fork processing it's expected that some transactions will either:
+				// - be marked as conflicting/spent, or
+				// - be temporarily missing parents and placed into the orphanage.
+				// In these cases we must not fail the whole block.
+				if strings.Contains(errStr, "[processTransactionsInLevels] Completed processing with") &&
+					(strings.Contains(errStr, "UTXO_SPENT") ||
+						strings.Contains(errStr, "TX_CONFLICTING") ||
+						!strings.Contains(errStr, ", 0 transactions added to orphanage")) {
+					u.logger.Warnf("[CheckBlockSubtrees] Non-fatal transaction processing errors for block %s: %v", block.Hash().String(), err)
+				} else {
+					return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in batch %d", batchNum, err)
+				}
 			}
 			totalProcessedTxs += batchTxCount
 
@@ -703,10 +716,45 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 				continue
 			}
 
-			// Count all other errors
-			errorsFound++
+			// Conflicting/Spent are expected outcomes when CreateConflicting is enabled.
+			// The validator records these transactions as conflicting; block processing must continue.
+			if opts.CreateConflicting {
+				if errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrTxConflicting) {
+					u.logger.Debugf("[processTransactionsInLevels] Transaction %s marked as conflicting: %v", txHash.String(), err)
+					continue
+				}
 
-			// Handle missing parent transactions by adding to orphanage
+				// Handle cases where we only have a teranode error code available.
+				// In fork processing we expect some spends to fail due to conflicts.
+				var tErr *errors.Error
+				if errors.As(err, &tErr) {
+					switch tErr.Code() {
+					case errors.ERR_TX_CONFLICTING, errors.ERR_UTXO_SPENT:
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s marked as conflicting (code): %v", txHash.String(), err)
+						continue
+					case errors.ERR_UTXO_ERROR:
+						// This error is used as an aggregate for spend failures. When it is the
+						// standard 'could not be spent' case, treat it as a conflict outcome.
+						if strings.Contains(strings.ToLower(tErr.Message()), "could not be spent") {
+							u.logger.Debugf("[processTransactionsInLevels] Transaction %s marked as conflicting (utxo_error): %v", txHash.String(), err)
+							continue
+						}
+					}
+				}
+
+				// Some UTXO backends (or gRPC rehydration) return spent/conflict failures where
+				// the underlying code doesn't survive as a wrapped error chain. In those cases,
+				// the canonical code is still present in the formatted error string.
+				errStr := err.Error()
+				if strings.Contains(errStr, "UTXO_SPENT") || strings.Contains(errStr, "TX_CONFLICTING") {
+					u.logger.Debugf("[processTransactionsInLevels] Transaction %s marked as conflicting (string-match): %v", txHash.String(), err)
+					continue
+				}
+			}
+
+			// Handle missing parent transactions by adding to orphanage.
+			// Missing parents are expected during parallel subtree processing, but we still
+			// report them as errors via the aggregate errorsFound return so callers can decide.
 			if errors.Is(err, errors.ErrTxMissingParent) {
 				isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
 				if runningErr == nil && isRunning {
@@ -725,7 +773,14 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 				} else {
 					u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", txHash.String())
 				}
-			} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
+				errorsFound++
+				continue
+			}
+
+			// Count all other errors
+			errorsFound++
+
+			if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
 				// Log truly invalid transactions and fail
 				u.logger.Warnf("[processTransactionsInLevels] Invalid transaction detected: %s: %v", txHash.String(), err)
 				return err

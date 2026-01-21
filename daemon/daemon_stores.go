@@ -18,7 +18,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	utxofactory "github.com/bsv-blockchain/teranode/stores/utxo/factory"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/bsv-blockchain/teranode/util/kafka"
 )
 
 type Stores struct {
@@ -44,13 +43,12 @@ func (d *Stores) GetUtxoStore(ctx context.Context, logger ulogger.Logger,
 		return d.mainUtxoStore, nil
 	}
 
-	var err error
-
-	d.mainUtxoStore, err = utxofactory.NewStore(ctx, logger, appSettings, "main")
+	store, err := utxofactory.NewStore(ctx, logger, appSettings, "main")
 	if err != nil {
 		return nil, err
 	}
 
+	d.mainUtxoStore = store
 	return d.mainUtxoStore, nil
 }
 
@@ -63,11 +61,13 @@ func (d *Stores) GetSubtreeValidationClient(ctx context.Context, logger ulogger.
 		return d.mainSubtreeValidationClient, nil
 	}
 
-	var err error
+	client, err := subtreevalidation.NewClient(ctx, logger, appSettings, "main_stores")
+	if err != nil {
+		return nil, err
+	}
 
-	d.mainSubtreeValidationClient, err = subtreevalidation.NewClient(ctx, logger, appSettings, "main_stores")
-
-	return d.mainSubtreeValidationClient, err
+	d.mainSubtreeValidationClient = client
+	return d.mainSubtreeValidationClient, nil
 }
 
 // GetBlockValidationClient returns the main block validation client instance. If the client
@@ -79,11 +79,13 @@ func (d *Stores) GetBlockValidationClient(ctx context.Context, logger ulogger.Lo
 		return d.mainBlockValidationClient, nil
 	}
 
-	var err error
+	client, err := blockvalidation.NewClient(ctx, logger, appSettings, "main_stores")
+	if err != nil {
+		return nil, err
+	}
 
-	d.mainBlockValidationClient, err = blockvalidation.NewClient(ctx, logger, appSettings, "main_stores")
-
-	return d.mainBlockValidationClient, err
+	d.mainBlockValidationClient = client
+	return d.mainBlockValidationClient, nil
 }
 
 // GetP2PClient creates and returns a new P2P client instance. Unlike other store getters, this function
@@ -103,14 +105,13 @@ func (d *Stores) GetP2PClient(ctx context.Context, logger ulogger.Logger, appSet
 		return d.mainP2PClient, nil
 	}
 
-	p2pClient, err := p2p.NewClient(ctx, logger, appSettings)
+	client, err := p2p.NewClient(ctx, logger, appSettings)
 	if err != nil {
 		return nil, err
 	}
 
-	d.mainP2PClient = p2pClient
-
-	return p2pClient, nil
+	d.mainP2PClient = client
+	return d.mainP2PClient, nil
 }
 
 // GetBlockchainClient creates and returns a new blockchain client instance. Unlike other store
@@ -129,16 +130,13 @@ func (d *Stores) GetBlockAssemblyClient(ctx context.Context, logger ulogger.Logg
 		return d.mainBlockAssemblyClient, nil
 	}
 
-	var err error
-
 	client, err := blockassembly.NewClient(ctx, logger, appSettings)
 	if err != nil {
 		return nil, err
 	}
 
 	d.mainBlockAssemblyClient = client
-
-	return client, nil
+	return d.mainBlockAssemblyClient, nil
 }
 
 // GetValidatorClient returns the main validator client instance. If the client hasn't been
@@ -150,51 +148,37 @@ func (d *Stores) GetValidatorClient(ctx context.Context, logger ulogger.Logger,
 		return d.mainValidatorClient, nil
 	}
 
-	var err error
-
 	localValidator := appSettings.Validator.UseLocalValidator
 
 	if localValidator {
 		logger.Infof("[Validator] Using local validator")
 
-		var utxoStore utxostore.Store
-
-		utxoStore, err = d.GetUtxoStore(ctx, logger, appSettings)
+		utxoStore, err := d.GetUtxoStore(ctx, logger, appSettings)
 		if err != nil {
 			return nil, errors.NewServiceError("could not create local validator client", err)
 		}
 
-		var txMetaKafkaProducerClient *kafka.KafkaAsyncProducer
-
-		txMetaKafkaProducerClient, err = getKafkaTxmetaAsyncProducer(ctx, logger, appSettings)
+		txMetaKafkaProducerClient, err := getKafkaTxmetaAsyncProducer(ctx, logger, appSettings)
 		if err != nil {
 			return nil, errors.NewServiceError("could not create txmeta kafka producer for local validator", err)
 		}
 
-		var rejectedTxKafkaProducerClient *kafka.KafkaAsyncProducer
-
-		rejectedTxKafkaProducerClient, err = getKafkaRejectedTxAsyncProducer(ctx, logger, appSettings)
+		rejectedTxKafkaProducerClient, err := getKafkaRejectedTxAsyncProducer(ctx, logger, appSettings)
 		if err != nil {
 			return nil, errors.NewServiceError("could not create rejectedTx kafka producer for local validator", err)
 		}
 
-		var blockAssemblyClient blockassembly.ClientI
-
-		blockAssemblyClient, err = d.GetBlockAssemblyClient(ctx, logger, appSettings)
+		blockAssemblyClient, err := d.GetBlockAssemblyClient(ctx, logger, appSettings)
 		if err != nil {
 			return nil, errors.NewServiceError("could not create block assembly client for local validator", err)
 		}
 
-		var validatorClient validator.Interface
-
-		var blockchainClient blockchain.ClientI
-
-		blockchainClient, err = d.GetBlockchainClient(ctx, logger, appSettings, "validator")
+		blockchainClient, err := d.GetBlockchainClient(ctx, logger, appSettings, "validator")
 		if err != nil {
 			return nil, errors.NewServiceError("could not create block validation client for local validator", err)
 		}
 
-		validatorClient, err = validator.New(ctx,
+		validatorClient, err := validator.New(ctx,
 			logger,
 			appSettings,
 			utxoStore,
@@ -207,15 +191,17 @@ func (d *Stores) GetValidatorClient(ctx context.Context, logger ulogger.Logger,
 			return nil, errors.NewServiceError("could not create local validator", err)
 		}
 
-		return validatorClient, nil
+		d.mainValidatorClient = validatorClient
+		return d.mainValidatorClient, nil
 	} else {
-		d.mainValidatorClient, err = validator.NewClient(ctx, logger, appSettings)
+		client, err := validator.NewClient(ctx, logger, appSettings)
 		if err != nil {
 			return nil, errors.NewServiceError("could not create validator client", err)
 		}
-	}
 
-	return d.mainValidatorClient, nil
+		d.mainValidatorClient = client
+		return d.mainValidatorClient, nil
+	}
 }
 
 // GetTxStore returns the main transaction store instance. If the store hasn't been initialized yet,
@@ -241,11 +227,12 @@ func (d *Stores) GetTxStore(logger ulogger.Logger, appSettings *settings.Setting
 		}
 	}
 
-	d.mainTxStore, err = blob.NewStore(logger, txStoreURL, options.WithHashPrefix(hashPrefix))
+	store, err := blob.NewStore(logger, txStoreURL, options.WithHashPrefix(hashPrefix))
 	if err != nil {
 		return nil, errors.NewServiceError("could not create tx store", err)
 	}
 
+	d.mainTxStore = store
 	return d.mainTxStore, nil
 }
 
@@ -283,11 +270,12 @@ func (d *Stores) GetSubtreeStore(ctx context.Context, logger ulogger.Logger, app
 		return nil, errors.NewServiceError("could not create block height tracker channel", err)
 	}
 
-	d.mainSubtreeStore, err = blob.NewStore(logger, subtreeStoreURL, options.WithHashPrefix(hashPrefix), options.WithBlockHeightCh(ch))
+	store, err := blob.NewStore(logger, subtreeStoreURL, options.WithHashPrefix(hashPrefix), options.WithBlockHeightCh(ch))
 	if err != nil {
 		return nil, errors.NewServiceError("could not create subtree store", err)
 	}
 
+	d.mainSubtreeStore = store
 	return d.mainSubtreeStore, nil
 }
 
@@ -314,11 +302,12 @@ func (d *Stores) GetTempStore(ctx context.Context, logger ulogger.Logger, appSet
 		return nil, errors.NewServiceError("could not create block height tracker channel", err)
 	}
 
-	d.mainTempStore, err = blob.NewStore(logger, tempStoreURL, options.WithBlockHeightCh(ch))
+	store, err := blob.NewStore(logger, tempStoreURL, options.WithBlockHeightCh(ch))
 	if err != nil {
 		return nil, errors.NewServiceError("could not create temp_store", err)
 	}
 
+	d.mainTempStore = store
 	return d.mainTempStore, nil
 }
 
@@ -357,11 +346,12 @@ func (d *Stores) GetBlockStore(ctx context.Context, logger ulogger.Logger, appSe
 		return nil, errors.NewServiceError("could not create block height tracker channel", err)
 	}
 
-	d.mainBlockStore, err = blob.NewStore(logger, blockStoreURL, options.WithHashPrefix(hashPrefix), options.WithBlockHeightCh(ch))
+	store, err := blob.NewStore(logger, blockStoreURL, options.WithHashPrefix(hashPrefix), options.WithBlockHeightCh(ch))
 	if err != nil {
 		return nil, errors.NewServiceError("could not create block store", err)
 	}
 
+	d.mainBlockStore = store
 	return d.mainBlockStore, nil
 }
 
@@ -399,11 +389,12 @@ func (d *Stores) GetBlockPersisterStore(ctx context.Context, logger ulogger.Logg
 		return nil, errors.NewServiceError("could not create block height tracker channel", err)
 	}
 
-	d.mainBlockPersisterStore, err = blob.NewStore(logger, blockStoreURL, options.WithHashPrefix(hashPrefix), options.WithBlockHeightCh(ch))
+	store, err := blob.NewStore(logger, blockStoreURL, options.WithHashPrefix(hashPrefix), options.WithBlockHeightCh(ch))
 	if err != nil {
 		return nil, errors.NewServiceError("could not create block persister store", err)
 	}
 
+	d.mainBlockPersisterStore = store
 	return d.mainBlockPersisterStore, nil
 }
 

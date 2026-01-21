@@ -542,8 +542,6 @@ func TestServer_catchup(t *testing.T) {
 			utxoStore:           utxoStore,
 			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
-			validationSemaphore:     make(chan struct{}, 1),
-		activeCatchupSessions:   make(map[string]*CatchupContext),
 			subtreeStore:        subtreeStore,
 		}
 
@@ -1739,10 +1737,10 @@ func TestHealth_IncludesCatchupStatus(t *testing.T) {
 	server.lastCatchupResult = true
 	server.catchupStatsMu.Unlock()
 
-	// No active sessions means not catching up
-	server.activeCatchupSessionsMu.Lock()
-	server.activeCatchupSessions = make(map[string]*CatchupContext)
-	server.activeCatchupSessionsMu.Unlock()
+	// No active catchup means not catching up
+	server.activeCatchupCtxMu.Lock()
+	server.activeCatchupCtx = nil
+	server.activeCatchupCtxMu.Unlock()
 
 	status, details, err := server.Health(ctx, false)
 

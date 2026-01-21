@@ -94,22 +94,13 @@ type CatchupStatus struct {
 // Returns:
 //   - *CatchupStatus: Current catchup status, or a status with IsCatchingUp=false if no catchup is active
 func (u *Server) getCatchupStatusInternal() *CatchupStatus {
-	// Get the active catchup sessions and previous attempt (thread-safe)
-	u.activeCatchupSessionsMu.RLock()
-	var ctx *CatchupContext
-	var latestStartTime time.Time
-
-	// Find the most recent session (latest startTime)
-	for _, session := range u.activeCatchupSessions {
-		if session.startTime.After(latestStartTime) {
-			latestStartTime = session.startTime
-			ctx = session
-		}
-	}
-
+	// Get the active catchup context and previous attempt (thread-safe)
+	u.activeCatchupCtxMu.RLock()
+	ctx := u.activeCatchupCtx
 	previousAttempt := u.previousCatchupAttempt
-	isCatchingUp := len(u.activeCatchupSessions) > 0
-	u.activeCatchupSessionsMu.RUnlock()
+	u.activeCatchupCtxMu.RUnlock()
+
+	isCatchingUp := ctx != nil
 
 	status := &CatchupStatus{
 		IsCatchingUp: isCatchingUp,
@@ -138,8 +129,8 @@ func (u *Server) getCatchupStatusInternal() *CatchupStatus {
 	status.TargetBlockHeight = ctx.blockUpTo.Height
 	status.CurrentHeight = ctx.currentHeight
 	status.TotalBlocks = len(ctx.blockHeaders)
-	status.BlocksFetched = ctx.blocksFetched.Load()
-	status.BlocksValidated = ctx.blocksValidated.Load()
+	status.BlocksFetched = u.blocksFetched.Load()
+	status.BlocksValidated = u.blocksValidated.Load()
 	status.StartTime = ctx.startTime.UnixMilli()
 	status.DurationMs = time.Since(ctx.startTime).Milliseconds()
 	status.ForkDepth = ctx.forkDepth
