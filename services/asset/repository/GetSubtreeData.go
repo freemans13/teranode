@@ -9,7 +9,9 @@ import (
 	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
@@ -60,6 +62,18 @@ func (repo *Repository) GetSubtreeDataReader(ctx context.Context, subtreeHash *c
 		}, nil
 	}
 
+	// File doesn't exist - check if we should create it on-demand
+	if !repo.settings.Asset.CreateSubtreeDataOnDemand {
+		// Setting disabled - use dynamic streaming only (current behavior)
+		return repo.dynamicStreamOnly(ctx, subtreeHash)
+	}
+
+	// Try to create the subtreeData file while streaming to HTTP response
+	return repo.dualStreamWithFileCreation(ctx, subtreeHash)
+}
+
+// dynamicStreamOnly streams subtree data to HTTP response without creating a file (legacy behavior)
+func (repo *Repository) dynamicStreamOnly(ctx context.Context, subtreeHash *chainhash.Hash) (io.ReadCloser, error) {
 	r, w := io.Pipe()
 	g, gCtx := errgroup.WithContext(ctx)
 
@@ -82,4 +96,75 @@ func (repo *Repository) GetSubtreeDataReader(ctx context.Context, subtreeHash *c
 	})
 
 	return r, nil
+}
+
+// dualStreamWithFileCreation creates a subtreeData file while simultaneously streaming to HTTP response
+func (repo *Repository) dualStreamWithFileCreation(ctx context.Context, subtreeHash *chainhash.Hash) (io.ReadCloser, error) {
+	// Initialize metrics (safe to call multiple times due to sync.Once)
+	initPrometheusMetrics()
+
+	// Create FileStorer for blob storage (will fail if file already exists - race protection)
+	storer, err := filestorer.NewFileStorer(ctx, repo.logger, repo.settings,
+		repo.SubtreeStore, subtreeHash[:], fileformat.FileTypeSubtreeData)
+	if err != nil {
+		if errors.Is(err, errors.NewBlobAlreadyExistsError("")) {
+			// Another process created the file - just read from it
+			repo.logger.Debugf("[GetSubtreeDataReader] SubtreeData file for %s created by another process, reading from file", subtreeHash.String())
+			prometheusAssetSubtreeDataCreated.WithLabelValues("success", "file_existed").Inc()
+
+			reader, err := repo.SubtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
+			if err != nil {
+				releaseSemaphorePermit(repo.semGetSubtreeDataReader)
+				return nil, err
+			}
+			return &semaphoreReadCloser{
+				ReadCloser: reader,
+				sem:        repo.semGetSubtreeDataReader,
+			}, nil
+		}
+		// Other error - return it
+		releaseSemaphorePermit(repo.semGetSubtreeDataReader)
+		prometheusAssetSubtreeDataCreated.WithLabelValues("error", "creation_failed").Inc()
+		return nil, err
+	}
+
+	// Create pipe for HTTP response
+	httpReader, httpWriter := io.Pipe()
+
+	// Use MultiWriter to write to both file storage and HTTP pipe simultaneously
+	multiWriter := io.MultiWriter(storer, httpWriter)
+
+	// Background goroutine: generate data and write to both destinations
+	g, gCtx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		defer releaseSemaphorePermit(repo.semGetSubtreeDataReader)
+
+		// Write all transactions to both destinations
+		err := repo.writeTransactionsViaSubtreeStoreStreaming(gCtx, multiWriter, nil, subtreeHash)
+
+		// Close file storer
+		if err != nil {
+			repo.logger.Warnf("[GetSubtreeDataReader] Error writing subtreeData for %s: %v", subtreeHash.String(), err)
+			storer.Abort(err)
+			_ = httpWriter.CloseWithError(err)
+			prometheusAssetSubtreeDataCreated.WithLabelValues("error", "write_failed").Inc()
+			return err
+		}
+
+		// Close the file storer successfully
+		if closeErr := storer.Close(ctx); closeErr != nil {
+			repo.logger.Warnf("[GetSubtreeDataReader] Error closing subtreeData file for %s: %v", subtreeHash.String(), closeErr)
+			_ = httpWriter.CloseWithError(closeErr)
+			prometheusAssetSubtreeDataCreated.WithLabelValues("error", "close_failed").Inc()
+			return closeErr
+		}
+
+		// Success - close HTTP pipe
+		repo.logger.Infof("[GetSubtreeDataReader] Successfully created subtreeData file on-demand for %s", subtreeHash.String())
+		_ = httpWriter.CloseWithError(io.ErrClosedPipe)
+		prometheusAssetSubtreeDataCreated.WithLabelValues("success", "on_demand_created").Inc()
+		return nil
+	})
+
+	return httpReader, nil
 }
