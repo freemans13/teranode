@@ -32,7 +32,7 @@ func BenchmarkFinalOptimization(b *testing.B) {
 
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.BlockAssembly.Disabled = true
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 10  // Optimal
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 10 // Optimal
 	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
 	tSettings.UtxoStore.GetBatcherDurationMillis = 10
 	tSettings.Aerospike.StoreBatcherDuration = 10 * time.Millisecond
@@ -65,7 +65,7 @@ func BenchmarkFinalOptimization(b *testing.B) {
 			opts.SkipScriptVerification = true
 			opts.SkipLevelOrganization = false
 			opts.AutoExtendTransactions = true
-			opts.ChunkSize = chunkSize
+			opts.BatchSize = chunkSize
 
 			b.ResetTimer()
 			b.StartTimer()
@@ -107,7 +107,7 @@ func BenchmarkFinalOptimization(b *testing.B) {
 			opts.SkipScriptVerification = true
 			opts.SkipLevelOrganization = false
 			opts.AutoExtendTransactions = true
-			opts.ChunkSize = chunkSize
+			opts.BatchSize = chunkSize
 
 			b.ResetTimer()
 			b.StartTimer()

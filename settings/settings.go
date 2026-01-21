@@ -364,6 +364,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TxMetaKafkaBatchSize:                getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
 			TxMetaKafkaBatchTimeoutMs:           getInt("validator_txmeta_kafka_batchTimeoutMs", 5, alternativeContext...),
 			SkipScriptVerificationDuringCatchup: getBool("validator_skipScriptVerificationDuringCatchup", true, alternativeContext...),
+			MultiBatchSize:                      getInt("validator_multi_batch_size", 100, alternativeContext...),
+			MultiBatchConcurrency:               getInt("validator_multi_batch_concurrency", 2, alternativeContext...),
 		},
 		Region: RegionSettings{
 			Name: getString("regionName", "defaultRegionName", alternativeContext...),
@@ -408,7 +410,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UpdateTxMinedStatus:               getBool("utxostore_updateTxMinedStatus", true, alternativeContext...),
 			MaxMinedRoutines:                  getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
 			MaxMinedBatchSize:                 getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
-			MaxAerospikeBatchSize:             getInt("utxostore_maxAerospikeBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment:    getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
 			DisableDAHCleaner:                 getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 		},

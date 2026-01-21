@@ -15,13 +15,16 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
-	"golang.org/x/sync/errgroup"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
+	"github.com/libsv/go-p2p/chaincfg/chainhash"
 )
 
 // CreateBatchDirect performs batch creation for multiple transactions in a single operation.
 // This method bypasses the batcher queue and executes a direct Aerospike BatchOperate,
 // providing significant performance improvements for level-based block validation.
-//
+var _ = uaerospike.CalculateKeySource
+var _ chainhash.Hash
+
 // Safety: Preserves all creation semantics including:
 // - Conflicting flag with automatic DAH (DeleteAtHeight) for cleanup
 // - Locked flag for block assembly two-phase commit
@@ -217,51 +220,22 @@ func (s *Store) CreateBatchDirect(ctx context.Context, requests []*utxo.BatchCre
 		batchRecords[i] = aerospike.NewBatchWrite(batchWritePolicy, key, putOps...)
 	}
 
-	// PHASE 3: Execute Aerospike batch operations (split into chunks if needed)
+	// PHASE 3: Execute Aerospike batch operation
+	// Caller controls batch size - no internal chunking needed
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
-	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
 
-	// numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
-	// s.logger.Debugf("[CREATE_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
-
-	// PHASE 2 OPTIMIZATION: Parallelize chunk processing for high throughput
-	// Split into chunks and execute them in parallel using errgroup
-	// Limit concurrency to ConnectionQueueSize to prevent overwhelming Aerospike
-	// This is safe because each chunk operates on disjoint transaction keys
-	g, _ := errgroup.WithContext(ctx)
-	// g.SetLimit(1)
-	g.SetLimit(s.client.GetConnectionQueueSize())
-
-	for i := 0; i < len(batchRecords); i += maxBatchSize {
-		i := i // Capture loop variable for goroutine
-		end := i + maxBatchSize
-		if end > len(batchRecords) {
-			end = len(batchRecords)
+	err := s.client.BatchOperate(batchPolicy, batchRecords)
+	if err != nil {
+		// Check if this is KEY_EXISTS_ERROR - this happens when ANY record in the batch
+		// already exists with CREATE_ONLY policy. This is not a fatal error - individual
+		// records will have their own errors set which we handle in Phase 4.
+		aErr, ok := err.(*aerospike.AerospikeError)
+		if !ok || aErr.ResultCode != types.KEY_EXISTS_ERROR {
+			// True batch-level failure (connection error, etc.)
+			return nil, errors.NewStorageError("[CREATE_BATCH_DIRECT] failed to batch create", err)
 		}
-
-		chunk := batchRecords[i:end]
-
-		g.Go(func() error {
-			err := s.client.BatchOperate(batchPolicy, chunk)
-			if err != nil {
-				// Check if this is KEY_EXISTS_ERROR - this happens when ANY record in the batch
-				// already exists with CREATE_ONLY policy. This is not a fatal error - individual
-				// records will have their own errors set which we handle in Phase 4.
-				aErr, ok := err.(*aerospike.AerospikeError)
-				if !ok || aErr.ResultCode != types.KEY_EXISTS_ERROR {
-					// True batch-level failure (connection error, etc.)
-					return errors.NewStorageError("[CREATE_BATCH_DIRECT] failed to batch create (chunk %d-%d)", i, end, err)
-				}
-				// KEY_EXISTS_ERROR - continue to Phase 4 to handle per-record results
-				s.logger.Debugf("[CREATE_BATCH_DIRECT] Batch chunk %d-%d contains existing keys, will handle per-record in Phase 4", i, end)
-			}
-			return nil
-		})
-	}
-
-	// Wait for all chunks to complete
-	if err := g.Wait(); err != nil {
-		return nil, err
+		// KEY_EXISTS_ERROR - continue to Phase 4 to handle per-record results
+		s.logger.Debugf("[CREATE_BATCH_DIRECT] Batch contains existing keys, will handle per-record in Phase 4")
 	}
 
 	// PHASE 4: Process results

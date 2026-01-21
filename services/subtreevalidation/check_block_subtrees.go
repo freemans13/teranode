@@ -672,8 +672,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		IgnoreLocked:           true,
 		ParentBlockHeights:     make(map[chainhash.Hash]uint32),
 		AddTXToBlockAssembly:   true,
-		ChunkSize:              75,
-		MaxConcurrentChunks:    2, // VERY conservative: 2 chunks to prevent Aerospike overload
 	}
 
 	// During legacy syncing or catching up, disable adding transactions to block assembly

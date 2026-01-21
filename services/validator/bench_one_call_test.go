@@ -39,7 +39,6 @@ func BenchmarkOneCallVsManyCalls(b *testing.B) {
 	tSettings.UtxoStore.SpendBatcherSize = 100
 	tSettings.UtxoStore.StoreBatcherSize = 100
 	tSettings.UtxoStore.GetBatcherSize = 100
-	tSettings.UtxoStore.MaxAerospikeBatchSize = 10000
 
 	// 100K transactions
 	b.Run("ValidateMulti_100K_CalledOnceWithDAG", func(b *testing.B) {

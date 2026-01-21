@@ -48,12 +48,12 @@ func BenchmarkValidate_vs_ValidateMulti_1M_Txs(b *testing.B) {
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.BlockAssembly.Disabled = true // Disable block assembly for cleaner benchmark
 
-	// CRITICAL: Configure aggressive batcher settings for benchmark
-	// Default 100ms delays kill performance for individual Validate() calls
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 1 // 1ms instead of 100ms
-	tSettings.UtxoStore.StoreBatcherDurationMillis = 1 // 1ms instead of 100ms
-	tSettings.UtxoStore.GetBatcherDurationMillis = 1   // 1ms instead of 10ms
-	tSettings.Aerospike.StoreBatcherDuration = 1 * time.Millisecond
+	// CRITICAL: Configure optimal batcher settings from previous testing
+	// 10ms provides the right balance for batching without excessive delay
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 10 // 10ms - optimal from testing
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 10 // 10ms - optimal from testing
+	tSettings.UtxoStore.GetBatcherDurationMillis = 10   // 10ms - optimal from testing
+	tSettings.Aerospike.StoreBatcherDuration = 10 * time.Millisecond
 
 	// Use optimal batcher size from testing
 	tSettings.UtxoStore.SpendBatcherSize = 100
@@ -61,18 +61,24 @@ func BenchmarkValidate_vs_ValidateMulti_1M_Txs(b *testing.B) {
 	tSettings.UtxoStore.GetBatcherSize = 100
 
 	// CRITICAL: Increase Aerospike batch size limit to avoid chunking
-	tSettings.UtxoStore.MaxAerospikeBatchSize = 10000 // Was 1024 - this was causing chunking!
 
 	// Test transaction counts with different chain structures
 	type testConfig struct {
-		totalTxs    int
-		numChains   int
-		chainDepth  int
-		description string
+		totalTxs      int
+		numChains     int
+		chainDepth    int
+		description   string
+		chunkSize     int
+		maxConcurrent int
 	}
 
 	testConfigs := []testConfig{
-		{100000, 1000, 100, "100K_1000perLevel"},   // Current best config
+		{100000, 1000, 100, "100K_OPTIMAL_Chunk75_Conc8", 75, 8}, // Your exact config!
+		{100000, 1000, 100, "100K_Chunk50_Conc16", 50, 16},
+		{100000, 1000, 100, "100K_Chunk75_Conc16", 75, 16},
+		{100000, 1000, 100, "100K_Chunk100_Conc16", 100, 16},
+		{100000, 1000, 100, "100K_Chunk100_Conc32", 100, 32},
+		{100000, 1000, 100, "100K_Chunk150_Conc16", 150, 16},
 	}
 
 	for _, cfg := range testConfigs {
@@ -173,7 +179,9 @@ func BenchmarkValidate_vs_ValidateMulti_1M_Txs(b *testing.B) {
 			opts := NewDefaultOptions()
 			opts.SkipScriptVerification = true
 			opts.SkipLevelOrganization = true
-			opts.UseIndividualBatchedCalls = false // Sequential BatchDirect
+
+			opts.BatchSize = cfg.chunkSize
+			// MaxConcurrentChunks removed - using simplified architecture
 
 			// PRE-BUILD level slices BEFORE timing starts
 			levelSlices := make([][]*bt.Tx, chainDepth)
@@ -261,118 +269,119 @@ func BenchmarkExtensionComparison_DISABLED(b *testing.B) {
 
 	// Test with NON-EXTENDED transactions (must fetch parent data)
 	b.Run(fmt.Sprintf("Validate_%d_txs_NOT_EXTENDED", txCount), func(b *testing.B) {
-			b.StopTimer()
+		b.StopTimer()
 
-			aeroURL, err := url.Parse(fmt.Sprintf("aerospike://%s:%d/test?set=utxo_validate_noext_%d&externalStore=file://./data/noext_val_%d", host, port, txCount, txCount))
-			require.NoError(b, err)
+		aeroURL, err := url.Parse(fmt.Sprintf("aerospike://%s:%d/test?set=utxo_validate_noext_%d&externalStore=file://./data/noext_val_%d", host, port, txCount, txCount))
+		require.NoError(b, err)
 
-			store, err := aerospike.New(ctx, logger, tSettings, aeroURL)
-			require.NoError(b, err)
-			store.SetBlockHeight(100)
+		store, err := aerospike.New(ctx, logger, tSettings, aeroURL)
+		require.NoError(b, err)
+		store.SetBlockHeight(100)
 
-			v, err := New(ctx, logger, tSettings, store, nil, nil, nil, nil)
-			require.NoError(b, err)
+		v, err := New(ctx, logger, tSettings, store, nil, nil, nil, nil)
+		require.NoError(b, err)
 
-			txs, numChains, chainDepth, err := generateChainedTransactionsWithLevels(ctx, store, txCount, 100)
-			require.NoError(b, err)
+		txs, numChains, chainDepth, err := generateChainedTransactionsWithLevels(ctx, store, txCount, 100)
+		require.NoError(b, err)
 
-			// STRIP extension data - force both to fetch from UTXO store
-			stripExtensionData(txs)
+		// STRIP extension data - force both to fetch from UTXO store
+		stripExtensionData(txs)
 
-			b.ResetTimer()
-			b.StartTimer()
+		b.ResetTimer()
+		b.StartTimer()
 
-			for i := 0; i < b.N; i++ {
-				successCount := 0
-				var successMutex sync.Mutex
+		for i := 0; i < b.N; i++ {
+			successCount := 0
+			var successMutex sync.Mutex
 
-				for level := 0; level < chainDepth; level++ {
-					var wg sync.WaitGroup
-					for chainIdx := 0; chainIdx < numChains; chainIdx++ {
-						txIdx := level*numChains + chainIdx
-						if txIdx >= len(txs) {
-							break
-						}
-						tx := txs[txIdx]
-						wg.Add(1)
-						go func(transaction *bt.Tx) {
-							defer wg.Done()
-							_, err := v.Validate(ctx, transaction, 101, WithSkipScriptVerification(true))
-							if err == nil {
-								successMutex.Lock()
-								successCount++
-								successMutex.Unlock()
-							}
-						}(tx)
-					}
-					wg.Wait()
-				}
-				b.Logf("Validate (NOT_EXTENDED) processed %d txs, %d succeeded", len(txs), successCount)
-			}
-
-			b.StopTimer()
-			// b.ReportMetric - disabled
-		})
-
-		b.Run("ValidateMulti_NOT_EXTENDED", func(b *testing.B) {
-			b.Skip("Disabled")
-			b.StopTimer()
-
-			txCount := 10000
-			aeroURL, err := url.Parse(fmt.Sprintf("aerospike://%s:%d/test?set=utxo_multi_noext_%d&externalStore=file://./data/noext_multi_%d", host, port, txCount, txCount))
-			require.NoError(b, err)
-
-			store, err := aerospike.New(ctx, logger, tSettings, aeroURL)
-			require.NoError(b, err)
-			store.SetBlockHeight(100)
-
-			v, err := New(ctx, logger, tSettings, store, nil, nil, nil, nil)
-			require.NoError(b, err)
-
-			txs, numChains, chainDepth, err := generateChainedTransactionsWithLevels(ctx, store, txCount, 100)
-			require.NoError(b, err)
-
-			// STRIP extension data - force both to fetch from UTXO store
-			stripExtensionData(txs)
-
-			opts := NewDefaultOptions()
-			opts.SkipScriptVerification = true
-			opts.SkipLevelOrganization = true
-			opts.UseIndividualBatchedCalls = false
-
-			levelSlices := make([][]*bt.Tx, chainDepth)
 			for level := 0; level < chainDepth; level++ {
-				levelTxs := make([]*bt.Tx, 0, numChains)
+				var wg sync.WaitGroup
 				for chainIdx := 0; chainIdx < numChains; chainIdx++ {
 					txIdx := level*numChains + chainIdx
-					if txIdx < len(txs) {
-						levelTxs = append(levelTxs, txs[txIdx])
+					if txIdx >= len(txs) {
+						break
 					}
-				}
-				levelSlices[level] = levelTxs
-			}
-
-			b.ResetTimer()
-			b.StartTimer()
-
-			for i := 0; i < b.N; i++ {
-				successCount := 0
-
-				for level := 0; level < chainDepth; level++ {
-					result, _ := v.ValidateMulti(ctx, levelSlices[level], 101, opts)
-
-					for _, r := range result.Results {
-						if r.Success {
+					tx := txs[txIdx]
+					wg.Add(1)
+					go func(transaction *bt.Tx) {
+						defer wg.Done()
+						_, err := v.Validate(ctx, transaction, 101, WithSkipScriptVerification(true))
+						if err == nil {
+							successMutex.Lock()
 							successCount++
+							successMutex.Unlock()
 						}
+					}(tx)
+				}
+				wg.Wait()
+			}
+			b.Logf("Validate (NOT_EXTENDED) processed %d txs, %d succeeded", len(txs), successCount)
+		}
+
+		b.StopTimer()
+		// b.ReportMetric - disabled
+	})
+
+	b.Run("ValidateMulti_NOT_EXTENDED", func(b *testing.B) {
+		b.Skip("Disabled")
+		b.StopTimer()
+
+		txCount := 10000
+		aeroURL, err := url.Parse(fmt.Sprintf("aerospike://%s:%d/test?set=utxo_multi_noext_%d&externalStore=file://./data/noext_multi_%d", host, port, txCount, txCount))
+		require.NoError(b, err)
+
+		store, err := aerospike.New(ctx, logger, tSettings, aeroURL)
+		require.NoError(b, err)
+		store.SetBlockHeight(100)
+
+		v, err := New(ctx, logger, tSettings, store, nil, nil, nil, nil)
+		require.NoError(b, err)
+
+		txs, numChains, chainDepth, err := generateChainedTransactionsWithLevels(ctx, store, txCount, 100)
+		require.NoError(b, err)
+
+		// STRIP extension data - force both to fetch from UTXO store
+		stripExtensionData(txs)
+
+		opts := NewDefaultOptions()
+		opts.SkipScriptVerification = true
+		opts.SkipLevelOrganization = true
+
+		opts.BatchSize = 100 // Default for NOT_EXTENDED test
+
+		levelSlices := make([][]*bt.Tx, chainDepth)
+		for level := 0; level < chainDepth; level++ {
+			levelTxs := make([]*bt.Tx, 0, numChains)
+			for chainIdx := 0; chainIdx < numChains; chainIdx++ {
+				txIdx := level*numChains + chainIdx
+				if txIdx < len(txs) {
+					levelTxs = append(levelTxs, txs[txIdx])
+				}
+			}
+			levelSlices[level] = levelTxs
+		}
+
+		b.ResetTimer()
+		b.StartTimer()
+
+		for i := 0; i < b.N; i++ {
+			successCount := 0
+
+			for level := 0; level < chainDepth; level++ {
+				result, _ := v.ValidateMulti(ctx, levelSlices[level], 101, opts)
+
+				for _, r := range result.Results {
+					if r.Success {
+						successCount++
 					}
 				}
-				b.Logf("ValidateMulti (NOT_EXTENDED) processed %d txs, %d succeeded", len(txs), successCount)
 			}
+			b.Logf("ValidateMulti (NOT_EXTENDED) processed %d txs, %d succeeded", len(txs), successCount)
+		}
 
-			b.StopTimer()
-			// b.ReportMetric - disabled
-		})
+		b.StopTimer()
+		// b.ReportMetric - disabled
+	})
 }
 
 // generateChainedTransactionsWithSpecificStructure creates chains with exact structure

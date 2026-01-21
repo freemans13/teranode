@@ -374,6 +374,10 @@ type ValidatorSettings struct {
 	TxMetaKafkaBatchSize                int  // Batch size for TxMeta Kafka messages (0 = disabled)
 	TxMetaKafkaBatchTimeoutMs           int  // Batch timeout in milliseconds for TxMeta Kafka messages
 	SkipScriptVerificationDuringCatchup bool // Skip CPU-intensive script verification when catching up blocks
+
+	// ValidateMulti specific settings
+	MultiBatchSize        int // Number of transactions per batch for ValidateMulti (0 = process entire level)
+	MultiBatchConcurrency int // Maximum concurrent batch operations for ValidateMulti (0 = use ConnectionQueueSize)
 }
 
 type RegionSettings struct {
@@ -386,23 +390,23 @@ type AdvertisingSettings struct {
 }
 
 type UtxoStoreSettings struct {
-	UtxoStore                         *url.URL
-	BlockHeightRetention              uint32
-	UnminedTxRetention                uint32
-	ParentPreservationBlocks          uint32
-	OutpointBatcherSize               int
-	OutpointBatcherDurationMillis     int
-	SpendBatcherDurationMillis        int
-	SpendBatcherSize                  int
-	SpendBatcherConcurrency           int
-	SpendWaitTimeout                  time.Duration
-	SpendCircuitBreakerFailureCount   int
-	SpendCircuitBreakerCooldown       time.Duration
-	SpendCircuitBreakerHalfOpenMax    int
-	StoreBatcherDurationMillis        int
-	StoreBatcherSize                  int
-	UtxoBatchSize                     int
-	MaxAerospikeBatchSize             int // Maximum batch size for Aerospike batch operations (default: 1024)
+	UtxoStore                       *url.URL
+	BlockHeightRetention            uint32
+	UnminedTxRetention              uint32
+	ParentPreservationBlocks        uint32
+	OutpointBatcherSize             int
+	OutpointBatcherDurationMillis   int
+	SpendBatcherDurationMillis      int
+	SpendBatcherSize                int
+	SpendBatcherConcurrency         int
+	SpendWaitTimeout                time.Duration
+	SpendCircuitBreakerFailureCount int
+	SpendCircuitBreakerCooldown     time.Duration
+	SpendCircuitBreakerHalfOpenMax  int
+	StoreBatcherDurationMillis      int
+	StoreBatcherSize                int
+	UtxoBatchSize                   int
+
 	IncrementBatcherSize              int
 	IncrementBatcherDurationMillis    int
 	SetDAHBatcherSize                 int

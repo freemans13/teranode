@@ -2,7 +2,6 @@ package validator
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -294,66 +293,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 	phaseStart = time.Now()
 	// ================================
 
-	if opts.UseIndividualBatchedCalls {
-		// PIPELINING APPROACH: Use individual Spend/Create calls through batchers
-		// This allows natural overlap between Spend and Create operations
-		v.logger.Errorf("[ValidateLevelBatch] Using individual batched calls (pipelining enabled)")
-
-		var utxoWg sync.WaitGroup
-		resultsMutex := sync.Mutex{}
-
-		for i := range finalSpendRequests {
-			reqIdx := i
-			request := finalSpendRequests[i]
-			txIdx := spendIndexMap[reqIdx]
-
-			utxoWg.Add(1)
-			go func() {
-				defer utxoWg.Done()
-
-				// Spend (through spendBatcher)
-				spends, spendErr := v.utxoStore.Spend(ctx, request.Tx, request.BlockHeight, request.IgnoreFlags)
-
-				resultsMutex.Lock()
-				defer resultsMutex.Unlock()
-
-				// Check spend result
-				if spendErr != nil {
-					results[txIdx].Err = spendErr
-					return
-				}
-
-				// Check if any individual spend failed
-				for _, spend := range spends {
-					if spend.Err != nil {
-						results[txIdx].Err = spend.Err
-						if spend.ConflictingTxID != nil {
-							results[txIdx].ConflictingTxID = spend.ConflictingTxID
-						}
-						return
-					}
-				}
-
-				// Spend succeeded - Create (through storeBatcher)
-				// This can start while other goroutines are still spending!
-				txMeta, createErr := v.CreateInUtxoStore(ctx, request.Tx, request.BlockHeight, false, false)
-				if createErr != nil {
-					results[txIdx].Err = createErr
-					return
-				}
-
-				// Success!
-				results[txIdx].Success = true
-				results[txIdx].TxMeta = txMeta
-			}()
-		}
-
-		utxoWg.Wait()
-		v.logger.Debugf("[ValidateLevelBatch] PHASE 2 (pipelined spend+create) completed in %v", time.Since(phaseStart))
-		return results, nil
-	}
-
-	// ORIGINAL APPROACH: Sequential BatchDirect operations
+	// Sequential BatchDirect operations
 	var spendResults []*utxo.BatchSpendResult
 	var spendErr error
 
@@ -779,42 +719,12 @@ func (v *Validator) prefetchParentsForLevel(ctx context.Context, txs []*bt.Tx, o
 		})
 	}
 
-	// Step 3: Call BatchDecorate with chunking for large batches
+	// Step 3: Call BatchDecorate - caller controls batch size
 	startBatch := time.Now()
 
-	// For large parent sets, chunk the BatchDecorate call to prevent overwhelming Aerospike
-	// Use same batch size as Create/Spend operations for consistency
-	maxBatchSize := 5000 // Match settings.conf utxostore_maxAerospikeBatchSize
-
-	if len(items) <= maxBatchSize {
-		// Small batch - single call
-		err := v.utxoStore.BatchDecorate(ctx, items)
-		if err != nil {
-			return nil, errors.NewProcessingError("[prefetchParentsForLevel] failed to batch fetch parents", err)
-		}
-	} else {
-		// Large batch - chunk and parallelize
-		g, _ := errgroup.WithContext(ctx)
-		// g.SetLimit(1)
-		g.SetLimit(64)
-
-		for i := 0; i < len(items); i += maxBatchSize {
-			i := i
-			end := i + maxBatchSize
-			if end > len(items) {
-				end = len(items)
-			}
-
-			chunk := items[i:end]
-
-			g.Go(func() error {
-				return v.utxoStore.BatchDecorate(ctx, chunk)
-			})
-		}
-
-		if err := g.Wait(); err != nil {
-			return nil, errors.NewProcessingError("[prefetchParentsForLevel] failed to batch fetch parents", err)
-		}
+	err := v.utxoStore.BatchDecorate(ctx, items)
+	if err != nil {
+		return nil, errors.NewProcessingError("[prefetchParentsForLevel] failed to batch fetch parents", err)
 	}
 
 	v.logger.Debugf("[prefetchParentsForLevel] BatchDecorate completed in %v for %d parents", time.Since(startBatch), len(items))

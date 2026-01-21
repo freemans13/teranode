@@ -56,8 +56,8 @@ func BenchmarkAutoExtend(b *testing.B) {
 
 		opts := NewDefaultOptions()
 		opts.SkipScriptVerification = true
-		opts.AutoExtendTransactions = true  // BUILD PARENT MAPS
-		opts.ChunkSize = 75
+		opts.AutoExtendTransactions = true // BUILD PARENT MAPS
+		opts.BatchSize = 75
 
 		b.ResetTimer()
 		b.StartTimer()
@@ -85,7 +85,7 @@ func BenchmarkAutoExtend(b *testing.B) {
 		opts := NewDefaultOptions()
 		opts.SkipScriptVerification = true
 		opts.AutoExtendTransactions = false // SKIP PARENT MAPS - Just fetch!
-		opts.ChunkSize = 75
+		opts.BatchSize = 75
 
 		b.ResetTimer()
 		b.StartTimer()
@@ -113,7 +113,7 @@ func BenchmarkAutoExtend(b *testing.B) {
 		opts := NewDefaultOptions()
 		opts.SkipScriptVerification = true
 		opts.AutoExtendTransactions = true // Wasteful - builds maps then skips
-		opts.ChunkSize = 75
+		opts.BatchSize = 75
 
 		b.ResetTimer()
 		b.StartTimer()
@@ -141,7 +141,7 @@ func BenchmarkAutoExtend(b *testing.B) {
 		opts := NewDefaultOptions()
 		opts.SkipScriptVerification = true
 		opts.AutoExtendTransactions = false // SKIP MAPS - Already extended!
-		opts.ChunkSize = 75
+		opts.BatchSize = 75
 
 		b.ResetTimer()
 		b.StartTimer()

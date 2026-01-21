@@ -91,29 +91,11 @@ type Options struct {
 	// level organization overhead needs to be eliminated for benchmarking
 	SkipLevelOrganization bool
 
-	// UseIndividualBatchedCalls uses individual Spend/Create calls (through batchers) instead of
-	// SpendBatchDirect/CreateBatchDirect. This allows natural pipelining where Create operations
-	// can start before all Spend operations complete.
-	UseIndividualBatchedCalls bool
-
-	// ConcurrentLevels allows processing multiple dependency levels in parallel
-	// When > 1, ValidateMulti will process this many levels concurrently (with proper dependency management)
-	// This increases CPU utilization and throughput by reducing idle time between levels
-	// Default: 1 (sequential processing)
-	ConcurrentLevels int
-
-	// ChunkSize splits each level into smaller chunks for concurrent processing
-	// When > 0, each level is divided into chunks of this size and processed concurrently
+	// BatchSize splits each level into smaller batches for concurrent processing
+	// When > 0, each level is divided into batches of this size and processed concurrently
 	// This improves CPU utilization by allowing multiple batch operations to run in parallel
 	// Default: 0 (process entire level as one batch)
-	ChunkSize int
-
-	// MaxConcurrentChunks limits how many chunks can process simultaneously
-	// Prevents overwhelming Aerospike connection pool when ChunkSize creates many chunks
-	// Each chunk runs SpendBatchDirect and CreateBatchDirect, both using connection pool
-	// Default: 0 (auto-calculated as 8, safe for typical ConnectionQueueSize=64)
-	// Recommended: 8-16 for stable operation, tune upward if no connection warnings
-	MaxConcurrentChunks int
+	BatchSize int
 }
 
 // Option defines a function type for setting options

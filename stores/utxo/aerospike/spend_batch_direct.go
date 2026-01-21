@@ -11,7 +11,6 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
-	"golang.org/x/sync/errgroup"
 )
 
 // spendBatchDirectItem tracks a single spend operation within the batch
@@ -180,47 +179,17 @@ func (s *Store) SpendBatchDirect(ctx context.Context, requests []*utxo.BatchSpen
 		batchGroupKeys = append(batchGroupKeys, gKey)
 	}
 
-	// PHASE 3: Execute Aerospike batch operations (split into chunks if needed)
+	// PHASE 3: Execute Aerospike batch operation
+	// Caller controls batch size - no internal chunking needed
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
-	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
 
-	// startBatch := time.Now()
-	// numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
-	// s.logger.Debugf("[SPEND_BATCH_DIRECT] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
-
-	// PHASE 2 OPTIMIZATION: Parallelize chunk processing for high throughput
-	// Split into chunks and execute them in parallel using errgroup
-	// Limit concurrency to ConnectionQueueSize to prevent overwhelming Aerospike
-	// This is safe because each chunk operates on disjoint UTXO keys
-	g, _ := errgroup.WithContext(ctx)
-	// g.SetLimit(1)
-	g.SetLimit(s.client.GetConnectionQueueSize())
-
-	for i := 0; i < len(batchRecords); i += maxBatchSize {
-		i := i // Capture loop variable for goroutine
-		end := i + maxBatchSize
-		if end > len(batchRecords) {
-			end = len(batchRecords)
+	err := s.client.BatchOperate(batchPolicy, batchRecords)
+	if err != nil {
+		// Batch-level failure - record for circuit breaker
+		if s.spendCircuitBreaker != nil {
+			s.spendCircuitBreaker.RecordFailure()
 		}
-
-		chunk := batchRecords[i:end]
-
-		g.Go(func() error {
-			err := s.client.BatchOperate(batchPolicy, chunk)
-			if err != nil {
-				// Batch-level failure - record for circuit breaker
-				if s.spendCircuitBreaker != nil {
-					s.spendCircuitBreaker.RecordFailure()
-				}
-				return errors.NewStorageError("[SPEND_BATCH_DIRECT] failed to batch spend aerospike (chunk %d-%d)", i, end, err)
-			}
-			return nil
-		})
-	}
-
-	// Wait for all chunks to complete
-	if err := g.Wait(); err != nil {
-		return nil, err
+		return nil, errors.NewStorageError("[SPEND_BATCH_DIRECT] failed to batch spend aerospike", err)
 	}
 
 	// s.logger.Debugf("[SPEND_BATCH_DIRECT] Aerospike BatchOperate completed in %v", time.Since(startBatch))

@@ -40,7 +40,6 @@ func BenchmarkNotExtended(b *testing.B) {
 	tSettings.UtxoStore.SpendBatcherSize = 100
 	tSettings.UtxoStore.StoreBatcherSize = 100
 	tSettings.UtxoStore.GetBatcherSize = 100
-	tSettings.UtxoStore.MaxAerospikeBatchSize = 10000
 
 	// Test with 100K
 	testSizes := []int{100000}
@@ -49,7 +48,7 @@ func BenchmarkNotExtended(b *testing.B) {
 	concurrencyLevels := []int{1, 2, 4, 8}
 
 	for _, totalTxs := range testSizes {
-		numChains := totalTxs / 100  // 100 levels each
+		numChains := totalTxs / 100 // 100 levels each
 		chainDepth := 100
 
 		// Validate() - NOT EXTENDED
@@ -111,8 +110,8 @@ func BenchmarkNotExtended(b *testing.B) {
 				opts := NewDefaultOptions()
 				opts.SkipScriptVerification = true
 				opts.SkipLevelOrganization = false // Let ValidateMulti handle DAG
-				opts.AutoExtendTransactions = true  // Should help with in-block parents
-				opts.ConcurrentLevels = concurrency // ENABLE CONCURRENT LEVEL PROCESSING!
+				opts.AutoExtendTransactions = true // Should help with in-block parents
+				// ConcurrentLevels removed - levels must be processed sequentially
 
 				b.ResetTimer()
 				b.StartTimer()
@@ -150,7 +149,7 @@ func BenchmarkNotExtended(b *testing.B) {
 
 			opts := NewDefaultOptions()
 			opts.SkipScriptVerification = true
-			opts.SkipLevelOrganization = true // Caller handles levels
+			opts.SkipLevelOrganization = true   // Caller handles levels
 			opts.AutoExtendTransactions = false // Can't extend without parent metadata
 
 			levelSlices := make([][]*bt.Tx, chainDepth)

@@ -76,32 +76,8 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 		))
 	}
 
-	// Chunk and parallelize batch operations to match Create/Spend/BatchDecorate pattern
-	maxBatchSize := s.settings.UtxoStore.MaxAerospikeBatchSize
-	// numChunks := (len(batchRecords) + maxBatchSize - 1) / maxBatchSize
-
-	// s.logger.Debugf("[setLockedBatch] Executing Aerospike BatchOperate with %d operations (max %d per batch, %d chunks)", len(batchRecords), maxBatchSize, numChunks)
-
-	// Split into chunks and execute in parallel with concurrency limit
-	g := errgroup.Group{}
-	g.SetLimit(s.client.GetConnectionQueueSize())
-
-	for i := 0; i < len(batchRecords); i += maxBatchSize {
-		i := i // Capture loop variable
-		end := i + maxBatchSize
-		if end > len(batchRecords) {
-			end = len(batchRecords)
-		}
-
-		chunk := batchRecords[i:end]
-
-		g.Go(func() error {
-			return s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), chunk)
-		})
-	}
-
-	// Wait for all chunks to complete
-	if err := g.Wait(); err != nil {
+	// Execute batch operation - caller controls batch size
+	if err := s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords); err != nil {
 		for _, batchItem := range batch {
 			batchItem.errCh <- errors.NewProcessingError("could not batch write locked flag", err)
 		}
