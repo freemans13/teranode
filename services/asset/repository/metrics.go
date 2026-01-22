@@ -34,7 +34,20 @@ func _initPrometheusMetrics() {
 		},
 		[]string{
 			"result", // success or error
-			"source", // on_demand_created, file_existed, creation_failed
+			"source", // Event source - see values below
+			// Source values:
+			//   Success cases:
+			//     - on_demand_created: Created without quorum lock (single instance)
+			//     - on_demand_created_locked: Created with quorum lock (multi-instance)
+			//     - file_existed: File already existed when checked
+			//     - file_appeared: File appeared during creation (rare race)
+			//     - waited_for_other: Waited for another instance to create file (quorum)
+			//   Error cases:
+			//     - creation_failed: FileStorer creation failed
+			//     - storer_creation_failed: FileStorer creation failed (with quorum)
+			//     - write_failed: Write operation failed
+			//     - close_failed: File close operation failed
+			//     - quorum_lock_failed: Quorum lock acquisition failed, fell back to no-lock
 		},
 	)
 }

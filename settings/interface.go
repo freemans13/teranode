@@ -200,9 +200,6 @@ type AssetSettings struct {
 	// Streaming configuration
 	SubtreeDataStreamingChunkSize   int // Number of transactions to process per chunk when streaming subtree data (default: 10000)
 	SubtreeDataStreamingConcurrency int // Number of concurrent chunks to fetch in parallel when streaming subtree data (default: 4)
-
-	// On-demand subtreeData file creation
-	CreateSubtreeDataOnDemand bool // Create and persist subtreeData files when they don't exist (default: true)
 }
 
 type BlockSettings struct {

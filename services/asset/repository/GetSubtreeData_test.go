@@ -61,6 +61,7 @@ func TestGetSubtreeDataWithReader(t *testing.T) {
 	})
 
 	t.Run("get subtree from utxo store and verify file creation", func(t *testing.T) {
+		resetQuorumForTests() // Reset singleton for this test
 		ctx, subtree, _ := setupSubtreeReaderTest(t)
 
 		subtreeBytes, err := subtree.Serialize()
@@ -116,38 +117,8 @@ func TestGetSubtreeDataWithReader(t *testing.T) {
 		require.NoError(t, r2.Close())
 	})
 
-	t.Run("get subtree with setting disabled", func(t *testing.T) {
-		ctx, subtree, _ := setupSubtreeReaderTest(t)
-
-		// Disable on-demand file creation
-		ctx.settings.Asset.CreateSubtreeDataOnDemand = false
-
-		subtreeBytes, err := subtree.Serialize()
-		require.NoError(t, err)
-
-		// write the subtree to the subtree store
-		err = ctx.repo.SubtreeStore.Set(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
-		require.NoError(t, err)
-
-		// Verify subtreeData file does NOT exist yet
-		exists, err := ctx.repo.SubtreeStore.Exists(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
-		require.NoError(t, err)
-		require.False(t, exists, "subtreeData file should not exist before first request")
-
-		// Request with setting disabled - should use dynamic streaming only
-		r, err := ctx.repo.GetSubtreeDataReader(t.Context(), subtree.RootHash())
-		require.NoError(t, err)
-
-		checkSubtreeTransactions(t, r, false)
-		require.NoError(t, r.Close())
-
-		// Verify subtreeData file still does NOT exist (dynamic streaming doesn't create file)
-		exists, err = ctx.repo.SubtreeStore.Exists(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
-		require.NoError(t, err)
-		require.False(t, exists, "subtreeData file should NOT exist with setting disabled")
-	})
-
 	t.Run("verify DAH is set on created file", func(t *testing.T) {
+		resetQuorumForTests() // Reset singleton for this test
 		ctx, subtree, _ := setupSubtreeReaderTest(t)
 
 		subtreeBytes, err := subtree.Serialize()
@@ -228,4 +199,76 @@ func checkSubtreeTransactions(t *testing.T, r io.ReadCloser, includeCoinbase boo
 	} else {
 		require.Equal(t, len(params.txs)-1, txCount)
 	}
+}
+
+// TestGetSubtreeDataWithQuorum tests quorum-based distributed locking for subtreeData creation.
+func TestGetSubtreeDataWithQuorum(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	t.Run("create with quorum lock", func(t *testing.T) {
+		resetQuorumForTests() // Reset singleton for this test
+		ctx, subtree, _ := setupSubtreeReaderTest(t)
+
+		// Configure quorum path in settings to enable distributed locking
+		quorumPath := t.TempDir()
+		ctx.settings.SubtreeValidation.QuorumPath = quorumPath
+
+		subtreeBytes, err := subtree.Serialize()
+		require.NoError(t, err)
+
+		// Write the subtree to the subtree store
+		err = ctx.repo.SubtreeStore.Set(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
+		require.NoError(t, err)
+
+		// Verify subtreeData file does NOT exist yet
+		exists, err := ctx.repo.SubtreeStore.Exists(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, err)
+		require.False(t, exists, "subtreeData file should not exist before first request")
+
+		// First request with quorum - should trigger dual-streaming with lock
+		r, err := ctx.repo.GetSubtreeDataReader(t.Context(), subtree.RootHash())
+		require.NoError(t, err)
+
+		checkSubtreeTransactions(t, r, false)
+		require.NoError(t, r.Close())
+
+		// Verify subtreeData file NOW exists
+		exists, err = ctx.repo.SubtreeStore.Exists(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, err)
+		require.True(t, exists, "subtreeData file should exist after first request")
+
+		// Second request - should read from the file (no lock needed)
+		r2, err := ctx.repo.GetSubtreeDataReader(t.Context(), subtree.RootHash())
+		require.NoError(t, err)
+
+		checkSubtreeTransactions(t, r2, false)
+		require.NoError(t, r2.Close())
+	})
+
+	t.Run("fallback when quorum not configured", func(t *testing.T) {
+		resetQuorumForTests() // Reset singleton for this test
+		ctx, subtree, _ := setupSubtreeReaderTest(t)
+
+		// Ensure quorum path is empty (no distributed locking)
+		ctx.settings.SubtreeValidation.QuorumPath = ""
+
+		subtreeBytes, err := subtree.Serialize()
+		require.NoError(t, err)
+
+		// Write the subtree to the subtree store
+		err = ctx.repo.SubtreeStore.Set(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
+		require.NoError(t, err)
+
+		// Request without quorum - should use fallback behavior (no lock)
+		r, err := ctx.repo.GetSubtreeDataReader(t.Context(), subtree.RootHash())
+		require.NoError(t, err)
+
+		checkSubtreeTransactions(t, r, false)
+		require.NoError(t, r.Close())
+
+		// Verify file was still created (just without distributed locking)
+		exists, err := ctx.repo.SubtreeStore.Exists(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, err)
+		require.True(t, exists, "subtreeData file should exist even without quorum")
+	})
 }
