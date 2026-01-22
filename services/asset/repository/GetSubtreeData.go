@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
+	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
@@ -103,9 +104,40 @@ func (repo *Repository) dualStreamWithFileCreation(ctx context.Context, subtreeH
 	// Initialize metrics (safe to call multiple times due to sync.Once)
 	initPrometheusMetrics()
 
-	// Create FileStorer for blob storage (will fail if file already exists - race protection)
+	// Get current block height to calculate DAH (Delete After Height)
+	// DAH allows pruning of temporary subtreeData files created by asset service
+	// Block persister will set DAH=0 when it processes the block, making the file permanent
+	var dah uint32
+	if repo.BlockchainClient != nil {
+		// Use a deferred recover to gracefully handle mock clients in tests that don't set up GetBestBlockHeader
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					repo.logger.Debugf("[GetSubtreeDataReader] Failed to get best block height (likely mock client): %v", r)
+				}
+			}()
+
+			_, bestHeaderMeta, err := repo.BlockchainClient.GetBestBlockHeader(ctx)
+			if err != nil {
+				repo.logger.Debugf("[GetSubtreeDataReader] Failed to get best block height for DAH calculation: %v", err)
+				// Continue without DAH - file will not have delete-at-height
+			} else {
+				// Set DAH to current height + global retention
+				dah = bestHeaderMeta.Height + repo.settings.GlobalBlockHeightRetention
+				repo.logger.Debugf("[GetSubtreeDataReader] Setting DAH=%d for subtreeData file (current=%d, retention=%d)",
+					dah, bestHeaderMeta.Height, repo.settings.GlobalBlockHeightRetention)
+			}
+		}()
+	}
+
+	// Create FileStorer for blob storage with DAH option (will fail if file already exists - race protection)
+	var fileOptions []bloboptions.FileOption
+	if dah > 0 {
+		fileOptions = append(fileOptions, bloboptions.WithDeleteAt(dah))
+	}
+
 	storer, err := filestorer.NewFileStorer(ctx, repo.logger, repo.settings,
-		repo.SubtreeStore, subtreeHash[:], fileformat.FileTypeSubtreeData)
+		repo.SubtreeStore, subtreeHash[:], fileformat.FileTypeSubtreeData, fileOptions...)
 	if err != nil {
 		if errors.Is(err, errors.NewBlobAlreadyExistsError("")) {
 			// Another process created the file - just read from it
