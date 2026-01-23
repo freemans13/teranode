@@ -457,6 +457,12 @@ func (u *Server) HealthGRPC(ctx context.Context, _ *blockvalidation_api.EmptyMes
 //   - error: Any error encountered (always nil for this method)
 func (u *Server) GetCatchupStatus(ctx context.Context, _ *blockvalidation_api.EmptyMessage) (*blockvalidation_api.CatchupStatusResponse, error) {
 	status := u.getCatchupStatusInternal()
+	if status != nil && !status.IsCatchingUp && u.blockchainClient != nil {
+		_, meta, err := u.blockchainClient.GetBestBlockHeader(ctx)
+		if err == nil && meta != nil {
+			status.CurrentHeight = meta.Height
+		}
+	}
 
 	resp := &blockvalidation_api.CatchupStatusResponse{
 		IsCatchingUp:         status.IsCatchingUp,
