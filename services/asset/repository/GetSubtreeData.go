@@ -239,13 +239,6 @@ func (repo *Repository) calculateDAH(ctx context.Context) uint32 {
 		return 0
 	}
 
-	// Defensive: some mock clients may panic if GetBestBlockHeader is not set up
-	defer func() {
-		if r := recover(); r != nil {
-			repo.logger.Warnf("[calculateDAH] Recovered from panic (likely mock blockchain client): %v. GetBestBlockHeader may need to be configured. Setting DAH=0.", r)
-		}
-	}()
-
 	_, bestHeaderMeta, err := repo.BlockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
 		return 0
