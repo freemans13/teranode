@@ -211,7 +211,7 @@ func (repo *Repository) dualStreamWithFileCreation(ctx context.Context, subtreeH
 		}
 
 		// Close the file storer successfully
-		if closeErr := storer.Close(ctx); closeErr != nil {
+		if closeErr := storer.Close(gCtx); closeErr != nil {
 			repo.logger.Warnf("[GetSubtreeDataReader] Error closing subtreeData file for %s: %v", subtreeHash.String(), closeErr)
 			_ = httpWriter.CloseWithError(closeErr)
 			prometheusAssetSubtreeDataCreated.WithLabelValues("error", "close_failed").Inc()
@@ -242,7 +242,7 @@ func (repo *Repository) calculateDAH(ctx context.Context) uint32 {
 	// Defensive: some mock clients may panic if GetBestBlockHeader is not set up
 	defer func() {
 		if r := recover(); r != nil {
-			// Mock client not configured - DAH will be 0
+			repo.logger.Warnf("[calculateDAH] Recovered from panic (likely mock blockchain client): %v. GetBestBlockHeader may need to be configured. Setting DAH=0.", r)
 		}
 	}()
 
