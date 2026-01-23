@@ -70,15 +70,20 @@ function checkInitialResponse(response: Response): Promise<ResponseData> {
       response
         .json()
         .then((errorBody) => {
+          const bodyMessage =
+            errorBody?.error || errorBody?.message || errorBody?.Err || errorBody?.details || undefined
           reject({
             code: response.status,
-            message: errorBody?.error || response.statusText || 'Unspecified error.',
+            message: bodyMessage || response.statusText || 'Unspecified error.',
+            status: response.status,
+            body: errorBody,
           })
         })
         .catch((e) => {
           reject({
             code: response.status,
             message: response.statusText || 'Unspecified error.',
+            status: response.status,
           })
         })
     }
@@ -276,7 +281,7 @@ function handleApiError<T>(error: any, endpoint: string): ApiResponse<T> {
 
   // Handle HTTP errors
   if (error.status) {
-    let message = `HTTP ${error.status}`
+    let message = error.message || `HTTP ${error.status}`
 
     if (error.status === 404) {
       // Check if this is a block operation
@@ -288,7 +293,7 @@ function handleApiError<T>(error: any, endpoint: string): ApiResponse<T> {
     } else if (error.status === 401 || error.status === 403) {
       message = 'Authentication error: You are not authorized to access this resource.'
     } else if (error.status === 500) {
-      message = 'Server error: The server encountered an internal error.'
+      message = error.message || 'Server error: The server encountered an internal error.'
     } else if (error.status === 503) {
       message = 'Service unavailable: The blockchain service may not be running.'
     }

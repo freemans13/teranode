@@ -55,6 +55,31 @@
     return error instanceof Error ? error.message : String(error)
   }
 
+  function isEventAllowedForState(state: string | undefined, eventName: string): boolean {
+    if (!state || !eventName) return false
+
+    switch (state) {
+      case 'IDLE':
+        return eventName === 'RUN' || eventName === 'LEGACYSYNC'
+      case 'RUNNING':
+        return eventName === 'STOP' || eventName === 'CATCHUPBLOCKS'
+      case 'LEGACYSYNCING':
+        return eventName === 'RUN' || eventName === 'STOP'
+      case 'CATCHINGBLOCKS':
+        return eventName === 'RUN'
+      default:
+        return false
+    }
+  }
+
+  function getEventDisabledReason(state: string | undefined, eventName: string): string {
+    if (!state) return 'FSM state not available'
+    if (state === 'CATCHINGBLOCKS' && eventName !== 'RUN') {
+      return 'Catchup must complete first'
+    }
+    return `Not allowed from ${state}`
+  }
+
   function formatTimeAgo(timestamp: number): string {
     const now = Date.now()
     const diffMs = now - timestamp
@@ -609,12 +634,14 @@
                   <div class="action-buttons">
                     {#each fsmEvents.sort((a, b) => a.value - b.value) as event}
                       {#if event && event.name}
+                        {@const allowed = isEventAllowedForState(fsmState?.state, event.name)}
                         <button
                           on:click={() => sendFSMEvent(event.name)}
-                          disabled={fsmLoading}
+                          disabled={fsmLoading || !allowed}
                           class="action-button"
                           data-event={event.name.toLowerCase()}
                           data-event-id={event.value}
+                          title={!allowed ? getEventDisabledReason(fsmState?.state, event.name) : ''}
                         >
                           {#if fsmLoading}
                             <div class="spinner"></div>
