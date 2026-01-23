@@ -478,7 +478,7 @@ export function revalidateBlock(blockHash: string): Promise<ApiResponse<any>> {
 }
 
 // Get last N invalid blocks
-export function getLastInvalidBlocks(count: number = 5): Promise<ApiResponse<any>> {
+export function getLastInvalidBlocks(count: number = 5, offset: number = 0): Promise<ApiResponse<any>> {
   return new Promise<ApiResponse<any>>((resolve) => {
     incSpinCount()
 
@@ -487,7 +487,7 @@ export function getLastInvalidBlocks(count: number = 5): Promise<ApiResponse<any
       baseUrl = value
     })()
 
-    fetch(`${baseUrl}/blocks/invalid?count=${count}`, {
+    fetch(`${baseUrl}/blocks/invalid?count=${count}&offset=${offset}`, {
       method: 'GET',
       credentials: 'include',
     })
