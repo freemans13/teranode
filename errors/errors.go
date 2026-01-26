@@ -185,32 +185,42 @@ func (e *Error) As(target interface{}) bool {
 		return false
 	}
 
+	isNilableInterfaceValue := func(v interface{}) bool {
+		if v == nil {
+			return true
+		}
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Interface, reflect.Slice:
+			return rv.IsNil()
+		default:
+			return false
+		}
+	}
+
 	// Fast path for our own error type.
 	if te, ok := target.(**Error); ok {
 		*te = e
 		return true
 	}
 
-	// 1. Try the data payload.
-	if err, ok := e.data.(error); ok {
-		var as interface{ As(interface{}) bool }
-		if as, ok = err.(interface{ As(interface{}) bool }); ok && as.As(target) {
+	// 1. Try the data payload using the stdlib traversal.
+	if err, ok := e.data.(error); ok && err != nil {
+		if errors.As(err, target) {
 			return true
 		}
 	}
 
-	// 2. Try an explicitly wrapped error.
-	if err := e.wrappedErr; err != nil && !reflect.ValueOf(err).IsNil() {
-		if as, ok := err.(interface{ As(interface{}) bool }); ok && as.As(target) {
+	// 2. Traverse explicitly wrapped errors via stdlib so we avoid re-entering our own As implementation repeatedly.
+	if err := e.wrappedErr; err != nil && !isNilableInterfaceValue(err) {
+		if errors.As(err, target) {
 			return true
 		}
 	}
 
-	// 3. Finally, get whatever "errors.Unwrap" gives us.
+	// 3. Follow the standard error chain produced by errors.Unwrap.
 	if err := errors.Unwrap(e); err != nil {
-		if as, ok := err.(interface{ As(interface{}) bool }); ok && as.As(target) {
-			return true
-		}
+		return errors.As(err, target)
 	}
 
 	return false
