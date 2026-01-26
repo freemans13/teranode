@@ -218,11 +218,6 @@ func (e *Error) As(target interface{}) bool {
 		}
 	}
 
-	// 3. Follow the standard error chain produced by errors.Unwrap.
-	if err := errors.Unwrap(e); err != nil {
-		return errors.As(err, target)
-	}
-
 	return false
 }
 
