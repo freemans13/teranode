@@ -444,6 +444,23 @@ func TestGetLastNInvalidBlocksWithInvalidCount(t *testing.T) {
 	assert.Contains(t, err.Error(), "Invalid count parameter")
 }
 
+// TestGetLastNInvalidBlocksWithInvalidOffset tests the GetLastNInvalidBlocks method with an invalid offset parameter
+func TestGetLastNInvalidBlocksWithInvalidOffset(t *testing.T) {
+	// Setup test
+	handler, _, c, _ := setupBlockHandlerTest(t, "")
+
+	// Create a request with an invalid offset query parameter
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/blocks/invalid?count=5&offset=invalid", nil)
+	c.SetRequest(req)
+
+	// Call the function to be tested
+	err := handler.GetLastNInvalidBlocks(c)
+
+	// Assert results
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Invalid offset parameter")
+}
+
 // TestGetLastNInvalidBlocksWithNegativeCount tests the GetLastNInvalidBlocks method with a negative count parameter
 func TestGetLastNInvalidBlocksWithNegativeCount(t *testing.T) {
 	// Setup test

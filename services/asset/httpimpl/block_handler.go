@@ -4,6 +4,7 @@ package httpimpl
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -227,28 +228,25 @@ func (h *BlockHandler) GetLastNInvalidBlocks(c echo.Context) error {
 		offsetStr = "0" // Default to 0 if not specified
 	}
 
-	// Convert count to int64
-	var count int64
-	var offset int64
-
-	_, err := fmt.Sscanf(countStr, "%d", &count)
+	// Convert count/offset to int64
+	count, err := strconv.ParseInt(countStr, 10, 64)
 	if err != nil {
-		return errors.NewInvalidArgumentError("Invalid count parameter: " + err.Error())
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Invalid count parameter", err).Error())
 	}
 
-	_, err = fmt.Sscanf(offsetStr, "%d", &offset)
+	offset, err := strconv.ParseInt(offsetStr, 10, 64)
 	if err != nil {
-		return errors.NewInvalidArgumentError("Invalid offset parameter: " + err.Error())
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Invalid offset parameter", err).Error())
 	}
 
 	// Validate count is positive
 	if count <= 0 {
-		return errors.NewInvalidArgumentError("Count must be a positive number")
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Count must be a positive number").Error())
 	}
 
 	// Validate offset is non-negative
 	if offset < 0 {
-		return errors.NewInvalidArgumentError("Offset must be a non-negative number")
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Offset must be a non-negative number").Error())
 	}
 
 	ctx := c.Request().Context()
@@ -256,7 +254,7 @@ func (h *BlockHandler) GetLastNInvalidBlocks(c echo.Context) error {
 	// Fetch enough blocks to serve the requested page plus one extra to determine if there is a next page.
 	fetchN := offset + count + 1
 	if fetchN < 0 {
-		return errors.NewInvalidArgumentError("Invalid pagination parameters")
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Invalid pagination parameters").Error())
 	}
 
 	// Call the blockchain service to get the invalid blocks

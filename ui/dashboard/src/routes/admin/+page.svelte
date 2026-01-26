@@ -781,7 +781,7 @@
           {/if}
           <button
             class="icon-button"
-            on:click={fetchInvalidBlocks}
+            on:click={() => fetchInvalidBlocks()}
             disabled={invalidBlocksLoading}
             title="Refresh invalidated blocks list"
           >
@@ -807,7 +807,7 @@
               <i class="fas fa-exclamation-circle"></i>
               <p>Error loading invalidated blocks</p>
               <p class="error-message">{invalidBlocksError}</p>
-              <button class="icon-button with-text" on:click={fetchInvalidBlocks}>
+              <button class="icon-button with-text" on:click={() => fetchInvalidBlocks()}>
                 <Icon name="icon-refresh-line" size={16} />
                 <span>Try again</span>
               </button>
