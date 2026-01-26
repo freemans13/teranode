@@ -13,7 +13,6 @@ package errors
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"runtime"
 	"strings"
 	"unicode/utf8"
@@ -185,19 +184,6 @@ func (e *Error) As(target interface{}) bool {
 		return false
 	}
 
-	isNilableInterfaceValue := func(v interface{}) bool {
-		if v == nil {
-			return true
-		}
-		rv := reflect.ValueOf(v)
-		switch rv.Kind() {
-		case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Interface, reflect.Slice:
-			return rv.IsNil()
-		default:
-			return false
-		}
-	}
-
 	// Fast path for our own error type.
 	if te, ok := target.(**Error); ok {
 		*te = e
@@ -211,10 +197,23 @@ func (e *Error) As(target interface{}) bool {
 		}
 	}
 
-	// 2. Traverse explicitly wrapped errors via stdlib so we avoid re-entering our own As implementation repeatedly.
-	if err := e.wrappedErr; err != nil && !isNilableInterfaceValue(err) {
-		if errors.As(err, target) {
-			return true
+	// 2. Walk the chain manually to avoid recursive re-entry through errors.As
+	current := e.wrappedErr
+	for current != nil {
+		// Handle *Error types manually to avoid re-entering As
+		if errPtr, ok := current.(*Error); ok {
+			// Check if this error's data satisfies target
+			if err, ok := errPtr.data.(error); ok && err != nil {
+				if errors.As(err, target) {
+					return true
+				}
+			}
+			// Continue to next in chain
+			current = errPtr.wrappedErr
+		} else {
+			// Not an *Error, safe to use stdlib errors.As
+			// This handles all other error types including those with custom As methods
+			return errors.As(current, target)
 		}
 	}
 
@@ -769,11 +768,12 @@ func Join(errs ...error) error {
 	if len(errs) > 0 && errors.As(errs[0], &tErr) {
 		previousErr = tErr
 
-		for i := 1; i < len(errs); i++ {
-			if errors.As(errs[i], &tErr2) {
+		// Skip the first error (already processed) and chain the rest
+		for _, err := range errs[1:] {
+			if errors.As(err, &tErr2) {
 				previousErr.SetWrappedErr(tErr2)
 			} else {
-				tErr2 = NewError(errs[i].Error())
+				tErr2 = NewError(err.Error())
 				previousErr.SetWrappedErr(tErr2)
 			}
 
