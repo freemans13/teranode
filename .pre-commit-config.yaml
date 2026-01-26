@@ -10,7 +10,7 @@ repos:
     hooks:
       - id: golangci-lint
         name: Run go linter
-        entry: make lint-full-changed-dirs
+        entry: golangci-lint run --new ./...
         language: system
         types: [ go ]
         pass_filenames: false

@@ -202,7 +202,13 @@ func (e *Error) As(target interface{}) bool {
 	for current != nil {
 		// Handle *Error types manually to avoid re-entering As
 		if errPtr, ok := current.(*Error); ok {
-			// Check if this error's data satisfies target
+			// First check if the *Error itself matches the target type
+			if te, ok := target.(**Error); ok {
+				*te = errPtr
+				return true
+			}
+
+			// Then check if this error's data satisfies target
 			if err, ok := errPtr.data.(error); ok && err != nil {
 				if errors.As(err, target) {
 					return true
@@ -768,12 +774,11 @@ func Join(errs ...error) error {
 	if len(errs) > 0 && errors.As(errs[0], &tErr) {
 		previousErr = tErr
 
-		// Skip the first error (already processed) and chain the rest
-		for _, err := range errs[1:] {
-			if errors.As(err, &tErr2) {
+		for i := 1; i < len(errs); i++ {
+			if errors.As(errs[i], &tErr2) {
 				previousErr.SetWrappedErr(tErr2)
 			} else {
-				tErr2 = NewError(err.Error())
+				tErr2 = NewError(errs[i].Error())
 				previousErr.SetWrappedErr(tErr2)
 			}
 
