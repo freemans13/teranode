@@ -494,6 +494,7 @@ export function getLastInvalidBlocks(count: number = 5, offset: number = 0): Pro
     fetch(`${baseUrl}/blocks/invalid?count=${count}&offset=${offset}`, {
       method: 'GET',
       credentials: 'include',
+      cache: 'no-store',
     })
       .then((response) => checkInitialResponse(response))
       .then((data) => {

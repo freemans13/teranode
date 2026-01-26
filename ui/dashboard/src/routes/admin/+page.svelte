@@ -38,6 +38,9 @@
   const INVALID_BLOCKS_PAGE_SIZE = 5
   let invalidBlocksHasMore = false
 
+  $: invalidBlocksShowingFrom = invalidBlocks.length > 0 ? invalidBlocksOffset + 1 : 0
+  $: invalidBlocksShowingTo = invalidBlocksOffset + invalidBlocks.length
+
   // Re-validate block state
   let revalidatingBlock = false
   let revalidatingBlockHash = ''
@@ -342,7 +345,7 @@
       blockActionResult = { success: true, message: 'Block invalidated successfully' }
 
       // Refresh the invalid blocks list after a successful action
-      await fetchInvalidBlocks()
+      await refreshInvalidBlocksWithPageFallback()
     } catch (error: unknown) {
       blockActionResult = {
         success: false,
@@ -397,7 +400,7 @@
       }
 
       // Refresh the invalid blocks list after a successful action
-      await fetchInvalidBlocks()
+      await refreshInvalidBlocksWithPageFallback()
     } catch (error: unknown) {
       failure(`${getErrorMessage(error)}`)
     } finally {
@@ -442,7 +445,7 @@
       )
 
       // Refresh the invalid blocks list after a successful action
-      await fetchInvalidBlocks()
+      await refreshInvalidBlocksWithPageFallback()
     } catch (error: unknown) {
       failure(`${getErrorMessage(error)}`)
     } finally {
@@ -497,7 +500,12 @@
       blockHash = ''
 
       // Refresh the invalid blocks list after a successful action
-      await fetchInvalidBlocks()
+      if (actionName === 'invalidate') {
+        invalidBlocksOffset = 0
+        await refreshInvalidBlocksWithPageFallback(0)
+      } else {
+        await refreshInvalidBlocksWithPageFallback()
+      }
     } catch (error: unknown) {
       failure(`${getErrorMessage(error)}`)
     } finally {
@@ -539,6 +547,17 @@
           behavior: 'instant',
         })
       }, 0)
+    }
+  }
+
+  async function refreshInvalidBlocksWithPageFallback(startOffset: number = invalidBlocksOffset) {
+    await fetchInvalidBlocks(startOffset)
+
+    if (invalidBlocks.length === 0 && invalidBlocksOffset > 0) {
+      const prevOffset = Math.max(0, invalidBlocksOffset - INVALID_BLOCKS_PAGE_SIZE)
+      if (prevOffset !== invalidBlocksOffset) {
+        await fetchInvalidBlocks(prevOffset)
+      }
     }
   }
 
@@ -764,7 +783,7 @@
             <span>Prev</span>
           </button>
           <span class="last-refresh">
-            Showing {invalidBlocksOffset + 1}-{invalidBlocksOffset + invalidBlocks.length}
+            Showing {invalidBlocksShowingFrom}-{invalidBlocksShowingTo}
           </span>
           <button
             class="icon-button with-text"
