@@ -224,6 +224,10 @@ export function getBlockStats(): Promise<ApiResponse<any>> {
     .catch((error) => handleApiError<any>(error, '/blockstats'))
 }
 
+export function getChainParams(): Promise<ApiResponse<any>> {
+  return get<any>(`${baseUrl}/chainparams`, {})
+}
+
 export function getBlockForks(data: { hash: string; limit: number }): Promise<ApiResponse<any>> {
   return get<any>(`${baseUrl}/block/${data.hash}/forks`, { query: { limit: String(data.limit) } })
 }
