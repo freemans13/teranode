@@ -1024,6 +1024,14 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		u.kafkaConsumerClient.Start(gctx, u.consumerMessageHandler(gctx), kafka.WithLogErrorAndMoveOn())
 
 		u.logger.Infof("[Start] Kafka consumer started successfully")
+
+		<-gctx.Done()
+
+		u.logger.Infof("[Start] Kafka consumer context done, closing consumer")
+		if err := u.kafkaConsumerClient.Close(); err != nil {
+			u.logger.Errorf("[Start] failed to close kafka consumer gracefully: %v", err)
+		}
+
 		return nil
 	})
 

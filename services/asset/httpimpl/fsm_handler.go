@@ -111,8 +111,16 @@ func extractInvalidArgumentMessage(err error) string {
 
 	msg := err.Error()
 
-	if idx := strings.LastIndex(msg, "INVALID_ARGUMENT"); idx >= 0 {
-		remaining := msg[idx:]
+	marker := ""
+	markerIdx := -1
+	for _, m := range []string{"INVALID_ARGUMENT", "InvalidArgument"} {
+		if idx := strings.LastIndex(msg, m); idx >= 0 && idx > markerIdx {
+			marker = m
+			markerIdx = idx
+		}
+	}
+	if markerIdx >= 0 {
+		remaining := msg[markerIdx+len(marker):]
 		if colon := strings.Index(remaining, ":"); colon >= 0 {
 			return strings.TrimSpace(remaining[colon+1:])
 		}

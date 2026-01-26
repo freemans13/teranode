@@ -58,6 +58,8 @@
     return error instanceof Error ? error.message : String(error)
   }
 
+  // duplicates the FSM transition logic from the backend (fsm_handler.go 
+  // If the backend state machine changes, the UI will become out of sync. 
   function isEventAllowedForState(state: string | undefined, eventName: string): boolean {
     if (!state || !eventName) return false
 
