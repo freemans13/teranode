@@ -328,11 +328,6 @@ var rpcLimited = map[string]struct{}{
 	"version":               {},
 	"getminingcandidate":    {},
 	"submitminingsolution":  {},
-
-	// BSV-specific commands
-	"freeze":   {},
-	"unfreeze": {},
-	"reassign": {},
 }
 
 // builderScript is a convenience function which is used for hard-coded scripts

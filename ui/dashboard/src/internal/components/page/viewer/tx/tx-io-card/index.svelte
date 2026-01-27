@@ -7,7 +7,6 @@
   import i18n from '$internal/i18n'
   import { detectScriptType, scriptToAsm, extractOpReturnData, getScriptTypeDescription, ScriptType, extractAddress } from '$internal/utils/bitcoin-scripts'
   import { onMount } from 'svelte'
-  import * as api from '$internal/api'
 
   const baseKey = 'page.viewer-tx.txs'
 
@@ -21,9 +20,6 @@
   let outputViewModes: { [key: number]: 'default' | 'asm' | 'hex' } = {}
   let inputViewModes: { [key: number]: 'default' | 'hex' } = {}
   let outputAddresses: { [key: number]: string | null } = {}
-
-  let legacyPubKeyHashAddrID = 0x00
-  let legacyScriptHashAddrID = 0x05
 
   function increaseSlize() {
     sliceCount += 10
@@ -58,24 +54,6 @@
     }
   }
 
-  onMount(async () => {
-    const resp: any = await api.getChainParams()
-    if (resp?.ok) {
-      if (typeof resp.data?.legacyPubKeyHashAddrID === 'number') {
-        legacyPubKeyHashAddrID = resp.data.legacyPubKeyHashAddrID
-      }
-      if (typeof resp.data?.legacyScriptHashAddrID === 'number') {
-        legacyScriptHashAddrID = resp.data.legacyScriptHashAddrID
-      }
-    }
-
-
-    if (data?.outputs?.length) {
-      processedOutputsHash = ''
-      extractOutputAddresses()
-    }
-  })
-
   async function extractOutputAddresses() {
     if (!data.outputs) return
 
@@ -85,10 +63,7 @@
       const output = data.outputs[index]
       const scriptType = detectScriptType(output.lockingScript)
       if (scriptType === ScriptType.P2PKH || scriptType === ScriptType.P2SH) {
-        const address = await extractAddress(output.lockingScript, scriptType, {
-          p2pkh: legacyPubKeyHashAddrID,
-          p2sh: legacyScriptHashAddrID,
-        })
+        const address = await extractAddress(output.lockingScript, scriptType)
         if (address) {
           newAddresses[index] = address
         }

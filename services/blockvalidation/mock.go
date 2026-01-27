@@ -80,12 +80,6 @@ func (m *mockKafkaConsumer) BrokersURL() []string {
 }
 
 func (m *mockKafkaConsumer) Close() error {
-	for _, call := range m.ExpectedCalls {
-		if call.Method == "Close" {
-			args := m.Called()
-			return args.Error(0)
-		}
-	}
-
-	return nil
+	args := m.Called()
+	return args.Error(0)
 }

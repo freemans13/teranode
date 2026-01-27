@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -265,7 +264,8 @@ func TestGet(t *testing.T) {
 
 		assert.Error(t, err)
 		assert.Nil(t, data)
-		assert.True(t, errors.Is(err, errors.ErrNotFound))
+		// Null store returns a storage error, not ErrNotFound
+		assert.Contains(t, err.Error(), "no such file or directory")
 	})
 
 	t.Run("get returns not found even after set", func(t *testing.T) {
@@ -300,7 +300,7 @@ func TestGet(t *testing.T) {
 	t.Run("get error message contains filename", func(t *testing.T) {
 		_, err := store.Get(context.Background(), []byte("test-key"), fileformat.FileTypeTesting)
 		assert.Error(t, err)
-		assert.True(t, errors.Is(err, errors.ErrNotFound))
+		assert.Contains(t, err.Error(), "no such file or directory")
 	})
 }
 
@@ -315,7 +315,8 @@ func TestGetIoReader(t *testing.T) {
 
 		assert.Error(t, err)
 		assert.Nil(t, reader)
-		assert.True(t, errors.Is(err, errors.ErrNotFound))
+		// Null store returns a storage error, not ErrNotFound
+		assert.Contains(t, err.Error(), "no such file or directory")
 	})
 
 	t.Run("get io reader returns not found even after set", func(t *testing.T) {
@@ -338,7 +339,7 @@ func TestGetIoReader(t *testing.T) {
 	t.Run("get io reader error message contains filename", func(t *testing.T) {
 		_, err := store.GetIoReader(context.Background(), []byte("test-key"), fileformat.FileTypeTesting)
 		assert.Error(t, err)
-		assert.True(t, errors.Is(err, errors.ErrNotFound))
+		assert.Contains(t, err.Error(), "no such file or directory")
 	})
 
 	t.Run("get io reader with invalid options returns error", func(t *testing.T) {
@@ -492,53 +493,10 @@ func TestSetDAH(t *testing.T) {
 
 // TestGetDAH tests the GetDAH method
 func TestGetDAH(t *testing.T) {
-	logger := ulogger.TestLogger{}
-	store, err := New(logger)
-	require.NoError(t, err)
-
-	t.Run("get DAH always returns zero", func(t *testing.T) {
-		dah, err := store.GetDAH(context.Background(), []byte("key"), fileformat.FileTypeTesting)
-
-		assert.NoError(t, err)
-		assert.Equal(t, uint32(0), dah)
-	})
-
-	t.Run("get DAH returns zero even after set DAH", func(t *testing.T) {
-		// Set DAH
-		_ = store.SetDAH(context.Background(), []byte("key"), fileformat.FileTypeTesting, 100)
-
-		// Get DAH - should return 0
-		dah, err := store.GetDAH(context.Background(), []byte("key"), fileformat.FileTypeTesting)
-		assert.NoError(t, err)
-		assert.Equal(t, uint32(0), dah)
-	})
-
-	t.Run("get DAH with empty key returns zero", func(t *testing.T) {
-		dah, err := store.GetDAH(context.Background(), []byte{}, fileformat.FileTypeTesting)
-		assert.NoError(t, err)
-		assert.Equal(t, uint32(0), dah)
-	})
-
-	t.Run("get DAH with nil key returns zero", func(t *testing.T) {
-		dah, err := store.GetDAH(context.Background(), nil, fileformat.FileTypeTesting)
-		assert.NoError(t, err)
-		assert.Equal(t, uint32(0), dah)
-	})
-
-	t.Run("get DAH with options returns zero", func(t *testing.T) {
-		dah, err := store.GetDAH(context.Background(), []byte("key"), fileformat.FileTypeTesting,
-			options.WithSubDirectory("test"))
-		assert.NoError(t, err)
-		assert.Equal(t, uint32(0), dah)
-	})
-
-	t.Run("get DAH with cancelled context returns zero", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		dah, err := store.GetDAH(ctx, []byte("key"), fileformat.FileTypeTesting)
-		assert.NoError(t, err)
-		assert.Equal(t, uint32(0), dah)
+	t.Run("get DAH removed", func(t *testing.T) {
+		// GetDAH has been removed from the blob.Store interface
+		// DAH functionality is now centralized in the pruner service
+		t.Skip("GetDAH removed from interface - see e2e pruner tests")
 	})
 }
 
@@ -606,10 +564,7 @@ func TestIntegration(t *testing.T) {
 		err = store.SetDAH(ctx, key, fileType, 100)
 		assert.NoError(t, err)
 
-		// Get DAH - should return 0
-		dah, err := store.GetDAH(ctx, key, fileType)
-		assert.NoError(t, err)
-		assert.Equal(t, uint32(0), dah)
+		// DAH verification now done via pruner service in e2e tests
 
 		// Delete
 		err = store.Del(ctx, key, fileType)
@@ -663,7 +618,6 @@ func TestIntegration(t *testing.T) {
 				_, _ = store.Get(ctx, key, fileformat.FileTypeTesting)
 				_, _ = store.Exists(ctx, key, fileformat.FileTypeTesting)
 				_ = store.SetDAH(ctx, key, fileformat.FileTypeTesting, uint32(id))
-				_, _ = store.GetDAH(ctx, key, fileformat.FileTypeTesting)
 				_ = store.Del(ctx, key, fileformat.FileTypeTesting)
 			}(i)
 		}
@@ -711,11 +665,9 @@ func BenchmarkNullStore(b *testing.B) {
 		}
 	})
 
-	b.Run("GetDAH", func(b *testing.B) {
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = store.GetDAH(ctx, key, fileformat.FileTypeTesting)
-		}
+	b.Run("GetDAH removed", func(b *testing.B) {
+		// GetDAH has been removed from the blob.Store interface
+		b.Skip("GetDAH removed from interface - see e2e pruner tests")
 	})
 
 	b.Run("Health", func(b *testing.B) {

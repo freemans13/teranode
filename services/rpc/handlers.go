@@ -601,14 +601,16 @@ func handleGetRawTransaction(ctx context.Context, s *RPCServer, cmd interface{},
 	outputs := make([]bsvjson.Vout, len(tx.Outputs))
 
 	for i, txOut := range tx.Outputs {
-		_, addrs, _, err := txscript.ExtractPkScriptAddrs(txOut.LockingScript.Bytes(), s.settings.ChainCfgParams)
+		addresses, err := txOut.LockingScript.Addresses()
 		if err != nil {
 			return nil, errors.NewServiceError("Error extracting script addresses", err)
 		}
 
-		addressStrings := make([]string, 0, len(addrs))
-		for _, addr := range addrs {
-			addressStrings = append(addressStrings, addr.EncodeAddress())
+		// Convert addresses to []string
+		// Can't use copy() here because we're converting between different types
+		addressStrings := make([]string, len(addresses))
+		for j, addr := range addresses { //nolint:gosimple
+			addressStrings[j] = addr // Type conversion happens here
 		}
 
 		asm, err := txscript.DisasmString(txOut.LockingScript.Bytes())

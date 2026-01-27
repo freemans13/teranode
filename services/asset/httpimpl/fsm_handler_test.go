@@ -122,10 +122,7 @@ func TestGetFSMState(t *testing.T) {
 // TestGetFSMEvents tests the GetFSMEvents method
 func TestGetFSMEvents(t *testing.T) {
 	// Setup test
-	handler, mockClient, c, rec := setupFSMHandlerTest(t, "")
-
-	state := blockchain_api.FSMStateType_IDLE
-	mockClient.On("GetFSMCurrentState", mock.Anything).Return(&state, nil)
+	handler, _, c, rec := setupFSMHandlerTest(t, "")
 
 	// Call the function to be tested
 	err := handler.GetFSMEvents(c)
@@ -155,30 +152,6 @@ func TestGetFSMEvents(t *testing.T) {
 	// Check for some known FSM events
 	// Note: These may need to be updated based on the actual events in the blockchain_api.FSMEventType enum
 	assert.True(t, len(eventMap) > 0, "Should have at least one event")
-
-	// Verify that the mock was called with the correct arguments
-	mockClient.AssertCalled(t, "GetFSMCurrentState", mock.Anything)
-}
-
-func TestExtractInvalidArgumentMessage(t *testing.T) {
-	t.Run("Nil error", func(t *testing.T) {
-		assert.Equal(t, "", extractInvalidArgumentMessage(nil))
-	})
-
-	t.Run("Extracts from INVALID_ARGUMENT marker", func(t *testing.T) {
-		err := errors.NewInvalidArgumentError("rpc error: code = INVALID_ARGUMENT: bad event")
-		assert.Equal(t, "bad event", extractInvalidArgumentMessage(err))
-	})
-
-	t.Run("Extracts from InvalidArgument marker", func(t *testing.T) {
-		err := errors.NewInvalidArgumentError("rpc error: code = InvalidArgument: bad event")
-		assert.Equal(t, "bad event", extractInvalidArgumentMessage(err))
-	})
-
-	t.Run("Extracts from desc field", func(t *testing.T) {
-		err := errors.NewInvalidArgumentError("rpc error: code = InvalidArgument desc = bad event")
-		assert.Equal(t, "bad event", extractInvalidArgumentMessage(err))
-	})
 }
 
 // TestGetFSMStates tests the GetFSMStates method
@@ -300,7 +273,7 @@ func TestSendFSMEvent(t *testing.T) {
 	t.Run("Error from SendFSMEvent", func(t *testing.T) {
 		// Setup test with a valid event request
 		requestBody := `{"event": "RUN"}`
-		handler, mockClient, c, rec := setupFSMHandlerTest(t, requestBody)
+		handler, mockClient, c, _ := setupFSMHandlerTest(t, requestBody)
 
 		// Mock the blockchain client response with error
 		mockClient.On("SendFSMEvent", mock.Anything, blockchain_api.FSMEventType_RUN).Return(errors.ErrServiceUnavailable)
@@ -309,15 +282,10 @@ func TestSendFSMEvent(t *testing.T) {
 		err := handler.SendFSMEvent(c)
 
 		// Assert results
-		require.NoError(t, err)
-		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-
-		var response errorResponse
-		err = json.Unmarshal(rec.Body.Bytes(), &response)
-		require.NoError(t, err)
-		assert.Equal(t, int32(http.StatusInternalServerError), response.Status)
-		assert.Equal(t, int32(errors.ERR_SERVICE_ERROR), response.Code)
-		assert.Contains(t, strings.ToLower(response.Err), "failed to send fsm event")
+		httpErr, ok := err.(*echo.HTTPError)
+		require.True(t, ok)
+		assert.Equal(t, http.StatusInternalServerError, httpErr.Code)
+		assert.Contains(t, httpErr.Message, "Failed to send FSM event")
 
 		// Verify that the mock was called with the correct arguments
 		mockClient.AssertCalled(t, "SendFSMEvent", mock.Anything, blockchain_api.FSMEventType_RUN)
