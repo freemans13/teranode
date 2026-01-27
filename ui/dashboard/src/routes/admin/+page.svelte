@@ -80,6 +80,22 @@
     }
   }
 
+  async function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  async function refreshFSMStateAfterEvent(previousStateValue: number | undefined) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await fetchFSMState(true)
+
+      if (previousStateValue === undefined || fsmState?.state_value !== previousStateValue) {
+        return
+      }
+
+      await delay(250 * (attempt + 1))
+    }
+  }
+
   function goToPrevInvalidBlocksPage(): void {
     if (invalidBlocksLoading) return
     const nextOffset = Math.max(0, invalidBlocksOffset - INVALID_BLOCKS_PAGE_SIZE)
@@ -124,6 +140,8 @@
       fsmLoading = true
     }
 
+    const previousStateValue = fsmState?.state_value
+
     try {
       // Log the baseUrl for debugging
       console.log('FSM API baseUrl:', apiBaseUrl)
@@ -136,6 +154,10 @@
       }
 
       fsmState = result.data
+
+      if (previousStateValue !== undefined && previousStateValue !== fsmState.state_value) {
+        await fetchFSMEvents()
+      }
     } catch (error: unknown) {
       console.error('Error fetching FSM state:', error)
       fsmError = getErrorMessage(error)
@@ -168,7 +190,7 @@
     }
 
     fsmLoading = true
-    const previousState = fsmState
+    const previousStateValue = fsmState?.state_value
 
     try {
       console.log(`Sending FSM event: ${eventName}`)
@@ -180,30 +202,14 @@
         throw new Error(result.error?.message || `Failed to send ${eventName} event`)
       }
 
-      // Store the new state
-      fsmState = result.data
+      await refreshFSMStateAfterEvent(previousStateValue)
 
-      // Check if state actually changed
-      if (previousState && previousState.state_value === fsmState.state_value) {
-        console.warn(
-          `FSM state did not change after ${eventName} event. Still in ${fsmState.state} state.`,
-        )
-      }
-
-      success(`Successfully sent ${eventName} event. State: ${fsmState.state}`)
-
-      // Refresh the state after a short delay to ensure we get the latest state
-      setTimeout(() => {
-        fetchFSMState()
-      }, 1000)
+      success(`Successfully sent ${eventName} event. State: ${fsmState?.state}`)
     } catch (error) {
       console.error(`Error sending ${eventName} event:`, error)
       failure(`Failed to send ${eventName} event: ${getErrorMessage(error)}`)
 
-      // Refresh the state to ensure we're showing the correct information
-      setTimeout(() => {
-        fetchFSMState()
-      }, 1000)
+      await fetchFSMState(true)
     } finally {
       fsmLoading = false
     }
