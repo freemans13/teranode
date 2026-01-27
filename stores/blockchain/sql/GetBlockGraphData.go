@@ -48,40 +48,37 @@ func (s *SQL) GetBlockGraphData(ctx context.Context, periodMillis uint64) (*mode
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "sql:GetBlockGraphData")
 	defer deferFn()
 
-	// Optimized query: Instead of traversing the entire chain and then filtering by time,
-	// we start from the best block and walk back only until we reach blocks older than
-	// the requested period. This is much more efficient for recent time periods.
+	// Query to get block graph data from the main chain.
+	// Uses idx_chain_work_valid to quickly find the best block, then traverses
+	// back through the chain using idx_parent_id.
 	//
-	// The query uses idx_chain_work_valid to quickly find the best block, then uses
-	// idx_parent_id for efficient parent lookups during traversal.
-	//
-	// The original query started from both genesis and best block, then walked back from
-	// both. However, since walking back from genesis produces nothing (genesis has no parent),
-	// we only need to walk back from the best block. We stop early when we hit blocks
-	// older than the requested period, which is a significant optimization for recent queries.
+	// The query starts from both genesis (id=0) and the best block, walking back
+	// through parent links. The final WHERE clause filters to only blocks within
+	// the requested time period.
 	q := `
-		WITH RECURSIVE
-		best_block AS (
-			SELECT id
+		WITH RECURSIVE ChainBlocks AS (
+			SELECT
+			 id
+			,parent_id
+			,block_time
+			,tx_count
 			FROM blocks
-			WHERE invalid = false AND id > 0
-			ORDER BY chain_work DESC, peer_id ASC, id ASC
-			LIMIT 1
-		),
-		chain_blocks AS (
-			-- Start from best block
-			SELECT b.id, b.parent_id, b.block_time, b.tx_count
-			FROM blocks b
-			INNER JOIN best_block bb ON b.id = bb.id
+			WHERE id IN (
+				0,
+				(SELECT id FROM blocks WHERE id > 0 ORDER BY chain_work DESC, id ASC LIMIT 1)
+			)
+			AND EXISTS (SELECT 1 FROM blocks WHERE id > 0)
 			UNION ALL
-			-- Walk back until we hit genesis or go past the time period
-			SELECT b.id, b.parent_id, b.block_time, b.tx_count
+			SELECT
+			 b.id
+			,b.parent_id
+			,b.block_time
+			,b.tx_count
 			FROM blocks b
-			INNER JOIN chain_blocks cb ON b.id = cb.parent_id
-			WHERE b.id != cb.id AND b.id > 0 AND cb.block_time >= $1
+			INNER JOIN ChainBlocks cb ON b.id = cb.parent_id
+			WHERE b.parent_id != 0
 		)
-		SELECT block_time, tx_count
-		FROM chain_blocks
+		SELECT block_time, tx_count FROM ChainBlocks
 		WHERE block_time >= $1
 	`
 

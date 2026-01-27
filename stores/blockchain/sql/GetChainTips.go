@@ -158,56 +158,124 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 
 // calculateBranchLength calculates the length of a branch from a tip back to
 // the common ancestor with the main chain.
-//
-// This optimized implementation uses a single SQL query with recursive CTEs to:
-// 1. Build the main chain from the tip back to genesis
-// 2. Build the fork chain from the fork tip back until it intersects the main chain
-// 3. Count the number of blocks in the fork chain before the intersection
-//
-// This replaces the previous iterative approach that issued multiple individual queries.
 func (s *SQL) calculateBranchLength(ctx context.Context, tipHashBytes []byte, mainChainTipHash *chainhash.Hash) (uint32, error) {
-	// Use a single recursive CTE query to calculate branch length efficiently
-	// The query walks back from both the fork tip and main chain tip simultaneously,
-	// finding where they intersect and counting the fork blocks
-	q := `
-		WITH RECURSIVE
-		-- Build the main chain from tip to genesis (or up to 10000 blocks for safety)
-		main_chain AS (
-			SELECT id, parent_id, 1 as depth
-			FROM blocks
-			WHERE hash = $2
-			UNION ALL
-			SELECT b.id, b.parent_id, mc.depth + 1
-			FROM blocks b
-			INNER JOIN main_chain mc ON b.id = mc.parent_id
-			WHERE mc.depth < 10000 AND b.id != mc.id
-		),
-		-- Walk back from fork tip, counting steps until we find a main chain block
-		fork_chain AS (
-			SELECT id, parent_id, 0 as branch_len,
-				   EXISTS(SELECT 1 FROM main_chain WHERE id = blocks.id) as in_main
-			FROM blocks
-			WHERE hash = $1
-			UNION ALL
-			SELECT b.id, b.parent_id, fc.branch_len + 1,
-				   EXISTS(SELECT 1 FROM main_chain WHERE id = b.id) as in_main
-			FROM blocks b
-			INNER JOIN fork_chain fc ON b.id = fc.parent_id
-			WHERE NOT fc.in_main AND fc.branch_len < 1000 AND b.id != fc.id
-		)
-		SELECT COALESCE(MAX(branch_len), 0) as branch_length
-		FROM fork_chain
-		WHERE in_main = true OR parent_id IS NULL OR branch_len >= 1000
-	`
-
-	var branchLength uint32
-	err := s.db.QueryRowContext(ctx, q, tipHashBytes, mainChainTipHash.CloneBytes()).Scan(&branchLength)
+	// Convert tipHashBytes to chainhash.Hash
+	tipHash, err := chainhash.NewHash(tipHashBytes)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, nil
+		return 0, errors.NewStorageError("failed to create hash from bytes", err)
+	}
+
+	branchLength := uint32(0)
+	currentHash := tipHash
+
+	for {
+		q := `SELECT parent_id, height FROM blocks WHERE hash = $1`
+
+		var (
+			parentID sql.NullInt64
+			height   uint32
+		)
+
+		err := s.db.QueryRowContext(ctx, q, currentHash.CloneBytes()).Scan(&parentID, &height)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// Reached genesis or orphaned block
+				break
+			}
+
+			return 0, errors.NewStorageError("failed to query parent block", err)
 		}
-		return 0, errors.NewStorageError("failed to calculate branch length", err)
+
+		if !parentID.Valid {
+			// Reached genesis block
+			break
+		}
+
+		branchLength++
+
+		// Get parent hash
+		q = `SELECT hash FROM blocks WHERE id = $1`
+
+		var parentHashBytes []byte
+
+		err = s.db.QueryRowContext(ctx, q, parentID.Int64).Scan(&parentHashBytes)
+		if err != nil {
+			return 0, errors.NewStorageError("failed to query parent hash", err)
+		}
+
+		currentHash, err = chainhash.NewHash(parentHashBytes)
+		if err != nil {
+			return 0, errors.NewStorageError("failed to create parent hash", err)
+		}
+
+		// Check if this block is in the main chain by walking back from main tip
+		isInMainChain, err := s.isBlockInMainChain(ctx, currentHash, mainChainTipHash)
+		if err != nil {
+			return 0, errors.NewStorageError("failed to check if block is in main chain", err)
+		}
+
+		if isInMainChain {
+			// Found common ancestor
+			break
+		}
+
+		// Prevent infinite loops - limit to reasonable branch length
+		if branchLength > 1000 {
+			s.logger.Warnf("Branch length calculation exceeded 1000 blocks, stopping")
+			break
+		}
 	}
 
 	return branchLength, nil
+}
+
+// isBlockInMainChain checks if a given block is part of the main chain
+// by walking back from the main chain tip
+func (s *SQL) isBlockInMainChain(ctx context.Context, blockHash, mainChainTipHash *chainhash.Hash) (bool, error) {
+	if blockHash.String() == mainChainTipHash.String() {
+		return true, nil
+	}
+
+	currentHash := mainChainTipHash
+	for i := 0; i < 1000; i++ { // Prevent infinite loops
+		if currentHash.String() == blockHash.String() {
+			return true, nil
+		}
+
+		// Get parent
+		q := `SELECT parent_id FROM blocks WHERE hash = $1`
+
+		var parentID sql.NullInt64
+
+		err := s.db.QueryRowContext(ctx, q, currentHash.CloneBytes()).Scan(&parentID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+
+			return false, errors.NewStorageError("failed to query parent block", err)
+		}
+
+		if !parentID.Valid {
+			// Reached genesis
+			return false, nil
+		}
+
+		// Get parent hash
+		q = `SELECT hash FROM blocks WHERE id = $1`
+
+		var parentHashBytes []byte
+
+		err = s.db.QueryRowContext(ctx, q, parentID.Int64).Scan(&parentHashBytes)
+		if err != nil {
+			return false, errors.NewStorageError("failed to query parent hash", err)
+		}
+
+		currentHash, err = chainhash.NewHash(parentHashBytes)
+		if err != nil {
+			return false, errors.NewStorageError("failed to create parent hash", err)
+		}
+	}
+
+	return false, nil
 }
