@@ -2292,7 +2292,7 @@ func handleSetBan(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan s
 				success = true
 				s.logger.Debugf("Added ban for %s until %v", c.IPOrSubnet, expirationTime)
 			} else {
-				s.logger.Errorf("Error while trying to ban teranode peer: %v", err)
+				s.logger.Warnf("Error while trying to ban teranode peer: %v", err)
 			}
 		}
 
