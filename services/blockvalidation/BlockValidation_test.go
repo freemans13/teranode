@@ -3079,6 +3079,7 @@ func TestBlockValidation_OptimisticMining_InValidBlock(t *testing.T) {
 	mockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil)
 	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 100}, nil)
 
+	mockBlockchain.On("ReValidateBlock", mock.Anything, mock.Anything).Return()
 	txMetaStore, subtreeValidationClient, _, txStore, subtreeStore, deferFunc := setup(t)
 	defer deferFunc()
 
