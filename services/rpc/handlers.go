@@ -2268,15 +2268,19 @@ func handleSetBan(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan s
 
 		var expirationTime time.Time
 
-		if c.Absolute != nil && *c.Absolute {
-			expirationTime = time.Unix(*c.BanTime, 0)
-		} else {
-			expirationTime = time.Now().Add(time.Duration(*c.BanTime) * time.Second)
-		}
+		// If BanTime is nil or 0, use a default ban time (e.g., 24 hours)
+		expirationTime = time.Now().Add(24 * time.Hour)
 
-		// If BanTime is 0, use a default ban time (e.g., 24 hours)
-		if *c.BanTime == 0 {
-			expirationTime = time.Now().Add(24 * time.Hour)
+		if c.Absolute != nil && *c.Absolute {
+			if c.BanTime == nil {
+				return nil, &bsvjson.RPCError{
+					Code:    bsvjson.ErrRPCInvalidParameter,
+					Message: "BanTime is required when absolute is true",
+				}
+			}
+			expirationTime = time.Unix(*c.BanTime, 0)
+		} else if c.BanTime != nil && *c.BanTime != 0 {
+			expirationTime = time.Now().Add(time.Duration(*c.BanTime) * time.Second)
 		}
 
 		expirationTimeInt64 := expirationTime.Unix()
@@ -2302,7 +2306,7 @@ func handleSetBan(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan s
 			})
 
 			if err != nil {
-				s.logger.Errorf("Error while trying to ban legacy peer: %v", err)
+				s.logger.Warnf("Error while trying to ban legacy peer: %v", err)
 
 				if !success {
 					return nil, &bsvjson.RPCError{
