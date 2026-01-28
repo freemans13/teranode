@@ -33,6 +33,34 @@ type resultItem struct {
 	err   error
 }
 
+// isLocalError checks if an error is a local resource error (not peer-related).
+// Local errors include context cancellation, semaphore exhaustion, and storage errors
+// that are caused by local resource constraints rather than peer failures.
+// These errors should not trigger peer failover since trying another peer won't help.
+func isLocalError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for context cancellation (includes semaphore wait timeouts)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	// Check for our custom context canceled error type
+	if errors.Is(err, errors.ErrContextCanceled) {
+		return true
+	}
+
+	// Check for storage errors that indicate local resource issues
+	if errors.Is(err, errors.ErrStorageError) {
+		// Storage errors during existence checks or local operations are local issues
+		return true
+	}
+
+	return false
+}
+
 // fetchBlocksConcurrently fetches blocks from a peer using a high-performance worker pool architecture.
 // This function implements:
 // 1. Large batch fetching (~100 blocks per HTTP request) for maximum throughput
@@ -551,8 +579,16 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 		if err = u.fetchAndStoreSubtreeData(ctx, block, subtreeHash, subtree, peerID, baseURL); err == nil {
 			return nil // Success
 		}
+		// Check if error is local (not peer-related) - don't retry with other peers
+		if isLocalError(err) {
+			return errors.NewServiceError("[catchup:fetchAndStoreSubtreeAndSubtreeData] Local error fetching subtreeData for %s (not retrying with other peers)", subtreeHash.String(), err)
+		}
 		u.logger.Warnf("[catchup:fetchAndStoreSubtreeAndSubtreeData] Primary peer %s failed to fetch subtreeData for %s: %v, trying alternatives", peerID, subtreeHash.String(), err)
 	} else {
+		// Check if error is local (not peer-related) - don't retry with other peers
+		if isLocalError(err) {
+			return errors.NewServiceError("[catchup:fetchAndStoreSubtreeAndSubtreeData] Local error fetching subtree for %s (not retrying with other peers)", subtreeHash.String(), err)
+		}
 		u.logger.Warnf("[catchup:fetchAndStoreSubtreeAndSubtreeData] Primary peer %s failed to fetch subtree for %s: %v, trying alternatives", peerID, subtreeHash.String(), err)
 	}
 
@@ -580,6 +616,10 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 				if err != nil {
 					u.logger.Debugf("[catchup:fetchAndStoreSubtreeAndSubtreeData] Alternative peer %s failed for subtree %s: %v", altPeerID, subtreeHash.String(), err)
 					lastErr = err
+					// Don't continue trying other peers if it's a local error
+					if isLocalError(err) {
+						return errors.NewServiceError("[catchup:fetchAndStoreSubtreeAndSubtreeData] Local error fetching subtree %s (aborting peer retry)", subtreeHash.String(), err)
+					}
 					continue
 				}
 
@@ -587,6 +627,10 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 				if err = u.fetchAndStoreSubtreeData(ctx, block, subtreeHash, subtree, altPeerID, altBaseURL); err != nil {
 					u.logger.Debugf("[catchup:fetchAndStoreSubtreeAndSubtreeData] Alternative peer %s failed for subtreeData %s: %v", altPeerID, subtreeHash.String(), err)
 					lastErr = err
+					// Don't continue trying other peers if it's a local error
+					if isLocalError(err) {
+						return errors.NewServiceError("[catchup:fetchAndStoreSubtreeAndSubtreeData] Local error fetching subtreeData %s (aborting peer retry)", subtreeHash.String(), err)
+					}
 					continue
 				}
 
