@@ -142,7 +142,7 @@ func TestExtractCoinbaseHeightAndTextScripts(t *testing.T) {
 			script, err := bscript.NewFromHexString(tc.script)
 			require.NoError(t, err)
 
-			height, miner, err := extractCoinbaseHeightAndText(*script)
+			height, miner, err := extractCoinbaseHeightAndText(*script, false)
 			if tc.expectError {
 				require.Error(t, err)
 			} else {
@@ -310,4 +310,97 @@ func TestExtractCoinbaseMinerErrorHandling(t *testing.T) {
 	miner, err := ExtractCoinbaseMiner(tx)
 	require.NoError(t, err)    // Error is suppressed for missing height
 	assert.Equal(t, "", miner) // Should return empty string
+}
+
+// TestExtractCoinbaseMinerRaw tests the raw mode extraction that returns unsanitized miner text
+func TestExtractCoinbaseMinerRaw(t *testing.T) {
+	testCases := []struct {
+		name              string
+		tx                string
+		expectedSanitized string
+		expectedRaw       string
+	}{
+		{
+			name: "block 514587 with binary miner data",
+			// This block has binary data that gets sanitized differently
+			tx:                "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff14031bda07074125205a6ad8648d3b00009de70700ffffffff017777954a000000001976a9144770c259bc03c8dc36b853ed19fbb3514190be2e88ac00000000",
+			expectedSanitized: "A% Zjd;",
+			expectedRaw:       "\aA% Zj\xd8d\x8d;\x00\x00\x9d\xe7\a\x00", // Raw arbitrary text including non-printable chars
+		},
+		{
+			name:              "clean miner tag - both modes should be similar",
+			tx:                "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff18030910002f6d352d6363312fdcce95f3c057431c486ae662ffffffff0a0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac0065cd1d000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88ac00000000",
+			expectedSanitized: "/m5-cc1/",
+			expectedRaw:       "/m5-cc1/\xdc\xce\x95\xf3\xc0WC\x1cHj\xe6b", // Raw includes trailing binary data
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, err := bt.NewTxFromString(tc.tx)
+			require.NoError(t, err)
+
+			// Test sanitized mode (default)
+			sanitized, err := ExtractCoinbaseMinerRaw(tx, false)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedSanitized, sanitized)
+
+			// Test raw mode
+			raw, err := ExtractCoinbaseMinerRaw(tx, true)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedRaw, raw)
+
+			// Verify ExtractCoinbaseMiner (no param) matches sanitized behavior
+			defaultMiner, err := ExtractCoinbaseMiner(tx)
+			require.NoError(t, err)
+			assert.Equal(t, sanitized, defaultMiner)
+		})
+	}
+}
+
+// TestExtractCoinbaseMinerRawPreservesAllBytes verifies raw mode preserves all arbitrary text bytes
+func TestExtractCoinbaseMinerRawPreservesAllBytes(t *testing.T) {
+	testCases := []struct {
+		name   string
+		script string
+	}{
+		{
+			name:   "script with null bytes",
+			script: "03010203/miner/\x00\x00\x00",
+		},
+		{
+			name:   "script with high bytes",
+			script: "03010203/miner/\xff\xfe\xfd",
+		},
+		{
+			name:   "script with control characters",
+			script: "03010203/miner/\x01\x02\x03\x04",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			script, err := bscript.NewFromHexString("03010203" + "2f6d696e65722f" + "00000000") // height + "/miner/" + null bytes
+			require.NoError(t, err)
+
+			// Create a minimal transaction with this script
+			tx := &bt.Tx{
+				Inputs: []*bt.Input{
+					{
+						UnlockingScript: script,
+					},
+				},
+			}
+
+			// Raw mode should return everything after the height
+			raw, err := ExtractCoinbaseMinerRaw(tx, true)
+			require.NoError(t, err)
+			assert.Contains(t, raw, "/miner/")
+
+			// Sanitized mode should filter non-printable chars
+			sanitized, err := ExtractCoinbaseMinerRaw(tx, false)
+			require.NoError(t, err)
+			assert.Equal(t, "/miner/", sanitized)
+		})
+	}
 }

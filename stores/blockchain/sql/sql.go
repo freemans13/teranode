@@ -59,6 +59,8 @@ type SQL struct {
 	cacheTTL time.Duration
 	// chainParams contains the blockchain network parameters (mainnet, testnet, etc.)
 	chainParams *chaincfg.Params
+	// rawMinerTag controls whether miner tags are returned raw (true) or sanitized (false)
+	rawMinerTag bool
 }
 
 // New creates and initializes a new SQL blockchain store instance.
@@ -146,6 +148,7 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 		responseCache: NewGenerationalCache(),
 		cacheTTL:      2 * time.Minute,
 		chainParams:   tSettings.ChainCfgParams,
+		rawMinerTag:   tSettings.BlockChain.RawMinerTag,
 	}
 
 	err = s.insertGenesisTransaction(logger)

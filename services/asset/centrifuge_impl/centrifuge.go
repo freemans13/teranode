@@ -433,7 +433,7 @@ func (c *Centrifuge) _(ctx context.Context, addr string) error {
 						c.logger.Errorf("[Centrifuge] error extracting coinbase height: %s", err)
 					}
 
-					miner, err := util.ExtractCoinbaseMiner(block.CoinbaseTx)
+					miner, err := util.ExtractCoinbaseMinerRaw(block.CoinbaseTx, c.settings.BlockChain.RawMinerTag)
 					if err != nil {
 						c.logger.Errorf("[Centrifuge] error extracting coinbase miner: %s", err)
 					}
