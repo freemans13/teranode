@@ -239,23 +239,28 @@ func (h *BlockHandler) GetLastNInvalidBlocks(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Invalid offset parameter", err).Error())
 	}
 
-	// Validate count is positive
+	// Validate count is positive and within bounds
 	if count <= 0 {
 		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Count must be a positive number").Error())
 	}
+	const maxCount int64 = 1000
+	if count > maxCount {
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Count exceeds maximum allowed value of %d", maxCount).Error())
+	}
 
-	// Validate offset is non-negative
+	// Validate offset is non-negative and within bounds
 	if offset < 0 {
 		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Offset must be a non-negative number").Error())
+	}
+	const maxOffset int64 = 100000
+	if offset > maxOffset {
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Offset exceeds maximum allowed value of %d", maxOffset).Error())
 	}
 
 	ctx := c.Request().Context()
 
 	// Fetch enough blocks to serve the requested page plus one extra to determine if there is a next page.
 	fetchN := offset + count + 1
-	if fetchN < 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("Invalid pagination parameters").Error())
-	}
 
 	// Call the blockchain service to get the invalid blocks
 	blocks, err := h.blockchainClient.GetLastNInvalidBlocks(ctx, fetchN)

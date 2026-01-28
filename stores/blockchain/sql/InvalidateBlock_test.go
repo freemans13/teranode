@@ -15,18 +15,17 @@ import (
 func TestSQLInvalidateBlock(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
-	t.Run("non-existent block returns error", func(t *testing.T) {
+	t.Run("empty - no error (idempotent)", func(t *testing.T) {
 		storeURL, err := url.Parse("sqlitememory:///")
 		require.NoError(t, err)
 
 		s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
 		require.NoError(t, err)
 
-		// InvalidateBlock should return an error when the block doesn't exist
+		// InvalidateBlock should be idempotent - returns success even if block doesn't exist
 		hashes, err := s.InvalidateBlock(context.Background(), block2.Hash())
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "does not exist")
-		require.Nil(t, hashes)
+		require.NoError(t, err)
+		require.Empty(t, hashes)
 	})
 
 	t.Run("Block invalidated", func(t *testing.T) {
