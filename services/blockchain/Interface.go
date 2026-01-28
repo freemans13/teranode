@@ -627,6 +627,21 @@ type ClientI interface {
 	// - Error if the retrieval fails
 	GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, error)
 
+	// GetPendingBlocksCount returns the count of blocks not marked as mined,
+	// regardless of subtrees_set status.
+	//
+	// This method is used by WaitForPendingBlocks to wait for all blocks before
+	// loading unmined transactions. Unlike GetBlocksMinedNotSet, it does not filter
+	// by subtrees_set=true and only returns a count for efficiency.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	//
+	// Returns:
+	// - Count of blocks not marked as mined
+	// - Error if the retrieval fails
+	GetPendingBlocksCount(ctx context.Context) (int, error)
+
 	// SetBlockSubtreesSet marks a block as having its subtrees set
 	//
 	// This method updates the blockchain database to indicate that the subtree hash structure

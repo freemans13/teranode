@@ -136,6 +136,10 @@ service BlockchainAPI {
   // GetBlocksMinedNotSet retrieves blocks not marked as mined.
   rpc GetBlocksMinedNotSet(google.protobuf.Empty) returns (GetBlocksMinedNotSetResponse) {}
 
+  // GetPendingBlocksCount returns the count of blocks not marked as mined,
+  // regardless of subtrees_set status. Used by WaitForPendingBlocks.
+  rpc GetPendingBlocksCount(google.protobuf.Empty) returns (GetPendingBlocksCountResponse) {}
+
   // SetBlockSubtreesSet marks a block's subtrees as set.
   rpc SetBlockSubtreesSet(SetBlockSubtreesSetRequest) returns (google.protobuf.Empty) {}
 
@@ -586,6 +590,11 @@ message ClearBlockMinedSetRequest {
 // GetBlocksMinedNotSetResponse contains blocks not marked as mined.
 message GetBlocksMinedNotSetResponse {
   repeated bytes blockBytes = 1;  // List of serialized blocks
+}
+
+// GetPendingBlocksCountResponse contains the count of pending blocks.
+message GetPendingBlocksCountResponse {
+  int32 count = 1;  // Number of blocks with mined_set=false
 }
 
 // SetBlockSubtreesSetRequest marks block subtrees as set.

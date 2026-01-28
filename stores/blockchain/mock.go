@@ -586,6 +586,11 @@ func (m *MockStore) GetBlocksMinedNotSet(_ context.Context) ([]*model.Block, err
 	return []*model.Block{}, nil
 }
 
+// GetPendingBlocksCount returns the count of blocks not marked as mined.
+func (m *MockStore) GetPendingBlocksCount(_ context.Context) (int, error) {
+	return 0, nil
+}
+
 // SetBlockSubtreesSet marks a block's subtrees as processed.
 func (m *MockStore) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	return nil

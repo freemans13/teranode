@@ -2190,6 +2190,24 @@ func (b *Blockchain) GetBlocksMinedNotSet(ctx context.Context, _ *emptypb.Empty)
 	}, nil
 }
 
+// GetPendingBlocksCount returns the count of blocks not marked as mined.
+func (b *Blockchain) GetPendingBlocksCount(ctx context.Context, _ *emptypb.Empty) (*blockchain_api.GetPendingBlocksCountResponse, error) {
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetPendingBlocksCount",
+		tracing.WithParentStat(b.stats),
+		tracing.WithDebugLogMessage(b.logger, "[GetPendingBlocksCount] called"),
+	)
+	defer deferFn()
+
+	count, err := b.store.GetPendingBlocksCount(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &blockchain_api.GetPendingBlocksCountResponse{
+		Count: int32(count),
+	}, nil
+}
+
 // SetBlockPersistedAt marks a block as persisted in blob storage.
 func (b *Blockchain) SetBlockPersistedAt(ctx context.Context, req *blockchain_api.SetBlockPersistedAtRequest) (*emptypb.Empty, error) {
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "SetBlockPersistedAt",

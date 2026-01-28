@@ -749,6 +749,9 @@ func (m *MockBlockchainClient) GetBlockIsMined(ctx context.Context, blockHash *c
 func (m *MockBlockchainClient) GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, error) {
 	return nil, nil
 }
+func (m *MockBlockchainClient) GetPendingBlocksCount(ctx context.Context) (int, error) {
+	return 0, nil
+}
 func (m *MockBlockchainClient) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	return nil
 }
