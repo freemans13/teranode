@@ -1196,14 +1196,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// Wait for reValidationBlock to do its thing
 		// When waitForPreviousBlocksToBeProcessed is done, all the previous blocks will be processed
 		if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
-			// Check if parent block actually needs setTxMined before re-triggering
-			parentIsMined, getErr := u.blockchainClient.GetBlockIsMined(ctx, block.Header.HashPrevBlock)
-			if getErr == nil {
-				if !parentIsMined {
-					// re-trigger the setMinedChan for the parent block
-					u.setMinedChan <- block.Header.HashPrevBlock
-				}
-			}
+			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
+			u.setMinedChan <- block.Header.HashPrevBlock
 
 			if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
 				// Give up, the parent block isn't being fully validated
