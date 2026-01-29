@@ -1442,29 +1442,6 @@ func (c *Client) GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, erro
 	return blocks, nil
 }
 
-// GetPendingBlocksCount returns the count of blocks not marked as mined.
-// This method is used by WaitForPendingBlocks to efficiently check if there are
-// any pending blocks without retrieving full block data.
-//
-// The method returns a count of all blocks with mined_set=false, regardless
-// of their subtrees_set status. This ensures that WaitForPendingBlocks waits
-// for ALL blocks to be processed before loading unmined transactions.
-//
-// Parameters:
-//   - ctx: Context for the operation with timeout and cancellation support
-//
-// Returns:
-//   - int: Count of blocks not marked as mined
-//   - error: Any error encountered during the count operation
-func (c *Client) GetPendingBlocksCount(ctx context.Context) (int, error) {
-	resp, err := c.client.GetPendingBlocksCount(ctx, &emptypb.Empty{})
-	if err != nil {
-		return 0, errors.UnwrapGRPC(err)
-	}
-
-	return int(resp.Count), nil
-}
-
 // SetBlockSubtreesSet marks a block's subtrees as set in the blockchain.
 func (c *Client) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	_, err := c.client.SetBlockSubtreesSet(ctx, &blockchain_api.SetBlockSubtreesSetRequest{

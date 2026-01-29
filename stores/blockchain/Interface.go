@@ -317,13 +317,6 @@ type Store interface {
 	// Returns: Slice of unmined blocks and any error encountered
 	GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, error)
 
-	// GetPendingBlocksCount returns the count of blocks not marked as mined,
-	// regardless of subtrees_set status. Used by WaitForPendingBlocks.
-	// Parameters:
-	//   - ctx: Context for the operation
-	// Returns: Count of pending blocks and any error encountered
-	GetPendingBlocksCount(ctx context.Context) (int, error)
-
 	// SetBlockSubtreesSet marks a block's subtrees as processed.
 	// Parameters:
 	//   - ctx: Context for the operation

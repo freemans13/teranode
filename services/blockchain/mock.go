@@ -409,16 +409,6 @@ func (m *Mock) GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, error)
 	return args.Get(0).([]*model.Block), args.Error(1)
 }
 
-func (m *Mock) GetPendingBlocksCount(ctx context.Context) (int, error) {
-	args := m.Called(ctx)
-
-	if args.Error(1) != nil {
-		return 0, args.Error(1)
-	}
-
-	return args.Int(0), args.Error(1)
-}
-
 func (m *Mock) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	args := m.Called(ctx, blockHash)
 	return args.Error(0)
@@ -914,7 +904,6 @@ type mockBlockClient struct {
 	responseSetBlockMinedSet                     *emptypb.Empty
 	lastSetBlockMinedSetReq                      *blockchain_api.SetBlockMinedSetRequest
 	responseGetBlocksMinedNotSet                 *blockchain_api.GetBlocksMinedNotSetResponse
-	responseGetPendingBlocksCount                *blockchain_api.GetPendingBlocksCountResponse
 	responseSetBlockProcessedAt                  *emptypb.Empty
 	lastSetBlockProcessedAtReq                   *blockchain_api.SetBlockProcessedAtRequest
 	responseSetBlockSubtreesSet                  *emptypb.Empty
@@ -1228,14 +1217,6 @@ func (m *mockBlockClient) GetBlocksMinedNotSet(
 	opts ...grpc.CallOption,
 ) (*blockchain_api.GetBlocksMinedNotSetResponse, error) {
 	return m.responseGetBlocksMinedNotSet, m.err
-}
-
-func (m *mockBlockClient) GetPendingBlocksCount(
-	ctx context.Context,
-	in *emptypb.Empty,
-	opts ...grpc.CallOption,
-) (*blockchain_api.GetPendingBlocksCountResponse, error) {
-	return m.responseGetPendingBlocksCount, m.err
 }
 
 func (m *mockBlockClient) SetBlockProcessedAt(

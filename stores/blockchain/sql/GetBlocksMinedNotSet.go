@@ -40,9 +40,7 @@ import (
 // that will never be fully processed. This is used by:
 //   - BlockValidation's periodic job to process blocks needing mined status updates
 //   - BlockValidation.isParentMined() to check if parent blocks are ready
-//
-// Note: For waiting for all blocks (including those with subtrees not set), use
-// GetPendingBlocksCount instead. This method only returns blocks with subtrees_set=true.
+//   - SubtreeProcessor.WaitForPendingBlocks() to wait for all blocks to be processed
 //
 // The query is ordered by height to process blocks in chronological order.
 //

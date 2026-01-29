@@ -394,10 +394,6 @@ func (c *LocalClient) GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block,
 	return c.store.GetBlocksMinedNotSet(ctx)
 }
 
-func (c *LocalClient) GetPendingBlocksCount(ctx context.Context) (int, error) {
-	return c.store.GetPendingBlocksCount(ctx)
-}
-
 func (c *LocalClient) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	return c.store.SetBlockSubtreesSet(ctx, blockHash)
 }

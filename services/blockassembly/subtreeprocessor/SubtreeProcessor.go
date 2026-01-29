@@ -3218,16 +3218,12 @@ func (stp *SubtreeProcessor) waitForBlockBeingMined(ctx context.Context, blockHa
 
 // WaitForPendingBlocks waits for any pending blocks to be processed before loading unmined transactions.
 // This method continuously polls the blockchain client to check if there are any blocks that have not been
-// marked as mined yet. It will wait until GetPendingBlocksCount returns 0, indicating that all blocks have
-// been processed and marked as mined.
+// marked as mined yet. It will wait until GetBlocksMinedNotSet returns an empty list, indicating that all
+// blocks have been processed and marked as mined.
 //
 // The method implements a polling loop with exponential backoff and includes logging to provide visibility
 // into the waiting process. This ensures that the BlockAssembly service doesn't start loading unmined
 // transactions until all pending blocks have been fully processed.
-//
-// The method uses GetPendingBlocksCount (not GetBlocksMinedNotSet) to count ALL blocks with mined_set=false,
-// regardless of subtrees_set status. This ensures it waits for blocks still processing subtrees, preventing
-// race conditions where unmined transactions might be loaded before all blocks are fully processed.
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout support
@@ -3243,20 +3239,22 @@ func (stp *SubtreeProcessor) WaitForPendingBlocks(ctx context.Context) error {
 
 	// Use retry utility with infinite retries until no pending blocks remain
 	_, err := retry.Retry(ctx, stp.logger, func() (interface{}, error) {
-		pendingCount, err := stp.blockchainClient.GetPendingBlocksCount(ctx)
+		blockNotMined, err := stp.blockchainClient.GetBlocksMinedNotSet(ctx)
 		if err != nil {
-			return nil, errors.NewProcessingError("error getting pending blocks count", err)
+			return nil, errors.NewProcessingError("error getting blocks with mined not set", err)
 		}
 
-		if pendingCount == 0 {
+		if len(blockNotMined) == 0 {
 			stp.logger.Infof("[WaitForPendingBlocks] no pending blocks found, ready to load unmined transactions")
 			return nil, nil
 		}
 
-		stp.logger.Debugf("[WaitForPendingBlocks] waiting for %d blocks to be processed", pendingCount)
+		for _, block := range blockNotMined {
+			stp.logger.Debugf("[WaitForPendingBlocks] waiting for block %s to be processed, height %d, ID %d", block.Hash(), block.Height, block.ID)
+		}
 
 		// Return an error to trigger retry when blocks are still pending
-		return nil, errors.NewProcessingError("waiting for %d blocks to be processed", pendingCount)
+		return nil, errors.NewProcessingError("waiting for %d blocks to be processed", len(blockNotMined))
 	},
 		retry.WithMessage("[WaitForPendingBlocks] blockchain service check"),
 		retry.WithInfiniteRetry(),
