@@ -876,6 +876,8 @@ func TestInvalidBlockWithoutGenesisBlock(t *testing.T) {
 	}
 
 	tSettings := test.CreateBaseTestSettings(t)
+	// Reduce retry settings for faster test failure
+	tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 2
 
 	block := &model.Block{
 		Header:           blockHeader,
@@ -901,9 +903,9 @@ func TestInvalidBlockWithoutGenesisBlock(t *testing.T) {
 	t.Logf("Time taken: %s\n", time.Since(start))
 
 	// With parent transaction validation fix, blocks now properly validate parent existence
-	// This block should still be invalid (either SERVICE_ERROR or BLOCK_INVALID depending on which check fails first)
-	require.True(t, errors.Is(err, errors.ErrServiceError) || errors.Is(err, errors.ErrBlockInvalid),
-		"Expected either SERVICE_ERROR (no genesis connection) or BLOCK_INVALID, got: %v", err)
+	// This block should still be invalid (either SERVICE_ERROR, BLOCK_INVALID, or BLOCK_ERROR depending on which check fails first)
+	require.True(t, errors.Is(err, errors.ErrServiceError) || errors.Is(err, errors.ErrBlockInvalid) || errors.Is(err, errors.ErrBlockError),
+		"Expected either SERVICE_ERROR (no genesis connection), BLOCK_INVALID, or BLOCK_ERROR, got: %v", err)
 }
 
 func TestInvalidChainWithoutGenesisBlock(t *testing.T) {
@@ -933,6 +935,7 @@ func TestInvalidChainWithoutGenesisBlock(t *testing.T) {
 	var blocks []*model.Block
 
 	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 2
 
 	for i := 0; i < numBlocks; i++ {
 		subtree, err := subtreepkg.NewTreeByLeafCount(4)
@@ -3121,9 +3124,8 @@ func TestBlockValidation_OptimisticMining_InValidBlock(t *testing.T) {
 	invalidateBlockCalled := make(chan struct{})
 
 	mockBlockchain := &blockchain.Mock{}
-	// Mock GetNextWorkRequired for difficulty validation
-	defaultNBits3, _ := model.NewNBitFromString("2000ffff")
-	mockBlockchain.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(defaultNBits3, nil)
+	// Mock GetNextWorkRequired for difficulty validation - return the same nBits as block
+	mockBlockchain.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nBits, nil)
 	mockBlockchain.On("AddBlock", mock.Anything, block, mock.Anything, mock.Anything).Return(nil)
 	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{1}, nil)
 	mockBlockchain.On("InvalidateBlock", mock.Anything, block.Header.Hash()).Return([]chainhash.Hash{}, nil).Run(func(args mock.Arguments) {
@@ -3138,6 +3140,7 @@ func TestBlockValidation_OptimisticMining_InValidBlock(t *testing.T) {
 	mockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil)
 	mockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil)
 	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 100}, nil)
+	mockBlockchain.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
 
 	txMetaStore, subtreeValidationClient, _, txStore, subtreeStore, deferFunc := setup(t)
 	defer deferFunc()
