@@ -136,6 +136,10 @@ service BlockchainAPI {
   // GetBlocksMinedNotSet retrieves blocks not marked as mined.
   rpc GetBlocksMinedNotSet(google.protobuf.Empty) returns (GetBlocksMinedNotSetResponse) {}
 
+  // GetPendingBlocksCount returns the count of blocks not marked as mined,
+  // regardless of subtrees_set status. Used by WaitForPendingBlocks.
+  rpc GetPendingBlocksCount(google.protobuf.Empty) returns (GetPendingBlocksCountResponse) {}
+
   // SetBlockSubtreesSet marks a block's subtrees as set.
   rpc SetBlockSubtreesSet(SetBlockSubtreesSetRequest) returns (google.protobuf.Empty) {}
 
@@ -588,6 +592,11 @@ message GetBlocksMinedNotSetResponse {
   repeated bytes blockBytes = 1;  // List of serialized blocks
 }
 
+// GetPendingBlocksCountResponse contains the count of pending blocks.
+message GetPendingBlocksCountResponse {
+  int32 count = 1;  // Number of blocks with mined_set=false
+}
+
 // SetBlockSubtreesSetRequest marks block subtrees as set.
 message SetBlockSubtreesSetRequest {
   bytes blockHash = 1;  // Block hash
@@ -697,19 +706,13 @@ message GetBlocksNotPersistedResponse {
 }
 
 // Blob deletion scheduling messages
-
-enum BlobStoreType {
-  TXSTORE = 0;
-  SUBTREESTORE = 1;
-  BLOCKSTORE = 2;
-  TEMPSTORE = 3;
-  BLOCKPERSISTERSTORE = 4;
-}
+// Note: store_type values map to storetypes.BlobStoreType:
+// 0=TXSTORE, 1=SUBTREESTORE, 2=BLOCKSTORE, 3=TEMPSTORE, 4=BLOCKPERSISTERSTORE
 
 message ScheduleBlobDeletionRequest {
   bytes blob_key = 1;
   string file_type = 2;
-  BlobStoreType store_type = 3;
+  int32 store_type = 3;
   uint32 delete_at_height = 4;
 }
 
@@ -722,7 +725,7 @@ message ScheduleBlobDeletionResponse {
 message CancelBlobDeletionRequest {
   bytes blob_key = 1;
   string file_type = 2;
-  BlobStoreType store_type = 3;
+  int32 store_type = 3;
   string cancel_reason = 4;
 }
 
@@ -734,7 +737,7 @@ message CancelBlobDeletionResponse {
 message ListScheduledDeletionsRequest {
   uint32 min_height = 1;
   uint32 max_height = 2;
-  BlobStoreType store_type = 3;
+  int32 store_type = 3;
   int32 limit = 4;
   int32 offset = 5;
   bool filter_by_store = 6;
@@ -744,7 +747,7 @@ message ScheduledDeletion {
   int64 id = 1;
   bytes blob_key = 2;
   string file_type = 3;
-  BlobStoreType store_type = 4;
+  int32 store_type = 4;
   uint32 delete_at_height = 5;
   uint32 retry_count = 6;
 }

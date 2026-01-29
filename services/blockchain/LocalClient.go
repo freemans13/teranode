@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -393,6 +394,10 @@ func (c *LocalClient) GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block,
 	return c.store.GetBlocksMinedNotSet(ctx)
 }
 
+func (c *LocalClient) GetPendingBlocksCount(ctx context.Context) (int, error) {
+	return c.store.GetPendingBlocksCount(ctx)
+}
+
 func (c *LocalClient) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	return c.store.SetBlockSubtreesSet(ctx, blockHash)
 }
@@ -536,8 +541,18 @@ func (c *LocalClient) GetBestHeightAndTime(ctx context.Context) (uint32, uint32,
 // Blob deletion methods - LocalClient implementations
 
 // ScheduleBlobDeletion schedules a blob for deletion at a specific block height.
-func (c *LocalClient) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
+func (c *LocalClient) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
 	return 0, false, errors.NewProcessingError("not implemented")
+}
+
+// CancelBlobDeletion cancels a previously scheduled blob deletion.
+func (c *LocalClient) CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType) (bool, error) {
+	return false, errors.NewProcessingError("not implemented")
+}
+
+// ListScheduledDeletions lists scheduled blob deletions with optional filtering.
+func (c *LocalClient) ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType storetypes.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error) {
+	return nil, 0, errors.NewProcessingError("not implemented")
 }
 
 // GetPendingBlobDeletions retrieves blob deletions ready for processing at a specific height.

@@ -631,6 +631,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		mockBlockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
@@ -655,6 +656,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 		stp.Start(ctx)
@@ -703,6 +705,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 		stp.Start(ctx)
@@ -737,6 +740,10 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
+		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
+		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+		mockBlockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
@@ -785,6 +792,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
 		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+		mockBlockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
@@ -902,6 +910,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
 		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+		mockBlockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
@@ -1131,6 +1140,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
 		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+		mockBlockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)

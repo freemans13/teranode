@@ -20,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -1441,6 +1442,29 @@ func (c *Client) GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, erro
 	return blocks, nil
 }
 
+// GetPendingBlocksCount returns the count of blocks not marked as mined.
+// This method is used by WaitForPendingBlocks to efficiently check if there are
+// any pending blocks without retrieving full block data.
+//
+// The method returns a count of all blocks with mined_set=false, regardless
+// of their subtrees_set status. This ensures that WaitForPendingBlocks waits
+// for ALL blocks to be processed before loading unmined transactions.
+//
+// Parameters:
+//   - ctx: Context for the operation with timeout and cancellation support
+//
+// Returns:
+//   - int: Count of blocks not marked as mined
+//   - error: Any error encountered during the count operation
+func (c *Client) GetPendingBlocksCount(ctx context.Context) (int, error) {
+	resp, err := c.client.GetPendingBlocksCount(ctx, &emptypb.Empty{})
+	if err != nil {
+		return 0, errors.UnwrapGRPC(err)
+	}
+
+	return int(resp.Count), nil
+}
+
 // SetBlockSubtreesSet marks a block's subtrees as set in the blockchain.
 func (c *Client) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
 	_, err := c.client.SetBlockSubtreesSet(ctx, &blockchain_api.SetBlockSubtreesSetRequest{
@@ -2143,11 +2167,11 @@ func (c *Client) GetBlocksNotPersisted(ctx context.Context, limit int) ([]*model
 }
 
 // ScheduleBlobDeletion schedules a blob for deletion at a specific block height.
-func (c *Client) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
+func (c *Client) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
 	resp, err := c.client.ScheduleBlobDeletion(ctx, &blockchain_api.ScheduleBlobDeletionRequest{
 		BlobKey:        blobKey,
 		FileType:       fileType,
-		StoreType:      storeType,
+		StoreType:      int32(storeType),
 		DeleteAtHeight: deleteAtHeight,
 	})
 	if err != nil {
@@ -2155,6 +2179,37 @@ func (c *Client) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileT
 	}
 
 	return resp.DeletionId, resp.Scheduled, nil
+}
+
+// CancelBlobDeletion cancels a previously scheduled blob deletion.
+func (c *Client) CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType) (bool, error) {
+	resp, err := c.client.CancelBlobDeletion(ctx, &blockchain_api.CancelBlobDeletionRequest{
+		BlobKey:   blobKey,
+		FileType:  fileType,
+		StoreType: int32(storeType),
+	})
+	if err != nil {
+		return false, errors.UnwrapGRPC(err)
+	}
+
+	return resp.Cancelled, nil
+}
+
+// ListScheduledDeletions lists scheduled blob deletions with optional filtering.
+func (c *Client) ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType storetypes.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error) {
+	resp, err := c.client.ListScheduledDeletions(ctx, &blockchain_api.ListScheduledDeletionsRequest{
+		MinHeight:     minHeight,
+		MaxHeight:     maxHeight,
+		StoreType:     int32(storeType),
+		FilterByStore: filterByStore,
+		Limit:         int32(limit),
+		Offset:        int32(offset),
+	})
+	if err != nil {
+		return nil, 0, errors.UnwrapGRPC(err)
+	}
+
+	return resp.Deletions, int(resp.TotalCount), nil
 }
 
 // GetPendingBlobDeletions retrieves blob deletions ready for processing at a specific height.

@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 )
 
@@ -627,6 +628,21 @@ type ClientI interface {
 	// - Error if the retrieval fails
 	GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, error)
 
+	// GetPendingBlocksCount returns the count of blocks not marked as mined,
+	// regardless of subtrees_set status.
+	//
+	// This method is used by WaitForPendingBlocks to wait for all blocks before
+	// loading unmined transactions. Unlike GetBlocksMinedNotSet, it does not filter
+	// by subtrees_set=true and only returns a count for efficiency.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	//
+	// Returns:
+	// - Count of blocks not marked as mined
+	// - Error if the retrieval fails
+	GetPendingBlocksCount(ctx context.Context) (int, error)
+
 	// SetBlockSubtreesSet marks a block as having its subtrees set
 	//
 	// This method updates the blockchain database to indicate that the subtree hash structure
@@ -985,7 +1001,37 @@ type ClientI interface {
 	// Returns:
 	// - Deletion ID and success status
 	// - Error if scheduling fails
-	ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error)
+	ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType, deleteAtHeight uint32) (int64, bool, error)
+
+	// CancelBlobDeletion cancels a previously scheduled blob deletion.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - blobKey: The key of the blob
+	// - fileType: The file type of the blob
+	// - storeType: The type of blob store
+	//
+	// Returns:
+	// - cancelled: True if the deletion was found and cancelled
+	// - Error if cancellation fails
+	CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType) (bool, error)
+
+	// ListScheduledDeletions lists scheduled blob deletions with optional filtering.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - minHeight: Minimum delete-at height (0 = no minimum)
+	// - maxHeight: Maximum delete-at height (0 = no maximum)
+	// - storeType: Filter by store type (only applied if filterByStore is true)
+	// - filterByStore: Whether to filter by store type
+	// - limit: Maximum number of results (0 = default)
+	// - offset: Number of results to skip
+	//
+	// Returns:
+	// - Array of scheduled deletions
+	// - Total count of matching deletions
+	// - Error if query fails
+	ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType storetypes.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error)
 
 	// GetPendingBlobDeletions retrieves blob deletions ready for processing at a specific height.
 	//

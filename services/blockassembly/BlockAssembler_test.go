@@ -172,6 +172,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		blockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		// Mock GetFSMCurrentState for parent preservation logic in Start()
 		runningState := blockchain.FSMStateRUNNING
@@ -213,6 +214,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		blockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
 		// Send initial notification to mimic real blockchain service behavior
@@ -272,6 +274,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		blockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 		nextBits := model.NBit{0xff, 0xff, 0x7f, 0x20}
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, bestBlockHeader.Hash(), mock.Anything).Return(&nextBits, nil)
 		subChan := make(chan *blockchain_api.Notification, 1)
@@ -320,6 +323,7 @@ func TestBlockAssembly_Start(t *testing.T) {
 		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
 		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		blockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
 		subChan := make(chan *blockchain_api.Notification, 1)
 		// Send initial notification to mimic real blockchain service behavior

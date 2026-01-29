@@ -1856,6 +1856,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		blockchainClient := &blockchain.Mock{}
 		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		blockchainClient.On("GetPendingBlocksCount", mock.Anything).Return(0, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
