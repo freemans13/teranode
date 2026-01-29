@@ -135,6 +135,67 @@ type MockSubtreeValidationClient struct {
 	server *subtreevalidation.Server
 }
 
+type trackingBlockchainClient struct {
+	blockchain.ClientI
+	invalidateOnce   sync.Once
+	invalidateCalled chan struct{}
+	notificationCh   chan *blockchain_api.Notification
+	setMinedOnce     sync.Once
+	setMinedCalled   chan struct{}
+}
+
+func newTrackingBlockchainClient(client blockchain.ClientI) *trackingBlockchainClient {
+	return &trackingBlockchainClient{
+		ClientI:          client,
+		invalidateCalled: make(chan struct{}),
+	}
+}
+
+func (t *trackingBlockchainClient) withNotificationChannel() *trackingBlockchainClient {
+	if t.notificationCh == nil {
+		t.notificationCh = make(chan *blockchain_api.Notification, 1)
+	}
+	return t
+}
+
+func (t *trackingBlockchainClient) subscriptionChannel() chan *blockchain_api.Notification {
+	if t.notificationCh == nil {
+		t.notificationCh = make(chan *blockchain_api.Notification, 1)
+	}
+	return t.notificationCh
+}
+
+func (t *trackingBlockchainClient) withSetMinedTracking() *trackingBlockchainClient {
+	if t.setMinedCalled == nil {
+		t.setMinedCalled = make(chan struct{})
+	}
+	return t
+}
+
+func (t *trackingBlockchainClient) InvalidateBlock(ctx context.Context, hash *chainhash.Hash) ([]chainhash.Hash, error) {
+	hashes, err := t.ClientI.InvalidateBlock(ctx, hash)
+	t.invalidateOnce.Do(func() {
+		close(t.invalidateCalled)
+	})
+	return hashes, err
+}
+
+func (t *trackingBlockchainClient) Subscribe(ctx context.Context, tag string) (chan *blockchain_api.Notification, error) {
+	if t.notificationCh != nil {
+		return t.notificationCh, nil
+	}
+	return t.ClientI.Subscribe(ctx, tag)
+}
+
+func (t *trackingBlockchainClient) SetBlockMinedSet(ctx context.Context, hash *chainhash.Hash) error {
+	if t.setMinedCalled != nil {
+		t.setMinedOnce.Do(func() {
+			close(t.setMinedCalled)
+		})
+	}
+	return t.ClientI.SetBlockMinedSet(ctx, hash)
+}
+
 func (m *MockSubtreeValidationClient) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	return 0, "MockValidator", nil
 }
@@ -331,7 +392,7 @@ func TestBlockValidationValidateBlockSmall(t *testing.T) {
 		httpmock.NewBytesResponder(200, subtreeDataBytes),
 	)
 
-	nBits, _ := model.NewNBitFromString("2000ffff")
+	nBits, _ := model.NewNBitFromString("207fffff")
 
 	coinbase, err := bt.NewTxFromString(model.CoinbaseHex)
 	require.NoError(t, err)
@@ -546,7 +607,7 @@ func TestBlockValidationShouldNotAllowDuplicateCoinbasePlaceholder(t *testing.T)
 	utxoStore, subtreeValidationClient, blockchainClient, txStore, subtreeStore, deferFunc := setup(t)
 	defer deferFunc()
 
-	nBits, _ := model.NewNBitFromString("2000ffff")
+	nBits, _ := model.NewNBitFromString("207fffff")
 	hashPrevBlock, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
 
 	coinbase, err := bt.NewTxFromString(model.CoinbaseHex)
@@ -634,7 +695,7 @@ func TestBlockValidationShouldNotAllowDuplicateCoinbaseTx(t *testing.T) {
 	utxoStore, subtreeValidationClient, _, txStore, subtreeStore, deferFunc := setup(t)
 	defer deferFunc()
 
-	nBits, _ := model.NewNBitFromString("2000ffff")
+	nBits, _ := model.NewNBitFromString("207fffff")
 	hashPrevBlock, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
 
 	coinbase, err := bt.NewTxFromString(model.CoinbaseHex)
@@ -3030,7 +3091,7 @@ func TestBlockValidation_OptimisticMining_InValidBlock(t *testing.T) {
 
 	httpmock.RegisterResponder("GET", `=~^/subtree/[a-z0-9]+\z`, httpmock.NewBytesResponder(200, nodeBytes))
 
-	nBits, _ := model.NewNBitFromString("2000ffff")
+	nBits, _ := model.NewNBitFromString("207fffff")
 	blockHeader := &model.BlockHeader{
 		Version:        1,
 		HashPrevBlock:  tSettings.ChainCfgParams.GenesisHash,
@@ -3057,7 +3118,6 @@ func TestBlockValidation_OptimisticMining_InValidBlock(t *testing.T) {
 		100, 0,
 	)
 
-	// Create a channel to signal when InvalidateBlock is called
 	invalidateBlockCalled := make(chan struct{})
 
 	mockBlockchain := &blockchain.Mock{}
@@ -3346,21 +3406,13 @@ func TestBlockValidation_BlockchainSubscription_TriggersSetMined(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	utxoStore, subtreeValidationClient, _, txStore, subtreeStore, deferFunc := setup(t)
+	utxoStore, subtreeValidationClient, blockchainClient, txStore, subtreeStore, deferFunc := setup(t)
 	defer deferFunc()
 
 	tSettings := test.CreateBaseTestSettings(t)
 
-	mockBlockchain := &blockchain.Mock{}
-	// Mock GetNextWorkRequired for difficulty validation (in case it's called)
-	defaultNBits4, _ := model.NewNBitFromString("2000ffff")
-	mockBlockchain.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(defaultNBits4, nil).Maybe()
-
-	notificationCh := make(chan *blockchain_api.Notification, 1)
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationCh, nil)
-	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{1}, nil)
-	mockBlockchain.On("SetBlockMinedSet", mock.Anything, mock.Anything).Return(nil)
-	mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+	tracker := newTrackingBlockchainClient(blockchainClient).withNotificationChannel()
+	notificationCh := tracker.subscriptionChannel()
 
 	privateKey, _ := bec.NewPrivateKey()
 	address, _ := bscript.NewAddressFromPublicKey(privateKey.PubKey(), true)
@@ -3415,7 +3467,7 @@ func TestBlockValidation_BlockchainSubscription_TriggersSetMined(t *testing.T) {
 	replicatedSubtree.ReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, uint64(coinbaseTx.Size())) //nolint:gosec
 	calculatedMerkleRootHash := replicatedSubtree.RootHash()
 
-	nBits, _ := model.NewNBitFromString("2000ffff")
+	nBits, _ := model.NewNBitFromString("207fffff")
 	blockHeader := &model.BlockHeader{
 		Version:        1,
 		HashPrevBlock:  tSettings.ChainCfgParams.GenesisHash,
@@ -3444,18 +3496,7 @@ func TestBlockValidation_BlockchainSubscription_TriggersSetMined(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	mockBlockchain.ExpectedCalls = nil
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationCh, nil)
-	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{1}, nil)
-	mockBlockchain.On("SetBlockMinedSet", mock.Anything, mock.Anything).Return(nil)
-	mockBlockchain.On("GetBlock", mock.Anything, mock.Anything).Return(block, nil)
-	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-	mockBlockchain.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{}, nil)
-	mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
-
-	blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
+	blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, tracker, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
 	err = blockValidation.ValidateBlock(context.Background(), block, "test")
 	require.NoError(t, err, "Block should be valid")
 
@@ -3463,7 +3504,7 @@ func TestBlockValidation_BlockchainSubscription_TriggersSetMined(t *testing.T) {
 
 	// Simulate receiving a blockchain notification
 	notificationCh <- &blockchain_api.Notification{
-		Type: model.NotificationType_Block,
+		Type: model.NotificationType_BlockSubtreesSet,
 		Hash: blockHash[:],
 	}
 
@@ -3477,6 +3518,10 @@ func TestBlockValidation_InvalidBlock_PublishesToKafka(t *testing.T) {
 	initPrometheusMetrics()
 
 	tSettings := test.CreateBaseTestSettings(t)
+	blockChainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+	blockchainClient, err := blockchain.NewLocalClient(ulogger.TestLogger{}, tSettings, blockChainStore, nil, nil)
+	require.NoError(t, err)
 
 	// Duplicate Transaction Setup
 	privateKey, _ := bec.NewPrivateKey()
@@ -3553,23 +3598,6 @@ func TestBlockValidation_InvalidBlock_PublishesToKafka(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	// Mock Blockchain and Kafka
-	mockBlockchain := &blockchain.Mock{}
-	// Mock GetNextWorkRequired for difficulty validation
-	defaultNBits5, _ := model.NewNBitFromString("2000ffff")
-	mockBlockchain.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(defaultNBits5, nil)
-	mockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-	mockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil)
-	mockBlockchain.On("InvalidateBlock", mock.Anything, block.Header.Hash()).Return([]chainhash.Hash{}, nil)
-	mockBlockchain.On("AddBlock", mock.Anything, block, mock.Anything, mock.Anything).Return(nil)
-	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{1}, nil)
-	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	subChan := make(chan *blockchain_api.Notification, 1)
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(subChan, nil)
-	mockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil)
-	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 100}, nil)
-
 	// Use our thread-safe mock
 	mockKafka := &SafeMockKafkaProducer{}
 	mockKafka.On("Publish", mock.MatchedBy(func(msg *kafka.Message) bool {
@@ -3580,7 +3608,7 @@ func TestBlockValidation_InvalidBlock_PublishesToKafka(t *testing.T) {
 	bv := &BlockValidation{
 		logger:                        ulogger.TestLogger{},
 		settings:                      tSettings,
-		blockchainClient:              mockBlockchain,
+		blockchainClient:              blockchainClient,
 		subtreeStore:                  subtreeStore,
 		txStore:                       txStore,
 		utxoStore:                     txMetaStore,
