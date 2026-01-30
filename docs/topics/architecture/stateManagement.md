@@ -217,7 +217,7 @@ Allowed Operations in Catching Blocks State:
 - ✅ Process external transactions
 - ✅ Legacy relay transactions
 - ✅ Queue subtrees
-- ✅ Process subtrees
+- ❌ Process subtrees
 - ✅ Queue blocks
 - ✅ Process blocks
 - ✅ Relay blocks
