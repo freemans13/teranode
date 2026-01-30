@@ -351,6 +351,14 @@ func (b *Blockchain) Init(ctx context.Context) error {
 	if b.localTestStartState != "" {
 		b.finiteStateMachine.SetState(b.localTestStartState)
 
+		// If starting in LAUNCHING state (test mode), auto-transition to RUNNING
+		// This simulates what happens in production after sync check passes
+		if b.localTestStartState == blockchain_api.FSMStateType_LAUNCHING.String() {
+			if err := b.finiteStateMachine.Event(ctx, blockchain_api.FSMEventType_RUN.String()); err != nil {
+				b.logger.Errorf("[Blockchain][Init] Error transitioning from LAUNCHING to RUNNING: %v", err)
+			}
+		}
+
 		err := b.store.SetFSMState(ctx, b.finiteStateMachine.Current())
 		if err != nil {
 			b.logger.Errorf("[Blockchain][Init] Error setting FSM state in blockchain store: %v", err)
