@@ -849,6 +849,21 @@ type ClientI interface {
 	// - Error if the readiness check fails
 	IsFullyReady(ctx context.Context) (bool, error)
 
+	// Launch initiates the node startup with sync check.
+	//
+	// This method transitions the FSM from IDLE to LAUNCHING state, which allows
+	// block validation to perform a sync check before transitioning to RUNNING or
+	// CATCHINGBLOCKS state. This prevents subtree validation from processing messages
+	// with the wrong block height context during catchup.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - source: Identifier for the source requesting the launch
+	//
+	// Returns:
+	// - Error if the launch fails
+	Launch(ctx context.Context, source string) error
+
 	// Run initiates the normal operation of the blockchain service.
 	//
 	// This method starts the blockchain service in its standard operational mode,

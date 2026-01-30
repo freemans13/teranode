@@ -75,9 +75,12 @@ func (h *FSMHandler) GetFSMEvents(c echo.Context) error {
 	switch *state {
 	case blockchain_api.FSMStateType_IDLE:
 		events = []string{
-			blockchain_api.FSMEventType_RUN.String(),
+			blockchain_api.FSMEventType_LAUNCH.String(), // Primary - safe startup with sync check
 			blockchain_api.FSMEventType_LEGACYSYNC.String(),
 		}
+		// NOTE: RUN is NOT available from IDLE - must use LAUNCH
+	case blockchain_api.FSMStateType_LAUNCHING:
+		events = []string{} // No manual events - auto-transitions only
 	case blockchain_api.FSMStateType_RUNNING:
 		events = []string{
 			blockchain_api.FSMEventType_STOP.String(),

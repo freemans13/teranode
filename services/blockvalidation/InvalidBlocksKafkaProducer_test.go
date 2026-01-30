@@ -393,6 +393,12 @@ func (m *MockBlockchainClient) Run(ctx context.Context, source string) error {
 	return args.Error(0)
 }
 
+// Launch implements the blockchain.ClientI interface
+func (m *MockBlockchainClient) Launch(ctx context.Context, source string) error {
+	args := m.Called(ctx, source)
+	return args.Error(0)
+}
+
 // SendFSMEvent implements the blockchain.ClientI interface
 func (m *MockBlockchainClient) SendFSMEvent(ctx context.Context, event blockchain.FSMEventType) error {
 	args := m.Called(ctx, event)

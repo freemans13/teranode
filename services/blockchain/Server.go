@@ -2586,6 +2586,26 @@ func (b *Blockchain) Idle(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty
 	return &emptypb.Empty{}, nil
 }
 
+// Launch transitions the blockchain service to the LAUNCHING state for initial sync check.
+func (b *Blockchain) Launch(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
+	// check whether the FSM is already in the LAUNCHING state
+	if b.finiteStateMachine.Is(blockchain_api.FSMStateType_LAUNCHING.String()) {
+		return &emptypb.Empty{}, nil
+	}
+
+	req := &blockchain_api.SendFSMEventRequest{
+		Event: blockchain_api.FSMEventType_LAUNCH,
+	}
+
+	_, err := b.SendFSMEvent(ctx, req)
+	if err != nil {
+		// unable to send the event, no need to update the state.
+		return nil, err
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
 // Legacy endpoints
 
 // GetBlockLocator retrieves a block locator for synchronization purposes.

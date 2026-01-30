@@ -13,8 +13,8 @@ import (
 
 // NewFiniteStateMachine creates a new finite state machine for the blockchain service.
 //
-// States: IDLE, RUNNING, CATCHINGBLOCKS, LEGACYSYNCING
-// Events: RUN, CATCHUPBLOCKS, LEGACYSYNC, STOP
+// States: IDLE, RUNNING, CATCHINGBLOCKS, LEGACYSYNCING, LAUNCHING
+// Events: RUN, CATCHUPBLOCKS, LEGACYSYNC, STOP, LAUNCH
 //
 // Automatically sends notifications on state transitions and updates Prometheus metrics.
 func (b *Blockchain) NewFiniteStateMachine(opts ...func(*fsm.FSM)) *fsm.FSM {
@@ -45,10 +45,19 @@ func (b *Blockchain) NewFiniteStateMachine(opts ...func(*fsm.FSM)) *fsm.FSM {
 	finiteStateMachine := fsm.NewFSM(
 		blockchain_api.FSMStateType_IDLE.String(),
 		fsm.Events{
+			// LAUNCH: IDLE -> LAUNCHING (safe startup with sync check)
+			{
+				Name: blockchain_api.FSMEventType_LAUNCH.String(),
+				Src: []string{
+					blockchain_api.FSMStateType_IDLE.String(),
+				},
+				Dst: blockchain_api.FSMStateType_LAUNCHING.String(),
+			},
+			// RUN: only from LAUNCHING, LEGACYSYNCING, or CATCHINGBLOCKS (NOT from IDLE)
 			{
 				Name: blockchain_api.FSMEventType_RUN.String(),
 				Src: []string{
-					blockchain_api.FSMStateType_IDLE.String(),
+					blockchain_api.FSMStateType_LAUNCHING.String(),
 					blockchain_api.FSMStateType_LEGACYSYNCING.String(),
 					blockchain_api.FSMStateType_CATCHINGBLOCKS.String(),
 				},
@@ -61,10 +70,12 @@ func (b *Blockchain) NewFiniteStateMachine(opts ...func(*fsm.FSM)) *fsm.FSM {
 				},
 				Dst: blockchain_api.FSMStateType_LEGACYSYNCING.String(),
 			},
+			// CATCHUPBLOCKS: from RUNNING or LAUNCHING
 			{
 				Name: blockchain_api.FSMEventType_CATCHUPBLOCKS.String(),
 				Src: []string{
 					blockchain_api.FSMStateType_RUNNING.String(),
+					blockchain_api.FSMStateType_LAUNCHING.String(),
 				},
 				Dst: blockchain_api.FSMStateType_CATCHINGBLOCKS.String(),
 			},
@@ -113,6 +124,8 @@ func CheckFSM(blockchainClient ClientI) func(ctx context.Context, checkLiveness 
 		case blockchain_api.FSMStateType_RUNNING:
 			status = http.StatusOK
 		case blockchain_api.FSMStateType_IDLE:
+			status = http.StatusOK
+		case blockchain_api.FSMStateType_LAUNCHING:
 			status = http.StatusOK
 		default:
 			status = http.StatusServiceUnavailable

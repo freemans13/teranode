@@ -362,6 +362,9 @@ export function getFSMEvents(): Promise<ApiResponse<FSMEvent[]>> {
             case 'LEGACYSYNC':
               value = 4
               break
+            case 'LAUNCH':
+              value = 5
+              break
             default:
               // Try to extract a numeric ID from the event name if it exists
               const match = eventName.match(/[_-]?(\d+)$/)

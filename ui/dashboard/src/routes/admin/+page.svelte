@@ -61,14 +61,17 @@
     return error instanceof Error ? error.message : String(error)
   }
 
-  // duplicates the FSM transition logic from the backend (fsm_handler.go 
-  // If the backend state machine changes, the UI will become out of sync. 
+  // duplicates the FSM transition logic from the backend (fsm_handler.go
+  // If the backend state machine changes, the UI will become out of sync.
   function isEventAllowedForState(state: string | undefined, eventName: string): boolean {
     if (!state || !eventName) return false
 
     switch (state) {
       case 'IDLE':
-        return eventName === 'RUN' || eventName === 'LEGACYSYNC'
+        return eventName === 'LAUNCH' || eventName === 'LEGACYSYNC'
+        // NOTE: RUN is NOT available from IDLE - must use LAUNCH
+      case 'LAUNCHING':
+        return false // No manual events - auto-transitions only
       case 'RUNNING':
         return eventName === 'STOP' || eventName === 'CATCHUPBLOCKS'
       case 'LEGACYSYNCING':
@@ -221,6 +224,7 @@
     1: 'RUNNING',
     2: 'CATCHING BLOCKS',
     3: 'LEGACY SYNCING',
+    4: 'LAUNCHING',
     '-1': 'DISCONNECTED',
   }
 
@@ -230,6 +234,7 @@
     1: 'green',
     2: 'blue',
     3: 'purple',
+    4: 'orange', // LAUNCHING - orange like a rocket
     '-1': 'red',
   }
 
@@ -253,6 +258,8 @@
         return 'fas fa-fast-forward'
       case 'LEGACYSYNC':
         return 'fas fa-sync'
+      case 'LAUNCH':
+        return 'fas fa-rocket'
       default:
         return 'fas fa-question'
     }
@@ -270,6 +277,8 @@
         return 'Catch Up'
       case 'LEGACYSYNC':
         return 'Legacy Sync'
+      case 'LAUNCH':
+        return 'Launch'
       default:
         return eventName
     }

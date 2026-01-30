@@ -55,7 +55,10 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 			return errors.NewProcessingError("[subtreeMessageHandler] failed to get FSM current state", err)
 		}
 
-		if *state == blockchain.FSMStateCATCHINGBLOCKS {
+		// Skip processing in non-operational states
+		if *state == blockchain.FSMStateCATCHINGBLOCKS ||
+			*state == blockchain.FSMStateLAUNCHING ||
+			*state == blockchain.FSMStateIDLE {
 			return nil
 		}
 

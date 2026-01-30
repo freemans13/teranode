@@ -18,7 +18,7 @@ const fieldKey = `${pageKey}.fields`
 // Function to calculate chainwork scores
 export function calculateChainworkScores(nodes: any[]): Map<string, number> {
   const scoreMap = new Map<string, number>()
-  
+
   // Collect unique chainwork values and filter out empty/invalid ones
   const chainworkSet = new Set<string>()
   nodes.forEach(node => {
@@ -26,7 +26,7 @@ export function calculateChainworkScores(nodes: any[]): Map<string, number> {
       chainworkSet.add(node.chain_work)
     }
   })
-  
+
   // Convert to array and sort in descending order (higher chainwork = lower score number)
   const sortedChainworks = Array.from(chainworkSet).sort((a, b) => {
     // Compare hex strings as big integers (reversed for descending)
@@ -41,7 +41,7 @@ export function calculateChainworkScores(nodes: any[]): Map<string, number> {
   sortedChainworks.forEach((chainwork, index) => {
     chainworkToScore.set(chainwork, index + 1)
   })
-  
+
   // Map each node to its score
   nodes.forEach(node => {
     const key = node.peer_id
@@ -51,7 +51,7 @@ export function calculateChainworkScores(nodes: any[]): Map<string, number> {
       scoreMap.set(key, 0) // No chainwork = score 0
     }
   })
-  
+
   return scoreMap
 }
 
@@ -186,10 +186,10 @@ export const renderCells = {
     const url = item.base_url || '-'
     const peerId = item.peer_id || '-'
     const isCurrentNode = item.isCurrentNode === true
-    
+
     // Build tooltip with base URL and peer ID
     const tooltip = `${url}\n${peerId}`
-    
+
     return {
       component: RenderSpanWithTooltip,
       props: {
@@ -203,17 +203,17 @@ export const renderCells = {
   version: (idField, item, colId) => {
     const fullVersion = item.version || '-'
     const commitHash = item.commit_hash || ''
-    
+
     // Try to extract semantic version (e.g., "v1.2.3" from "v1.2.3-abc123")
     const semverMatch = fullVersion.match(/^(v?\d+\.\d+\.\d+)/)
     const displayVersion = semverMatch ? semverMatch[1] : fullVersion
-    
+
     // Build tooltip with full version and commit
     let tooltipText = fullVersion
     if (commitHash) {
       tooltipText = `${fullVersion} (commit: ${commitHash})`
     }
-    
+
     return {
       component: RenderSpanWithTooltip,
       props: {
@@ -242,6 +242,9 @@ export const renderCells = {
     } else if (state === 'IDLE') {
       emoji = '⏸️'
       tooltip = 'IDLE'
+    } else if (state === 'LAUNCHING') {
+      emoji = '🚀'
+      tooltip = 'LAUNCHING'
     }
 
     return {
@@ -473,13 +476,13 @@ export const renderCells = {
     // Support both best_block_hash (from node_status) and hash (from mining_on)
     const hash = item[colId] || item.hash
     let miner = item.miner_name || item.miner || ''
-    
+
     // If miner is not available, lookup from block hash -> miner cache
     if (!miner && hash) {
       const minerCache = get(blockHashToMiner)
       miner = minerCache.get(hash) || ''
     }
-    
+
     return {
       component: hash ? RenderHashWithMiner : null,
       props: {

@@ -447,6 +447,10 @@ func (c *LocalClient) Run(ctx context.Context, source string) error {
 	return nil
 }
 
+func (c *LocalClient) Launch(ctx context.Context, source string) error {
+	return nil
+}
+
 func (c *LocalClient) Idle(ctx context.Context) error {
 	return nil
 }

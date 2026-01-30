@@ -24,10 +24,19 @@ func Test_NewFiniteStateMachine(t *testing.T) {
 	fsm := blockchainClient.NewFiniteStateMachine()
 	require.NotNil(t, fsm)
 	require.Equal(t, "IDLE", fsm.Current())
-	require.True(t, fsm.Can(blockchain_api.FSMEventType_RUN.String()))
+	require.True(t, fsm.Can(blockchain_api.FSMEventType_LAUNCH.String()))
+	require.False(t, fsm.Can(blockchain_api.FSMEventType_RUN.String())) // RUN not valid from IDLE
 
 	// Test transitions
-	t.Run("Transition from Idle to Running", func(t *testing.T) {
+	t.Run("Transition from Idle to Launching", func(t *testing.T) {
+		err := fsm.Event(ctx, blockchain_api.FSMEventType_LAUNCH.String())
+		require.NoError(t, err)
+		require.Equal(t, "LAUNCHING", fsm.Current())
+		require.True(t, fsm.Can(blockchain_api.FSMEventType_RUN.String()))
+		require.True(t, fsm.Can(blockchain_api.FSMEventType_CATCHUPBLOCKS.String()))
+	})
+
+	t.Run("Transition from Launching to Running", func(t *testing.T) {
 		err := fsm.Event(ctx, blockchain_api.FSMEventType_RUN.String())
 		require.NoError(t, err)
 		require.Equal(t, "RUNNING", fsm.Current())
@@ -74,6 +83,19 @@ func Test_GetSetFSMStateFromStore(t *testing.T) {
 		state, err := blockchainClient.GetStoreFSMState(ctx)
 		require.NoError(t, err)
 		require.Equal(t, "IDLE", state)
+	})
+
+	t.Run("Alter current state to Launching", func(t *testing.T) {
+		_, err = blockchainClient.Launch(ctx, &emptypb.Empty{})
+		require.NoError(t, err)
+
+		resp, err := blockchainClient.GetFSMCurrentState(ctx, &emptypb.Empty{})
+		require.NoError(t, err)
+		require.Equal(t, "LAUNCHING", resp.State.String())
+
+		state, err := blockchainClient.GetStoreFSMState(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "LAUNCHING", state)
 	})
 
 	t.Run("Alter current state to Running", func(t *testing.T) {

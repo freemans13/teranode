@@ -77,6 +77,7 @@ const (
 	BlockchainAPI_CatchUpBlocks_FullMethodName                        = "/blockchain_api.BlockchainAPI/CatchUpBlocks"
 	BlockchainAPI_LegacySync_FullMethodName                           = "/blockchain_api.BlockchainAPI/LegacySync"
 	BlockchainAPI_Idle_FullMethodName                                 = "/blockchain_api.BlockchainAPI/Idle"
+	BlockchainAPI_Launch_FullMethodName                               = "/blockchain_api.BlockchainAPI/Launch"
 	BlockchainAPI_ReportPeerFailure_FullMethodName                    = "/blockchain_api.BlockchainAPI/ReportPeerFailure"
 	BlockchainAPI_GetBlockLocator_FullMethodName                      = "/blockchain_api.BlockchainAPI/GetBlockLocator"
 	BlockchainAPI_LocateBlockHeaders_FullMethodName                   = "/blockchain_api.BlockchainAPI/LocateBlockHeaders"
@@ -208,6 +209,8 @@ type BlockchainAPIClient interface {
 	LegacySync(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Idle marks the service as idle.
 	Idle(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Launch initiates the node startup with sync check.
+	Launch(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ReportPeerFailure notifies about peer download failures (catchup, subtree, block, etc).
 	ReportPeerFailure(ctx context.Context, in *ReportPeerFailureRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// GetBlockLocator retrieves a block locator for chain synchronization.
@@ -796,6 +799,16 @@ func (c *blockchainAPIClient) Idle(ctx context.Context, in *emptypb.Empty, opts 
 	return out, nil
 }
 
+func (c *blockchainAPIClient) Launch(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, BlockchainAPI_Launch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *blockchainAPIClient) ReportPeerFailure(ctx context.Context, in *ReportPeerFailureRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -1042,6 +1055,8 @@ type BlockchainAPIServer interface {
 	LegacySync(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
 	// Idle marks the service as idle.
 	Idle(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
+	// Launch initiates the node startup with sync check.
+	Launch(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
 	// ReportPeerFailure notifies about peer download failures (catchup, subtree, block, etc).
 	ReportPeerFailure(context.Context, *ReportPeerFailureRequest) (*emptypb.Empty, error)
 	// GetBlockLocator retrieves a block locator for chain synchronization.
@@ -1242,6 +1257,9 @@ func (UnimplementedBlockchainAPIServer) LegacySync(context.Context, *emptypb.Emp
 }
 func (UnimplementedBlockchainAPIServer) Idle(context.Context, *emptypb.Empty) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method Idle not implemented")
+}
+func (UnimplementedBlockchainAPIServer) Launch(context.Context, *emptypb.Empty) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method Launch not implemented")
 }
 func (UnimplementedBlockchainAPIServer) ReportPeerFailure(context.Context, *ReportPeerFailureRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportPeerFailure not implemented")
@@ -2268,6 +2286,24 @@ func _BlockchainAPI_Idle_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BlockchainAPI_Launch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BlockchainAPIServer).Launch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BlockchainAPI_Launch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BlockchainAPIServer).Launch(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _BlockchainAPI_ReportPeerFailure_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReportPeerFailureRequest)
 	if err := dec(in); err != nil {
@@ -2720,6 +2756,10 @@ var BlockchainAPI_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Idle",
 			Handler:    _BlockchainAPI_Idle_Handler,
+		},
+		{
+			MethodName: "Launch",
+			Handler:    _BlockchainAPI_Launch_Handler,
 		},
 		{
 			MethodName: "ReportPeerFailure",

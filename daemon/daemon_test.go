@@ -232,7 +232,7 @@ func TestDaemon_Start_AllServices(t *testing.T) {
 
 	// Configure settings - this will now pick up KAFKA_PORT and persister URLs from gocore.Config
 	appSettings := settings.NewSettings()
-	appSettings.LocalTestStartFromState = "RUNNING"
+	appSettings.LocalTestStartFromState = "LAUNCHING"
 	appSettings.P2P.Port = p2pPort
 	appSettings.Asset.HTTPPort = assetPort
 	appSettings.Asset.HTTPListenAddress = fmt.Sprintf(":%d", assetPort)

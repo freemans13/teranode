@@ -502,6 +502,12 @@ func (m *Mock) Run(ctx context.Context, source string) error {
 	return args.Error(0)
 }
 
+// Launch mocks the Launch method
+func (m *Mock) Launch(ctx context.Context, source string) error {
+	args := m.Called(ctx, source)
+	return args.Error(0)
+}
+
 // CatchUpBlocks mocks the CatchUpBlocks method
 func (m *Mock) CatchUpBlocks(ctx context.Context) error {
 	args := m.Called(ctx)

@@ -378,7 +378,7 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	require.NoError(t, err)
 	appSettings.Asset.CentrifugeDisable = true
 	appSettings.UtxoStore.DBTimeout = 500 * time.Second
-	appSettings.LocalTestStartFromState = "RUNNING"
+	appSettings.LocalTestStartFromState = "LAUNCHING"
 	appSettings.SubtreeValidation.TxMetaCacheEnabled = false
 	appSettings.ProfilerAddr = ""
 	appSettings.RPC.CacheEnabled = false

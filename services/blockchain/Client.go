@@ -76,11 +76,13 @@ const (
 	FSMStateRUNNING        = blockchain_api.FSMStateType_RUNNING
 	FSMStateCATCHINGBLOCKS = blockchain_api.FSMStateType_CATCHINGBLOCKS
 	FSMStateLEGACYSYNCING  = blockchain_api.FSMStateType_LEGACYSYNCING
+	FSMStateLAUNCHING      = blockchain_api.FSMStateType_LAUNCHING
 
 	FSMEventIDLE          = blockchain_api.FSMEventType_STOP
 	FSMEventRUN           = blockchain_api.FSMEventType_RUN
 	FSMEventCATCHUPBLOCKS = blockchain_api.FSMEventType_CATCHUPBLOCKS
 	FSMEventLEGACYSYNC    = blockchain_api.FSMEventType_LEGACYSYNC
+	FSMEventLAUNCH        = blockchain_api.FSMEventType_LAUNCH
 )
 
 // NewClient creates a new blockchain client with default address settings.
@@ -1706,6 +1708,44 @@ func (c *Client) Run(ctx context.Context, source string) error {
 	c.logger.Infof("[Blockchain Client] Sending Run event %s (%s => Run)", source, currentState)
 
 	_, err := c.client.Run(ctx, &emptypb.Empty{})
+	if err != nil {
+		return errors.UnwrapGRPC(err)
+	}
+
+	return nil
+}
+
+// Launch sends a launch FSM event to the blockchain service.
+// This method transitions the blockchain service's finite state machine to the
+// LAUNCHING state, which performs an initial sync check before starting normal
+// operations. This ensures subtree validation doesn't process transactions
+// before the node is synchronized with peers.
+//
+// The method first checks if the FSM is already in the LAUNCHING state
+// to avoid unnecessary state transitions.
+//
+// Parameters:
+//   - ctx: Context for the operation with timeout and cancellation support
+//   - source: Identifier for the source of the event (for logging)
+//
+// Returns:
+//   - error: Any error encountered during the FSM event transmission
+func (c *Client) Launch(ctx context.Context, source string) error {
+	currentState := ""
+
+	state, _ := c.GetFSMCurrentState(ctx)
+	if state != nil {
+		// check whether the current state is the same as the target state
+		if *state == FSMStateLAUNCHING {
+			return nil
+		}
+
+		currentState = state.String()
+	}
+
+	c.logger.Infof("[Blockchain Client] Sending Launch event %s (%s => Launch)", source, currentState)
+
+	_, err := c.client.Launch(ctx, &emptypb.Empty{})
 	if err != nil {
 		return errors.UnwrapGRPC(err)
 	}

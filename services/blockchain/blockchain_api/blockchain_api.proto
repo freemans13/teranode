@@ -177,6 +177,9 @@ service BlockchainAPI {
   // Idle marks the service as idle.
   rpc Idle(google.protobuf.Empty) returns (google.protobuf.Empty) {}
 
+  // Launch initiates the node startup with sync check.
+  rpc Launch(google.protobuf.Empty) returns (google.protobuf.Empty) {}
+
   // ReportPeerFailure notifies about peer download failures (catchup, subtree, block, etc).
   rpc ReportPeerFailure(ReportPeerFailureRequest) returns (google.protobuf.Empty) {}
 
@@ -629,6 +632,7 @@ enum FSMEventType {
   RUN = 1;
   CATCHUPBLOCKS = 2;
   LEGACYSYNC = 3;
+  LAUNCH = 4;  // Trigger initial sync check before running
 }
 
 // FSMStateType defines possible states of the blockchain FSM.
@@ -637,6 +641,7 @@ enum FSMStateType {
   RUNNING = 1;        // Service is running normally
   CATCHINGBLOCKS = 2; // Service is catching up blocks
   LEGACYSYNCING = 3;  // Service is in legacy sync mode
+  LAUNCHING = 4;      // Service is performing initial sync check before running
 }
 
 // GetBlockLocatorRequest requests a block locator.

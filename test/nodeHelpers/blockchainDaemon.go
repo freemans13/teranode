@@ -138,7 +138,12 @@ func (m *BlockchainDaemon) StartBlockchainService() error {
 	}
 	m.Logger.Infof("Initial FSM state: %v", initialState)
 
-	// Run the blockchain FSM to transition from IDLE to RUNNING
+	// Launch the blockchain FSM to transition from IDLE to LAUNCHING
+	if err := m.BlockchainClient.Launch(m.ctx, "test"); err != nil {
+		return errors.NewProcessingError("failed to launch blockchain FSM", err)
+	}
+
+	// Run the blockchain FSM to transition from LAUNCHING to RUNNING
 	if err := m.BlockchainClient.Run(m.ctx, "test"); err != nil {
 		return errors.NewProcessingError("failed to run blockchain FSM", err)
 	}
