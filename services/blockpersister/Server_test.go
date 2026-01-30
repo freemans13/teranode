@@ -791,12 +791,12 @@ func (m *MockBlockchainClient) GetFSMCurrentStateForE2ETestMode() blockchain.FSM
 	defer m.mu.RUnlock()
 	return m.fsmState
 }
-func (m *MockBlockchainClient) IsFullyReady(ctx context.Context) (bool, error) { return true, nil }
+func (m *MockBlockchainClient) IsFullyReady(ctx context.Context) (bool, error)  { return true, nil }
 func (m *MockBlockchainClient) Run(ctx context.Context, source string) error    { return nil }
 func (m *MockBlockchainClient) Launch(ctx context.Context, source string) error { return nil }
 func (m *MockBlockchainClient) CatchUpBlocks(ctx context.Context) error         { return nil }
-func (m *MockBlockchainClient) LegacySync(ctx context.Context) error           { return nil }
-func (m *MockBlockchainClient) Idle(ctx context.Context) error                 { return nil }
+func (m *MockBlockchainClient) LegacySync(ctx context.Context) error            { return nil }
+func (m *MockBlockchainClient) Idle(ctx context.Context) error                  { return nil }
 func (m *MockBlockchainClient) SendFSMEvent(ctx context.Context, event blockchain.FSMEventType) error {
 	return nil
 }
