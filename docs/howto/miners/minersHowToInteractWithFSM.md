@@ -48,6 +48,7 @@ The `teranode-cli` is recommended for scripting and automation. It provides a co
 ### Docker Compose Environment
 
 #### 1. Check Current State
+
 ```bash
 docker exec -it blockchain teranode-cli getfsmstate
 ```
@@ -55,7 +56,8 @@ docker exec -it blockchain teranode-cli getfsmstate
 #### 2. Set New State
 
 ```bash
-docker exec -it blockchain teranode-cli setfsmstate --fsmstate RUNNING
+# Launch the node (recommended from IDLE - performs sync check)
+docker exec -it blockchain teranode-cli setfsmstate --fsmstate LAUNCHING
 ```
 
 ### Kubernetes Environment
@@ -78,18 +80,31 @@ kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o js
 #### 2. Set New State
 
 ```bash
-# Change state to RUNNING
-kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate --fsmstate RUNNING
+# Launch the node (recommended from IDLE - performs sync check)
+kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate --fsmstate LAUNCHING
 ```
 
 ## Valid FSM States
 
 The following states are valid for all environments:
 
-- IDLE
-- RUNNING
-- LEGACYSYNCING
-- CATCHINGBLOCKS
+- **IDLE** - Node is stopped and not processing
+- **LAUNCHING** - Node is performing initial sync check (auto-transitions to RUNNING or CATCHINGBLOCKS)
+- **RUNNING** - Node is fully operational
+- **CATCHINGBLOCKS** - Node is catching up with the network
+- **LEGACYSYNCING** - Node is syncing using legacy Bitcoin protocol
+
+## State Transitions
+
+**Starting the node (from IDLE):**
+
+- Use `LAUNCH` event to transition IDLE → LAUNCHING
+- The node will automatically transition to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers)
+- **Note:** The `RUN` event is NOT valid from IDLE state. You must use `LAUNCH`.
+
+**Legacy sync mode:**
+
+- Use `LEGACYSYNC` event to transition IDLE → LEGACYSYNCING (bypasses LAUNCHING state)
 
 ## Validation
 
@@ -118,16 +133,20 @@ grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.GetFSMCurrentSt
 **Trigger State Transitions:**
 
 ```bash
-# Transition to RUNNING state
+# Start the node (IDLE -> LAUNCHING -> RUNNING/CATCHINGBLOCKS)
+# This is the recommended way to start the node
+grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.Launch
+
+# Transition to RUNNING state (only valid from LAUNCHING, LEGACYSYNCING, or CATCHINGBLOCKS)
 grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.Run
 
-# Transition to LEGACYSYNCING state
+# Transition to LEGACYSYNCING state (from IDLE)
 grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.LegacySync
 
-# Transition to CATCHINGBLOCKS state
+# Transition to CATCHINGBLOCKS state (from RUNNING or LAUNCHING)
 grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.CatchUpBlocks
 
-# Transition to IDLE state
+# Transition to IDLE state (from RUNNING or LEGACYSYNCING)
 grpcurl -plaintext blockchain:18087 blockchain_api.BlockchainAPI.Idle
 ```
 
@@ -157,16 +176,20 @@ Expected output:
 **Trigger State Transitions:**
 
 ```bash
-# Transition to RUNNING state
+# Start the node (IDLE -> LAUNCHING -> RUNNING/CATCHINGBLOCKS)
+# This is the recommended way to start the node
+grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.Launch
+
+# Transition to RUNNING state (only valid from LAUNCHING, LEGACYSYNCING, or CATCHINGBLOCKS)
 grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.Run
 
-# Transition to LEGACYSYNCING state
+# Transition to LEGACYSYNCING state (from IDLE)
 grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.LegacySync
 
-# Transition to CATCHINGBLOCKS state
+# Transition to CATCHINGBLOCKS state (from RUNNING or LAUNCHING)
 grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.CatchUpBlocks
 
-# Transition to IDLE state
+# Transition to IDLE state (from RUNNING or LEGACYSYNCING)
 grpcurl -plaintext localhost:18087 blockchain_api.BlockchainAPI.Idle
 ```
 

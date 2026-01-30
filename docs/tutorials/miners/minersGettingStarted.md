@@ -130,12 +130,14 @@ Force the node to transition to Run mode:
 #### Option 2: Using teranode-cli
 
 ```bash
-# Transition to Run mode
-docker exec -it blockchain teranode-cli setfsmstate --fsmstate RUNNING
+# Launch the node (recommended - performs sync check before running)
+docker exec -it blockchain teranode-cli setfsmstate --fsmstate LAUNCHING
 
-# Or transition to LegacySync mode
+# Or transition to LegacySync mode (for syncing from legacy BSV nodes)
 docker exec -it blockchain teranode-cli setfsmstate --fsmstate LEGACYSYNCING
 ```
+
+> **Note:** The LAUNCHING state performs a sync check and will automatically transition to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers).
 
 - Verify services are running:
 

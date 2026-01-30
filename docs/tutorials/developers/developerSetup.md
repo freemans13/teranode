@@ -243,7 +243,7 @@ SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run .
 
 If no errors are seen, you have successfully installed the project and are ready to start working on the project or running the node.
 
-Note that the node is initialized in IDLE mode by default. You'll need to transition it to RUNNING mode to start processing transactions.
+Note that the node is initialized in IDLE mode by default. You'll need to launch the node to start processing transactions. The recommended approach is to use the `LAUNCH` event, which performs a sync check before transitioning to RUNNING.
 
 ### 7.1. Executing the Teranode-CLI as a Developer
 
@@ -265,8 +265,8 @@ Once built, you can run commands directly:
 # Get current FSM state
 SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli getfsmstate
 
-# Set FSM state to RUNNING
-SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli setfsmstate --fsmstate running
+# Launch the node (recommended way to start from IDLE)
+SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli setfsmstate --fsmstate launching
 ```
 
 #### Available Commands
@@ -301,23 +301,32 @@ For general help and a list of available commands:
 
 The CLI will use your development settings as specified by your `SETTINGS_CONTEXT` environment variable.
 
-#### Transitioning the Node to RUNNING Mode
+#### Launching the Node
 
-To transition the node from IDLE to RUNNING mode, use:
+To start the node from IDLE mode, use the `LAUNCHING` state which performs a sync check before processing:
 
 ```bash
 # Get current FSM state
 SETTINGS_CONTEXT=dev ./teranode-cli getfsmstate
 
-# Set FSM state to RUNNING
-SETTINGS_CONTEXT=dev ./teranode-cli setfsmstate --fsmstate running
+# Launch the node (recommended way to start from IDLE)
+SETTINGS_CONTEXT=dev ./teranode-cli setfsmstate --fsmstate launching
 ```
+
+The node will:
+
+1. Transition to LAUNCHING state
+2. Perform a sync check with peers (if P2P is enabled)
+3. Automatically transition to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers)
 
 After executing these commands, your log should show a successful transition:
 
 ```bash
-[Blockchain Client] FSM successfully transitioned from IDLE to state:RUNNING
+[Blockchain Client] FSM successfully transitioned from IDLE to state:LAUNCHING
+[Blockchain Client] FSM successfully transitioned from LAUNCHING to state:RUNNING
 ```
+
+> **Note:** In development mode with P2P disabled, the node will immediately transition from LAUNCHING to RUNNING.
 
 ### 7.2. Debugging Teranode
 

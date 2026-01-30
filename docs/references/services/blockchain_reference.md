@@ -532,13 +532,21 @@ func (b *Blockchain) SendFSMEvent(ctx context.Context, eventReq *blockchain_api.
 
 Sends an event to the finite state machine.
 
+### Launch
+
+```go
+func (b *Blockchain) Launch(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error)
+```
+
+Transitions the FSM from IDLE to the LAUNCHING state. This is the **recommended way to start the node** as it performs an initial sync check before processing transactions. The P2P sync coordinator will automatically transition the node to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers).
+
 ### Run
 
 ```go
 func (b *Blockchain) Run(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error)
 ```
 
-Transitions the FSM to the RUNNING state.
+Transitions the FSM to the RUNNING state. **Note:** This is only valid from LAUNCHING, LEGACYSYNCING, or CATCHINGBLOCKS states - not from IDLE. Use Launch() to start the node from IDLE.
 
 ### CatchUpBlocks
 

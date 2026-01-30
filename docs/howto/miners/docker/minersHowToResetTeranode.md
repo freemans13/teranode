@@ -160,8 +160,8 @@ Teranode starts in IDLE state. You need to transition to the appropriate state:
 
 # Or via teranode-cli
 docker exec -it blockchain teranode-cli setfsmstate --fsmstate LEGACYSYNCING
-# Or for direct operation:
-docker exec -it blockchain teranode-cli setfsmstate --fsmstate RUNNING
+# Or launch the node (performs sync check before running):
+docker exec -it blockchain teranode-cli setfsmstate --fsmstate LAUNCHING
 ```
 
 ### Monitor Synchronization

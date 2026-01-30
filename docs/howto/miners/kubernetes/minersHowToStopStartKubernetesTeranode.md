@@ -41,11 +41,13 @@ kubectl wait --for=condition=ready pod -l app=blockchain -n teranode-operator --
 kubectl logs -n teranode-operator -l app=blockchain -f
 ```
 
-### 3. Start Syncing (if needed)
+### 3. Launch the Node (if needed)
 
 ```bash
-kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate -fsmstate running
+kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate -fsmstate launching
 ```
+
+> **Note:** The LAUNCHING state performs a sync check and will automatically transition to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers).
 
 ## Stopping Teranode
 

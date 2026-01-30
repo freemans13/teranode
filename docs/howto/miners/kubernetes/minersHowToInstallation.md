@@ -208,11 +208,13 @@ By default, this configuration deploys Teranode to connect to the **teratestnet*
 
 #### Start Syncing Process
 
-A fresh Teranode starts up in IDLE state by default. To start syncing from the network, you can run:
+A fresh Teranode starts up in IDLE state by default. To launch the node and start syncing from the network, run:
 
 ```bash
-kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate -fsmstate running
+kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate -fsmstate launching
 ```
+
+> **Note:** The LAUNCHING state performs a sync check and will automatically transition to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers).
 
 To know more about the syncing process, please refer to the [Teranode Sync Guide](minersHowToSyncTheNode.md)
 

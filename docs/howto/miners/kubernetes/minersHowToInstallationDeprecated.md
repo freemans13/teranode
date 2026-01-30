@@ -2,7 +2,7 @@
 
 Last modified: 29-January-2025
 
-# Index
+## Index
 
 - [Introduction](#introduction)
 - [Prerequisites](#prerequisites)
@@ -10,13 +10,13 @@ Last modified: 29-January-2025
 - [Software Requirements](#software-requirements)
 - [Network Considerations](#network-considerations)
 - [Installation Process](#installation-process)
-  - [Teranode Initial Synchronization](#teranode-initial-synchronization)
-    - [Full P2P Download](#full-p2p-download)
-    - [Initial Data Set Installation](#initial-data-set-installation)
-  - [Teranode Installation - Introduction to the Kubernetes Operator](#teranode-installation-introduction-to-the-kubernetes-operator)
-  - [Installing Teranode with the Custom Kubernetes Operator](#installing-teranode-with-the-custom-kubernetes-operator)
+    - [Teranode Initial Synchronization](#teranode-initial-synchronization)
+        - [Full P2P Download](#full-p2p-download)
+        - [Initial Data Set Installation](#initial-data-set-installation)
+    - [Teranode Installation - Introduction to the Kubernetes Operator](#teranode-installation---introduction-to-the-kubernetes-operator)
+    - [Installing Teranode with the Custom Kubernetes Operator](#installing-teranode-with-the-custom-kubernetes-operator)
 - [Optimizations](#optimizations)
-- [Reference - Settings](#reference-settings)
+- [Reference - Settings](#reference---settings)
 
 ## Introduction
 
@@ -153,7 +153,7 @@ data:
   utxostore: 'aerospike://...'
 ```
 
-To review the list of settings you could configure in the ConfigMap, please refer to the list [here](https://github.com/bsv-blockchain/teranode/blob/main/settings.conf).
+To review the list of settings you could configure in the ConfigMap, please refer to [the settings configuration file](https://github.com/bsv-blockchain/teranode/blob/main/settings.conf).
 
 #### Storage Requirements
 
@@ -300,15 +300,17 @@ Standard Kubernetes logging and troubleshooting approaches apply. Users can use 
 - The various Teranode services will be accessible through the configured ingress or service endpoints.
 - Refer to your specific ingress or network configuration for exact URLs and ports.
 
-### Step 9: Change the node status to Run or LegacySync
+### Step 9: Launch the Node or Enter LegacySync
 
-1. **Force the node to transition to Run mode:**
+1. **Launch the node (recommended - performs sync check before running):**
 
     ```bash
-    kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate --fsmstate RUNNING
+    kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate --fsmstate LAUNCHING
     ```
 
-2. **Or LegacySync mode:**
+    > **Note:** The LAUNCHING state performs a sync check and will automatically transition to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers).
+
+2. **Or LegacySync mode (for syncing from legacy BSV nodes):**
 
     ```bash
     kubectl exec -it $(kubectl get pods -n teranode-operator -l app=blockchain -o jsonpath='{.items[0].metadata.name}') -n teranode-operator -- teranode-cli setfsmstate --fsmstate LEGACYSYNCING
@@ -371,4 +373,4 @@ If you have local access to SV Nodes, you can use them to speed up the initial b
 
 ## Reference - Settings
 
-You can find the pre-configured settings file [here](https://github.com/bsv-blockchain/teranode/blob/main/settings.conf). You can refer to this document in order to identify the current system behaviour and in order to override desired settings in your `settings_local.conf`.
+You can find the [pre-configured settings file](https://github.com/bsv-blockchain/teranode/blob/main/settings.conf) in the repository. You can refer to this document in order to identify the current system behaviour and in order to override desired settings in your `settings_local.conf`.

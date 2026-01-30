@@ -248,16 +248,17 @@ The admin page (`/admin`) provides administrative operations. **This page requir
 
 **Current State Display:**
 
-- Shows blockchain state: IDLE, RUNNING, CATCHING BLOCKS, LEGACY SYNCING, DISCONNECTED
+- Shows blockchain state: IDLE, LAUNCHING, RUNNING, CATCHING BLOCKS, LEGACY SYNCING, DISCONNECTED
 
 **State Transitions:**
 
 | Event | Description |
 |-------|-------------|
-| RUN | Start blockchain processing |
+| LAUNCH | Start node with sync check (recommended from IDLE) |
+| RUN | Transition to running state (from LAUNCHING, LEGACYSYNCING, or CATCHINGBLOCKS) |
 | STOP | Stop blockchain (transition to IDLE) |
 | CATCHUPBLOCKS | Enter block catchup mode |
-| LEGACYSYNC | Enter legacy sync mode |
+| LEGACYSYNC | Enter legacy sync mode (from IDLE) |
 
 - Dynamic button UI showing available events for current state
 - Custom event submission

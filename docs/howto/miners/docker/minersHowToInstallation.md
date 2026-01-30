@@ -265,19 +265,21 @@ docker compose up -d
 
 Force the node to transition to Run mode:
 
-**Option 1: Using Admin Dashboard (Easiest)**
+##### Option 1: Using Admin Dashboard (Easiest)
 
-Access the dashboard at <http://localhost:8090/admin> and use the FSM State controls to transition to **RUNNING** or **LEGACYSYNCING**.
+Access the dashboard at <http://localhost:8090/admin> and use the FSM State controls to **LAUNCH** the node or transition to **LEGACYSYNCING**.
 
-**Option 2: Using teranode-cli**
+##### Option 2: Using teranode-cli
 
 ```bash
-# Transition to Run mode
-docker exec -it blockchain teranode-cli setfsmstate --fsmstate running
+# Launch the node (recommended - performs sync check before running)
+docker exec -it blockchain teranode-cli setfsmstate --fsmstate launching
 
-# Or transition to LegacySync mode
+# Or transition to LegacySync mode (for syncing from legacy BSV nodes)
 docker exec -it blockchain teranode-cli setfsmstate --fsmstate legacysyncing
 ```
+
+> **Note:** The LAUNCHING state performs a sync check and will automatically transition to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers).
 
 You can verify the current state with:
 
@@ -589,11 +591,11 @@ docker exec -it blockchain teranode-cli setfsmstate --fsmstate LEGACYSYNCING
 # Or via Admin Dashboard at http://localhost:8090/admin
 ```
 
-**Set FSM State to Running**:
+**Launch the Node** (recommended from IDLE):
 
 ```bash
-# Via teranode-cli
-docker exec -it blockchain teranode-cli setfsmstate --fsmstate RUNNING
+# Via teranode-cli (performs sync check before running)
+docker exec -it blockchain teranode-cli setfsmstate --fsmstate LAUNCHING
 
 # Or via Admin Dashboard at http://localhost:8090/admin
 ```

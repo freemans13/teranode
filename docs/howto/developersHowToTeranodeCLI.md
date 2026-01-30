@@ -68,21 +68,26 @@ SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli setfsmstate --fsmstate <state
 
 Valid states you can issue are:
 
+- `launching` - Performs sync check before starting operations (recommended from IDLE)
 - `running` - Normal operation mode (processes transactions and creates blocks)
 - `idle` - Idle mode (default startup state)
+- `catchingblocks` - Catching up blocks from peers
+- `legacysyncing` - Legacy sync mode (for syncing from legacy BSV nodes)
 
-Example to switch to RUNNING state:
+Example to launch the node (recommended from IDLE):
 
 ```bash
-SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli setfsmstate --fsmstate running
+SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli setfsmstate --fsmstate launching
 ```
 
 Expected output:
 
 ```text
-Setting FSM state to: running
-FSM state successfully set to: RUNNING
+Setting FSM state to: launching
+FSM state successfully set to: LAUNCHING
 ```
+
+The node will automatically transition to RUNNING (if synced) or CATCHINGBLOCKS (if behind peers).
 
 ### View System Configuration
 
@@ -253,10 +258,10 @@ Press `r` to refresh manually or `q` to quit.
     SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli getfsmstate
     ```
 
-3. Transition to RUNNING state:
+3. Launch the node (performs sync check before running):
 
     ```bash
-    SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli setfsmstate --fsmstate running
+    SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] ./teranode-cli setfsmstate --fsmstate launching
     ```
 
 4. Verify the FSM state change:

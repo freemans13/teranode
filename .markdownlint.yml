@@ -5,6 +5,7 @@
 MD013: false  # Line length (Material MkDocs handles this)
 MD033: false  # Allow inline HTML (needed for admonitions)
 MD041: false  # First line in file should be a top level header
+MD060: false  # Table column style (existing tables use various styles)
 
 # Configure list formatting rules (these would have caught our issues!)
 MD004:
