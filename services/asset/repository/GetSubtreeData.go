@@ -224,7 +224,7 @@ func (repo *Repository) dualStreamWithFileCreation(ctx context.Context, subtreeH
 			metricLabel = "on_demand_created_locked"
 		}
 		repo.logger.Infof("[GetSubtreeDataReader] Successfully created subtreeData file on-demand for %s", subtreeHash.String())
-		_ = httpWriter.CloseWithError(io.ErrClosedPipe)
+		_ = httpWriter.Close()
 		prometheusAssetSubtreeDataCreated.WithLabelValues("success", metricLabel).Inc()
 		return nil
 	})
