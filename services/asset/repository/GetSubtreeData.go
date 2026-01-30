@@ -13,7 +13,6 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
-	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
@@ -119,14 +118,8 @@ func (repo *Repository) dualStreamWithFileCreation(ctx context.Context, subtreeH
 	// Initialize metrics (safe to call multiple times due to sync.Once)
 	initPrometheusMetrics()
 
-	// Calculate DAH (Delete After Height) for file cleanup
-	dah := repo.calculateDAH(ctx)
-
-	// Prepare file options
-	var fileOptions []bloboptions.FileOption
-	if dah > 0 {
-		fileOptions = append(fileOptions, bloboptions.WithDeleteAt(dah))
-	}
+	// Note: subtreeData files have DAH=0 (no expiration), set by FileStorer.Close()
+	// This is consistent with blockpersister behavior.
 
 	// If quorum is available, use distributed locking
 	var release func()
@@ -160,7 +153,7 @@ func (repo *Repository) dualStreamWithFileCreation(ctx context.Context, subtreeH
 
 	// Create FileStorer (with or without quorum lock)
 	storer, err := filestorer.NewFileStorer(ctx, repo.logger, repo.settings,
-		repo.SubtreeStore, subtreeHash[:], fileformat.FileTypeSubtreeData, fileOptions...)
+		repo.SubtreeStore, subtreeHash[:], fileformat.FileTypeSubtreeData)
 	if err != nil {
 		if release != nil {
 			release() // Release quorum lock on error
@@ -230,19 +223,4 @@ func (repo *Repository) dualStreamWithFileCreation(ctx context.Context, subtreeH
 	})
 
 	return httpReader, nil
-}
-
-// calculateDAH returns the Delete After Height for subtreeData files created on-demand.
-// Returns 0 if DAH cannot be calculated (blockchain client unavailable or error).
-func (repo *Repository) calculateDAH(ctx context.Context) uint32 {
-	if repo.BlockchainClient == nil {
-		return 0
-	}
-
-	_, bestHeaderMeta, err := repo.BlockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		return 0
-	}
-
-	return bestHeaderMeta.Height + repo.settings.GlobalBlockHeightRetention
 }
