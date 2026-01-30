@@ -326,12 +326,58 @@ func (sc *SyncCoordinator) checkFSMState(ctx context.Context) {
 		return // Transition handled, no further action needed
 	}
 
+	// When FSM is LAUNCHING, perform initial sync check and transition appropriately
+	if *currentState == blockchain_api.FSMStateType_LAUNCHING {
+		sc.handleLaunchingState(ctx)
+		return
+	}
+
 	// When FSM is RUNNING, we need to find a new sync peer and trigger catchup
 	if *currentState == blockchain_api.FSMStateType_RUNNING {
 		// Check if we should attempt reputation recovery
 		sc.considerReputationRecovery()
 
 		sc.handleRunningState(ctx)
+	}
+}
+
+// handleLaunchingState handles the FSM LAUNCHING state - performs initial sync check
+// and transitions to RUNNING (if synced) or triggers catchup (if behind peers)
+func (sc *SyncCoordinator) handleLaunchingState(ctx context.Context) {
+	localHeight := sc.getLocalHeightSafe()
+
+	// Get max peer height
+	maxPeerHeight := uint32(0)
+	hasPeers := false
+	peers := sc.registry.GetAll()
+
+	for _, peer := range peers {
+		hasPeers = true
+		if peer.Height > maxPeerHeight {
+			maxPeerHeight = peer.Height
+		}
+	}
+
+	sc.logger.Infof("[SyncCoordinator] LAUNCHING state check: localHeight=%d, maxPeerHeight=%d, hasPeers=%v",
+		localHeight, maxPeerHeight, hasPeers)
+
+	// If we're behind peers, trigger catchup
+	if hasPeers && localHeight < maxPeerHeight {
+		sc.logger.Infof("[SyncCoordinator] Behind peers (local=%d, max=%d), triggering catchup", localHeight, maxPeerHeight)
+		if err := sc.blockchainClient.CatchUpBlocks(ctx); err != nil {
+			sc.logger.Errorf("[SyncCoordinator] Failed to trigger catchup from LAUNCHING: %v", err)
+			return
+		}
+		// Now trigger the actual sync by selecting a peer and sending sync message
+		sc.logger.Infof("[SyncCoordinator] Selecting sync peer and triggering block download")
+		sc.selectAndActivateNewPeer(localHeight, "")
+		return
+	}
+
+	// If synced with peers or no peers, transition to RUNNING
+	sc.logger.Infof("[SyncCoordinator] Synced with peers or no peers, transitioning to RUNNING")
+	if err := sc.blockchainClient.Run(ctx, "p2p/sync_coordinator"); err != nil {
+		sc.logger.Errorf("[SyncCoordinator] Failed to transition from LAUNCHING to RUNNING: %v", err)
 	}
 }
 
