@@ -45,9 +45,18 @@ type SubtreeProcessorState struct {
 
 // captureSubtreeProcessorState captures the current state for comparison
 func captureSubtreeProcessorState(stp *SubtreeProcessor) SubtreeProcessorState {
+	// Use production-safe method when processor is running, direct access when not
+	var currentSubtreeLength int
+	if stp.GetCurrentRunningState() == StateStarting {
+		// Processor not running - safe to access directly
+		currentSubtreeLength = stp.currentSubtree.Load().Length()
+	} else {
+		// Processor running - use channel-based sync to avoid race
+		currentSubtreeLength = stp.GetCurrentLength()
+	}
 	return SubtreeProcessorState{
 		ChainedSubtreesCount: len(stp.chainedSubtrees),
-		CurrentSubtreeLength: stp.currentSubtree.Load().Length(),
+		CurrentSubtreeLength: currentSubtreeLength,
 		TxCount:              stp.TxCount(),
 		CurrentTxMapLength:   stp.currentTxMap.Length(),
 	}
