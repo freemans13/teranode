@@ -254,6 +254,9 @@ type SubtreeProcessor struct {
 
 	// startOnce ensures the processing goroutine is only started once
 	startOnce sync.Once
+
+	// stopped indicates the worker goroutine has exited (set on context cancellation)
+	stopped atomic.Bool
 }
 
 type State uint32
@@ -443,6 +446,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 				case <-processorCtx.Done():
 					logger.Infof("[SubtreeProcessor] context cancelled, stopping processor")
 					stp.announcementTicker.Stop()
+					stp.stopped.Store(true)
 					return
 
 				case getSubtreesChan := <-stp.getSubtreesChan:
@@ -1176,8 +1180,8 @@ func (stp *SubtreeProcessor) GetRemoveMapLength() int {
 // Returns:
 //   - []*util.Subtree: Array of chained subtrees
 func (stp *SubtreeProcessor) GetChainedSubtrees() []*subtreepkg.Subtree {
-	// When processor is not running, direct access is safe (no concurrent writers)
-	if stp.GetCurrentRunningState() == StateStarting {
+	// When processor is not running or has stopped, direct access is safe (no concurrent writers)
+	if stp.GetCurrentRunningState() == StateStarting || stp.stopped.Load() {
 		return stp.chainedSubtrees
 	}
 	// Processor running - use channel-based sync to avoid race
