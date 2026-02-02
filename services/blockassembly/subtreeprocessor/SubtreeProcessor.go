@@ -674,7 +674,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						stp.setCurrentRunningState(StateRunning)
 						// Sleep briefly to avoid busy-wait when queue is empty.
 						// This prevents excessive CPU usage from goroutine scheduling overhead.
-						time.Sleep(10 * time.Millisecond)
+						time.Sleep(stp.settings.BlockAssembly.IdleSleepDuration)
 						continue
 					}
 
