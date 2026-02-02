@@ -289,6 +289,16 @@ func (b *BlockAssembler) GetChainedSubtrees() []*subtree.Subtree {
 	return b.subtreeProcessor.GetChainedSubtrees()
 }
 
+// GetChainedSubtreesTotalSize returns the total size in bytes of all chained subtrees.
+// This uses atomic access and is safe to call from any context without channel-based
+// synchronization, avoiding potential deadlocks.
+//
+// Returns:
+//   - uint64: Total size in bytes of all chained subtrees
+func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
+	return b.subtreeProcessor.GetChainedSubtreesTotalSize()
+}
+
 // startChannelListeners initializes and starts all channel listeners for block assembly operations.
 // It handles blockchain notifications, mining candidate requests, and reset operations.
 //
