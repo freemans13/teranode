@@ -1281,7 +1281,7 @@ func (stp *SubtreeProcessor) SubtreeCount() int {
 	// not using len(chainSubtrees) to avoid Race condition
 	// should we be using locks around all chainSubtree operations instead?
 	// the subtree count isn't mission-critical - it's just for statistics
-	return int(stp.chainedSubtreeCount.Load()) + 01
+	return int(stp.chainedSubtreeCount.Load()) + 1
 }
 
 // GetChainedSubtreesTotalSize returns the total size in bytes of all chained subtrees.
