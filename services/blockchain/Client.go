@@ -1227,18 +1227,6 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 		}()
 
 		for c.running.Load() {
-			// Check heartbeat staleness before attempting subscription
-			// If heartbeat is stale, we're reconnecting after a connection loss
-			lastHB := c.lastHeartbeat.Load()
-			if lastHB > 0 && time.Since(time.Unix(0, lastHB)) > heartbeatTimeout {
-				c.logger.Warnf("[Blockchain] Heartbeat stale (%v), setting FSM to IDLE before reconnecting: %s", time.Since(time.Unix(0, lastHB)), source)
-				idleState := FSMStateIDLE
-				c.fmsState.Store(&idleState)
-			}
-
-			// Initialize heartbeat on new subscription
-			c.lastHeartbeat.Store(time.Now().UnixNano())
-
 			c.logger.Infof("[Blockchain] Subscribing to blockchain service: %s", source)
 
 			stream, err := c.client.Subscribe(ctx, &blockchain_api.SubscribeRequest{
@@ -1257,6 +1245,10 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 			// Subscription established successfully - fetch current FSM state
 			c.logger.Infof("[Blockchain] Subscription established, fetching current FSM state for %s", source)
 			c.fetchAndRestoreFSMState(ctx, source)
+
+			// Initialize heartbeat only after successful subscription
+			// This ensures staleness detection works during reconnection attempts
+			c.lastHeartbeat.Store(time.Now().UnixNano())
 
 			for c.running.Load() {
 				resp, err := stream.Recv()
