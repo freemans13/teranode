@@ -76,6 +76,7 @@ func testSameChainGrandparentDoubleSpend(t *testing.T, utxoStore string) {
 
 	// Submit and mine grandparent
 	require.NoError(t, td.PropagationClient.ProcessTransaction(td.Ctx, grandparent))
+	require.NoError(t, td.WaitForTransactionInBlockAssembly(grandparent, blockWait))
 	td.MineAndWait(t, 1)
 
 	// Verify grandparent is mined
@@ -97,6 +98,7 @@ func testSameChainGrandparentDoubleSpend(t *testing.T, utxoStore string) {
 
 	// Submit and mine parent
 	require.NoError(t, td.PropagationClient.ProcessTransaction(td.Ctx, parent))
+	require.NoError(t, td.WaitForTransactionInBlockAssembly(parent, blockWait))
 	td.MineAndWait(t, 1)
 
 	block4, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 4)
