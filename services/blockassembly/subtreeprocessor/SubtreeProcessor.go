@@ -1176,7 +1176,14 @@ func (stp *SubtreeProcessor) GetRemoveMapLength() int {
 // Returns:
 //   - []*util.Subtree: Array of chained subtrees
 func (stp *SubtreeProcessor) GetChainedSubtrees() []*subtreepkg.Subtree {
-	return stp.chainedSubtrees
+	// When processor is not running, direct access is safe (no concurrent writers)
+	if stp.GetCurrentRunningState() == StateStarting {
+		return stp.chainedSubtrees
+	}
+	// Processor running - use channel-based sync to avoid race
+	response := make(chan []*subtreepkg.Subtree)
+	stp.getSubtreesChan <- response
+	return <-response
 }
 
 func (stp *SubtreeProcessor) GetSubtreeHashes() []chainhash.Hash {

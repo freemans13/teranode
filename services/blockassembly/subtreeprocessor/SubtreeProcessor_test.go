@@ -45,7 +45,7 @@ type SubtreeProcessorState struct {
 
 // captureSubtreeProcessorState captures the current state for comparison
 func captureSubtreeProcessorState(stp *SubtreeProcessor) SubtreeProcessorState {
-	// Use production-safe method when processor is running, direct access when not
+	// Use production-safe methods which handle running state internally
 	var currentSubtreeLength int
 	if stp.GetCurrentRunningState() == StateStarting {
 		// Processor not running - safe to access directly
@@ -55,7 +55,7 @@ func captureSubtreeProcessorState(stp *SubtreeProcessor) SubtreeProcessorState {
 		currentSubtreeLength = stp.GetCurrentLength()
 	}
 	return SubtreeProcessorState{
-		ChainedSubtreesCount: len(stp.chainedSubtrees),
+		ChainedSubtreesCount: len(stp.GetChainedSubtrees()), // GetChainedSubtrees handles sync internally
 		CurrentSubtreeLength: currentSubtreeLength,
 		TxCount:              stp.TxCount(),
 		CurrentTxMapLength:   stp.currentTxMap.Length(),
@@ -1633,6 +1633,13 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 	t.Run("subtree_store_errors", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		defer close(newSubtreeChan)
+
+		// Consume subtree announcements to prevent blocking when GetChainedSubtrees() is called
+		go func() {
+			for req := range newSubtreeChan {
+				req.ErrChan <- nil
+			}
+		}()
 
 		ctx := context.Background()
 		logger := ulogger.NewErrorTestLogger(t)
