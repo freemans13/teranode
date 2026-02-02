@@ -761,19 +761,7 @@ func (u *BlockValidation) hasValidSubtrees(block *model.Block) bool {
 		return false
 	}
 
-	// Check if subtrees are loaded and match expected count
-	if len(block.SubtreeSlices) != len(block.Subtrees) || len(block.SubtreeSlices) == 0 {
-		return false
-	}
-
-	// Verify all subtrees are non-nil
-	for _, subtree := range block.SubtreeSlices {
-		if subtree == nil {
-			return false
-		}
-	}
-
-	return true
+	return block.SubtreesLoaded()
 }
 
 // setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
@@ -964,9 +952,13 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 // current block to proceed with validation. This maintains proper blockchain ordering
 // and prevents validation of orphaned or premature blocks.
 //
-// The function queries the blockchain client to check the mining status of the parent
-// block, using the HashPrevBlock field from the provided block header. This check is
-// essential for maintaining chain consistency and proper block sequencing.
+// The function directly queries the blockchain client to check the mined_set status of
+// the parent block, using the HashPrevBlock field from the provided block header.
+// This check is essential for maintaining chain consistency and proper block sequencing.
+//
+// Note: This checks only the mined_set flag, not subtrees_set status. This means
+// it will wait for the parent to be marked as mined even if its subtrees are still
+// being processed, ensuring proper ordering of block validation and mining operations.
 //
 // Parameters:
 //   - ctx: Context for the operation, enabling cancellation and timeout handling
@@ -976,19 +968,9 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 //   - bool: True if the parent block has been mined, false otherwise
 //   - error: Any error encountered during the mining status verification
 func (u *BlockValidation) isParentMined(ctx context.Context, blockHeader *model.BlockHeader) (bool, error) {
-	blockNotMined, err := u.blockchainClient.GetBlocksMinedNotSet(ctx)
+	parentBlockMined, err := u.blockchainClient.GetBlockIsMined(ctx, blockHeader.HashPrevBlock)
 	if err != nil {
-		return false, errors.NewServiceError("[setTxMined][%s] failed to get blocks mined not set", blockHeader.Hash().String(), err)
-	}
-
-	// check whether our parent block is in the list of not mined blocks
-	parentBlockMined := true
-
-	for _, b := range blockNotMined {
-		if b.Header.Hash().IsEqual(blockHeader.HashPrevBlock) {
-			parentBlockMined = false
-			break
-		}
+		return false, errors.NewServiceError("[isParentMined][%s] failed to get parent mined status", blockHeader.Hash().String(), err)
 	}
 
 	return parentBlockMined, nil
@@ -1128,16 +1110,22 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			}
 
 			if block.SizeInBytes > excessiveBlockSizeUint64 {
+				u.storeInvalidBlock(ctx, block, baseURL, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
+
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block size %d exceeds excessiveblocksize %d", block.Header.Hash().String(), block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize)
 			}
 		}
 
 		if block.CoinbaseTx == nil || block.CoinbaseTx.Inputs == nil || len(block.CoinbaseTx.Inputs) == 0 {
+			u.storeInvalidBlock(ctx, block, baseURL, "coinbase tx is nil or empty")
+
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] coinbase tx is nil or empty", block.Header.Hash().String())
 		}
 
 		// check the coinbase length
 		if len(block.CoinbaseTx.Inputs[0].UnlockingScript.Bytes()) < 2 || len(block.CoinbaseTx.Inputs[0].UnlockingScript.Bytes()) > int(u.settings.ChainCfgParams.MaxCoinbaseScriptSigSize) {
+			u.storeInvalidBlock(ctx, block, baseURL, "bad coinbase length")
+
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] bad coinbase length", block.Header.Hash().String())
 		}
 
@@ -1196,21 +1184,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// Wait for reValidationBlock to do its thing
 		// When waitForPreviousBlocksToBeProcessed is done, all the previous blocks will be processed
 		if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
-			// Check if parent block actually needs setTxMined before re-triggering
-			blocksMinedNotSet, getErr := u.blockchainClient.GetBlocksMinedNotSet(ctx)
-			if getErr == nil {
-				parentNeedsMining := false
-				for _, b := range blocksMinedNotSet {
-					if b.Header.Hash().IsEqual(block.Header.HashPrevBlock) {
-						parentNeedsMining = true
-						break
-					}
-				}
-				if parentNeedsMining {
-					// re-trigger the setMinedChan for the parent block
-					u.setMinedChan <- block.Header.HashPrevBlock
-				}
-			}
+			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
+			u.setMinedChan <- block.Header.HashPrevBlock
 
 			if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
 				// Give up, the parent block isn't being fully validated
@@ -1479,11 +1454,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 		// Cache the block only if subtrees are loaded (they should be from Valid() call)
 		if u.hasValidSubtrees(block) {
-			u.logger.Debugf("[ValidateBlock][%s] caching block with %d subtrees loaded", block.Hash().String(), len(block.SubtreeSlices))
+			u.logger.Debugf("[ValidateBlock][%s] caching block with %d subtrees loaded", block.Hash().String(), block.GetSubtreeSlicesCount())
 			u.lastValidatedBlocks.Set(*block.Hash(), block)
 		} else {
-			if len(block.SubtreeSlices) != len(block.Subtrees) || len(block.SubtreeSlices) == 0 {
-				u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), len(block.SubtreeSlices), len(block.Subtrees))
+			if !block.SubtreesLoaded() {
+				u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), block.GetSubtreeSlicesCount(), len(block.Subtrees))
 			} else {
 				u.logger.Warnf("[ValidateBlock][%s] not caching block - some subtrees are nil", block.Hash().String())
 			}
