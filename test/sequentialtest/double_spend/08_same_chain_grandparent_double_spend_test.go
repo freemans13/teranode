@@ -166,6 +166,7 @@ func testSameChainGrandparentDoubleSpend(t *testing.T, utxoStore string) {
 	// This should succeed
 	require.NoError(t, td.PropagationClient.ProcessTransaction(td.Ctx, validChild),
 		"ValidChild should be accepted - it only spends unspent outputs")
+	require.NoError(t, td.WaitForTransactionInBlockAssembly(validChild, blockWait))
 	td.MineAndWait(t, 1)
 
 	block5, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 5)
