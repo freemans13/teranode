@@ -1260,8 +1260,9 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 
 					// Check if heartbeat was stale when error occurred
 					lastHB := c.lastHeartbeat.Load()
-					if lastHB > 0 && time.Since(time.Unix(0, lastHB)) > heartbeatTimeout {
-						c.logger.Warnf("[Blockchain] Heartbeat stale (%v), setting FSM to IDLE: %s", time.Since(time.Unix(0, lastHB)), source)
+					lastHeartbeatAge := time.Since(time.Unix(0, lastHB))
+					if lastHB > 0 && lastHeartbeatAge > heartbeatTimeout {
+						c.logger.Warnf("[Blockchain] Heartbeat stale (%v), setting FSM to IDLE: %s", lastHeartbeatAge, source)
 						idleState := FSMStateIDLE
 						c.fmsState.Store(&idleState)
 					}
