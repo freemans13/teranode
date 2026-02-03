@@ -1376,8 +1376,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					reason = err.Error()
 				}
 
-				// Check if we had a storage error; if so do not mark the block as invalid
-				if errors.Is(err, errors.ErrStorageError) {
+				// Check if we had an infrastructure error (storage, service, or processing);
+				// if so do not mark the block as invalid - these are transient issues
+				if errors.Is(err, errors.ErrStorageError) ||
+					errors.Is(err, errors.ErrServiceError) ||
+					errors.Is(err, errors.ErrProcessing) {
 					return err
 				}
 
