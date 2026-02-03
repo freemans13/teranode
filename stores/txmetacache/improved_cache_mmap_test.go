@@ -60,11 +60,11 @@ func TestTxMetaCache_Unallocated_Memory_1_2_3_GiB(t *testing.T) {
 				maxChunksPerBucket = 1
 			}
 
-			// With key=32 and val=2000: kvLen = 4+32+2000 = 2036 bytes -> 2 entries per 4096B chunk.
+			// With key=32 and val=2000: kvLen = 4+32+2000 = 2036 bytes -> 2 entries per 4KB chunk.
 			entriesPerChunk := uint64(2)
 			entriesToFullyAllocateBucket := maxChunksPerBucket * entriesPerChunk
 
-			// Fill all buckets to their per-bucket chunk capacity.
+			// Fill all buckets to their trim threshold (not full capacity)
 			for bi := 0; bi < BucketsCount; bi++ {
 				ub, ok := cache.buckets[bi].(*bucketUnallocated)
 				require.True(t, ok, "bucket %d is not bucketUnallocated", bi)
@@ -84,7 +84,16 @@ func TestTxMetaCache_Unallocated_Memory_1_2_3_GiB(t *testing.T) {
 					require.NoError(t, ub.Set(key, val, h))
 				}
 
-				require.Equal(t, maxChunksPerBucket, ub.allocatedChunks, "bucket %d should be fully allocated", bi)
+				// Verify each bucket allocated up to trim threshold (with small variance)
+				trimRatio := ub.trimRatio
+				expectedMinAllocatedChunks := uint64(float64(maxChunksPerBucket) * (100 - float64(trimRatio)) / 100)
+				if expectedMinAllocatedChunks < 1 {
+					expectedMinAllocatedChunks = 1
+				}
+				expectedMaxAllocatedChunks := expectedMinAllocatedChunks + (expectedMinAllocatedChunks / 20)
+
+				require.GreaterOrEqual(t, ub.allocatedChunks, expectedMinAllocatedChunks, "bucket %d should allocate at least min threshold (trimRatio=%d, maxChunks=%d)", bi, trimRatio, maxChunksPerBucket)
+				require.LessOrEqual(t, ub.allocatedChunks, expectedMaxAllocatedChunks, "bucket %d should not allocate more than max threshold (trimRatio=%d, maxChunks=%d)", bi, trimRatio, maxChunksPerBucket)
 			}
 
 			// Total off-heap chunk bytes mmapped is tracked by allocatedChunks.
@@ -99,6 +108,11 @@ func TestTxMetaCache_Unallocated_Memory_1_2_3_GiB(t *testing.T) {
 			for bi := 0; bi < BucketsCount; bi++ {
 				ub := cache.buckets[bi].(*bucketUnallocated)
 				allocatedAtFull := ub.allocatedChunks
+
+				// Only overwrite buckets that were actually allocated
+				if allocatedAtFull == 0 {
+					continue
+				}
 
 				// Overwrite enough entries to force wraparounds (exceed capacity in "entries"),
 				// but it must never allocate more chunk buffers once fully allocated.

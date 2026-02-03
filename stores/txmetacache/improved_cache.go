@@ -282,7 +282,7 @@ func New(maxBytes int, bucketType BucketType) (*ImprovedCache, error) {
 	case Unallocated:
 		for i := 0; i < BucketsCount; i++ {
 			c.buckets[i] = &bucketUnallocated{}
-			if err := c.buckets[i].Init(maxBucketBytes, 0); err != nil {
+			if err := c.buckets[i].Init(maxBucketBytes, trimRatio); err != nil {
 				return nil, errors.NewProcessingError("error creating unallocated cache", err)
 			}
 		}
@@ -298,7 +298,7 @@ func New(maxBytes int, bucketType BucketType) (*ImprovedCache, error) {
 	default: // trimmed cache
 		for i := 0; i < BucketsCount; i++ {
 			c.buckets[i] = &bucketTrimmed{}
-			if err := c.buckets[i].Init(maxBucketBytes, 0); err != nil {
+			if err := c.buckets[i].Init(maxBucketBytes, trimRatio); err != nil {
 				return nil, errors.NewProcessingError("error creating trimmed cache", err)
 			}
 		}
@@ -647,13 +647,15 @@ type bucketTrimmed struct {
 
 	elementsAdded int
 
+	trimRatio int
+
 	// number of items in the bucket.
 	numberOfItems int
 
 	overWriting bool
 }
 
-func (b *bucketTrimmed) Init(maxBytes uint64, _ int) error {
+func (b *bucketTrimmed) Init(maxBytes uint64, trimRatio int) error {
 	if maxBytes == 0 {
 		return errors.NewInvalidArgumentError("maxBytes cannot be zero")
 	}
@@ -676,6 +678,7 @@ func (b *bucketTrimmed) Init(maxBytes uint64, _ int) error {
 	b.chunks = make([][]byte, maxChunksInt)
 	b.m = txmap.NewSplitSwissLockFreeMapUint64(1024)
 	b.overWriting = false
+	b.trimRatio = trimRatio
 	b.Reset()
 
 	return nil
@@ -801,7 +804,7 @@ func (b *bucketTrimmed) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 
 	// calculate the idx of the k-v pair to be added
 	// adjust idxNew, calculate where the new k-v pair will end
-	// the new k-v pair must be in the same chunk.
+	// new k-v pair must be in the same chunk.
 	idx := b.idx
 	idxNew := idx + kvLen
 	chunkIdx := idx / ChunkSize
@@ -809,8 +812,13 @@ func (b *bucketTrimmed) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 
 	// check if we are crossing the chunk boundary, we need to allocate a new chunk
 	if chunkIdxNew > chunkIdx {
-		// if there are no more chunks to allocate, we need to reset the bucket
-		if chunkIdxNew >= uint64(len(chunks)) {
+		// if there are no more chunks to allocate, we need to reset bucket
+		maxChunks := uint64(len(chunks))
+		trimThreshold := uint64(float64(maxChunks) * (100 - float64(b.trimRatio)) / 100)
+		if trimThreshold < 1 {
+			trimThreshold = 1
+		}
+		if chunkIdxNew >= trimThreshold {
 			// writing needs to start over from the beginning.
 			idx = 0
 			idxNew = kvLen
@@ -1355,9 +1363,11 @@ type bucketUnallocated struct {
 	// maxSlabChunks is the per-bucket cap for mmap slab size (in chunks).
 	// It is computed from the configured bucket maxBytes.
 	maxSlabChunks uint64
+
+	trimRatio int
 }
 
-func (b *bucketUnallocated) Init(maxBytes uint64, _ int) error {
+func (b *bucketUnallocated) Init(maxBytes uint64, trimRatio int) error {
 	if maxBytes == 0 {
 		return errors.NewProcessingError("maxBytes cannot be zero")
 	}
@@ -1382,6 +1392,7 @@ func (b *bucketUnallocated) Init(maxBytes uint64, _ int) error {
 
 	b.chunks = make([][]byte, maxChunksInt)
 	b.m = make(map[uint64]uint64)
+	b.trimRatio = trimRatio
 
 	b.Reset()
 
@@ -1500,7 +1511,7 @@ func (b *bucketUnallocated) Set(k, v []byte, h uint64, skipLocking ...bool) erro
 
 	// calculate the idx of the k-v pair to be added
 	// adjust idxNew, calculate where the new k-v pair will end
-	// the new k-v pair must be in the same chunk.
+	// new k-v pair must be in same chunk.
 	idx := b.idx
 	idxNew := idx + kvLen
 	chunkIdx := idx / ChunkSize
@@ -1508,7 +1519,12 @@ func (b *bucketUnallocated) Set(k, v []byte, h uint64, skipLocking ...bool) erro
 	// check if we are crossing the chunk boundary, we need to allocate a new chunk
 	if chunkIdxNew > chunkIdx {
 		// if there are no more chunks to allocate, we need to reset the bucket
-		if chunkIdxNew >= uint64(len(chunks)) {
+		maxChunks := uint64(len(chunks))
+		trimThreshold := uint64(float64(maxChunks) * (100 - float64(b.trimRatio)) / 100)
+		if trimThreshold < 1 {
+			trimThreshold = 1
+		}
+		if chunkIdxNew >= trimThreshold {
 			// writing needs to start over from the beginning.
 			idx = 0
 			idxNew = kvLen
