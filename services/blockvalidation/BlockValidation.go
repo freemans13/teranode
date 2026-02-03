@@ -17,6 +17,7 @@ package blockvalidation
 import (
 	"context"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -167,6 +169,34 @@ type BlockValidation struct {
 
 	// backgroundTasks tracks background goroutines to ensure proper shutdown
 	backgroundTasks sync.WaitGroup
+}
+
+// subtreeStoreWrapper wraps blob.Store to implement model.SubtreeStoreWriter
+// This allows the subtree store to be used with the meta regenerator
+type subtreeStoreWrapper struct {
+	store blob.Store
+}
+
+// GetIoReader implements model.SubtreeStoreReader
+func (w *subtreeStoreWrapper) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...bloboptions.FileOption) (io.ReadCloser, error) {
+	return w.store.GetIoReader(ctx, key, fileType, opts...)
+}
+
+// Set implements model.SubtreeStoreWriter
+func (w *subtreeStoreWrapper) Set(ctx context.Context, key []byte, fileType fileformat.FileType, value []byte, opts ...bloboptions.FileOption) error {
+	return w.store.Set(ctx, key, fileType, value, opts...)
+}
+
+// createMetaRegenerator creates a SubtreeMetaRegenerator with the given peer URLs.
+// This is used to regenerate missing subtree meta files during block validation.
+// If peerURLs is empty and subtreeStore is nil, returns nil (regeneration not available).
+func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.SubtreeMetaRegeneratorI {
+	if u.subtreeStore == nil && len(peerURLs) == 0 {
+		return nil
+	}
+
+	wrapper := &subtreeStoreWrapper{store: u.subtreeStore}
+	return model.NewSubtreeMetaRegenerator(u.logger, wrapper, peerURLs, u.settings.Asset.APIPrefix)
 }
 
 // NewBlockValidation creates a new block validation instance with the provided dependencies.
@@ -1309,7 +1339,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 				u.logger.Infof("[ValidateBlock][%s] validating block in background", block.Hash().String())
 
-				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings); !ok {
+				// Create meta regenerator with peer URL for potential meta file recovery
+				metaRegenerator := u.createMetaRegenerator([]string{baseURL})
+				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 					u.logger.Errorf("[ValidateBlock][%s] InvalidateBlock block is not valid in background: %v", block.String(), err)
 
 					if errors.Is(err, errors.ErrBlockInvalid) {
@@ -1378,7 +1410,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// validate the block
 			u.logger.Infof("[ValidateBlock][%s] validating block", block.Hash().String())
 
-			if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings); !ok {
+			// Create meta regenerator with peer URL for potential meta file recovery
+			metaRegenerator := u.createMetaRegenerator([]string{baseURL})
+			if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 				reason := "unknown"
 				if err != nil {
 					reason = err.Error()
@@ -1693,7 +1727,9 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 
 	oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
-	if ok, err := blockData.block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings); !ok {
+	// Create meta regenerator with peer URL for potential meta file recovery during revalidation
+	metaRegenerator := u.createMetaRegenerator([]string{blockData.baseURL})
+	if ok, err := blockData.block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 		u.logger.Errorf("[ReValidateBlock][%s] InvalidateBlock block is not valid in background: %v", blockData.block.String(), err)
 
 		if errors.Is(err, errors.ErrBlockInvalid) {
