@@ -791,19 +791,7 @@ func (u *BlockValidation) hasValidSubtrees(block *model.Block) bool {
 		return false
 	}
 
-	// Check if subtrees are loaded and match expected count
-	if len(block.SubtreeSlices) != len(block.Subtrees) || len(block.SubtreeSlices) == 0 {
-		return false
-	}
-
-	// Verify all subtrees are non-nil
-	for _, subtree := range block.SubtreeSlices {
-		if subtree == nil {
-			return false
-		}
-	}
-
-	return true
+	return block.SubtreesLoaded()
 }
 
 // setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
@@ -942,36 +930,6 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		}
 
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
-	}
-
-	// Preserve parents of old unmined transactions to protect them from pruning.
-	//
-	// When a transaction sits unmined beyond UnminedTxRetention, its parents may be fully spent
-	// and eligible for DAH pruning. We preserve those parents by setting PreserveUntil so they
-	// remain available if the child is later mined or resubmitted.
-	//
-	// FSM STATE DETERMINES WHEN TO RUN:
-	// - FSMStateRUNNING: Run on every block (normal operation, unmined pool is stable)
-	// - FSMStateCATCHINGBLOCKS: Skip (Block Assembly handles at startup as one-time batch operation)
-	//
-	// WHY DIFFERENT BEHAVIOR FOR CATCHINGBLOCKS:
-	// During catchup, child txs transition from unmined→mined rapidly. By the time we execute this
-	// code, the child's UnminedSince is already cleared (no longer in unmined query results).
-	// Block Assembly startup runs before any txs are mined, catching all unmined txs while they're
-	// still in the pool. This eliminates the timing window and is more efficient (one batch vs per-block).
-	if len(unsetMined) == 0 || !unsetMined[0] {
-		// Only preserve when setting mined (not when unsetting during invalidation)
-		fsmState, fsmErr := u.blockchainClient.GetFSMCurrentState(ctx)
-		if fsmErr != nil {
-			u.logger.Warnf("[setTxMined][%s] Failed to get blockchain FSM state for parent preservation: %v", block.Hash().String(), fsmErr)
-			// Continue - best effort
-		} else if fsmState != nil && *fsmState == blockchain.FSMStateRUNNING {
-			// Only preserve during normal operation (catchup is handled at Block Assembly startup)
-			if _, preserveErr := utxo.PreserveParentsOfOldUnminedTransactions(ctx, u.utxoStore, block.Height, u.settings, u.logger); preserveErr != nil {
-				u.logger.Errorf("[setTxMined][%s] Failed to preserve parents at height %d: %v", block.Hash().String(), block.Height, preserveErr)
-				// Continue - best effort, pruner will still run
-			}
-		}
 	}
 
 	// Clear subtrees to free memory - they're no longer needed after UpdateTxMinedStatus
@@ -1500,11 +1458,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 		// Cache the block only if subtrees are loaded (they should be from Valid() call)
 		if u.hasValidSubtrees(block) {
-			u.logger.Debugf("[ValidateBlock][%s] caching block with %d subtrees loaded", block.Hash().String(), len(block.SubtreeSlices))
+			u.logger.Debugf("[ValidateBlock][%s] caching block with %d subtrees loaded", block.Hash().String(), block.GetSubtreeSlicesCount())
 			u.lastValidatedBlocks.Set(*block.Hash(), block)
 		} else {
-			if len(block.SubtreeSlices) != len(block.Subtrees) || len(block.SubtreeSlices) == 0 {
-				u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), len(block.SubtreeSlices), len(block.Subtrees))
+			if !block.SubtreesLoaded() {
+				u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), block.GetSubtreeSlicesCount(), len(block.Subtrees))
 			} else {
 				u.logger.Warnf("[ValidateBlock][%s] not caching block - some subtrees are nil", block.Hash().String())
 			}
