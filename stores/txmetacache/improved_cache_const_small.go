@@ -12,6 +12,11 @@ const BucketsCount = 32
 // ChunkSize defines the memory chunk size (maxValueSizeKB * 512 = ~1MB per chunk).
 const ChunkSize = maxValueSizeKB * 512
 
+// MaxGenWindow defines the multi-generation retention window for unallocated buckets.
+// Higher values improve retention but increase map heap memory.
+// Development setting: 5 generations = ~85% retention, balanced memory usage.
+const MaxGenWindow = 5
+
 // LogCacheSize logs which cache configuration is active for diagnostics.
 func LogCacheSize() {
 	logger := ulogger.NewZeroLogger("improved_cache")

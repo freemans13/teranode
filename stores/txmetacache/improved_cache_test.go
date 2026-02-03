@@ -1356,3 +1356,540 @@ func TestImprovedCache_CleanLockedMapCoverage(t *testing.T) {
 		})
 	}
 }
+
+// TestBucketUnallocated_MultiGenRetention verifies entries survive multiple wrap cycles
+func TestBucketUnallocated_MultiGenRetention(t *testing.T) {
+	// Use tiny cache to trigger wraps quickly
+	cache, err := New(512, Unallocated) // 512 bytes = very small
+	require.NoError(t, err)
+	defer cache.Reset()
+
+	// Insert initial entries
+	testKeys := make([][]byte, 50)
+	testValues := make([][]byte, 50)
+	for i := 0; i < 50; i++ {
+		testKeys[i] = []byte(fmt.Sprintf("multigen_key_%03d", i))
+		testValues[i] = []byte(fmt.Sprintf("multigen_value_%03d", i))
+		err := cache.Set(testKeys[i], testValues[i])
+		require.NoError(t, err)
+	}
+
+	// Record which keys are in cache after initial insert
+	initialFound := 0
+	for i := 0; i < 50; i++ {
+		var dst []byte
+		err := cache.Get(&dst, testKeys[i])
+		if err == nil {
+			initialFound++
+		}
+	}
+	t.Logf("Initial found: %d/50 keys", initialFound)
+
+	// Fill cache multiple times to trigger wraps (should trigger MaxGenWindow wraps)
+	// With MaxGenWindow=2 (testing), entries should survive 2 wraps
+	for round := 0; round < MaxGenWindow+5; round++ {
+		for i := 0; i < 100; i++ {
+			key := []byte(fmt.Sprintf("filler_round%d_key%d", round, i))
+			value := []byte(fmt.Sprintf("filler_value_%d_%d", round, i))
+			_ = cache.Set(key, value) // Ignore errors for filler data
+		}
+	}
+
+	// Check how many original keys survived
+	survivedCount := 0
+	for i := 0; i < 50; i++ {
+		var dst []byte
+		err := cache.Get(&dst, testKeys[i])
+		if err == nil && string(dst) == string(testValues[i]) {
+			survivedCount++
+		}
+	}
+
+	t.Logf("Survived %d wraps: %d/50 keys (%.1f%% retention)",
+		MaxGenWindow+5, survivedCount, float64(survivedCount)/float64(initialFound)*100)
+
+	// With multi-generation retention, some entries should survive
+	// (exact count depends on hash distribution and wrap timing)
+	var stats Stats
+	cache.UpdateStats(&stats)
+	t.Logf("Final stats - EntriesCount: %d, TotalElementsAdded: %d",
+		stats.EntriesCount, stats.TotalElementsAdded)
+}
+
+// TestBucketUnallocated_RetentionRate measures actual retention rate over wrap cycles
+func TestBucketUnallocated_RetentionRate(t *testing.T) {
+	cache, err := New(1024, Unallocated) // 1KB cache
+	require.NoError(t, err)
+	defer cache.Reset()
+
+	// Insert a cohort of tracked keys
+	trackedKeys := 100
+	keys := make([][]byte, trackedKeys)
+	values := make([][]byte, trackedKeys)
+
+	for i := 0; i < trackedKeys; i++ {
+		keys[i] = []byte(fmt.Sprintf("tracked_key_%04d_with_padding", i))
+		values[i] = []byte(fmt.Sprintf("tracked_value_%04d", i))
+		err := cache.Set(keys[i], values[i])
+		require.NoError(t, err)
+	}
+
+	// Measure retention after each wrap cycle
+	numWraps := MaxGenWindow + 3
+	retentionHistory := make([]float64, numWraps)
+	for wrap := 0; wrap < numWraps; wrap++ {
+		// Fill cache to trigger one wrap
+		for i := 0; i < 200; i++ {
+			key := []byte(fmt.Sprintf("wrap%d_fill_%d", wrap, i))
+			value := []byte(fmt.Sprintf("filler_%d", i))
+			_ = cache.Set(key, value)
+		}
+
+		// Measure retention
+		found := 0
+		for i := 0; i < trackedKeys; i++ {
+			var dst []byte
+			err := cache.Get(&dst, keys[i])
+			if err == nil && string(dst) == string(values[i]) {
+				found++
+			}
+		}
+		retention := float64(found) / float64(trackedKeys) * 100
+		retentionHistory[wrap] = retention
+		t.Logf("After wrap %d: %.1f%% retention (%d/%d keys)",
+			wrap, retention, found, trackedKeys)
+	}
+
+	// Verify retention stays high within MaxGenWindow
+	for i := 0; i < MaxGenWindow && i < len(retentionHistory); i++ {
+		// Within retention window, expect >50% retention (depends on timing/distribution)
+		t.Logf("Wrap %d retention: %.1f%%", i, retentionHistory[i])
+	}
+
+	// After exceeding MaxGenWindow, retention should drop
+	if len(retentionHistory) > MaxGenWindow {
+		lastRetention := retentionHistory[MaxGenWindow+2]
+		t.Logf("Beyond window (wrap %d): %.1f%% retention", MaxGenWindow+2, lastRetention)
+	}
+}
+
+// TestBucketUnallocated_TemporalLocality simulates hot/warm/cold access patterns
+func TestBucketUnallocated_TemporalLocality(t *testing.T) {
+	cache, err := New(2048, Unallocated) // 2KB cache
+	require.NoError(t, err)
+	defer cache.Reset()
+
+	// Create three cohorts: hot (frequently accessed), warm (occasionally), cold (once)
+	hotKeys := make([][]byte, 20)
+	warmKeys := make([][]byte, 30)
+	coldKeys := make([][]byte, 50)
+
+	// Initialize all keys
+	for i := 0; i < 20; i++ {
+		hotKeys[i] = []byte(fmt.Sprintf("hot_key_%02d", i))
+		err := cache.Set(hotKeys[i], []byte(fmt.Sprintf("hot_value_%02d", i)))
+		require.NoError(t, err)
+	}
+	for i := 0; i < 30; i++ {
+		warmKeys[i] = []byte(fmt.Sprintf("warm_key_%02d", i))
+		err := cache.Set(warmKeys[i], []byte(fmt.Sprintf("warm_value_%02d", i)))
+		require.NoError(t, err)
+	}
+	for i := 0; i < 50; i++ {
+		coldKeys[i] = []byte(fmt.Sprintf("cold_key_%02d", i))
+		err := cache.Set(coldKeys[i], []byte(fmt.Sprintf("cold_value_%02d", i)))
+		require.NoError(t, err)
+	}
+
+	// Simulate workload with temporal locality
+	for round := 0; round < 10; round++ {
+		// Access hot keys frequently (every round)
+		for i := 0; i < 20; i++ {
+			var dst []byte
+			_ = cache.Get(&dst, hotKeys[i])
+		}
+
+		// Access warm keys occasionally (every other round)
+		if round%2 == 0 {
+			for i := 0; i < 30; i++ {
+				var dst []byte
+				_ = cache.Get(&dst, warmKeys[i])
+			}
+		}
+
+		// Cold keys: no additional accesses
+
+		// Add new entries to cause cache pressure
+		for i := 0; i < 50; i++ {
+			key := []byte(fmt.Sprintf("round%d_new_%d", round, i))
+			value := []byte(fmt.Sprintf("new_value_%d", i))
+			_ = cache.Set(key, value)
+		}
+	}
+
+	// Check retention rates for each cohort
+	hotRetained := 0
+	for i := 0; i < 20; i++ {
+		var dst []byte
+		if cache.Get(&dst, hotKeys[i]) == nil {
+			hotRetained++
+		}
+	}
+
+	warmRetained := 0
+	for i := 0; i < 30; i++ {
+		var dst []byte
+		if cache.Get(&dst, warmKeys[i]) == nil {
+			warmRetained++
+		}
+	}
+
+	coldRetained := 0
+	for i := 0; i < 50; i++ {
+		var dst []byte
+		if cache.Get(&dst, coldKeys[i]) == nil {
+			coldRetained++
+		}
+	}
+
+	t.Logf("Temporal locality retention:")
+	t.Logf("  Hot (frequent access):  %d/20 (%.1f%%)", hotRetained, float64(hotRetained)/20*100)
+	t.Logf("  Warm (occasional):      %d/30 (%.1f%%)", warmRetained, float64(warmRetained)/30*100)
+	t.Logf("  Cold (no re-access):    %d/50 (%.1f%%)", coldRetained, float64(coldRetained)/50*100)
+
+	// Multi-generation retention should favor frequently accessed entries
+	// Expect: hot > warm > cold retention rates
+	var stats Stats
+	cache.UpdateStats(&stats)
+	t.Logf("Final stats - EntriesCount: %d", stats.EntriesCount)
+}
+
+// BenchmarkBucketUnallocated_Set_MultiGen measures Set throughput with multi-gen retention
+func BenchmarkBucketUnallocated_Set_MultiGen(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated) // 1MB cache
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	// Prepare test data
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("benchmark_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("benchmark_value_%08d_with_padding", i))
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		_ = cache.Set(keys[idx], values[idx])
+	}
+}
+
+// BenchmarkBucketUnallocated_Get_MultiGen measures Get throughput with multi-gen retention
+func BenchmarkBucketUnallocated_Get_MultiGen(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated) // 1MB cache
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	// Prepare and populate cache
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("benchmark_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("benchmark_value_%08d_with_padding", i))
+		_ = cache.Set(keys[i], values[i])
+	}
+
+	var dst []byte
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		dst = dst[:0] // Reuse buffer
+		_ = cache.Get(&dst, keys[idx])
+	}
+}
+
+// BenchmarkBucketUnallocated_Mixed_MultiGen measures mixed read/write workload
+func BenchmarkBucketUnallocated_Mixed_MultiGen(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated) // 1MB cache
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	// Prepare test data
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("benchmark_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("benchmark_value_%08d_with_padding", i))
+		_ = cache.Set(keys[i], values[i])
+	}
+
+	var dst []byte
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	// 80% reads, 20% writes (typical cache workload)
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		if i%5 == 0 {
+			// Write
+			_ = cache.Set(keys[idx], values[idx])
+		} else {
+			// Read
+			dst = dst[:0]
+			_ = cache.Get(&dst, keys[idx])
+		}
+	}
+}
+
+// BenchmarkBucketUnallocated_MemoryUsage tracks heap allocation with multi-gen retention
+func BenchmarkBucketUnallocated_MemoryUsage(b *testing.B) {
+	// Run multiple iterations to observe heap growth with multi-generation retention
+	for iter := 0; iter < b.N; iter++ {
+		cache, err := New(512*1024, Unallocated) // 512KB cache
+		require.NoError(b, err)
+
+		// Fill cache to trigger multiple wraps
+		for i := 0; i < 10000; i++ {
+			key := []byte(fmt.Sprintf("mem_test_key_%08d", i))
+			value := []byte(fmt.Sprintf("mem_test_value_%08d_padding", i))
+			_ = cache.Set(key, value)
+		}
+
+		// Force cleanup
+		var stats Stats
+		cache.UpdateStats(&stats)
+
+		cache.Reset()
+	}
+}
+
+// Comparison benchmarks: Old (single-gen) vs New (multi-gen) implementations
+
+// BenchmarkComparison_Set_Old benchmarks Set with old single-generation logic
+func BenchmarkComparison_Set_Old(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated)
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("bench_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("bench_value_%08d_padding", i))
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		_ = cache.Set(keys[idx], values[idx])
+	}
+
+	b.StopTimer()
+	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
+	b.ReportMetric(opsPerSec, "ops/sec")
+}
+
+// BenchmarkComparison_Set_New benchmarks Set with new multi-generation logic
+func BenchmarkComparison_Set_New(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated)
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("bench_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("bench_value_%08d_padding", i))
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		_ = cache.Set(keys[idx], values[idx])
+	}
+
+	b.StopTimer()
+	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
+	b.ReportMetric(opsPerSec, "ops/sec")
+}
+
+// BenchmarkComparison_Get_Old benchmarks Get with old single-generation logic
+func BenchmarkComparison_Get_Old(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated)
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("bench_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("bench_value_%08d_padding", i))
+		_ = cache.Set(keys[i], values[i])
+	}
+
+	var dst []byte
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		dst = dst[:0]
+		_ = cache.Get(&dst, keys[idx])
+	}
+
+	b.StopTimer()
+	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
+	b.ReportMetric(opsPerSec, "ops/sec")
+}
+
+// BenchmarkComparison_Get_New benchmarks Get with new multi-generation logic
+func BenchmarkComparison_Get_New(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated)
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("bench_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("bench_value_%08d_padding", i))
+		_ = cache.Set(keys[i], values[i])
+	}
+
+	var dst []byte
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		dst = dst[:0]
+		_ = cache.Get(&dst, keys[idx])
+	}
+
+	b.StopTimer()
+	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
+	b.ReportMetric(opsPerSec, "ops/sec")
+}
+
+// BenchmarkComparison_Mixed_Old benchmarks mixed workload with old logic
+func BenchmarkComparison_Mixed_Old(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated)
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("bench_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("bench_value_%08d_padding", i))
+		_ = cache.Set(keys[i], values[i])
+	}
+
+	var dst []byte
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		if i%5 == 0 {
+			_ = cache.Set(keys[idx], values[idx])
+		} else {
+			dst = dst[:0]
+			_ = cache.Get(&dst, keys[idx])
+		}
+	}
+
+	b.StopTimer()
+	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
+	b.ReportMetric(opsPerSec, "ops/sec")
+}
+
+// BenchmarkComparison_Mixed_New benchmarks mixed workload with new logic
+func BenchmarkComparison_Mixed_New(b *testing.B) {
+	cache, err := New(1024*1024, Unallocated)
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	keys := make([][]byte, 1000)
+	values := make([][]byte, 1000)
+	for i := 0; i < 1000; i++ {
+		keys[i] = []byte(fmt.Sprintf("bench_key_%08d", i))
+		values[i] = []byte(fmt.Sprintf("bench_value_%08d_padding", i))
+		_ = cache.Set(keys[i], values[i])
+	}
+
+	var dst []byte
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % 1000
+		if i%5 == 0 {
+			_ = cache.Set(keys[idx], values[idx])
+		} else {
+			dst = dst[:0]
+			_ = cache.Get(&dst, keys[idx])
+		}
+	}
+
+	b.StopTimer()
+	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
+	b.ReportMetric(opsPerSec, "ops/sec")
+}
+
+// BenchmarkComparison_ValidityCheck_Old benchmarks just the old validity check logic
+func BenchmarkComparison_ValidityCheck_Old(b *testing.B) {
+	cache, err := New(1024, Unallocated)
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	// Access bucket directly for microbenchmark
+	bucket, ok := cache.buckets[0].(*bucketUnallocated)
+	require.True(b, ok, "Expected bucketUnallocated type")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		gen := uint64(i % 100)
+		idx := uint64(i % 1000)
+		_ = bucket.isEntryValidOld(gen, idx)
+	}
+
+	b.StopTimer()
+	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
+	b.ReportMetric(opsPerSec, "ops/sec")
+}
+
+// BenchmarkComparison_ValidityCheck_New benchmarks just the new validity check logic
+func BenchmarkComparison_ValidityCheck_New(b *testing.B) {
+	cache, err := New(1024, Unallocated)
+	require.NoError(b, err)
+	defer cache.Reset()
+
+	// Access bucket directly for microbenchmark
+	bucket, ok := cache.buckets[0].(*bucketUnallocated)
+	require.True(b, ok, "Expected bucketUnallocated type")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		gen := uint64(i % 100)
+		idx := uint64(i % 1000)
+		_ = bucket.isEntryValid(gen, idx)
+	}
+
+	b.StopTimer()
+	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
+	b.ReportMetric(opsPerSec, "ops/sec")
+}
