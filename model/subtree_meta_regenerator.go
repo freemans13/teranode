@@ -48,7 +48,7 @@ func NewSubtreeMetaRegenerator(logger ulogger.Logger, subtreeStore SubtreeStoreW
 		subtreeStore: subtreeStore,
 		peerURLs:     peerURLs,
 		apiPrefix:    apiPrefix,
-		httpClient:   &http.Client{Timeout: 5 * time.Minute},
+		httpClient:   &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -111,7 +111,10 @@ func (r *SubtreeMetaRegenerator) getSubtreeDataFromPeer(ctx context.Context, sub
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.NewNotFoundError("peer returned status %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, errors.NewNotFoundError("peer returned 404 not found")
+		}
+		return nil, errors.NewServiceError("peer returned HTTP %d", resp.StatusCode)
 	}
 
 	return subtreepkg.NewSubtreeDataFromReader(subtree, resp.Body)
