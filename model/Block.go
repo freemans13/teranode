@@ -714,9 +714,7 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 		err                 error
 	)
 
-	subtreeMetaSlice, err = retry.Retry(ctx, logger, func() (*subtreepkg.Meta, error) {
-		return b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
-	}, retry.WithMessage(fmt.Sprintf("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice", b.String(), subtreeHash.String(), sIdx)))
+	subtreeMetaSlice, err = b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
 
 	// Attempt regeneration if meta not found and regenerator is available
 	if err != nil && deps.metaRegenerator != nil {
