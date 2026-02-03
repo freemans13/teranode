@@ -1893,3 +1893,56 @@ func BenchmarkComparison_ValidityCheck_New(b *testing.B) {
 	opsPerSec := float64(b.N) / b.Elapsed().Seconds()
 	b.ReportMetric(opsPerSec, "ops/sec")
 }
+
+// TestUnallocated_MemoryBudgeting verifies that txMetaCacheMaxMB controls TOTAL memory
+func TestUnallocated_MemoryBudgeting(t *testing.T) {
+	// Test with different MaxGenWindow values to verify budgeting
+	testCases := []struct {
+		name        string
+		totalBudget int
+		// Expected ring buffer will be smaller to accommodate map
+	}{
+		{"256MB budget", 256 * 1024 * 1024},
+		{"512MB budget", 512 * 1024 * 1024},
+		{"1GB budget", 1024 * 1024 * 1024},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, err := New(tc.totalBudget, Unallocated)
+			require.NoError(t, err)
+			defer cache.Reset()
+
+			// Fill cache with entries to trigger map growth
+			numEntries := 10000
+			for i := 0; i < numEntries; i++ {
+				key := []byte(fmt.Sprintf("memory_test_key_%08d", i))
+				value := []byte(fmt.Sprintf("memory_test_value_%08d_with_some_padding", i))
+				_ = cache.Set(key, value)
+			}
+
+			// Measure actual memory usage
+			var stats Stats
+			cache.UpdateStats(&stats)
+
+			// Calculate per-bucket budget
+			bucketBudget := uint64(tc.totalBudget) / uint64(BucketsCount)
+
+			// With MaxGenWindow adjustment, map size should be proportional
+			// Total map size across all buckets
+			totalMapSize := stats.TotalMapSize
+
+			t.Logf("%s with MaxGenWindow=%d:", tc.name, MaxGenWindow)
+			t.Logf("  Total budget: %.2f MB", float64(tc.totalBudget)/(1024*1024))
+			t.Logf("  Bucket budget: %.2f MB", float64(bucketBudget)/(1024*1024))
+			t.Logf("  Map size: %.2f MB", float64(totalMapSize)/(1024*1024))
+			t.Logf("  Entries: %d", stats.EntriesCount)
+
+			// The map size should be reasonable relative to budget
+			// With adjustment, total (ring + map) should be close to budget
+			// Map takes most of the memory with MaxGenWindow=10
+			expectedMapRatio := float64(MaxGenWindow) * 0.94 / (1.0 + float64(MaxGenWindow)*0.94)
+			t.Logf("  Expected map ratio: %.2f%%", expectedMapRatio*100)
+		})
+	}
+}

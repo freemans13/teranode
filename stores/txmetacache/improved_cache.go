@@ -240,11 +240,56 @@ type ImprovedCache struct {
 	trimRatio int
 }
 
+// calculateRingBufferSize adjusts the ring buffer allocation to account for map overhead
+// in multi-generation retention mode, ensuring total memory (ring + map) stays within budget.
+//
+// For single-generation retention (MaxGenWindow = 1), returns maxBucketBytes unchanged.
+// For multi-generation retention, calculates ring buffer size such that:
+//
+//	Total Memory = Ring Buffer + Map ≈ maxBucketBytes
+//
+// The map overhead multiplier is empirically determined from the relationship:
+//
+//	Map Size ≈ Ring Buffer × MaxGenWindow × 0.94
+//
+// where 0.94 accounts for entry size vs map entry overhead (16 bytes per map entry).
+//
+// Formula:
+//
+//	Total = Ring × (1 + MaxGenWindow × 0.94)
+//	Ring = Total / (1 + MaxGenWindow × 0.94)
+func calculateRingBufferSize(maxBucketBytes uint64) uint64 {
+	// Single-generation mode: no adjustment needed
+	if MaxGenWindow <= 1 {
+		return maxBucketBytes
+	}
+
+	// Map overhead ratio: (8 bytes key + 8 bytes value) per entry
+	// divided by average entry size (~17 bytes per our measurements)
+	const mapOverheadRatio = 0.94
+
+	// Total memory multiplier with multi-generation retention
+	totalMultiplier := 1.0 + float64(MaxGenWindow)*mapOverheadRatio
+
+	// Calculate ring buffer size to fit within total budget
+	ringBufferSize := uint64(float64(maxBucketBytes) / totalMultiplier)
+
+	// Ensure minimum viable ring buffer size
+	minRingSize := uint64(ChunkSize * 4)
+	if ringBufferSize < minRingSize {
+		ringBufferSize = minRingSize
+	}
+
+	return ringBufferSize
+}
+
 // New creates a new cache instance with the specified memory allocation strategy.
 //
 // Parameters:
-//   - maxBytes: Maximum memory capacity of the cache in bytes. This is divided evenly
-//     among all buckets.
+//   - maxBytes: Maximum TOTAL memory capacity of the cache in bytes (ring buffer + map heap).
+//     For Unallocated buckets with multi-generation retention, this is automatically adjusted
+//     to account for map overhead. The ring buffer will be sized smaller to ensure total
+//     memory (ring + map) stays within maxBytes.
 //   - bucketType: The memory allocation strategy to use (Unallocated, Preallocated, or Trimmed)
 //     which affects performance characteristics and memory usage patterns:
 //   - Unallocated: Allocates memory on demand, suitable for caches with unpredictable usage patterns
@@ -257,6 +302,14 @@ type ImprovedCache struct {
 //
 // The cache distributes data across multiple buckets to reduce lock contention,
 // with each bucket initialized according to the specified allocation strategy.
+//
+// Memory budgeting for Unallocated buckets:
+// With multi-generation retention (MaxGenWindow > 1), the map heap memory grows proportionally.
+// To respect the maxBytes budget as TOTAL memory, we calculate:
+//
+//	Ring Buffer Size = maxBytes / (1 + MaxGenWindow × MapOverheadRatio)
+//
+// where MapOverheadRatio ≈ 0.94 (empirically measured).
 func New(maxBytes int, bucketType BucketType) (*ImprovedCache, error) {
 	LogCacheSize() // log whether we are using small or large cache
 
@@ -280,9 +333,12 @@ func New(maxBytes int, bucketType BucketType) (*ImprovedCache, error) {
 	switch bucketType {
 	// if the cache is unallocated cache, unallocatedCache is false, minedBlockStore
 	case Unallocated:
+		// Adjust bucket size for multi-generation retention overhead
+		adjustedBucketBytes := calculateRingBufferSize(maxBucketBytes)
+
 		for i := 0; i < BucketsCount; i++ {
 			c.buckets[i] = &bucketUnallocated{}
-			if err := c.buckets[i].Init(maxBucketBytes, 0); err != nil {
+			if err := c.buckets[i].Init(adjustedBucketBytes, 0); err != nil {
 				return nil, errors.NewProcessingError("error creating unallocated cache", err)
 			}
 		}

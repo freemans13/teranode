@@ -54,8 +54,10 @@ func TestTxMetaCache_Unallocated_Memory_1_2_3_GiB(t *testing.T) {
 			maxBucketBytes := tt.cacheBytes / uint64(BucketsCount)
 			require.NotZero(t, maxBucketBytes)
 
-			// Init() floors to whole chunks.
-			maxChunksPerBucket := maxBucketBytes / uint64(ChunkSize)
+			// With multi-generation retention, ring buffer is adjusted to account for map overhead.
+			// Use the actual adjusted size from the bucket's initialized chunks array.
+			ub0 := cache.buckets[0].(*bucketUnallocated)
+			maxChunksPerBucket := uint64(len(ub0.chunks))
 			if maxChunksPerBucket == 0 {
 				maxChunksPerBucket = 1
 			}
