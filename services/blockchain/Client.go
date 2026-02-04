@@ -1276,6 +1276,30 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 					break
 				}
 
+				if resp.Type == model.NotificationType_PING {
+					// Update heartbeat immediately on receipt to avoid staleness races.
+					c.lastHeartbeat.Store(time.Now().UnixNano())
+
+					notification := &blockchain_api.Notification{
+						Type:     resp.Type,
+						Hash:     nil,
+						Base_URL: resp.Base_URL,
+						Metadata: resp.Metadata,
+					}
+
+					// Use a timeout for sending to prevent blocking
+					select {
+					case ch <- notification:
+						// Successfully sent
+					case <-time.After(5 * time.Second):
+						c.logger.Warnf("[Blockchain] timeout sending notification for %s, channel may be blocked", source)
+					case <-ctx.Done():
+						return
+					}
+
+					continue
+				}
+
 				hash, err := chainhash.NewHash(resp.Hash)
 				if err != nil {
 					c.logger.Errorf("[Blockchain] failed to parse hash: %v", err)
