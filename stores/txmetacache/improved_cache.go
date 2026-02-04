@@ -914,7 +914,7 @@ func (b *bucketTrimmed) Get(dst *[]byte, k []byte, h uint64, returnDst bool, ski
 			valLen := (uint64(vLenBuf[0]) << 8) | uint64(vLenBuf[1])
 			idx += 2
 
-			if idx+keyLen+valLen >= ChunkSize {
+			if idx+keyLen+valLen > ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				goto end
 			}
@@ -1300,7 +1300,7 @@ func (b *bucketPreallocated) Get(dst *[]byte, k []byte, h uint64, returnDst bool
 			valLen := (uint64(vLenBuf[0]) << 8) | uint64(vLenBuf[1])
 			idx += 2
 
-			if idx+keyLen+valLen >= ChunkSize {
+			if idx+keyLen+valLen > ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				goto end
 			}
@@ -1605,7 +1605,7 @@ func (b *bucketUnallocated) Get(dst *[]byte, k []byte, h uint64, returnDst bool,
 
 			idx += 2
 
-			if idx+keyLen+valLen >= ChunkSize {
+			if idx+keyLen+valLen > ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				goto end
 			}
