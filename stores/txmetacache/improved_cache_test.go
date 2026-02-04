@@ -1366,14 +1366,21 @@ func TestImprovedCache_CleanLockedMapCoverage(t *testing.T) {
 // This test runs at dev scale (4GB) to prove the algorithm works before extrapolating to production (640GB).
 func TestTxMetaCache_ClockRetention90Percent(t *testing.T) {
 	// Test with 4GB cache (~22.6M entries at 177 bytes/entry)
-	cache, err := New(4*1024*1024*1024, Clock)
+	// With race detector, use 1GB to avoid timeout (race adds 5-10x overhead)
+	cacheSize := 4 * 1024 * 1024 * 1024
+	if raceDetectorEnabled {
+		cacheSize = 1 * 1024 * 1024 * 1024
+		t.Log("Race detector enabled: using 1GB cache to avoid timeout")
+	}
+
+	cache, err := New(cacheSize, Clock)
 	require.NoError(t, err)
 	defer cache.Reset()
 
 	entrySize := 177
-	capacity := int(float64(4*1024*1024*1024) / float64(entrySize))
+	capacity := int(float64(cacheSize) / float64(entrySize))
 
-	t.Logf("Testing 4GB Clock cache with capacity ~%d entries", capacity)
+	t.Logf("Testing %dGB Clock cache with capacity ~%d entries", cacheSize/(1024*1024*1024), capacity)
 
 	// Phase 1: Fill cache and trigger wrap cycles by inserting 2x capacity
 	// This exercises the Clock algorithm's eviction logic extensively
@@ -1466,11 +1473,12 @@ func TestTxMetaCache_ClockRetention90Percent(t *testing.T) {
 		"Data integrity %.1f%% is below 90%% target - cache is corrupting data", integrityRate*100)
 
 	// Verify memory efficiency
-	bytesPerEntry := float64(4*1024*1024*1024) / float64(actualEntries)
+	bytesPerEntry := float64(cacheSize) / float64(actualEntries)
 	t.Logf("Memory efficiency: %.1f bytes/entry (target: ≤177)", bytesPerEntry)
 	require.LessOrEqual(t, bytesPerEntry, 180.0, "Memory per entry exceeds budget")
 
-	t.Log("✓ Clock algorithm verified: High utilization + high integrity at 4GB scale")
+	cacheGB := cacheSize / (1024 * 1024 * 1024)
+	t.Logf("✓ Clock algorithm verified: High utilization + high integrity at %dGB scale", cacheGB)
 }
 
 // TestTxMetaCache_ClockLinearScaling proves linear scaling from 1GB to 4GB with Clock.
