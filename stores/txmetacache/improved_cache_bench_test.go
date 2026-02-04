@@ -373,6 +373,7 @@ func BenchmarkCacheConcurrency(b *testing.B) {
 		}
 	}
 }
+
 // BenchmarkCacheSweepThroughput validates Clock performance during active sweeping
 // Tests concurrent reads/writes while cache oscillates 90-100% to verify:
 // - Throughput remains consistent during sweep cycles
