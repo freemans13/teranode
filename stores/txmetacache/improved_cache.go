@@ -1974,13 +1974,8 @@ func (b *bucketClock) UpdateStats(s *Stats) {
 	s.ClockForcedEvictions += atomic.LoadUint64(&b.forcedEvictions)
 }
 
-// listChunks prints bucket state for debugging (Clock buckets use slots, not chunks).
 func (b *bucketClock) listChunks() {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	fmt.Printf("Clock bucket: %d entries, %d capacity, clockHand at %d\n",
-		b.count, b.capacity, b.clockHand)
+	fmt.Println("slots: ", b.slots)
 }
 
 // getMapSize returns the current map size.
