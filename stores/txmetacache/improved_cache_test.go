@@ -1488,6 +1488,13 @@ func TestTxMetaCache_ClockLinearScaling(t *testing.T) {
 
 	results := make([]map[string]interface{}, len(sizes))
 
+	// Adjust overfill based on race detector (race detector adds 5-10x overhead)
+	overfillMultiplier := 2.0
+	if raceDetectorEnabled {
+		overfillMultiplier = 1.2 // Reduce to 1.2x capacity when race detector is enabled
+		t.Log("Race detector enabled: reducing test scale to 1.2x capacity for faster completion")
+	}
+
 	for i, tc := range sizes {
 		t.Run(tc.name, func(t *testing.T) {
 			sizeBytes := tc.sizeGB * 1024 * 1024 * 1024
@@ -1495,8 +1502,8 @@ func TestTxMetaCache_ClockLinearScaling(t *testing.T) {
 			require.NoError(t, err)
 			defer cache.Reset()
 
-			// Insert 2x capacity to trigger eviction cycles
-			totalInserts := tc.capacity * 2
+			// Insert overfillMultiplier x capacity to trigger eviction cycles
+			totalInserts := int(float64(tc.capacity) * overfillMultiplier)
 			start := time.Now()
 
 			for j := 0; j < totalInserts; j++ {
