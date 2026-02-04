@@ -639,7 +639,12 @@ func (u *Server) Init(ctx context.Context) (err error) {
 							errors.Is(err, errors.ErrTxNotFound) ||
 							errors.Is(err, errors.ErrTxInvalid) {
 							u.logger.Warnf("[catchup] Block %s is invalid, not trying alternative sources", c.block.Hash().String())
-							// Clean up the processing notification for this block so it can be retried later if needed
+
+							// Mark peer as malicious for providing unvalidatable block
+							// All these errors indicate the peer is sending blocks we can't validate
+							u.reportCatchupMalicious(ctx, c.peerID, "invalid_block")
+
+							// Clean up the processing notification for this block
 							u.processBlockNotify.Delete(*c.block.Hash())
 							continue
 						}
@@ -1612,6 +1617,14 @@ func (u *Server) addBlockToPriorityQueue(ctx context.Context, blockFound process
 	block, err := u.fetchSingleBlock(fetchCtx, blockFound.hash, blockFound.peerID, blockFound.baseURL)
 	if err != nil {
 		u.logger.Errorf("[addBlockToPriorityQueue] Failed to fetch block %s: %v", blockFound.hash.String(), err)
+
+		// Report peer failure to P2P service for reputation tracking
+		// This ensures peers with misconfigured asset servers (e.g., 401 errors) have their reputation degraded
+		if blockFound.peerID != "" {
+			u.reportCatchupFailure(ctx, blockFound.peerID)
+			u.reportCatchupError(ctx, blockFound.peerID, err.Error())
+		}
+
 		if blockFound.errCh != nil {
 			blockFound.errCh <- err
 		}
