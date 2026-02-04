@@ -776,7 +776,7 @@ func (b *bucketTrimmed) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 		return errors.NewProcessingError("[bucketTrimmed.Set] key must be 32 bytes, got %d", len(k))
 	}
 
-	if len(v) >= (1<<maxValueSizeLog) {
+	if len(v) >= (1 << maxValueSizeLog) {
 		// Too big value - its length cannot be encoded
 		// with 2 bytes (see below). Skip the entry.
 		return errors.NewProcessingError("[bucketTrimmed.Set] too big value %d, max %d", len(v), 1<<maxValueSizeLog)
@@ -785,7 +785,7 @@ func (b *bucketTrimmed) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 	var vLenBuf [2]byte
 
 	vLenBuf[0] = byte(uint16(len(v)) >> 8) // nolint:gosec // higher order 8 bits of value's length
-	vLenBuf[1] = byte(len(v))              // lower order 8 bits of value's length
+	vLenBuf[1] = byte(len(v))              // nolint:gosec // lower order 8 bits of value's length
 
 	kvLen := uint64(len(vLenBuf) + len(k) + len(v)) // nolint:gosec
 	if kvLen >= ChunkSize {
@@ -1180,7 +1180,7 @@ func (b *bucketPreallocated) Set(k, v []byte, h uint64, skipLocking ...bool) err
 		return errors.NewProcessingError("[bucketPreallocated.Set] key must be 32 bytes, got %d", len(k))
 	}
 
-	if len(v) >= (1<<maxValueSizeLog) {
+	if len(v) >= (1 << maxValueSizeLog) {
 		// Too big value - its length cannot be encoded
 		// with 2 bytes (see below). Skip the entry.
 		return errors.NewProcessingError("[bucketPreallocated.Set] too big value %d, max %d", len(v), 1<<maxValueSizeLog)
@@ -1189,7 +1189,7 @@ func (b *bucketPreallocated) Set(k, v []byte, h uint64, skipLocking ...bool) err
 	var vLenBuf [2]byte
 
 	vLenBuf[0] = byte(uint16(len(v)) >> 8) // nolint: gosec // higher order 8 bits of value's length
-	vLenBuf[1] = byte(len(v))              // lower order 8 bits of value's length
+	vLenBuf[1] = byte(len(v))              // nolint: gosec // lower order 8 bits of value's length
 
 	kvLen := uint64(len(vLenBuf) + len(k) + len(v)) // nolint: gosec
 	if kvLen >= ChunkSize {
@@ -1481,7 +1481,7 @@ func (b *bucketUnallocated) Set(k, v []byte, h uint64, skipLocking ...bool) erro
 		return errors.NewProcessingError("[bucketUnallocated.Set] key must be 32 bytes, got %d", len(k))
 	}
 
-	if len(v) >= (1<<maxValueSizeLog) {
+	if len(v) >= (1 << maxValueSizeLog) {
 		// Too big value - its length cannot be encoded
 		// with 2 bytes (see below). Skip the entry.
 		return errors.NewProcessingError("[bucketUnallocated.Set] too big value %d, max %d", len(v), 1<<maxValueSizeLog)
@@ -1490,7 +1490,7 @@ func (b *bucketUnallocated) Set(k, v []byte, h uint64, skipLocking ...bool) erro
 	var vLenBuf [2]byte
 
 	vLenBuf[0] = byte(uint16(len(v)) >> 8) // nolint: gosec // higher order 8 bits of value's length
-	vLenBuf[1] = byte(len(v))              // lower order 8 bits of value's length
+	vLenBuf[1] = byte(len(v))              // nolint: gosec // lower order 8 bits of value's length
 
 	kvLen := uint64(len(vLenBuf) + len(k) + len(v)) // nolint: gosec
 	if kvLen >= ChunkSize {
