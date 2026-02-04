@@ -1,6 +1,9 @@
 package settings
 
 import (
+	"errors" //nolint:depguard // refactor needed to use the internal errors package
+	"fmt"
+	"net/url"
 	"runtime"
 	"time"
 
@@ -64,10 +67,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 		LocalTestStartFromState:      getString("local_test_start_from_state", "", alternativeContext...),
 		PostgresCheckAddress:         getString("postgres_check_address", "localhost:5432", alternativeContext...),
 		Postgres: PostgresSettings{
-			MaxOpenConns:    getInt("postgres_maxOpenConns", 50, alternativeContext...),
-			MaxIdleConns:    getInt("postgres_maxIdleConns", 10, alternativeContext...),
-			ConnMaxLifetime: getDuration("postgres_connMaxLifetime", 5*time.Minute, alternativeContext...),
-			ConnMaxIdleTime: getDuration("postgres_connMaxIdleTime", 1*time.Minute, alternativeContext...),
+			MaxOpenConns:     getInt("postgres_maxOpenConns", 50, alternativeContext...),
+			MaxIdleConns:     getInt("postgres_maxIdleConns", 10, alternativeContext...),
+			ConnMaxLifetime:  getDuration("postgres_connMaxLifetime", 5*time.Minute, alternativeContext...),
+			ConnMaxIdleTime:  getDuration("postgres_connMaxIdleTime", 1*time.Minute, alternativeContext...),
+			RetryMaxAttempts: getInt("postgres_retryMaxAttempts", 3, alternativeContext...),
+			RetryBaseDelay:   getDuration("postgres_retryBaseDelay", 100*time.Millisecond, alternativeContext...),
+			RetryEnabled:     getBool("postgres_retryEnabled", false, alternativeContext...),
 		},
 		UseCgoVerifier:             getBool("use_cgo_verifier", true, alternativeContext...),
 		GRPCResolver:               getString("grpc_resolver", "", alternativeContext...),
@@ -179,6 +185,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HTTPPort:                getPort("ASSET_HTTP_PORT", 8090, alternativeContext...),
 			SignHTTPResponses:       getBool("asset_sign_http_responses", false, alternativeContext...),
 			EchoDebug:               getBool("ECHO_DEBUG", false, alternativeContext...),
+			PropagationPublicURL:    getString("asset_propagation_public_url", "", alternativeContext...),
 
 			// Concurrency limits for repository methods (0 = unlimited, -1 = NumCPU(), anything else is the specific limit)
 			ConcurrencyGetTransaction:         getInt("asset_concurrency_get_transaction", 0, alternativeContext...),
@@ -268,6 +275,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SubtreeAnnouncementInterval:       getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
 			ParallelSetIfNotExistsThreshold:   getInt("blockassembly_parallelSetIfNotExistsThreshold", 10_000, alternativeContext...),
 			StoreTxInpointsForSubtreeMeta:     getBool("blockassembly_storeTxInpointsForSubtreeMeta", false, alternativeContext...), // memory optimization
+			IdleSleepDuration:                 getDuration("blockassembly_idle_sleep_duration", 10*time.Millisecond, alternativeContext...),
 		},
 
 		BlockChain: BlockChainSettings{
@@ -382,43 +390,44 @@ func NewSettings(alternativeContext ...string) *Settings {
 			URL:      getString("advertisingURL", "defaultAdvertisingURL", alternativeContext...),
 		},
 		UtxoStore: UtxoStoreSettings{
-			UtxoStore:                         getURL("utxostore", "", alternativeContext...),
-			BlockHeightRetention:              getUint32("utxostore_blockHeightRetention", globalBlockHeightRetention, alternativeContext...),
-			UnminedTxRetention:                getUint32("utxostore_unminedTxRetention", globalBlockHeightRetention/2, alternativeContext...),
-			ParentPreservationBlocks:          getUint32("utxostore_parentPreservationBlocks", blocksInADayOnAverage*10, alternativeContext...),
-			OutpointBatcherSize:               getInt("utxostore_outpointBatcherSize", 100, alternativeContext...),
-			OutpointBatcherDurationMillis:     getInt("utxostore_outpointBatcherDurationMillis", 10, alternativeContext...),
-			SpendBatcherDurationMillis:        getInt("utxostore_spendBatcherDurationMillis", 100, alternativeContext...),
-			SpendBatcherSize:                  getInt("utxostore_spendBatcherSize", 100, alternativeContext...),
-			SpendBatcherConcurrency:           getInt("utxostore_spendBatcherConcurrency", 32, alternativeContext...),
-			SpendWaitTimeout:                  getDuration("utxostore_spendWaitTimeout", 30*time.Second, alternativeContext...),
-			SpendCircuitBreakerFailureCount:   getInt("utxostore_spendCircuitBreakerFailureCount", 10, alternativeContext...),
-			SpendCircuitBreakerCooldown:       getDuration("utxostore_spendCircuitBreakerCooldown", 30*time.Second, alternativeContext...),
-			SpendCircuitBreakerHalfOpenMax:    getInt("utxostore_spendCircuitBreakerHalfOpenMax", 4, alternativeContext...),
-			StoreBatcherDurationMillis:        getInt("utxostore_storeBatcherDurationMillis", 100, alternativeContext...),
-			StoreBatcherSize:                  getInt("utxostore_storeBatcherSize", 100, alternativeContext...),
-			UtxoBatchSize:                     getInt("utxostore_utxoBatchSize", 128, alternativeContext...),
-			IncrementBatcherSize:              getInt("utxostore_incrementBatcherSize", 256, alternativeContext...),
-			IncrementBatcherDurationMillis:    getInt("utxostore_incrementBatcherDurationMillis", 10, alternativeContext...),
-			SetDAHBatcherSize:                 getInt("utxostore_setDAHBatcherSize", 256, alternativeContext...),
-			SetDAHBatcherDurationMillis:       getInt("utxostore_setDAHBatcherDurationMillis", 10, alternativeContext...),
-			LockedBatcherSize:                 getInt("utxostore_lockedBatcherSize", 1024, alternativeContext...),
-			LockedBatcherDurationMillis:       getInt("utxostore_lockedBatcherDurationMillis", 5, alternativeContext...),
-			LongestChainBatcherSize:           getInt("utxostore_longestChainBatcherSize", 1024, alternativeContext...),
-			LongestChainBatcherDurationMillis: getInt("utxostore_longestChainBatcherDurationMillis", 5, alternativeContext...),
-			GetBatcherSize:                    getInt("utxostore_getBatcherSize", 1, alternativeContext...),
-			GetBatcherDurationMillis:          getInt("utxostore_getBatcherDurationMillis", 10, alternativeContext...),
-			DBTimeout:                         getDuration("utxostore_dbTimeoutDuration", 5*time.Second, alternativeContext...),
-			UseExternalTxCache:                getBool("utxostore_useExternalTxCache", true, alternativeContext...),
-			ExternalizeAllTransactions:        getBool("utxostore_externalizeAllTransactions", false, alternativeContext...),
-			ExternalStoreConcurrency:          getInt("utxostore_externalStoreConcurrency", 16, alternativeContext...),
-			PostgresPool:                      getPostgresPoolSettings("utxostore", alternativeContext...),
-			VerboseDebug:                      getBool("utxostore_verbose_debug", false, alternativeContext...),
-			UpdateTxMinedStatus:               getBool("utxostore_updateTxMinedStatus", true, alternativeContext...),
-			MaxMinedRoutines:                  getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
-			MaxMinedBatchSize:                 getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
-			BlockHeightRetentionAdjustment:    getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
-			DisableDAHCleaner:                 getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
+			UtxoStore:                          getURL("utxostore", "", alternativeContext...),
+			BlockHeightRetention:               getUint32("utxostore_blockHeightRetention", globalBlockHeightRetention, alternativeContext...),
+			UnminedTxRetention:                 getUint32("utxostore_unminedTxRetention", globalBlockHeightRetention/2, alternativeContext...),
+			ParentPreservationBlocks:           getUint32("utxostore_parentPreservationBlocks", blocksInADayOnAverage*10, alternativeContext...),
+			OutpointBatcherSize:                getInt("utxostore_outpointBatcherSize", 100, alternativeContext...),
+			OutpointBatcherDurationMillis:      getInt("utxostore_outpointBatcherDurationMillis", 10, alternativeContext...),
+			SpendBatcherDurationMillis:         getInt("utxostore_spendBatcherDurationMillis", 100, alternativeContext...),
+			SpendBatcherSize:                   getInt("utxostore_spendBatcherSize", 100, alternativeContext...),
+			SpendBatcherConcurrency:            getInt("utxostore_spendBatcherConcurrency", 32, alternativeContext...),
+			SpendWaitTimeout:                   getDuration("utxostore_spendWaitTimeout", 30*time.Second, alternativeContext...),
+			SpendCircuitBreakerFailureCount:    getInt("utxostore_spendCircuitBreakerFailureCount", 10, alternativeContext...),
+			SpendCircuitBreakerCooldown:        getDuration("utxostore_spendCircuitBreakerCooldown", 30*time.Second, alternativeContext...),
+			SpendCircuitBreakerHalfOpenMax:     getInt("utxostore_spendCircuitBreakerHalfOpenMax", 4, alternativeContext...),
+			StoreBatcherDurationMillis:         getInt("utxostore_storeBatcherDurationMillis", 100, alternativeContext...),
+			StoreBatcherSize:                   getInt("utxostore_storeBatcherSize", 100, alternativeContext...),
+			UtxoBatchSize:                      getInt("utxostore_utxoBatchSize", 128, alternativeContext...),
+			IncrementBatcherSize:               getInt("utxostore_incrementBatcherSize", 256, alternativeContext...),
+			IncrementBatcherDurationMillis:     getInt("utxostore_incrementBatcherDurationMillis", 10, alternativeContext...),
+			SetDAHBatcherSize:                  getInt("utxostore_setDAHBatcherSize", 256, alternativeContext...),
+			SetDAHBatcherDurationMillis:        getInt("utxostore_setDAHBatcherDurationMillis", 10, alternativeContext...),
+			LockedBatcherSize:                  getInt("utxostore_lockedBatcherSize", 1024, alternativeContext...),
+			LockedBatcherDurationMillis:        getInt("utxostore_lockedBatcherDurationMillis", 5, alternativeContext...),
+			LongestChainBatcherSize:            getInt("utxostore_longestChainBatcherSize", 1024, alternativeContext...),
+			LongestChainBatcherDurationMillis:  getInt("utxostore_longestChainBatcherDurationMillis", 5, alternativeContext...),
+			GetBatcherSize:                     getInt("utxostore_getBatcherSize", 1, alternativeContext...),
+			GetBatcherDurationMillis:           getInt("utxostore_getBatcherDurationMillis", 10, alternativeContext...),
+			DBTimeout:                          getDuration("utxostore_dbTimeoutDuration", 5*time.Second, alternativeContext...),
+			UseExternalTxCache:                 getBool("utxostore_useExternalTxCache", true, alternativeContext...),
+			ExternalizeAllTransactions:         getBool("utxostore_externalizeAllTransactions", false, alternativeContext...),
+			ExternalStoreConcurrency:           getInt("utxostore_externalStoreConcurrency", 16, alternativeContext...),
+			PostgresPool:                       getPostgresPoolSettings("utxostore", alternativeContext...),
+			VerboseDebug:                       getBool("utxostore_verbose_debug", false, alternativeContext...),
+			UpdateTxMinedStatus:                getBool("utxostore_updateTxMinedStatus", true, alternativeContext...),
+			MaxMinedRoutines:                   getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
+			MaxMinedBatchSize:                  getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
+			BlockHeightRetentionAdjustment:     getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
+			DisableDAHCleaner:                  getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
+			ReAssignedUtxoSpendableAfterBlocks: getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
 		},
 		P2P: P2PSettings{
 			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),
@@ -493,6 +502,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UTXOChunkGroupLimit:            getInt("pruner_utxoChunkGroupLimit", 10, alternativeContext...),                      // Process 10 chunks in parallel
 			UTXOProgressLogInterval:        getDuration("pruner_utxoProgressLogInterval", 30*time.Second, alternativeContext...), // Progress every 30s
 			UTXOPartitionQueries:           getInt("pruner_utxoPartitionQueries", 0, alternativeContext...),                      // 0 = auto-detect based on CPU cores
+			BlobDeletionEnabled:            getBool("pruner_blobDeletionEnabled", true, alternativeContext...),                   // Enable blob deletion by default
+			BlobDeletionSafetyWindow:       getUint32("pruner_blobDeletionSafetyWindow", 10, alternativeContext...),              // Wait 10 blocks after persister
+			BlobDeletionBatchSize:          getInt("pruner_blobDeletionBatchSize", 1000, alternativeContext...),                  // Process 1000 deletions per batch
+			BlobDeletionMaxRetries:         getInt("pruner_blobDeletionMaxRetries", 3, alternativeContext...),                    // Retry failed deletions up to 3 times
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
@@ -576,6 +589,35 @@ func NewSettings(alternativeContext ...string) *Settings {
 			WebSocketPort:  getString("dashboard_websocketPort", "8090", alternativeContext...),
 			WebSocketPath:  getString("dashboard_websocketPath", "/connection/websocket", alternativeContext...),
 		},
+	}
+}
+
+// GetBlobStoreURL returns the blob store URL for the given store type enum value.
+// This allows the pruner to look up blob stores dynamically by their type,
+// enabling distributed deployments where each server may have different local paths
+// to the same shared storage (e.g., different NFS mount points, different S3 endpoints).
+//
+// BlobStoreType enum values (defined in services/pruner/pruner_api/pruner_api.proto):
+//
+//	0 = TXSTORE
+//	1 = SUBTREESTORE
+//	2 = BLOCKSTORE
+//	3 = TEMPSTORE
+//	4 = BLOCKPERSISTERSTORE
+func (s *Settings) GetBlobStoreURL(storeType int32) (*url.URL, error) {
+	switch storeType {
+	case 0: // TXSTORE
+		return s.Block.TxStore, nil
+	case 1: // SUBTREESTORE
+		return s.SubtreeValidation.SubtreeStore, nil
+	case 2: // BLOCKSTORE
+		return s.Block.BlockStore, nil
+	case 3: // TEMPSTORE
+		return s.Legacy.TempStore, nil
+	case 4: // BLOCKPERSISTERSTORE
+		return s.BlockPersister.Store, nil
+	default:
+		return nil, errors.New("unknown blob store type: " + fmt.Sprintf("%d", storeType))
 	}
 }
 

@@ -329,7 +329,7 @@ function handleApiError<T>(error: any, endpoint: string): ApiResponse<T> {
 
 // Get the current FSM state
 export function getFSMState(): Promise<ApiResponse<FSMState>> {
-  return get<FSMState>(`${baseUrl}/fsm/state`, { credentials: 'include' })
+  return get<FSMState>(`${baseUrl}/fsm/state`, { credentials: 'include', cache: 'no-store' })
     .then((response) => {
       if (response.ok) {
         return { ok: true, data: response.data } as ApiResponse<FSMState>
@@ -341,7 +341,7 @@ export function getFSMState(): Promise<ApiResponse<FSMState>> {
 
 // Get available FSM events
 export function getFSMEvents(): Promise<ApiResponse<FSMEvent[]>> {
-  return get<{ events: string[] }>(`${baseUrl}/fsm/events`, { credentials: 'include' })
+  return get<{ events: string[] }>(`${baseUrl}/fsm/events`, { credentials: 'include', cache: 'no-store' })
     .then((response) => {
       if (response.ok) {
         // Convert string array to FSMEvent objects with name and value
@@ -499,6 +499,7 @@ export function getLastInvalidBlocks(count: number = 5, offset: number = 0): Pro
     fetch(`${baseUrl}/blocks/invalid?count=${count}&offset=${offset}`, {
       method: 'GET',
       credentials: 'include',
+      cache: 'no-store',
     })
       .then((response) => checkInitialResponse(response))
       .then((data) => {

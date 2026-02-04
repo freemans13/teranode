@@ -54,13 +54,18 @@ This guide does not cover:
 
 ## Hardware Requirements
 
-The Teranode team will provide you with current hardware recommendations. These recommendations will be:
+For detailed hardware specifications including CPU, RAM, and storage requirements, see the [System Requirements](../systemRequirements.md) document.
 
-1. Tailored to your specific configuration settings
-2. Designed to handle the expected production transaction volume
-3. Updated regularly to reflect the latest performance requirements
+**Quick reference for Docker Compose mainnet:**
 
-This ensures your system is appropriately equipped to manage the projected workload efficiently.
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| CPU | 8 cores | 16 cores |
+| RAM | 128 GB | 256 GB |
+| Storage | 1 TB | 2 TB |
+| Storage Type | NVMe SSD | NVMe SSD |
+
+These specifications assume a seeded, pruned node with default retention settings.
 
 ## Software Requirements
 
@@ -646,38 +651,9 @@ docker run -it \
 
 ### Step 3: Complete Seeding Process
 
-For Docker Compose setup, use the following instructions:
+For complete seeding instructions including Docker Compose setup, database preparation, and FSM state transitions, refer to the dedicated sync guide:
 
-```bash
-# Stop all services
-docker compose down
-
-# Clear out the postgres, aerospike and external data
-sudo rm -rf ~/teranode-public/docker/testnet/data/*
-
-# Bring up the dependent services
-# Blockchain service will insert the correct genesis block for your selected network
-docker compose up -d aerospike postgres kafka-shared
-
-# Wait to make sure genesis block gets inserted
-# You will see it in the blockchain logs as `genesis block inserted`
-docker compose logs -f -n 100 blockchain
-
-# Run the seeder (see command above)
-docker run -it ...
-
-# Bring down blockchain to reset the internal caches
-docker compose down blockchain
-
-# Bring all other services back online
-docker compose up -d
-
-# Transition Teranode to LEGACYSYNCING
-# Option 1: Via teranode-cli
-docker exec -it blockchain teranode-cli setfsmstate --fsmstate LEGACYSYNCING
-
-# Option 2: Via Admin Dashboard at http://localhost:8090/admin
-```
+- **[Syncing the Blockchain Guide](./minersHowToSyncTheNode.md)** - Comprehensive instructions for all synchronization methods
 
 ## CPU Mining
 
