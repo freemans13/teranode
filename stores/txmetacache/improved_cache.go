@@ -178,10 +178,11 @@ const chunkSizeTest = maxValueSizeKB * 2 * 1024  //nolint:unused
 // Use ImprovedCache.UpdateStats method to obtain the most current statistics.
 type Stats struct {
 	// EntriesCount is the current number of entries in the cache.
-	EntriesCount       uint64 // Current number of entries stored in the cache
-	TrimCount          uint64 // Number of trim operations performed on the cache
-	TotalMapSize       uint64 // Total size of all hash maps used by the cache buckets
-	TotalElementsAdded uint64 // Cumulative count of all elements ever added to the cache
+	EntriesCount         uint64 // Current number of entries stored in the cache
+	TrimCount            uint64 // Number of trim operations performed on the cache
+	TotalMapSize         uint64 // Total size of all hash maps used by the cache buckets
+	TotalElementsAdded   uint64 // Cumulative count of all elements ever added to the cache
+	ClockForcedEvictions uint64 // Number of forced evictions when Clock sweep hit maxClockSweep limit
 }
 
 // Reset clears all statistics in the Stats object.
@@ -1731,20 +1732,9 @@ func (b *bucketUnallocated) getMapSize() uint64 {
 	return uint64(len(b.m))
 }
 
-// bucketClock implements a cache bucket with Clock algorithm (Second-Chance Algorithm) LRU eviction.
-//
-// This bucket type uses the Clock algorithm to achieve 90-95% retention by giving recently
-// accessed entries a second chance before eviction. Unlike the ring buffer approach which
-// physically overwrites data (leading to ~50% retention), Clock explicitly evicts entries
-// only when the clock hand finds an unreferenced entry.
-//
-// Key characteristics:
-// - Explicit LRU eviction using Clock algorithm (not physical overwrite)
-// - Access bit tracking for second-chance logic (1 byte per entry)
-// - Data stays valid until Clock hand evicts it
-// - 90-95% retention vs ring buffer's 50% retention
-// - Minimal memory overhead: 177 bytes/entry (vs 176 for ring buffer)
-// - O(1) amortized Set and Get operations
+// bucketClock implements Clock/Second-Chance LRU eviction.
+// Achieves 90%+ retention vs ring buffer's 50% by giving accessed entries a second chance.
+// Uses 1 byte per entry for access tracking. O(1) amortized operations.
 type bucketClock struct {
 	mu sync.RWMutex
 
@@ -1762,6 +1752,9 @@ type bucketClock struct {
 
 	// count is the current number of valid entries
 	count uint64
+
+	// forcedEvictions tracks how often we hit maxClockSweep limit (observability)
+	forcedEvictions uint64
 }
 
 // clockSlot represents a single cache entry in the Clock algorithm.
@@ -1819,6 +1812,7 @@ func (b *bucketClock) Reset() {
 	b.m = make(map[uint64]uint64)
 	b.clockHand = 0
 	b.count = 0
+	atomic.StoreUint64(&b.forcedEvictions, 0)
 }
 
 // maxClockSweep is the maximum number of slots to check before forcing eviction.
@@ -1827,59 +1821,37 @@ func (b *bucketClock) Reset() {
 // With this limit, worst case is <10 μs regardless of cache size.
 const maxClockSweep = 1024
 
-// evictWithClock finds a victim entry using the Clock algorithm (Second-Chance Algorithm).
-// It advances the clock hand, checking each entry's access bit:
-// - If accessed = 1: Give second chance (set to 0), advance
-// - If accessed = 0: Evict this entry, return its slot index
-//
-// To prevent unbounded latency at large scales (640GB = 3.6B entries), this method
-// sweeps at most maxClockSweep iterations (~1024). If no victim is found, it forces
-// eviction of the current slot. This caps worst-case time at ~4 microseconds instead
-// of seconds, while maintaining 90%+ retention in typical workloads.
-//
-// This method must be called with the bucket lock held.
+// evictWithClock finds a victim using Clock algorithm. Scans up to maxClockSweep slots,
+// giving accessed entries a second chance. Forces eviction if limit reached.
+// Must be called with bucket lock held.
 func (b *bucketClock) evictWithClock() uint64 {
 	checked := uint64(0)
 
 	for {
-		// Check current slot at clock hand
 		slot := &b.slots[b.clockHand]
+		victimIdx := b.clockHand
 
-		if atomic.LoadUint32(&slot.accessed) == 0 {
-			// Found victim - not recently accessed
-			victimIdx := b.clockHand
+		// Check if we found a victim (accessed=0) or hit sweep limit
+		if atomic.LoadUint32(&slot.accessed) == 0 || checked >= maxClockSweep {
+			// Track forced evictions for observability
+			if checked >= maxClockSweep {
+				atomic.AddUint64(&b.forcedEvictions, 1)
+			}
 
-			// Remove from map (if entry exists)
+			// Remove from map if entry exists
 			if slot.hash != 0 {
 				delete(b.m, slot.hash)
 			}
 
-			// Advance clock hand for next eviction
+			// Advance for next eviction
 			b.clockHand = (b.clockHand + 1) % b.capacity
-
 			return victimIdx
 		}
 
-		// Give second chance - reset access bit and advance
+		// Give second chance
 		atomic.StoreUint32(&slot.accessed, 0)
 		b.clockHand = (b.clockHand + 1) % b.capacity
 		checked++
-
-		// Bounded sweep: prevent multi-second stalls at 640GB scale
-		// After maxClockSweep checks (~4 μs), force eviction
-		if checked >= maxClockSweep {
-			victimIdx := b.clockHand
-
-			// Remove from map (if entry exists)
-			if b.slots[victimIdx].hash != 0 {
-				delete(b.m, b.slots[victimIdx].hash)
-			}
-
-			// Advance for next eviction
-			b.clockHand = (b.clockHand + 1) % b.capacity
-
-			return victimIdx
-		}
 	}
 }
 
@@ -1979,15 +1951,16 @@ func (b *bucketClock) Get(dst *[]byte, k []byte, h uint64, returnDst bool, skipL
 	return true
 }
 
-// Del removes an entry from the bucket.
+// Del removes an entry from the bucket. The slot becomes reusable when Clock hand reaches it.
+// Count is not decremented - Clock hand will naturally reclaim the slot during eviction.
 func (b *bucketClock) Del(h uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if slotIdx, exists := b.m[h]; exists {
 		delete(b.m, h)
-		b.slots[slotIdx].hash = 0 // Clear hash so eviction doesn't try to delete again
-		// Note: count is not decremented to maintain clock hand behavior
+		b.slots[slotIdx].hash = 0   // Mark slot as empty
+		b.slots[slotIdx].data = nil // Free memory
 	}
 }
 
@@ -1998,6 +1971,7 @@ func (b *bucketClock) UpdateStats(s *Stats) {
 
 	s.EntriesCount += uint64(len(b.m))
 	s.TotalMapSize += b.getMapSize()
+	s.ClockForcedEvictions += atomic.LoadUint64(&b.forcedEvictions)
 }
 
 // listChunks prints bucket state for debugging (Clock buckets use slots, not chunks).

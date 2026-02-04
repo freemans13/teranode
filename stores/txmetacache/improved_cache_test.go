@@ -1594,6 +1594,10 @@ func TestTxMetaCache_ClockLinearScaling(t *testing.T) {
 
 // TestTxMetaCache_ClockMemoryStability validates no memory leaks and stable behavior with Clock algorithm.
 func TestTxMetaCache_ClockMemoryStability(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping memory stability test in short mode")
+	}
+
 	// Use smaller cache for faster testing
 	cache, err := New(256*1024*1024, Clock) // 256MB
 	require.NoError(t, err)

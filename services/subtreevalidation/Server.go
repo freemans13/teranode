@@ -227,7 +227,7 @@ func New(
 
 	// create a caching tx meta store
 	if tSettings.SubtreeValidation.TxMetaCacheEnabled {
-		logger.Infof("Using cached version of tx meta store with Clock algorithm (90%+ retention)")
+		logger.Infof("Using cached version of tx meta store (algorithm: Clock)")
 
 		var err error
 
