@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"testing"
@@ -1355,4 +1356,343 @@ func TestImprovedCache_CleanLockedMapCoverage(t *testing.T) {
 			require.True(t, true, "cleanLockedMap was exercised for %s", tt.name)
 		})
 	}
+}
+
+// TestTxMetaCache_ClockRetention90Percent validates that Clock algorithm maintains
+// cache integrity with minimal data corruption. The test measures:
+// 1. Cache utilization: Should stay at ~100% capacity (not waste space)
+// 2. Data integrity: Of entries in the cache, >90% should be retrievable (not corrupted)
+//
+// This test runs at dev scale (4GB) to prove the algorithm works before extrapolating to production (640GB).
+func TestTxMetaCache_ClockRetention90Percent(t *testing.T) {
+	// Test with 4GB cache (~22.6M entries at 177 bytes/entry)
+	cache, err := New(4*1024*1024*1024, Clock)
+	require.NoError(t, err)
+	defer cache.Reset()
+
+	entrySize := 177
+	capacity := int(float64(4*1024*1024*1024) / float64(entrySize))
+
+	t.Logf("Testing 4GB Clock cache with capacity ~%d entries", capacity)
+
+	// Phase 1: Fill cache and trigger wrap cycles by inserting 2x capacity
+	// This exercises the Clock algorithm's eviction logic extensively
+	totalInserts := capacity * 2
+	t.Logf("Phase 1: Inserting %d entries (2x capacity) to trigger eviction cycles", totalInserts)
+
+	// Track which entries we expect to find (last capacity worth of entries)
+	expectedPresentStart := capacity
+
+	for i := 0; i < totalInserts; i++ {
+		key := []byte(fmt.Sprintf("tx_%09d", i))
+		value := make([]byte, entrySize-len(key)-4)
+		// Add unique data to detect corruption
+		binary.BigEndian.PutUint64(value[0:8], uint64(i))
+		err := cache.Set(key, value)
+		require.NoError(t, err)
+
+		if i%(totalInserts/10) == 0 && i > 0 {
+			t.Logf("Progress: %d/%d entries inserted", i, totalInserts)
+		}
+	}
+
+	t.Logf("Insertion complete. Now measuring cache integrity...")
+
+	// Phase 2: Measure cache integrity
+	// The cache should contain approximately the last 'capacity' entries due to FIFO/LRU eviction
+	// We verify: (1) cache is at capacity, (2) recent entries are retrievable and not corrupted
+
+	var stats Stats
+	cache.UpdateStats(&stats)
+	actualEntries := stats.EntriesCount
+
+	t.Logf("Cache reports %d entries (capacity: %d, utilization: %.1f%%)",
+		actualEntries, capacity, float64(actualEntries)/float64(capacity)*100)
+
+	// Verify cache utilization is high (>90% full)
+	utilization := float64(actualEntries) / float64(capacity)
+	require.Greater(t, utilization, 0.90,
+		"Cache utilization %.1f%% is too low - cache is wasting space", utilization*100)
+
+	// Phase 3: Verify data integrity of entries currently in cache
+	// Check that recent entries (expected to be in cache) are retrievable and correct
+	sampleSize := 100000 // Sample 100k entries to get accurate integrity measurement
+	sampleInterval := (totalInserts - expectedPresentStart) / sampleSize
+	if sampleInterval < 1 {
+		sampleInterval = 1
+	}
+
+	retrievableCount := 0
+	corruptedCount := 0
+	samplesChecked := 0
+
+	for i := expectedPresentStart; i < totalInserts && samplesChecked < sampleSize; i += sampleInterval {
+		key := []byte(fmt.Sprintf("tx_%09d", i))
+		var dst []byte
+		err := cache.Get(&dst, key)
+
+		samplesChecked++
+
+		if err == nil {
+			// Verify data integrity
+			if len(dst) >= 8 {
+				storedID := binary.BigEndian.Uint64(dst[0:8])
+				if storedID == uint64(i) {
+					retrievableCount++
+				} else {
+					corruptedCount++
+					t.Logf("WARNING: Entry %d corrupted (stored ID: %d)", i, storedID)
+				}
+			} else {
+				corruptedCount++
+				t.Logf("WARNING: Entry %d has invalid data length: %d", i, len(dst))
+			}
+		}
+		// Missing entries are OK - they may have been evicted due to LRU
+	}
+
+	integrityRate := float64(retrievableCount) / float64(samplesChecked)
+
+	t.Logf("Clock integrity: %d/%d recent entries retrievable and correct = %.1f%%",
+		retrievableCount, samplesChecked, integrityRate*100)
+
+	if corruptedCount > 0 {
+		t.Logf("WARNING: %d corrupted entries detected!", corruptedCount)
+	}
+
+	// CRITICAL: Of entries we checked (recent entries likely still in cache),
+	// >90% should be retrievable and not corrupted
+	require.Greater(t, integrityRate, 0.90,
+		"Data integrity %.1f%% is below 90%% target - cache is corrupting data", integrityRate*100)
+
+	// Verify memory efficiency
+	bytesPerEntry := float64(4*1024*1024*1024) / float64(actualEntries)
+	t.Logf("Memory efficiency: %.1f bytes/entry (target: ≤177)", bytesPerEntry)
+	require.LessOrEqual(t, bytesPerEntry, 180.0, "Memory per entry exceeds budget")
+
+	t.Log("✓ Clock algorithm verified: High utilization + high integrity at 4GB scale")
+}
+
+// TestTxMetaCache_ClockLinearScaling proves linear scaling from 1GB to 4GB with Clock.
+// Tests cache utilization and integrity at different scales to validate linear scaling behavior.
+func TestTxMetaCache_ClockLinearScaling(t *testing.T) {
+	sizes := []struct {
+		name     string
+		sizeGB   int
+		capacity int
+	}{
+		{"1GB", 1, 5_650_000},  // 1GB / 177 bytes
+		{"2GB", 2, 11_300_000}, // 2GB / 177 bytes
+		{"4GB", 4, 22_600_000}, // 4GB / 177 bytes
+	}
+
+	results := make([]map[string]interface{}, len(sizes))
+
+	for i, tc := range sizes {
+		t.Run(tc.name, func(t *testing.T) {
+			sizeBytes := tc.sizeGB * 1024 * 1024 * 1024
+			cache, err := New(sizeBytes, Clock)
+			require.NoError(t, err)
+			defer cache.Reset()
+
+			// Insert 2x capacity to trigger eviction cycles
+			totalInserts := tc.capacity * 2
+			start := time.Now()
+
+			for j := 0; j < totalInserts; j++ {
+				key := []byte(fmt.Sprintf("tx_%09d", j))
+				value := make([]byte, 177-len(key)-4)
+				// Add unique data to detect corruption
+				binary.BigEndian.PutUint64(value[0:8], uint64(j))
+				err := cache.Set(key, value)
+				require.NoError(t, err)
+
+				if j%(totalInserts/10) == 0 && j > 0 {
+					t.Logf("%s Progress: %d/%d entries", tc.name, j, totalInserts)
+				}
+			}
+			duration := time.Since(start)
+
+			// Measure cache utilization and integrity
+			var stats Stats
+			cache.UpdateStats(&stats)
+			actualEntries := stats.EntriesCount
+
+			// Check integrity of recent entries (last capacity worth)
+			sampleSize := 10000
+			sampleInterval := tc.capacity / sampleSize
+			if sampleInterval < 1 {
+				sampleInterval = 1
+			}
+
+			retrievableCount := 0
+			samplesChecked := 0
+
+			for j := tc.capacity; j < totalInserts && samplesChecked < sampleSize; j += sampleInterval {
+				key := []byte(fmt.Sprintf("tx_%09d", j))
+				var dst []byte
+				samplesChecked++
+				if cache.Get(&dst, key) == nil && len(dst) >= 8 {
+					storedID := binary.BigEndian.Uint64(dst[0:8])
+					if storedID == uint64(j) {
+						retrievableCount++
+					}
+				}
+			}
+
+			integrityRate := float64(retrievableCount) / float64(samplesChecked)
+			utilization := float64(actualEntries) / float64(tc.capacity)
+			opsPerSec := float64(totalInserts) / duration.Seconds()
+
+			results[i] = map[string]interface{}{
+				"size_gb":        tc.sizeGB,
+				"capacity":       tc.capacity,
+				"actual_entries": actualEntries,
+				"integrity":      integrityRate,
+				"utilization":    utilization,
+				"ops_per_sec":    opsPerSec,
+			}
+
+			t.Logf("%s Clock: %d entries (%.1f%% util), %.1f%% integrity, %.2f M ops/sec",
+				tc.name, actualEntries, utilization*100, integrityRate*100, opsPerSec/1_000_000)
+
+			// Verify >90% integrity
+			require.Greater(t, integrityRate, 0.90,
+				"Integrity %.1f%% below target at %s scale", integrityRate*100, tc.name)
+
+			// Verify high utilization
+			require.Greater(t, utilization, 0.90,
+				"Utilization %.1f%% too low at %s scale", utilization*100, tc.name)
+		})
+	}
+
+	// Verify linear scaling
+	for i := 1; i < len(results); i++ {
+		prev := results[i-1]
+		curr := results[i]
+
+		sizeRatio := float64(curr["size_gb"].(int)) / float64(prev["size_gb"].(int))
+		entriesRatio := float64(curr["actual_entries"].(uint64)) / float64(prev["actual_entries"].(uint64))
+
+		// Verify: 2x size ≈ 2x entries retained
+		require.InDelta(t, sizeRatio, entriesRatio, 0.10,
+			"Entry count should scale linearly with size")
+
+		t.Logf("Scaling from %d GB to %d GB: %.2fx entries",
+			prev["size_gb"].(int), curr["size_gb"].(int), entriesRatio)
+	}
+
+	t.Log("✓ Clock algorithm: Linear scaling + high integrity verified - safe to extrapolate to production")
+}
+
+// TestTxMetaCache_ClockMemoryStability validates no memory leaks and stable behavior with Clock algorithm.
+func TestTxMetaCache_ClockMemoryStability(t *testing.T) {
+	// Use smaller cache for faster testing
+	cache, err := New(256*1024*1024, Clock) // 256MB
+	require.NoError(t, err)
+	defer cache.Reset()
+
+	capacity := (256 * 1024 * 1024) / 177
+	samples := make([]uint64, 0)
+	integritySamples := make([]float64, 0)
+
+	t.Logf("Testing memory stability with %d entry capacity", capacity)
+
+	// Fill to capacity with unique data
+	for i := 0; i < capacity; i++ {
+		key := []byte(fmt.Sprintf("tx_%09d", i))
+		value := make([]byte, 177-len(key)-4)
+		binary.BigEndian.PutUint64(value[0:8], uint64(i))
+		_ = cache.Set(key, value)
+	}
+
+	// Monitor memory for 1 minute while continuously inserting
+	stopTime := time.Now().Add(1 * time.Minute)
+	sampleInterval := 5 * time.Second
+	lastSample := time.Now()
+
+	insertCount := capacity
+
+	t.Logf("Monitoring stability for 1 minute...")
+
+	for time.Now().Before(stopTime) {
+		// Insert new entries (will trigger Clock eviction)
+		key := []byte(fmt.Sprintf("tx_%09d", insertCount))
+		value := make([]byte, 177-len(key)-4)
+		binary.BigEndian.PutUint64(value[0:8], uint64(insertCount))
+		_ = cache.Set(key, value)
+
+		insertCount++
+
+		// Sample memory and integrity every 5 seconds
+		if time.Since(lastSample) >= sampleInterval {
+			var stats Stats
+			cache.UpdateStats(&stats)
+			samples = append(samples, stats.EntriesCount)
+
+			// Sample integrity of recent entries (last capacity worth)
+			sampleSize := 1000
+			sampleInterval := capacity / sampleSize
+			if sampleInterval < 1 {
+				sampleInterval = 1
+			}
+
+			retrievableCount := 0
+			samplesChecked := 0
+			startCheck := insertCount - capacity
+			if startCheck < 0 {
+				startCheck = 0
+			}
+
+			for j := startCheck; j < insertCount && samplesChecked < sampleSize; j += sampleInterval {
+				key := []byte(fmt.Sprintf("tx_%09d", j))
+				var dst []byte
+				samplesChecked++
+				if cache.Get(&dst, key) == nil && len(dst) >= 8 {
+					storedID := binary.BigEndian.Uint64(dst[0:8])
+					if storedID == uint64(j) {
+						retrievableCount++
+					}
+				}
+			}
+
+			integrityRate := 0.0
+			if samplesChecked > 0 {
+				integrityRate = float64(retrievableCount) / float64(samplesChecked)
+			}
+			integritySamples = append(integritySamples, integrityRate)
+
+			t.Logf("Clock sample %d: %d entries, %.1f%% integrity",
+				len(samples), stats.EntriesCount, integrityRate*100)
+
+			lastSample = time.Now()
+		}
+	}
+
+	// Verify: memory stayed flat (no upward drift = no leaks)
+	avgEntries := uint64(0)
+	for _, s := range samples {
+		avgEntries += s
+	}
+	avgEntries /= uint64(len(samples))
+
+	for i, s := range samples {
+		deviation := math.Abs(float64(s-avgEntries)) / float64(avgEntries)
+		require.Less(t, deviation, 0.10, "Sample %d deviates >10%% from average", i)
+	}
+
+	// Verify: integrity stayed >90% throughout
+	avgIntegrity := 0.0
+	for _, r := range integritySamples {
+		avgIntegrity += r
+	}
+	avgIntegrity /= float64(len(integritySamples))
+
+	require.Greater(t, avgIntegrity, 0.90,
+		"Average integrity %.1f%% below 90%% target", avgIntegrity*100)
+
+	t.Logf("✓ Clock memory stable: %d samples, avg %d entries, <10%% deviation",
+		len(samples), avgEntries)
+	t.Logf("✓ Clock integrity stable: %.1f%% average over %d samples",
+		avgIntegrity*100, len(integritySamples))
 }

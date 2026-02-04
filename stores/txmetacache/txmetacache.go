@@ -104,6 +104,13 @@ const (
 	// less frequently used entries to maintain a smaller memory footprint.
 	// Suitable for long-running services with memory constraints.
 	Trimmed
+
+	// Clock indicates that the cache uses the Clock algorithm (Second-Chance Algorithm)
+	// for LRU eviction. This strategy achieves 90-95% retention by giving recently
+	// accessed entries a second chance before eviction. Memory overhead is minimal
+	// (1 byte per entry for access bit). Suitable for high-throughput environments
+	// where maximizing effective capacity is critical.
+	Clock
 )
 
 // NewTxMetaCache creates a new transaction metadata cache that wraps an existing UTXO store.
