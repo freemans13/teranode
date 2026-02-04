@@ -178,10 +178,11 @@ const chunkSizeTest = maxValueSizeKB * 2 * 1024  //nolint:unused
 // Use ImprovedCache.UpdateStats method to obtain the most current statistics.
 type Stats struct {
 	// EntriesCount is the current number of entries in the cache.
-	EntriesCount       uint64 // Current number of entries stored in the cache
-	TrimCount          uint64 // Number of trim operations performed on the cache
-	TotalMapSize       uint64 // Total size of all hash maps used by the cache buckets
-	TotalElementsAdded uint64 // Cumulative count of all elements ever added to the cache
+	EntriesCount         uint64 // Current number of entries stored in the cache
+	TrimCount            uint64 // Number of trim operations performed on the cache
+	TotalMapSize         uint64 // Total size of all hash maps used by the cache buckets
+	TotalElementsAdded   uint64 // Cumulative count of all elements ever added to the cache
+	ClockForcedEvictions uint64 // Number of times Clock algorithm forced eviction due to maxClockSweep limit
 }
 
 // Reset clears all statistics in the Stats object.
@@ -1753,6 +1754,11 @@ type bucketClock struct {
 
 	// count is the current number of valid entries
 	count uint64
+
+	// forcedEvictions tracks how many times maxClockSweep limit forced eviction.
+	// Exposed in CacheStats to help operators tune maxClockSweep for their workload.
+	// High values indicate hot entries may be prematurely evicted.
+	forcedEvictions uint64
 }
 
 // clockSlot represents a single cache entry in the Clock algorithm.
@@ -1816,6 +1822,7 @@ func (b *bucketClock) Reset() {
 	b.m = make(map[uint64]uint64)
 	b.clockHand = 0
 	b.count = 0
+	atomic.StoreUint64(&b.forcedEvictions, 0)
 }
 
 // maxClockSweep is the maximum number of slots to check before forcing eviction.
@@ -1827,6 +1834,14 @@ const maxClockSweep = 1024
 // evictWithClock finds a victim using Clock algorithm. Scans up to maxClockSweep slots,
 // prioritizing empty slots (from Del()) before checking accessed bits.
 // Gives accessed entries a second chance. Forces eviction if limit reached.
+//
+// RACE CONDITION NOTE: There is an acceptable race between the atomic accessed check
+// and the delete operation. A concurrent Get() could set accessed=1 between these
+// operations, causing a recently-accessed entry to be evicted. This is acceptable
+// because Clock is inherently an approximate LRU algorithm - occasional suboptimal
+// eviction does not violate correctness, only optimality. The mutex protects
+// structural integrity (map and slot consistency), not LRU perfection.
+//
 // Must be called with bucket lock held.
 func (b *bucketClock) evictWithClock() uint64 {
 	checked := uint64(0)
@@ -1843,6 +1858,11 @@ func (b *bucketClock) evictWithClock() uint64 {
 
 		// Priority 2: Unaccessed slots or sweep limit reached
 		if atomic.LoadUint32(&slot.accessed) == 0 || checked >= maxClockSweep {
+			// Track forced evictions when sweep limit reached (for operator tuning)
+			if checked >= maxClockSweep {
+				atomic.AddUint64(&b.forcedEvictions, 1)
+			}
+
 			// Remove from map
 			delete(b.m, slot.hash)
 
@@ -1975,6 +1995,7 @@ func (b *bucketClock) UpdateStats(s *Stats) {
 
 	s.EntriesCount += uint64(len(b.m))
 	s.TotalMapSize += b.getMapSize()
+	s.ClockForcedEvictions += atomic.LoadUint64(&b.forcedEvictions)
 }
 
 func (b *bucketClock) listChunks() {

@@ -74,10 +74,11 @@ type TxMetaCache struct {
 // The metrics exposed through this struct are critical for operational monitoring,
 // capacity planning, and performance tuning of the transaction metadata cache.
 type CacheStats struct {
-	EntriesCount       uint64 // Number of entries currently in the cache; indicates current utilization
-	TrimCount          uint64 // Number of trim operations performed; indicates memory management activity
-	TotalMapSize       uint64 // Total size of all map buckets in the cache; reflects memory consumption
-	TotalElementsAdded uint64 // Cumulative count of all elements added to the cache; measures total throughput
+	EntriesCount         uint64 // Number of entries currently in the cache; indicates current utilization
+	TrimCount            uint64 // Number of trim operations performed; indicates memory management activity
+	TotalMapSize         uint64 // Total size of all map buckets in the cache; reflects memory consumption
+	TotalElementsAdded   uint64 // Cumulative count of all elements added to the cache; measures total throughput
+	ClockForcedEvictions uint64 // Number of times Clock algorithm forced eviction at maxClockSweep limit; helps tune performance
 }
 
 // BucketType defines the allocation strategy for the cache's internal buckets.
@@ -745,10 +746,11 @@ func (t *TxMetaCache) GetCacheStats() *CacheStats {
 	t.cache.UpdateStats(s)
 
 	return &CacheStats{
-		EntriesCount:       s.EntriesCount,
-		TrimCount:          s.TrimCount,
-		TotalMapSize:       s.TotalMapSize,
-		TotalElementsAdded: s.TotalElementsAdded,
+		EntriesCount:         s.EntriesCount,
+		TrimCount:            s.TrimCount,
+		TotalMapSize:         s.TotalMapSize,
+		TotalElementsAdded:   s.TotalElementsAdded,
+		ClockForcedEvictions: s.ClockForcedEvictions,
 	}
 }
 
