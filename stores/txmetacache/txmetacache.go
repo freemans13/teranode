@@ -18,7 +18,6 @@ package txmetacache
 
 import (
 	"context"
-	"encoding/binary"
 	"sync/atomic"
 	"time"
 
@@ -42,13 +41,11 @@ import (
 // These metrics are critical for operational monitoring and can help identify:
 // - Cache hit ratio (hits vs. misses) to evaluate cache effectiveness
 // - Insertion and eviction rates to detect memory pressure
-// - Age-related expiration patterns through hitOldTx tracking
 type metrics struct {
 	insertions atomic.Uint64 // Tracks number of items inserted into the cache; indicates write throughput
 	hits       atomic.Uint64 // Tracks number of successful cache retrievals; indicates cache effectiveness
 	misses     atomic.Uint64 // Tracks number of failed cache retrievals; helps identify sizing issues
 	evictions  atomic.Uint64 // Tracks number of items evicted from the cache; indicates memory pressure
-	hitOldTx   atomic.Uint64 // Tracks number of cache hits for outdated transactions; monitors expiration policy
 }
 
 // TxMetaCache wraps a utxo.Store implementation and adds caching capabilities for transaction metadata.
@@ -57,16 +54,14 @@ type metrics struct {
 //
 // The cache is designed for high-throughput blockchain environments where transaction metadata
 // is frequently accessed during validation, mining, and mempool management operations.
-// It implements an LRU-like eviction policy based on block height to ensure that older, less
-// relevant transactions are removed first when memory pressure occurs.
+// It implements a ring buffer eviction policy where oldest entries are overwritten when capacity is reached.
 //
 // Thread-safety: All operations are thread-safe and can be called concurrently from multiple goroutines.
 type TxMetaCache struct {
-	utxoStore                     utxo.Store     // The underlying UTXO store that this cache wraps; provides persistence
-	cache                         *ImprovedCache // The in-memory cache implementation; provides high-performance access
-	metrics                       metrics        // Performance metrics for monitoring cache efficiency and throughput
-	logger                        ulogger.Logger // Logger for operational logging and diagnostic information
-	noOfBlocksToKeepInTxMetaCache uint32         // Configuration for cache expiration based on block height; controls data retention
+	utxoStore utxo.Store     // The underlying UTXO store that this cache wraps; provides persistence
+	cache     *ImprovedCache // The in-memory cache implementation; provides high-performance access
+	metrics   metrics        // Performance metrics for monitoring cache efficiency and throughput
+	logger    ulogger.Logger // Logger for operational logging and diagnostic information
 }
 
 // CacheStats provides statistical information about the current state of the cache.
@@ -151,22 +146,11 @@ func NewTxMetaCache(
 		return nil, errors.NewProcessingError("error creating cache", err)
 	}
 
-	const percentageOfGlobalBlockHeightRetentionToKeep = 10
-
-	var noOfBlocksToKeepInTxMetaCache uint32
-
-	if tSettings.GlobalBlockHeightRetention < percentageOfGlobalBlockHeightRetentionToKeep {
-		noOfBlocksToKeepInTxMetaCache = 1
-	} else {
-		noOfBlocksToKeepInTxMetaCache = tSettings.GlobalBlockHeightRetention / percentageOfGlobalBlockHeightRetentionToKeep
-	}
-
 	m := &TxMetaCache{
-		utxoStore:                     utxoStore,
-		cache:                         cache,
-		metrics:                       metrics{},
-		logger:                        logger,
-		noOfBlocksToKeepInTxMetaCache: noOfBlocksToKeepInTxMetaCache,
+		utxoStore: utxoStore,
+		cache:     cache,
+		metrics:   metrics{},
+		logger:    logger,
 	}
 
 	go func() {
@@ -187,7 +171,6 @@ func NewTxMetaCache(
 					prometheusBlockValidationTxMetaCacheTrims.Set(float64(cacheStats.TrimCount))
 					prometheusBlockValidationTxMetaCacheMapSize.Set(float64(cacheStats.TotalMapSize))
 					prometheusBlockValidationTxMetaCacheTotalElementsAdded.Set(float64(cacheStats.TotalElementsAdded))
-					prometheusBlockValidationTxMetaCacheHitOldTx.Set(float64(m.metrics.hitOldTx.Load()))
 				}
 			}
 		}
@@ -226,7 +209,7 @@ func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
-	err := t.cache.Set(key, t.appendHeightToValue(txMetaBytes))
+	err := t.cache.Set(key, txMetaBytes)
 	if err != nil {
 		return err
 	}
@@ -247,12 +230,7 @@ func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
 // Returns:
 // - Error if the batch cache operation fails
 func (t *TxMetaCache) SetCacheMulti(keys [][]byte, values [][]byte) error {
-	valuesWithHeight := make([][]byte, len(values))
-	for i, value := range values {
-		valuesWithHeight[i] = t.appendHeightToValue(value)
-	}
-
-	err := t.cache.SetMulti(keys, valuesWithHeight)
+	err := t.cache.SetMulti(keys, values)
 	if err != nil {
 		return err
 	}
@@ -282,13 +260,12 @@ func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) err
 // - hash: Transaction hash to use as the cache key
 //
 // Returns:
-// - Pointer to the cached transaction metadata if found and not expired, nil otherwise
+// - Pointer to the cached transaction metadata if found, nil otherwise
 // - Error if the cache operation fails or if the data cannot be unmarshalled
 //
 // The function performs several checks:
 // 1. Verifies the data exists in the cache
 // 2. Validates that the data is not empty
-// 3. Checks if the data has expired based on block height
 // All these conditions have corresponding metrics incremented for monitoring.
 func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash, txmetaData *meta.Data) (bool, error) {
 	cachedBytes := make([]byte, 0, 64)
@@ -678,15 +655,6 @@ func (t *TxMetaCache) Delete(_ context.Context, hash *chainhash.Hash) error {
 // - A new byte slice containing the original metadata followed by the current block height
 //
 // The height is encoded as a little-endian uint32 in the last 4 bytes of the returned slice.
-func (t *TxMetaCache) appendHeightToValue(txMetaBytes []byte) []byte {
-	height := t.utxoStore.GetBlockHeight()
-	valueWithHeight := make([]byte, len(txMetaBytes)+4)
-	copy(valueWithHeight, txMetaBytes)
-	binary.BigEndian.PutUint32(valueWithHeight[len(txMetaBytes):], height)
-
-	return valueWithHeight
-}
-
 // GetCacheStats retrieves current operational statistics from the underlying cache.
 // These statistics are useful for monitoring cache performance and behavior.
 //

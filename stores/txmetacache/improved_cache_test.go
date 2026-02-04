@@ -1,6 +1,7 @@
 package txmetacache
 
 import (
+	"crypto/sha256"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -12,6 +13,13 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+// makeKey32 creates a 32-byte key from a string (for testing)
+// Uses SHA256 to ensure all keys are exactly 32 bytes
+func makeKey32(s string) []byte {
+	hash := sha256.Sum256([]byte(s))
+	return hash[:]
+}
 
 func init() {
 	if os.Getenv("TERANODE_TXMETACACHE_PPROF_HTTP") != "1" {
@@ -192,22 +200,22 @@ func TestImprovedCache_SetAndGet(t *testing.T) {
 	}{
 		{
 			name:  "small key-value pair",
-			key:   []byte("key1"),
+			key:   makeKey32("key1"),
 			value: []byte("value1"),
 		},
 		{
 			name:  "larger key-value pair",
-			key:   make([]byte, 32),  // 32 bytes
+			key:   makeKey32("key2"),
 			value: make([]byte, 100), // 100 bytes
 		},
 		{
 			name:  "empty value",
-			key:   []byte("key3"),
+			key:   makeKey32("key3"),
 			value: nil, // Use nil instead of []byte{} for comparison
 		},
 		{
 			name:  "binary data",
-			key:   []byte{0x01, 0x02, 0x03, 0x04},
+			key:   makeKey32("key4"),
 			value: []byte{0xFF, 0xFE, 0xFD, 0xFC},
 		},
 	}
@@ -237,7 +245,7 @@ func TestImprovedCache_Has(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Reset()
 
-	key := []byte("test_key")
+	key := makeKey32("test_key")
 	value := []byte("test_value")
 
 	// Key should not exist initially
@@ -253,7 +261,7 @@ func TestImprovedCache_Has(t *testing.T) {
 	require.True(t, exists)
 
 	// Non-existent key should return false
-	nonExistentKey := []byte("non_existent")
+	nonExistentKey := makeKey32("non_existent")
 	exists = cache.Has(nonExistentKey)
 	require.False(t, exists)
 }
@@ -264,7 +272,7 @@ func TestImprovedCache_Del(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Reset()
 
-	key := []byte("test_key")
+	key := makeKey32("test_key")
 	value := []byte("test_value")
 
 	// Set the key-value pair
@@ -298,12 +306,12 @@ func TestImprovedCache_SetMultiKeysSingleValue(t *testing.T) {
 	// The function processes keys[i] where i increases by keySize each iteration
 	// So keySize=2 means process keys[0], keys[2], keys[4], etc.
 	keys := [][]byte{
-		[]byte("key1"),
-		[]byte("key2"),
-		[]byte("key3"),
-		[]byte("key4"),
-		[]byte("key5"),
-		[]byte("key6"), // 6 keys total
+		makeKey32("key1"),
+		makeKey32("key2"),
+		makeKey32("key3"),
+		makeKey32("key4"),
+		makeKey32("key5"),
+		makeKey32("key6"), // 6 keys total
 	}
 	value := []byte("shared_value")
 	keySize := 2 // Process every 2nd key: keys[0], keys[2], keys[4]

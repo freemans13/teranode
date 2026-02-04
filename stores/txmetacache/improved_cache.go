@@ -771,20 +771,23 @@ func (b *bucketTrimmed) SetMulti(keys [][]byte, values [][]byte) {
 
 // Set skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 func (b *bucketTrimmed) Set(k, v []byte, h uint64, skipLocking ...bool) error {
-	if len(k) >= (1<<maxValueSizeLog) || len(v) >= (1<<maxValueSizeLog) {
-		// Too big key or value - its length cannot be encoded
-		// with 2 bytes (see below). Skip the entry.
-		return errors.NewProcessingError("[bucketTrimmed.Set]too big key or value (key %d, value %d) max %d", len(k), len(v), 1<<maxValueSizeLog)
+	if len(k) != 32 {
+		// Keys must be exactly 32 bytes (transaction hashes)
+		return errors.NewProcessingError("[bucketTrimmed.Set] key must be 32 bytes, got %d", len(k))
 	}
 
-	var kvLenBuf [4]byte
+	if len(v) >= (1<<maxValueSizeLog) {
+		// Too big value - its length cannot be encoded
+		// with 2 bytes (see below). Skip the entry.
+		return errors.NewProcessingError("[bucketTrimmed.Set] too big value %d, max %d", len(v), 1<<maxValueSizeLog)
+	}
 
-	kvLenBuf[0] = byte(uint16(len(k)) >> 8) // nolint:gosec // higher order 8 bits of key's length
-	kvLenBuf[1] = byte(len(k))              // lower order 8 bits of key's length
-	kvLenBuf[2] = byte(uint16(len(v)) >> 8) // nolint:gosec // higher order 8 bits of value's length
-	kvLenBuf[3] = byte(len(v))              // lower order 8 bits of value's length
+	var vLenBuf [2]byte
 
-	kvLen := uint64(len(kvLenBuf) + len(k) + len(v)) // nolint:gosec
+	vLenBuf[0] = byte(uint16(len(v)) >> 8) // nolint:gosec // higher order 8 bits of value's length
+	vLenBuf[1] = byte(len(v))              // lower order 8 bits of value's length
+
+	kvLen := uint64(len(vLenBuf) + len(k) + len(v)) // nolint:gosec
 	if kvLen >= ChunkSize {
 		// Do not store too big keys and values, since they do not
 		// fit a chunk.
@@ -847,7 +850,7 @@ func (b *bucketTrimmed) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 		chunk = chunk[:0]
 	}
 
-	chunk = append(chunk, kvLenBuf[:]...)
+	chunk = append(chunk, vLenBuf[:]...)
 	chunk = append(chunk, k...)
 	chunk = append(chunk, v...)
 	chunks[chunkIdx] = chunk
@@ -901,15 +904,15 @@ func (b *bucketTrimmed) Get(dst *[]byte, k []byte, h uint64, returnDst bool, ski
 			chunk := chunks[chunkIdx]
 			idx %= ChunkSize
 
-			if idx+4 >= ChunkSize {
+			if idx+2 >= ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				goto end
 			}
 
-			kvLenBuf := chunk[idx : idx+4]
-			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
-			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
-			idx += 4
+			vLenBuf := chunk[idx : idx+2]
+			const keyLen = 32 // Transaction hashes are always 32 bytes
+			valLen := (uint64(vLenBuf[0]) << 8) | uint64(vLenBuf[1])
+			idx += 2
 
 			if idx+keyLen+valLen >= ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
@@ -1172,20 +1175,23 @@ func (b *bucketPreallocated) SetMultiKeysSingleValue(keys [][]byte, value []byte
 // SetNew skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 // removes only half of the each chunk when the chunk is full
 func (b *bucketPreallocated) Set(k, v []byte, h uint64, skipLocking ...bool) error {
-	if len(k) >= (1<<maxValueSizeLog) || len(v) >= (1<<maxValueSizeLog) {
-		// Too big key or value - its length cannot be encoded
-		// with 2 bytes (see below). Skip the entry.
-		return errors.NewProcessingError("[bucketPreallocated.Set]too big key or value (key %d, value %d) max %d", len(k), len(v), 1<<maxValueSizeLog)
+	if len(k) != 32 {
+		// Keys must be exactly 32 bytes (transaction hashes)
+		return errors.NewProcessingError("[bucketPreallocated.Set] key must be 32 bytes, got %d", len(k))
 	}
 
-	var kvLenBuf [4]byte
+	if len(v) >= (1<<maxValueSizeLog) {
+		// Too big value - its length cannot be encoded
+		// with 2 bytes (see below). Skip the entry.
+		return errors.NewProcessingError("[bucketPreallocated.Set] too big value %d, max %d", len(v), 1<<maxValueSizeLog)
+	}
 
-	kvLenBuf[0] = byte(uint16(len(k)) >> 8) // nolint: gosec // higher order 8 bits of key's length
-	kvLenBuf[1] = byte(len(k))              // lower order 8 bits of key's length
-	kvLenBuf[2] = byte(uint16(len(v)) >> 8) // nolint: gosec // higher order 8 bits of value's length
-	kvLenBuf[3] = byte(len(v))              // lower order 8 bits of value's length
+	var vLenBuf [2]byte
 
-	kvLen := uint64(len(kvLenBuf) + len(k) + len(v)) // nolint: gosec
+	vLenBuf[0] = byte(uint16(len(v)) >> 8) // nolint: gosec // higher order 8 bits of value's length
+	vLenBuf[1] = byte(len(v))              // lower order 8 bits of value's length
+
+	kvLen := uint64(len(vLenBuf) + len(k) + len(v)) // nolint: gosec
 	if kvLen >= ChunkSize {
 		// Do not store too big keys and values, since they do not
 		// fit a chunk.
@@ -1246,7 +1252,7 @@ func (b *bucketPreallocated) Set(k, v []byte, h uint64, skipLocking ...bool) err
 		return errors.NewProcessingError("SHOULD NEVER ENTER HERE, chunk is nil or empty")
 	}
 
-	data := append(append(kvLenBuf[:], k...), v...)
+	data := append(append(vLenBuf[:], k...), v...)
 	copy(chunk[idx%ChunkSize:], data)
 
 	chunks[chunkIdx] = chunk
@@ -1284,15 +1290,15 @@ func (b *bucketPreallocated) Get(dst *[]byte, k []byte, h uint64, returnDst bool
 			chunk := chunks[chunkIdx]
 			idx %= ChunkSize
 
-			if idx+4 >= ChunkSize {
+			if idx+2 >= ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				goto end
 			}
 
-			kvLenBuf := chunk[idx : idx+4]
-			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
-			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
-			idx += 4
+			vLenBuf := chunk[idx : idx+2]
+			const keyLen = 32 // Transaction hashes are always 32 bytes
+			valLen := (uint64(vLenBuf[0]) << 8) | uint64(vLenBuf[1])
+			idx += 2
 
 			if idx+keyLen+valLen >= ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
@@ -1470,20 +1476,23 @@ func (b *bucketUnallocated) SetMulti(keys [][]byte, values [][]byte) {
 
 // Set skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 func (b *bucketUnallocated) Set(k, v []byte, h uint64, skipLocking ...bool) error {
-	if len(k) >= (1<<maxValueSizeLog) || len(v) >= (1<<maxValueSizeLog) {
-		// Too big key or value - its length cannot be encoded
-		// with 2 bytes (see below). Skip the entry.
-		return errors.NewProcessingError("[bucketUnallocated.Set] too big key or value (key %d, value %d) max %d", len(k), len(v), 1<<maxValueSizeLog)
+	if len(k) != 32 {
+		// Keys must be exactly 32 bytes (transaction hashes)
+		return errors.NewProcessingError("[bucketUnallocated.Set] key must be 32 bytes, got %d", len(k))
 	}
 
-	var kvLenBuf [4]byte
+	if len(v) >= (1<<maxValueSizeLog) {
+		// Too big value - its length cannot be encoded
+		// with 2 bytes (see below). Skip the entry.
+		return errors.NewProcessingError("[bucketUnallocated.Set] too big value %d, max %d", len(v), 1<<maxValueSizeLog)
+	}
 
-	kvLenBuf[0] = byte(uint16(len(k)) >> 8) // nolint: gosec // higher order 8 bits of key's length
-	kvLenBuf[1] = byte(len(k))              // lower order 8 bits of key's length
-	kvLenBuf[2] = byte(uint16(len(v)) >> 8) // nolint: gosec // higher order 8 bits of value's length
-	kvLenBuf[3] = byte(len(v))              // lower order 8 bits of value's length
+	var vLenBuf [2]byte
 
-	kvLen := uint64(len(kvLenBuf) + len(k) + len(v)) // nolint: gosec
+	vLenBuf[0] = byte(uint16(len(v)) >> 8) // nolint: gosec // higher order 8 bits of value's length
+	vLenBuf[1] = byte(len(v))              // lower order 8 bits of value's length
+
+	kvLen := uint64(len(vLenBuf) + len(k) + len(v)) // nolint: gosec
 	if kvLen >= ChunkSize {
 		// Do not store too big keys and values, since they do not
 		// fit a chunk.
@@ -1544,7 +1553,7 @@ func (b *bucketUnallocated) Set(k, v []byte, h uint64, skipLocking ...bool) erro
 		chunk = chunk[:0]
 	}
 
-	chunk = append(chunk, kvLenBuf[:]...)
+	chunk = append(chunk, vLenBuf[:]...)
 	chunk = append(chunk, k...)
 	chunk = append(chunk, v...)
 	chunks[chunkIdx] = chunk
@@ -1585,16 +1594,16 @@ func (b *bucketUnallocated) Get(dst *[]byte, k []byte, h uint64, returnDst bool,
 			chunk := chunks[chunkIdx]
 			idx %= ChunkSize
 
-			if idx+4 >= ChunkSize {
+			if idx+2 >= ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				goto end
 			}
 
-			kvLenBuf := chunk[idx : idx+4]
-			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
-			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
+			vLenBuf := chunk[idx : idx+2]
+			const keyLen = 32 // Transaction hashes are always 32 bytes
+			valLen := (uint64(vLenBuf[0]) << 8) | uint64(vLenBuf[1])
 
-			idx += 4
+			idx += 2
 
 			if idx+keyLen+valLen >= ChunkSize {
 				// Corrupted data during the load from file. Just skip it.
