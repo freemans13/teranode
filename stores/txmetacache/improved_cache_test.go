@@ -1365,7 +1365,7 @@ func TestImprovedCache_CleanLockedMapCoverage(t *testing.T) {
 //
 // This test runs at dev scale (4GB) to prove the algorithm works before extrapolating to production (640GB).
 func TestTxMetaCache_ClockRetention90Percent(t *testing.T) {
-	// Test with 4GB cache (~22.6M entries at 177 bytes/entry)
+	// Test with 4GB cache (~17.9M entries at 240 bytes/entry)
 	// With race detector, use 1GB to avoid timeout (race adds 5-10x overhead)
 	cacheSize := 4 * 1024 * 1024 * 1024
 	if raceDetectorEnabled {
@@ -1377,7 +1377,7 @@ func TestTxMetaCache_ClockRetention90Percent(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Reset()
 
-	entrySize := 177
+	entrySize := 240
 	capacity := int(float64(cacheSize) / float64(entrySize))
 
 	t.Logf("Testing %dGB Clock cache with capacity ~%d entries", cacheSize/(1024*1024*1024), capacity)
@@ -1474,8 +1474,8 @@ func TestTxMetaCache_ClockRetention90Percent(t *testing.T) {
 
 	// Verify memory efficiency
 	bytesPerEntry := float64(cacheSize) / float64(actualEntries)
-	t.Logf("Memory efficiency: %.1f bytes/entry (target: ≤177)", bytesPerEntry)
-	require.LessOrEqual(t, bytesPerEntry, 180.0, "Memory per entry exceeds budget")
+	t.Logf("Memory efficiency: %.1f bytes/entry (target: ≤240)", bytesPerEntry)
+	require.LessOrEqual(t, bytesPerEntry, 250.0, "Memory per entry exceeds budget")
 
 	cacheGB := cacheSize / (1024 * 1024 * 1024)
 	t.Logf("✓ Clock algorithm verified: High utilization + high integrity at %dGB scale", cacheGB)
@@ -1489,9 +1489,9 @@ func TestTxMetaCache_ClockLinearScaling(t *testing.T) {
 		sizeGB   int
 		capacity int
 	}{
-		{"1GB", 1, 5_650_000},  // 1GB / 177 bytes
-		{"2GB", 2, 11_300_000}, // 2GB / 177 bytes
-		{"4GB", 4, 22_600_000}, // 4GB / 177 bytes
+		{"1GB", 1, 4_470_000},  // 1GB / 240 bytes
+		{"2GB", 2, 8_940_000},  // 2GB / 240 bytes
+		{"4GB", 4, 17_880_000}, // 4GB / 240 bytes
 	}
 
 	// With race detector, skip 4GB test (takes >8 minutes, causes timeout)
@@ -1521,7 +1521,7 @@ func TestTxMetaCache_ClockLinearScaling(t *testing.T) {
 
 			for j := 0; j < totalInserts; j++ {
 				key := []byte(fmt.Sprintf("tx_%09d", j))
-				value := make([]byte, 177-len(key)-4)
+				value := make([]byte, 240-len(key)-4)
 				// Add unique data to detect corruption
 				binary.BigEndian.PutUint64(value[0:8], uint64(j))
 				err := cache.Set(key, value)
@@ -1616,7 +1616,7 @@ func TestTxMetaCache_ClockMemoryStability(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Reset()
 
-	capacity := (256 * 1024 * 1024) / 177
+	capacity := (256 * 1024 * 1024) / 240
 	samples := make([]uint64, 0)
 	integritySamples := make([]float64, 0)
 
@@ -1625,7 +1625,7 @@ func TestTxMetaCache_ClockMemoryStability(t *testing.T) {
 	// Fill to capacity with unique data
 	for i := 0; i < capacity; i++ {
 		key := []byte(fmt.Sprintf("tx_%09d", i))
-		value := make([]byte, 177-len(key)-4)
+		value := make([]byte, 240-len(key)-4)
 		binary.BigEndian.PutUint64(value[0:8], uint64(i))
 		_ = cache.Set(key, value)
 	}
@@ -1642,7 +1642,7 @@ func TestTxMetaCache_ClockMemoryStability(t *testing.T) {
 	for time.Now().Before(stopTime) {
 		// Insert new entries (will trigger Clock eviction)
 		key := []byte(fmt.Sprintf("tx_%09d", insertCount))
-		value := make([]byte, 177-len(key)-4)
+		value := make([]byte, 240-len(key)-4)
 		binary.BigEndian.PutUint64(value[0:8], uint64(insertCount))
 		_ = cache.Set(key, value)
 

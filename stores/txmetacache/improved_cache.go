@@ -1733,7 +1733,9 @@ func (b *bucketUnallocated) getMapSize() uint64 {
 
 // bucketClock implements Clock/Second-Chance LRU eviction.
 // Achieves 90%+ retention vs ring buffer's 50% by giving accessed entries a second chance.
-// Uses 1 byte per entry for access tracking. O(1) amortized operations.
+// Uses 40 bytes per entry for slot structure (hash, slice header, accessed bit, padding).
+// Total memory per entry (~240 bytes) is comparable to Unallocated due to capacity adjustment.
+// O(1) amortized operations with bounded eviction scan.
 type bucketClock struct {
 	mu sync.RWMutex
 
@@ -1778,9 +1780,15 @@ func (b *bucketClock) Init(maxBytes uint64, _ int) error {
 		return errors.NewProcessingError("too big maxBytes=%d; should be smaller than %d", maxBytes, maxBucketSize)
 	}
 
-	// Calculate capacity based on average entry size
-	// Average entry: ~160 bytes data + 16 bytes map + 1 byte accessed = 177 bytes
-	const avgEntrySize = 177
+	// Calculate capacity based on total memory per entry to match configured limit.
+	// Memory breakdown per entry:
+	//   - clockSlot struct (preallocated): 40 bytes (hash + slice header + accessed + padding)
+	//   - Transaction metadata (when populated): 160 bytes average
+	//   - Go map overhead: 48 bytes (bucket overhead + key + value)
+	//   - Total: ~248 bytes per entry when cache is full
+	// Using 240 bytes/entry ensures total memory stays close to configured maxBytes,
+	// matching Unallocated's memory usage for safe algorithm switching.
+	const avgEntrySize = 240
 	b.capacity = maxBytes / avgEntrySize
 	if b.capacity == 0 {
 		b.capacity = 1
