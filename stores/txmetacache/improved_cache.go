@@ -182,7 +182,6 @@ type Stats struct {
 	TrimCount            uint64 // Number of trim operations performed on the cache
 	TotalMapSize         uint64 // Total size of all hash maps used by the cache buckets
 	TotalElementsAdded   uint64 // Cumulative count of all elements ever added to the cache
-	ClockForcedEvictions uint64 // Number of forced evictions when Clock sweep hit maxClockSweep limit
 }
 
 // Reset clears all statistics in the Stats object.
@@ -1752,9 +1751,6 @@ type bucketClock struct {
 
 	// count is the current number of valid entries
 	count uint64
-
-	// forcedEvictions tracks how often we hit maxClockSweep limit (observability)
-	forcedEvictions uint64
 }
 
 // clockSlot represents a single cache entry in the Clock algorithm.
@@ -1812,7 +1808,6 @@ func (b *bucketClock) Reset() {
 	b.m = make(map[uint64]uint64)
 	b.clockHand = 0
 	b.count = 0
-	atomic.StoreUint64(&b.forcedEvictions, 0)
 }
 
 // maxClockSweep is the maximum number of slots to check before forcing eviction.
@@ -1833,11 +1828,6 @@ func (b *bucketClock) evictWithClock() uint64 {
 
 		// Check if we found a victim (accessed=0) or hit sweep limit
 		if atomic.LoadUint32(&slot.accessed) == 0 || checked >= maxClockSweep {
-			// Track forced evictions for observability
-			if checked >= maxClockSweep {
-				atomic.AddUint64(&b.forcedEvictions, 1)
-			}
-
 			// Remove from map if entry exists
 			if slot.hash != 0 {
 				delete(b.m, slot.hash)
@@ -1971,7 +1961,6 @@ func (b *bucketClock) UpdateStats(s *Stats) {
 
 	s.EntriesCount += uint64(len(b.m))
 	s.TotalMapSize += b.getMapSize()
-	s.ClockForcedEvictions += atomic.LoadUint64(&b.forcedEvictions)
 }
 
 func (b *bucketClock) listChunks() {
