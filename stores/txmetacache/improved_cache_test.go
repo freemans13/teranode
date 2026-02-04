@@ -44,11 +44,12 @@ func TestImprovedCache_TestSetMultiWithExpectedMisses(t *testing.T) {
 	// bucket size: 128 MB / 8 * 1024 = 16 KB per bucket
 	// chunk size: 4 KB
 	// 16 KB / 4 KB = 4 chunks per bucket
-	// 4 KB / 68  = 60 key-value pairs per chunk
-	// 60 * 4 = 240 key-value pairs per bucket
-	// 240 * 8 * 1024 =  1966080 key-value pairs per cache
+	// Entry size: [2B:valLen][32B:key][32B:value] = 66 bytes per entry
+	// 4 KB / 66  = 62 key-value pairs per chunk
+	// 62 * 4 = 248 key-value pairs per bucket
+	// 248 * 8 * 1024 = 2,031,616 key-value pairs per cache
 
-	numberOfKeys := 1_967_000
+	numberOfKeys := 2_050_000 // Exceed capacity to trigger evictions
 
 	for i := 0; i < numberOfKeys; i++ {
 		key := make([]byte, 32)
@@ -344,13 +345,13 @@ func TestImprovedCache_SetMultiKeysSingleValueAppended(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Reset()
 
-	// Create keys as a single byte slice
-	keySize := 4
+	// Create keys as a single byte slice (all keys must be 32 bytes)
+	keySize := 32
 	numKeys := 3
 	keys := make([]byte, keySize*numKeys)
-	copy(keys[0:4], []byte("key1"))
-	copy(keys[4:8], []byte("key2"))
-	copy(keys[8:12], []byte("key3"))
+	copy(keys[0:32], makeKey32("key1"))
+	copy(keys[32:64], makeKey32("key2"))
+	copy(keys[64:96], makeKey32("key3"))
 
 	value := []byte("appended_value")
 
@@ -384,7 +385,7 @@ func TestImprovedCache_UpdateStats(t *testing.T) {
 	// Add some entries
 	numEntries := 10
 	for i := 0; i < numEntries; i++ {
-		key := []byte("key" + string(rune('0'+i)))
+		key := makeKey32("key" + string(rune('0'+i)))
 		value := []byte("value" + string(rune('0'+i)))
 		err := cache.Set(key, value)
 		require.NoError(t, err)
@@ -404,7 +405,7 @@ func TestImprovedCache_Reset(t *testing.T) {
 
 	// Add some entries
 	for i := 0; i < 5; i++ {
-		key := []byte("key" + string(rune('0'+i)))
+		key := makeKey32("key" + string(rune('0'+i)))
 		value := []byte("value" + string(rune('0'+i)))
 		err := cache.Set(key, value)
 		require.NoError(t, err)
@@ -424,7 +425,7 @@ func TestImprovedCache_Reset(t *testing.T) {
 	require.Equal(t, uint64(0), stats.EntriesCount)
 
 	// Verify keys no longer exist
-	key := []byte("key0")
+	key := makeKey32("key0")
 	exists := cache.Has(key)
 	require.False(t, exists)
 }
@@ -452,30 +453,28 @@ func TestImprovedCache_LargeKeys(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Reset()
 
-	// Test with maximum allowed key size (2^11 - 1 = 2047 bytes)
-	maxKeySize := (1 << maxValueSizeLog) - 1
-	largeKey := make([]byte, maxKeySize)
-	for i := range largeKey {
-		largeKey[i] = byte(i % 256)
-	}
-	value := []byte("large_key_value")
+	// Keys must be exactly 32 bytes (transaction hash size)
+	correctKey := makeKey32("correct_key")
+	value := []byte("test_value")
 
-	// This should work
-	err = cache.Set(largeKey, value)
+	// 32-byte key should work
+	err = cache.Set(correctKey, value)
 	require.NoError(t, err)
 
 	// Verify retrieval
 	var dst []byte
-	err = cache.Get(&dst, largeKey)
+	err = cache.Get(&dst, correctKey)
 	require.NoError(t, err)
 	require.Equal(t, value, dst)
 
-	// Test with key that exceeds limit (should fail but not crash)
-	oversizedKey := make([]byte, maxKeySize+1)
-	err = cache.Set(oversizedKey, value)
-	// Implementation might handle this gracefully or return an error
-	// The test verifies it doesn't crash
-	t.Logf("Setting oversized key result: %v", err)
+	// Test with wrong-sized keys (should fail)
+	smallKey := make([]byte, 16)
+	err = cache.Set(smallKey, value)
+	require.Error(t, err, "Keys smaller than 32 bytes should be rejected")
+
+	largeKey := make([]byte, 64)
+	err = cache.Set(largeKey, value)
+	require.Error(t, err, "Keys larger than 32 bytes should be rejected")
 }
 
 // TestImprovedCache_LargeValues tests behavior with values near the size limit
@@ -484,7 +483,7 @@ func TestImprovedCache_LargeValues(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Reset()
 
-	key := []byte("large_value_key")
+	key := makeKey32("large_value_key")
 
 	// Test with maximum allowed value size
 	maxValueSize := (1 << maxValueSizeLog) - 1
@@ -520,7 +519,7 @@ func TestImprovedCache_ConcurrentAccess(t *testing.T) {
 			defer func() { done <- struct{}{} }()
 
 			for j := 0; j < numOpsPerGoroutine; j++ {
-				key := []byte("key" + string(rune('0'+goroutineID)) + "_" + string(rune('0'+(j%10))))
+				key := makeKey32("key" + string(rune('0'+goroutineID)) + "_" + string(rune('0'+(j%10))))
 				value := []byte("value" + string(rune('0'+goroutineID)) + "_" + string(rune('0'+(j%10))))
 
 				// Set operation
@@ -571,7 +570,7 @@ func TestImprovedCache_DifferentBucketTypes(t *testing.T) {
 			defer cache.Reset()
 
 			// Test basic operations
-			key := []byte("test_key")
+			key := makeKey32("test_key")
 			value := []byte("test_value")
 
 			// Set
@@ -624,17 +623,13 @@ func TestImprovedCache_EdgeCases(t *testing.T) {
 		emptyKey := []byte{}
 		value := []byte("value_for_empty_key")
 
+		// Should fail - keys must be 32 bytes
 		err := cache.Set(emptyKey, value)
-		require.NoError(t, err)
-
-		var dst []byte
-		err = cache.Get(&dst, emptyKey)
-		require.NoError(t, err)
-		require.Equal(t, value, dst)
+		require.Error(t, err)
 	})
 
 	t.Run("empty value", func(t *testing.T) {
-		key := []byte("key_for_empty_value")
+		key := makeKey32("key_for_empty_value")
 		emptyValue := []byte{}
 
 		err := cache.Set(key, emptyValue)
@@ -648,7 +643,7 @@ func TestImprovedCache_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("overwrite existing key", func(t *testing.T) {
-		key := []byte("overwrite_key")
+		key := makeKey32("overwrite_key")
 		value1 := []byte("first_value")
 		value2 := []byte("second_value")
 
@@ -845,13 +840,13 @@ func TestImprovedCache_GenerationWraparound(t *testing.T) {
 	defer cache.Reset()
 
 	// Create entries that will cause multiple generations
-	baseKey := []byte("generation_test_key_")
+	baseKey := "generation_test_key_"
 	baseValue := []byte("generation_test_value_")
 
 	// Fill and refill the cache multiple times to cause generation changes
 	for round := 0; round < 5; round++ {
 		for i := 0; i < 200; i++ { // 200 entries per round
-			key := append(baseKey, byte(round), byte(i))
+			key := makeKey32(fmt.Sprintf("%s%d_%d", baseKey, round, i))
 			value := append(baseValue, byte(round), byte(i))
 
 			err := cache.Set(key, value)
@@ -860,7 +855,7 @@ func TestImprovedCache_GenerationWraparound(t *testing.T) {
 	}
 
 	// Verify the cache is still functional after multiple generations
-	testKey := append(baseKey, byte(4), byte(100)) // Key from last round
+	testKey := makeKey32(fmt.Sprintf("%s4_100", baseKey)) // Key from last round
 	testValue := append(baseValue, byte(4), byte(100))
 
 	// Try to retrieve a recent key
@@ -898,24 +893,19 @@ func TestImprovedCache_CleanLockedMapEdgeCases(t *testing.T) {
 			require.NoError(t, err)
 			defer cache.Reset()
 
-			// Create a mix of small and larger entries to stress the cleanup logic
+			// Create a mix of different value sizes to stress the cleanup logic
 			entries := []struct {
-				key   []byte
-				value []byte
+				keyStr string
+				value  []byte
 			}{
-				{[]byte("small_key_1"), []byte("small_val_1")},
-				{make([]byte, 100), make([]byte, 200)}, // Larger entry
-				{[]byte("small_key_2"), []byte("small_val_2")},
-				{make([]byte, 150), make([]byte, 300)}, // Another larger entry
+				{"small_key_1", []byte("small_val_1")},
+				{"large_key_1", make([]byte, 200)}, // Larger value
+				{"small_key_2", []byte("small_val_2")},
+				{"large_key_2", make([]byte, 300)}, // Another larger value
 			}
 
-			// Fill with pattern data
+			// Fill value pattern data
 			for i, entry := range entries {
-				for j := range entry.key {
-					if len(entry.key) > 20 { // Only fill large keys
-						entry.key[j] = byte(i*13 + j)
-					}
-				}
 				for j := range entry.value {
 					if len(entry.value) > 20 { // Only fill large values
 						entry.value[j] = byte(i*17 + j + 50)
@@ -927,8 +917,8 @@ func TestImprovedCache_CleanLockedMapEdgeCases(t *testing.T) {
 			successCount := 0
 			for cycle := 0; cycle < 100; cycle++ {
 				for i, entry := range entries {
-					// Make each cycle's keys unique
-					key := append(entry.key, byte(cycle), byte(i))
+					// Make each cycle's keys unique (all keys are 32 bytes via makeKey32)
+					key := makeKey32(fmt.Sprintf("%s_%d_%d", entry.keyStr, cycle, i))
 					value := append(entry.value, byte(cycle), byte(i))
 
 					err := cache.Set(key, value)
@@ -980,11 +970,11 @@ func TestImprovedCache_ForceCleanLockedMap(t *testing.T) {
 			successCount := 0
 			totalAttempts := 0
 
-			// Try to overflow the cache with many small entries
+			// Try to overflow the cache with many entries
 			for round := 0; round < 20; round++ { // Multiple rounds to trigger wraparound
 				for i := 0; i < 200; i++ { // Many entries per round
-					// Create small unique keys and values
-					key := []byte(fmt.Sprintf("%s%d_%d", baseKey, round, i))
+					// Create 32-byte keys (transaction hash size)
+					key := makeKey32(fmt.Sprintf("%s%d_%d", baseKey, round, i))
 					value := []byte(fmt.Sprintf("%s%d_%d", baseValue, round, i))
 
 					totalAttempts++
@@ -1168,8 +1158,8 @@ func TestImprovedCache_TrimmedSetMultiKeysSingleValue(t *testing.T) {
 	// Test the specific behavior of trimmed bucket's SetMultiKeysSingleValue
 	// which appends to existing values rather than overwriting
 	keys := [][]byte{
-		[]byte("test_key1"),
-		[]byte("test_key2"),
+		makeKey32("test_key1"),
+		makeKey32("test_key2"),
 	}
 
 	// Set initial values
@@ -1182,7 +1172,7 @@ func TestImprovedCache_TrimmedSetMultiKeysSingleValue(t *testing.T) {
 
 	// Now use SetMultiKeysSingleValue - this should append to existing values for trimmed bucket
 	appendValue := []byte("_appended")
-	err = cache.SetMultiKeysSingleValue(keys, appendValue, len(keys[0]))
+	err = cache.SetMultiKeysSingleValue(keys, appendValue, 32) // keySize is now 32
 	if err != nil {
 		t.Logf("SetMultiKeysSingleValue failed: %v", err)
 	}
@@ -1234,9 +1224,9 @@ func TestImprovedCache_BucketDelFunctions(t *testing.T) {
 
 			// Add some test data
 			testKeys := [][]byte{
-				[]byte("del_test_key1"),
-				[]byte("del_test_key2"),
-				[]byte("del_test_key3"),
+				makeKey32("del_test_key1"),
+				makeKey32("del_test_key2"),
+				makeKey32("del_test_key3"),
 			}
 			testValue := []byte("test_value_to_delete")
 

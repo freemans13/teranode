@@ -538,11 +538,11 @@ func Test_txMetaCache_MultiOperations(t *testing.T) {
 		err = cache.SetCacheMulti([][]byte{hash[:]}, [][]byte{[]byte{}})
 		require.NoError(t, err)
 
-		// Verify height is still encoded
+		// Verify empty data is cached correctly (no height encoding anymore)
 		cachedBytes := make([]byte, 0)
 		err = cache.cache.Get(&cachedBytes, hash[:])
 		require.NoError(t, err)
-		require.Equal(t, 4, len(cachedBytes)) // Should only contain height
+		require.Equal(t, 0, len(cachedBytes)) // Empty data, no height suffix
 	})
 }
 
