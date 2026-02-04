@@ -227,11 +227,11 @@ func New(
 
 	// create a caching tx meta store
 	if tSettings.SubtreeValidation.TxMetaCacheEnabled {
-		logger.Infof("Using cached version of tx meta store")
+		logger.Infof("Using cached version of tx meta store with Clock algorithm (90%+ retention)")
 
 		var err error
 
-		u.utxoStore, err = txmetacache.NewTxMetaCache(ctx, tSettings, logger, utxoStore, txmetacache.Unallocated)
+		u.utxoStore, err = txmetacache.NewTxMetaCache(ctx, tSettings, logger, utxoStore, txmetacache.Clock)
 		if err != nil {
 			logger.Errorf("Failed to create tx meta cache: %v", err)
 		}
