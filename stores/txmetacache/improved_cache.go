@@ -1826,8 +1826,15 @@ func (b *bucketClock) Reset() {
 // - If accessed = 1: Give second chance (set to 0), advance
 // - If accessed = 0: Evict this entry, return its slot index
 //
+// To prevent infinite loops when concurrent Get() calls continuously set accessed=1,
+// this method sweeps at most one full rotation (capacity iterations). If no victim
+// is found after a full sweep, it evicts the current slot regardless of access bit.
+//
 // This method must be called with the bucket lock held.
 func (b *bucketClock) evictWithClock() uint64 {
+	startPos := b.clockHand
+	checked := uint64(0)
+
 	for {
 		// Check current slot at clock hand
 		slot := &b.slots[b.clockHand]
@@ -1850,6 +1857,38 @@ func (b *bucketClock) evictWithClock() uint64 {
 		// Give second chance - reset access bit and advance
 		atomic.StoreUint32(&slot.accessed, 0)
 		b.clockHand = (b.clockHand + 1) % b.capacity
+		checked++
+
+		// Prevent infinite loop: if we've checked all slots and found none with
+		// accessed=0 (all recently accessed), evict the current slot anyway
+		if checked >= b.capacity {
+			victimIdx := b.clockHand
+
+			// Remove from map (if entry exists)
+			if b.slots[victimIdx].hash != 0 {
+				delete(b.m, b.slots[victimIdx].hash)
+			}
+
+			// Advance for next eviction
+			b.clockHand = (b.clockHand + 1) % b.capacity
+
+			return victimIdx
+		}
+
+		// Additional safety: if we've wrapped back to start, evict current slot
+		// (This should be caught by the checked >= capacity condition above,
+		// but provides defense in depth)
+		if b.clockHand == startPos && checked > 0 {
+			victimIdx := b.clockHand
+
+			if b.slots[victimIdx].hash != 0 {
+				delete(b.m, b.slots[victimIdx].hash)
+			}
+
+			b.clockHand = (b.clockHand + 1) % b.capacity
+
+			return victimIdx
+		}
 	}
 }
 
