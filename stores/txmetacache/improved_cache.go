@@ -1825,7 +1825,8 @@ func (b *bucketClock) Reset() {
 const maxClockSweep = 1024
 
 // evictWithClock finds a victim using Clock algorithm. Scans up to maxClockSweep slots,
-// giving accessed entries a second chance. Forces eviction if limit reached.
+// prioritizing empty slots (from Del()) before checking accessed bits.
+// Gives accessed entries a second chance. Forces eviction if limit reached.
 // Must be called with bucket lock held.
 func (b *bucketClock) evictWithClock() uint64 {
 	checked := uint64(0)
@@ -1834,12 +1835,16 @@ func (b *bucketClock) evictWithClock() uint64 {
 		slot := &b.slots[b.clockHand]
 		victimIdx := b.clockHand
 
-		// Check if we found a victim (accessed=0) or hit sweep limit
+		// Priority 1: Empty slots from Del() - reuse immediately
+		if slot.hash == 0 {
+			b.clockHand = (b.clockHand + 1) % b.capacity
+			return victimIdx
+		}
+
+		// Priority 2: Unaccessed slots or sweep limit reached
 		if atomic.LoadUint32(&slot.accessed) == 0 || checked >= maxClockSweep {
-			// Remove from map if entry exists
-			if slot.hash != 0 {
-				delete(b.m, slot.hash)
-			}
+			// Remove from map
+			delete(b.m, slot.hash)
 
 			// Advance for next eviction
 			b.clockHand = (b.clockHand + 1) % b.capacity
@@ -1949,8 +1954,8 @@ func (b *bucketClock) Get(dst *[]byte, k []byte, h uint64, returnDst bool, skipL
 	return true
 }
 
-// Del removes an entry from the bucket. The slot becomes reusable when Clock hand reaches it.
-// Count is not decremented - Clock hand will naturally reclaim the slot during eviction.
+// Del removes an entry from the bucket. The slot becomes reusable immediately.
+// Count is decremented so eviction logic knows slots are available.
 func (b *bucketClock) Del(h uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1959,6 +1964,7 @@ func (b *bucketClock) Del(h uint64) {
 		delete(b.m, h)
 		b.slots[slotIdx].hash = 0   // Mark slot as empty
 		b.slots[slotIdx].data = nil // Free memory
+		b.count--                   // Decrement count to reflect deletion
 	}
 }
 
