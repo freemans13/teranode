@@ -113,6 +113,39 @@ const (
 	Clock
 )
 
+// String returns the string representation of the BucketType.
+func (bt BucketType) String() string {
+	switch bt {
+	case Unallocated:
+		return "Unallocated"
+	case Preallocated:
+		return "Preallocated"
+	case Trimmed:
+		return "Trimmed"
+	case Clock:
+		return "Clock"
+	default:
+		return "Unknown"
+	}
+}
+
+// ParseBucketType converts a string to a BucketType.
+// Returns Clock as the default if the string is not recognized.
+func ParseBucketType(s string) BucketType {
+	switch s {
+	case "Unallocated", "unallocated":
+		return Unallocated
+	case "Preallocated", "preallocated":
+		return Preallocated
+	case "Trimmed", "trimmed":
+		return Trimmed
+	case "Clock", "clock":
+		return Clock
+	default:
+		return Clock // Default to Clock
+	}
+}
+
 // NewTxMetaCache creates a new transaction metadata cache that wraps an existing UTXO store.
 // The cache intercepts and handles transaction metadata operations to improve performance
 // while maintaining the same interface as the underlying store.

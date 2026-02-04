@@ -227,11 +227,12 @@ func New(
 
 	// create a caching tx meta store
 	if tSettings.SubtreeValidation.TxMetaCacheEnabled {
-		logger.Infof("Using cached version of tx meta store (algorithm: Clock)")
+		bucketType := txmetacache.ParseBucketType(tSettings.SubtreeValidation.TxMetaCacheBucketType)
+		logger.Infof("Using cached version of tx meta store (algorithm: %s)", bucketType.String())
 
 		var err error
 
-		u.utxoStore, err = txmetacache.NewTxMetaCache(ctx, tSettings, logger, utxoStore, txmetacache.Clock)
+		u.utxoStore, err = txmetacache.NewTxMetaCache(ctx, tSettings, logger, utxoStore, bucketType)
 		if err != nil {
 			logger.Errorf("Failed to create tx meta cache: %v", err)
 		}
