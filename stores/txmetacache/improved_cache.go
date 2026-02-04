@@ -178,10 +178,10 @@ const chunkSizeTest = maxValueSizeKB * 2 * 1024  //nolint:unused
 // Use ImprovedCache.UpdateStats method to obtain the most current statistics.
 type Stats struct {
 	// EntriesCount is the current number of entries in the cache.
-	EntriesCount         uint64 // Current number of entries stored in the cache
-	TrimCount            uint64 // Number of trim operations performed on the cache
-	TotalMapSize         uint64 // Total size of all hash maps used by the cache buckets
-	TotalElementsAdded   uint64 // Cumulative count of all elements ever added to the cache
+	EntriesCount       uint64 // Current number of entries stored in the cache
+	TrimCount          uint64 // Number of trim operations performed on the cache
+	TotalMapSize       uint64 // Total size of all hash maps used by the cache buckets
+	TotalElementsAdded uint64 // Cumulative count of all elements ever added to the cache
 }
 
 // Reset clears all statistics in the Stats object.
