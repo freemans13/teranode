@@ -1192,8 +1192,8 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 	// Use a buffered channel to prevent blocking on sends
 	ch := make(chan *blockchain_api.Notification, 100)
 
-	// Heartbeat timeout: 3 missed heartbeats (server sends every 10s)
-	const heartbeatTimeout = 30 * time.Second
+	// Heartbeat timeout: 3x the server's broadcast interval (allows 3 missed heartbeats)
+	heartbeatTimeout := 3 * c.settings.BlockChain.HeartbeatInterval
 
 	// Use sync.Once to ensure channel is closed exactly once
 	var closeOnce sync.Once

@@ -599,9 +599,9 @@ func (b *Blockchain) startKafka() {
 
 // startHeartbeatSender sends periodic heartbeat (PING) notifications to all subscribers.
 // This allows clients to detect subscription staleness and reconnect if needed.
-// The heartbeat interval is 10 seconds.
+// The heartbeat interval is configurable via settings (default: 10s).
 func (b *Blockchain) startHeartbeatSender(ctx context.Context) {
-	const heartbeatInterval = 10 * time.Second
+	heartbeatInterval := b.settings.BlockChain.HeartbeatInterval
 
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
