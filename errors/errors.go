@@ -13,7 +13,6 @@ package errors
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"runtime"
 	"strings"
 	"unicode/utf8"
@@ -191,25 +190,22 @@ func (e *Error) As(target interface{}) bool {
 		return true
 	}
 
-	// 1. Try the data payload.
+	// Try the data payload (not reachable via Unwrap, so check it here).
 	if err, ok := e.data.(error); ok {
-		var as interface{ As(interface{}) bool }
-		if as, ok = err.(interface{ As(interface{}) bool }); ok && as.As(target) {
-			return true
-		}
-	}
-
-	// 2. Try an explicitly wrapped error.
-	if err := e.wrappedErr; err != nil && !reflect.ValueOf(err).IsNil() {
 		if as, ok := err.(interface{ As(interface{}) bool }); ok && as.As(target) {
 			return true
 		}
 	}
 
-	// 3. Finally, get whatever "errors.Unwrap" gives us.
-	if err := errors.Unwrap(e); err != nil {
-		if as, ok := err.(interface{ As(interface{}) bool }); ok && as.As(target) {
-			return true
+	// Try wrapped error, but ONLY if it's not an *Error type.
+	// If wrapped error is *Error, skip here - Go's errors.As will find it via Unwrap().
+	// This prevents infinite recursion when *Error wraps *Error.
+	if e.wrappedErr != nil {
+		// Skip if wrapped error is *Error to avoid recursive loop
+		if _, isError := e.wrappedErr.(*Error); !isError {
+			if as, ok := e.wrappedErr.(interface{ As(interface{}) bool }); ok && as.As(target) {
+				return true
+			}
 		}
 	}
 
