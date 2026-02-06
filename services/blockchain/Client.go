@@ -173,7 +173,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 
 				switch notification.Type {
 				case model.NotificationType_PING:
-					c.lastHeartbeat.Store(time.Now().UnixNano())
+					// Heartbeat already updated in SubscribeToServer before sending to channel
 					c.logger.Debugf("[Blockchain] Received heartbeat for %s", source)
 				case model.NotificationType_FSMState:
 					c.logger.Debugf("[Blockchain] Received FSM state notification for %s: %s", source, notification.GetMetadata().String())
@@ -1246,9 +1246,9 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 			c.logger.Infof("[Blockchain] Subscription established, fetching current FSM state for %s", source)
 			c.fetchAndRestoreFSMState(ctx, source)
 
-			// Initialize heartbeat only after successful subscription
-			// This ensures staleness detection works during reconnection attempts
-			c.lastHeartbeat.Store(time.Now().UnixNano())
+			// Don't initialize heartbeat here - let it remain 0 until first PING is received.
+			// This ensures staleness detection works correctly: if connection breaks before
+			// first PING, lastHB will be 0 and we'll properly set FSM to IDLE.
 
 			for c.running.Load() {
 				resp, err := stream.Recv()
@@ -1260,11 +1260,18 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 
 					// Check if heartbeat was stale when error occurred
 					lastHB := c.lastHeartbeat.Load()
-					lastHeartbeatAge := time.Since(time.Unix(0, lastHB))
-					if lastHB > 0 && lastHeartbeatAge > heartbeatTimeout {
-						c.logger.Warnf("[Blockchain] Heartbeat stale (%v), setting FSM to IDLE: %s", lastHeartbeatAge, source)
+					if lastHB == 0 {
+						// Never received a heartbeat - connection broke before first PING
+						c.logger.Warnf("[Blockchain] No heartbeat received, setting FSM to IDLE: %s", source)
 						idleState := FSMStateIDLE
 						c.fmsState.Store(&idleState)
+					} else {
+						lastHeartbeatAge := time.Since(time.Unix(0, lastHB))
+						if lastHeartbeatAge > heartbeatTimeout {
+							c.logger.Warnf("[Blockchain] Heartbeat stale (%v), setting FSM to IDLE: %s", lastHeartbeatAge, source)
+							idleState := FSMStateIDLE
+							c.fmsState.Store(&idleState)
+						}
 					}
 
 					if !strings.Contains(err.Error(), context.Canceled.Error()) {
@@ -1338,7 +1345,9 @@ func (c *Client) fetchAndRestoreFSMState(ctx context.Context, source string) {
 
 	state, err := c.client.GetFSMCurrentState(stateCtx, &emptypb.Empty{})
 	if err != nil {
-		c.logger.Warnf("[Blockchain] Failed to fetch FSM state for %s: %v, keeping current state", source, err)
+		c.logger.Warnf("[Blockchain] Failed to fetch FSM state, setting to IDLE for safety: %v", err)
+		idleState := FSMStateIDLE
+		c.fmsState.Store(&idleState)
 		return
 	}
 
