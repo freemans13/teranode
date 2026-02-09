@@ -39,8 +39,10 @@ var _ pruner.Service = (*Service)(nil)
 var IndexName, _ = gocore.Config().Get("pruner_IndexName", "pruner_dah_index")
 
 var (
-	prometheusMetricsInitOnce  sync.Once
-	prometheusUtxoCleanupBatch prometheus.Histogram
+	prometheusMetricsInitOnce     sync.Once
+	prometheusUtxoCleanupBatch    prometheus.Histogram
+	prometheusUtxoRecordErrors    prometheus.Counter
+	prometheusUtxoBatchQueryError prometheus.Counter
 )
 
 // Options contains configuration options for the cleanup service
@@ -161,6 +163,14 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 			Name:    "utxo_cleanup_batch_duration_seconds",
 			Help:    "Time taken to process a batch of cleanup jobs",
 			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120},
+		})
+		prometheusUtxoRecordErrors = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_record_errors_total",
+			Help: "Total number of Aerospike record-level errors during pruning",
+		})
+		prometheusUtxoBatchQueryError = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_batch_query_errors_total",
+			Help: "Total number of Aerospike batch query errors during child verification",
 		})
 	})
 
@@ -640,6 +650,10 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	var safetyMap map[string]bool
 	var parentToChildren map[string][]string
 
+	// Track record errors for batch-level reporting (avoid log flooding)
+	var recordErrorCount int
+	var firstRecordError error
+
 	if !s.defensiveEnabled {
 		// Defensive mode disabled - allow all deletions without child verification
 		safetyMap = make(map[string]bool)
@@ -653,7 +667,15 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		deletedChildren := make(map[string]bool, 20)              // child hash -> already deleted (typical: 0-20)
 
 		for _, rec := range chunk {
-			if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
+			if rec.Err != nil {
+				if firstRecordError == nil {
+					firstRecordError = rec.Err
+				}
+				recordErrorCount++
+				prometheusUtxoRecordErrors.Inc()
+				continue
+			}
+			if rec.Record == nil || rec.Record.Bins == nil {
 				continue
 			}
 
@@ -734,7 +756,15 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	skippedCount := 0
 
 	for _, rec := range chunk {
-		if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
+		if rec.Err != nil {
+			if firstRecordError == nil {
+				firstRecordError = rec.Err
+			}
+			recordErrorCount++
+			prometheusUtxoRecordErrors.Inc()
+			continue
+		}
+		if rec.Record == nil || rec.Record.Bins == nil {
 			continue
 		}
 
@@ -829,6 +859,11 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	// Flush all accumulated operations in one batch per chunk
 	if err := s.flushCleanupBatches(ctx, allParentUpdates, allDeletions, allExternalFiles); err != nil {
 		return 0, 0, err
+	}
+
+	// Report record-level errors once per chunk (avoid log flooding)
+	if recordErrorCount > 0 {
+		s.logger.Errorf("Aerospike record errors in chunk: %d records failed (sample error: %v)", recordErrorCount, firstRecordError)
 	}
 
 	return processedCount, skippedCount, nil
@@ -954,7 +989,8 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 	// Execute batch operation
 	err := s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
-		s.logger.Errorf("[processBatchOfChildren] Batch operation failed: %v", err)
+		s.logger.Errorf("[processBatchOfChildren] Batch operation failed (affected %d child records): %v", len(batchRecords), err)
+		prometheusUtxoBatchQueryError.Inc()
 		// Mark all in this batch as unsafe on batch error
 		for hexHash := range hashToKey {
 			safetyMap[hexHash] = false
@@ -971,6 +1007,10 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 	for _, batchRec := range batchRecords {
 		keyToRecord[batchRec.BatchRec().Key.String()] = batchRec.BatchRec()
 	}
+
+	// Track individual record errors in batch (avoid log flooding)
+	var batchRecordErrorCount int
+	var firstBatchRecordError error
 
 	for hexHash, keyStr := range hashToKey {
 		// O(1) map lookup instead of O(n) scan
@@ -995,7 +1035,11 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 				}
 			}
 			// Any other error → be conservative, don't delete parent
-			s.logger.Warnf("[batchVerifyChildrenSafety] Unexpected error for child %s: %v", hexHash[:8], record.Err)
+			// Track for batch-level reporting (avoid log flooding)
+			if firstBatchRecordError == nil {
+				firstBatchRecordError = record.Err
+			}
+			batchRecordErrorCount++
 			safetyMap[hexHash] = false
 			continue
 		}
@@ -1049,6 +1093,11 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 		} else {
 			safetyMap[hexHash] = true
 		}
+	}
+
+	// Report individual record errors from this batch (avoid log flooding)
+	if batchRecordErrorCount > 0 {
+		s.logger.Warnf("[batchVerifyChildrenSafety] %d child record errors in batch (sample error: %v)", batchRecordErrorCount, firstBatchRecordError)
 	}
 }
 
