@@ -209,6 +209,12 @@ func TestSVNodeSyncFromTeranode(t *testing.T) {
 		_ = sv.Stop(td.Ctx)
 	}()
 
+	// Generate 1 block on SVNode BEFORE P2P connection to avoid race
+	// (SVNode needs 1 block to accept blocks from pruned nodes)
+	_, err = sv.Generate(1)
+	require.NoError(t, err, "Failed to generate initial block on svnode")
+	t.Logf("SVNode generated 1 block, now at height 1")
+
 	// Wait for P2P connection to establish between teranode and SVNode
 	// Teranode's legacy service needs time to retry connecting to SVNode
 	var getPeerInfoResp helper.P2PRPCResponse
@@ -238,12 +244,10 @@ func TestSVNodeSyncFromTeranode(t *testing.T) {
 
 	td.LogJSON(t, "getPeerInfo (connected)", getPeerInfoResp)
 
-	_, err = sv.Generate(1)
-	require.NoError(t, err, "Failed to generate initial block on svnode")
-
-	// Wait for svnode to sync from teranode
-	err = sv.WaitForBlockHeight(ctx, targetHeight, 30*time.Second)
-	require.NoError(t, err, "SVNode failed to sync blocks from teranode")
+	// Wait for svnode to sync from teranode (reorg from height 1 to teranode's height 5)
+	// This requires: headers exchange, block download, validation, and reorg - give it more time
+	err = sv.WaitForBlockHeight(ctx, targetHeight, 60*time.Second)
+	require.NoError(t, err, "SVNode failed to sync blocks from teranode within 60 seconds")
 
 	// Verify final state
 	svBlockCount, err := sv.GetBlockCount()
