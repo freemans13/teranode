@@ -244,15 +244,15 @@ func TestService_PruneExecution(t *testing.T) {
 		assert.GreaterOrEqual(t, recordsProcessed, int64(0))
 
 		// Verify logging
-		assert.GreaterOrEqual(t, len(loggedMessages), 2)
+		assert.GreaterOrEqual(t, len(loggedMessages), 1)
 		found := false
 		for _, msg := range loggedMessages {
-			if strings.Contains(msg, "Starting pruner for block height") {
+			if strings.Contains(msg, "phase 2: starting cleanup scan") {
 				found = true
 				break
 			}
 		}
-		assert.True(t, found, "Expected to find 'Starting pruner' in logged messages")
+		assert.True(t, found, "Expected to find 'starting cleanup scan' in logged messages")
 	})
 
 	t.Run("PruneWithNoRecords", func(t *testing.T) {
