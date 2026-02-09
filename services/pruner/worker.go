@@ -254,7 +254,6 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				if latestReq.BlockHash != nil {
 					hashStr = latestReq.BlockHash.String()
 				}
-				s.logger.Infof("[pruner][%s:%d] phase 2: starting DAH pruner", hashStr, latestReq.Height)
 				startTime := time.Now()
 
 				recordsProcessed, err := s.prunerService.Prune(ctx, latestReq.Height, hashStr)
@@ -262,8 +261,6 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					s.logger.Errorf("[pruner][%s:%d] phase 2: DAH pruner failed: %v", hashStr, latestReq.Height, err)
 					prunerErrors.WithLabelValues("dah_pruner").Inc()
 				} else {
-					duration := time.Since(startTime).Round(time.Second)
-					s.logger.Infof("[pruner][%s:%d] phase 2: pruned %s records (took %s)", hashStr, latestReq.Height, humanize.Comma(recordsProcessed), duration)
 					prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
 					prunerDeletingChildren.Add(float64(recordsProcessed))
 				}
