@@ -209,19 +209,34 @@ func TestSVNodeSyncFromTeranode(t *testing.T) {
 		_ = sv.Stop(td.Ctx)
 	}()
 
-	// Test getpeerinfo
-	resp, err := td.CallRPC(td.Ctx, "getpeerinfo", []any{})
-	require.NoError(t, err, "Failed to call getpeerinfo")
-
+	// Wait for P2P connection to establish between teranode and SVNode
+	// Teranode's legacy service needs time to retry connecting to SVNode
 	var getPeerInfoResp helper.P2PRPCResponse
-	err = json.Unmarshal([]byte(resp), &getPeerInfoResp)
-	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		resp, err := td.CallRPC(td.Ctx, "getpeerinfo", []any{})
+		if err != nil {
+			t.Logf("Failed to call getpeerinfo: %v", err)
+			return false
+		}
 
-	td.LogJSON(t, "getPeerInfo", getPeerInfoResp)
+		err = json.Unmarshal([]byte(resp), &getPeerInfoResp)
+		if err != nil {
+			t.Logf("Failed to unmarshal getpeerinfo response: %v", err)
+			return false
+		}
 
-	// Verify the response structure
-	require.Nil(t, getPeerInfoResp.Error, "Should not have an error")
-	require.NotNil(t, getPeerInfoResp.Result, "Result should not be nil")
+		if getPeerInfoResp.Error != nil {
+			t.Logf("getpeerinfo returned error: %v", getPeerInfoResp.Error)
+			return false
+		}
+
+		// Check if we have at least one peer
+		peerCount := len(getPeerInfoResp.Result)
+		t.Logf("P2P peer count: %d", peerCount)
+		return peerCount > 0
+	}, 30*time.Second, 500*time.Millisecond, "Teranode and SVNode failed to establish P2P connection")
+
+	td.LogJSON(t, "getPeerInfo (connected)", getPeerInfoResp)
 
 	_, err = sv.Generate(1)
 	require.NoError(t, err, "Failed to generate initial block on svnode")
