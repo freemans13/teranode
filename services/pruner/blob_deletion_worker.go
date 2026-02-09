@@ -44,7 +44,7 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 	}
 
 	ctx := s.ctx
-	hashStr := "<persisted>"
+	hashStr := "<unknown>"
 	if blockHash != nil {
 		hashStr = blockHash.String()
 	}

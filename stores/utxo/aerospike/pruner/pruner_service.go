@@ -498,7 +498,7 @@ type workerResult struct {
 // PruneWithPartitions implements parallel partition-based pruning
 // This method splits the Aerospike keyspace (4096 partitions) across multiple workers
 // for maximum throughput, achieving 100x performance improvement over sequential queries
-func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, numPartitionQueries int) (int64, error) {
+func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, blockHashStr string, numPartitionQueries int) (int64, error) {
 	startTime := time.Now()
 
 	// BLOCK PERSISTER COORDINATION: Calculate safe cleanup height
@@ -528,8 +528,8 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, n
 	partitionsPerQuery := totalPartitions / numPartitionQueries
 	remainingPartitions := totalPartitions % numPartitionQueries
 
-	s.logger.Infof("Starting parallel pruning with %d partition workers for height %d (safe cleanup height: %d, total partitions: %d)",
-		numPartitionQueries, blockHeight, safeCleanupHeight, totalPartitions)
+	s.logger.Infof("[pruner][%s:%d] phase 2: starting parallel pruning with %d partition workers (safe cleanup height: %d, total partitions: %d)",
+		blockHashStr, blockHeight, numPartitionQueries, safeCleanupHeight, totalPartitions)
 
 	// Launch partition workers
 	results := make(chan workerResult, numPartitionQueries)
@@ -597,8 +597,8 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, n
 		modeStr += ", TTL mode"
 	}
 
-	s.logger.Infof("Completed parallel pruning for block height %d in %v: pruned %s records, skipped %s records (%s%s)",
-		blockHeight, elapsed, formattedTotal, formattedSkipped, tpsStr, modeStr)
+	s.logger.Infof("[pruner][%s:%d] phase 2: completed parallel pruning in %v: pruned %s records, skipped %s records (%s%s)",
+		blockHashStr, blockHeight, elapsed, formattedTotal, formattedSkipped, tpsStr, modeStr)
 
 	prometheusUtxoCleanupBatch.Observe(float64(elapsed.Microseconds()) / 1_000_000)
 
@@ -610,7 +610,7 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, n
 // Prune removes transactions marked for deletion at or before the specified height.
 // Returns the number of records processed and any error encountered.
 // This method is synchronous and blocks until pruning completes or context is cancelled.
-func (s *Service) Prune(ctx context.Context, blockHeight uint32) (int64, error) {
+func (s *Service) Prune(ctx context.Context, blockHeight uint32, blockHashStr string) (int64, error) {
 	if blockHeight == 0 {
 		return 0, errors.NewProcessingError("block height cannot be zero")
 	}
@@ -626,11 +626,11 @@ func (s *Service) Prune(ctx context.Context, blockHeight uint32) (int64, error) 
 	// Log pruner trigger - note that blockHeight is from BlockPersisted notification
 	// which may lag behind current block validation height during catchup
 	if s.getPersistedHeight != nil && s.getPersistedHeight() > 0 {
-		s.logger.Infof("Pruner triggered for height %d with %d partition workers (block persister last reported: %d)",
-			blockHeight, numWorkers, s.getPersistedHeight())
+		s.logger.Debugf("[pruner][%s:%d] phase 2: DAH pruner triggered with %d partition workers (block persister last reported: %d)",
+			blockHashStr, blockHeight, numWorkers, s.getPersistedHeight())
 	} else {
-		s.logger.Infof("Pruner triggered for height %d with %d partition workers",
-			blockHeight, numWorkers)
+		s.logger.Debugf("[pruner][%s:%d] phase 2: DAH pruner triggered with %d partition workers",
+			blockHashStr, blockHeight, numWorkers)
 	}
 
 	if s.utxoSetTTL {
@@ -638,7 +638,7 @@ func (s *Service) Prune(ctx context.Context, blockHeight uint32) (int64, error) 
 	}
 
 	// Always use partition-based approach (even if numWorkers=1)
-	return s.PruneWithPartitions(ctx, blockHeight, numWorkers)
+	return s.PruneWithPartitions(ctx, blockHeight, blockHashStr, numWorkers)
 }
 
 // processRecordChunk processes a chunk of parent records with batched child verification

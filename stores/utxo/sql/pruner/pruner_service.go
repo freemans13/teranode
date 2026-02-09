@@ -93,7 +93,7 @@ func (s *Service) AddObserver(observer pruner.Observer) {
 // Prune removes transactions marked for deletion at or before the specified height.
 // Returns the number of records processed and any error encountered.
 // This method is synchronous and blocks until pruning completes or context is cancelled.
-func (s *Service) Prune(ctx context.Context, blockHeight uint32) (int64, error) {
+func (s *Service) Prune(ctx context.Context, blockHeight uint32, blockHashStr string) (int64, error) {
 	if blockHeight == 0 {
 		return 0, errors.NewProcessingError("Cannot prune at block height 0")
 	}

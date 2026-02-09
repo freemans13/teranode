@@ -173,19 +173,38 @@ func (s *Server) Init(ctx context.Context) error {
 								s.logger.Debugf("[pruner] updated persisted height to %d", height32)
 							}
 
-							// Queue pruning request (blockHash=nil, already mined by definition)
+							// Queue pruning request
 							if height32 > s.lastProcessedHeight.Load() {
+								// Extract block hash from notification
+								var blockHash *chainhash.Hash
+								if notification.Hash != nil {
+									var err error
+									blockHash, err = chainhash.NewHash(notification.Hash)
+									if err != nil {
+										s.logger.Warnf("Failed to parse block hash from BlockPersisted notification: %v", err)
+										blockHash = nil
+									}
+								}
+
 								req := &PruneRequest{
 									Height:    height32,
-									BlockHash: nil, // Not needed - BlockPersisted implies mined
+									BlockHash: blockHash, // For logging - BlockPersisted implies already mined
 								}
 
 								// Try to queue pruning (non-blocking - channel has buffer of 1)
 								select {
 								case s.prunerCh <- req:
-									s.logger.Infof("[pruner][<persisted>:%d] queued from BlockPersisted notification", height32)
+									hashStr := "<unknown>"
+									if blockHash != nil {
+										hashStr = blockHash.String()
+									}
+									s.logger.Infof("[pruner][%s:%d] queued from BlockPersisted notification", hashStr, height32)
 								default:
-									s.logger.Warnf("[pruner][<persisted>:%d] pruner channel full, skipping (already running)", height32)
+									hashStr := "<unknown>"
+									if blockHash != nil {
+										hashStr = blockHash.String()
+									}
+									s.logger.Warnf("[pruner][%s:%d] pruner channel full, skipping (already running)", hashStr, height32)
 								}
 
 								// Queue blob deletion

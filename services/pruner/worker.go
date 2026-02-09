@@ -154,7 +154,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			}
 
 			if drained {
-				hashStr := "<persisted>"
+				hashStr := "<unknown>"
 				if latestReq.BlockHash != nil {
 					hashStr = latestReq.BlockHash.String()
 				}
@@ -171,7 +171,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					continue
 				}
 				if fsmState != nil && *fsmState == blockchain.FSMStateCATCHINGBLOCKS {
-					hashStr := "<persisted>"
+					hashStr := "<unknown>"
 					if latestReq.BlockHash != nil {
 						hashStr = latestReq.BlockHash.String()
 					}
@@ -205,14 +205,14 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			// Phase 1: Preserve parents of old unmined transactions
 			// This must run before Phase 2 to protect parents from deletion
 			if s.utxoStore != nil {
-				hashStr := "<persisted>"
+				hashStr := "<unknown>"
 				if latestReq.BlockHash != nil {
 					hashStr = latestReq.BlockHash.String()
 				}
 				s.logger.Debugf("[pruner][%s:%d] phase 1: preserving parents", hashStr, latestReq.Height)
 				startTimePhase1 := time.Now()
 				if count, err := utxo.PreserveParentsOfOldUnminedTransactions(
-					ctx, s.utxoStore, latestReq.Height, s.settings, s.logger,
+					ctx, s.utxoStore, latestReq.Height, hashStr, s.settings, s.logger,
 				); err != nil {
 					s.logger.Warnf("[pruner][%s:%d] phase 1: failed to preserve parents: %v", hashStr, latestReq.Height, err)
 					prunerErrors.WithLabelValues("parent_preservation").Inc()
@@ -231,14 +231,14 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			// Phase 2: DAH pruning (deletion)
 			// Deletes transactions marked for deletion at or before the current height
 			if s.prunerService != nil {
-				hashStr := "<persisted>"
+				hashStr := "<unknown>"
 				if latestReq.BlockHash != nil {
 					hashStr = latestReq.BlockHash.String()
 				}
 				s.logger.Infof("[pruner][%s:%d] phase 2: starting DAH pruner", hashStr, latestReq.Height)
 				startTime := time.Now()
 
-				recordsProcessed, err := s.prunerService.Prune(ctx, latestReq.Height)
+				recordsProcessed, err := s.prunerService.Prune(ctx, latestReq.Height, hashStr)
 				if err != nil {
 					s.logger.Errorf("[pruner][%s:%d] phase 2: DAH pruner failed: %v", hashStr, latestReq.Height, err)
 					prunerErrors.WithLabelValues("dah_pruner").Inc()
