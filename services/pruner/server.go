@@ -151,6 +151,10 @@ func (s *Server) Init(ctx context.Context) error {
 	// Start a goroutine to handle blockchain notifications
 	go func() {
 		for notification := range subscriptionCh {
+			if notification == nil {
+				continue
+			}
+
 			switch notification.Type {
 			case model.NotificationType_BlockPersisted:
 				// Skip BlockPersisted notifications if using OnBlockMined trigger mode
@@ -230,27 +234,46 @@ func (s *Server) Init(ctx context.Context) error {
 					continue
 				}
 
-				// Get height from block assembly (use current chaintip height)
+				// Get height from block assembly state
 				state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
 				if err != nil {
 					s.logger.Debugf("Failed to get block assembly state on Block notification: %v", err)
 					continue
 				}
 
-				// Queue pruning request immediately - processor will wait for mined_set
-				if state.CurrentHeight > s.lastProcessedHeight.Load() {
+				// If block assembly hasn't initialized yet (height=0), get height from blockchain
+				// This handles the edge case where Block notifications arrive before block assembly
+				// has processed its first block
+				var height uint32
+				if state.CurrentHeight == 0 {
+					header, meta, err := s.blockchainClient.GetBlockHeader(ctx, blockHash)
+					if err != nil {
+						s.logger.Debugf("Failed to get block header for Block notification hash %s: %v", blockHash, err)
+						continue
+					}
+					if header == nil || meta == nil {
+						s.logger.Debugf("Block notification for hash %s has no header/meta", blockHash)
+						continue
+					}
+					height = meta.Height
+				} else {
+					height = state.CurrentHeight
+				}
+
+				// Queue pruning request immediately - processor will wait for mined_set if block assembly is running
+				if height > s.lastProcessedHeight.Load() {
 					req := &PruneRequest{
-						Height:    state.CurrentHeight,
+						Height:    height,
 						BlockHash: blockHash, // Needed for mined_set wait
 					}
 
 					select {
 					case s.prunerCh <- req:
 						s.logger.Infof("[pruner][%s:%d] queued from Block notification",
-							blockHash.String(), state.CurrentHeight)
+							blockHash.String(), height)
 					default:
 						s.logger.Warnf("[pruner][%s:%d] pruner channel full, skipping (already running)",
-							blockHash.String(), state.CurrentHeight)
+							blockHash.String(), height)
 					}
 				}
 			}

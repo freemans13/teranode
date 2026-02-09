@@ -49,8 +49,9 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 		hashStr = blockHash.String()
 	}
 
-	// Wait for block to be mined (only if blockHash provided)
-	if blockHash != nil {
+	// Wait for block to be mined (only if blockHash provided AND block assembly is running)
+	// When block assembly is not running (e.g., in tests), blocks are immediately mined
+	if blockHash != nil && s.blockAssemblyClient != nil {
 		s.logger.Debugf("[pruner][%s:%d] blob deletion: waiting for mined_set=true", hashStr, height)
 		if !s.waitForBlockMinedStatus(ctx, blockHash) {
 			s.logger.Warnf("[pruner][%s:%d] blob deletion: skipped - timeout waiting for mined_set", hashStr, height)

@@ -38,16 +38,23 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 		}
 
 		// Check that block assembly has caught up to the height being pruned
-		if state.CurrentHeight < height {
+		// Allow 1 block tolerance for race conditions during rapid block generation
+		if state.CurrentHeight < height-1 {
 			return false, errors.NewProcessingError("block assembly height %d is behind pruner height %d", state.CurrentHeight, height)
+		}
+
+		// If within tolerance but not caught up, log and retry
+		if state.CurrentHeight < height {
+			s.logger.Debugf("[pruner][height:%d] block assembly catching up (ba:%d, pruner:%d)", height, state.CurrentHeight, height)
+			return false, errors.NewProcessingError("block assembly catching up")
 		}
 
 		// State is "running" and height is correct, success!
 		return true, nil
 	},
 		retry.WithBackoffDurationType(1*time.Second),
-		retry.WithExponentialBackoff(),
-		retry.WithRetryCount(1000), // High count - timeout context will stop retries after BlockAssemblyWaitTimeout
+		retry.WithBackoffMultiplier(1), // Linear backoff for predictable timing
+		retry.WithRetryCount(1000),     // 1000 attempts with 1s intervals = ~1000s max
 		retry.WithMessage(fmt.Sprintf("[pruner][height:%d] waiting for block assembly to be ready for %s", height, phase)),
 	)
 
@@ -85,9 +92,9 @@ func (s *Server) waitForBlockMinedStatus(ctx context.Context, blockHash *chainha
 		// Block has mined_set=true, success!
 		return true, nil
 	},
-		retry.WithBackoffDurationType(1*time.Second),
-		retry.WithExponentialBackoff(),
-		retry.WithRetryCount(1000), // High count - timeout context will stop retries after BlockAssemblyWaitTimeout
+		retry.WithBackoffDurationType(500*time.Millisecond), // Faster initial checks
+		retry.WithBackoffMultiplier(1),                      // Linear backoff for predictable timing
+		retry.WithRetryCount(1000),                          // 1000 attempts with 500ms intervals = ~500s max
 		retry.WithMessage(fmt.Sprintf("[Pruner] Waiting for block %s to have mined_set=true", blockHash)),
 	)
 
@@ -140,6 +147,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			// Deduplicate: drain channel and process latest request only
 			// This is important during block catchup when multiple heights may be queued
 			latestReq := req
+			var hashStr string
 			drained := false
 		drainLoop:
 			for {
@@ -153,9 +161,10 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			}
 
 			if drained {
-				hashStr := "<unknown>"
 				if latestReq.BlockHash != nil {
 					hashStr = latestReq.BlockHash.String()
+				} else {
+					hashStr = "<unknown>"
 				}
 				s.logger.Debugf("[pruner][%s:%d] deduplicating operations, skipping to height %d",
 					hashStr, latestReq.Height, latestReq.Height)
@@ -170,9 +179,10 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					continue
 				}
 				if fsmState != nil && *fsmState == blockchain.FSMStateCATCHINGBLOCKS {
-					hashStr := "<unknown>"
 					if latestReq.BlockHash != nil {
 						hashStr = latestReq.BlockHash.String()
+					} else {
+						hashStr = "<unknown>"
 					}
 					s.logger.Debugf("[pruner][%s:%d] skipping during catchup", hashStr, latestReq.Height)
 					prunerSkipped.WithLabelValues("catchup_mode").Inc()
@@ -180,18 +190,26 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				}
 			}
 
-			// Wait for block to be mined (only if blockHash provided)
-			// BlockPersisted notifications have nil blockHash (already mined)
-			// Block notifications have blockHash and need mined_set wait
+			// Initialize hashStr for logging
 			if latestReq.BlockHash != nil {
+				hashStr = latestReq.BlockHash.String()
+			} else {
+				hashStr = "<nil>"
+			}
+
+			// Wait for block to be mined (only if blockHash provided AND block assembly is running)
+			// BlockPersisted notifications have nil blockHash (already mined)
+			// Block notifications have blockHash and need mined_set wait only when block assembly is active
+			// When block assembly is not running (e.g., in tests), blocks are immediately mined
+			if latestReq.BlockHash != nil && s.blockAssemblyClient != nil {
 				s.logger.Debugf("[pruner][%s:%d] waiting for mined_set=true",
-					latestReq.BlockHash.String(), latestReq.Height)
+					hashStr, latestReq.Height)
 				if !s.waitForBlockMinedStatus(ctx, latestReq.BlockHash) {
 					// Already logged by waitForBlockMinedStatus
 					continue
 				}
 				s.logger.Debugf("[pruner][%s:%d] block has mined_set=true",
-					latestReq.BlockHash.String(), latestReq.Height)
+					hashStr, latestReq.Height)
 			}
 
 			// Safety check before pruning
