@@ -13,7 +13,7 @@ import (
 )
 
 // checkBlockAssemblySafeForPruner verifies that block assembly is in "running" state
-// and safe to proceed with pruner operations. Returns true if safe, false otherwise.
+// and has caught up to the specified height. Returns true if safe, false otherwise.
 // This function will retry checking the block assembly state until the configured
 // timeout is reached, allowing for temporary state transitions (e.g., brief reorgs).
 func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase string, height uint32) bool {
@@ -26,7 +26,7 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 	timeoutCtx, cancel := context.WithTimeout(ctx, s.settings.Pruner.BlockAssemblyWaitTimeout)
 	defer cancel()
 
-	// Use retry logic to wait for Block Assembly to be in "running" state
+	// Use retry logic to wait for Block Assembly to be in "running" state and at correct height
 	_, err := retry.Retry(timeoutCtx, s.logger, func() (bool, error) {
 		state, err := s.blockAssemblyClient.GetBlockAssemblyState(timeoutCtx)
 		if err != nil {
@@ -37,7 +37,12 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 			return false, errors.NewProcessingError("block assembly state is %s (not running)", state.BlockAssemblyState)
 		}
 
-		// State is "running", success!
+		// Check that block assembly has caught up to the height being pruned
+		if state.CurrentHeight < height {
+			return false, errors.NewProcessingError("block assembly height %d is behind pruner height %d", state.CurrentHeight, height)
+		}
+
+		// State is "running" and height is correct, success!
 		return true, nil
 	},
 		retry.WithBackoffDurationType(1*time.Second),
