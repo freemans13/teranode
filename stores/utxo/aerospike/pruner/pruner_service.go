@@ -299,9 +299,11 @@ func (s *Service) getConfigValue(configParam string) (string, error) {
 // calculatePartitionWorkers determines the optimal number of partition workers
 // based on CPU cores and Aerospike's query-threads-limit configuration
 func (s *Service) calculatePartitionWorkers() int {
+	maxPartitions := aerospike.NewPartitionFilterAll().Count // Total partitions in Aerospike (4096)
+
 	// If explicitly configured, use that value
 	if s.partitionQueries > 0 {
-		return min(s.partitionQueries, 4096) // Cap at total partitions
+		return min(s.partitionQueries, maxPartitions) // Cap at total partitions
 	}
 
 	// Auto-detect based on CPU cores and Aerospike query-threads-limit
@@ -332,7 +334,7 @@ func (s *Service) calculatePartitionWorkers() int {
 	}
 
 	// Ensure at least 1 worker, cap at total partitions
-	return max(1, min(numPartitionQueries, 4096))
+	return max(1, min(numPartitionQueries, maxPartitions))
 }
 
 // getConnectionQueueSize returns the Aerospike connection pool size from the client.
@@ -521,12 +523,13 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, n
 	}
 
 	// Calculate partition distribution
-	const totalPartitions = 4096
+	// Get total partitions from Aerospike client library (always 4096 in Aerospike architecture)
+	totalPartitions := aerospike.NewPartitionFilterAll().Count
 	partitionsPerQuery := totalPartitions / numPartitionQueries
 	remainingPartitions := totalPartitions % numPartitionQueries
 
-	s.logger.Infof("Starting parallel pruning with %d partition workers for height %d (safe cleanup height: %d)",
-		numPartitionQueries, blockHeight, safeCleanupHeight)
+	s.logger.Infof("Starting parallel pruning with %d partition workers for height %d (safe cleanup height: %d, total partitions: %d)",
+		numPartitionQueries, blockHeight, safeCleanupHeight, totalPartitions)
 
 	// Launch partition workers
 	results := make(chan workerResult, numPartitionQueries)
