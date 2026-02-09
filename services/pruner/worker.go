@@ -200,6 +200,25 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				continue
 			}
 
+			// Safety check passed - now queue blob pruning to run concurrently with Phase 1&2
+			select {
+			case s.blobDeletionCh <- &PruneRequest{
+				Height:    latestReq.Height,
+				BlockHash: latestReq.BlockHash,
+			}:
+				hashStr := "<unknown>"
+				if latestReq.BlockHash != nil {
+					hashStr = latestReq.BlockHash.String()
+				}
+				s.logger.Debugf("[pruner][%s:%d] queued blob pruning", hashStr, latestReq.Height)
+			default:
+				hashStr := "<unknown>"
+				if latestReq.BlockHash != nil {
+					hashStr = latestReq.BlockHash.String()
+				}
+				s.logger.Warnf("[pruner][%s:%d] blob deletion channel full, skipping blob pruning", hashStr, latestReq.Height)
+			}
+
 			prunerActive.Set(1)
 
 			// Phase 1: Preserve parents of old unmined transactions

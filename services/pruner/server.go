@@ -191,7 +191,7 @@ func (s *Server) Init(ctx context.Context) error {
 									BlockHash: blockHash, // For logging - BlockPersisted implies already mined
 								}
 
-								// Try to queue pruning (non-blocking - channel has buffer of 1)
+								// Try to queue pruning (Phase 1 & 2, will trigger blob pruning)
 								select {
 								case s.prunerCh <- req:
 									hashStr := "<unknown>"
@@ -205,12 +205,6 @@ func (s *Server) Init(ctx context.Context) error {
 										hashStr = blockHash.String()
 									}
 									s.logger.Warnf("[pruner][%s:%d] pruner channel full, skipping (already running)", hashStr, height32)
-								}
-
-								// Queue blob deletion
-								select {
-								case s.blobDeletionCh <- req:
-								default:
 								}
 							}
 						}
@@ -257,12 +251,6 @@ func (s *Server) Init(ctx context.Context) error {
 					default:
 						s.logger.Warnf("[pruner][%s:%d] pruner channel full, skipping (already running)",
 							blockHash.String(), state.CurrentHeight)
-					}
-
-					// Queue blob deletion
-					select {
-					case s.blobDeletionCh <- req:
-					default:
 					}
 				}
 			}
