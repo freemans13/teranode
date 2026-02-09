@@ -667,15 +667,8 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		deletedChildren := make(map[string]bool, 20)              // child hash -> already deleted (typical: 0-20)
 
 		for _, rec := range chunk {
-			if rec.Err != nil {
-				if firstRecordError == nil {
-					firstRecordError = rec.Err
-				}
-				recordErrorCount++
-				prometheusUtxoRecordErrors.Inc()
-				continue
-			}
-			if rec.Record == nil || rec.Record.Bins == nil {
+			if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
+				// Skip errored/empty records - errors will be tracked in main processing loop
 				continue
 			}
 
