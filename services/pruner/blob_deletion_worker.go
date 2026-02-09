@@ -51,9 +51,9 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 
 	// Wait for block to be mined (only if blockHash provided)
 	if blockHash != nil {
-		s.logger.Debugf("[pruner][%s:%d] phase 3: waiting for mined_set=true", hashStr, height)
+		s.logger.Debugf("[pruner][%s:%d] blob deletion: waiting for mined_set=true", hashStr, height)
 		if !s.waitForBlockMinedStatus(ctx, blockHash) {
-			s.logger.Warnf("[pruner][%s:%d] phase 3: skipped - timeout waiting for mined_set", hashStr, height)
+			s.logger.Warnf("[pruner][%s:%d] blob deletion: skipped - timeout waiting for mined_set", hashStr, height)
 			return
 		}
 	}
@@ -91,12 +91,12 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 	}
 
 	if batchToken == "" || len(deletions) == 0 {
-		s.logger.Debugf("[pruner][%s:%d] phase 3: no blob deletions available", hashStr, height)
+		s.logger.Debugf("[pruner][%s:%d] blob deletion: no blob deletions available", hashStr, height)
 		return
 	}
 
 	batchStartTime := time.Now()
-	s.logger.Infof("[pruner][%s:%d] phase 3: acquired blob deletion batch with %s deletions", hashStr, height, humanize.Comma(int64(len(deletions))))
+	s.logger.Infof("[pruner][%s:%d] blob deletion: acquired blob deletion batch with %s deletions", hashStr, height, humanize.Comma(int64(len(deletions))))
 
 	// Track completed and failed deletions
 	completedIDs := make([]int64, 0, len(deletions))
@@ -109,11 +109,11 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 	for i, deletion := range deletions {
 		storeType := storetypes.BlobStoreType(deletion.StoreType)
 
-		s.logger.Debugf("[pruner][%s:%d] phase 3: processing deletion %s/%s (id=%d, key=%x)",
+		s.logger.Debugf("[pruner][%s:%d] blob deletion: processing deletion %s/%s (id=%d, key=%x)",
 			hashStr, height, humanize.Comma(int64(i+1)), humanize.Comma(int64(len(deletions))), deletion.Id, deletion.BlobKey)
 
 		if err := s.processOneDeletion(ctx, deletion, hashStr, height); err != nil {
-			s.logger.Warnf("[pruner][%s:%d] phase 3: failed to delete blob %x from %s (attempt %d/%d): %v",
+			s.logger.Warnf("[pruner][%s:%d] blob deletion: failed to delete blob %x from %s (attempt %d/%d): %v",
 				hashStr, height, deletion.BlobKey, storeType.String(),
 				int(deletion.RetryCount)+1, maxRetries, err)
 
@@ -121,7 +121,7 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 
 			// Check if this will be removed due to max retries
 			if int(deletion.RetryCount)+1 >= maxRetries {
-				s.logger.Errorf("[pruner][%s:%d] phase 3: blob %x will be removed after %d failed attempts",
+				s.logger.Errorf("[pruner][%s:%d] blob deletion: blob %x will be removed after %d failed attempts",
 					hashStr, height, deletion.BlobKey, maxRetries)
 				blobDeletionErrorsTotal.WithLabelValues(storeType.String()).Inc()
 				failCount++
@@ -133,19 +133,19 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 	}
 
 	// Complete the entire batch in a single gRPC call
-	s.logger.Infof("[pruner][%s:%d] phase 3: completing batch - %s succeeded, %s failed",
+	s.logger.Infof("[pruner][%s:%d] blob deletion: completing batch - %s succeeded, %s failed",
 		hashStr, height, humanize.Comma(successCount), humanize.Comma(int64(len(failedIDs))))
 
 	err = s.blockchainClient.CompleteBlobDeletionBatch(ctx, batchToken, completedIDs, failedIDs, maxRetries)
 	if err != nil {
-		s.logger.Errorf("[pruner][%s:%d] phase 3: failed to complete batch: %v", hashStr, height, err)
+		s.logger.Errorf("[pruner][%s:%d] blob deletion: failed to complete batch: %v", hashStr, height, err)
 		blobDeletionErrorsTotal.WithLabelValues("completion").Inc()
 		// Batch will be released when token expires - deletions will be retried
 		return
 	}
 
 	duration := time.Since(batchStartTime).Round(time.Second)
-	s.logger.Infof("[pruner][%s:%d] phase 3: batch complete - %s succeeded, %s failed (took %s)",
+	s.logger.Infof("[pruner][%s:%d] blob deletion: batch complete - %s succeeded, %s failed (took %s)",
 		hashStr, height, humanize.Comma(successCount), humanize.Comma(failCount), duration)
 	blobDeletionProcessedTotal.Add(float64(successCount))
 
@@ -177,13 +177,13 @@ func (s *Server) processOneDeletion(ctx context.Context, deletion *blockchain_ap
 	if err != nil {
 		if errors.Is(err, errors.ErrNotFound) {
 			// Already deleted - success (idempotent)
-			s.logger.Debugf("[pruner][%s:%d] phase 3: blob key=%x already deleted (idempotent success)", hashStr, height, deletion.BlobKey)
+			s.logger.Debugf("[pruner][%s:%d] blob deletion: blob key=%x already deleted (idempotent success)", hashStr, height, deletion.BlobKey)
 			return nil
 		}
 		return err
 	}
 
-	s.logger.Debugf("[pruner][%s:%d] phase 3: deleted blob key=%x from %s (took %s)",
+	s.logger.Debugf("[pruner][%s:%d] blob deletion: deleted blob key=%x from %s (took %s)",
 		hashStr, height, deletion.BlobKey, storeType.String(), duration.Round(time.Second))
 
 	return nil
