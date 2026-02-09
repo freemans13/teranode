@@ -139,7 +139,7 @@ func (s *Service) Prune(ctx context.Context, blockHeight uint32, blockHashStr st
 			maxSafeHeight := persistedHeight + retention
 			if maxSafeHeight < safeCleanupHeight {
 				s.logger.Infof("[pruner][%s:%d] phase 2: limiting cleanup to height %d (persisted: %d, retention: %d)",
-					blockHashStr, blockHashStr, blockHeight, maxSafeHeight, persistedHeight, retention)
+					blockHashStr, blockHeight, maxSafeHeight, persistedHeight, retention)
 				safeCleanupHeight = maxSafeHeight
 			}
 		}
@@ -147,7 +147,7 @@ func (s *Service) Prune(ctx context.Context, blockHeight uint32, blockHashStr st
 
 	// Log start of cleanup
 	s.logger.Infof("[pruner][%s:%d] phase 2: starting cleanup scan (delete_at_height <= %d)",
-		blockHashStr, blockHashStr, blockHeight, safeCleanupHeight)
+		blockHashStr, blockHeight, safeCleanupHeight)
 
 	// Execute the cleanup with safe height
 	deletedCount, err := s.deleteTombstoned(ctx, safeCleanupHeight)

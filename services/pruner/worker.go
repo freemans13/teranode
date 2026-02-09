@@ -10,7 +10,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/util/retry"
-	"github.com/dustin/go-humanize"
 )
 
 // checkBlockAssemblySafeForPruner verifies that block assembly is in "running" state
@@ -239,9 +238,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				} else {
 					prunerDuration.WithLabelValues("preserve_parents").Observe(time.Since(startTimePhase1).Seconds())
 					if count > 0 {
-						duration := time.Since(startTimePhase1).Round(time.Second)
-						s.logger.Infof("[pruner][%s:%d] phase 1: preserved %s unique parents for %s old unmined transactions (took %s)",
-							hashStr, latestReq.Height, humanize.Comma(int64(count)), humanize.Comma(int64(count)), duration)
+						// Detailed logging already happens in pruner_unmined.go with correct parent/tx counts
 						prunerUpdatingParents.Add(float64(count))
 					}
 				}
