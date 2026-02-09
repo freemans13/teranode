@@ -46,8 +46,9 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 	}
 
 	// Calculate cutoff block height
+	cutoffBlockHeight := blockHeight - settings.UtxoStore.UnminedTxRetention
 
-	logger.Infof("[PreserveParents] Starting preservation of parents for unmined transactions older than block height %d", blockHeight)
+	logger.Infof("[PreserveParents] Starting preservation of parents for unmined transactions older than block height %d (cutoff: %d)", blockHeight, cutoffBlockHeight)
 
 	// OPTIMIZATION: Use parallel partition iterator instead of sequential QueryOldUnminedTransactions
 	// This reuses the optimized GetUnminedTxIterator which already has:
@@ -87,7 +88,7 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 			}
 
 			// Filter for old unmined transactions (UnminedSince <= cutoffBlockHeight)
-			if unminedTx.UnminedSince > 0 && unminedTx.UnminedSince <= int(blockHeight) {
+			if unminedTx.UnminedSince > 0 && unminedTx.UnminedSince <= int(cutoffBlockHeight) {
 				// TxInpoints already available - no Get() call needed!
 				if len(unminedTx.TxInpoints.ParentTxHashes) > 0 {
 					for _, parentHash := range unminedTx.TxInpoints.ParentTxHashes {
@@ -115,7 +116,7 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 		}
 
 		logger.Infof("[PreserveParents] Completed parent preservation: preserved %d unique parents for %d old unmined transactions (cutoff block height %d)",
-			len(parentSlice), processedCount, blockHeight)
+			len(parentSlice), processedCount, cutoffBlockHeight)
 	} else {
 		logger.Infof("[PreserveParents] No parents to preserve for old unmined transactions (block height %d)", blockHeight)
 	}
