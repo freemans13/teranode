@@ -47,7 +47,7 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 		return true, nil
 	},
 		retry.WithBackoffDurationType(1*time.Second),
-		retry.WithBackoffMultiplier(2),
+		retry.WithExponentialBackoff(),
 		retry.WithRetryCount(1000), // High count - timeout context will stop retries after BlockAssemblyWaitTimeout
 		retry.WithMessage(fmt.Sprintf("[pruner][height:%d] waiting for block assembly to be ready for %s", height, phase)),
 	)
@@ -87,7 +87,7 @@ func (s *Server) waitForBlockMinedStatus(ctx context.Context, blockHash *chainha
 		return true, nil
 	},
 		retry.WithBackoffDurationType(1*time.Second),
-		retry.WithBackoffMultiplier(2),
+		retry.WithExponentialBackoff(),
 		retry.WithRetryCount(1000), // High count - timeout context will stop retries after BlockAssemblyWaitTimeout
 		retry.WithMessage(fmt.Sprintf("[Pruner] Waiting for block %s to have mined_set=true", blockHash)),
 	)
