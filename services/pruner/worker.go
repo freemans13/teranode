@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/util/retry"
+	"github.com/dustin/go-humanize"
 )
 
 // checkBlockAssemblySafeForPruner verifies that block assembly is in "running" state
@@ -48,7 +49,7 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 		retry.WithBackoffDurationType(1*time.Second),
 		retry.WithBackoffMultiplier(2),
 		retry.WithRetryCount(1000), // High count - timeout context will stop retries after BlockAssemblyWaitTimeout
-		retry.WithMessage(fmt.Sprintf("[Pruner] Waiting for block assembly to be ready for %s at height %d", phase, height)),
+		retry.WithMessage(fmt.Sprintf("[pruner][height:%d] waiting for block assembly to be ready for %s", height, phase)),
 	)
 
 	if err != nil {
@@ -136,16 +137,16 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			s.logger.Infof("Stopping pruner processor")
 			return
 
-		case height := <-s.prunerCh:
-			// Deduplicate: drain channel and process latest height only
+		case req := <-s.prunerCh:
+			// Deduplicate: drain channel and process latest request only
 			// This is important during block catchup when multiple heights may be queued
-			latestHeight := height
+			latestReq := req
 			drained := false
 		drainLoop:
 			for {
 				select {
-				case nextHeight := <-s.prunerCh:
-					latestHeight = nextHeight
+				case nextReq := <-s.prunerCh:
+					latestReq = nextReq
 					drained = true
 				default:
 					break drainLoop
@@ -153,7 +154,12 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			}
 
 			if drained {
-				s.logger.Debugf("Deduplicating pruner operations, skipping to height %d", latestHeight)
+				hashStr := "<persisted>"
+				if latestReq.BlockHash != nil {
+					hashStr = latestReq.BlockHash.String()
+				}
+				s.logger.Debugf("[pruner][%s:%d] deduplicating operations, skipping to height %d",
+					hashStr, latestReq.Height, latestReq.Height)
 			}
 
 			// Check FSM state - skip during CATCHINGBLOCKS if configured
@@ -165,14 +171,32 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					continue
 				}
 				if fsmState != nil && *fsmState == blockchain.FSMStateCATCHINGBLOCKS {
-					s.logger.Debugf("Skipping pruner during catchup (height %d)", latestHeight)
+					hashStr := "<persisted>"
+					if latestReq.BlockHash != nil {
+						hashStr = latestReq.BlockHash.String()
+					}
+					s.logger.Debugf("[pruner][%s:%d] skipping during catchup", hashStr, latestReq.Height)
 					prunerSkipped.WithLabelValues("catchup_mode").Inc()
 					continue
 				}
 			}
 
+			// Wait for block to be mined (only if blockHash provided)
+			// BlockPersisted notifications have nil blockHash (already mined)
+			// Block notifications have blockHash and need mined_set wait
+			if latestReq.BlockHash != nil {
+				s.logger.Debugf("[pruner][%s:%d] waiting for mined_set=true",
+					latestReq.BlockHash.String(), latestReq.Height)
+				if !s.waitForBlockMinedStatus(ctx, latestReq.BlockHash) {
+					// Already logged by waitForBlockMinedStatus
+					continue
+				}
+				s.logger.Debugf("[pruner][%s:%d] block has mined_set=true",
+					latestReq.BlockHash.String(), latestReq.Height)
+			}
+
 			// Safety check before pruning
-			if !s.checkBlockAssemblySafeForPruner(ctx, "pruner", latestHeight) {
+			if !s.checkBlockAssemblySafeForPruner(ctx, "pruner", latestReq.Height) {
 				continue
 			}
 
@@ -181,18 +205,24 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			// Phase 1: Preserve parents of old unmined transactions
 			// This must run before Phase 2 to protect parents from deletion
 			if s.utxoStore != nil {
-				s.logger.Debugf("Phase 1: Preserving parents at height %d", latestHeight)
+				hashStr := "<persisted>"
+				if latestReq.BlockHash != nil {
+					hashStr = latestReq.BlockHash.String()
+				}
+				s.logger.Debugf("[pruner][%s:%d] phase 1: preserving parents", hashStr, latestReq.Height)
 				startTimePhase1 := time.Now()
 				if count, err := utxo.PreserveParentsOfOldUnminedTransactions(
-					ctx, s.utxoStore, latestHeight, s.settings, s.logger,
+					ctx, s.utxoStore, latestReq.Height, s.settings, s.logger,
 				); err != nil {
-					s.logger.Warnf("Phase 1: Failed to preserve parents at height %d: %v", latestHeight, err)
+					s.logger.Warnf("[pruner][%s:%d] phase 1: failed to preserve parents: %v", hashStr, latestReq.Height, err)
 					prunerErrors.WithLabelValues("parent_preservation").Inc()
 					// Continue to Phase 2 - best effort, don't block pruning
 				} else {
 					prunerDuration.WithLabelValues("preserve_parents").Observe(time.Since(startTimePhase1).Seconds())
 					if count > 0 {
-						s.logger.Infof("Phase 1: Preserved parents for %d unmined transactions at height %d", count, latestHeight)
+						duration := time.Since(startTimePhase1).Round(time.Second)
+						s.logger.Infof("[pruner][%s:%d] phase 1: preserved %s unique parents for %s old unmined transactions (took %s)",
+							hashStr, latestReq.Height, humanize.Comma(int64(count)), humanize.Comma(int64(count)), duration)
 						prunerUpdatingParents.Add(float64(count))
 					}
 				}
@@ -201,25 +231,30 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			// Phase 2: DAH pruning (deletion)
 			// Deletes transactions marked for deletion at or before the current height
 			if s.prunerService != nil {
-				s.logger.Infof("Phase 2: Starting DAH pruner for height %d", latestHeight)
+				hashStr := "<persisted>"
+				if latestReq.BlockHash != nil {
+					hashStr = latestReq.BlockHash.String()
+				}
+				s.logger.Infof("[pruner][%s:%d] phase 2: starting DAH pruner", hashStr, latestReq.Height)
 				startTime := time.Now()
 
-				recordsProcessed, err := s.prunerService.Prune(ctx, latestHeight)
+				recordsProcessed, err := s.prunerService.Prune(ctx, latestReq.Height)
 				if err != nil {
-					s.logger.Errorf("Phase 2: DAH pruner failed for height %d: %v", latestHeight, err)
+					s.logger.Errorf("[pruner][%s:%d] phase 2: DAH pruner failed: %v", hashStr, latestReq.Height, err)
 					prunerErrors.WithLabelValues("dah_pruner").Inc()
 				} else {
-					s.logger.Infof("Phase 2: Pruned %d records at height %d", recordsProcessed, latestHeight)
+					duration := time.Since(startTime).Round(time.Second)
+					s.logger.Infof("[pruner][%s:%d] phase 2: pruned %s records (took %s)", hashStr, latestReq.Height, humanize.Comma(recordsProcessed), duration)
 					prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
 					prunerDeletingChildren.Add(float64(recordsProcessed))
 				}
 			}
 
-			prunerCurrentHeight.Set(float64(latestHeight))
+			prunerCurrentHeight.Set(float64(latestReq.Height))
 			prunerActive.Set(0)
 
 			// Update last processed height atomically
-			s.lastProcessedHeight.Store(latestHeight)
+			s.lastProcessedHeight.Store(latestReq.Height)
 		}
 	}
 }

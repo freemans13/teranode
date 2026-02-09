@@ -38,6 +38,14 @@ import (
 	"google.golang.org/grpc"
 )
 
+// PruneRequest represents a pruning request with height and optional block hash.
+// BlockHash is populated for Block notifications (needed for mined_set wait)
+// and nil for BlockPersisted notifications (already mined by definition).
+type PruneRequest struct {
+	Height    uint32
+	BlockHash *chainhash.Hash // nil for BlockPersisted
+}
+
 // BlobDeletionObserver is an optional callback interface for testing.
 // It allows tests to be notified when blob deletion processing completes.
 type BlobDeletionObserver interface {
@@ -62,12 +70,12 @@ type Server struct {
 	prunerService       pruner.Service
 	lastProcessedHeight atomic.Uint32
 	lastPersistedHeight atomic.Uint32
-	prunerCh            chan uint32
+	prunerCh            chan *PruneRequest
 	stats               *gocore.Stat
 
 	// Blob deletion
 	blobStores           map[storetypes.BlobStoreType]blob.Store
-	blobDeletionCh       chan uint32
+	blobDeletionCh       chan *PruneRequest
 	blobDeletionObserver BlobDeletionObserver
 }
 
@@ -90,7 +98,7 @@ func New(
 		blockchainClient:    blockchainClient,
 		blockAssemblyClient: blockAssemblyClient,
 		blobStores:          make(map[storetypes.BlobStoreType]blob.Store),
-		blobDeletionCh:      make(chan uint32, 1),
+		blobDeletionCh:      make(chan *PruneRequest, 1),
 		stats:               gocore.NewStat("pruner"),
 	}
 }
@@ -160,24 +168,29 @@ func (s *Server) Init(ctx context.Context) error {
 
 							// Log at INFO level when Block Persister first becomes active (transition from 0)
 							if oldHeight == 0 && height32 > 0 {
-								s.logger.Infof("Block Persister is now active, pruner will follow BlockPersisted notifications (persisted height: %d)", height32)
+								s.logger.Infof("[pruner] block persister is now active (persisted height: %d)", height32)
 							} else {
-								s.logger.Debugf("Updated persisted height to %d", height32)
+								s.logger.Debugf("[pruner] updated persisted height to %d", height32)
 							}
 
-							// Trigger pruning when block persister completes a block
+							// Queue pruning request (blockHash=nil, already mined by definition)
 							if height32 > s.lastProcessedHeight.Load() {
-								// Try to queue pruning (non-blocking - channel has buffer of 1)
-								select {
-								case s.prunerCh <- height32:
-									s.logger.Infof("Queued pruning for height %d from BlockPersisted notification", height32)
-								default:
-									s.logger.Warnf("Pruner channel full, skipping height %d (pruner already running)", height32)
+								req := &PruneRequest{
+									Height:    height32,
+									BlockHash: nil, // Not needed - BlockPersisted implies mined
 								}
 
-								// Trigger blob deletion
+								// Try to queue pruning (non-blocking - channel has buffer of 1)
 								select {
-								case s.blobDeletionCh <- height32:
+								case s.prunerCh <- req:
+									s.logger.Infof("[pruner][<persisted>:%d] queued from BlockPersisted notification", height32)
+								default:
+									s.logger.Warnf("[pruner][<persisted>:%d] pruner channel full, skipping (already running)", height32)
+								}
+
+								// Queue blob deletion
+								select {
+								case s.blobDeletionCh <- req:
 								default:
 								}
 							}
@@ -186,17 +199,13 @@ func (s *Server) Init(ctx context.Context) error {
 				}
 
 			case model.NotificationType_Block:
-				// Fallback trigger: if block persister is not running, wait for block to have mined_set=true
-				// Check if we should ignore block persister height
-				persistedHeight := s.lastPersistedHeight.Load()
-
-				// Skip Block notifications if using OnBlockPersisted trigger mode AND persister is running
+				// Skip if using OnBlockPersisted trigger mode
 				if s.settings.Pruner.BlockTrigger == settings.PrunerBlockTriggerOnBlockPersisted {
-					s.logger.Debugf("Block notification received but pruner configured for BlockPersisted trigger (persisted height: %d)", persistedHeight)
+					s.logger.Debugf("Block notification received but pruner configured for BlockPersisted trigger")
 					continue
 				}
 
-				// Block persister not running - wait for block to have mined_set=true before triggering
+				// Extract block hash (required for mined_set wait in processor)
 				if notification.Hash == nil {
 					s.logger.Debugf("Block notification missing hash, skipping")
 					continue
@@ -208,30 +217,32 @@ func (s *Server) Init(ctx context.Context) error {
 					continue
 				}
 
-				// Wait for block to have mined_set=true (block validation completed)
-				if !s.waitForBlockMinedStatus(ctx, blockHash) {
-					continue
-				}
-
-				// Block has mined_set=true, get its height and trigger pruning
+				// Get height from block assembly (use current chaintip height)
 				state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
 				if err != nil {
 					s.logger.Debugf("Failed to get block assembly state on Block notification: %v", err)
 					continue
 				}
 
+				// Queue pruning request immediately - processor will wait for mined_set
 				if state.CurrentHeight > s.lastProcessedHeight.Load() {
-					// Try to queue pruning (non-blocking - channel has buffer of 1)
-					select {
-					case s.prunerCh <- state.CurrentHeight:
-						s.logger.Infof("Queued pruning for height %d from Block notification (mined_set=true)", state.CurrentHeight)
-					default:
-						s.logger.Warnf("Pruner channel full, skipping height %d (pruner already running)", state.CurrentHeight)
+					req := &PruneRequest{
+						Height:    state.CurrentHeight,
+						BlockHash: blockHash, // Needed for mined_set wait
 					}
 
-					// Trigger blob deletion
 					select {
-					case s.blobDeletionCh <- state.CurrentHeight:
+					case s.prunerCh <- req:
+						s.logger.Infof("[pruner][%s:%d] queued from Block notification",
+							blockHash.String(), state.CurrentHeight)
+					default:
+						s.logger.Warnf("[pruner][%s:%d] pruner channel full, skipping (already running)",
+							blockHash.String(), state.CurrentHeight)
+					}
+
+					// Queue blob deletion
+					select {
+					case s.blobDeletionCh <- req:
 					default:
 					}
 				}
@@ -263,7 +274,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	}
 
 	// Initialize pruner channel (buffer of 1 to prevent blocking while ensuring only one pruner)
-	s.prunerCh = make(chan uint32, 1)
+	s.prunerCh = make(chan *PruneRequest, 1)
 
 	// Start the pruner service (Aerospike or SQL)
 	if s.prunerService != nil {

@@ -48,7 +48,7 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 	// Calculate cutoff block height
 	cutoffBlockHeight := blockHeight - settings.UtxoStore.UnminedTxRetention
 
-	logger.Infof("[PreserveParents] Starting preservation of parents for unmined transactions older than block height %d (cutoff: %d)", blockHeight, cutoffBlockHeight)
+	logger.Infof("[pruner][height:%d] phase 1: starting parent preservation (cutoff: %d)", blockHeight, cutoffBlockHeight)
 
 	// OPTIMIZATION: Use parallel partition iterator instead of sequential QueryOldUnminedTransactions
 	// This reuses the optimized GetUnminedTxIterator which already has:
@@ -62,7 +62,7 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 	}
 	defer func() {
 		if closeErr := iterator.Close(); closeErr != nil {
-			logger.Warnf("[PreserveParents] Failed to close iterator: %v", closeErr)
+			logger.Warnf("[pruner][height:%d] phase 1: failed to close iterator: %v", blockHeight, closeErr)
 		}
 	}()
 
@@ -100,8 +100,8 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 		}
 	}
 
-	logger.Debugf("[PreserveParents] Found %d old unmined transactions with %d unique parent hashes to preserve",
-		processedCount, len(allParents))
+	logger.Debugf("[pruner][height:%d] phase 1: scanned %d unmined transactions, found %d unique parents",
+		blockHeight, processedCount, len(allParents))
 
 	// Preserve all parents in single batch operation
 	if len(allParents) > 0 {
@@ -115,10 +115,10 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 			return 0, errors.NewStorageError("failed to preserve parent transactions", err)
 		}
 
-		logger.Infof("[PreserveParents] Completed parent preservation: preserved %d unique parents for %d old unmined transactions (cutoff block height %d)",
-			len(parentSlice), processedCount, cutoffBlockHeight)
+		logger.Infof("[pruner][height:%d] phase 1: preserved %d unique parents for %d old unmined transactions",
+			blockHeight, len(parentSlice), processedCount)
 	} else {
-		logger.Infof("[PreserveParents] No parents to preserve for old unmined transactions (block height %d)", blockHeight)
+		logger.Infof("[pruner][height:%d] phase 1: no parents to preserve", blockHeight)
 	}
 
 	return processedCount, nil
