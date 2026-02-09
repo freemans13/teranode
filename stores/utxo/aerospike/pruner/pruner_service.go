@@ -1025,7 +1025,8 @@ func (s *Service) processBatchOfChildren(batch []childHashEntry, safetyMap map[s
 			// In this case, the child is ALREADY deleted, so it's safe to consider it stable
 			if aerospikeErr, ok := record.Err.(*aerospike.AerospikeError); ok {
 				if aerospikeErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
-					// Child already deleted by another chunk - safe to proceed with parent deletion
+					// Idempotent race handling: Child already deleted by concurrent partition processing
+					// This is safe - child is gone so parent's deletedChildren map doesn't need updating
 					safetyMap[hexHash] = true
 					continue
 				}
@@ -1145,7 +1146,8 @@ func (s *Service) getTxInputsFromBins(ctx context.Context, blockHeight uint32, b
 					return nil, nil
 				}
 
-				// External blob already deleted (by LocalDAH or previous cleanup), just need to delete Aerospike record
+				// Idempotent: External file missing (cleaned by LocalDAH or previous run)
+				// We can still proceed with record deletion - return empty inputs list
 				s.logger.Debugf("external tx %s already deleted from blob store at height %d, proceeding to delete Aerospike record",
 					txHash.String(), blockHeight)
 				return []*bt.Input{}, nil
@@ -1254,7 +1256,15 @@ func (s *Service) extractInputs(ctx context.Context, blockHeight uint32, bins ae
 	return s.getTxInputsFromBins(ctx, blockHeight, bins, txHash)
 }
 
-// executeBatchParentUpdates executes a batch of parent update operations
+// executeBatchParentUpdates performs Phase 2a: updates parent records to mark that their
+// child transactions have been deleted (adds to deletedChildren map).
+//
+// IDEMPOTENCY: This operation is safely re-runnable:
+// - Missing parents (KEY_NOT_FOUND) are skipped - they were already deleted
+// - Duplicate updates are no-ops - deletedChildren map updates are idempotent
+// - Partial batch failures can be retried without side effects
+//
+// This must complete before Phase 2b (child deletion) to maintain referential integrity.
 func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[string]*parentUpdateInfo) error {
 	if len(updates) == 0 {
 		return nil
@@ -1297,8 +1307,9 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 
 	for _, rec := range batchRecords {
 		if rec.BatchRec().Err != nil {
-			// Ignore KEY_NOT_FOUND - parent may have been deleted already
 			if rec.BatchRec().Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
+				// Idempotent: Parent may have been deleted by concurrent pruning or LocalDAH cleanup
+				// This is a success condition - parent is already gone so we don't need to update it
 				notFoundCount++
 				continue
 			}
@@ -1318,7 +1329,15 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 	return nil
 }
 
-// executeBatchDeletions executes a batch of deletion operations
+// executeBatchDeletions performs Phase 2b: removes child transaction records from Aerospike
+// after their parents have been updated (Phase 2a).
+//
+// IDEMPOTENCY: This operation is safely re-runnable:
+// - Already-deleted records (KEY_NOT_FOUND) are counted as success
+// - Multiple delete attempts on same record are harmless
+// - Partial batch failures can be retried without side effects
+//
+// Parents must be updated first (Phase 2a) before calling this function.
 func (s *Service) executeBatchDeletions(ctx context.Context, keys []*aerospike.Key) error {
 	if len(keys) == 0 {
 		return nil
@@ -1363,7 +1382,8 @@ func (s *Service) executeBatchDeletions(ctx context.Context, keys []*aerospike.K
 	for _, rec := range batchRecords {
 		if rec.BatchRec().Err != nil {
 			if rec.BatchRec().Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
-				// Already deleted
+				// Idempotent: Record already deleted by concurrent pruning or previous run
+				// This operation is safely re-runnable - treat as success
 				alreadyDeletedCount++
 			} else {
 				s.logger.Errorf("Deletion error for key %v: %v", rec.BatchRec().Key, rec.BatchRec().Err)
@@ -1382,7 +1402,15 @@ func (s *Service) executeBatchDeletions(ctx context.Context, keys []*aerospike.K
 	return nil
 }
 
-// executeBatchExternalFileDeletions deletes external blob files for transactions being pruned
+// executeBatchExternalFileDeletions performs Phase 3: removes external blob files
+// for transactions that have been deleted from Aerospike (Phase 2b).
+//
+// IDEMPOTENCY: This operation is safely re-runnable:
+// - Already-deleted files (ErrNotFound) are counted as success
+// - Files deleted by LocalDAH cleanup are handled gracefully
+// - Partial batch failures can be retried without side effects
+//
+// This runs after Phase 2b (child deletion) but can run concurrently with other blocks.
 func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, files []*externalFileInfo) error {
 	if len(files) == 0 {
 		return nil
@@ -1405,7 +1433,8 @@ func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, files [
 		err := s.external.Del(ctx, fileInfo.txHash.CloneBytes(), fileInfo.fileType)
 		if err != nil {
 			if errors.Is(err, errors.ErrNotFound) {
-				// Already deleted (by LocalDAH cleanup or previous pruning)
+				// Idempotent: File already deleted by LocalDAH cleanup, concurrent pruning, or previous run
+				// This operation is safely re-runnable - treat as success
 				alreadyDeletedCount++
 				s.logger.Debugf("External file for tx %s (type %d) already deleted", fileInfo.txHash.String(), fileInfo.fileType)
 			} else {
