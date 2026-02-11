@@ -127,9 +127,6 @@ func (s *Server) Init(ctx context.Context) error {
 		return errors.NewServiceError("pruner service not available from UTXO store")
 	}
 
-	// Set persisted height getter for block persister coordination
-	s.prunerService.SetPersistedHeightGetter(s.GetLastPersistedHeight)
-
 	// Validate block trigger mode
 	blockTrigger := s.settings.Pruner.BlockTrigger
 	if blockTrigger != settings.PrunerBlockTriggerOnBlockPersisted && blockTrigger != settings.PrunerBlockTriggerOnBlockMined {
@@ -234,31 +231,18 @@ func (s *Server) Init(ctx context.Context) error {
 					continue
 				}
 
-				// Get height from block assembly state
-				state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
+				// Get height from blockchain client using the block hash
+				// This is the authoritative source and avoids race conditions with Block Assembly state updates
+				header, meta, err := s.blockchainClient.GetBlockHeader(ctx, blockHash)
 				if err != nil {
-					s.logger.Debugf("Failed to get block assembly state on Block notification: %v", err)
+					s.logger.Debugf("Failed to get block header for Block notification hash %s: %v", blockHash, err)
 					continue
 				}
-
-				// If block assembly hasn't initialized yet (height=0), get height from blockchain
-				// This handles the edge case where Block notifications arrive before block assembly
-				// has processed its first block
-				var height uint32
-				if state.CurrentHeight == 0 {
-					header, meta, err := s.blockchainClient.GetBlockHeader(ctx, blockHash)
-					if err != nil {
-						s.logger.Debugf("Failed to get block header for Block notification hash %s: %v", blockHash, err)
-						continue
-					}
-					if header == nil || meta == nil {
-						s.logger.Debugf("Block notification for hash %s has no header/meta", blockHash)
-						continue
-					}
-					height = meta.Height
-				} else {
-					height = state.CurrentHeight
+				if header == nil || meta == nil {
+					s.logger.Debugf("Block notification for hash %s has no header/meta", blockHash)
+					continue
 				}
+				height := meta.Height
 
 				// Queue pruning request immediately - processor will wait for mined_set if block assembly is running
 				if height > s.lastProcessedHeight.Load() {
@@ -424,13 +408,6 @@ func (s *Server) HealthGRPC(ctx context.Context, _ *pruner_api.EmptyMessage) (*p
 		Ok:      status == http.StatusOK,
 		Details: details,
 	}, errors.WrapGRPC(err)
-}
-
-// GetLastPersistedHeight returns the last known block height that has been persisted
-// by the block persister service. This is used to coordinate cleanup operations to
-// avoid deleting data that the block persister still needs.
-func (s *Server) GetLastPersistedHeight() uint32 {
-	return s.lastPersistedHeight.Load()
 }
 
 // SetBlobDeletionObserver sets an optional observer for blob deletion completion events.

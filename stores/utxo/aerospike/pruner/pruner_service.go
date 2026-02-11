@@ -120,10 +120,6 @@ type Service struct {
 	writePolicy      *aerospike.WritePolicy
 	batchWritePolicy *aerospike.BatchWritePolicy
 	batchPolicy      *aerospike.BatchPolicy
-
-	// getPersistedHeight returns the last block height processed by block persister
-	// Used to coordinate cleanup with block persister progress (can be nil)
-	getPersistedHeight func() uint32
 }
 
 // parentUpdateInfo holds accumulated parent update information for batching
@@ -238,7 +234,6 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		writePolicy:                    writePolicy,
 		batchWritePolicy:               batchWritePolicy,
 		batchPolicy:                    batchPolicy,
-		getPersistedHeight:             opts.GetPersistedHeight,
 		utxoBatchSize:                  settings.UtxoStore.UtxoBatchSize,
 		blockHeightRetention:           settings.GetUtxoStoreBlockHeightRetention(),
 		defensiveEnabled:               settings.Pruner.UTXODefensiveEnabled,
@@ -281,12 +276,6 @@ func (s *Service) Start(ctx context.Context) {
 		s.indexReady.Store(true)
 		s.logger.Infof("[AerospikeCleanupService] index ready")
 	}()
-}
-
-// SetPersistedHeightGetter sets the function used to get block persister progress.
-// This should be called after service creation to wire up coordination with block persister.
-func (s *Service) SetPersistedHeightGetter(getter func() uint32) {
-	s.getPersistedHeight = getter
 }
 
 // AddObserver adds an observer to be notified when pruning completes.
@@ -424,7 +413,6 @@ func (s *Service) validateConnectionPoolSettings() {
 func (s *Service) partitionWorker(
 	ctx context.Context,
 	blockHeight uint32,
-	safeCleanupHeight uint32,
 	partitionStart int,
 	partitionCount int,
 ) (processed int64, skipped int64, err error) {
@@ -436,8 +424,8 @@ func (s *Service) partitionWorker(
 	// Create statement with delete_at_height filter
 	stmt := aerospike.NewStatement(s.namespace, s.set)
 
-	// Set the filter to find records with delete_at_height <= safeCleanupHeight
-	if err := stmt.SetFilter(aerospike.NewRangeFilter(s.fieldDeleteAtHeight, 1, int64(safeCleanupHeight))); err != nil {
+	// Set the filter to find records with delete_at_height <= blockHeight
+	if err := stmt.SetFilter(aerospike.NewRangeFilter(s.fieldDeleteAtHeight, 1, int64(blockHeight))); err != nil {
 		return 0, 0, err
 	}
 
@@ -542,35 +530,14 @@ type workerResult struct {
 func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, blockHashStr string, numPartitionQueries int) (int64, error) {
 	startTime := time.Now()
 
-	// BLOCK PERSISTER COORDINATION: Calculate safe cleanup height
-	// (keep existing logic from sequential implementation)
-	safeCleanupHeight := blockHeight
-
-	if s.getPersistedHeight != nil {
-		persistedHeight := s.getPersistedHeight()
-
-		// Only apply limitation if block persister has actually processed blocks (height > 0)
-		if persistedHeight > 0 {
-			retention := s.blockHeightRetention
-
-			// Calculate max safe height: persisted_height + retention
-			maxSafeHeight := persistedHeight + retention
-			if maxSafeHeight < safeCleanupHeight {
-				s.logger.Infof("Limiting cleanup from height %d to %d (persisted: %d, retention: %d)",
-					blockHeight, maxSafeHeight, persistedHeight, retention)
-				safeCleanupHeight = maxSafeHeight
-			}
-		}
-	}
-
 	// Calculate partition distribution
 	// Get total partitions from Aerospike client library (always 4096 in Aerospike architecture)
 	totalPartitions := aerospike.NewPartitionFilterAll().Count
 	partitionsPerQuery := totalPartitions / numPartitionQueries
 	remainingPartitions := totalPartitions % numPartitionQueries
 
-	s.logger.Infof("[pruner][%s:%d] phase 2: starting parallel pruning with %d partition workers (safe cleanup height: %d, total partitions: %d)",
-		blockHashStr, blockHeight, numPartitionQueries, safeCleanupHeight, totalPartitions)
+	s.logger.Infof("[pruner][%s:%d] phase 2: starting parallel pruning with %d partition workers (total partitions: %d)",
+		blockHashStr, blockHeight, numPartitionQueries, totalPartitions)
 
 	// Launch partition workers
 	results := make(chan workerResult, numPartitionQueries)
@@ -586,8 +553,7 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 		wg.Add(1)
 		go func(start, count int) {
 			defer wg.Done() // Call Done() AFTER sending to channel
-			processed, skipped, err := s.partitionWorker(ctx, blockHeight, safeCleanupHeight,
-				start, count)
+			processed, skipped, err := s.partitionWorker(ctx, blockHeight, start, count)
 			results <- workerResult{processed, skipped, err}
 		}(partitionStart, partitionCount)
 
@@ -664,15 +630,9 @@ func (s *Service) Prune(ctx context.Context, blockHeight uint32, blockHashStr st
 	// Calculate optimal number of partition workers
 	numWorkers := s.calculatePartitionWorkers()
 
-	// Log pruner trigger - note that blockHeight is from BlockPersisted notification
-	// which may lag behind current block validation height during catchup
-	if s.getPersistedHeight != nil && s.getPersistedHeight() > 0 {
-		s.logger.Debugf("[pruner][%s:%d] phase 2: DAH pruner triggered with %d partition workers (block persister last reported: %d)",
-			blockHashStr, blockHeight, numWorkers, s.getPersistedHeight())
-	} else {
-		s.logger.Debugf("[pruner][%s:%d] phase 2: DAH pruner triggered with %d partition workers",
-			blockHashStr, blockHeight, numWorkers)
-	}
+	// Log pruner trigger
+	s.logger.Debugf("[pruner][%s:%d] phase 2: DAH pruner triggered with %d partition workers",
+		blockHashStr, blockHeight, numWorkers)
 
 	if s.utxoSetTTL {
 		s.logger.Infof("Pruner operating in TTL mode (records expire via nsup)")

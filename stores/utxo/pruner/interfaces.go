@@ -18,10 +18,6 @@ type Service interface {
 	// This method is synchronous and blocks until pruning completes or context is cancelled.
 	Prune(ctx context.Context, height uint32, blockHashStr string) (recordsProcessed int64, err error)
 
-	// SetPersistedHeightGetter sets the function used to get block persister progress.
-	// This allows pruner to coordinate with block persister to avoid premature deletion.
-	SetPersistedHeightGetter(getter func() uint32)
-
 	// AddObserver adds an observer to be notified when pruning completes.
 	// This method is thread-safe and can be called after service creation.
 	AddObserver(observer Observer)
