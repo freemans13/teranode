@@ -240,7 +240,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 
 			// Phase 1: Preserve parents of old unmined transactions
 			// This must run before Phase 2 to protect parents from deletion
-			if s.utxoStore != nil {
+			if s.utxoStore != nil && !s.settings.Pruner.SkipPreserveParents {
 				hashStr := "<unknown>"
 				if latestReq.BlockHash != nil {
 					hashStr = latestReq.BlockHash.String()
@@ -260,6 +260,12 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 						prunerUpdatingParents.Add(float64(count))
 					}
 				}
+			} else if s.settings.Pruner.SkipPreserveParents {
+				hashStr := "<unknown>"
+				if latestReq.BlockHash != nil {
+					hashStr = latestReq.BlockHash.String()
+				}
+				s.logger.Infof("[pruner][%s:%d] phase 1: skipped (pruner_skipPreserveParents=true)", hashStr, latestReq.Height)
 			}
 
 			// Phase 2: DAH pruning (deletion)

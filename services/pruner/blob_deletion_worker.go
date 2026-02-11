@@ -39,7 +39,7 @@ func (s *Server) blobDeletionWorker() {
 }
 
 func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhash.Hash) {
-	if !s.settings.Pruner.BlobDeletionEnabled {
+	if s.settings.Pruner.SkipBlobDeletion {
 		return
 	}
 

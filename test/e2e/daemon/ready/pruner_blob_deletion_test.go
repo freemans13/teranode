@@ -39,7 +39,7 @@ func TestBlobDeletionScheduling(t *testing.T) {
 		SettingsOverrideFunc: test.ComposeSettings(
 			test.SystemTestSettings(),
 			func(s *settings.Settings) {
-				s.Pruner.BlobDeletionEnabled = true
+				s.Pruner.SkipBlobDeletion = false
 				s.Pruner.BlobDeletionSafetyWindow = 0
 				s.Pruner.BlobDeletionBatchSize = 100
 				s.Pruner.BlobDeletionMaxRetries = 3
@@ -186,7 +186,7 @@ func TestBlobDeletionSchedulingViaBlobStore(t *testing.T) {
 		SettingsOverrideFunc: test.ComposeSettings(
 			test.SystemTestSettings(),
 			func(s *settings.Settings) {
-				s.Pruner.BlobDeletionEnabled = true
+				s.Pruner.SkipBlobDeletion = false
 				s.Pruner.BlobDeletionSafetyWindow = 0
 				s.Pruner.BlobDeletionBatchSize = 100
 				s.Pruner.BlobDeletionMaxRetries = 3
