@@ -1365,18 +1365,23 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					return
 				}
 
+				// Block validation succeeded - cache it with subtrees loaded BEFORE sending notification
+				// This ensures the setMined worker can use the cached block when it receives the
+				// BlockSubtreesSet notification (sent by updateSubtreesDAH)
+				u.logger.Debugf("[ValidateBlock][%s] background validation complete, caching block", block.Hash().String())
+				u.lastValidatedBlocks.Set(*block.Hash(), block)
+
 				// Update subtrees DAH now that we know the block is valid
+				// This sends the BlockSubtreesSet notification which triggers setMined
 				if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
 					u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
+					// Clean up cache since DAH update failed
+					u.lastValidatedBlocks.Delete(*block.Hash())
 					// Trigger revalidation to ensure block is retried
 					// This is consistent with other error handling in this goroutine
 					u.ReValidateBlock(block, baseURL)
 					return
 				}
-
-				// Block validation succeeded - now cache it with subtrees loaded
-				u.logger.Debugf("[ValidateBlock][%s] background validation complete, caching block", block.Hash().String())
-				u.lastValidatedBlocks.Set(*block.Hash(), block)
 			}()
 		} else {
 			// get all 100 previous block headers on the main chain
@@ -1482,16 +1487,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// decouple the tracing context to not cancel the context when finalize the block processing in the background
 		decoupledCtx, _, _ := tracing.DecoupleTracingSpan(ctx, "ValidateBlock", "decoupled")
 
-		// Only update subtrees DAH for non-optimistic mining
-		// (optimistic mining handles this in its background validation goroutine)
-		if !useOptimisticMining {
-			// it's critical that we call updateSubtreesDAH() only when we know the block is valid
-			if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
-				return errors.NewProcessingError("[ValidateBlock][%s] failed to update subtrees DAH", block.Hash().String(), err)
-			}
-		}
-
-		// Cache the block only if subtrees are loaded (they should be from Valid() call)
+		// Cache the block BEFORE updating subtrees DAH to avoid race condition
+		// The setMined worker needs the block cached when it receives the BlockSubtreesSet notification
 		if u.hasValidSubtrees(block) {
 			u.logger.Debugf("[ValidateBlock][%s] caching block with %d subtrees loaded", block.Hash().String(), block.GetSubtreeSlicesCount())
 			u.lastValidatedBlocks.Set(*block.Hash(), block)
@@ -1500,6 +1497,18 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), block.GetSubtreeSlicesCount(), len(block.Subtrees))
 			} else {
 				u.logger.Warnf("[ValidateBlock][%s] not caching block - some subtrees are nil", block.Hash().String())
+			}
+		}
+
+		// Only update subtrees DAH for non-optimistic mining
+		// (optimistic mining handles this in its background validation goroutine)
+		if !useOptimisticMining {
+			// it's critical that we call updateSubtreesDAH() only when we know the block is valid
+			// This sends the BlockSubtreesSet notification which triggers setMined
+			if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
+				// Clean up cache since DAH update failed
+				u.lastValidatedBlocks.Delete(*block.Hash())
+				return errors.NewProcessingError("[ValidateBlock][%s] failed to update subtrees DAH", block.Hash().String(), err)
 			}
 		}
 
