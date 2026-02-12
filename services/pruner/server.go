@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -297,6 +298,59 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	// Start pruner processor goroutine
 	go s.prunerProcessor(ctx)
+
+	// Trigger initial pruning if there's work to do
+	// This ensures the pruner starts working immediately on startup
+	// rather than waiting for the next block notification
+	go func() {
+		var currentHeight uint32
+		var blockHash *chainhash.Hash
+
+		// Determine height based on trigger mode
+		blockTrigger := s.settings.Pruner.BlockTrigger
+
+		if blockTrigger == settings.PrunerBlockTriggerOnBlockPersisted {
+			// OnBlockPersisted mode: Use persisted height from block persister
+			currentHeight = s.lastPersistedHeight.Load()
+			// blockHash remains nil - BlockPersisted implies already mined
+
+		} else if blockTrigger == settings.PrunerBlockTriggerOnBlockMined {
+			// OnBlockMined mode: Get current blockchain height
+			if tipHeader, tipMeta, err := s.blockchainClient.GetBestBlockHeader(ctx); err == nil && tipHeader != nil && tipMeta != nil {
+				currentHeight = tipMeta.Height
+				blockHash = tipHeader.Hash() // Need hash for mined_set wait
+			} else {
+				s.logger.Warnf("[pruner] failed to get best block header for initial pruning: %v", err)
+				return
+			}
+		}
+
+		// Queue initial pruning if we have a valid height
+		if currentHeight > 0 && currentHeight > s.lastProcessedHeight.Load() {
+			req := &PruneRequest{
+				Height:    currentHeight,
+				BlockHash: blockHash,
+			}
+
+			hashStr := "<startup>"
+			if blockHash != nil {
+				hashStr = blockHash.String()
+			}
+
+			select {
+			case s.prunerCh <- req:
+				s.logger.Infof("[pruner][%s:%d] triggered initial pruning on startup (mode: %s)", hashStr, currentHeight, blockTrigger)
+			case <-time.After(5 * time.Second):
+				s.logger.Warnf("[pruner] failed to queue initial pruning request (timeout)")
+			case <-ctx.Done():
+				return
+			}
+		} else if currentHeight == 0 {
+			s.logger.Infof("[pruner] no initial pruning needed (current height: 0)")
+		} else {
+			s.logger.Debugf("[pruner] no initial pruning needed (current height: %d, last processed: %d)", currentHeight, s.lastProcessedHeight.Load())
+		}
+	}()
 
 	// Start blob deletion worker
 	go s.blobDeletionWorker()
