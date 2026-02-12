@@ -557,10 +557,11 @@ func (s *Service) partitionWorker(
 				}
 			}
 
-			// Other errors: continue processing (existing behavior - these are logged elsewhere)
-			// Non-timeout errors are tracked via prometheusUtxoRecordErrors in processRecordChunk
+			// Non-timeout errors: add record to chunk for normal error handling in processRecordChunk
+			// These errors are tracked via prometheusUtxoRecordErrors in processRecordChunk
 		}
 
+		// Add record to chunk (even if it has non-timeout errors - processRecordChunk will handle them)
 		chunk = append(chunk, rec)
 		if len(chunk) >= s.chunkSize {
 			submitChunk(chunk)
