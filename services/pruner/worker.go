@@ -145,10 +145,10 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			return
 
 		case sig := <-s.pruneNotify:
-			height := sig.height
-			hashStr := sig.blockHash.String()
+			blockHeight := sig.blockHeight
+			blockHashStr := sig.blockHash.String()
 
-			if height <= s.lastProcessedHeight.Load() {
+			if blockHeight <= s.lastProcessedHeight.Load() {
 				continue
 			}
 
@@ -161,7 +161,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					continue
 				}
 				if fsmState != nil && *fsmState == blockchain.FSMStateCATCHINGBLOCKS {
-					s.logger.Debugf("[pruner][%s:%d] skipping during catchup", hashStr, height)
+					s.logger.Debugf("[pruner][%s:%d] skipping during catchup", blockHashStr, blockHeight)
 					prunerSkipped.WithLabelValues("catchup_mode").Inc()
 					continue
 				}
@@ -171,15 +171,15 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			// OnBlockPersisted mode receives notifications after block is already mined
 			// OnBlockMined mode needs to wait for mined_set=true before proceeding
 			if s.settings.Pruner.BlockTrigger == settings.PrunerBlockTriggerOnBlockMined && s.blockAssemblyClient != nil {
-				s.logger.Debugf("[pruner][%s:%d] waiting for mined_set=true", hashStr, height)
+				s.logger.Debugf("[pruner][%s:%d] waiting for mined_set=true", blockHashStr, blockHeight)
 				if !s.waitForBlockMinedStatus(ctx, &sig.blockHash) {
 					continue
 				}
-				s.logger.Debugf("[pruner][%s:%d] block has mined_set=true", hashStr, height)
+				s.logger.Debugf("[pruner][%s:%d] block has mined_set=true", blockHashStr, blockHeight)
 			}
 
 			// Safety check before pruning
-			if !s.checkBlockAssemblySafeForPruner(ctx, "pruner", height) {
+			if !s.checkBlockAssemblySafeForPruner(ctx, "pruner", blockHeight) {
 				continue
 			}
 
@@ -189,37 +189,37 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			default:
 			}
 			s.blobNotify <- sig
-			s.logger.Debugf("[pruner][%s:%d] notified blob deletion worker", hashStr, height)
+			s.logger.Debugf("[pruner][%s:%d] notified blob deletion worker", blockHashStr, blockHeight)
 
 			prunerActive.Set(1)
 
 			// Phase 1: Preserve parents of old unmined transactions
 			// This must run before Phase 2 to protect parents from deletion
 			if s.utxoStore != nil && !s.settings.Pruner.SkipPreserveParents {
-				s.logger.Debugf("[pruner][%s:%d] phase 1: preserving parents", hashStr, height)
-				startTimePhase1 := time.Now()
-				if count, err := utxo.PreserveParentsOfOldUnminedTransactions(
-					ctx, s.utxoStore, height, hashStr, s.settings, s.logger,
+				s.logger.Debugf("[pruner][%s:%d] phase 1: preserving parents", blockHashStr, blockHeight)
+				startTime := time.Now()
+				if recordsProcessed, err := utxo.PreserveParentsOfOldUnminedTransactions(
+					ctx, s.utxoStore, blockHeight, blockHashStr, s.settings, s.logger,
 				); err != nil {
-					s.logger.Warnf("[pruner][%s:%d] phase 1: failed to preserve parents: %v", hashStr, height, err)
+					s.logger.Warnf("[pruner][%s:%d] phase 1: failed to preserve parents: %v", blockHashStr, blockHeight, err)
 					prunerErrors.WithLabelValues("parent_preservation").Inc()
 				} else {
-					prunerDuration.WithLabelValues("preserve_parents").Observe(time.Since(startTimePhase1).Seconds())
-					if count > 0 {
-						prunerUpdatingParents.Add(float64(count))
+					prunerDuration.WithLabelValues("preserve_parents").Observe(time.Since(startTime).Seconds())
+					if recordsProcessed > 0 {
+						prunerUpdatingParents.Add(float64(recordsProcessed))
 					}
 				}
 			} else if s.settings.Pruner.SkipPreserveParents {
-				s.logger.Infof("[pruner][%s:%d] phase 1: skipped (pruner_skipPreserveParents=true)", hashStr, height)
+				s.logger.Infof("[pruner][%s:%d] phase 1: skipped (pruner_skipPreserveParents=true)", blockHashStr, blockHeight)
 			}
 
 			// Phase 2: DAH pruning (deletion)
 			// Deletes transactions marked for deletion at or before the current height
 			if s.prunerService != nil {
 				startTime := time.Now()
-				recordsProcessed, err := s.prunerService.Prune(ctx, height, hashStr)
+				recordsProcessed, err := s.prunerService.Prune(ctx, blockHeight, blockHashStr)
 				if err != nil {
-					s.logger.Errorf("[pruner][%s:%d] phase 2: DAH pruner failed: %v", hashStr, height, err)
+					s.logger.Errorf("[pruner][%s:%d] phase 2: DAH pruner failed: %v", blockHashStr, blockHeight, err)
 					prunerErrors.WithLabelValues("dah_pruner").Inc()
 				} else {
 					prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
@@ -227,11 +227,11 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				}
 			}
 
-			prunerCurrentHeight.Set(float64(height))
+			prunerCurrentHeight.Set(float64(blockHeight))
 			prunerActive.Set(0)
 
 			// Update last processed height atomically
-			s.lastProcessedHeight.Store(height)
+			s.lastProcessedHeight.Store(blockHeight)
 		}
 	}
 }

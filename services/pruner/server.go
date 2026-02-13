@@ -39,10 +39,10 @@ import (
 	"google.golang.org/grpc"
 )
 
-// pruneSignal carries the height and block hash to prune up to.
+// pruneSignal carries the block height and hash to prune up to.
 type pruneSignal struct {
-	height    uint32
-	blockHash chainhash.Hash
+	blockHeight uint32
+	blockHash   chainhash.Hash
 }
 
 // BlobDeletionObserver is an optional callback interface for testing.
@@ -161,28 +161,28 @@ func (s *Server) Init(ctx context.Context) error {
 				// Track persisted height for coordination with block persister
 				if notification.Metadata != nil && notification.Metadata.Metadata != nil {
 					if heightStr, ok := notification.Metadata.Metadata["height"]; ok {
-						if height, err := strconv.ParseUint(heightStr, 10, 32); err == nil {
-							height32 := uint32(height)
-							oldHeight := s.lastPersistedHeight.Swap(height32)
+						if parsedHeight, err := strconv.ParseUint(heightStr, 10, 32); err == nil {
+							height := uint32(parsedHeight)
+							oldHeight := s.lastPersistedHeight.Swap(height)
 
 							// Log at INFO level when Block Persister first becomes active (transition from 0)
-							if oldHeight == 0 && height32 > 0 {
-								s.logger.Infof("[pruner] block persister is now active (persisted height: %d)", height32)
+							if oldHeight == 0 && height > 0 {
+								s.logger.Infof("[pruner] block persister is now active (persisted height: %d)", height)
 							} else {
-								s.logger.Debugf("[pruner] updated persisted height to %d", height32)
+								s.logger.Debugf("[pruner] updated persisted height to %d", height)
 							}
 
 							// Send signal to wake worker with latest height
-							if height32 > s.lastProcessedHeight.Load() {
+							if height > s.lastProcessedHeight.Load() {
 								blockHash, err := chainhash.NewHash(notification.Hash)
 								if err != nil {
 									s.logger.Warnf("Failed to parse block hash from BlockPersisted notification: %v", err)
 									continue
 								}
 
-								sig := pruneSignal{height: height32, blockHash: *blockHash}
+								sig := pruneSignal{blockHeight: height, blockHash: *blockHash}
 
-								s.logger.Infof("[pruner][%s:%d] notified from BlockPersisted notification", blockHash.String(), height32)
+								s.logger.Infof("[pruner][%s:%d] notified from BlockPersisted notification", blockHash.String(), height)
 
 								// Drain old signal (if any) and replace with latest
 								select {
@@ -229,7 +229,7 @@ func (s *Server) Init(ctx context.Context) error {
 
 				// Send signal to wake worker - processor will wait for mined_set if block assembly is running
 				if height > s.lastProcessedHeight.Load() {
-					sig := pruneSignal{height: height, blockHash: *blockHash}
+					sig := pruneSignal{blockHeight: height, blockHash: *blockHash}
 
 					s.logger.Infof("[pruner][%s:%d] notified from Block notification", blockHash.String(), height)
 
@@ -284,7 +284,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// rather than waiting for the next block notification
 	go func() {
 		var currentHeight uint32
-		var blockHash *chainhash.Hash
+		var blockHash chainhash.Hash
 
 		// Determine height based on trigger mode
 		blockTrigger := s.settings.Pruner.BlockTrigger
@@ -292,34 +292,25 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		if blockTrigger == settings.PrunerBlockTriggerOnBlockPersisted {
 			// OnBlockPersisted mode: Use persisted height from block persister
 			currentHeight = s.lastPersistedHeight.Load()
-			// blockHash remains nil - BlockPersisted implies already mined
 
 		} else if blockTrigger == settings.PrunerBlockTriggerOnBlockMined {
 			// OnBlockMined mode: Get current blockchain height
 			if tipHeader, tipMeta, err := s.blockchainClient.GetBestBlockHeader(ctx); err == nil && tipHeader != nil && tipMeta != nil {
 				currentHeight = tipMeta.Height
-				blockHash = tipHeader.Hash() // Need hash for mined_set wait
+				blockHash = *tipHeader.Hash()
 			} else {
 				s.logger.Warnf("[pruner] failed to get best block header for initial pruning: %v", err)
 				return
 			}
 		}
 
-		// Queue initial pruning if we have a valid height
+		// Send initial pruning signal if we have a valid height
 		if currentHeight > 0 && currentHeight > s.lastProcessedHeight.Load() {
-			req := &PruneRequest{
-				Height:    currentHeight,
-				BlockHash: blockHash,
-			}
-
-			hashStr := "<startup>"
-			if blockHash != nil {
-				hashStr = blockHash.String()
-			}
+			sig := pruneSignal{blockHeight: currentHeight, blockHash: blockHash}
 
 			select {
-			case s.prunerCh <- req:
-				s.logger.Infof("[pruner][%s:%d] triggered initial pruning on startup (mode: %s)", hashStr, currentHeight, blockTrigger)
+			case s.pruneNotify <- sig:
+				s.logger.Infof("[pruner][%s:%d] triggered initial pruning on startup (mode: %s)", blockHash.String(), currentHeight, blockTrigger)
 			case <-time.After(5 * time.Second):
 				s.logger.Warnf("[pruner] failed to queue initial pruning request (timeout)")
 			case <-ctx.Done():
