@@ -2264,7 +2264,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// movedBackBlockTxMap keeps track of all the transactions that were in the blocks we moved back
 	// this is used to determine which transactions need to be marked as on the longest chain when moving forward
 	// if a transaction was in a block we moved back, it means it was on the longest chain before the reorg
-	movedBackBlockTxMap := make(map[chainhash.Hash]bool) // keeps track of all the transactions that were in the blocks we moved back
+	movedBackBlockTxMap := make(map[chainhash.Hash]struct{}) // keeps track of all the transactions that were in the blocks we moved back
 
 	for _, block := range moveBackBlocks {
 		// move back the block, getting all the transactions in the block and any conflicting hashes
@@ -2285,7 +2285,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		for _, subtreeNodes := range subtreesNodes {
 			for _, node := range subtreeNodes {
 				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					movedBackBlockTxMap[node.Hash] = true
+					movedBackBlockTxMap[node.Hash] = struct{}{}
 				}
 			}
 		}
@@ -2303,11 +2303,14 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	}
 
 	var (
-		transactionMap     *SplitSwissMap
-		losingTxHashesMap  txmap.TxMap
+		transactionMap    *SplitSwissMap
+		losingTxHashesMap txmap.TxMap
+		// winningTxSet and losingTxSet track tx membership for dedup/filtering
+		winningTxSet = make(map[chainhash.Hash]struct{})
+		losingTxSet  = make(map[chainhash.Hash]struct{})
+		// markOnLongestChain collects hashes that need to be marked as on longest chain;
+		// filtered inline to avoid a second pass
 		markOnLongestChain = make([]chainhash.Hash, 0, 1024)
-		winningTxSet       = make(map[chainhash.Hash]bool)
-		rawLosingTxHashes  = make([]chainhash.Hash, 0, 1024)
 	)
 
 	for blockIdx, block := range moveForwardBlocks {
@@ -2321,8 +2324,8 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		if transactionMap != nil {
 			transactionMap.Iter(func(hash chainhash.Hash, _ struct{}) bool {
 				if !hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					winningTxSet[hash] = true
-					if !movedBackBlockTxMap[hash] {
+					winningTxSet[hash] = struct{}{}
+					if _, inMovedBack := movedBackBlockTxMap[hash]; !inMovedBack {
 						markOnLongestChain = append(markOnLongestChain, hash)
 					}
 				}
@@ -2331,8 +2334,14 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			})
 		}
 
+		// Build losingTxSet directly from the map iterator, avoiding Keys() intermediate slice
 		if losingTxHashesMap != nil && losingTxHashesMap.Length() > 0 {
-			rawLosingTxHashes = append(rawLosingTxHashes, losingTxHashesMap.Keys()...)
+			losingTxHashesMap.Iter(func(hash chainhash.Hash, _ uint64) bool {
+				if _, isWinning := winningTxSet[hash]; !isWinning {
+					losingTxSet[hash] = struct{}{}
+				}
+				return true
+			})
 		}
 
 		stp.currentBlockHeader = block.Header
@@ -2340,26 +2349,21 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 
 	movedBackBlockTxMap = nil // free up memory
 
-	losingTxSet := make(map[chainhash.Hash]bool)
-	allLosingTxHashes := make([]chainhash.Hash, 0, len(rawLosingTxHashes))
-	for _, hash := range rawLosingTxHashes {
-		if winningTxSet[hash] {
-			continue
-		}
-		if losingTxSet[hash] {
-			continue
-		}
-		losingTxSet[hash] = true
-		allLosingTxHashes = append(allLosingTxHashes, hash)
+	// Build allLosingTxHashes directly from losingTxSet (already deduped, already filtered vs winningTxSet)
+	allLosingTxHashes := getHashSlice(len(losingTxSet))
+	for hash := range losingTxSet {
+		*allLosingTxHashes = append(*allLosingTxHashes, hash)
 	}
 
-	filteredMarkOnLongestChain := make([]chainhash.Hash, 0, len(markOnLongestChain))
+	// Filter markOnLongestChain against losingTxSet in-place to avoid a second slice allocation
+	n := 0
 	for _, hash := range markOnLongestChain {
-		if losingTxSet[hash] {
-			continue
+		if _, isLosing := losingTxSet[hash]; !isLosing {
+			markOnLongestChain[n] = hash
+			n++
 		}
-		filteredMarkOnLongestChain = append(filteredMarkOnLongestChain, hash)
 	}
+	filteredMarkOnLongestChain := markOnLongestChain[:n]
 
 	// all the transactions in markOnLongestChain need to be marked as on the longest chain in the utxo store
 	if len(filteredMarkOnLongestChain) > 0 {
@@ -2368,51 +2372,46 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 	}
 
-	if len(allLosingTxHashes) > 0 {
-		if err = stp.utxoStore.MarkTransactionsOnLongestChain(ctx, allLosingTxHashes, false); err != nil {
+	if len(*allLosingTxHashes) > 0 {
+		if err = stp.utxoStore.MarkTransactionsOnLongestChain(ctx, *allLosingTxHashes, false); err != nil {
+			putHashSlice(allLosingTxHashes)
 			return errors.NewProcessingError("[reorgBlocks] error marking losing conflicting transactions as not on longest chain in utxo store", err)
 		}
 	}
+	putHashSlice(allLosingTxHashes)
 
 	// everything now in block assembly is not mined on the longest chain
 	// so we need to set the unminedSince for all transactions in block assembly
+	// Pre-compute total capacity for allMarkFalse to avoid repeated allocations
+	allMarkFalseLen := 0
 	for _, subtree := range stp.chainedSubtrees {
-		notOnLongestChain := make([]chainhash.Hash, 0, len(subtree.Nodes))
+		allMarkFalseLen += len(subtree.Nodes)
+	}
+	currentSubtree := stp.currentSubtree.Load()
+	allMarkFalseLen += len(currentSubtree.Nodes)
 
+	allMarkFalse := getHashSlice(allMarkFalseLen)
+	for _, subtree := range stp.chainedSubtrees {
 		for _, node := range subtree.Nodes {
-			if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				// skip coinbase placeholder
-				continue
-			}
-
-			notOnLongestChain = append(notOnLongestChain, node.Hash)
-		}
-
-		if len(notOnLongestChain) > 0 {
-			if err = stp.markNotOnLongestChain(ctx, moveBackBlocks, moveForwardBlocks, notOnLongestChain); err != nil {
-				return err
+			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				*allMarkFalse = append(*allMarkFalse, node.Hash)
 			}
 		}
 	}
-
-	// also for the current subtree
-	currentSubtree := stp.currentSubtree.Load()
-	notOnLongestChain := make([]chainhash.Hash, 0, len(currentSubtree.Nodes))
 
 	for _, node := range currentSubtree.Nodes {
-		if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			// skip coinbase placeholder
-			continue
+		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			*allMarkFalse = append(*allMarkFalse, node.Hash)
 		}
-
-		notOnLongestChain = append(notOnLongestChain, node.Hash)
 	}
 
-	if len(notOnLongestChain) > 0 {
-		if err = stp.markNotOnLongestChain(ctx, moveBackBlocks, moveForwardBlocks, notOnLongestChain); err != nil {
+	if len(*allMarkFalse) > 0 {
+		if err = stp.markNotOnLongestChain(ctx, moveBackBlocks, moveForwardBlocks, *allMarkFalse); err != nil {
+			putHashSlice(allMarkFalse)
 			return err
 		}
 	}
+	putHashSlice(allMarkFalse)
 
 	// announce all the subtrees to the network
 	// this will also store it by the Server in the subtree store
@@ -3507,10 +3506,15 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 				return nil
 			}
 
-			// Pre-allocate result arrays indexed by position
-			existedInTxMap := make([]bool, n)    // true if SetIfExists found the key
-			existsInLosingMap := make([]bool, n) // true if in losingTxHashesMap
-			isRemoveMap := make([]bool, n)       // true if in removeMap (to delete)
+			// Pack 3 boolean flags per element into a single byte array:
+			// bit 0 = existedInTxMap, bit 1 = existsInLosingMap, bit 2 = isRemoveMap
+			// Saves ~66% memory vs three separate []bool arrays
+			const (
+				flagExistedInTxMap    = 1 << 0
+				flagExistsInLosingMap = 1 << 1
+				flagIsRemoveMap       = 1 << 2
+			)
+			nodeFlags := make([]byte, n)
 
 			numWorkers := min(runtime.NumCPU(), n/100, 16)
 			if numWorkers < 2 {
@@ -3538,16 +3542,16 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 						}
 
 						if removeMapLength > 0 && stp.removeMap.Exists(node.Hash) {
-							isRemoveMap[i] = true
+							nodeFlags[i] = flagIsRemoveMap
 							continue
 						}
 
 						// SetIfExists: atomic check + set (1 lock instead of 2)
 						existed := transactionMap.Exists(node.Hash)
-						existedInTxMap[i] = existed
-
-						if !existed && losingTxHashesMap != nil {
-							existsInLosingMap[i] = losingTxHashesMap.Exists(node.Hash)
+						if existed {
+							nodeFlags[i] = flagExistedInTxMap
+						} else if losingTxHashesMap != nil && losingTxHashesMap.Exists(node.Hash) {
+							nodeFlags[i] = flagExistsInLosingMap
 						}
 					}
 				}(start, end)
@@ -3561,12 +3565,13 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 					continue
 				}
 
-				if isRemoveMap[i] {
+				f := nodeFlags[i]
+				if f&flagIsRemoveMap != 0 {
 					_ = stp.removeMap.Delete(node.Hash)
 					continue
 				}
 
-				if !existedInTxMap[i] && !existsInLosingMap[i] {
+				if f&(flagExistedInTxMap|flagExistsInLosingMap) == 0 {
 					remainderSubtrees[idx] = append(remainderSubtrees[idx], node)
 				}
 			}
