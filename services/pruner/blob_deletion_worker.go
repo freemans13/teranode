@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/dustin/go-humanize"
@@ -19,41 +20,26 @@ func (s *Server) blobDeletionWorker() {
 		case <-s.ctx.Done():
 			return
 
-		case req := <-s.blobDeletionCh:
-			// Drain channel to get latest request
-			latestReq := req
-		drainLoop:
-			for {
-				select {
-				case nextReq := <-s.blobDeletionCh:
-					latestReq = nextReq
-				default:
-					break drainLoop
-				}
-			}
-
-			s.logger.Debugf("Processing blob deletions for height %d", latestReq.Height)
-			s.processBlobDeletionsAtHeight(latestReq.Height, latestReq.BlockHash)
+		case sig := <-s.blobNotify:
+			s.logger.Debugf("Processing blob deletions for height %d", sig.height)
+			s.processBlobDeletionsAtHeight(sig.height, sig.blockHash)
 		}
 	}
 }
 
-func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhash.Hash) {
+func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash chainhash.Hash) {
 	if s.settings.Pruner.SkipBlobDeletion {
 		return
 	}
 
 	ctx := s.ctx
-	hashStr := "<unknown>"
-	if blockHash != nil {
-		hashStr = blockHash.String()
-	}
+	hashStr := blockHash.String()
 
-	// Wait for block to be mined (only if blockHash provided AND block assembly is running)
-	// When block assembly is not running (e.g., in tests), blocks are immediately mined
-	if blockHash != nil && s.blockAssemblyClient != nil {
+	// Wait for block to be mined (only in OnBlockMined trigger mode AND when block assembly is running)
+	// OnBlockPersisted mode receives notifications after block is already mined
+	if s.settings.Pruner.BlockTrigger == settings.PrunerBlockTriggerOnBlockMined && s.blockAssemblyClient != nil {
 		s.logger.Debugf("[pruner][%s:%d] blob deletion: waiting for mined_set=true", hashStr, height)
-		if !s.waitForBlockMinedStatus(ctx, blockHash) {
+		if !s.waitForBlockMinedStatus(ctx, &blockHash) {
 			s.logger.Warnf("[pruner][%s:%d] blob deletion: skipped - timeout waiting for mined_set", hashStr, height)
 			return
 		}
