@@ -99,6 +99,7 @@ func New(
 		blockchainClient:    blockchainClient,
 		blockAssemblyClient: blockAssemblyClient,
 		blobStores:          make(map[storetypes.BlobStoreType]blob.Store),
+		prunerCh:            make(chan *PruneRequest, 1),
 		blobDeletionCh:      make(chan *PruneRequest, 1),
 		stats:               gocore.NewStat("pruner"),
 	}
@@ -287,9 +288,6 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	if err != nil {
 		return err
 	}
-
-	// Initialize pruner channel (buffer of 1 to prevent blocking while ensuring only one pruner)
-	s.prunerCh = make(chan *PruneRequest, 1)
 
 	// Start the pruner service (Aerospike or SQL)
 	if s.prunerService != nil {
