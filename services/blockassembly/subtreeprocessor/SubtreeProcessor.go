@@ -2370,7 +2370,13 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 
 	// Consolidate all "mark as false" operations into a single call
 	// This includes: losing transactions + all transactions in block assembly (chainedSubtrees + currentSubtree)
-	allMarkFalse := make([]chainhash.Hash, 0, len(allLosingTxHashes)+len(stp.chainedSubtrees)*1000)
+	subtreeNodeCount := 0
+	for _, subtree := range stp.chainedSubtrees {
+		subtreeNodeCount += len(subtree.Nodes)
+	}
+	currentSubtreeForCap := stp.currentSubtree.Load()
+	subtreeNodeCount += len(currentSubtreeForCap.Nodes)
+	allMarkFalse := make([]chainhash.Hash, 0, len(allLosingTxHashes)+subtreeNodeCount)
 
 	// Add losing conflicting transactions
 	allMarkFalse = append(allMarkFalse, allLosingTxHashes...)
