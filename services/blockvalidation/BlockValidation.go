@@ -42,7 +42,6 @@ import (
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/teranode/util/retry"
@@ -199,7 +198,8 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 	}
 
 	wrapper := &subtreeStoreWrapper{store: u.subtreeStore}
-	return model.NewSubtreeMetaRegenerator(u.logger, wrapper, peerURLs, u.settings.Asset.APIPrefix)
+	return model.NewSubtreeMetaRegenerator(u.logger, wrapper, peerURLs, u.settings.Asset.APIPrefix,
+		u.utxoStore.GetBlockHeight, u.subtreeBlockHeightRetention)
 }
 
 // NewBlockValidation creates a new block validation instance with the provided dependencies.
@@ -1749,14 +1749,15 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 	return u.checkOldBlockIDs(ctx, oldBlockIDsMap, blockData.block)
 }
 
-// updateSubtreesDAH manages retention periods for block subtrees.
-// It updates the DAH values and marks subtrees as properly set in the blockchain.
+// updateSubtreesDAH marks block subtrees as properly set in the blockchain.
+// Subtrees retain their finite DAH from assembly/validation — the block persister
+// will promote them to permanent (DAH=0) when the block is confirmed on the main chain.
 //
 // Parameters:
 //   - ctx: Context for the operation
 //   - block: Block containing subtrees to update
 //
-// Returns an error if DAH updates fail.
+// Returns an error if the update fails.
 func (u *BlockValidation) updateSubtreesDAH(ctx context.Context, block *model.Block) (err error) {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "BlockValidation:updateSubtreesDAH",
 		tracing.WithLogMessage(u.logger, "[updateSubtreesDAH][%s] updating subtrees DAH", block.Hash().String()),
@@ -1764,27 +1765,8 @@ func (u *BlockValidation) updateSubtreesDAH(ctx context.Context, block *model.Bl
 
 	defer deferFn()
 
-	// update the subtree DAHs
-	g, gCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(g, u.settings.SubtreeValidation.SubtreeDAHConcurrency)
-
-	for _, subtreeHash := range block.Subtrees {
-		subtreeHash := subtreeHash
-
-		g.Go(func() error {
-			u.logger.Debugf("[updateSubtreesDAH][%s] updating subtree DAH for %s", block.Hash().String(), subtreeHash.String())
-
-			if err := u.subtreeStore.SetDAH(gCtx, subtreeHash[:], fileformat.FileTypeSubtree, 0); err != nil {
-				return errors.NewStorageError("[updateSubtreesDAH][%s] failed to update subtree DAH for %s", block.Hash().String(), subtreeHash.String(), err)
-			}
-
-			return nil
-		})
-	}
-
-	if err = g.Wait(); err != nil {
-		return errors.NewServiceError("[updateSubtreesDAH][%s] failed to update subtree DAH", block.Hash().String(), err)
-	}
+	// Subtrees already have finite DAH from assembly/validation — no DAH update needed.
+	// The block persister will promote to permanent (DAH=0) when the block is confirmed.
 
 	// update block subtrees_set to true
 	u.logger.Debugf("[updateSubtreesDAH][%s] setting block subtrees_set to true", block.Hash().String())
@@ -1793,7 +1775,7 @@ func (u *BlockValidation) updateSubtreesDAH(ctx context.Context, block *model.Bl
 		return errors.NewServiceError("[updateSubtreesDAH][%s] failed to set block subtrees_set", block.Hash().String(), err)
 	}
 
-	u.logger.Infof("[ValidateBlock][%s] updated subtree DAHs and set block subtrees_set", block.Hash().String())
+	u.logger.Infof("[ValidateBlock][%s] set block subtrees_set", block.Hash().String())
 
 	return nil
 }

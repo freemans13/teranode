@@ -4049,11 +4049,13 @@ func (stp *SubtreeProcessor) markConflictingTxsInSubtrees(ctx context.Context, l
 						return errors.NewProcessingError("error serializing subtree %s", subtreeHash.String(), err)
 					}
 
+					dah := stp.utxoStore.GetBlockHeight() + stp.settings.GlobalBlockHeightRetention
 					if err = stp.subtreeStore.Set(gCtx,
 						subtreeHash[:],
 						fileformat.FileTypeSubtree,
 						subtreeBytes,
 						options.WithAllowOverwrite(true),
+						options.WithDeleteAt(dah),
 					); err != nil {
 						return errors.NewServiceError("error saving subtree %s", subtreeHash.String(), err)
 					}
