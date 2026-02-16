@@ -197,6 +197,10 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 		return nil
 	}
 
+	if u.utxoStore == nil {
+		return nil
+	}
+
 	wrapper := &subtreeStoreWrapper{store: u.subtreeStore}
 	return model.NewSubtreeMetaRegenerator(u.logger, wrapper, peerURLs, u.settings.Asset.APIPrefix,
 		u.utxoStore.GetBlockHeight, u.subtreeBlockHeightRetention)
