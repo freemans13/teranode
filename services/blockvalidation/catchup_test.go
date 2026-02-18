@@ -1264,6 +1264,10 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 			nil,
 		)
 
+		// Mock GetBlockByHeight for locator capping (blockchain height 10000 > UTXO height 1018)
+		mockBlockchainClient.On("GetBlockByHeight", mock.Anything, mock.Anything).
+			Return(bestBlock, nil).Maybe()
+
 		// Mock GetBlockLocator
 		locatorHashes := []*chainhash.Hash{bestBlock.Header.Hash()}
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
@@ -1671,8 +1675,10 @@ func TestCatchupErrorScenarios(t *testing.T) {
 				MaxHalfOpenRequests: 1,
 			},
 		}
-		server, mockBlockchainClient, _, cleanup := setupTestCatchupServerWithConfig(t, config)
+		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServerWithConfig(t, config)
 		defer cleanup()
+
+		mockUTXOStore.On("GetBlockHeight").Return(uint32(0))
 
 		blocks := testhelpers.CreateTestBlockChain(t, 5)
 		targetBlock := blocks[4]
@@ -2538,8 +2544,10 @@ func TestCatchup_NoRepeatedHeaderFetching(t *testing.T) {
 	// and doesn't fetch the same headers repeatedly
 
 	ctx := context.Background()
-	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
+
+	mockUTXOStore.On("GetBlockHeight").Return(uint32(0))
 
 	// Create test headers
 	allHeaders := testhelpers.CreateTestHeaders(t, 11) // Need headers 0-10
@@ -3643,8 +3651,10 @@ func TestCatchup_MemoryLimitAfterDuplicateRemoval(t *testing.T) {
 	ctx := context.Background()
 
 	// Create test server
-	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
+
+	mockUTXOStore.On("GetBlockHeight").Return(uint32(0))
 
 	// Set memory limit to 10,001 - just enough for 10,000 + 1 new header after duplicate removal
 	// But with the bug, 10,000 + 2 = 10,002 > 10,001 triggers premature truncation

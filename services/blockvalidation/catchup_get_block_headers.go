@@ -103,6 +103,38 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 	startHash := bestBlockHeader.Hash()
 	startHeight := bestBlockMeta.Height
 
+	// Cap block locator at UTXO height when the blockchain store is ahead.
+	//
+	// The blockchain store (PostgreSQL) is updated synchronously by AddBlock during
+	// catchup, but the UTXO store height is updated asynchronously — it receives a
+	// NotificationType_Block notification on a channel, then makes a GetBestHeightAndTime
+	// RPC call back to the blockchain service. During a long catchup or after a failed
+	// catchup that validated some blocks before erroring out, the blockchain store can
+	// be many blocks ahead of the UTXO store.
+	//
+	// This matters because findCommonAncestor rejects any block whose height exceeds the
+	// UTXO height (those blocks exist in the blockchain store but aren't fully processed).
+	// If the locator starts from blockchain height, the peer returns headers from that
+	// height onwards, and findCommonAncestor rejects them all — "no common ancestor found".
+	if u.utxoStore != nil {
+		utxoHeight := u.utxoStore.GetBlockHeight()
+		if utxoHeight > 0 && bestBlockMeta.Height > utxoHeight {
+			u.logger.Infof("[catchup][%s] blockchain height %d ahead of UTXO height %d, capping locator",
+				blockUpTo.Hash().String(), bestBlockMeta.Height, utxoHeight)
+
+			utxoBlock, capErr := u.blockchainClient.GetBlockByHeight(ctx, utxoHeight)
+			if capErr == nil {
+				startHash = utxoBlock.Header.Hash()
+				startHeight = utxoHeight
+				bestBlockHeader = utxoBlock.Header
+				bestBlockMeta = &model.BlockHeaderMeta{Height: utxoHeight}
+			} else {
+				u.logger.Warnf("[catchup][%s] failed to get block at UTXO height %d, using blockchain height: %v",
+					blockUpTo.Hash().String(), utxoHeight, capErr)
+			}
+		}
+	}
+
 	// Create block locator
 	locatorHashes, err := u.blockchainClient.GetBlockLocator(ctx, bestBlockHeader.Hash(), bestBlockMeta.Height)
 	if err != nil {
