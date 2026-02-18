@@ -1215,7 +1215,7 @@ func (s *File) Del(ctx context.Context, key []byte, fileType fileformat.FileType
 	// Try to remove the hash prefix directory if now empty (best-effort, ignore errors).
 	// os.Remove on a non-empty directory returns an error, so this is safe.
 	// Only attempt if the parent is a subdirectory of the store root (i.e. a hash prefix dir).
-	if dir := filepath.Dir(fileName); dir != s.path {
+	if dir := filepath.Dir(fileName); dir != s.path && len(filepath.Base(dir)) <= 2 {
 		_ = os.Remove(dir)
 	}
 
