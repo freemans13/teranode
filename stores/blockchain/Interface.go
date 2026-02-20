@@ -311,6 +311,7 @@ type Store interface {
 	ClearBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash) error
 
 	// GetBlocksMinedNotSet retrieves blocks that haven't been marked as mined.
+	// Only returns blocks with subtrees_set=true to ensure blocks are processable.
 	// Parameters:
 	//   - ctx: Context for the operation
 	// Returns: Slice of unmined blocks and any error encountered
@@ -343,6 +344,16 @@ type Store interface {
 	//   - blockIDs: Slice of block IDs to check
 	// Returns: Boolean indicating if blocks are in current chain and any error encountered
 	CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32) (bool, error)
+
+	// CheckBlockIsAncestorOfBlock checks if any of the given block IDs are ancestors of the block with the given hash.
+	// This is used for double-spend detection on fork blocks where we need to check against
+	// the fork's ancestor chain rather than the main chain.
+	// Parameters:
+	//   - ctx: Context for the operation
+	//   - blockIDs: Slice of block IDs to check
+	//   - blockHash: Hash of the block to check ancestry against
+	// Returns: Boolean indicating if any block ID is an ancestor, and any error encountered
+	CheckBlockIsAncestorOfBlock(ctx context.Context, blockIDs []uint32, blockHash *chainhash.Hash) (bool, error)
 
 	// GetChainTips retrieves information about all known tips in the block tree.
 	// This method finds all blocks that have no children (tips) and determines their

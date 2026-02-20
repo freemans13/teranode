@@ -111,6 +111,10 @@ const (
 	// maxProtocolVersion = wire.FeeFilterVersion
 )
 
+// timeZeroVal is simply the zero value for a time.Time and is used to avoid
+// creating multiple instances.
+var timeZeroVal time.Time
+
 // RPCStat provides performance statistics collection for the RPC service.
 var RPCStat = gocore.NewStat("RPC")
 
@@ -328,6 +332,11 @@ var rpcLimited = map[string]struct{}{
 	"version":               {},
 	"getminingcandidate":    {},
 	"submitminingsolution":  {},
+
+	// BSV-specific commands
+	"freeze":   {},
+	"unfreeze": {},
+	"reassign": {},
 }
 
 // builderScript is a convenience function which is used for hard-coded scripts
@@ -1078,6 +1087,10 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 		return
 	}
 
+	// Use context-aware logger for trace correlation
+	ctx := r.Context()
+	ctxLogger := s.logger.WithTraceContext(ctx)
+
 	// Read and close the JSON-RPC request body from the caller.
 	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
@@ -1090,7 +1103,7 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 		return
 	}
 
-	s.logger.Debugf("jsonRPCRead body: %s", body)
+	ctxLogger.Debugf("jsonRPCRead body: %s", body)
 
 	// Unfortunately, the http server doesn't provide the ability to
 	// change the read deadline for the new connection and having one breaks
@@ -1101,7 +1114,7 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		errMsg := "webserver doesn't support hijacking"
-		s.logger.Warnf(errMsg)
+		ctxLogger.Warnf("%s", errMsg)
 
 		errCode := http.StatusInternalServerError
 		http.Error(w, strconv.Itoa(errCode)+" "+errMsg, errCode)
@@ -1112,7 +1125,7 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 	conn, buf, err := hj.Hijack()
 
 	if err != nil {
-		s.logger.Warnf("Failed to hijack HTTP connection: %v", err)
+		ctxLogger.Warnf("Failed to hijack HTTP connection: %v", err)
 
 		errCode := http.StatusInternalServerError
 
@@ -1123,7 +1136,8 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 
 	defer conn.Close()
 	defer buf.Flush()
-	// conn.SetReadDeadline(timeZeroVal)
+
+	_ = conn.SetReadDeadline(timeZeroVal)
 
 	// Attempt to parse the raw body into a JSON-RPC request.
 	var responseID interface{}
@@ -1161,7 +1175,7 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 		// RPC quirks can be enabled by the user to avoid compatibility issues
 		// with software relying on Core's behavior.
 		if request.ID == nil && !(s.rpcQuirks && request.Jsonrpc == "") {
-			s.logger.Debugf("request id:%d, rpsQuirks: %t", request.ID, s.rpcQuirks) //
+			ctxLogger.Debugf("request id:%d, rpsQuirks: %t", request.ID, s.rpcQuirks)
 
 			return
 		}
@@ -1206,24 +1220,24 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 	// Marshal the response.
 	msg, err := s.createMarshalledReply(responseID, result, jsonErr)
 	if err != nil {
-		s.logger.Errorf("Failed to marshal reply: %v", err)
+		ctxLogger.Errorf("Failed to marshal reply: %v", err)
 		return
 	}
 
 	// Write the response.
 	err = s.writeHTTPResponseHeaders(r, w.Header(), http.StatusOK, buf)
 	if err != nil {
-		s.logger.Errorf("Error writing HTTPResponseHeaders: %v", err)
+		ctxLogger.Errorf("Error writing HTTPResponseHeaders: %v", err)
 		return
 	}
 
 	if _, err := buf.Write(msg); err != nil {
-		s.logger.Errorf("Failed to write marshalled reply: %v", err)
+		ctxLogger.Errorf("Failed to write marshalled reply: %v", err)
 	}
 
 	// Terminate with newline to maintain compatibility with Bitcoin Core.
 	if err := buf.WriteByte('\n'); err != nil {
-		s.logger.Errorf("Failed to append terminating newline to reply: %v", err)
+		ctxLogger.Errorf("Failed to append terminating newline to reply: %v", err)
 	}
 }
 

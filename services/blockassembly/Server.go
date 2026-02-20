@@ -406,7 +406,7 @@ func (ba *BlockAssembly) subtreeStorageWorker(ctx context.Context, workChan <-ch
 				result.storedOK = true
 				result.err = nil
 			} else {
-				ba.logger.Errorf(err.Error())
+				ba.logger.Errorf("%s", err.Error())
 				result.storedOK = false
 			}
 		} else {
@@ -419,23 +419,6 @@ func (ba *BlockAssembly) subtreeStorageWorker(ctx context.Context, workChan <-ch
 		case resultChan <- result:
 		case <-ctx.Done():
 			return
-		}
-
-		// Smart cache invalidation: only invalidate if significant change
-		currentTxCount := uint32(ba.blockAssembler.TxCount())
-		currentSubtreeCount := ba.blockAssembler.SubtreeCount()
-
-		var currentSize uint64
-		subtrees := ba.blockAssembler.GetChainedSubtrees()
-		for _, st := range subtrees {
-			currentSize += st.SizeInBytes
-		}
-
-		if ba.blockAssembler.shouldInvalidateCache(currentTxCount, currentSize, currentSubtreeCount) {
-			ba.logger.Debugf("[Server] Invalidating cache: significant change detected (txs=%d, size=%d, subtrees=%d)", currentTxCount, currentSize, currentSubtreeCount)
-			ba.blockAssembler.invalidateMiningCandidateCache()
-		} else {
-			ba.logger.Debugf("[Server] Keeping cache valid: minor change (txs=%d, size=%d, subtrees=%d)", currentTxCount, currentSize, currentSubtreeCount)
 		}
 
 		// Wait for all work to complete before sending response to caller
@@ -1426,7 +1409,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 
 	// check fully valid, including whether difficulty in header is low enough
 	// TODO add more checks to the Valid function, like whether the parent/child relationships are OK
-	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, ba.settings); !ok {
+	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, ba.settings, nil); !ok {
 		ba.logger.Errorf("[BlockAssembly][%s][%s] invalid block: %v - %v", jobID, block.Hash().String(), block.Header, err)
 
 		// the subtreeprocessor created an invalid block, we must reset
@@ -1749,7 +1732,9 @@ func (ba *BlockAssembly) GetBlockAssemblyTxs(ctx context.Context, _ *blockassemb
 //   - *blockassembly_api.GetCurrentDifficultyResponse: Response containing the current difficulty
 //   - error: Any error encountered during retrieval
 func (ba *BlockAssembly) GetCurrentDifficulty(_ context.Context, _ *blockassembly_api.EmptyMessage) (resp *blockassembly_api.GetCurrentDifficultyResponse, err error) {
-	nBits, err := ba.blockAssembler.getNextNbits(time.Now().Unix())
+	blockHeader, _ := ba.blockAssembler.CurrentBlock()
+
+	nBits, err := ba.blockAssembler.getNextNbits(blockHeader, time.Now().Unix())
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewProcessingError("error getting next nbits", err))
 	}
@@ -1758,6 +1743,7 @@ func (ba *BlockAssembly) GetCurrentDifficulty(_ context.Context, _ *blockassembl
 
 	return &blockassembly_api.GetCurrentDifficultyResponse{
 		Difficulty: f,
+		BlockHash:  blockHeader.Hash().CloneBytes(),
 	}, nil
 }
 

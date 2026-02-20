@@ -121,10 +121,16 @@ func (d *Difficulty) CalcNextWorkRequired(ctx context.Context, blockHeader *mode
 
 	ancestorHash, err := d.store.GetHashOfAncestorBlock(ctx, blockHeader.Hash(), DifficultyAdjustmentWindow)
 	if err != nil {
-		// could be that we don't have a long enough chain to get the ancestor
-		d.logger.Debugf("[Difficulty] error getting ancestor block: %v", err)
-
-		ancestorHash = blockHeader.Hash()
+		// Only use fallback if chain is too short (ErrNotFound).
+		// For other errors (timeouts, DB errors), we must return an error
+		// to avoid calculating incorrect difficulty.
+		if errors.Is(err, errors.ErrNotFound) {
+			d.logger.Debugf("[Difficulty] chain too short to get ancestor %d blocks back, using current block hash", DifficultyAdjustmentWindow)
+			ancestorHash = blockHeader.Hash()
+		} else {
+			// Don't silently fall back for timeouts or other errors - this causes wrong difficulty!
+			return nil, errors.NewStorageError("[Difficulty] error getting ancestor block (not using fallback to prevent incorrect difficulty)", err)
+		}
 	}
 
 	d.logger.Debugf("[Difficulty] ancestorHash: %s", ancestorHash.String())
@@ -182,10 +188,10 @@ func (d *Difficulty) computeTarget(suitableFirstBlock *model.SuitableBlock, suit
 
 	duration := int64(suitableLastBlock.Time - suitableFirstBlock.Time)
 	if duration > 288*int64(d.settings.ChainCfgParams.TargetTimePerBlock.Seconds()) {
-		d.logger.Debugf("duration %d is greater than 288 * target time per block %d - setting to 288 * target time per block", duration, d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
+		d.logger.Debugf("duration %d is greater than 288 * target time per block %.0f - setting to 288 * target time per block", duration, d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
 		duration = 288 * int64(d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
 	} else if duration < 72*int64(d.settings.ChainCfgParams.TargetTimePerBlock.Seconds()) {
-		d.logger.Debugf("duration %d is less than 72 * target time per block %d - setting to 72 * target time per block", duration, d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
+		d.logger.Debugf("duration %d is less than 72 * target time per block %.0f - setting to 72 * target time per block", duration, d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
 		duration = 72 * int64(d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
 	}
 

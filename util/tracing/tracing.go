@@ -3,14 +3,26 @@ package tracing
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/ordishs/gocore"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 )
@@ -20,6 +32,14 @@ type contextKey string
 
 const (
 	StartTime contextKey = "startTime"
+)
+
+var (
+	once           sync.Once
+	initErr        error
+	tp             *sdktrace.TracerProvider
+	mu             sync.Mutex
+	tracingEnabled atomic.Bool // Global flag to completely disable tracing overhead
 )
 
 // Options func represents a functional option for configuring tracing
@@ -62,6 +82,112 @@ func (s *TraceOptions) addLogMessage(logger ulogger.Logger, message, level strin
 	} else {
 		s.LogMessages = append(s.LogMessages, logMessage{message: message, args: args, level: level})
 	}
+}
+
+// IsTracingEnabled returns whether tracing is currently enabled.
+func IsTracingEnabled() bool {
+	return tracingEnabled.Load()
+}
+
+// SetTracingEnabled sets the global tracing enabled flag.
+// This should be called during initialization based on settings.TracingEnabled.
+// When false, all tracing operations become no-ops with minimal overhead.
+func SetTracingEnabled(enabled bool) {
+	tracingEnabled.Store(enabled)
+}
+
+// InitTracer initializes the global tracer. Safe to call multiple times.
+// Only the first call will actually initialize the tracer.
+// Returns an error if initialization fails.
+func InitTracer(appSettings *settings.Settings) error {
+	once.Do(func() {
+		// Create OTLP exporter
+		var (
+			exporter *otlptrace.Exporter
+
+			opts []otlptracehttp.Option
+		)
+
+		opts = append(opts, otlptracehttp.WithEndpoint(appSettings.TracingCollectorURL.Host))
+		if appSettings.TracingCollectorURL.Scheme == "http" {
+			opts = append(opts, otlptracehttp.WithInsecure())
+		}
+		exporter, initErr = otlptracehttp.New(
+			context.Background(),
+			opts...,
+		)
+		if initErr != nil {
+			initErr = errors.NewProcessingError("failed to create OTLP exporter", initErr)
+			return
+		}
+
+		// Create resource with service information
+		var res *resource.Resource
+
+		res, initErr = resource.New(
+			context.Background(),
+			resource.WithAttributes(
+				semconv.ServiceNameKey.String(appSettings.ServiceName),
+				semconv.ServiceVersionKey.String(appSettings.Version),
+				attribute.String("commit", appSettings.Commit),
+			),
+		)
+		if initErr != nil {
+			initErr = errors.NewProcessingError("failed to create resource", initErr)
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		// Create trace provider with the exporter
+		tp = sdktrace.NewTracerProvider(
+			sdktrace.WithBatcher(exporter, sdktrace.WithBatchTimeout(time.Second)), // Send batches every second
+			sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(appSettings.TracingSampleRate))),
+			sdktrace.WithResource(res),
+		)
+
+		// Set the global trace provider only after validation succeeds
+		otel.SetTracerProvider(tp)
+
+		// Set up propagation (for distributed tracing)
+		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		))
+
+		// Enable tracing globally now that initialization succeeded
+		SetTracingEnabled(true)
+	})
+
+	return initErr
+}
+
+// ShutdownTracer shuts down the global tracer provider.
+// Safe to call multiple times - subsequent calls are no-ops.
+func ShutdownTracer(ctx context.Context) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if tp != nil {
+		// Force flush to ensure spans are sent to Jaeger BEFORE stopping daemon
+		if err := tp.ForceFlush(ctx); err != nil {
+			if strings.Contains(err.Error(), "connection refused") {
+				log.Error().Err(err).Msg("failed to flush spans")
+				return nil
+			}
+
+			return errors.NewProcessingError("failed to flush spans", err)
+		}
+
+		if err := tp.Shutdown(ctx); err != nil {
+			return errors.NewProcessingError("failed to shutdown tracer", err)
+		}
+
+		tp = nil
+	}
+
+	return nil
 }
 
 func WithSpanStartOptions(options ...trace.SpanStartOption) Options {
@@ -241,20 +367,6 @@ func (u *UTracer) Start(ctx context.Context, spanName string, opts ...Options) (
 	// add the start time to the context
 	ctx = context.WithValue(ctx, StartTime, start)
 
-	// Log start messages (only if logging is enabled)
-	if options.Logger != nil && len(options.LogMessages) > 0 {
-		for _, l := range options.LogMessages {
-			switch l.level {
-			case "WARN":
-				options.Logger.Warnf(l.message, l.args...)
-			case "DEBUG":
-				options.Logger.Debugf(l.message, l.args...)
-			default:
-				options.Logger.Infof(l.message, l.args...)
-			}
-		}
-	}
-
 	var span trace.Span
 
 	if tracingEnabled {
@@ -279,6 +391,23 @@ func (u *UTracer) Start(ctx context.Context, spanName string, opts ...Options) (
 		span = trace.SpanFromContext(ctx)
 	}
 
+	// Log start messages (only if logging is enabled)
+	// This is done AFTER starting the span so that WithTraceContext can extract
+	// traceId/spanId from the context for log-trace correlation.
+	if options.Logger != nil && len(options.LogMessages) > 0 {
+		ctxLogger := options.Logger.WithTraceContext(ctx)
+		for _, l := range options.LogMessages {
+			switch l.level {
+			case "WARN":
+				ctxLogger.Warnf(l.message, l.args...)
+			case "DEBUG":
+				ctxLogger.Debugf(l.message, l.args...)
+			default:
+				ctxLogger.Infof(l.message, l.args...)
+			}
+		}
+	}
+
 	endFn := func(optionalError ...error) {
 		var err error
 
@@ -297,7 +426,7 @@ func (u *UTracer) Start(ctx context.Context, spanName string, opts ...Options) (
 		}
 
 		u.recordMetrics(options, start)
-		u.logEndMessage(options, start, err)
+		u.logEndMessage(ctx, options, start, err)
 
 		// Ensure the cancelCtx function is called when the span ends
 		if cancelFunc != nil {
@@ -349,15 +478,16 @@ func DecoupleTracingSpan(ctx context.Context, name string, spanName string) (con
 	return Tracer(name).Start(newCtx, spanName)
 }
 
-// logEndMessage logs the completion message for a span
-func (u *UTracer) logEndMessage(options *TraceOptions, start time.Time, err error) {
+// logEndMessage logs the completion message for a span with trace context correlation
+func (u *UTracer) logEndMessage(ctx context.Context, options *TraceOptions, start time.Time, err error) {
 	if options.Logger == nil || len(options.LogMessages) == 0 {
 		return
 	}
 
 	// Duplicate the logger to ensure the skip frame is correct, since we are calling this from
-	// a closure and we want to skip the frame of this function
-	logger := options.Logger.Duplicate(ulogger.WithSkipFrameIncrement(1))
+	// a closure and we want to skip the frame of this function.
+	// Then enrich with trace context for log-trace correlation.
+	logger := options.Logger.Duplicate(ulogger.WithSkipFrameIncrement(1)).WithTraceContext(ctx)
 
 	var done string
 	if err != nil {

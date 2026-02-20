@@ -457,6 +457,12 @@ func (u *Server) HealthGRPC(ctx context.Context, _ *blockvalidation_api.EmptyMes
 //   - error: Any error encountered (always nil for this method)
 func (u *Server) GetCatchupStatus(ctx context.Context, _ *blockvalidation_api.EmptyMessage) (*blockvalidation_api.CatchupStatusResponse, error) {
 	status := u.getCatchupStatusInternal()
+	if status != nil && !status.IsCatchingUp && u.blockchainClient != nil {
+		_, meta, err := u.blockchainClient.GetBestBlockHeader(ctx)
+		if err == nil && meta != nil {
+			status.CurrentHeight = meta.Height
+		}
+	}
 
 	resp := &blockvalidation_api.CatchupStatusResponse{
 		IsCatchingUp:         status.IsCatchingUp,
@@ -633,7 +639,12 @@ func (u *Server) Init(ctx context.Context) (err error) {
 							errors.Is(err, errors.ErrTxNotFound) ||
 							errors.Is(err, errors.ErrTxInvalid) {
 							u.logger.Warnf("[catchup] Block %s is invalid, not trying alternative sources", c.block.Hash().String())
-							// Clean up the processing notification for this block so it can be retried later if needed
+
+							// Mark peer as malicious for providing unvalidatable block
+							// All these errors indicate the peer is sending blocks we can't validate
+							u.reportCatchupMalicious(ctx, c.peerID, "invalid_block")
+
+							// Clean up the processing notification for this block
 							u.processBlockNotify.Delete(*c.block.Hash())
 							continue
 						}
@@ -993,36 +1004,51 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	var closeOnce sync.Once
 	defer closeOnce.Do(func() { close(readyCh) })
 
-	// Blocks until the FSM transitions from the IDLE state
-	err := u.blockchainClient.WaitUntilFSMTransitionFromIdleState(ctx)
-	if err != nil {
-		u.logger.Errorf("[Block Validation Service] Failed to wait for FSM transition from IDLE state: %s", err)
+	g, gctx := errgroup.WithContext(ctx)
 
-		return err
-	}
+	// Start Kafka consumer only after the blockchain FSM transitions from IDLE.
+	// This prevents validation processing from starting too early, while still allowing
+	// the gRPC server to accept administrative calls (e.g. RevalidateBlock).
+	g.Go(func() error {
+		// Blocks until the FSM transitions from the IDLE state
+		err := u.blockchainClient.WaitUntilFSMTransitionFromIdleState(gctx)
+		if err != nil {
+			u.logger.Errorf("[Block Validation Service] Failed to wait for FSM transition from IDLE state: %s", err)
+			return err
+		}
 
-	u.logger.Infof("[Start] FSM transitioned from IDLE state, starting Kafka consumer")
+		u.logger.Infof("[Start] FSM transitioned from IDLE state, starting Kafka consumer")
 
-	// start blocks kafka consumer
-	if u.kafkaConsumerClient == nil {
-		u.logger.Errorf("[Start] kafkaConsumerClient is nil!")
-		return errors.NewServiceError("kafkaConsumerClient is nil")
-	}
+		// start blocks kafka consumer
+		if u.kafkaConsumerClient == nil {
+			u.logger.Errorf("[Start] kafkaConsumerClient is nil!")
+			return errors.NewServiceError("kafkaConsumerClient is nil")
+		}
 
-	u.logger.Infof("[Start] Starting Kafka consumer with handler")
-	u.kafkaConsumerClient.Start(ctx, u.consumerMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())
+		u.logger.Infof("[Start] Starting Kafka consumer with handler")
+		u.kafkaConsumerClient.Start(gctx, u.consumerMessageHandler(gctx), kafka.WithLogErrorAndMoveOn())
 
-	u.logger.Infof("[Start] Kafka consumer started successfully")
+		u.logger.Infof("[Start] Kafka consumer started successfully")
 
-	// this will block
-	if err := util.StartGRPCServer(ctx, u.logger, u.settings, "blockvalidation", u.settings.BlockValidation.GRPCListenAddress, func(server *grpc.Server) {
-		blockvalidation_api.RegisterBlockValidationAPIServer(server, u)
-		closeOnce.Do(func() { close(readyCh) })
-	}, nil); err != nil {
-		return err
-	}
+		<-gctx.Done()
 
-	return nil
+		u.logger.Infof("[Start] Kafka consumer context done, closing consumer")
+		if err := u.kafkaConsumerClient.Close(); err != nil {
+			u.logger.Errorf("[Start] failed to close kafka consumer gracefully: %v", err)
+		}
+
+		return nil
+	})
+
+	// Start gRPC server immediately (blocks until shutdown)
+	g.Go(func() error {
+		return util.StartGRPCServer(gctx, u.logger, u.settings, "blockvalidation", u.settings.BlockValidation.GRPCListenAddress, func(server *grpc.Server) {
+			blockvalidation_api.RegisterBlockValidationAPIServer(server, u)
+			closeOnce.Do(func() { close(readyCh) })
+		}, nil)
+	})
+
+	return g.Wait()
 }
 
 // Stop gracefully shuts down the block validation server by stopping background
@@ -1138,6 +1164,20 @@ func (u *Server) RevalidateBlock(ctx context.Context, request *blockvalidation_a
 	_, blockHeaderMeta, err := u.blockchainClient.GetBlockHeader(ctx, blockHash)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewServiceError("[RevalidateBlock][%s] failed to get block header", blockHash.String(), err))
+	}
+
+	// Ensure all subtree files exist before proceeding with revalidation.
+	// This handles the case where pruner has removed subtree data for old invalid blocks.
+	if u.p2pClient != nil {
+		var baseURL string
+		if peer, err := u.p2pClient.GetPeer(ctx, blockHeaderMeta.PeerID); err != nil {
+			u.logger.Warnf("[RevalidateBlock][%s] failed to get peer %s for DataHubURL, will use fallback peers: %v", block.String(), blockHeaderMeta.PeerID, err)
+		} else if peer != nil {
+			baseURL = peer.DataHubURL
+		}
+		if err := u.fetchSubtreeDataForBlock(ctx, block, blockHeaderMeta.PeerID, baseURL); err != nil {
+			return nil, errors.WrapGRPC(errors.NewServiceError("[RevalidateBlock][%s] failed to fetch missing subtree data", block.String(), err))
+		}
 	}
 
 	// Create validation options
@@ -1262,7 +1302,9 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 
 	oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
-	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings); !ok {
+	// Create meta regenerator for potential meta file recovery (no peer URL for gRPC, local store only)
+	metaRegenerator := u.blockValidation.createMetaRegenerator(nil)
+	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err))
 	}
 
@@ -1591,6 +1633,14 @@ func (u *Server) addBlockToPriorityQueue(ctx context.Context, blockFound process
 	block, err := u.fetchSingleBlock(fetchCtx, blockFound.hash, blockFound.peerID, blockFound.baseURL)
 	if err != nil {
 		u.logger.Errorf("[addBlockToPriorityQueue] Failed to fetch block %s: %v", blockFound.hash.String(), err)
+
+		// Report peer failure to P2P service for reputation tracking
+		// This ensures peers with misconfigured asset servers (e.g., 401 errors) have their reputation degraded
+		if blockFound.peerID != "" {
+			u.reportCatchupFailure(ctx, blockFound.peerID)
+			u.reportCatchupError(ctx, blockFound.peerID, err.Error())
+		}
+
 		if blockFound.errCh != nil {
 			blockFound.errCh <- err
 		}

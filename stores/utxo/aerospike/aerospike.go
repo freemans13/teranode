@@ -128,7 +128,6 @@ type Store struct {
 	incrementBatcher    batcherIfc[batchIncrement]
 	setDAHBatcher       batcherIfc[batchDAH]
 	lockedBatcher       batcherIfc[batchLocked]
-	longestChainBatcher batcherIfc[batchLongestChain]
 	externalStore       blob.Store
 	utxoBatchSize       int
 	externalTxCache     *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
@@ -327,12 +326,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	lockedBatchDurationStr := tSettings.UtxoStore.LockedBatcherDurationMillis
 	lockedBatchDuration := time.Duration(lockedBatchDurationStr) * time.Millisecond
 	s.lockedBatcher = batcher.New(lockedBatcherSize, lockedBatchDuration, s.setLockedBatch, true)
-
-	// Initialize longest chain batcher with dedicated settings
-	longestChainBatcherSize := tSettings.UtxoStore.LongestChainBatcherSize
-	longestChainBatchDurationStr := tSettings.UtxoStore.LongestChainBatcherDurationMillis
-	longestChainBatchDuration := time.Duration(longestChainBatchDurationStr) * time.Millisecond
-	s.longestChainBatcher = batcher.New(longestChainBatcherSize, longestChainBatchDuration, s.setLongestChainBatch, true)
 
 	logger.Infof("[Aerospike] map txmeta store initialised with namespace: %s, set: %s", namespace, setName)
 
@@ -668,6 +661,12 @@ func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeig
 // PreserveTransactions marks transactions to be preserved from deletion until a specific block height.
 // This clears any existing DeleteAtHeight and sets PreserveUntil to the specified height.
 // Used to protect parent transactions when cleaning up unmined transactions.
+//
+// IDEMPOTENCY: This operation is safely re-runnable:
+// - Missing transactions (LuaErrorCodeTxNotFound) are logged as debug, not errors
+// - Multiple preservation attempts with same preserveUntil are idempotent
+// - Batch operations handle per-record failures independently
+// - Returns nil even if some transactions aren't found (partial success is OK)
 func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash, preserveUntilHeight uint32) error {
 	if len(txIDs) == 0 {
 		return nil

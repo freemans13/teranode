@@ -360,7 +360,7 @@ type SubtreeStore interface {
 }
 
 func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, txMetaStore utxo.Store, oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
-	currentChain []*BlockHeader, currentBlockHeaderIDs []uint32, settings *settings.Settings) (bool, error) {
+	currentChain []*BlockHeader, currentBlockHeaderIDs []uint32, settings *settings.Settings, metaRegenerator SubtreeMetaRegeneratorI) (bool, error) {
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "Valid",
 		tracing.WithHistogram(prometheusBlockValid),
 		tracing.WithLogMessage(logger, "[Block:Valid] called for %s", b.Header.String()),
@@ -511,6 +511,7 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 			currentChain:          currentChain,
 			currentBlockHeaderIDs: currentBlockHeaderIDs,
 			oldBlockIDsMap:        oldBlockIDsMap,
+			metaRegenerator:       metaRegenerator,
 		}
 		err = b.validOrderAndBlessed(ctx, logger, deps, settings.Block.ValidOrderAndBlessedConcurrency)
 		if err != nil {
@@ -663,6 +664,7 @@ type validationDependencies struct {
 	currentChain          []*BlockHeader
 	currentBlockHeaderIDs []uint32
 	oldBlockIDsMap        *txmap.SyncedMap[chainhash.Hash, []uint32]
+	metaRegenerator       SubtreeMetaRegeneratorI // optional: nil means no regeneration
 }
 
 func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger, deps *validationDependencies, validOrderAndBlessedConcurrency int) error {
@@ -678,7 +680,7 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 	validationCtx := &validationContext{
 		currentBlockHeaderHashesMap: b.buildBlockHeaderHashesMap(deps.currentChain),
 		currentBlockHeaderIDsMap:    b.buildBlockHeaderIDsMap(deps.currentBlockHeaderIDs),
-		parentSpendsMap:             NewSplitSyncedParentMap(4096),
+		parentSpendsMap:             NewSplitSyncedParentMap(4096, b.TransactionCount*3),
 	}
 
 	concurrency := b.getValidationConcurrency(validOrderAndBlessedConcurrency)
@@ -708,13 +710,21 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 	var (
 		subtreeMetaSlice    *subtreepkg.Meta
 		subtreeHash         = subtree.RootHash()
-		checkParentTxHashes = make([]missingParentTx, 0, len(subtree.Nodes))
+		checkParentTxHashes = make([]missingParentTx, 0, len(subtree.Nodes)/16)
 		err                 error
 	)
 
-	subtreeMetaSlice, err = retry.Retry(ctx, logger, func() (*subtreepkg.Meta, error) {
-		return b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
-	}, retry.WithMessage(fmt.Sprintf("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice", b.String(), subtreeHash.String(), sIdx)))
+	subtreeMetaSlice, err = b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
+
+	// Attempt regeneration if meta not found and regenerator is available
+	if err != nil && deps.metaRegenerator != nil {
+		logger.Warnf("[validateSubtree][%s][%s:%d] subtree meta not found, attempting regeneration", b.String(), subtreeHash.String(), sIdx)
+
+		subtreeMetaSlice, err = deps.metaRegenerator.RegenerateMeta(ctx, subtreeHash, subtree)
+		if err == nil {
+			logger.Warnf("[validateSubtree][%s][%s:%d] successfully regenerated subtree meta", b.String(), subtreeHash.String(), sIdx)
+		}
+	}
 
 	// a subtreeMetaSlice is required for further block validation, so if we cannot get it, we return an error
 	if err != nil {
@@ -1166,6 +1176,33 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 	// TODO something with conflicts
 
 	return nil
+}
+
+// SubtreesLoaded checks if subtrees are loaded and valid.
+// This method is safe for concurrent use.
+func (b *Block) SubtreesLoaded() bool {
+	b.subtreeSlicesMu.RLock()
+	defer b.subtreeSlicesMu.RUnlock()
+
+	if len(b.SubtreeSlices) != len(b.Subtrees) || len(b.SubtreeSlices) == 0 {
+		return false
+	}
+
+	for _, subtree := range b.SubtreeSlices {
+		if subtree == nil {
+			return false
+		}
+	}
+
+	return true
+}
+
+// GetSubtreeSlicesCount returns the number of loaded subtree slices.
+// This method is safe for concurrent use.
+func (b *Block) GetSubtreeSlicesCount() int {
+	b.subtreeSlicesMu.RLock()
+	defer b.subtreeSlicesMu.RUnlock()
+	return len(b.SubtreeSlices)
 }
 
 func (b *Block) getSubtreeMetaSlice(ctx context.Context, subtreeStore SubtreeStore, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree) (*subtreepkg.Meta, error) {

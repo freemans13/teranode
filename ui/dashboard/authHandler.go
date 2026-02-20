@@ -36,7 +36,7 @@ func NewAuthHandler(logger ulogger.Logger, settings *settings.Settings) *AuthHan
 
 		logger.Debugf("Auth initialized with user: %s", rpcUser)
 	} else {
-		logger.Warnf("RPC authentication not configured properly. User: %s, Pass: %s",
+		logger.Warnf("RPC authentication not configured properly. User set: %v, Pass set: %v",
 			rpcUser != "", rpcPass != "")
 	}
 
@@ -380,6 +380,20 @@ func (h *AuthHandler) PostAuthMiddleware(next echo.HandlerFunc) echo.HandlerFunc
 					"error":   "Authentication required for POST endpoints",
 				})
 			}
+		}
+
+		return next(c)
+	}
+}
+
+// RequireAuthMiddleware is a middleware that requires authentication for all requests
+func (h *AuthHandler) RequireAuthMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		if !h.CheckAuth(c.Request()) {
+			return c.JSON(http.StatusUnauthorized, map[string]interface{}{
+				"success": false,
+				"error":   "Authentication required",
+			})
 		}
 
 		return next(c)

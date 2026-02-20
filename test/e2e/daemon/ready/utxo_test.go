@@ -24,7 +24,6 @@ import (
 )
 
 func TestFreezeAndUnfreezeUtxos(t *testing.T) {
-	t.Skip()
 	// Initialize test daemon with required services
 	td := daemon.NewTestDaemon(t, daemon.TestOptions{
 		EnableRPC:            true,
@@ -146,6 +145,9 @@ func TestFreezeAndUnfreezeUtxos(t *testing.T) {
 	// Create and send transaction with the unfrozen spends - should succeed
 	spendingTx, err := createAndSendTx(parentTx.Outputs[:firstSet], 0)
 	require.NoError(t, err, "Failed to create and send transaction after unfreezing")
+
+	// Wait for the spending transaction to be processed by block assembly before mining
+	td.WaitForBlockAssemblyToProcessTx(t, spendingTx.TxIDChainHash().String())
 
 	// Mine a block
 	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{1})
