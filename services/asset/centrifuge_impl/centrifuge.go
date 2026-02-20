@@ -418,7 +418,7 @@ func (c *Centrifuge) _(ctx context.Context, addr string) error {
 
 					hash, err := chainhash.NewHash(notification.Hash)
 					if err != nil {
-						c.logger.Errorf("[Blockchain] failed to parse hash", err)
+						c.logger.Errorf("[Blockchain] failed to parse hash: %v", err)
 						continue
 					}
 

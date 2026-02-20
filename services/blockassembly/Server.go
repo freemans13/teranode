@@ -405,7 +405,7 @@ func (ba *BlockAssembly) subtreeStorageWorker(ctx context.Context, workChan <-ch
 				result.storedOK = true
 				result.err = nil
 			} else {
-				ba.logger.Errorf(err.Error())
+				ba.logger.Errorf("%s", err.Error())
 				result.storedOK = false
 			}
 		} else {
