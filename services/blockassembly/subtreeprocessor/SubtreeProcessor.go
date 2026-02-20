@@ -2005,6 +2005,9 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 
 			// Re-add the node (adds back to currentTxMap)
 			if err = stp.addNode(node, parents, true); err != nil {
+				// Restore to currentTxMap to avoid inconsistent state
+				stp.currentTxMap.Set(node.Hash, parents)
+				stp.deletedTxs.Delete(node.Hash)
 				return errors.NewProcessingError("error adding node to subtree", err)
 			}
 
