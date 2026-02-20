@@ -1,6 +1,7 @@
 package httpimpl
 
 import (
+	"math"
 	"net/http"
 	"time"
 
@@ -37,7 +38,11 @@ func (h *HTTP) GetPolicy(c echo.Context) error {
 	// Convert MinMiningTxFee (BSV/kB) to satoshis/bytes ratio
 	// MinMiningTxFee is in BSV per kilobyte
 	// 1 BSV = 100,000,000 satoshis, 1 kB = 1000 bytes
-	satoshisPerKB := uint64(policy.MinMiningTxFee * 100_000_000)
+	feeInSatoshis := policy.MinMiningTxFee * 100_000_000
+	if feeInSatoshis < 0 || feeInSatoshis > float64(math.MaxUint64) {
+		return echo.NewHTTPError(http.StatusInternalServerError, "invalid fee configuration")
+	}
+	satoshisPerKB := uint64(feeInSatoshis)
 
 	return c.JSON(http.StatusOK, &PolicyResponse{
 		Timestamp: time.Now().UTC(),
