@@ -467,7 +467,6 @@ func TestClose_ReaderError(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
-
 // Integration tests
 func TestFileStorer_WriteAndClose_Integration(t *testing.T) {
 	ctx := createTestContext()
