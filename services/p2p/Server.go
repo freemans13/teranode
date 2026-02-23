@@ -596,7 +596,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	// Start blockchain subscription before marking service as ready
 	// This ensures we don't miss any block notifications
-	blockchainSubscription, err := s.blockchainClient.Subscribe(ctx, "p2pServer")
+	blockchainSubscription, err := s.blockchainClient.Subscribe(ctx, blockchain.SubscriberP2P)
 	if err != nil {
 		return errors.NewServiceError("error subscribing to blockchain service", err)
 	}
@@ -1002,6 +1002,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 		return nil
 	}
 
+	ctxLogger := s.logger.WithTraceContext(ctx)
 	var msgBytes []byte
 
 	h, meta, err := s.blockchainClient.GetBlockHeader(ctx, hash)
@@ -1011,7 +1012,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 
 	if meta.Invalid {
 		// do not announce invalid blocks
-		s.logger.Infof("[handleBlockNotification] Not announcing invalid block %s", hash.String())
+		ctxLogger.Infof("[handleBlockNotification] Not announcing invalid block %s", hash.String())
 		return nil
 	}
 
@@ -1036,7 +1037,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 	// Also send a node_status update when best block changes
 	if err = s.handleNodeStatusNotification(ctx); err != nil {
 		// Log the error but don't fail the block notification
-		s.logger.Warnf("[handleBlockNotification] error sending node status update: %v", err)
+		ctxLogger.Warnf("[handleBlockNotification] error sending node status update: %v", err)
 	}
 
 	return nil
@@ -1404,6 +1405,7 @@ func (s *Server) handlePeerFailureNotification(_ context.Context, notification *
 }
 
 func (s *Server) processBlockchainNotification(ctx context.Context, notification *blockchain.Notification) error {
+	ctxLogger := s.logger.WithTraceContext(ctx)
 	hash, err := chainhash.NewHash(notification.Hash)
 	if err != nil {
 		// Specific error about hash conversion, not logged here, but returned to caller.
@@ -1412,25 +1414,26 @@ func (s *Server) processBlockchainNotification(ctx context.Context, notification
 
 	switch notification.Type {
 	case model.NotificationType_Block:
-		s.logger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
 		return s.handleBlockNotification(ctx, hash) // These handlers return wrapped errors
 
 	case model.NotificationType_Subtree:
-		s.logger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
 		return s.handleSubtreeNotification(ctx, hash)
 
 	case model.NotificationType_PeerFailure:
-		s.logger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
 		return s.handlePeerFailureNotification(ctx, notification)
 
 	default:
-		s.logger.Warnf("[processBlockchainNotification] Received unhandled notification type: %s for hash %s", notification.Type, hash.String())
+		ctxLogger.Warnf("[processBlockchainNotification] Received unhandled notification type: %s for hash %s", notification.Type, hash.String())
 	}
 
 	return nil // For unhandled types, not an error that stops the listener
 }
 
 func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainSubscription <-chan *blockchain.Notification) {
+	ctxLogger := s.logger.WithTraceContext(ctx)
 
 	// define vars here to prevent too many allocs
 	var notification *blockchain.Notification
@@ -1438,7 +1441,7 @@ func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainS
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Infof("[blockchainSubscriptionListener] P2P service shutting down")
+			ctxLogger.Infof("[blockchainSubscriptionListener] P2P service shutting down")
 			return
 		case notification = <-blockchainSubscription:
 			if notification == nil {
@@ -1451,7 +1454,7 @@ func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainS
 			)
 
 			if syncing, err = s.isBlockchainSyncingOrCatchingUp(ctx); err != nil {
-				s.logger.Errorf("[blockchainSubscriptionListener] error getting blockchain FSM state: %v", err)
+				ctxLogger.Errorf("[blockchainSubscriptionListener] error getting blockchain FSM state: %v", err)
 
 				continue
 			}
@@ -1463,7 +1466,7 @@ func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainS
 
 			// received a message
 			if err := s.processBlockchainNotification(ctx, notification); err != nil {
-				s.logger.Errorf("[blockchainSubscriptionListener] Error processing notification (Type: %s, Hash: %s): %v", notification.Type, notification.Hash, err)
+				ctxLogger.Errorf("[blockchainSubscriptionListener] Error processing notification (Type: %s, Hash: %s): %v", notification.Type, notification.Hash, err)
 				continue // Continue to next notification on error
 			}
 		}
@@ -1636,7 +1639,7 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 
 	// Fallback to libp2p client data if registry not available
 	if s.P2PClient == nil {
-		return nil, errors.NewError("[GetPeers] P2PClient is not initialised")
+		return nil, errors.WrapGRPCPublic(errors.NewError("[GetPeers] P2PClient is not initialised"))
 	}
 
 	s.logger.Debugf("Creating reply channel")
@@ -1681,7 +1684,7 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 func (s *Server) BanPeer(ctx context.Context, peer *p2p_api.BanPeerRequest) (*p2p_api.BanPeerResponse, error) {
 	err := s.banList.Add(ctx, peer.Addr, time.Unix(peer.Until, 0))
 	if err != nil {
-		return nil, err
+		return nil, errors.WrapGRPCPublic(err)
 	}
 
 	return &p2p_api.BanPeerResponse{Ok: true}, nil
@@ -1690,7 +1693,7 @@ func (s *Server) BanPeer(ctx context.Context, peer *p2p_api.BanPeerRequest) (*p2
 func (s *Server) UnbanPeer(ctx context.Context, peer *p2p_api.UnbanPeerRequest) (*p2p_api.UnbanPeerResponse, error) {
 	err := s.banList.Remove(ctx, peer.Addr)
 	if err != nil {
-		return nil, err
+		return nil, errors.WrapGRPCPublic(err)
 	}
 
 	return &p2p_api.UnbanPeerResponse{Ok: true}, nil
@@ -1754,7 +1757,7 @@ func (s *Server) RecordBytesDownloaded(ctx context.Context, req *p2p_api.RecordB
 	peerID, err := peer.Decode(req.PeerId)
 	if err != nil {
 		s.logger.Errorf("[RecordBytesDownloaded] failed to decode peer ID %s: %v", req.PeerId, err)
-		return &p2p_api.RecordBytesDownloadedResponse{Ok: false}, errors.NewServiceError("failed to decode peer ID", err)
+		return &p2p_api.RecordBytesDownloadedResponse{Ok: false}, errors.WrapGRPCPublic(errors.NewServiceError("failed to decode peer ID", err))
 	}
 
 	// Get current peer info from registry

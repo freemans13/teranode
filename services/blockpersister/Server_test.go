@@ -732,6 +732,9 @@ func (m *MockBlockchainClient) GetBlockHeaderIDs(ctx context.Context, blockHash 
 func (m *MockBlockchainClient) Subscribe(ctx context.Context, source string) (chan *blockchain_api.Notification, error) {
 	return nil, nil
 }
+func (m *MockBlockchainClient) GetSubscribers(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
 func (m *MockBlockchainClient) GetState(ctx context.Context, key string) ([]byte, error) {
 	return nil, nil
 }
@@ -975,6 +978,9 @@ func (m *MockUTXOStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.H
 	return nil, nil
 }
 func (m *MockUTXOStore) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) { return nil, nil }
+func (m *MockUTXOStore) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (utxo.UnminedTxIterator, error) {
+	return nil, nil
+}
 func (m *MockUTXOStore) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error) {
 	return nil, nil
 }
