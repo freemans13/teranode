@@ -2520,25 +2520,22 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 	}
 
-	if len(*allLosingTxHashes) > 0 {
-		if err = stp.utxoStore.MarkTransactionsOnLongestChain(ctx, *allLosingTxHashes, false); err != nil {
-			putHashSlice(allLosingTxHashes)
-			return errors.NewProcessingError("[reorgBlocks] error marking losing conflicting transactions as not on longest chain in utxo store", err)
-		}
-	}
-	putHashSlice(allLosingTxHashes)
-
-	// everything now in block assembly is not mined on the longest chain
-	// so we need to set the unminedSince for all transactions in block assembly
-	// Pre-compute total capacity for allMarkFalse to avoid repeated allocations
-	allMarkFalseLen := 0
+	// Consolidate all "mark as false" operations into a single call
+	// This includes: losing transactions + all transactions in block assembly (chainedSubtrees + currentSubtree)
+	subtreeNodeCount := 0
 	for _, subtree := range stp.chainedSubtrees {
-		allMarkFalseLen += len(subtree.Nodes)
+		subtreeNodeCount += len(subtree.Nodes)
 	}
 	currentSubtree := stp.currentSubtree.Load()
-	allMarkFalseLen += len(currentSubtree.Nodes)
+	subtreeNodeCount += len(currentSubtree.Nodes)
 
-	allMarkFalse := getHashSlice(allMarkFalseLen)
+	allMarkFalse := getHashSlice(len(*allLosingTxHashes) + subtreeNodeCount)
+
+	// Add losing conflicting transactions
+	*allMarkFalse = append(*allMarkFalse, *allLosingTxHashes...)
+	putHashSlice(allLosingTxHashes)
+
+	// Add everything in block assembly (not mined on the longest chain)
 	for _, subtree := range stp.chainedSubtrees {
 		for _, node := range subtree.Nodes {
 			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
@@ -2553,6 +2550,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 	}
 
+	// Make one consolidated call instead of separate calls
 	if len(*allMarkFalse) > 0 {
 		if err = stp.markNotOnLongestChain(ctx, moveBackBlocks, moveForwardBlocks, *allMarkFalse); err != nil {
 			putHashSlice(allMarkFalse)
@@ -4054,11 +4052,13 @@ func (stp *SubtreeProcessor) markConflictingTxsInSubtrees(ctx context.Context, l
 						return errors.NewProcessingError("error serializing subtree %s", subtreeHash.String(), err)
 					}
 
+					dah := stp.utxoStore.GetBlockHeight() + stp.settings.GlobalBlockHeightRetention
 					if err = stp.subtreeStore.Set(gCtx,
 						subtreeHash[:],
 						fileformat.FileTypeSubtree,
 						subtreeBytes,
 						options.WithAllowOverwrite(true),
+						options.WithDeleteAt(dah),
 					); err != nil {
 						return errors.NewServiceError("error saving subtree %s", subtreeHash.String(), err)
 					}
