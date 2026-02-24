@@ -3965,8 +3965,7 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 			existsInLosingMap := make([]bool, n) // true if in losingTxHashesMap
 			isRemoveMap := make([]bool, n)       // true if in removeMap (to delete)
 
-			numWorkers := max(min(runtime.NumCPU(), n/100), 2)
-
+			numWorkers := max(min(runtime.NumCPU(), n/100, 16), 2)
 			chunkSize := (n + numWorkers - 1) / numWorkers
 
 			// Phase 1: Parallel SetIfExists + Exists lookups
