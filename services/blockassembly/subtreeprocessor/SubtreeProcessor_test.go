@@ -1512,7 +1512,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		stp.InitCurrentBlockHeader(blockHeader)
 
 		// Call internal moveBackBlock method (safe since Start() is not running)
-		_, _, _, err = stp.moveBackBlock(context.Background(), &model.Block{
+		_, _, err = stp.moveBackBlock(context.Background(), &model.Block{
 			Header: prevBlockHeader,
 			Subtrees: []*chainhash.Hash{
 				subtree1.RootHash(),
@@ -1578,7 +1578,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		originalState := captureSubtreeProcessorState(stp)
 
 		// Test nil block
-		_, _, _, err = stp.moveBackBlock(context.Background(), nil, true)
+		_, _, err = stp.moveBackBlock(context.Background(), nil, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "you must pass in a block to moveBackBlock")
 
@@ -1621,7 +1621,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test empty block processing
-		_, _, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
+		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
 		require.NoError(t, err)
 
 		// Verify state after processing empty block
@@ -1681,7 +1681,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree store error
-		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree, true)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1734,7 +1734,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test coinbase placeholder handling
-		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder, true)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder, true)
 		require.NoError(t, err)
 
 		// Verify the coinbase placeholder was handled correctly
@@ -1778,7 +1778,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test SetBlockProcessedAt error (should not cause overall failure)
-		_, _, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
+		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
 		require.NoError(t, err) // Error in SetBlockProcessedAt should not fail the operation
 	})
 
@@ -1849,7 +1849,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test single subtree processing
-		_, _, _, err = stp.moveBackBlock(context.Background(), singleSubtreeBlock, true)
+		_, _, err = stp.moveBackBlock(context.Background(), singleSubtreeBlock, true)
 		require.NoError(t, err)
 
 		// Verify result
@@ -1956,7 +1956,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree deserialization failure
-		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree, true)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -2013,7 +2013,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta deserialization failure
-		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta, true)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -2067,7 +2067,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta retrieval failure
-		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -2150,7 +2150,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// This should succeed since the UTXO exists and can be deleted
-		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase, true)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase, true)
 		require.NoError(t, err) // This will pass, but we've tested the delete path
 
 		// Verify state was properly updated after successful operation
@@ -2238,7 +2238,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// This should succeed because addNode with skipNotification=true will handle duplicates gracefully
-		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx, true)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx, true)
 		require.NoError(t, err) // addNode with skipNotification doesn't fail on duplicates
 
 		// Verify state was properly updated after successful operation
@@ -3410,7 +3410,7 @@ func TestRemoveCoinbaseUtxosChildrenRemoval(t *testing.T) {
 // the removal of child transactions when processing coinbase UTXOs through
 // the removeCoinbaseUtxos function integration.
 func TestMoveBackBlockChildrenRemoval(t *testing.T) {
-	t.Run("moveBackBlockCreateNewSubtrees_integration_with_child_removal", func(t *testing.T) {
+	t.Run("moveBackBlock_integration_with_child_removal", func(t *testing.T) {
 		ctx := context.Background()
 
 		// Setup test environment
@@ -3434,7 +3434,10 @@ func TestMoveBackBlockChildrenRemoval(t *testing.T) {
 		}()
 		defer close(newSubtreeChan)
 
-		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, nil, utxoStore, newSubtreeChan)
+		blockchainClient := &blockchain.Mock{}
+		blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 
 		// Use existing coinbase transaction from test data
@@ -3444,7 +3447,7 @@ func TestMoveBackBlockChildrenRemoval(t *testing.T) {
 		_, err = utxoStore.Create(ctx, coinbase, 1)
 		require.NoError(t, err)
 
-		// Create block with empty subtrees (so moveBackBlockCreateNewSubtrees only calls removeCoinbaseUtxos)
+		// Create block with empty subtrees (so moveBackBlock only calls removeCoinbaseUtxos)
 		block := &model.Block{
 			CoinbaseTx: coinbase,
 			Header: &model.BlockHeader{
@@ -3458,9 +3461,9 @@ func TestMoveBackBlockChildrenRemoval(t *testing.T) {
 			Subtrees: []*chainhash.Hash{}, // Empty to focus on removeCoinbaseUtxos call
 		}
 
-		// Call moveBackBlockCreateNewSubtrees directly
-		_, _, err = stp.moveBackBlockCreateNewSubtrees(ctx, block, true)
-		require.NoError(t, err, "moveBackBlockCreateNewSubtrees should succeed")
+		// Call moveBackBlock directly
+		_, _, err = stp.moveBackBlock(ctx, block, true)
+		require.NoError(t, err, "moveBackBlock should succeed")
 	})
 }
 
@@ -3800,17 +3803,26 @@ func TestRemoveCoinbaseUtxos_MissingTransaction(t *testing.T) {
 	})
 }
 
-func TestMoveBackBlockCreateNewSubtrees_ErrorRecovery(t *testing.T) {
-	t.Run("moveBackBlockCreateNewSubtrees handles partial processing failures", func(t *testing.T) {
+func TestMoveBackBlock_ErrorRecovery(t *testing.T) {
+	t.Run("moveBackBlock handles partial processing failures", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
 		settings := test.CreateBaseTestSettings(t)
 
 		// Create a memory blob store for testing
 		blobStore := blob_memory.New()
 
-		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, settings, blobStore, nil, nil, newSubtreeChan)
+		blockchainClient := &blockchain.Mock{}
+		blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+		ctx := t.Context()
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, settings, utxoStoreURL)
+		require.NoError(t, err)
+
+		stp, _ := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, blockchainClient, utxoStore, newSubtreeChan)
 		stp.InitCurrentBlockHeader(prevBlockHeader)
-		stp.Start(t.Context())
+		stp.Start(ctx)
 
 		// Create a block with subtrees but corrupted data
 		subtreeHash := chainhash.HashH([]byte("subtree1"))
@@ -3829,19 +3841,19 @@ func TestMoveBackBlockCreateNewSubtrees_ErrorRecovery(t *testing.T) {
 
 		// Store corrupted subtree data in blob store
 		corruptedData := []byte("corrupted_subtree_data")
-		err := stp.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtree, corruptedData)
+		err = stp.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtree, corruptedData)
 		require.NoError(t, err)
 
 		// Capture state before operation
 		originalState := captureSubtreeProcessorState(stp)
 
-		// Call moveBackBlockCreateNewSubtrees
-		_, _, err = stp.moveBackBlockCreateNewSubtrees(context.Background(), block, true)
+		// Call moveBackBlock
+		_, _, err = stp.moveBackBlock(context.Background(), block, true)
 
 		// Should handle corrupted data gracefully or return appropriate error
 		if err != nil {
 			// If error occurred, verify state remains unchanged
-			assertStateUnchanged(t, stp, originalState, "moveBackBlockCreateNewSubtrees with corrupted data")
+			assertStateUnchanged(t, stp, originalState, "moveBackBlock with corrupted data")
 		}
 	})
 }

@@ -354,7 +354,7 @@ func BenchmarkMoveBackBlock(b *testing.B) {
 				runtime.GC()
 				b.StartTimer()
 
-				_, _, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
+				_, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
 				if err != nil {
 					b.Fatalf("moveBackBlock failed: %v", err)
 				}
@@ -396,7 +396,7 @@ func BenchmarkMoveForwardBlock(b *testing.B) {
 				populateMempool(b, state)
 
 				// First do a moveBackBlock to get into a post-moveBack state
-				_, _, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
+				_, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
 				if err != nil {
 					b.Fatalf("moveBackBlock failed: %v", err)
 				}
@@ -472,7 +472,7 @@ func BenchmarkFullReorg(b *testing.B) {
 				b.StartTimer()
 
 				// Step 1: moveBackBlock
-				_, _, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
+				_, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
 				if err != nil {
 					b.Fatalf("moveBackBlock failed: %v", err)
 				}
@@ -697,7 +697,7 @@ func BenchmarkReorgMemoryProfile(b *testing.B) {
 			start := time.Now()
 
 			// moveBackBlock
-			_, _, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
+			_, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
 			require.NoError(b, err)
 
 			var memAfterMoveBack runtime.MemStats
@@ -774,7 +774,7 @@ func TestReorgBenchmarkBaseline(t *testing.T) {
 
 		start := time.Now()
 
-		_, _, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
+		_, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
 		require.NoError(t, err)
 		moveBackDuration := time.Since(start)
 

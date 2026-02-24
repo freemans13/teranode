@@ -2584,7 +2584,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		// move back the block, getting all the transactions in the block and any conflicting hashes
 		// if we are not moving forward any blocks, we need to make sure we create properly sized subtrees
 		// so we pass in len(moveForwardBlocks) == 0 as the second parameter
-		_, conflictingHashes, blockTxMap, err := stp.moveBackBlock(ctx, block, len(moveForwardBlocks) == 0)
+		subtreesNodes, conflictingHashes, err := stp.moveBackBlock(ctx, block, len(moveForwardBlocks) == 0)
 		if err != nil {
 			return err
 		}
@@ -2595,9 +2595,13 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			}
 		}
 
-		// merge blockTxMap (built as side product of moveBackBlockBulkBuild)
-		for hash := range blockTxMap {
-			movedBackBlockTxMap[hash] = true
+		// add all the transactions in the block to the movedBackBlockTxMap
+		for _, subtreeNodes := range subtreesNodes {
+			for _, node := range subtreeNodes {
+				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+					movedBackBlockTxMap[node.Hash] = true
+				}
+			}
 		}
 	}
 
@@ -2671,49 +2675,29 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		filteredMarkOnLongestChain = append(filteredMarkOnLongestChain, hash)
 	}
 
-	// Prepare allMarkFalse: losing transactions + all transactions in block assembly
-	// Extract hashes from each subtree in parallel, then merge
-	currentSubtree := stp.currentSubtree.Load()
-	numSources := len(stp.chainedSubtrees) + 1 // +1 for currentSubtree
-	hashSlices := make([][]chainhash.Hash, numSources)
-
-	var extractWg sync.WaitGroup
-	for i, subtree := range stp.chainedSubtrees {
-		extractWg.Add(1)
-		go func(idx int, st *subtreepkg.Subtree) {
-			defer extractWg.Done()
-			hashes := make([]chainhash.Hash, 0, len(st.Nodes))
-			for _, node := range st.Nodes {
-				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					hashes = append(hashes, node.Hash)
-				}
-			}
-			hashSlices[idx] = hashes
-		}(i, subtree)
+	// Consolidate all "mark as false" operations into a single call
+	// This includes: losing transactions + all transactions in block assembly (chainedSubtrees + currentSubtree)
+	subtreeNodeCount := 0
+	for _, subtree := range stp.chainedSubtrees {
+		subtreeNodeCount += len(subtree.Nodes)
 	}
-	// currentSubtree in parallel too
-	extractWg.Add(1)
-	go func() {
-		defer extractWg.Done()
-		hashes := make([]chainhash.Hash, 0, len(currentSubtree.Nodes))
-		for _, node := range currentSubtree.Nodes {
+	currentSubtree := stp.currentSubtree.Load()
+	subtreeNodeCount += len(currentSubtree.Nodes)
+	allMarkFalse := make([]chainhash.Hash, 0, len(allLosingTxHashes)+subtreeNodeCount)
+
+	allMarkFalse = append(allMarkFalse, allLosingTxHashes...)
+
+	for _, subtree := range stp.chainedSubtrees {
+		for _, node := range subtree.Nodes {
 			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				hashes = append(hashes, node.Hash)
+				allMarkFalse = append(allMarkFalse, node.Hash)
 			}
 		}
-		hashSlices[numSources-1] = hashes
-	}()
-	extractWg.Wait()
-
-	// Merge: losing txs + extracted hashes
-	totalHashes := len(allLosingTxHashes)
-	for _, h := range hashSlices {
-		totalHashes += len(h)
 	}
-	allMarkFalse := make([]chainhash.Hash, 0, totalHashes)
-	allMarkFalse = append(allMarkFalse, allLosingTxHashes...)
-	for _, h := range hashSlices {
-		allMarkFalse = append(allMarkFalse, h...)
+	for _, node := range currentSubtree.Nodes {
+		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			allMarkFalse = append(allMarkFalse, node.Hash)
+		}
 	}
 
 	// Run mark(true) and mark(false) concurrently — they operate on disjoint tx hash sets
@@ -2916,9 +2900,9 @@ func (stp *SubtreeProcessor) setTxCountFromSubtrees() {
 //
 // Returns:
 //   - error: Any error encountered during processing
-func (stp *SubtreeProcessor) moveBackBlock(ctx context.Context, block *model.Block, createProperlySizedSubtrees bool) (subtreesNodes [][]subtreepkg.Node, conflictingHashes []chainhash.Hash, blockTxMap map[chainhash.Hash]bool, err error) {
+func (stp *SubtreeProcessor) moveBackBlock(ctx context.Context, block *model.Block, createProperlySizedSubtrees bool) (subtreesNodes [][]subtreepkg.Node, conflictingHashes []chainhash.Hash, err error) {
 	if block == nil {
-		return nil, nil, nil, errors.NewProcessingError("[moveBackBlock] you must pass in a block to moveBackBlock")
+		return nil, nil, errors.NewProcessingError("[moveBackBlock] you must pass in a block to moveBackBlock")
 	}
 
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "moveBackBlock",
@@ -2937,14 +2921,14 @@ func (stp *SubtreeProcessor) moveBackBlock(ctx context.Context, block *model.Blo
 	if err = stp.removeCoinbaseUtxos(ctx, block); err != nil {
 		// no need to error out if the key doesn't exist anyway
 		if !errors.Is(err, errors.ErrTxNotFound) {
-			return nil, nil, nil, errors.NewProcessingError("[moveBackBlock][%s] error removing coinbase utxo", block.String(), err)
+			return nil, nil, errors.NewProcessingError("[moveBackBlock][%s] error removing coinbase utxo", block.String(), err)
 		}
 	}
 
 	// Bulk build: get block subtrees, collect all nodes, and build subtrees in parallel
-	// This replaces the per-node addNode calls in moveBackBlockCreateNewSubtrees + moveBackBlockAddPreviousNodes
-	if subtreesNodes, conflictingHashes, blockTxMap, err = stp.moveBackBlockBulkBuild(ctx, block, createProperlySizedSubtrees, chainedSubtrees, lastIncompleteSubtree); err != nil {
-		return nil, nil, nil, err
+	// Bulk build: collect all nodes, then build subtrees in parallel
+	if subtreesNodes, conflictingHashes, err = stp.moveBackBlockBulkBuild(ctx, block, createProperlySizedSubtrees, chainedSubtrees, lastIncompleteSubtree); err != nil {
+		return nil, nil, err
 	}
 
 	// set the tx count from the subtrees
@@ -2956,48 +2940,12 @@ func (stp *SubtreeProcessor) moveBackBlock(ctx context.Context, block *model.Blo
 		stp.logger.Errorf("[moveBackBlock][%s] error clearing block processed_at timestamp: %v", block.String(), err)
 	}
 
-	return subtreesNodes, conflictingHashes, blockTxMap, nil
+	return subtreesNodes, conflictingHashes, nil
 }
 
-func (stp *SubtreeProcessor) moveBackBlockAddPreviousNodes(ctx context.Context, block *model.Block, chainedSubtrees []*subtreepkg.Subtree, lastIncompleteSubtree *subtreepkg.Subtree) error {
-	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "moveBackBlock",
-		tracing.WithLogMessage(stp.logger, "[moveBackBlock:AddPreviousNodes][%s] with %d subtrees: add previous nodes to subtrees", block.String(), len(block.Subtrees)),
-	)
-	defer deferFn()
-
-	// add all the transactions from the previous state
-	for _, subtree := range chainedSubtrees {
-		for _, node := range subtree.Nodes {
-			if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				// skip coinbase placeholder
-				continue
-			}
-
-			if err := stp.addNode(node, nil, true); err != nil {
-				return errors.NewProcessingError("[moveBackBlock:AddPreviousNodes][%s] error adding node to subtree", block.String(), err)
-			}
-		}
-	}
-
-	// add all the transactions from the last incomplete subtree
-	for _, node := range lastIncompleteSubtree.Nodes {
-		if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			// skip coinbase placeholder
-			continue
-		}
-
-		if err := stp.addNode(node, nil, true); err != nil {
-			return errors.NewProcessingError("[moveBackBlock:AddPreviousNodes][%s] error adding node to subtree", block.String(), err)
-		}
-	}
-
-	return nil
-}
-
-// moveBackBlockBulkBuild replaces moveBackBlockCreateNewSubtrees + moveBackBlockAddPreviousNodes
-// with a single-pass bulk construction approach. Instead of calling addNode() per node (which
-// acquires a mutex, checks IsComplete, and potentially calls processCompleteSubtree for each),
-// this function:
+// moveBackBlockBulkBuild uses a single-pass bulk construction approach. Instead of calling
+// addNode() per node (which acquires a mutex, checks IsComplete, and potentially calls
+// processCompleteSubtree for each), this function:
 //  1. Reads block subtrees from blob store (parallel, same as before)
 //  2. Collects block nodes into a flat list, populating currentTxMap for new entries
 //  3. Collects previous mempool nodes into the same flat list
@@ -3008,7 +2956,7 @@ func (stp *SubtreeProcessor) moveBackBlockAddPreviousNodes(ctx context.Context, 
 func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *model.Block,
 	createProperlySizedSubtrees bool,
 	previousChainedSubtrees []*subtreepkg.Subtree,
-	previousCurrentSubtree *subtreepkg.Subtree) ([][]subtreepkg.Node, []chainhash.Hash, map[chainhash.Hash]bool, error) {
+	previousCurrentSubtree *subtreepkg.Subtree) ([][]subtreepkg.Node, []chainhash.Hash, error) {
 
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "moveBackBlockBulkBuild",
 		tracing.WithLogMessage(stp.logger, "[moveBackBlock:BulkBuild][%s] with %d subtrees", block.String(), len(block.Subtrees)),
@@ -3018,7 +2966,7 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 	// Step 1: Get block subtrees from blob store (parallel)
 	subtreesNodes, subtreeMetaTxInpoints, conflictingHashes, err := stp.moveBackBlockGetSubtrees(ctx, block)
 	if err != nil {
-		return nil, nil, nil, errors.NewProcessingError("[moveBackBlock:BulkBuild][%s] error getting subtrees", block.String(), err)
+		return nil, nil, errors.NewProcessingError("[moveBackBlock:BulkBuild][%s] error getting subtrees", block.String(), err)
 	}
 
 	// Step 2: Estimate total node count for pre-allocation
@@ -3055,12 +3003,6 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 			flatInpoints = append(flatInpoints, &subtreeMetaTxInpoints[idx][i])
 			flatNodes = append(flatNodes, subtreeNodes[i])
 		}
-	}
-
-	// Build blockTxMap as side product of the flatten (avoids re-iterating in reorgBlocks)
-	blockTxMap := make(map[chainhash.Hash]bool, len(flatHashes))
-	for _, hash := range flatHashes {
-		blockTxMap[hash] = true
 	}
 
 	if len(flatHashes) > 0 {
@@ -3104,7 +3046,7 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 	// Step 6: Reset subtree state with coinbase in first subtree
 	newSubtree, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
 	if err != nil {
-		return nil, nil, nil, errors.NewProcessingError("[moveBackBlock:BulkBuild][%s] error creating new subtree", block.String(), err)
+		return nil, nil, errors.NewProcessingError("[moveBackBlock:BulkBuild][%s] error creating new subtree", block.String(), err)
 	}
 	_ = newSubtree.AddCoinbaseNode()
 	stp.currentSubtree.Store(newSubtree)
@@ -3115,65 +3057,7 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 
 	// Step 7: Bulk build subtrees from all collected nodes
 	if err := stp.bulkBuildSubtrees(allNodes, subtreeSize); err != nil {
-		return nil, nil, nil, errors.NewProcessingError("[moveBackBlock:BulkBuild][%s] error bulk building subtrees", block.String(), err)
-	}
-
-	return subtreesNodes, conflictingHashes, blockTxMap, nil
-}
-
-func (stp *SubtreeProcessor) moveBackBlockCreateNewSubtrees(ctx context.Context, block *model.Block, createProperlySizedSubtrees bool) ([][]subtreepkg.Node, []chainhash.Hash, error) {
-	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "moveBackBlockCreateNewSubtrees",
-		tracing.WithLogMessage(stp.logger, "[moveBackBlock:CreateNewSubtrees][%s] with %d subtrees: create new subtrees", block.String(), len(block.Subtrees)),
-	)
-	defer deferFn()
-
-	// get all the subtrees in the block
-	subtreesNodes, subtreeMetaTxInpoints, conflictingHashes, err := stp.moveBackBlockGetSubtrees(ctx, block)
-	if err != nil {
-		return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s] error getting subtrees", block.String(), err)
-	}
-
-	// reset the subtree processor
-	subtreeSize := int(stp.currentItemsPerFile.Load())
-	if !createProperlySizedSubtrees {
-		// if we are moving forward blocks, we do not care about the subtree size
-		// as we will create new subtrees anyway when moving forward so for simplicity and speed,
-		// we create as few subtrees as possible when moving back, to avoid fragmentation and lots of small writes to disk
-		subtreeSize = 1024 * 1024
-	}
-	newSubtree, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
-	if err != nil {
-		return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s] error creating new subtree", block.String(), err)
-	}
-	stp.currentSubtree.Store(newSubtree)
-
-	stp.chainedSubtrees = make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees)
-	stp.chainedSubtreeCount.Store(0)
-	stp.chainedSubtreesTotalSize.Store(0)
-
-	// add first coinbase placeholder transaction
-	_ = stp.currentSubtree.Load().AddCoinbaseNode()
-
-	// run through the nodes of the subtrees in order and add to the new subtrees
-	if len(subtreesNodes) > 0 {
-		for idx, subtreeNodes := range subtreesNodes {
-			subtreeHash := block.Subtrees[idx]
-
-			if idx == 0 {
-				// skip the first transaction of the first subtree (coinbase)
-				for i := 1; i < len(subtreeNodes); i++ {
-					if err = stp.addNode(subtreeNodes[i], &subtreeMetaTxInpoints[idx][i], true); err != nil {
-						return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s][%s] error adding node to subtree", block.String(), subtreeHash.String(), err)
-					}
-				}
-			} else {
-				for i, node := range subtreeNodes {
-					if err = stp.addNode(node, &subtreeMetaTxInpoints[idx][i], true); err != nil {
-						return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s][%s] error adding node to subtree", block.String(), subtreeHash.String(), err)
-					}
-				}
-			}
-		}
+		return nil, nil, errors.NewProcessingError("[moveBackBlock:BulkBuild][%s] error bulk building subtrees", block.String(), err)
 	}
 
 	return subtreesNodes, conflictingHashes, nil
