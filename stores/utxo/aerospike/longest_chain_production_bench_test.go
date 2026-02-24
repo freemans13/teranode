@@ -168,6 +168,107 @@ func createProductionLikeTransactions(b *testing.B, ctx context.Context, store u
 	return txHashes
 }
 
+// BenchmarkConcurrentVsSequentialMarking compares running mark(true) and mark(false)
+// on disjoint hash sets sequentially vs concurrently. This mirrors the Phase 2 reorg
+// optimization where MarkTransactionsOnLongestChain(true) for winning-chain txs and
+// MarkTransactionsOnLongestChain(false) for losing-chain txs run in parallel via errgroup.
+//
+// Run:
+//
+//	go test -run=^$ -bench=BenchmarkConcurrentVsSequentialMarking -benchmem -benchtime=1x -timeout=30m ./stores/utxo/aerospike/
+func BenchmarkConcurrentVsSequentialMarking(b *testing.B) {
+	if testing.Short() {
+		b.Skip("Skipping production-scale benchmark in short mode")
+	}
+
+	store, ctx := getSharedBenchStore(b)
+
+	testCases := []struct {
+		name       string
+		count      int // per set (total = 2x)
+		seedOffset int
+	}{
+		{"1K_per_set", 1_000, 2_000_000},
+		{"10K_per_set", 10_000, 3_000_000},
+		{"100K_per_set", 100_000, 4_000_000},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			b.Logf("Creating %d txs for mark-true set + %d txs for mark-false set...", tc.count, tc.count)
+
+			// Create two disjoint transaction sets (simulating winning vs losing chain)
+			markTrueHashes := createProductionLikeTransactions(b, ctx, store, tc.count, tc.seedOffset)
+			markFalseHashes := createProductionLikeTransactions(b, ctx, store, tc.count, tc.seedOffset+tc.count)
+
+			// First mark them all as true so mark-false has something to flip
+			err := store.MarkTransactionsOnLongestChain(ctx, markTrueHashes, true)
+			require.NoError(b, err)
+			err = store.MarkTransactionsOnLongestChain(ctx, markFalseHashes, true)
+			require.NoError(b, err)
+
+			runtime.GC()
+
+			// --- Sequential baseline ---
+			b.Run("sequential", func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					start := time.Now()
+
+					err := store.MarkTransactionsOnLongestChain(ctx, markTrueHashes, true)
+					require.NoError(b, err)
+
+					err = store.MarkTransactionsOnLongestChain(ctx, markFalseHashes, false)
+					require.NoError(b, err)
+
+					elapsed := time.Since(start)
+					b.Logf("  Iter %d: %v (%.0f tx/sec total)", i+1, elapsed,
+						float64(tc.count*2)/elapsed.Seconds())
+				}
+				b.StopTimer()
+				throughput := float64(tc.count*2*b.N) / b.Elapsed().Seconds()
+				b.ReportMetric(throughput, "tx/sec")
+				b.Logf("SEQUENTIAL: %v total, %.0f tx/sec", b.Elapsed(), throughput)
+			})
+
+			// Reset state for concurrent benchmark
+			err = store.MarkTransactionsOnLongestChain(ctx, markTrueHashes, true)
+			require.NoError(b, err)
+			err = store.MarkTransactionsOnLongestChain(ctx, markFalseHashes, true)
+			require.NoError(b, err)
+
+			runtime.GC()
+
+			// --- Concurrent (Phase 2 approach) ---
+			b.Run("concurrent", func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					start := time.Now()
+
+					g, gCtx := errgroup.WithContext(ctx)
+					g.Go(func() error {
+						return store.MarkTransactionsOnLongestChain(gCtx, markTrueHashes, true)
+					})
+					g.Go(func() error {
+						return store.MarkTransactionsOnLongestChain(gCtx, markFalseHashes, false)
+					})
+					err := g.Wait()
+					require.NoError(b, err)
+
+					elapsed := time.Since(start)
+					b.Logf("  Iter %d: %v (%.0f tx/sec total)", i+1, elapsed,
+						float64(tc.count*2)/elapsed.Seconds())
+				}
+				b.StopTimer()
+				throughput := float64(tc.count*2*b.N) / b.Elapsed().Seconds()
+				b.ReportMetric(throughput, "tx/sec")
+				b.Logf("CONCURRENT: %v total, %.0f tx/sec", b.Elapsed(), throughput)
+			})
+		})
+	}
+}
+
 // createRealisticTransaction creates a unique coinbase transaction for each seed.
 func createRealisticTransaction(seed int) *bt.Tx {
 	coinbaseTxHex := "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff17032dff0c2f71646c6e6b2f5e931c7f7b6199adf35e1300ffffffff01d15fa012000000001976a91417db35d440a673a218e70a5b9d07f895facf50d288ac00000000"

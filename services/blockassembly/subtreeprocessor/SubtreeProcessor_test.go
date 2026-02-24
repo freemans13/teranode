@@ -1512,7 +1512,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		stp.InitCurrentBlockHeader(blockHeader)
 
 		// Call internal moveBackBlock method (safe since Start() is not running)
-		_, _, err = stp.moveBackBlock(context.Background(), &model.Block{
+		_, _, _, err = stp.moveBackBlock(context.Background(), &model.Block{
 			Header: prevBlockHeader,
 			Subtrees: []*chainhash.Hash{
 				subtree1.RootHash(),
@@ -1578,7 +1578,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		originalState := captureSubtreeProcessorState(stp)
 
 		// Test nil block
-		_, _, err = stp.moveBackBlock(context.Background(), nil, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), nil, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "you must pass in a block to moveBackBlock")
 
@@ -1621,7 +1621,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test empty block processing
-		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
 		require.NoError(t, err)
 
 		// Verify state after processing empty block
@@ -1681,7 +1681,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree store error
-		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1734,7 +1734,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test coinbase placeholder handling
-		_, _, err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder, true)
 		require.NoError(t, err)
 
 		// Verify the coinbase placeholder was handled correctly
@@ -1778,7 +1778,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test SetBlockProcessedAt error (should not cause overall failure)
-		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
 		require.NoError(t, err) // Error in SetBlockProcessedAt should not fail the operation
 	})
 
@@ -1849,7 +1849,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test single subtree processing
-		_, _, err = stp.moveBackBlock(context.Background(), singleSubtreeBlock, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), singleSubtreeBlock, true)
 		require.NoError(t, err)
 
 		// Verify result
@@ -1956,7 +1956,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree deserialization failure
-		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -2013,7 +2013,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta deserialization failure
-		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -2067,7 +2067,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta retrieval failure
-		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -2150,7 +2150,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// This should succeed since the UTXO exists and can be deleted
-		_, _, err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase, true)
 		require.NoError(t, err) // This will pass, but we've tested the delete path
 
 		// Verify state was properly updated after successful operation
@@ -2238,7 +2238,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// This should succeed because addNode with skipNotification=true will handle duplicates gracefully
-		_, _, err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx, true)
+		_, _, _, err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx, true)
 		require.NoError(t, err) // addNode with skipNotification doesn't fail on duplicates
 
 		// Verify state was properly updated after successful operation
