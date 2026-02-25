@@ -173,11 +173,7 @@ func NewClient(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 			logger.Errorf("Error sending batch: %s", err)
 		}
 	}
-	b := batcher.New(batchSize, duration, sendBatch, !tSettings.BatcherDrainMode)
-	if tSettings.BatcherDrainMode {
-		b.SetDrainMode(true)
-	}
-	c.batcher = *b
+	c.batcher = *batcher.New(batchSize, duration, sendBatch, true)
 
 	return c, nil
 }

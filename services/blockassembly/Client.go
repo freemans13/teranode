@@ -55,7 +55,7 @@ type Client struct {
 	batchCh chan []*batchItem
 
 	// batcher manages transaction batching
-	batcher batcher.Batcher[batchItem]
+	batcher *batcher.Batcher[batchItem]
 }
 
 // NewClient creates a new block assembly client.
@@ -117,7 +117,7 @@ func NewClient(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	if tSettings.BatcherDrainMode {
 		b.SetDrainMode(true)
 	}
-	client.batcher = *b
+	client.batcher = b
 
 	return client, nil
 }
@@ -166,7 +166,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 	if tSettings.BatcherDrainMode {
 		b.SetDrainMode(true)
 	}
-	client.batcher = *b
+	client.batcher = b
 
 	return client, nil
 }

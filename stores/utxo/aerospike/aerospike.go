@@ -311,17 +311,17 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	outpointBatchSize := s.settings.UtxoStore.OutpointBatcherSize
 	outpointBatchDurationStr := s.settings.UtxoStore.OutpointBatcherDurationMillis
 	outpointBatchDuration := time.Duration(outpointBatchDurationStr) * time.Millisecond
-	s.outpointBatcher = batcher.New(outpointBatchSize, outpointBatchDuration, s.sendOutpointBatch, !tSettings.BatcherDrainMode)
+	s.outpointBatcher = batcher.New(outpointBatchSize, outpointBatchDuration, s.sendOutpointBatch, true)
 
 	incrementBatchSize := tSettings.UtxoStore.IncrementBatcherSize
 	incrementBatchDurationStr := tSettings.UtxoStore.IncrementBatcherDurationMillis
 	incrementBatchDuration := time.Duration(incrementBatchDurationStr) * time.Millisecond
-	s.incrementBatcher = batcher.New(incrementBatchSize, incrementBatchDuration, s.sendIncrementBatch, !tSettings.BatcherDrainMode)
+	s.incrementBatcher = batcher.New(incrementBatchSize, incrementBatchDuration, s.sendIncrementBatch, true)
 
 	setDAHBatchSize := tSettings.UtxoStore.SetDAHBatcherSize
 	setDAHBatchDurationStr := tSettings.UtxoStore.SetDAHBatcherDurationMillis
 	setDAHBatchDuration := time.Duration(setDAHBatchDurationStr) * time.Millisecond
-	s.setDAHBatcher = batcher.New(setDAHBatchSize, setDAHBatchDuration, s.sendSetDAHBatch, !tSettings.BatcherDrainMode)
+	s.setDAHBatcher = batcher.New(setDAHBatchSize, setDAHBatchDuration, s.sendSetDAHBatch, true)
 
 	lockedBatcherSize := tSettings.UtxoStore.LockedBatcherSize
 	lockedBatchDurationStr := tSettings.UtxoStore.LockedBatcherDurationMillis
@@ -329,11 +329,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	s.lockedBatcher = batcher.New(lockedBatcherSize, lockedBatchDuration, s.setLockedBatch, !tSettings.BatcherDrainMode)
 
 	if tSettings.BatcherDrainMode {
-		for _, b := range []interface{ SetDrainMode(bool) }{
-			s.storeBatcher, s.getBatcher, s.spendBatcher,
-			s.outpointBatcher, s.incrementBatcher, s.setDAHBatcher, s.lockedBatcher,
-		} {
-			b.SetDrainMode(true)
+		s.getBatcher.SetDrainMode(true)
+		s.spendBatcher.SetDrainMode(true)
+		s.lockedBatcher.SetDrainMode(true)
+		if s.storeBatcher != nil {
+			s.storeBatcher.SetDrainMode(true)
 		}
 	}
 
