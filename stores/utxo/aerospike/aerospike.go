@@ -263,11 +263,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 	storeBatchDuration := tSettings.Aerospike.StoreBatcherDuration
 
-	if storeBatchSize > 1 {
-		s.storeBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendStoreBatch, !tSettings.BatcherDrainMode)
-	} else {
-		s.logger.Warnf("Store batch size is set to %d, store batching is disabled", storeBatchSize)
-	}
+	s.storeBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendStoreBatch, !tSettings.BatcherDrainMode)
 
 	getBatchSize := s.settings.UtxoStore.GetBatcherSize
 	getBatchDurationStr := s.settings.UtxoStore.GetBatcherDurationMillis
@@ -332,9 +328,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.getBatcher.SetDrainMode(true)
 		s.spendBatcher.SetDrainMode(true)
 		s.lockedBatcher.SetDrainMode(true)
-		if s.storeBatcher != nil {
-			s.storeBatcher.SetDrainMode(true)
-		}
+		s.storeBatcher.SetDrainMode(true)
 	}
 
 	logger.Infof("[Aerospike] map txmeta store initialised with namespace: %s, set: %s", namespace, setName)
