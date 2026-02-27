@@ -2592,7 +2592,7 @@ func TestBlockWorker(t *testing.T) {
 		// Check result
 		result := <-resultQueue
 		assert.Error(t, result.err, "Should propagate subtree fetch error")
-		assert.Contains(t, result.err.Error(), "Failed to fetch subtree data for block")
+		assert.Contains(t, result.err.Error(), "Failed to fetch subtrees for block")
 	})
 
 	t.Run("WorkerHandlesEmptyQueue", func(t *testing.T) {

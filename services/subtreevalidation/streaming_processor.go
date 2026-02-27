@@ -16,6 +16,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/pkg/utxocheck"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
@@ -258,6 +259,90 @@ func (u *Server) processMissingSubtreesStreaming(ctx context.Context, request *s
 		sp.validatedTransactions.Load(), sp.skippedTransactions.Load())
 
 	return blockIds, nil
+}
+
+// loadSubtreeOnly loads/fetches just the subtree structure (tx hashes) without downloading subtreeData.
+// Returns the tx hashes extracted from the subtree nodes.
+func (u *Server) loadSubtreeOnly(ctx context.Context, request *subtreevalidation_api.CheckBlockSubtreesRequest, subtreeHash chainhash.Hash, peerID string, dah uint32) ([]chainhash.Hash, error) {
+	subtreeToCheckExists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+	if err != nil {
+		return nil, errors.NewProcessingError("[loadSubtreeOnly][%s] failed to check if subtree exists", subtreeHash.String(), err)
+	}
+
+	var subtreeToCheck *subtreepkg.Subtree
+
+	if subtreeToCheckExists {
+		subtreeReader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+		if err != nil {
+			return nil, errors.NewStorageError("[loadSubtreeOnly][%s] failed to get subtree from store", subtreeHash.String(), err)
+		}
+		defer subtreeReader.Close()
+
+		bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+		bufferedReader.Reset(subtreeReader)
+		defer func() {
+			bufferedReader.Reset(nil)
+			bufioReaderPool.Put(bufferedReader)
+		}()
+
+		subtreeToCheck, err = subtreepkg.NewSubtreeFromReader(bufferedReader)
+		if err != nil {
+			return nil, errors.NewProcessingError("[loadSubtreeOnly][%s] failed to deserialize subtree", subtreeHash.String(), err)
+		}
+	} else {
+		url := fmt.Sprintf("%s/subtree/%s", request.BaseUrl, subtreeHash.String())
+
+		subtreeNodeBytes, err := util.DoHTTPRequest(ctx, url)
+		if err != nil {
+			return nil, errors.NewServiceError("[loadSubtreeOnly][%s] failed to get subtree from %s", subtreeHash.String(), url, err)
+		}
+
+		if u.p2pClient != nil && peerID != "" {
+			if err := u.p2pClient.RecordBytesDownloaded(ctx, peerID, uint64(len(subtreeNodeBytes))); err != nil {
+				u.logger.Warnf("[loadSubtreeOnly][%s] failed to record bytes downloaded: %v", subtreeHash.String(), err)
+			}
+		}
+
+		subtreeToCheck, err = subtreepkg.NewIncompleteTreeByLeafCount(len(subtreeNodeBytes) / chainhash.HashSize)
+		if err != nil {
+			return nil, errors.NewProcessingError("[loadSubtreeOnly][%s] failed to create subtree structure", subtreeHash.String(), err)
+		}
+
+		var nodeHash chainhash.Hash
+		for i := 0; i < len(subtreeNodeBytes)/chainhash.HashSize; i++ {
+			copy(nodeHash[:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
+
+			if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				if err = subtreeToCheck.AddCoinbaseNode(); err != nil {
+					return nil, errors.NewProcessingError("[loadSubtreeOnly][%s] failed to add coinbase node", subtreeHash.String(), err)
+				}
+			} else {
+				if err = subtreeToCheck.AddNode(nodeHash, 0, 0); err != nil {
+					return nil, errors.NewProcessingError("[loadSubtreeOnly][%s] failed to add node", subtreeHash.String(), err)
+				}
+			}
+		}
+
+		if !subtreeHash.Equal(*subtreeToCheck.RootHash()) {
+			return nil, errors.NewProcessingError("[loadSubtreeOnly][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
+		}
+
+		subtreeBytes, err := subtreeToCheck.Serialize()
+		if err != nil {
+			return nil, errors.NewProcessingError("[loadSubtreeOnly][%s] failed to serialize subtree", subtreeHash.String(), err)
+		}
+
+		if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
+			return nil, errors.NewProcessingError("[loadSubtreeOnly][%s] failed to store subtree", subtreeHash.String(), err)
+		}
+	}
+
+	txHashes := make([]chainhash.Hash, len(subtreeToCheck.Nodes))
+	for j, node := range subtreeToCheck.Nodes {
+		txHashes[j] = node.Hash
+	}
+
+	return txHashes, nil
 }
 
 // loadSubtreeTransactions loads transactions from a single subtree.
@@ -722,8 +807,31 @@ func (sp *streamingProcessor) streamAndFilterSubtrees(
 	dah uint32,
 	unvalidatedTxChan chan<- *bt.Tx,
 ) error {
+	needsSubtreeData := false
+
 	for i, subtreeHash := range missingSubtrees {
-		// Load subtree transactions
+		// Adaptive skip: try subtree-only path if no missing txs found yet
+		if !needsSubtreeData {
+			txHashes, loadErr := sp.server.loadSubtreeOnly(ctx, request, subtreeHash, peerID, dah)
+			if loadErr != nil {
+				sp.server.logger.Warnf("[streamAndFilterSubtrees] Failed to load subtree-only for %s: %v, falling back to full path", subtreeHash.String(), loadErr)
+				needsSubtreeData = true
+			} else {
+				allExist, checkErr := utxocheck.CheckAllTxsExistInUTXO(ctx, sp.server.utxoStore, txHashes, 1000)
+				if checkErr != nil {
+					sp.server.logger.Warnf("[streamAndFilterSubtrees] UTXO existence check failed for %s: %v, falling back to subtreeData", subtreeHash.String(), checkErr)
+					needsSubtreeData = true
+				} else if allExist {
+					sp.server.logger.Infof("[streamAndFilterSubtrees] Subtree %d/%d (%s): all %d txs exist in UTXO store, skipping subtreeData", i+1, len(missingSubtrees), subtreeHash.String(), len(txHashes))
+					continue
+				} else {
+					sp.server.logger.Infof("[streamAndFilterSubtrees] Subtree %d/%d (%s): missing txs found, switching to subtreeData mode", i+1, len(missingSubtrees), subtreeHash.String())
+					needsSubtreeData = true
+				}
+			}
+		}
+
+		// Load subtree transactions (full path with subtreeData)
 		txs, err := sp.server.loadSubtreeTransactions(ctx, request, subtreeHash, peerID, dah)
 		if err != nil {
 			return err

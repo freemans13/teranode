@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/pkg/utxocheck"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -206,8 +207,8 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				return nil
 			}
 
-			// Fetch subtree data for this block
-			err := u.fetchSubtreeDataForBlock(ctx, work.block, peerID, baseURL)
+			// Fetch subtree data for this block, adaptively skipping subtreeData when txs exist locally
+			err := u.fetchBlockSubtreesAdaptive(ctx, work.block, peerID, baseURL)
 			if err != nil {
 				// Send result (even if error occurred)
 				result := resultItem{
@@ -369,6 +370,108 @@ func (u *Server) fetchSubtreeDataForBlock(gCtx context.Context, block *model.Blo
 	// Wait for all subtree fetching to complete
 	if err := g.Wait(); err != nil {
 		return errors.NewServiceError("[catchup:fetchSubtreeDataForBlock] Failed to fetch subtree data for block %s", block.Hash().String(), err)
+	}
+
+	return nil
+}
+
+// fetchBlockSubtreesAdaptive processes subtrees with per-subtree adaptive logic.
+// For each subtree it first fetches just the subtree hashes and checks UTXO existence.
+// If all txs exist locally, the subtreeData download is skipped entirely.
+// Once any subtree has missing txs, all remaining subtrees go straight to full fetch.
+func (u *Server) fetchBlockSubtreesAdaptive(gCtx context.Context, block *model.Block, peerID, baseURL string) error {
+	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(gCtx, "fetchBlockSubtreesAdaptive",
+		tracing.WithParentStat(u.stats),
+		tracing.WithLogMessage(u.logger, "[catchup:fetchBlockSubtreesAdaptive][%s] adaptive subtree fetch for block with %d subtrees", block.Hash().String(), len(block.Subtrees)),
+	)
+	defer deferFn()
+
+	if len(block.Subtrees) == 0 {
+		u.logger.Debugf("[catchup:fetchBlockSubtreesAdaptive] Block %s has no subtrees, skipping", block.Hash().String())
+		return nil
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	subtreeConcurrency := 8
+	if u.settings.BlockValidation.SubtreeFetchConcurrency > 0 {
+		subtreeConcurrency = u.settings.BlockValidation.SubtreeFetchConcurrency
+	}
+	g.SetLimit(subtreeConcurrency)
+
+	// Get peer assignments for subtrees if parallel fetching is enabled
+	var peerAssignments []*PeerForSubtreeFetch
+	if u.settings.BlockValidation.CatchupParallelFetchEnabled && u.p2pClient != nil {
+		var err error
+		peerAssignments, err = DistributeSubtreesAcrossPeers(ctx, u.logger, u.p2pClient, peerID, baseURL, len(block.Subtrees))
+		if err != nil {
+			u.logger.Warnf("[catchup:fetchBlockSubtreesAdaptive][%s] Failed to distribute subtrees across peers: %v, using single peer", block.Hash().String(), err)
+			peerAssignments = nil
+		}
+	}
+
+	// Shared flag: once set, all subsequent subtrees skip UTXO probing
+	var needsSubtreeData atomic.Bool
+	// If no UTXO store is available, skip the optimization entirely
+	if u.utxoStore == nil {
+		needsSubtreeData.Store(true)
+	}
+
+	for i, subtreeHash := range block.Subtrees {
+		subtreeHashCopy := *subtreeHash
+		subtreeIndex := i
+
+		fetchPeerID := peerID
+		fetchBaseURL := baseURL
+		if peerAssignments != nil && subtreeIndex < len(peerAssignments) {
+			assignment := peerAssignments[subtreeIndex]
+			fetchPeerID = assignment.PeerID
+			fetchBaseURL = assignment.BaseURL
+		}
+
+		capturedPeerID := fetchPeerID
+		capturedBaseURL := fetchBaseURL
+
+		g.Go(func() error {
+			// If flag is already set, go straight to full fetch
+			if needsSubtreeData.Load() {
+				return u.fetchAndStoreSubtreeAndSubtreeData(ctx, block, &subtreeHashCopy, capturedPeerID, capturedBaseURL)
+			}
+
+			// Try subtree-only: fetch just the hashes and check UTXO existence
+			subtree, err := u.fetchAndStoreSubtree(ctx, block, &subtreeHashCopy, capturedPeerID, capturedBaseURL)
+			if err != nil {
+				// Can't get subtree hashes, fall back to full fetch
+				needsSubtreeData.Store(true)
+				return u.fetchAndStoreSubtreeAndSubtreeData(ctx, block, &subtreeHashCopy, capturedPeerID, capturedBaseURL)
+			}
+
+			// Extract tx hashes from subtree nodes
+			txHashes := make([]chainhash.Hash, len(subtree.Nodes))
+			for j, node := range subtree.Nodes {
+				txHashes[j] = node.Hash
+			}
+
+			allExist, err := utxocheck.CheckAllTxsExistInUTXO(ctx, u.utxoStore, txHashes, 1000)
+			if err != nil {
+				u.logger.Warnf("[catchup:fetchBlockSubtreesAdaptive][%s] UTXO existence check failed for subtree %s: %v, falling back to subtreeData", block.Hash().String(), subtreeHashCopy.String(), err)
+				needsSubtreeData.Store(true)
+				return u.fetchAndStoreSubtreeData(ctx, block, &subtreeHashCopy, subtree, capturedPeerID, capturedBaseURL)
+			}
+
+			if !allExist {
+				u.logger.Infof("[catchup:fetchBlockSubtreesAdaptive][%s] Missing txs found in subtree %s, switching to subtreeData mode", block.Hash().String(), subtreeHashCopy.String())
+				needsSubtreeData.Store(true)
+				return u.fetchAndStoreSubtreeData(ctx, block, &subtreeHashCopy, subtree, capturedPeerID, capturedBaseURL)
+			}
+
+			// All txs exist locally - no subtreeData needed for this subtree
+			u.logger.Infof("[catchup:fetchBlockSubtreesAdaptive][%s] All %d txs exist in UTXO store, skipping subtreeData download for subtree %s", block.Hash().String(), len(txHashes), subtreeHashCopy.String())
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return errors.NewServiceError("[catchup:fetchBlockSubtreesAdaptive] Failed to fetch subtrees for block %s", block.Hash().String(), err)
 	}
 
 	return nil
