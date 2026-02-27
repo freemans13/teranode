@@ -14,7 +14,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/pkg/utxocheck"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
@@ -150,8 +149,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 		// Load transactions for this batch of subtrees in parallel
 		subtreeTxs := make([][]*bt.Tx, len(batchSubtrees))
-		// Adaptive flag: once any subtree has missing txs, skip UTXO check for remaining subtrees
-		var needsSubtreeData atomic.Bool
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
@@ -236,32 +233,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					// we not set a DAH as this is part of a block and will be permanently stored anyway
 					if err = u.subtreeStore.Set(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah)); err != nil {
 						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to store subtree", subtreeHash.String(), err)
-					}
-				}
-
-				// Adaptive skip: check if all txs exist in UTXO store before downloading subtreeData
-				if !needsSubtreeData.Load() {
-					txHashes := make([]chainhash.Hash, len(subtreeToCheck.Nodes))
-					for j, node := range subtreeToCheck.Nodes {
-						txHashes[j] = node.Hash
-					}
-
-					// Re-check flag before the expensive UTXO call — another goroutine may have set it
-					// while we were loading the subtreeToCheck above
-					if needsSubtreeData.Load() {
-						u.logger.Debugf("[CheckBlockSubtrees][%s] Flag set by another goroutine, skipping UTXO check", subtreeHash.String())
-					} else {
-						allExist, checkErr := utxocheck.CheckAllTxsExistInUTXO(gCtx, u.utxoStore, txHashes, 1000)
-						if checkErr != nil {
-							u.logger.Warnf("[CheckBlockSubtrees][%s] UTXO existence check failed: %v, falling back to subtreeData", subtreeHash.String(), checkErr)
-							needsSubtreeData.Store(true)
-						} else if allExist {
-							u.logger.Infof("[CheckBlockSubtrees][%s] All %d txs exist in UTXO store, skipping subtreeData download", subtreeHash.String(), len(txHashes))
-							return nil
-						} else {
-							u.logger.Infof("[CheckBlockSubtrees][%s] Missing txs found, switching to subtreeData mode for block %s", subtreeHash.String(), block.Hash().String())
-							needsSubtreeData.Store(true)
-						}
 					}
 				}
 
