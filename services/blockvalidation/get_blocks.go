@@ -445,6 +445,11 @@ func (u *Server) fetchBlockSubtreesAdaptive(gCtx context.Context, block *model.B
 				return u.fetchAndStoreSubtreeAndSubtreeData(ctx, block, &subtreeHashCopy, capturedPeerID, capturedBaseURL)
 			}
 
+			// Re-check flag: another goroutine may have set it while we were fetching hashes
+			if needsSubtreeData.Load() {
+				return u.fetchAndStoreSubtreeData(ctx, block, &subtreeHashCopy, subtree, capturedPeerID, capturedBaseURL)
+			}
+
 			// Extract tx hashes from subtree nodes
 			txHashes := make([]chainhash.Hash, len(subtree.Nodes))
 			for j, node := range subtree.Nodes {

@@ -245,16 +245,23 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					for j, node := range subtreeToCheck.Nodes {
 						txHashes[j] = node.Hash
 					}
-					allExist, checkErr := utxocheck.CheckAllTxsExistInUTXO(gCtx, u.utxoStore, txHashes, 1000)
-					if checkErr != nil {
-						u.logger.Warnf("[CheckBlockSubtrees][%s] UTXO existence check failed: %v, falling back to subtreeData", subtreeHash.String(), checkErr)
-						needsSubtreeData.Store(true)
-					} else if allExist {
-						u.logger.Infof("[CheckBlockSubtrees][%s] All %d txs exist in UTXO store, skipping subtreeData download", subtreeHash.String(), len(txHashes))
-						return nil
+
+					// Re-check flag before the expensive UTXO call — another goroutine may have set it
+					// while we were loading the subtreeToCheck above
+					if needsSubtreeData.Load() {
+						u.logger.Debugf("[CheckBlockSubtrees][%s] Flag set by another goroutine, skipping UTXO check", subtreeHash.String())
 					} else {
-						u.logger.Infof("[CheckBlockSubtrees][%s] Missing txs found, switching to subtreeData mode for block %s", subtreeHash.String(), block.Hash().String())
-						needsSubtreeData.Store(true)
+						allExist, checkErr := utxocheck.CheckAllTxsExistInUTXO(gCtx, u.utxoStore, txHashes, 1000)
+						if checkErr != nil {
+							u.logger.Warnf("[CheckBlockSubtrees][%s] UTXO existence check failed: %v, falling back to subtreeData", subtreeHash.String(), checkErr)
+							needsSubtreeData.Store(true)
+						} else if allExist {
+							u.logger.Infof("[CheckBlockSubtrees][%s] All %d txs exist in UTXO store, skipping subtreeData download", subtreeHash.String(), len(txHashes))
+							return nil
+						} else {
+							u.logger.Infof("[CheckBlockSubtrees][%s] Missing txs found, switching to subtreeData mode for block %s", subtreeHash.String(), block.Hash().String())
+							needsSubtreeData.Store(true)
+						}
 					}
 				}
 
