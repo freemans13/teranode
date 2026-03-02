@@ -1110,9 +1110,11 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			return errors.NewProcessingError("[SubtreeProcessor][Reset] error processing coinbase utxos", err)
 		}
 
-		stp.currentBlockHeader.Store(blockHeader)
-		// Update pre-computed mining data after legacy sync reset
-		stp.updatePrecomputedMiningData()
+		// Finalize each moveForward block sequentially to ensure SetBlockProcessedAt
+		// is called for all blocks, not just the last one.
+		for _, block := range moveForwardBlocks {
+			stp.finalizeBlockProcessing(ctx, block)
+		}
 	} else {
 		for _, block := range moveForwardBlocks {
 			// A block has potentially some conflicting transactions that need to be processed when we move forward the block
@@ -1148,13 +1150,17 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			if err = stp.processCoinbaseUtxos(context.Background(), block); err != nil {
 				return errors.NewProcessingError("[SubtreeProcessor][Reset] error processing coinbase utxos", err)
 			}
+
+			// Finalize each moveForward block individually to ensure SetBlockProcessedAt
+			// is called for all blocks, not just the last one. Without this, intermediate
+			// moveForward blocks would never get processed_at set.
+			stp.finalizeBlockProcessing(ctx, block)
 		}
 	}
 
-	// persist the current state
-	if len(moveForwardBlocks) > 0 {
-		stp.finalizeBlockProcessing(ctx, moveForwardBlocks[len(moveForwardBlocks)-1])
-	} else if len(moveBackBlocks) > 0 {
+	// persist the current state — only needed when there are NO moveForward blocks
+	// (moveForward blocks are now finalized individually in the loop above)
+	if len(moveForwardBlocks) == 0 && len(moveBackBlocks) > 0 {
 		// we only moved back, finalize with the parent of the last block we moved back
 		block, err := stp.blockchainClient.GetBlock(ctx, moveBackBlocks[len(moveBackBlocks)-1].Header.HashPrevBlock)
 		if err != nil {
