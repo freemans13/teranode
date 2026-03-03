@@ -115,16 +115,20 @@ func (s *SQL) GetBlockHeaders(ctx context.Context, blockHashFrom *chainhash.Hash
 		WHERE id IN (
 			SELECT id FROM blocks
 			WHERE id IN (
-				WITH RECURSIVE ChainBlocks AS (
+				WITH RECURSIVE start_block AS (
 					SELECT id, parent_id, height
 					FROM blocks
 					WHERE hash = $1
+				),
+				ChainBlocks AS (
+					SELECT id, parent_id, height FROM start_block
 					UNION ALL
 					SELECT bb.id, bb.parent_id, bb.height
 					FROM blocks bb
 					JOIN ChainBlocks cb ON bb.id = cb.parent_id
+					CROSS JOIN start_block sb
 					WHERE bb.id != cb.id
-					  AND bb.height >= (SELECT height FROM blocks WHERE hash = $1) - $2
+					  AND bb.height >= sb.height - $2
 				)
 				SELECT id FROM ChainBlocks
 				LIMIT $2
