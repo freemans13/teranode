@@ -2803,7 +2803,7 @@ func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, inv
 		txMeta := txMetas[idx]
 		if txMeta == nil {
 			// transaction not found, not OK
-			return nil, errors.NewProcessingError("[reorgBlocks] error getting transaction %s from longest chain", hash.String(), err)
+			return nil, errors.NewProcessingError("[reorgBlocks] error getting transaction %s from longest chain", hash.String())
 		}
 
 		if len(txMeta.BlockIDs) == 1 && txMeta.BlockIDs[0] == invalidBlock.ID {
