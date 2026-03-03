@@ -124,6 +124,7 @@ func (s *SQL) GetBlockHeaders(ctx context.Context, blockHashFrom *chainhash.Hash
 					FROM blocks bb
 					JOIN ChainBlocks cb ON bb.id = cb.parent_id
 					WHERE bb.id != cb.id
+					  AND bb.height >= (SELECT height FROM blocks WHERE hash = $1) - $2
 				)
 				SELECT id FROM ChainBlocks
 				LIMIT $2
