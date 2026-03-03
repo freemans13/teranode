@@ -4054,14 +4054,13 @@ func TestSubtreeProcessor_checkMarkNotOnLongestChain(t *testing.T) {
 		}
 		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(txMeta, nil)
 
-		// Mock CheckBlockIsInCurrentChain - this will still be called due to the continue bug
-		// The transaction should be marked as on longest chain regardless
-		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+		// CheckBlockIsInCurrentChain should NOT be called - the recent block ID is recognized
+		// from the last 1000 block headers, so no blockchain query is needed
 
 		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
 
 		require.NoError(t, err)
-		require.Len(t, result, 0) // Should not mark as not on longest chain since it's still on longest chain
+		require.Len(t, result, 0) // Should not mark as not on longest chain since it's in a recent block
 		mockBlockchainClient.AssertExpectations(t)
 		mockUtxoStore.AssertExpectations(t)
 	})
@@ -4100,7 +4099,7 @@ func TestSubtreeProcessor_checkMarkNotOnLongestChain(t *testing.T) {
 
 		require.Error(t, err)
 		require.Nil(t, result)
-		require.Contains(t, err.Error(), "error checking if transaction is on longest chain")
+		require.Contains(t, err.Error(), "error checking if block is on longest chain")
 		mockBlockchainClient.AssertExpectations(t)
 		mockUtxoStore.AssertExpectations(t)
 	})
@@ -4228,11 +4227,10 @@ func TestSubtreeProcessor_checkMarkNotOnLongestChain(t *testing.T) {
 		mockUtxoStore.On("Get", mock.Anything, &txHash3, mock.Anything).Return(txMeta3, nil)
 		mockUtxoStore.On("Get", mock.Anything, &txHash4, mock.Anything).Return(txMeta4, nil)
 
-		// Mock CheckBlockIsInCurrentChain calls
-		// TX2 will also call CheckBlockIsInCurrentChain due to the continue bug (even though it's in recent blocks)
-		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{invalidBlockID, recentBlockID}).Return(true, nil)  // TX2 still on longest chain
-		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{invalidBlockID, otherBlockID1}).Return(false, nil) // TX3 not on longest chain
-		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{invalidBlockID, otherBlockID2}).Return(true, nil)  // TX4 still on longest chain
+		// Mock CheckBlockIsInCurrentChain calls - checked once per unique blockID (not per tx)
+		// TX2 is in a recent block (recentBlockID) so no CheckBlockIsInCurrentChain call needed for it
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{otherBlockID1}).Return(false, nil) // Block 999 not on longest chain
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{otherBlockID2}).Return(true, nil)  // Block 888 still on longest chain
 
 		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1, txHash2, txHash3, txHash4})
 
@@ -4300,13 +4298,13 @@ func TestSubtreeProcessor_checkMarkNotOnLongestChain(t *testing.T) {
 		}
 		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(txMeta, nil)
 
-		// Mock CheckBlockIsInCurrentChain - this will still be called due to the continue bug
-		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+		// CheckBlockIsInCurrentChain should NOT be called - both non-invalid blockIDs are
+		// recognized from the last 1000 block headers, so no blockchain query is needed
 
 		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
 
 		require.NoError(t, err)
-		require.Len(t, result, 0) // Should not mark since it's still on longest chain
+		require.Len(t, result, 0) // Should not mark since it's in recent blocks
 		mockBlockchainClient.AssertExpectations(t)
 		mockUtxoStore.AssertExpectations(t)
 	})
