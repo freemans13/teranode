@@ -944,6 +944,9 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		}
 
 		// Accumulate external files
+		// NOTE: When skipParentUpdates=true, inputs are not fetched, so all external
+		// files are classified as FileTypeOutputs. This is acceptable because
+		// skipParentUpdates is only used when external file support is not needed.
 		external, isExternal := rec.Record.Bins[s.fieldExternal].(bool)
 		if isExternal && external {
 			fileType := fileformat.FileTypeOutputs
