@@ -2596,44 +2596,21 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 	}
 
-	// Consolidate all "mark as false" operations into a single call
-	// This includes: losing transactions + all transactions in block assembly (chainedSubtrees + currentSubtree)
-	subtreeNodeCount := 0
-	for _, subtree := range stp.chainedSubtrees {
-		subtreeNodeCount += len(subtree.Nodes)
-	}
-	currentSubtree := stp.currentSubtree.Load()
-	subtreeNodeCount += len(currentSubtree.Nodes)
-
-	allMarkFalse := getHashSlice(len(*allLosingTxHashes) + subtreeNodeCount)
-
-	// Add losing conflicting transactions
-	*allMarkFalse = append(*allMarkFalse, *allLosingTxHashes...)
-	putHashSlice(allLosingTxHashes)
-
-	// Add everything in block assembly (not mined on the longest chain)
-	for _, subtree := range stp.chainedSubtrees {
-		for _, node := range subtree.Nodes {
-			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				*allMarkFalse = append(*allMarkFalse, node.Hash)
-			}
-		}
-	}
-
-	for _, node := range currentSubtree.Nodes {
-		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			*allMarkFalse = append(*allMarkFalse, node.Hash)
-		}
-	}
-
-	// Make one consolidated call instead of separate calls
-	if len(*allMarkFalse) > 0 {
-		if err = stp.markNotOnLongestChain(ctx, moveBackBlocks, moveForwardBlocks, *allMarkFalse, movedBackBlockTxMap); err != nil {
-			putHashSlice(allMarkFalse)
+	// Mark losing conflicting transactions as not on longest chain.
+	//
+	// Assembly txs (chainedSubtrees + currentSubtree) are NOT included here because
+	// they already have unmined_since set from when they entered the assembly queue.
+	// MoveBack txs are already handled by BlockAssembler.Reset (which calls
+	// MarkTransactionsOnLongestChain before reorgBlocks runs). For invalidation,
+	// setTxMinedStatus(unsetMined=true) handles the invalidated block's txs.
+	// Including the billions of assembly txs would be purely idempotent writes.
+	if len(*allLosingTxHashes) > 0 {
+		if err = stp.markNotOnLongestChain(ctx, *allLosingTxHashes); err != nil {
+			putHashSlice(allLosingTxHashes)
 			return err
 		}
 	}
-	putHashSlice(allMarkFalse)
+	putHashSlice(allLosingTxHashes)
 
 	// announce all the subtrees to the network
 	// this will also store it by the Server in the subtree store
@@ -2670,43 +2647,18 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	return nil
 }
 
-func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, markNotOnLongestChain []chainhash.Hash, movedBackBlockTxMap map[chainhash.Hash]struct{}) error {
-	if len(moveBackBlocks) == 1 && len(moveForwardBlocks) == 0 {
-		// special case: likely an invalidation; validate whether to update the transactions or not
-		_, blockHeaderMeta, err := stp.blockchainClient.GetBlockHeader(ctx, moveBackBlocks[0].Header.Hash())
-		if err != nil {
-			return errors.NewProcessingError("[reorgBlocks] error getting block header meta for block we moved back", err)
-		}
-
-		if blockHeaderMeta.Invalid {
-			// Skip markNotOnLongestChain entirely for block invalidation.
-			//
-			// BlockValidation's setTxMinedStatus(unsetMined=true) handles all txs in the
-			// invalidated block via the Lua UDF setMined, which:
-			//   - Removes the invalid block's ID from each tx's block_ids list
-			//   - If no blocks remain: sets unmined_since = currentBlockHeight
-			//   - If other valid blocks remain: leaves unmined_since untouched (tx stays mined)
-			//
-			// This correctly handles both single-block and multi-block tx scenarios.
-			// setTxMinedStatus runs as a background job and may not have completed yet,
-			// but that is acceptable — the txs have already been re-added to assembly by
-			// moveBackBlock, and unmined_since will be set shortly when the job completes.
-			//
-			// The remaining assembly txs (not in the invalidated block) already have
-			// unmined_since set from when they entered the assembly queue.
-			//
-			// Skipping this eliminates all UTXO store reads (fetching blockIDs per tx)
-			// and MarkTransactionsOnLongestChain writes for what can be billions of txs
-			// in production.
-			stp.logger.Infof("[reorgBlocks] block %s is invalid, skipping markNotOnLongestChain for %d transactions — setTxMinedStatus handles invalidated block txs", moveBackBlocks[0].String(), len(markNotOnLongestChain))
-			return nil
-		}
-	}
-
-	// mark remaining transactions as not on longest chain (non-invalidation reorg paths)
-	if len(markNotOnLongestChain) > 0 {
-		if err := stp.utxoStore.MarkTransactionsOnLongestChain(ctx, markNotOnLongestChain, false); err != nil {
-			return errors.NewProcessingError("[reorgBlocks] error marking transactions as not on longest chain in utxo store", err)
+func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, losingTxHashes []chainhash.Hash) error {
+	// Mark losing conflicting transactions as not on longest chain.
+	// This is only called with losing txs from moveForwardBlock (conflicting/double-spent txs).
+	//
+	// Assembly txs are excluded because they already have unmined_since set.
+	// MoveBack txs are handled by BlockAssembler.Reset before reorgBlocks runs.
+	// For invalidation (1 back, 0 forward), there are no moveForward blocks and
+	// therefore no losing txs, so this function is not called — setTxMinedStatus
+	// handles the invalidated block's txs.
+	if len(losingTxHashes) > 0 {
+		if err := stp.utxoStore.MarkTransactionsOnLongestChain(ctx, losingTxHashes, false); err != nil {
+			return errors.NewProcessingError("[reorgBlocks] error marking losing transactions as not on longest chain in utxo store", err)
 		}
 	}
 
