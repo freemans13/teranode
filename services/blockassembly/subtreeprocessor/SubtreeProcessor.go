@@ -40,7 +40,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/retry"
@@ -2663,107 +2662,6 @@ func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, losingTx
 	}
 
 	return nil
-}
-
-func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, invalidBlock *model.Block, markNotOnLongestChain []chainhash.Hash) ([]chainhash.Hash, error) {
-	stp.logger.Infof("[reorgBlocks] block %s we moved back is invalid, checking %d transactions for longest chain status", invalidBlock.String(), len(markNotOnLongestChain))
-
-	checkMarkNotOnLongestChain := make([]chainhash.Hash, 0, len(markNotOnLongestChain))
-
-	_, lastBlockHeaderMetas, err := stp.blockchainClient.GetBlockHeaders(ctx, invalidBlock.Header.HashPrevBlock, 1000)
-	if err != nil {
-		return nil, errors.NewProcessingError("[reorgBlocks] error getting last block headers", err)
-	}
-
-	lastBlockHeaderIDs := make(map[uint32]bool)
-	for _, header := range lastBlockHeaderMetas {
-		lastBlockHeaderIDs[header.ID] = true
-	}
-
-	txMetas := make([]*meta.Data, len(markNotOnLongestChain))
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(stp.settings.UtxoStore.GetBatcherSize * 2)
-
-	// Fetch BlockIDs for each transaction from the UTXO store concurrently
-	for idx, hash := range markNotOnLongestChain {
-		idx := idx
-		hashRef := &hash
-
-		g.Go(func() error {
-			txMeta, err := stp.utxoStore.Get(gCtx, hashRef, fields.BlockIDs)
-			if err != nil {
-				return errors.NewProcessingError("[reorgBlocks] error getting transaction from utxo store", err)
-			}
-
-			txMetas[idx] = txMeta
-
-			return nil
-		})
-	}
-
-	if err = g.Wait(); err != nil {
-		return nil, err
-	}
-
-	// Collect all unique blockIDs that need chain-checking, excluding the invalid block
-	// and blocks already known to be recent (in the last 1000 headers)
-	blockIDsToCheck := make(map[uint32]struct{})
-	for idx := range markNotOnLongestChain {
-		txMeta := txMetas[idx]
-		if txMeta == nil {
-			continue // handled in the per-tx loop below
-		}
-		if len(txMeta.BlockIDs) == 1 && txMeta.BlockIDs[0] == invalidBlock.ID {
-			continue // fast-path: only in invalid block, no chain check needed
-		}
-		for _, blockID := range txMeta.BlockIDs {
-			if blockID != invalidBlock.ID && !lastBlockHeaderIDs[blockID] {
-				blockIDsToCheck[blockID] = struct{}{}
-			}
-		}
-	}
-
-	// Build the on-chain block lookup: start with known recent blocks, then check each
-	// unique unknown blockID once (instead of per-tx calls)
-	onChainBlocks := make(map[uint32]bool, len(lastBlockHeaderIDs)+len(blockIDsToCheck))
-	for id := range lastBlockHeaderIDs {
-		onChainBlocks[id] = true
-	}
-	for blockID := range blockIDsToCheck {
-		onChain, checkErr := stp.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{blockID})
-		if checkErr != nil {
-			return nil, errors.NewProcessingError("[reorgBlocks] error checking if block is on longest chain", checkErr)
-		}
-		onChainBlocks[blockID] = onChain
-	}
-
-	// Filter transactions using pre-computed block chain status
-	for idx, hash := range markNotOnLongestChain {
-		txMeta := txMetas[idx]
-		if txMeta == nil {
-			// transaction not found, not OK
-			return nil, errors.NewProcessingError("[reorgBlocks] error getting transaction %s from longest chain", hash.String())
-		}
-
-		if len(txMeta.BlockIDs) == 1 && txMeta.BlockIDs[0] == invalidBlock.ID {
-			// the transaction is only in the invalid block, so it is definitely not on the longest chain
-			checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
-		} else {
-			// Check if any of the tx's blocks are on the longest chain using pre-computed results
-			txOnChain := false
-			for _, blockID := range txMeta.BlockIDs {
-				if onChainBlocks[blockID] {
-					txOnChain = true
-					break
-				}
-			}
-			if !txOnChain {
-				checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
-			}
-		}
-	}
-
-	return checkMarkNotOnLongestChain, nil
 }
 
 // setTxCountFromSubtrees recalculates the total transaction count
