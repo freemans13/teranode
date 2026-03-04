@@ -116,20 +116,16 @@ func (s *SQL) GetBlockHeaderIDs(ctx context.Context, blockHashFrom *chainhash.Ha
 	ids := make([]uint32, 0, initialCap)
 
 	q := `
-		WITH RECURSIVE start_block AS (
-			SELECT id, parent_id, height
+		WITH RECURSIVE ChainBlocks AS (
+			SELECT id, parent_id, 1 AS depth
 			FROM blocks
 			WHERE hash = $1
-		),
-		ChainBlocks AS (
-			SELECT id, parent_id, height FROM start_block
 			UNION ALL
-			SELECT bb.id, bb.parent_id, bb.height
+			SELECT bb.id, bb.parent_id, cb.depth + 1
 			FROM blocks bb
 			JOIN ChainBlocks cb ON bb.id = cb.parent_id
-			CROSS JOIN start_block sb
 			WHERE bb.id != cb.id
-			  AND bb.height >= sb.height - $2
+			  AND cb.depth < $2
 		)
 		SELECT id FROM ChainBlocks
 		LIMIT $2
