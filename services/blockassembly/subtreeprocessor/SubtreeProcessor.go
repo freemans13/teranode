@@ -2595,21 +2595,52 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 	}
 
-	// Mark losing conflicting transactions as not on longest chain.
+	// Consolidate all "mark as not on longest chain" operations:
+	// 1. Losing conflicting transactions from moveForward blocks
+	// 2. All transactions currently in block assembly (chainedSubtrees + currentSubtree)
 	//
-	// Assembly txs (chainedSubtrees + currentSubtree) are NOT included here because
-	// they already have unmined_since set from when they entered the assembly queue.
-	// MoveBack txs are already handled by BlockAssembler.Reset (which calls
-	// MarkTransactionsOnLongestChain before reorgBlocks runs). For invalidation,
-	// setTxMinedStatus(unsetMined=true) handles the invalidated block's txs.
-	// Including the billions of assembly txs would be purely idempotent writes.
-	if len(*allLosingTxHashes) > 0 {
-		if err = stp.markNotOnLongestChain(ctx, *allLosingTxHashes); err != nil {
-			putHashSlice(allLosingTxHashes)
+	// Assembly txs must be included because some may have entered the UTXO store via
+	// block validation of a non-longest-chain block (e.g., competing fork), where they
+	// were inserted with UnminedSince=0 (mined). These need unmined_since set.
+	// For txs that already have unmined_since set (from propagation), this is idempotent.
+	//
+	// MoveBack txs are handled by BlockAssembler.Reset (which calls
+	// MarkTransactionsOnLongestChain before reorgBlocks runs).
+	subtreeNodeCount := 0
+	for _, subtree := range stp.chainedSubtrees {
+		subtreeNodeCount += len(subtree.Nodes)
+	}
+	currentSubtree := stp.currentSubtree.Load()
+	subtreeNodeCount += len(currentSubtree.Nodes)
+
+	allMarkFalse := getHashSlice(len(*allLosingTxHashes) + subtreeNodeCount)
+
+	// Add losing conflicting transactions
+	*allMarkFalse = append(*allMarkFalse, *allLosingTxHashes...)
+	putHashSlice(allLosingTxHashes)
+
+	// Add all transactions in block assembly
+	for _, subtree := range stp.chainedSubtrees {
+		for _, node := range subtree.Nodes {
+			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				*allMarkFalse = append(*allMarkFalse, node.Hash)
+			}
+		}
+	}
+
+	for _, node := range currentSubtree.Nodes {
+		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			*allMarkFalse = append(*allMarkFalse, node.Hash)
+		}
+	}
+
+	if len(*allMarkFalse) > 0 {
+		if err = stp.markNotOnLongestChain(ctx, *allMarkFalse); err != nil {
+			putHashSlice(allMarkFalse)
 			return err
 		}
 	}
-	putHashSlice(allLosingTxHashes)
+	putHashSlice(allMarkFalse)
 
 	// announce all the subtrees to the network
 	// this will also store it by the Server in the subtree store
@@ -2646,18 +2677,17 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	return nil
 }
 
-func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, losingTxHashes []chainhash.Hash) error {
-	// Mark losing conflicting transactions as not on longest chain.
-	// This is only called with losing txs from moveForwardBlock (conflicting/double-spent txs).
+func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, txHashes []chainhash.Hash) error {
+	// Mark transactions as not on longest chain (set unmined_since).
+	// Called with the combined set of:
+	// 1. Losing conflicting txs from moveForward blocks
+	// 2. All txs currently in block assembly
 	//
-	// Assembly txs are excluded because they already have unmined_since set.
+	// For txs that already have unmined_since set, this is an idempotent write.
 	// MoveBack txs are handled by BlockAssembler.Reset before reorgBlocks runs.
-	// For invalidation (1 back, 0 forward), there are no moveForward blocks and
-	// therefore no losing txs, so this function is not called — setTxMinedStatus
-	// handles the invalidated block's txs.
-	if len(losingTxHashes) > 0 {
-		if err := stp.utxoStore.MarkTransactionsOnLongestChain(ctx, losingTxHashes, false); err != nil {
-			return errors.NewProcessingError("[reorgBlocks] error marking losing transactions as not on longest chain in utxo store", err)
+	if len(txHashes) > 0 {
+		if err := stp.utxoStore.MarkTransactionsOnLongestChain(ctx, txHashes, false); err != nil {
+			return errors.NewProcessingError("[reorgBlocks] error marking transactions as not on longest chain in utxo store", err)
 		}
 	}
 
