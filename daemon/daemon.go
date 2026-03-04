@@ -274,8 +274,6 @@ func (d *Daemon) updateServiceStatuses(logger ulogger.Logger) {
 
 // Start initializes and starts the Daemon and its services.
 func (d *Daemon) Start(logger ulogger.Logger, args []string, appSettings *settings.Settings, readyChannel ...chan struct{}) {
-	configureMemoryLimit(logger)
-
 	if d.loggerFactory == nil {
 		d.loggerFactory = func(serviceName string) ulogger.Logger {
 			return ulogger.New(serviceName, ulogger.WithLevel(appSettings.LogLevel))
