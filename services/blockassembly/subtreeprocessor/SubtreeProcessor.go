@@ -2679,44 +2679,31 @@ func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, moveBack
 		}
 
 		if blockHeaderMeta.Invalid {
-			// Performance optimization: use movedBackBlockTxMap to partition which txs need
-			// checking via checkMarkNotOnLongestChain. In production, block assembly can hold
-			// over a billion txs. Even though UTXO store reads are batched (via go-batcher
-			// into BatchOperate calls), funnelling a billion items through the batcher and
-			// then running blockchain chain-membership checks on each result is prohibitive.
+			// Skip markNotOnLongestChain entirely for block invalidation.
 			//
-			// Only txs that were in the invalidated block need checking, because those are
-			// the ones whose unmined_since was cleared when the block was originally mined.
-			// They may also exist in another valid block on the chain, so we must verify
-			// their chain status before marking them as unmined.
+			// BlockValidation's setTxMinedStatus(unsetMined=true) handles all txs in the
+			// invalidated block via the Lua UDF setMined, which:
+			//   - Removes the invalid block's ID from each tx's block_ids list
+			//   - If no blocks remain: sets unmined_since = currentBlockHeight
+			//   - If other valid blocks remain: leaves unmined_since untouched (tx stays mined)
 			//
-			// The remaining assembly txs (otherTxs) were never mined in this block — they
-			// were already sitting in the assembly queue with unmined_since set. Marking them
-			// again is idempotent and safe, so they skip checkMarkNotOnLongestChain entirely.
-			var invalidatedBlockTxs []chainhash.Hash
-			var otherTxs []chainhash.Hash
-			for _, hash := range markNotOnLongestChain {
-				if _, inBlock := movedBackBlockTxMap[hash]; inBlock {
-					invalidatedBlockTxs = append(invalidatedBlockTxs, hash)
-				} else {
-					otherTxs = append(otherTxs, hash)
-				}
-			}
-
-			stp.logger.Infof("[reorgBlocks] partitioning %d transactions: %d from invalidated block (checking), %d from assembly (marking directly)", len(markNotOnLongestChain), len(invalidatedBlockTxs), len(otherTxs))
-
-			// Only run checkMarkNotOnLongestChain on the invalidated block's txs
-			filteredInvalidated, err := stp.checkMarkNotOnLongestChain(ctx, moveBackBlocks[0], invalidatedBlockTxs)
-			if err != nil {
-				return errors.NewProcessingError("[reorgBlocks] error checking which transactions to mark as not on longest chain", err)
-			}
-
-			// Combine: filtered invalidated txs + other assembly txs (already unmined, idempotent to mark)
-			markNotOnLongestChain = append(filteredInvalidated, otherTxs...)
+			// This correctly handles both single-block and multi-block tx scenarios.
+			// setTxMinedStatus runs as a background job and may not have completed yet,
+			// but that is acceptable — the txs have already been re-added to assembly by
+			// moveBackBlock, and unmined_since will be set shortly when the job completes.
+			//
+			// The remaining assembly txs (not in the invalidated block) already have
+			// unmined_since set from when they entered the assembly queue.
+			//
+			// Skipping this eliminates all UTXO store reads (fetching blockIDs per tx)
+			// and MarkTransactionsOnLongestChain writes for what can be billions of txs
+			// in production.
+			stp.logger.Infof("[reorgBlocks] block %s is invalid, skipping markNotOnLongestChain for %d transactions — setTxMinedStatus handles invalidated block txs", moveBackBlocks[0].String(), len(markNotOnLongestChain))
+			return nil
 		}
 	}
 
-	// check again if we have any transactions to mark, after the checkMarkNotOnLongestChain
+	// mark remaining transactions as not on longest chain (non-invalidation reorg paths)
 	if len(markNotOnLongestChain) > 0 {
 		if err := stp.utxoStore.MarkTransactionsOnLongestChain(ctx, markNotOnLongestChain, false); err != nil {
 			return errors.NewProcessingError("[reorgBlocks] error marking transactions as not on longest chain in utxo store", err)
