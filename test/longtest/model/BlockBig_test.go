@@ -17,7 +17,6 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	teranode_model "github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -44,7 +43,6 @@ func TestBlock_ValidBlockWithMultipleTransactions(t *testing.T) {
 	require.NoError(t, err)
 
 	currentChain := make([]*teranode_model.BlockHeader, 11)
-	currentChainIDs := make([]uint32, 11)
 	for i := 0; i < 11; i++ {
 		currentChain[i] = &teranode_model.BlockHeader{
 			HashPrevBlock:  &chainhash.Hash{},
@@ -52,19 +50,12 @@ func TestBlock_ValidBlockWithMultipleTransactions(t *testing.T) {
 			// set the last 11 block header timestamps to be less than the current timestamps
 			Timestamp: 1231469665 - uint32(i),
 		}
-		currentChainIDs[i] = uint32(i)
 	}
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
 
-	// check if the block is valid, we expect an error because of the duplicate transaction
-	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-
-	v, err := block.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, txMetaStore, oldBlockIDs, currentChain, currentChainIDs, tSettings, nil)
+	v, err := block.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, txMetaStore, currentChain, tSettings, nil)
 	require.NoError(t, err)
 	require.True(t, v)
-
-	_, hasTransactionsReferencingOldBlocks := txmap.ConvertSyncedMapToUint32Slice(oldBlockIDs)
-	require.False(t, hasTransactionsReferencingOldBlocks)
 }
 
 func calculateMerkleRoot(hashes []*chainhash.Hash) (*chainhash.Hash, error) {
@@ -383,7 +374,6 @@ func TestBlock_WithDuplicateTransaction(t *testing.T) {
 	require.NoError(t, err)
 
 	currentChain := make([]*teranode_model.BlockHeader, 11)
-	currentChainIDs := make([]uint32, 11)
 	for i := 0; i < 11; i++ {
 		currentChain[i] = &teranode_model.BlockHeader{
 			HashPrevBlock:  &chainhash.Hash{},
@@ -391,19 +381,12 @@ func TestBlock_WithDuplicateTransaction(t *testing.T) {
 			// set the last 11 block header timestamps to be less than the current timestamps
 			Timestamp: 1231469665 - uint32(i),
 		}
-		currentChainIDs[i] = uint32(i)
 	}
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
 
-	// check if the block is valid, we expect an error because of the duplicate transaction
-	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-
-	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, teranode_model.TestCachedTxMetaStore, oldBlockIDs, currentChain, currentChainIDs, tSettings, nil)
+	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, teranode_model.TestCachedTxMetaStore, currentChain, tSettings, nil)
 	require.Error(t, err)
 	require.False(t, v)
-
-	_, hasTransactionsReferencingOldBlocks := txmap.ConvertSyncedMapToUint32Slice(oldBlockIDs)
-	require.False(t, hasTransactionsReferencingOldBlocks)
 }
 
 // This test runs a large block.Valid() test with a large number of txids
@@ -429,7 +412,6 @@ func TestBigBlock_Valid(t *testing.T) {
 	}, data)
 
 	currentChain := make([]*teranode_model.BlockHeader, 11)
-	currentChainIDs := make([]uint32, 11)
 	for i := 0; i < 11; i++ {
 		currentChain[i] = &teranode_model.BlockHeader{
 			HashPrevBlock:  &chainhash.Hash{},
@@ -437,7 +419,6 @@ func TestBigBlock_Valid(t *testing.T) {
 			// set the last 11 block header timestamps to be less than the current timestamps
 			Timestamp: 1231469665 - uint32(i),
 		}
-		currentChainIDs[i] = uint32(i)
 	}
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
 
@@ -453,9 +434,8 @@ func TestBigBlock_Valid(t *testing.T) {
 	}
 
 	start := time.Now()
-	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
-	v, err := block.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, teranode_model.TestCachedTxMetaStore, oldBlockIDs, currentChain, currentChainIDs, tSettings, nil)
+	v, err := block.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, teranode_model.TestCachedTxMetaStore, currentChain, tSettings, nil)
 	require.NoError(t, err)
 	t.Logf("Time taken: %s\n", time.Since(start))
 

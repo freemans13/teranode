@@ -30,7 +30,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/null"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -106,60 +105,6 @@ func TestZeroCoverageFunctions(t *testing.T) {
 		assert.Len(t, result, 0)
 	})
 
-	t.Run("filterCurrentBlockHeaderIDsMap standalone", func(t *testing.T) {
-		// Test the standalone function - this is safe to call
-		parentTxMeta := &meta.Data{
-			BlockIDs: []uint32{1, 2, 3, 4, 5},
-		}
-
-		currentBlockHeaderIDsMap := map[uint32]struct{}{
-			2: {},
-			4: {},
-			6: {},
-		}
-
-		found, minID := filterCurrentBlockHeaderIDsMap(parentTxMeta, currentBlockHeaderIDsMap)
-		assert.Len(t, found, 2) // Should find 2 and 4
-		assert.Equal(t, uint32(1), minID)
-	})
-
-	t.Run("getParentTxMetaBlockIDs standalone", func(t *testing.T) {
-		// Test the standalone function - this will error but safely
-		txHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		parentHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-
-		parentTxStruct := missingParentTx{
-			parentTxHash: *parentHash,
-			txHash:       *txHash,
-		}
-
-		txMeta, err := getParentTxMetaBlockIDs(context.Background(), createTestUTXOStore(t), parentTxStruct)
-		// This may or may not error depending on implementation
-		_ = err
-		_ = txMeta
-	})
-
-	t.Run("ErrCheckParentExistsOnChain function", func(t *testing.T) {
-		// Test the standalone error function - this is safe to call
-		txHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		parentHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-
-		parentTxStruct := missingParentTx{
-			parentTxHash: *parentHash,
-			txHash:       *txHash,
-		}
-
-		parentTxMeta := &meta.Data{
-			BlockIDs: []uint32{1, 2, 3},
-		}
-
-		block := &Block{}
-
-		err := ErrCheckParentExistsOnChain(context.Background(), make(map[uint32]struct{}), parentTxMeta, createTestUTXOStore(t), parentTxStruct, block, make(map[uint32]struct{}))
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "parent transaction")
-	})
-
 	t.Run("getSubtreeMetaSlice basic", func(t *testing.T) {
 		// Test with empty inputs
 		block := &Block{}
@@ -201,7 +146,6 @@ func TestZeroCoverageFunctions(t *testing.T) {
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -227,7 +171,7 @@ func TestZeroCoverageFunctions(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
 
-		_, err := block.checkParentExistsOnChain(ctx, ulogger.TestLogger{}, createTestUTXOStore(t), parentTxStruct, make(map[uint32]struct{}))
+		err := block.checkParentExistsOnChain(ctx, createTestUTXOStore(t), parentTxStruct)
 		// Don't assert on error - just call the function
 		_ = err
 	})
@@ -255,12 +199,10 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 		subtreeStore := &mockSubtreeStore{shouldError: true}
 		txMetaStore := createTestUTXOStore(t)
-		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 		currentChain := []*BlockHeader{}
-		currentBlockHeaderIDs := []uint32{}
 
 		// This should hit many validation paths
-		valid, err := block.Valid(ctx, logger, subtreeStore, txMetaStore, oldBlockIDsMap, currentChain, currentBlockHeaderIDs, settings, nil)
+		valid, err := block.Valid(ctx, logger, subtreeStore, txMetaStore, currentChain, settings, nil)
 		// May pass or fail, but we're testing coverage
 		_ = valid
 		_ = err
@@ -292,7 +234,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should fail validation (may hit difficulty or timestamp validation)
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
 		assert.False(t, valid)
 		assert.Error(t, err) // Just verify it fails - the specific error depends on validation order
 	})
@@ -316,7 +258,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the nil coinbase validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
 		assert.False(t, valid)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "no coinbase tx")
@@ -349,7 +291,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the median timestamp validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), currentChain, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), currentChain, tSettings, nil)
 		// May pass or fail, but we're testing the median timestamp code path
 		_ = valid
 		_ = err
@@ -374,7 +316,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the coinbase height validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
 		// Will likely fail due to height mismatch, but we're testing the code path
 		_ = valid
 		_ = err
@@ -402,7 +344,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		subtreeStore := &mockSubtreeStore{shouldError: true} // Empty store
 
 		// This should hit the subtree validation path
-		valid, err := block.Valid(ctx, logger, subtreeStore, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, subtreeStore, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
 		// Will likely fail due to missing subtree, but we're testing the code path
 		_ = valid
 		_ = err
@@ -425,7 +367,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should skip median timestamp validation due to empty chain
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
 		// Should hit the empty chain path
 		_ = valid
 		_ = err
@@ -1162,7 +1104,6 @@ func TestBlock_ValidWithOneTransaction(t *testing.T) {
 	require.NoError(t, err)
 
 	currentChain := make([]*BlockHeader, 11)
-	currentChainIDs := make([]uint32, 11)
 
 	for i := 0; i < 11; i++ {
 		currentChain[i] = &BlockHeader{
@@ -1171,17 +1112,12 @@ func TestBlock_ValidWithOneTransaction(t *testing.T) {
 			// set the last 11 block header timestamps to be less than the current timestamps
 			Timestamp: 1231469665 - uint32(i), // nolint:gosec
 		}
-		currentChainIDs[i] = uint32(i) // nolint:gosec
 	}
 
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
-	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, utxoStore, oldBlockIDs, currentChain, currentChainIDs, settings, nil)
+	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, utxoStore, currentChain, settings, nil)
 	require.NoError(t, err)
 	require.True(t, v)
-
-	_, hasTransactionsReferencingOldBlocks := txmap.ConvertSyncedMapToUint32Slice(oldBlockIDs)
-	require.False(t, hasTransactionsReferencingOldBlocks)
 }
 
 func TestGetAndValidateSubtrees(t *testing.T) {
@@ -1266,7 +1202,6 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 
-	blockID1 := uint32(1)
 	blockID100 := uint32(100)
 	blockID101 := uint32(101)
 
@@ -1278,73 +1213,69 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	_, err = utxoStore.Create(context.Background(), tx, blockID101, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 101, BlockHeight: 101}))
 	require.NoError(t, err)
 
-	currentBlockHeaderIDsMap := make(map[uint32]struct{})
-	currentBlockHeaderIDsMap[blockID100] = struct{}{}
-
 	block := &Block{}
 
-	t.Run("test parent is in a previous block", func(t *testing.T) {
+	t.Run("test parent is mined", func(t *testing.T) {
 		parentTxStruct := missingParentTx{
 			parentTxHash: *txParent.TxIDChainHash(),
 			txHash:       *tx.TxIDChainHash(),
 		}
 
-		oldBlockIDs, err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
+		err := block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
 		require.NoError(t, err)
-		require.True(t, len(oldBlockIDs) == 0)
 	})
 
-	t.Run("test parent is not in a previous block", func(t *testing.T) {
-		// swap parent/tx hashes to simulate a missing parent
+	t.Run("test parent is mined in different block", func(t *testing.T) {
+		// swap parent/tx hashes - both are mined so both should pass
 		parentTxStruct := missingParentTx{
 			parentTxHash: *tx.TxIDChainHash(),
 			txHash:       *txParent.TxIDChainHash(),
 		}
 
-		oldBlockIDs, err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
-		require.Error(t, err)
-		require.True(t, len(oldBlockIDs) == 0)
-		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+		err := block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
+		require.NoError(t, err)
 	})
 
-	t.Run("test parent has no block ID", func(t *testing.T) {
-		txParentWithNoBlockID := newTx(3)
-		_, err = utxoStore.Create(context.Background(), txParentWithNoBlockID, 0)
+	t.Run("test parent is unmined", func(t *testing.T) {
+		txParentUnmined := newTx(3)
+		// Create without MinedBlockInfo at blockHeight > 0 so UnminedSince is set to a non-zero value
+		_, err = utxoStore.Create(context.Background(), txParentUnmined, 50)
+		require.NoError(t, err)
 		parentTxStruct := missingParentTx{
-			parentTxHash: *txParentWithNoBlockID.TxIDChainHash(),
+			parentTxHash: *txParentUnmined.TxIDChainHash(),
 			txHash:       *tx.TxIDChainHash(),
 		}
 
-		oldBlockIDs, err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
+		err = block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
 		require.Error(t, err)
-		require.True(t, len(oldBlockIDs) == 0)
 		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
 	})
 
-	t.Run("test parent is not in store so assume is in a previous block", func(t *testing.T) {
+	t.Run("test parent is not in store", func(t *testing.T) {
 		txMissingParent := newTx(999) // don't put this in the store
 		parentTxStruct := missingParentTx{
 			parentTxHash: *txMissingParent.TxIDChainHash(),
 			txHash:       *tx.TxIDChainHash(),
 		}
 
-		oldBlockIDs, err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
-		require.True(t, len(oldBlockIDs) == 0)
-		// After bug fix, missing parent now returns BLOCK_INVALID error instead of nil
+		err := block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
 		require.Error(t, err)
 		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
 	})
 
-	t.Run("test parent is in store and block ID is < min BlockID of last 100 blocks", func(t *testing.T) {
-		txMissingParent := newTx(4)
-		_, err = utxoStore.Create(context.Background(), txMissingParent, blockID1, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 1}))
+	t.Run("test parent mined in old block still passes", func(t *testing.T) {
+		// Parent mined in block 1 (old block) - with UnminedSince-based check, it should still pass
+		// because the parent IS mined (UnminedSince=0 regardless of how old the block is)
+		blockID1 := uint32(1)
+		txOldParent := newTx(4)
+		_, err = utxoStore.Create(context.Background(), txOldParent, blockID1, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 1}))
+		require.NoError(t, err)
 		parentTxStruct := missingParentTx{
-			parentTxHash: *txMissingParent.TxIDChainHash(),
+			parentTxHash: *txOldParent.TxIDChainHash(),
 			txHash:       *tx.TxIDChainHash(),
 		}
 
-		oldBlockIDs, err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
-		require.True(t, len(oldBlockIDs) > 0)
+		err = block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
 		require.NoError(t, err)
 	})
 }
@@ -1779,11 +1710,9 @@ func TestBlock_ValidOrderAndBlessed_ErrorCases(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
 
 		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
@@ -1813,11 +1742,9 @@ func TestBlock_ValidOrderAndBlessed_WithSubtrees(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
 
 		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
@@ -2056,14 +1983,12 @@ func TestBlock_Valid_MoreCoverage(t *testing.T) {
 
 		mockBlobStore := &mockSubtreeStore{shouldError: true}
 		txMetaStore := createTestUTXOStore(t)
-		oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
 		ctx := context.Background()
 		logger := ulogger.TestLogger{}
 
 		// Call with txMetaStore to trigger validOrderAndBlessed path
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, tSettings, nil)
 
 		// This might error due to missing subtrees, but we're testing the path
 		_ = valid
@@ -2150,10 +2075,6 @@ func TestBlock_CoverageBoost(t *testing.T) {
 		hashMap := block.buildBlockHeaderHashesMap(headers)
 		assert.Len(t, hashMap, 1)
 
-		// Test buildBlockHeaderIDsMap
-		ids := []uint32{1, 2, 3}
-		idMap := block.buildBlockHeaderIDsMap(ids)
-		assert.Len(t, idMap, 3)
 	})
 
 	t.Run("median timestamp calculations", func(t *testing.T) {
@@ -2292,27 +2213,23 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 		logger := ulogger.TestLogger{}
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
 		txMetaStore := createTestUTXOStore(t)
-		oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
 		// Test with nil subtreeStore to skip the subtree check
-		valid, err := block.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, nil, []*BlockHeader{}, tSettings, nil)
 
 		// Should succeed because we're skipping most validation
 		require.NoError(t, err)
 		assert.True(t, valid)
 
 		// Test with subtreeStore but no txMetaStore to test different paths
-		valid, err = block.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err = block.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, tSettings, nil)
 
 		// This will error due to missing subtrees but tests the path
 		_ = valid
 		_ = err
 
 		// Test with txMetaStore to trigger validOrderAndBlessed
-		valid, err = block.Valid(ctx, logger, nil, txMetaStore, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err = block.Valid(ctx, logger, nil, txMetaStore, []*BlockHeader{}, tSettings, nil)
 
 		_ = valid
 		_ = err
@@ -2414,19 +2331,16 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		defer cancel()
 
 		logger := ulogger.TestLogger{}
-		oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
 		// Test with only subtreeStore
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
-		_, err = block.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		_, err = block.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, tSettings, nil)
 		// Will error but exercises the subtree validation path
 		_ = err
 
 		// Test checkBlockRewardAndFees path with height > 0
 		block.Height = 100
-		_, err = block.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		_, err = block.Valid(ctx, logger, nil, nil, []*BlockHeader{}, tSettings, nil)
 		// Will error but exercises checkBlockRewardAndFees path
 		_ = err
 	})
@@ -2472,11 +2386,9 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 
 		// Create validation dependencies
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -2529,15 +2441,12 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 
 		// Create block headers for currentChain
 		blockHeaders := []*BlockHeader{blockHeader}
-		blockHeaderIDs := []uint32{1}
 
 		// Create validation dependencies with comprehensive setup
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          blockHeaders,
-			currentBlockHeaderIDs: blockHeaderIDs,
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: blockHeaders,
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -2567,7 +2476,6 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		defer cancel()
 
 		logger := ulogger.TestLogger{}
-		oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
 		// Test path 1: checkBlockRewardAndFees with height > 0 - avoid crash with proper subtree setup
 		block1, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 100, 0)
@@ -2581,8 +2489,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		require.NoError(t, err)
 
 		block1.SubtreeSlices = []*subtreepkg.Subtree{subtree}
-		_, err = block1.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		_, err = block1.Valid(ctx, logger, nil, nil, []*BlockHeader{}, tSettings, nil)
 		_ = err // Exercises checkBlockRewardAndFees path safely
 
 		// Test path 2: GetAndValidateSubtrees path
@@ -2593,16 +2500,14 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		block2.Subtrees = []*chainhash.Hash{hash1}
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
 
-		_, err = block2.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		_, err = block2.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, tSettings, nil)
 		_ = err // Exercises GetAndValidateSubtrees path
 
 		// Test path 3: validOrderAndBlessed path with txMetaStore
 		block3, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
 		require.NoError(t, err)
 		txMetaStore := createTestUTXOStore(t)
-		_, err = block3.Valid(ctx, logger, nil, txMetaStore, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		_, err = block3.Valid(ctx, logger, nil, txMetaStore, []*BlockHeader{}, tSettings, nil)
 		_ = err // Exercises validOrderAndBlessed path
 
 		// Test path 4: CheckMerkleRoot path
@@ -2616,8 +2521,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		require.NoError(t, err)
 
 		block4.SubtreeSlices = []*subtreepkg.Subtree{subtree2}
-		_, err = block4.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings, nil)
+		_, err = block4.Valid(ctx, logger, nil, nil, []*BlockHeader{}, tSettings, nil)
 		_ = err // Exercises CheckMerkleRoot path
 	})
 
@@ -2659,15 +2563,12 @@ func TestMaximumCoverageBoost(t *testing.T) {
 
 		// Create validation context with current block headers
 		currentChain := []*BlockHeader{blockHeader}
-		currentBlockHeaderIDs := []uint32{1}
 
 		// Create dependencies
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          currentChain,
-			currentBlockHeaderIDs: currentBlockHeaderIDs,
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: currentChain,
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -3050,7 +2951,6 @@ func TestBlock_ValidateSubtree_ComprehensiveCoverage(t *testing.T) {
 		// Create validation context
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3111,15 +3011,13 @@ func TestBlock_ValidateSubtree_ComprehensiveCoverage(t *testing.T) {
 
 		// Create validation dependencies
 		deps := &validationDependencies{
-			txMetaStore:    createTestUTXOStore(t),
-			subtreeStore:   mockStore,
-			oldBlockIDsMap: txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: mockStore,
 		}
 
 		// Create validation context
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3165,15 +3063,12 @@ func TestBlock_ValidateSubtree_MissingParents(t *testing.T) {
 
 	// Mock dependencies
 	deps := &validationDependencies{
-		txMetaStore:           createTestUTXOStore(t),
-		subtreeStore:          mockStore,
-		currentBlockHeaderIDs: []uint32{1, 2},
-		oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+		txMetaStore:  createTestUTXOStore(t),
+		subtreeStore: mockStore,
 	}
 
 	validationCtx := &validationContext{
 		currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-		currentBlockHeaderIDsMap:    map[uint32]struct{}{1: {}, 2: {}},
 		parentSpendsMap:             NewSplitSyncedParentMap(4),
 	}
 
@@ -3267,12 +3162,6 @@ func TestBlock_ValidateSubtree_MissingParents(t *testing.T) {
 		// Create minimal subtree metadata
 		subtreeMetaSlice := []byte{0x01}
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
-
-		// Set up block header IDs map to simulate older blocks scenario
-		validationCtx.currentBlockHeaderIDsMap = map[uint32]struct{}{
-			10: {}, // Current block at height 10
-			11: {}, // Next block at height 11
-		}
 
 		err = block.validateSubtree(ctx, ulogger.TestLogger{}, deps, validationCtx, subtree, 0)
 
@@ -3398,16 +3287,13 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          mockStore,
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: mockStore,
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3445,16 +3331,13 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          mockStore,
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{1, 2},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: mockStore,
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    map[uint32]struct{}{1: {}, 2: {}},
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3488,16 +3371,13 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          mockStore,
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: mockStore,
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3529,16 +3409,13 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          mockStore,
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{1, 2, 3},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: mockStore,
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    map[uint32]struct{}{1: {}, 2: {}, 3: {}},
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3550,8 +3427,8 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		_ = err // May succeed or fail but exercises parallel processing
 	})
 
-	t.Run("oldBlockIDsMap population", func(t *testing.T) {
-		// Test case that should populate the oldBlockIDsMap when old parent blocks are found
+	t.Run("parent transaction mined check", func(t *testing.T) {
+		// Test case that exercises parent transaction mined check via UnminedSince
 		subtree, err := subtreepkg.NewTreeByLeafCount(1)
 		require.NoError(t, err)
 
@@ -3571,24 +3448,19 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          mockStore,
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{10, 11}, // Higher block IDs
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: mockStore,
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    map[uint32]struct{}{10: {}, 11: {}},
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
-		// This should test the oldBlockIDsMap.Set() logic when old parent blocks are found
+		// Exercises checkParentExistsOnChain with UnminedSince-based mined check
 		err = block.validateSubtree(ctx, ulogger.TestLogger{}, deps, validationCtx, subtree, 0)
-
-		// Test exercises: deps.oldBlockIDsMap.Set(parentTxStruct.txHash, oldParentBlockIDs)
-		_ = err // Tests oldBlockIDsMap population logic
+		_ = err // Result depends on actual parent transaction state in store
 	})
 }
 
@@ -3625,16 +3497,13 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 	t.Run("transaction not found in txMap", func(t *testing.T) {
 		// Test case where transaction hash is not in the block's txMap
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3667,16 +3536,13 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3709,16 +3575,13 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3753,16 +3616,13 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3795,17 +3655,14 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
 
 		// Add some duplicate inputs to validation context
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
@@ -3841,25 +3698,14 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
-			subtreeStore:          &mockSubtreeStore{shouldError: true},
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:  createTestUTXOStore(t),
+			subtreeStore: &mockSubtreeStore{shouldError: true},
+			currentChain: []*BlockHeader{},
 		}
-
-		// Add block header IDs to simulate recent blocks
-		deps.currentBlockHeaderIDs = []uint32{1, 2}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
-		}
-
-		// Populate the current block header IDs map
-		for _, id := range deps.currentBlockHeaderIDs {
-			validationCtx.currentBlockHeaderIDsMap[id] = struct{}{}
 		}
 
 		// Create subtree and subtree meta
@@ -4083,11 +3929,9 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		deps := &validationDependencies{
-			txMetaStore:           txMetaStore,
-			subtreeStore:          mockBlobStore,
-			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
-			currentChain:          []*BlockHeader{},
-			currentBlockHeaderIDs: []uint32{},
+			txMetaStore:  txMetaStore,
+			subtreeStore: mockBlobStore,
+			currentChain: []*BlockHeader{},
 		}
 
 		// This should pass validation - coinbase placeholder is in correct position
@@ -4133,8 +3977,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		txMetaStore := createTestUTXOStore(t)
 
 		// This should fail the coinbase placeholder check
-		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, tSettings, nil)
 		require.Error(t, err)
 		require.False(t, valid)
 		assert.Contains(t, err.Error(), "first transaction in first subtree is not a coinbase placeholder")
@@ -4183,8 +4026,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		txMetaStore := createTestUTXOStore(t)
 
 		// This should fail validation - coinbase placeholder must be in first subtree, first position
-		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, tSettings, nil)
 		require.Error(t, err)
 		require.False(t, valid)
 		assert.Contains(t, err.Error(), "first transaction in first subtree is not a coinbase placeholder")
@@ -4215,8 +4057,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 
 		// With empty subtree slices, the validation should pass this check
 		// (it will fail on other validations)
-		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, tSettings, nil)
 		_ = valid
 		_ = err
 		// The coinbase placeholder check should be skipped for empty subtrees
@@ -4403,17 +4244,14 @@ func TestValidateSubtreeBenchmark(t *testing.T) {
 
 	// Set up validation dependencies (SHARED across all subtrees)
 	deps := &validationDependencies{
-		txMetaStore:           utxoStore,
-		subtreeStore:          mockStore,
-		currentChain:          []*BlockHeader{blockHeader},
-		currentBlockHeaderIDs: []uint32{1},
-		oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+		txMetaStore:  utxoStore,
+		subtreeStore: mockStore,
+		currentChain: []*BlockHeader{blockHeader},
 	}
 
 	// Set up validation context (SHARED - this is where the contention happens!)
 	validationCtx := &validationContext{
 		currentBlockHeaderHashesMap: map[chainhash.Hash]struct{}{*blockHeader.Hash(): {}},
-		currentBlockHeaderIDsMap:    map[uint32]struct{}{1: {}},
 		parentSpendsMap:             NewSplitSyncedParentMap(256), // THE CONTENDED RESOURCE
 	}
 

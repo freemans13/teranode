@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
@@ -1291,25 +1290,14 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 		return nil, errors.WrapGRPC(err)
 	}
 
-	blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, u.settings.BlockValidation.PreviousBlockHeaderCount)
+	blockHeaders, _, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, u.settings.BlockValidation.PreviousBlockHeaderCount)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewServiceError("[ValidateBlock][%s] failed to get block headers", block.String(), err))
 	}
 
-	blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
-	for i, blockHeaderMeta := range blockHeadersMeta {
-		blockHeaderIDs[i] = blockHeaderMeta.ID
-	}
-
-	oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-
 	// Create meta regenerator for potential meta file recovery (no peer URL for gRPC, local store only)
 	metaRegenerator := u.blockValidation.createMetaRegenerator(nil)
-	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
-		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err))
-	}
-
-	if err = u.blockValidation.checkOldBlockIDs(ctx, oldBlockIDsMap, block); err != nil {
+	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, u.settings, metaRegenerator); !ok {
 		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err))
 	}
 

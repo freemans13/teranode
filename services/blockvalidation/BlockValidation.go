@@ -19,9 +19,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"slices"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1333,8 +1330,6 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 		var optimisticMiningWg sync.WaitGroup
 
-		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-
 		if useOptimisticMining {
 			// NOTE: We do NOT cache the block here as subtrees are not yet loaded.
 			// The block will be cached after subtrees are validated in the background goroutine.
@@ -1360,22 +1355,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			go func() {
 				defer optimisticMiningWg.Done()
 
-				blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(decoupledCtx, block.Header.HashPrevBlock, u.settings.BlockValidation.MaxPreviousBlockHeadersToCheck)
-				if err != nil {
-					u.logger.Errorf("[ValidateBlock][%s] failed to get block header ids: %v", block.String(), err)
-
-					u.ReValidateBlock(block, baseURL)
-
-					return
-				}
-
-				u.logger.Infof("[ValidateBlock][%s] GetBlockHeaders DONE", block.Header.Hash().String())
-
 				u.logger.Infof("[ValidateBlock][%s] validating block in background", block.Hash().String())
 
 				// Create meta regenerator with peer URL for potential meta file recovery
 				metaRegenerator := u.createMetaRegenerator([]string{baseURL})
-				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
+				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, u.settings, metaRegenerator); !ok {
 					u.logger.Errorf("[ValidateBlock][%s] InvalidateBlock block is not valid in background: %v", block.String(), err)
 
 					if errors.Is(err, errors.ErrBlockInvalid) {
@@ -1387,22 +1371,6 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 						}
 					} else {
 						// storage or processing error, block is not really invalid, but we need to re-validate
-						u.ReValidateBlock(block, baseURL)
-					}
-
-					return
-				}
-
-				// check the old block IDs and invalidate the block if needed
-				if err = u.checkOldBlockIDs(decoupledCtx, oldBlockIDsMap, block); err != nil {
-					u.logger.Errorf("[ValidateBlock][%s] failed to check old block IDs: %s", block.String(), err)
-
-					if errors.Is(err, errors.ErrBlockInvalid) {
-						if _, invalidateBlockErr := u.blockchainClient.InvalidateBlock(decoupledCtx, block.Header.Hash()); invalidateBlockErr != nil {
-							u.logger.Errorf("[ValidateBlock][%s][InvalidateBlock] failed to invalidate block: %v", block.String(), invalidateBlockErr)
-						}
-					} else {
-						// some other error, re-validate the block
 						u.ReValidateBlock(block, baseURL)
 					}
 
@@ -1431,7 +1399,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// get all 100 previous block headers on the main chain
 			u.logger.Infof("[ValidateBlock][%s] GetBlockHeaders", block.Header.Hash().String())
 
-			blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, 100)
+			blockHeaders, _, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, 100)
 			if err != nil {
 				u.logger.Errorf("[ValidateBlock][%s] failed to get block headers: %s", block.String(), err)
 				u.ReValidateBlock(block, baseURL)
@@ -1439,19 +1407,14 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				return errors.NewServiceError("[ValidateBlock][%s] failed to get block headers", block.String(), err)
 			}
 
-			blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
-			for i, blockHeaderMeta := range blockHeadersMeta {
-				blockHeaderIDs[i] = blockHeaderMeta.ID
-			}
-
-			u.logger.Infof("[ValidateBlock][%s] GetBlockHeaderIDs DONE", block.Header.Hash().String())
+			u.logger.Infof("[ValidateBlock][%s] GetBlockHeaders DONE", block.Header.Hash().String())
 
 			// validate the block
 			u.logger.Infof("[ValidateBlock][%s] validating block", block.Hash().String())
 
 			// Create meta regenerator with peer URL for potential meta file recovery
 			metaRegenerator := u.createMetaRegenerator([]string{baseURL})
-			if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
+			if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, u.settings, metaRegenerator); !ok {
 				reason := "unknown"
 				if err != nil {
 					reason = err.Error()
@@ -1468,15 +1431,6 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
 
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err)
-			}
-
-			if iterationError := u.checkOldBlockIDs(ctx, oldBlockIDsMap, block); iterationError != nil {
-				if errors.Is(iterationError, errors.ErrBlockInvalid) {
-					reason := iterationError.Error()
-					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
-				}
-
-				return iterationError
 			}
 
 			u.logger.Infof("[ValidateBlock][%s] validating block DONE", block.Hash().String())
@@ -1749,12 +1703,6 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 		return errors.NewServiceError("[reValidateBlock][%s] failed to get block headers", blockData.block.String(), err)
 	}
 
-	// Extract block header IDs from the fresh block headers metadata
-	blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
-	for i, blockHeaderMeta := range blockHeadersMeta {
-		blockHeaderIDs[i] = blockHeaderMeta.ID
-	}
-
 	// Check if parent block is invalid during revalidation
 	// If parent is invalid, no point revalidating the child
 	if len(blockHeadersMeta) > 0 && blockHeadersMeta[0].Invalid {
@@ -1771,11 +1719,9 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 
 	u.logger.Infof("[ReValidateBlock][%s] validating %d subtrees DONE", blockData.block.Hash().String(), len(blockData.block.Subtrees))
 
-	oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-
 	// Create meta regenerator with peer URL for potential meta file recovery during revalidation
 	metaRegenerator := u.createMetaRegenerator([]string{blockData.baseURL})
-	if ok, err := blockData.block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
+	if ok, err := blockData.block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, u.settings, metaRegenerator); !ok {
 		u.logger.Errorf("[ReValidateBlock][%s] InvalidateBlock block is not valid in background: %v", blockData.block.String(), err)
 
 		if errors.Is(err, errors.ErrBlockInvalid) {
@@ -1787,7 +1733,7 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 		return err
 	}
 
-	return u.checkOldBlockIDs(ctx, oldBlockIDsMap, blockData.block)
+	return nil
 }
 
 // updateSubtreesDAH marks block subtrees as properly set in the blockchain.
@@ -1837,100 +1783,6 @@ func (u *BlockValidation) validateBlockSubtrees(ctx context.Context, block *mode
 	}
 
 	return u.subtreeValidationClient.CheckBlockSubtrees(ctx, block, peerID, baseURL)
-}
-
-// checkOldBlockIDs verifies that referenced blocks are in the current chain.
-// It prevents invalid chain reorganizations and maintains chain consistency.
-//
-// Parameters:
-//   - ctx: Context for the operation
-//   - oldBlockIDsMap: Map of transaction IDs to their parent block IDs
-//   - block: Block to check IDs for
-//
-// Returns an error if block verification fails.
-func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
-	block *model.Block,
-) (iterationError error) {
-	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "BlockValidation:checkOldBlockIDs",
-		tracing.WithDebugLogMessage(u.logger, "[checkOldBlockIDs][%s] checking %d old block IDs", oldBlockIDsMap.Length(), block.Hash().String()),
-	)
-
-	defer deferFn()
-
-	currentChainBlockIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Hash(), 10_000)
-	if err != nil {
-		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] failed to get block header ids", block.String(), err)
-	}
-
-	currentChainBlockIDsMap := make(map[uint32]struct{}, len(currentChainBlockIDs))
-	for _, blockID := range currentChainBlockIDs {
-		currentChainBlockIDsMap[blockID] = struct{}{}
-	}
-
-	currentChainLookupCache := make(map[string]bool, len(currentChainBlockIDs))
-
-	var builder strings.Builder
-
-	// range over the oldBlockIDsMap to get txID - oldBlockID pairs
-	oldBlockIDsMap.Iterate(func(txID chainhash.Hash, blockIDs []uint32) bool {
-		if len(blockIDs) == 0 {
-			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] blockIDs is empty for txID: %v", block.String(), txID)
-			return false
-		}
-
-		// check whether the blockIDs are in the current chain we just fetched
-		for _, blockID := range blockIDs {
-			if _, ok := currentChainBlockIDsMap[blockID]; ok {
-				// all good, continue
-				return true
-			}
-		}
-
-		slices.Sort(blockIDs)
-
-		builder.Reset()
-
-		for i, id := range blockIDs {
-			if i > 0 {
-				builder.WriteString(",") // Add a separator
-			}
-
-			builder.WriteString(strconv.Itoa(int(id)))
-		}
-
-		blockIDsString := builder.String()
-
-		// check whether we already checked exactly the same blockIDs and can use a cache
-		if blocksPartOfCurrentChain, ok := currentChainLookupCache[blockIDsString]; ok {
-			if !blocksPartOfCurrentChain {
-				iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain using cache", block.String(), txID, blockIDs)
-				return false
-			}
-
-			return true
-		}
-
-		// Flag to check if the old blocks are part of the current chain
-		blocksPartOfCurrentChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, blockIDs)
-		// if err is not nil, log the error and continue iterating for the next transaction
-		if err != nil {
-			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] failed to check if old blocks are part of the current chain", block.String(), err)
-			return false
-		}
-
-		// set the cache for the blockIDs
-		currentChainLookupCache[blockIDsString] = blocksPartOfCurrentChain
-
-		// if the blocks are not part of the current chain, stop iteration, set the iterationError and return false
-		if !blocksPartOfCurrentChain {
-			iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain", block.String(), txID, blockIDs)
-			return false
-		}
-
-		return true
-	})
-
-	return
 }
 
 // Wait waits for all background tasks to complete.

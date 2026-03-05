@@ -120,7 +120,7 @@ func TestCatchup_DeepReorgDuringCatchup(t *testing.T) {
 		mockBlockchainClient.On("GetBlock", mock.Anything, mock.Anything).
 			Return(&model.Block{}, nil).Maybe()
 
-		// Mock GetBlockHeaderIDs for checkOldBlockIDs
+		// Mock GetBlockHeaderIDs for setTxMined
 		mockBlockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
 			Return([]uint32{}, nil).Maybe()
 

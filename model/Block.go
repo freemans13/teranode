@@ -27,7 +27,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/retry"
@@ -359,8 +358,8 @@ type SubtreeStore interface {
 	GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (io.ReadCloser, error)
 }
 
-func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, txMetaStore utxo.Store, oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
-	currentChain []*BlockHeader, currentBlockHeaderIDs []uint32, settings *settings.Settings, metaRegenerator SubtreeMetaRegeneratorI) (bool, error) {
+func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, txMetaStore utxo.Store,
+	currentChain []*BlockHeader, settings *settings.Settings, metaRegenerator SubtreeMetaRegeneratorI) (bool, error) {
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "Valid",
 		tracing.WithHistogram(prometheusBlockValid),
 		tracing.WithLogMessage(logger, "[Block:Valid] called for %s", b.Header.String()),
@@ -517,12 +516,10 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	//     Can only be done with a valid texMetaStore passed in
 	if txMetaStore != nil {
 		deps := &validationDependencies{
-			txMetaStore:           txMetaStore,
-			subtreeStore:          subtreeStore,
-			currentChain:          currentChain,
-			currentBlockHeaderIDs: currentBlockHeaderIDs,
-			oldBlockIDsMap:        oldBlockIDsMap,
-			metaRegenerator:       metaRegenerator,
+			txMetaStore:     txMetaStore,
+			subtreeStore:    subtreeStore,
+			currentChain:    currentChain,
+			metaRegenerator: metaRegenerator,
 		}
 		err = b.validOrderAndBlessed(ctx, logger, deps, settings.Block.ValidOrderAndBlessedConcurrency, settings.Block.DiskMapDirs)
 		if err != nil {
@@ -689,12 +686,10 @@ func (b *Block) checkDuplicateTransactionsInSubtree(subtree *subtreepkg.Subtree,
 }
 
 type validationDependencies struct {
-	txMetaStore           utxo.Store
-	subtreeStore          SubtreeStore
-	currentChain          []*BlockHeader
-	currentBlockHeaderIDs []uint32
-	oldBlockIDsMap        *txmap.SyncedMap[chainhash.Hash, []uint32]
-	metaRegenerator       SubtreeMetaRegeneratorI // optional: nil means no regeneration
+	txMetaStore     utxo.Store
+	subtreeStore    SubtreeStore
+	currentChain    []*BlockHeader
+	metaRegenerator SubtreeMetaRegeneratorI // optional: nil means no regeneration
 }
 
 func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger, deps *validationDependencies, validOrderAndBlessedConcurrency int, diskMapDirs []string) error {
@@ -729,7 +724,6 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 
 	validationCtx := &validationContext{
 		currentBlockHeaderHashesMap: b.buildBlockHeaderHashesMap(deps.currentChain),
-		currentBlockHeaderIDsMap:    b.buildBlockHeaderIDsMap(deps.currentBlockHeaderIDs),
 		parentSpendsMap:             psMap,
 	}
 
@@ -804,14 +798,14 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 	}
 
 	if len(checkParentTxHashes) > 0 {
-		return b.checkParentsExistOnChain(ctx, logger, deps, validationCtx, checkParentTxHashes)
+		return b.checkParentsExistOnChain(ctx, logger, deps, checkParentTxHashes)
 	}
 
 	return nil
 }
 
 func (b *Block) checkParentsExistOnChain(ctx context.Context, logger ulogger.Logger, deps *validationDependencies,
-	validationCtx *validationContext, checkParentTxHashes []missingParentTx) error {
+	checkParentTxHashes []missingParentTx) error {
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "checkParentsExistOnChain",
 		tracing.WithLogMessage(logger, "[validateSubtree][%s] called to check %d parent tx hashes", b.String(), len(checkParentTxHashes)),
 	)
@@ -825,16 +819,7 @@ func (b *Block) checkParentsExistOnChain(ctx context.Context, logger ulogger.Log
 		parentTxStruct := parentTxStruct
 
 		parentG.Go(func() error {
-			oldParentBlockIDs, err := b.checkParentExistsOnChain(ctx, logger, deps.txMetaStore, parentTxStruct, validationCtx.currentBlockHeaderIDsMap)
-
-			// there are old blocks we need to return to the validator
-			if err == nil && len(oldParentBlockIDs) > 0 {
-				// insert tx id and old parent block ids (i.e. tx's parent block ids) into the map.
-				// Each tx id and its block ids will be checked by the validator separately.
-				deps.oldBlockIDsMap.Set(parentTxStruct.txHash, oldParentBlockIDs)
-			}
-
-			return err
+			return b.checkParentExistsOnChain(ctx, deps.txMetaStore, parentTxStruct)
 		})
 	}
 
@@ -843,7 +828,6 @@ func (b *Block) checkParentsExistOnChain(ctx context.Context, logger ulogger.Log
 
 type validationContext struct {
 	currentBlockHeaderHashesMap map[chainhash.Hash]struct{}
-	currentBlockHeaderIDsMap    map[uint32]struct{}
 	parentSpendsMap             ParentSpendsMap
 }
 
@@ -856,15 +840,6 @@ func (b *Block) buildBlockHeaderHashesMap(currentChain []*BlockHeader) map[chain
 	return currentBlockHeaderHashesMap
 }
 
-func (b *Block) buildBlockHeaderIDsMap(currentBlockHeaderIDs []uint32) map[uint32]struct{} {
-	currentBlockHeaderIDsMap := make(map[uint32]struct{}, len(currentBlockHeaderIDs))
-	for _, id := range currentBlockHeaderIDs {
-		currentBlockHeaderIDsMap[id] = struct{}{}
-	}
-
-	return currentBlockHeaderIDsMap
-}
-
 func (b *Block) getValidationConcurrency(validOrderAndBlessedConcurrency int) int {
 	concurrency := validOrderAndBlessedConcurrency
 	if concurrency <= 0 {
@@ -874,69 +849,27 @@ func (b *Block) getValidationConcurrency(validOrderAndBlessedConcurrency int) in
 	return concurrency
 }
 
-func (b *Block) checkParentExistsOnChain(gCtx context.Context, logger ulogger.Logger, txMetaStore utxo.Store, parentTxStruct missingParentTx, currentBlockHeaderIDsMap map[uint32]struct{}) ([]uint32, error) {
-	var oldBlockIDs []uint32
-
-	// check whether the parent transaction has already been mined in a block on our chain
-	// we need to get back to the txMetaStore for this, to make sure we have the latest data
-	// two options: 1- parent is currently under validation, 2- parent is from forked chain.
-	// for the first situation we don't start validating the current block until the parent is validated.
-	// parent tx meta was not found, must be old, ignore | it is a coinbase, which obviously is mined in a block
-	parentTxMeta, err := getParentTxMetaBlockIDs(gCtx, txMetaStore, parentTxStruct)
+// checkParentExistsOnChain checks whether a parent transaction is mined by verifying
+// its UnminedSince field. If UnminedSince > 0, the parent is unmined and the block is invalid.
+// This is safe because:
+//   - SetTxMined clears UnminedSince synchronously before the next block validates
+//   - Reorg flow (MarkTransactionsOnLongestChain) sets UnminedSince before any consumer reads it
+//   - Imported/restored txs (via seeder) have UnminedSince=0 by construction
+func (b *Block) checkParentExistsOnChain(gCtx context.Context, txMetaStore utxo.Store, parentTxStruct missingParentTx) error {
+	parentTxMeta, err := txMetaStore.Get(gCtx, &parentTxStruct.parentTxHash, fields.UnminedSince)
 	if err != nil {
-		return oldBlockIDs, err
-	}
-
-	if parentTxMeta == nil {
-		return oldBlockIDs, nil
-	}
-
-	if len(parentTxMeta.BlockIDs) > 0 && parentTxMeta.BlockIDs[0] == GenesisBlockID {
-		// when blockIds[0] is GenesisBlockID, it means the transaction was imported from a restore and is on a valid chain
-		return oldBlockIDs, nil
-	}
-
-	// check whether the parent is on our current chain (of 100 blocks), it should be, because the tx meta is still in the store
-	foundInPreviousBlocks, minBlockID := filterCurrentBlockHeaderIDsMap(parentTxMeta, currentBlockHeaderIDsMap)
-
-	if len(foundInPreviousBlocks) == 0 && minBlockID > 0 {
-		var minSetBlockID uint32
-		for blockID := range currentBlockHeaderIDsMap {
-			if minSetBlockID == 0 || blockID < minSetBlockID {
-				minSetBlockID = blockID
-			}
+		if errors.Is(err, errors.ErrTxNotFound) {
+			return errors.NewBlockInvalidError("parent transaction %s of tx %s not found in txMetaStore", parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String())
 		}
 
-		if minBlockID < minSetBlockID {
-			// parent is from a block that is older than the blocks we have in the current chain
-			logger.Debugf("[BLOCK][%s] parent transaction %s of tx %s is over %d blocks ago - checking later in validator", b.String(), parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String(), len(currentBlockHeaderIDsMap))
-
-			// we need to return parentTxMeta.BlockIDs back to validator, which can check if those blocks are part of our chain
-			oldBlockIDs = append(oldBlockIDs, parentTxMeta.BlockIDs...)
-
-			return oldBlockIDs, nil
-		}
+		return errors.NewStorageError("error getting parent transaction %s from txMetaStore", parentTxStruct.parentTxHash.String(), err)
 	}
 
-	if len(foundInPreviousBlocks) != 1 {
-		return oldBlockIDs, ErrCheckParentExistsOnChain(gCtx, currentBlockHeaderIDsMap, parentTxMeta, txMetaStore, parentTxStruct, b, foundInPreviousBlocks)
+	if parentTxMeta.UnminedSince > 0 {
+		return errors.NewBlockInvalidError("parent transaction %s of tx %s is unmined (unminedSince=%d)", parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String(), parentTxMeta.UnminedSince)
 	}
 
-	return oldBlockIDs, nil
-}
-
-func ErrCheckParentExistsOnChain(gCtx context.Context, currentBlockHeaderIDsMap map[uint32]struct{}, parentTxMeta *meta.Data, txMetaStore utxo.Store, parentTxStruct missingParentTx, b *Block, foundInPreviousBlocks map[uint32]struct{}) error {
-	headerErr := errors.NewBlockError("currentBlockHeaderIDs: %v", currentBlockHeaderIDsMap)
-	headerErr = errors.NewBlockError("parent TxMeta: %v", parentTxMeta, headerErr)
-
-	txMeta := &meta.Data{}
-	if err := txMetaStore.GetMeta(gCtx, &parentTxStruct.txHash, txMeta); err != nil {
-		headerErr = errors.NewProcessingError("txMetaStore error getting transaction %s: %v", parentTxStruct.txHash.String(), err, headerErr)
-	} else {
-		headerErr = errors.NewProcessingError("tx TxMeta: %v", txMeta, headerErr)
-	}
-
-	return errors.NewBlockInvalidError("[BLOCK][%s] parent transaction %s of tx %s is not valid on our current chain, found %d times", b.String(), parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String(), len(foundInPreviousBlocks), headerErr)
+	return nil
 }
 
 type transactionValidationParams struct {
@@ -1025,41 +958,6 @@ func (b *Block) checkParentTransactions(parentTxHashes []chainhash.Hash, txIdx u
 	}
 
 	return checkParentTxHashes, nil
-}
-
-func filterCurrentBlockHeaderIDsMap(parentTxMeta *meta.Data, currentBlockHeaderIDsMap map[uint32]struct{}) (map[uint32]struct{}, uint32) {
-	foundInPreviousBlocks := make(map[uint32]struct{}, len(parentTxMeta.BlockIDs))
-
-	var minBlockID uint32
-
-	for _, blockID := range parentTxMeta.BlockIDs {
-		if minBlockID == 0 || blockID < minBlockID {
-			minBlockID = blockID
-		}
-
-		if _, found := currentBlockHeaderIDsMap[blockID]; found {
-			foundInPreviousBlocks[blockID] = struct{}{}
-		}
-	}
-
-	return foundInPreviousBlocks, minBlockID
-}
-
-func getParentTxMetaBlockIDs(gCtx context.Context, txMetaStore utxo.Store, parentTxStruct missingParentTx) (*meta.Data, error) {
-	parentTxMeta, err := txMetaStore.Get(gCtx, &parentTxStruct.parentTxHash, fields.BlockIDs)
-	if err != nil {
-		if errors.Is(err, errors.ErrTxNotFound) {
-			return nil, errors.NewBlockInvalidError("parent transaction %s of tx %s not found in txMetaStore", parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String())
-		}
-
-		return nil, errors.NewStorageError("error getting parent transaction %s from txMetaStore", parentTxStruct.parentTxHash.String(), err)
-	}
-
-	if len(parentTxMeta.BlockIDs) == 0 {
-		return nil, errors.NewBlockInvalidError("parent transaction %s of tx %s has no block IDs", parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String())
-	}
-
-	return parentTxMeta, nil
 }
 
 func (b *Block) GetSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, getAndValidateSubtreesConcurrency int) ([]*subtreepkg.Subtree, error) {
