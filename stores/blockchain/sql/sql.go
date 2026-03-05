@@ -43,6 +43,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// chainWalkCacheTTL is the time-to-live for chain walk cache entries (GetBlockHeaderIDs,
+// GetBlockHeaders). Set to 10 minutes because block validation in production can take
+// several minutes, and the cached results (parent_id walks) are immutable.
+const chainWalkCacheTTL = 10 * time.Minute
+
 // SQL implements the blockchain.Store interface using SQL database backends.
 // It provides a complete implementation of blockchain data storage and retrieval
 // operations with support for different SQL engines, caching mechanisms, and
@@ -81,6 +86,13 @@ type SQL struct {
 	// CheckBlockIsInCurrentChain to reject non-existent block IDs without a DB query.
 	// Updated atomically in StoreBlock after each successful insert.
 	maxBlockID atomic.Uint64
+	// chainWalkCache is a dedicated cache for chain-walking queries (GetBlockHeaderIDs,
+	// GetBlockHeaders) that follow parent_id links. Unlike responseCache, this is only
+	// invalidated on chain reorganizations (InvalidateBlock/RevalidateBlock), because
+	// parent_id links are immutable once stored. This prevents the cache-thrashing
+	// problem where responseCache is wiped 5+ times per block by StoreBlock and
+	// SetBlock* operations during sync.
+	chainWalkCache *GenerationalCache
 }
 
 // New creates and initializes a new SQL blockchain store instance.
@@ -166,6 +178,7 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 		engine:           util.SQLEngine(storeURL.Scheme),
 		logger:           logger,
 		responseCache:    NewGenerationalCache(),
+		chainWalkCache:   NewGenerationalCache(),
 		cacheTTL:         2 * time.Minute,
 		chainParams:      tSettings.ChainCfgParams,
 		offChainBlockIDs: make(map[uint32]struct{}),
@@ -205,6 +218,8 @@ func (s *SQL) GetDBEngine() util.SQLEngine {
 }
 
 func (s *SQL) Close() error {
+	s.responseCache.Stop()
+	s.chainWalkCache.Stop()
 	return s.db.Close()
 }
 
@@ -713,6 +728,15 @@ func (s *SQL) insertGenesisTransaction(logger ulogger.Logger) error {
 // could overwrite fresh cache entries with stale data.
 func (s *SQL) ResetResponseCache() {
 	s.responseCache.DeleteAll()
+}
+
+// resetChainWalkCache clears the dedicated cache for chain-walking queries
+// (GetBlockHeaderIDs, GetBlockHeaders). These queries follow parent_id links
+// which are immutable, so the cache only needs clearing on reorgs where the
+// "invalid" status of blocks may change, affecting which blocks are walked.
+// Unlike responseCache, this is NOT cleared on StoreBlock or SetBlock* calls.
+func (s *SQL) resetChainWalkCache() {
+	s.chainWalkCache.DeleteAll()
 }
 
 // ResetChainMembershipCache clears the chain membership cache.

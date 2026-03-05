@@ -75,10 +75,11 @@ func (s *SQL) GetBlockHeaderIDs(ctx context.Context, blockHashFrom *chainhash.Ha
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Try to get from response cache using derived cache key
-	// Use operation-prefixed key to avoid conflicts with other cached data
+	// Try to get from chain walk cache (dedicated cache for parent_id walks).
+	// This cache survives StoreBlock/SetBlock* wipes — only cleared on reorgs —
+	// because parent_id links are immutable once stored.
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlockHeaderIDs-%s-%d", blockHashFrom.String(), numberOfHeaders)))
-	cacheOp := s.responseCache.Begin(cacheID)
+	cacheOp := s.chainWalkCache.Begin(cacheID)
 
 	cached := cacheOp.Get()
 	if cached != nil {
@@ -153,8 +154,8 @@ func (s *SQL) GetBlockHeaderIDs(ctx context.Context, blockHashFrom *chainhash.Ha
 		ids = append(ids, id)
 	}
 
-	// Cache the result in response cache
-	cacheOp.Set(ids, s.cacheTTL)
+	// Cache the result in chain walk cache (10-min TTL, survives StoreBlock/SetBlock* wipes)
+	cacheOp.Set(ids, chainWalkCacheTTL)
 
 	return ids, nil
 }

@@ -19,8 +19,9 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 		return errors.NewStorageError("block %s does not exist", blockHash.String())
 	}
 
-	// Invalidate response cache to ensure cached blocks reflect updated invalid field
+	// Invalidate caches to ensure cached blocks reflect updated invalid field
 	defer s.ResetResponseCache()
+	defer s.resetChainWalkCache()
 	// Rebuild the off-chain set and membership cache after revalidation
 	defer func() {
 		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {

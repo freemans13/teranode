@@ -106,8 +106,9 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 	defer func() {
 		err = errors.Join(err, rows.Close())
 
-		// Invalidate response cache to ensure cached blocks reflect updated invalid field
+		// Invalidate caches to ensure cached blocks reflect updated invalid field
 		s.ResetResponseCache()
+		s.resetChainWalkCache()
 		// Rebuild the off-chain set and membership cache after invalidation
 		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
 			s.logger.Errorf("InvalidateBlock: %v", rebuildErr)
