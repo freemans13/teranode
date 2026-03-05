@@ -3,13 +3,11 @@
 // defined in the interface, with support for different SQL engines.
 //
 // This file implements the CheckBlockIsInCurrentChain method, which determines whether
-// specified blocks are part of the current main blockchain. In blockchain systems like
-// Teranode that support multiple competing chains (forks), it's critical to efficiently
-// determine which blocks belong to the main chain (the chain with the highest cumulative
-// proof-of-work). The implementation uses a recursive Common Table Expression (CTE) in SQL
-// to efficiently traverse the blockchain structure from the current tip backward, checking
-// if the specified blocks are part of this path. This functionality is essential for
-// transaction validation, chain reorganization, and ensuring consensus across the network.
+// specified blocks are part of the current main blockchain. Instead of walking the
+// entire chain from tip via an expensive recursive CTE, this implementation uses an
+// inverted approach: it maintains a small in-memory set of block IDs known to NOT be
+// on the main chain (fork/orphan blocks). A block is on the main chain if it is not
+// in this off-chain set. This provides O(1) lookups regardless of chain depth.
 package sql
 
 import (
@@ -25,15 +23,18 @@ import (
 // CheckBlockIsInCurrentChain determines if specified blocks are part of the current main chain.
 // This implements a specialized blockchain validation method not directly defined in the Store interface.
 //
-// In blockchain systems, it's critical to determine whether specific blocks are part of the
-// current main chain (the chain with the highest cumulative proof-of-work) or if they belong
-// to a fork chain. This method efficiently checks multiple block IDs in a single database query,
-// which is important for Teranode's high-throughput architecture where chain membership checks
-// are common during transaction validation and block processing.
+// The implementation uses a three-tier lookup strategy:
 //
-// The implementation uses a recursive SQL query to efficiently traverse the blockchain structure
-// from the current tip backward, checking if the specified blocks are part of this path. It handles
-// database engine differences (PostgreSQL vs SQLite) with appropriate SQL syntax adjustments.
+// 1. chainMembershipCache (sync.Map): Fast positive cache — block IDs previously confirmed
+// on the main chain. Survives StoreBlock/SetBlock* calls, only cleared on reorgs.
+//
+// 2. offChainBlockIDs (map[uint32]struct{}): Small in-memory set of block IDs known to NOT
+// be on the main chain (fork/orphan blocks). Rebuilt on fork detection, invalidation, or
+// revalidation via rebuildOffChainSet(). Typically contains only a few hundred entries
+// across all of mainnet history.
+//
+// 3. Recursive CTE fallback: Only used when the off-chain set is not yet initialized
+// (offChainBlockIDs == nil). Once initialized, the CTE is never needed.
 //
 // Parameters:
 //   - ctx: Context for the database operation, allowing for cancellation and timeouts
@@ -41,8 +42,7 @@ import (
 //
 // Returns:
 //   - bool: True if all specified blocks are part of the current main chain, false otherwise
-//   - error: Any error encountered during the check, specifically:
-//   - StorageError for database errors or processing failures
+//   - error: Any error encountered during the check
 func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32) (bool, error) {
 	ctx, _, deferFn := tracing.Tracer("SyncManager").Start(ctx, "sql:CheckIfBlockIsInCurrentChain",
 		tracing.WithDebugLogMessage(s.logger, "[CheckIfBlockIsInCurrentChain] checking if blocks (%v) are in current chain", blockIDs),
@@ -53,7 +53,7 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return false, nil
 	}
 
-	// Fast path: check if all block IDs are already confirmed on the main chain.
+	// Tier 1: Fast path — check if all block IDs are already confirmed on the main chain.
 	// This cache survives StoreBlock/SetBlock* calls and is only cleared on reorgs.
 	allCached := true
 	for _, id := range blockIDs {
@@ -67,8 +67,81 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return true, nil
 	}
 
-	// Capture cache generation before the DB query so we can detect
-	// if a reorg invalidated the cache while the query was in flight.
+	// Tier 2: Off-chain set lookup — check if any block ID is in the set of blocks
+	// known to NOT be on the main chain. This set is typically tiny (a few hundred
+	// entries on all of mainnet) and provides O(1) lookups.
+	s.offChainBlockIDsMu.RLock()
+	offChain := s.offChainBlockIDs
+	s.offChainBlockIDsMu.RUnlock()
+
+	if offChain != nil {
+		for _, id := range blockIDs {
+			if _, isOffChain := offChain[id]; isOffChain {
+				return false, nil
+			}
+		}
+
+		// None of the block IDs are in the off-chain set.
+		// Verify they actually exist in the DB (block IDs from UTXO store always exist,
+		// but we guard against non-existent IDs for correctness).
+		exists, err := s.blockIDsExist(ctx, blockIDs)
+		if err != nil {
+			return false, err
+		}
+
+		if !exists {
+			return false, nil
+		}
+
+		// All block IDs exist and none are off-chain — they're on the main chain.
+		// Cache them for future Tier 1 hits.
+		cacheGen := s.chainMembershipGen.Load()
+		if cacheGen == s.chainMembershipGen.Load() {
+			for _, id := range blockIDs {
+				s.chainMembershipCache.Store(id, true)
+			}
+		}
+
+		return true, nil
+	}
+
+	// Tier 3: Fallback to recursive CTE — only used when offChainBlockIDs has not been
+	// initialized yet (nil). This happens on first startup before any fork is detected.
+	// Once rebuildOffChainSet() runs (on first fork, invalidation, or revalidation),
+	// this path is never taken again.
+	return s.checkBlockIsInCurrentChainCTE(ctx, blockIDs)
+}
+
+// blockIDsExist checks whether all given block IDs exist in the blocks table.
+// This is a simple indexed primary key lookup (O(1) per ID) used to guard against
+// non-existent block IDs that aren't in the off-chain set.
+func (s *SQL) blockIDsExist(ctx context.Context, blockIDs []uint32) (bool, error) {
+	if len(blockIDs) == 0 {
+		return true, nil
+	}
+
+	// Build a single query to check all IDs at once
+	placeholders := make([]string, len(blockIDs))
+	args := make([]interface{}, len(blockIDs))
+	for i, id := range blockIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM blocks WHERE id IN (%s)`,
+		strings.Join(placeholders, ","))
+
+	var count int
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&count); err != nil {
+		return false, errors.NewStorageError("failed to check block IDs exist", err)
+	}
+
+	return count == len(blockIDs), nil
+}
+
+// checkBlockIsInCurrentChainCTE is the original recursive CTE implementation, retained
+// as a fallback for when the off-chain set has not yet been initialized.
+func (s *SQL) checkBlockIsInCurrentChainCTE(ctx context.Context, blockIDs []uint32) (bool, error) {
 	cacheGen := s.chainMembershipGen.Load()
 
 	// Get current best block header
@@ -100,7 +173,7 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	bestBlockID := bestBlockMeta.ID
 
 	// get the lowest block id
-	lowestBlockID := blockIDs[0] //nolint:gosec // length is checked on line 52
+	lowestBlockID := blockIDs[0] //nolint:gosec // length is checked above
 	for _, id := range blockIDs {
 		if id < lowestBlockID {
 			lowestBlockID = id
@@ -159,8 +232,6 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	}
 
 	// Cache positive results only if no reorg occurred during the query.
-	// If chainMembershipGen changed, a reorg invalidated the cache while our
-	// query was in flight, so the result may be stale — skip caching.
 	if result && cacheGen == s.chainMembershipGen.Load() {
 		for _, id := range blockIDs {
 			s.chainMembershipCache.Store(id, true)

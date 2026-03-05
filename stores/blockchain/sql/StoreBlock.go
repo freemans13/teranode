@@ -98,6 +98,11 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Capture the current best block header before storing, to detect forks.
+	// If the new block's previous_hash doesn't match the current best block's hash,
+	// a fork exists and we need to rebuild the off-chain set.
+	bestHeader, _, bestErr := s.GetBestBlockHeader(ctx)
+
 	// Apply options
 	storeBlockOptions := options.StoreBlockOptions{}
 	for _, opt := range opts {
@@ -111,6 +116,14 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 
 	// Reset response cache to invalidate cached block headers and best block
 	s.ResetResponseCache()
+
+	// If the new block's parent is not the previous best block, a fork was created.
+	// Rebuild the off-chain set so CheckBlockIsInCurrentChain can use it.
+	// During normal sync (extending the tip), the previous_hash matches the best
+	// block's hash, so this branch is never taken.
+	if bestErr == nil && !block.Header.HashPrevBlock.IsEqual(bestHeader.Hash()) {
+		s.rebuildOffChainSet(ctx)
+	}
 
 	return newBlockID, height, nil
 }

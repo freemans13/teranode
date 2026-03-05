@@ -38,7 +38,6 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 	defer deferFn()
 
 	// Try to get from response cache using derived cache key
-	// Use operation-prefixed key to be consistent with other operations
 	cacheID := chainhash.HashH([]byte("GetChainTips"))
 	cacheOp := s.responseCache.Begin(cacheID)
 
@@ -49,6 +48,20 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 		}
 	}
 
+	tips, err := s.getChainTipsUncached(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the result in response cache
+	cacheOp.Set(tips, s.cacheTTL)
+
+	return tips, nil
+}
+
+// getChainTipsUncached retrieves chain tips directly from the database, bypassing the
+// response cache. Used by rebuildOffChainSet which needs fresh data after chain changes.
+func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, error) {
 	// First, get the best block (main chain tip) to determine which is active
 	bestHeader, _, err := s.GetBestBlockHeader(ctx)
 	if err != nil {
@@ -149,9 +162,6 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 	if err := rows.Err(); err != nil {
 		return nil, errors.NewStorageError("error iterating chain tip rows", err)
 	}
-
-	// Cache the result in response cache
-	cacheOp.Set(chainTips, s.cacheTTL)
 
 	return chainTips, nil
 }
@@ -278,4 +288,68 @@ func (s *SQL) isBlockInMainChain(ctx context.Context, blockHash, mainChainTipHas
 	}
 
 	return false, nil
+}
+
+// collectForkBlockIDs walks backward from a non-active chain tip, collecting the
+// database IDs of all blocks on the fork branch (blocks NOT on the main chain).
+// It walks back branchlen steps from the fork tip, which is exactly the set of
+// blocks that diverge from the main chain.
+//
+// If branchlen is 0 (unknown), it falls back to walking up to 1000 blocks.
+func (s *SQL) collectForkBlockIDs(ctx context.Context, tip *model.ChainTip) ([]uint32, error) {
+	if tip.Status == statusActive {
+		return nil, nil
+	}
+
+	tipHash, err := chainhash.NewHashFromStr(tip.Hash)
+	if err != nil {
+		return nil, errors.NewStorageError("failed to parse fork tip hash", err)
+	}
+
+	maxWalk := tip.Branchlen
+	if maxWalk == 0 {
+		maxWalk = 1000 // safety limit for unknown branch length
+	}
+
+	var blockIDs []uint32
+	currentHash := tipHash
+
+	for i := uint32(0); i < maxWalk; i++ {
+		q := `SELECT id, parent_id FROM blocks WHERE hash = $1`
+
+		var (
+			blockID  uint32
+			parentID sql.NullInt64
+		)
+
+		err := s.db.QueryRowContext(ctx, q, currentHash.CloneBytes()).Scan(&blockID, &parentID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				break
+			}
+			return nil, errors.NewStorageError("failed to query fork block", err)
+		}
+
+		blockIDs = append(blockIDs, blockID)
+
+		if !parentID.Valid {
+			break // reached genesis
+		}
+
+		// Get parent hash to continue walking
+		q = `SELECT hash FROM blocks WHERE id = $1`
+
+		var parentHashBytes []byte
+		err = s.db.QueryRowContext(ctx, q, parentID.Int64).Scan(&parentHashBytes)
+		if err != nil {
+			return nil, errors.NewStorageError("failed to query fork parent hash", err)
+		}
+
+		currentHash, err = chainhash.NewHash(parentHashBytes)
+		if err != nil {
+			return nil, errors.NewStorageError("failed to create fork parent hash", err)
+		}
+	}
+
+	return blockIDs, nil
 }

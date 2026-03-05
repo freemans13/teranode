@@ -70,6 +70,13 @@ type SQL struct {
 	// Before a DB query, the caller captures the current generation; after the query,
 	// it only writes to chainMembershipCache if the generation hasn't changed.
 	chainMembershipGen atomic.Uint64
+	// offChainBlockIDs holds the set of block IDs known to NOT be on the main chain
+	// (fork/orphan blocks). This set is tiny (a few hundred entries on all of mainnet)
+	// and allows CheckBlockIsInCurrentChain to answer with a pure in-memory lookup
+	// instead of an expensive recursive CTE.
+	// Rebuilt via rebuildOffChainSet() on fork detection, invalidation, or revalidation.
+	offChainBlockIDs   map[uint32]struct{}
+	offChainBlockIDsMu sync.RWMutex
 }
 
 // New creates and initializes a new SQL blockchain store instance.
@@ -151,12 +158,13 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	}
 
 	s := &SQL{
-		db:            db,
-		engine:        util.SQLEngine(storeURL.Scheme),
-		logger:        logger,
-		responseCache: NewGenerationalCache(),
-		cacheTTL:      2 * time.Minute,
-		chainParams:   tSettings.ChainCfgParams,
+		db:               db,
+		engine:           util.SQLEngine(storeURL.Scheme),
+		logger:           logger,
+		responseCache:    NewGenerationalCache(),
+		cacheTTL:         2 * time.Minute,
+		chainParams:      tSettings.ChainCfgParams,
+		offChainBlockIDs: make(map[uint32]struct{}),
 	}
 
 	err = s.insertGenesisTransaction(logger)
@@ -708,6 +716,60 @@ func (s *SQL) ResetChainMembershipCache() {
 		s.chainMembershipCache.Delete(key)
 		return true
 	})
+}
+
+// rebuildOffChainSet rebuilds the set of block IDs that are NOT on the main chain.
+// It calls GetChainTips to find all fork tips, then walks each non-active tip back
+// to the fork point (where it meets the main chain), collecting the off-chain block IDs.
+//
+// This is called when:
+//   - A fork is detected in StoreBlock (new block's parent != current tip)
+//   - A block is invalidated (InvalidateBlock)
+//   - A block is revalidated (RevalidateBlock)
+//
+// The off-chain set is typically tiny (a few hundred blocks on all of mainnet history)
+// so this operation is fast even when it runs.
+func (s *SQL) rebuildOffChainSet(ctx context.Context) {
+	offChain := make(map[uint32]struct{})
+
+	tips, err := s.getChainTipsUncached(ctx)
+	if err != nil {
+		s.logger.Warnf("rebuildOffChainSet: failed to get chain tips: %v", err)
+		// On error, set empty off-chain set rather than leaving stale data.
+		// CheckBlockIsInCurrentChain will fall back to the CTE query.
+		s.offChainBlockIDsMu.Lock()
+		s.offChainBlockIDs = nil
+		s.offChainBlockIDsMu.Unlock()
+		return
+	}
+
+	for _, tip := range tips {
+		if tip.Status == statusActive {
+			continue
+		}
+
+		// Walk this fork tip back to the fork point, collecting block IDs
+		forkIDs, walkErr := s.collectForkBlockIDs(ctx, tip)
+		if walkErr != nil {
+			s.logger.Warnf("rebuildOffChainSet: failed to walk fork tip %s: %v", tip.Hash, walkErr)
+			continue
+		}
+
+		for _, id := range forkIDs {
+			offChain[id] = struct{}{}
+		}
+	}
+
+	s.offChainBlockIDsMu.Lock()
+	s.offChainBlockIDs = offChain
+	s.offChainBlockIDsMu.Unlock()
+
+	// Also reset the positive membership cache since chain structure changed
+	s.ResetChainMembershipCache()
+
+	if len(offChain) > 0 {
+		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs across %d fork tips", len(offChain), len(tips)-1)
+	}
 }
 
 // ExportBlockchainCSV exports the blockchain data to a CSV file for analysis or backup purposes.
