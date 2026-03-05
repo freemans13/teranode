@@ -155,10 +155,12 @@ func TestCheckBlockIsInCurrentChain_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// Test with cancelled context
-	_, err = s.CheckBlockIsInCurrentChain(ctx, []uint32{uint32(blockID)})
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "context canceled")
+	// With the off-chain set and maxBlockID, the lookup is fully in-memory
+	// and does not require a DB call, so a cancelled context does not cause an error.
+	// The function should still return the correct result.
+	result, err := s.CheckBlockIsInCurrentChain(ctx, []uint32{uint32(blockID)})
+	assert.NoError(t, err)
+	assert.True(t, result, "In-memory lookup should succeed even with cancelled context")
 }
 
 func TestCheckBlockIsInCurrentChain_BestBlockHeaderError(t *testing.T) {
@@ -172,11 +174,12 @@ func TestCheckBlockIsInCurrentChain_BestBlockHeaderError(t *testing.T) {
 	// Close the database connection to simulate error
 	s.Close()
 
-	// Test should fail when trying to access closed database
+	// With the off-chain set and maxBlockID, the lookup is fully in-memory.
+	// No blocks were stored (maxBlockID=0), so block ID 1 exceeds maxBlockID
+	// and returns false without hitting the DB.
 	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{1})
-	assert.Error(t, err)
-	assert.False(t, result)
-	assert.Contains(t, err.Error(), "sql: database is closed")
+	assert.NoError(t, err)
+	assert.False(t, result, "Block ID beyond maxBlockID should return false")
 }
 
 func TestCheckBlockIsInCurrentChain_LargeBlockIDList(t *testing.T) {

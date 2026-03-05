@@ -114,6 +114,11 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		return 0, height, err
 	}
 
+	// Track the highest block ID for CheckBlockIsInCurrentChain's existence check.
+	if newBlockID > s.maxBlockID.Load() {
+		s.maxBlockID.Store(newBlockID)
+	}
+
 	// Reset response cache to invalidate cached block headers and best block
 	s.ResetResponseCache()
 

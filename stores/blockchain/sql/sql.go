@@ -77,6 +77,10 @@ type SQL struct {
 	// Rebuilt via rebuildOffChainSet() on fork detection, invalidation, or revalidation.
 	offChainBlockIDs   map[uint32]struct{}
 	offChainBlockIDsMu sync.RWMutex
+	// maxBlockID tracks the highest block ID ever stored. Used by
+	// CheckBlockIsInCurrentChain to reject non-existent block IDs without a DB query.
+	// Updated atomically in StoreBlock after each successful insert.
+	maxBlockID atomic.Uint64
 }
 
 // New creates and initializes a new SQL blockchain store instance.
@@ -170,6 +174,13 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	err = s.insertGenesisTransaction(logger)
 	if err != nil {
 		return nil, errors.NewStorageError("failed to insert genesis transaction", err)
+	}
+
+	// Seed maxBlockID from existing data so CheckBlockIsInCurrentChain
+	// can reject non-existent block IDs without a DB query.
+	var maxID sql.NullInt64
+	if err = db.QueryRow(`SELECT MAX(id) FROM blocks`).Scan(&maxID); err == nil && maxID.Valid {
+		s.maxBlockID.Store(uint64(maxID.Int64))
 	}
 
 	return s, nil

@@ -75,25 +75,24 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	s.offChainBlockIDsMu.RUnlock()
 
 	if offChain != nil {
+		// Check if any block ID is a known fork block
 		for _, id := range blockIDs {
 			if _, isOffChain := offChain[id]; isOffChain {
 				return false, nil
 			}
 		}
 
-		// None of the block IDs are in the off-chain set.
-		// Verify they actually exist in the DB (block IDs from UTXO store always exist,
-		// but we guard against non-existent IDs for correctness).
-		exists, err := s.blockIDsExist(ctx, blockIDs)
-		if err != nil {
-			return false, err
+		// Check if any block ID is beyond what's been stored (doesn't exist).
+		// maxBlockID is updated atomically on every StoreBlock, so any ID above
+		// it refers to a block that hasn't been stored yet.
+		maxID := uint32(s.maxBlockID.Load()) //nolint:gosec // block IDs fit in uint32
+		for _, id := range blockIDs {
+			if id > maxID {
+				return false, nil
+			}
 		}
 
-		if !exists {
-			return false, nil
-		}
-
-		// All block IDs exist and none are off-chain — they're on the main chain.
+		// All block IDs exist, none are off-chain — they're on the main chain.
 		// Cache them for future Tier 1 hits.
 		cacheGen := s.chainMembershipGen.Load()
 		if cacheGen == s.chainMembershipGen.Load() {
@@ -110,33 +109,6 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	// Once rebuildOffChainSet() runs (on first fork, invalidation, or revalidation),
 	// this path is never taken again.
 	return s.checkBlockIsInCurrentChainCTE(ctx, blockIDs)
-}
-
-// blockIDsExist checks whether all given block IDs exist in the blocks table.
-// This is a simple indexed primary key lookup (O(1) per ID) used to guard against
-// non-existent block IDs that aren't in the off-chain set.
-func (s *SQL) blockIDsExist(ctx context.Context, blockIDs []uint32) (bool, error) {
-	if len(blockIDs) == 0 {
-		return true, nil
-	}
-
-	// Build a single query to check all IDs at once
-	placeholders := make([]string, len(blockIDs))
-	args := make([]interface{}, len(blockIDs))
-	for i, id := range blockIDs {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		args[i] = id
-	}
-
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM blocks WHERE id IN (%s)`,
-		strings.Join(placeholders, ","))
-
-	var count int
-	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&count); err != nil {
-		return false, errors.NewStorageError("failed to check block IDs exist", err)
-	}
-
-	return count == len(blockIDs), nil
 }
 
 // checkBlockIsInCurrentChainCTE is the original recursive CTE implementation, retained
