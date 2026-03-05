@@ -127,7 +127,9 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	// During normal sync (extending the tip), the previous_hash matches the best
 	// block's hash, so this branch is never taken.
 	if bestErr == nil && !block.Header.HashPrevBlock.IsEqual(bestHeader.Hash()) {
-		s.rebuildOffChainSet(ctx)
+		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
+			s.logger.Errorf("StoreBlock: %v", rebuildErr)
+		}
 	}
 
 	return newBlockID, height, nil

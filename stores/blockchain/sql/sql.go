@@ -740,19 +740,14 @@ func (s *SQL) ResetChainMembershipCache() {
 //
 // The off-chain set is typically tiny (a few hundred blocks on all of mainnet history)
 // so this operation is fast even when it runs.
-func (s *SQL) rebuildOffChainSet(ctx context.Context) {
-	offChain := make(map[uint32]struct{})
-
+func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 	tips, err := s.getChainTipsUncached(ctx)
 	if err != nil {
-		s.logger.Warnf("rebuildOffChainSet: failed to get chain tips: %v", err)
-		// On error, set empty off-chain set rather than leaving stale data.
-		// CheckBlockIsInCurrentChain will fall back to the CTE query.
-		s.offChainBlockIDsMu.Lock()
-		s.offChainBlockIDs = nil
-		s.offChainBlockIDsMu.Unlock()
-		return
+		// Keep the previous off-chain set — stale but better than nothing.
+		return fmt.Errorf("rebuildOffChainSet: failed to get chain tips: %w", err)
 	}
+
+	offChain := make(map[uint32]struct{})
 
 	for _, tip := range tips {
 		if tip.Status == statusActive {
@@ -762,8 +757,8 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) {
 		// Walk this fork tip back to the fork point, collecting block IDs
 		forkIDs, walkErr := s.collectForkBlockIDs(ctx, tip)
 		if walkErr != nil {
-			s.logger.Warnf("rebuildOffChainSet: failed to walk fork tip %s: %v", tip.Hash, walkErr)
-			continue
+			// Keep the previous off-chain set — partial rebuild is worse than stale.
+			return fmt.Errorf("rebuildOffChainSet: failed to walk fork tip %s: %w", tip.Hash, walkErr)
 		}
 
 		for _, id := range forkIDs {
@@ -781,6 +776,8 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) {
 	if len(offChain) > 0 {
 		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs across %d fork tips", len(offChain), len(tips)-1)
 	}
+
+	return nil
 }
 
 // ExportBlockchainCSV exports the blockchain data to a CSV file for analysis or backup purposes.
