@@ -28,6 +28,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -65,6 +66,10 @@ type SQL struct {
 	// (InvalidateBlock/RevalidateBlock), not on every StoreBlock/SetBlock* call.
 	// This dramatically reduces redundant recursive CTE queries during sync.
 	chainMembershipCache sync.Map // map[uint32]bool
+	// chainMembershipGen is incremented on reorgs to prevent stale cache writes.
+	// Before a DB query, the caller captures the current generation; after the query,
+	// it only writes to chainMembershipCache if the generation hasn't changed.
+	chainMembershipGen atomic.Uint64
 }
 
 // New creates and initializes a new SQL blockchain store instance.
@@ -698,6 +703,7 @@ func (s *SQL) ResetResponseCache() {
 // StoreBlock or SetBlockMinedSet, because a block's membership in the current
 // chain does not change when new blocks are appended — only when reorgs happen.
 func (s *SQL) ResetChainMembershipCache() {
+	s.chainMembershipGen.Add(1)
 	s.chainMembershipCache.Range(func(key, _ any) bool {
 		s.chainMembershipCache.Delete(key)
 		return true

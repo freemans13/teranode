@@ -67,6 +67,10 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return true, nil
 	}
 
+	// Capture cache generation before the DB query so we can detect
+	// if a reorg invalidated the cache while the query was in flight.
+	cacheGen := s.chainMembershipGen.Load()
+
 	// Get current best block header
 	_, bestBlockMeta, err := s.GetBestBlockHeader(ctx)
 	if err != nil {
@@ -154,9 +158,10 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return false, errors.NewStorageError("failed to check if given blocks are part of the current chain", err)
 	}
 
-	// Cache positive results: once a block is confirmed on the main chain,
-	// it stays there unless a reorg happens (which clears this cache).
-	if result {
+	// Cache positive results only if no reorg occurred during the query.
+	// If chainMembershipGen changed, a reorg invalidated the cache while our
+	// query was in flight, so the result may be stale — skip caching.
+	if result && cacheGen == s.chainMembershipGen.Load() {
 		for _, id := range blockIDs {
 			s.chainMembershipCache.Store(id, true)
 		}
