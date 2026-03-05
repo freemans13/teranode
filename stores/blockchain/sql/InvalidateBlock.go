@@ -108,6 +108,8 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 
 		// Invalidate response cache to ensure cached blocks reflect updated invalid field
 		s.ResetResponseCache()
+		// Chain membership results are no longer valid after a reorg
+		s.ResetChainMembershipCache()
 	}()
 
 	for rows.Next() {

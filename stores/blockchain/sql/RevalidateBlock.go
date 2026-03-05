@@ -21,6 +21,8 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 
 	// Invalidate response cache to ensure cached blocks reflect updated invalid field
 	defer s.ResetResponseCache()
+	// Chain membership results are no longer valid after a revalidation
+	defer s.ResetChainMembershipCache()
 
 	// recursively update all children blocks to invalid in 1 query
 	q := `

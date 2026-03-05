@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -59,6 +60,11 @@ type SQL struct {
 	cacheTTL time.Duration
 	// chainParams contains the blockchain network parameters (mainnet, testnet, etc.)
 	chainParams *chaincfg.Params
+	// chainMembershipCache caches block IDs confirmed to be on the main chain.
+	// Unlike responseCache, this is only invalidated on chain reorganizations
+	// (InvalidateBlock/RevalidateBlock), not on every StoreBlock/SetBlock* call.
+	// This dramatically reduces redundant recursive CTE queries during sync.
+	chainMembershipCache sync.Map // map[uint32]bool
 }
 
 // New creates and initializes a new SQL blockchain store instance.
@@ -683,6 +689,19 @@ func (s *SQL) insertGenesisTransaction(logger ulogger.Logger) error {
 // could overwrite fresh cache entries with stale data.
 func (s *SQL) ResetResponseCache() {
 	s.responseCache.DeleteAll()
+}
+
+// ResetChainMembershipCache clears the chain membership cache.
+// This must be called when a chain reorganization occurs (block invalidation or
+// revalidation) since block chain membership may have changed.
+// Unlike ResetResponseCache, this is NOT called on routine operations like
+// StoreBlock or SetBlockMinedSet, because a block's membership in the current
+// chain does not change when new blocks are appended — only when reorgs happen.
+func (s *SQL) ResetChainMembershipCache() {
+	s.chainMembershipCache.Range(func(key, _ any) bool {
+		s.chainMembershipCache.Delete(key)
+		return true
+	})
 }
 
 // ExportBlockchainCSV exports the blockchain data to a CSV file for analysis or backup purposes.
