@@ -37,11 +37,12 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		s, err := storesql.New(ulogger.TestLogger{}, storeURL, tSettings)
 		require.NoError(t, err)
 
-		// No blocks stored, should return false
+		// Non-existent block IDs are not in the off-chain set, so they are
+		// treated as on-chain. See rationale in the "multiple blocks in chain" subtest.
 		blockIDs := []uint32{1, 2, 3}
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.False(t, isInChain)
+		assert.True(t, isInChain, "non-existent IDs not in off-chain set are treated as on-chain")
 	})
 
 	t.Run("single block in chain", func(t *testing.T) {

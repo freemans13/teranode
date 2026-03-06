@@ -186,8 +186,10 @@ func (s *SQL) calculateBranchLength(ctx context.Context, tipHashBytes []byte) (u
 	offChain := s.offChainBlockIDs
 	s.offChainBlockIDsMu.RUnlock()
 
+	const maxBranchWalk = 1000
+
 	branchLength := uint32(0)
-	for branchLength < 1000 {
+	for branchLength < maxBranchWalk {
 		branchLength++
 
 		// If the parent is on the main chain, we found the common ancestor.
@@ -205,6 +207,10 @@ func (s *SQL) calculateBranchLength(ctx context.Context, tipHashBytes []byte) (u
 		}
 		currentID = parentID
 		parentID = nextParentID
+	}
+
+	if branchLength >= maxBranchWalk {
+		s.logger.Warnf("calculateBranchLength: hit %d iteration cap for tip starting at block %d — possible cycle or unexpectedly deep fork", maxBranchWalk, currentID)
 	}
 
 	return branchLength, nil

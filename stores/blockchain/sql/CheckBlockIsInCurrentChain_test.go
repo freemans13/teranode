@@ -142,10 +142,13 @@ func TestCheckBlockIsInCurrentChain_MixedOnChainAndOffChain(t *testing.T) {
 	forkID, _, err := s.StoreBlock(context.Background(), blockAlternative2, "")
 	require.NoError(t, err)
 
-	// Mixed: one on-chain block + one off-chain block should return false
+	// Mixed: one on-chain block + one off-chain block should return true (ANY-of semantics).
+	// This matches the old CTE behavior where the chain walk returned true if ANY input
+	// block was found. Required by BlockValidation.checkOldBlockIDs which passes candidate
+	// block IDs for a transaction across forks.
 	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID1), uint32(forkID)})
 	require.NoError(t, err)
-	assert.False(t, result, "Mixed on-chain and off-chain should return false (ALL-of semantics)")
+	assert.True(t, result, "Mixed on-chain and off-chain should return true (ANY-of semantics)")
 
 	// All on-chain should still return true
 	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID1), uint32(blockID2)})

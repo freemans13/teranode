@@ -127,7 +127,12 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	//   3. Error getting best block → log and skip (can't determine)
 	// The only case that skips the rebuild is normal chain extension: new block
 	// IS the best AND its parent was the previous best block.
-	postBestID, _, bestErr := s.getBestBlockID(ctx)
+	// Use a bounded context for the post-insert best block lookup because the
+	// caller's ctx may be cancelled after the DB insert succeeded. The fork/reorg
+	// detection must still run to keep in-memory chain membership consistent.
+	postBestCtx, postBestCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+	defer postBestCancel()
+	postBestID, _, bestErr := s.getBestBlockID(postBestCtx)
 	if bestErr != nil {
 		s.logger.Errorf("StoreBlock: failed to get best block ID: %v", bestErr)
 	} else if uint64(postBestID) != newBlockID {
