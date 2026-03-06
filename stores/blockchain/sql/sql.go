@@ -192,8 +192,18 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	// Seed maxBlockID from existing data so CheckBlockIsInCurrentChain
 	// can reject non-existent block IDs without a DB query.
 	var maxID sql.NullInt64
-	if err = db.QueryRow(`SELECT MAX(id) FROM blocks`).Scan(&maxID); err == nil && maxID.Valid {
+	if err = db.QueryRow(`SELECT MAX(id) FROM blocks`).Scan(&maxID); err != nil {
+		logger.Warnf("failed to seed maxBlockID from DB: %v — all blocks will fall through to DB query", err)
+	} else if maxID.Valid {
 		s.maxBlockID.Store(uint64(maxID.Int64))
+	}
+
+	// Rebuild the off-chain set from existing chain tips so that
+	// CheckBlockIsInCurrentChain works correctly after a process restart
+	// (without this, all IDs <= maxBlockID would be treated as on-main-chain
+	// until the first fork detection or reorg triggers a rebuild).
+	if rebuildErr := s.rebuildOffChainSet(context.Background()); rebuildErr != nil {
+		logger.Warnf("failed to seed off-chain set during startup: %v", rebuildErr)
 	}
 
 	return s, nil

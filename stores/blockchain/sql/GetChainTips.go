@@ -392,7 +392,8 @@ func (s *SQL) collectForkBlockIDs(ctx context.Context, tip *model.ChainTip, best
 	var blockIDs []uint32
 	currentHash := tipHash
 
-	for i := 0; i < 1000; i++ { // safety limit
+	const maxForkWalkIterations = 1000
+	for i := 0; i < maxForkWalkIterations; i++ { // safety limit
 		q := `SELECT id, parent_id FROM blocks WHERE hash = $1`
 
 		var (
@@ -446,6 +447,10 @@ func (s *SQL) collectForkBlockIDs(ctx context.Context, tip *model.ChainTip, best
 		currentHash, err = chainhash.NewHash(parentHashBytes)
 		if err != nil {
 			return nil, errors.NewStorageError("failed to create fork parent hash", err)
+		}
+
+		if i == maxForkWalkIterations-1 {
+			s.logger.Warnf("collectForkBlockIDs: hit %d iteration safety limit for fork tip %s — off-chain set may be incomplete", maxForkWalkIterations, tip.Hash)
 		}
 	}
 

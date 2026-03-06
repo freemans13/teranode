@@ -19,15 +19,17 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 		return errors.NewStorageError("block %s does not exist", blockHash.String())
 	}
 
-	// Invalidate caches to ensure cached blocks reflect updated invalid field
-	defer s.ResetResponseCache()
-	defer s.resetChainWalkCache()
-	// Rebuild the off-chain set and membership cache after revalidation
+	// Go defers execute LIFO, so register in reverse order of desired execution.
+	// Desired: ResetResponseCache → resetChainWalkCache → rebuildOffChainSet
+	// (rebuildOffChainSet calls GetBestBlockHeader which reads the response cache,
+	// so the cache must be reset before the rebuild runs.)
 	defer func() {
 		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
 			s.logger.Errorf("RevalidateBlock: %v", rebuildErr)
 		}
 	}()
+	defer s.resetChainWalkCache()
+	defer s.ResetResponseCache()
 
 	// recursively update all children blocks to invalid in 1 query
 	q := `

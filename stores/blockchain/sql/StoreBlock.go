@@ -115,8 +115,16 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	}
 
 	// Track the highest block ID for CheckBlockIsInCurrentChain's existence check.
-	if newBlockID > s.maxBlockID.Load() {
-		s.maxBlockID.Store(newBlockID)
+	// Use a CAS loop to avoid TOCTOU races where concurrent goroutines could
+	// regress maxBlockID (Load shows X, another goroutine stores X+1, we store X).
+	for {
+		current := s.maxBlockID.Load()
+		if uint64(newBlockID) <= current {
+			break
+		}
+		if s.maxBlockID.CompareAndSwap(current, uint64(newBlockID)) {
+			break
+		}
 	}
 
 	// Reset response cache to invalidate cached block headers and best block
