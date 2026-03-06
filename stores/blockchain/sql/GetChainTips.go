@@ -3,7 +3,6 @@ package sql
 
 import (
 	"context"
-	"database/sql"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -62,10 +61,10 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 // getChainTipsUncached retrieves chain tips directly from the database, bypassing the
 // response cache. Useful when fresh data is needed after chain changes.
 func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, error) {
-	// First, get the best block (main chain tip) to determine which is active
-	bestHeader, _, err := s.GetBestBlockHeader(ctx)
+	// Only need the best block's hash to identify the active tip.
+	_, bestHash, err := s.getBestBlockID(ctx)
 	if err != nil {
-		return nil, errors.NewStorageError("failed to get best block header", err)
+		return nil, errors.NewStorageError("failed to get best block ID", err)
 	}
 
 	// Optimized query: Use LEFT JOIN anti-pattern instead of NOT EXISTS
@@ -130,7 +129,7 @@ func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, erro
 		switch {
 		case invalid:
 			status = statusInvalid // This branch contains at least one invalid block
-		case tipHash.String() == bestHeader.Hash().String():
+		case *tipHash == *bestHash:
 			status = statusActive // This is the tip of the active main chain
 		case fullyProcessed:
 			status = statusValidFork // This branch is not part of the active chain, but is fully validated
@@ -139,10 +138,11 @@ func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, erro
 		}
 		// If none of the above, it remains "headers-only" - Not all blocks for this branch are available, but the headers are valid
 
-		// Calculate branch length for non-active tips
+		// Calculate branch length for non-active tips by walking parent_id links
+		// until we reach a block that's on the main chain (not in offChainBlockIDs).
 		branchLen := uint32(0)
 		if status != statusActive {
-			branchLen, err = s.calculateBranchLength(ctx, hashBytes, bestHeader.Hash())
+			branchLen, err = s.calculateBranchLength(ctx, hashBytes)
 			if err != nil {
 				// Log error but continue with branchLen = 0
 				s.logger.Warnf("Failed to calculate branch length for tip %s: %v", hash, err)
@@ -167,125 +167,44 @@ func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, erro
 }
 
 // calculateBranchLength calculates the length of a branch from a tip back to
-// the common ancestor with the main chain.
-func (s *SQL) calculateBranchLength(ctx context.Context, tipHashBytes []byte, mainChainTipHash *chainhash.Hash) (uint32, error) {
-	// Convert tipHashBytes to chainhash.Hash
-	tipHash, err := chainhash.NewHash(tipHashBytes)
-	if err != nil {
-		return 0, errors.NewStorageError("failed to create hash from bytes", err)
+// the common ancestor with the main chain. Uses the in-memory offChainBlockIDs
+// set for O(1) main-chain membership checks instead of walking the chain via SQL.
+func (s *SQL) calculateBranchLength(ctx context.Context, tipHashBytes []byte) (uint32, error) {
+	// Get the tip's block ID and parent_id to start walking
+	q := `SELECT id, parent_id FROM blocks WHERE hash = $1`
+
+	var (
+		currentID uint32
+		parentID  uint32
+	)
+	if err := s.db.QueryRowContext(ctx, q, tipHashBytes).Scan(&currentID, &parentID); err != nil {
+		return 0, errors.NewStorageError("failed to query tip block", err)
 	}
 
+	s.offChainBlockIDsMu.RLock()
+	offChain := s.offChainBlockIDs
+	s.offChainBlockIDsMu.RUnlock()
+
 	branchLength := uint32(0)
-	currentHash := tipHash
-
-	for {
-		q := `SELECT parent_id, height FROM blocks WHERE hash = $1`
-
-		var (
-			parentID sql.NullInt64
-			height   uint32
-		)
-
-		err := s.db.QueryRowContext(ctx, q, currentHash.CloneBytes()).Scan(&parentID, &height)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				// Reached genesis or orphaned block
-				break
-			}
-
-			return 0, errors.NewStorageError("failed to query parent block", err)
-		}
-
-		if !parentID.Valid {
-			// Reached genesis block
-			break
-		}
-
+	for branchLength < 1000 {
 		branchLength++
 
-		// Get parent hash
-		q = `SELECT hash FROM blocks WHERE id = $1`
-
-		var parentHashBytes []byte
-
-		err = s.db.QueryRowContext(ctx, q, parentID.Int64).Scan(&parentHashBytes)
-		if err != nil {
-			return 0, errors.NewStorageError("failed to query parent hash", err)
-		}
-
-		currentHash, err = chainhash.NewHash(parentHashBytes)
-		if err != nil {
-			return 0, errors.NewStorageError("failed to create parent hash", err)
-		}
-
-		// Check if this block is in the main chain by walking back from main tip
-		isInMainChain, err := s.isBlockInMainChain(ctx, currentHash, mainChainTipHash)
-		if err != nil {
-			return 0, errors.NewStorageError("failed to check if block is in main chain", err)
-		}
-
-		if isInMainChain {
-			// Found common ancestor
+		// If the parent is on the main chain, we found the common ancestor.
+		if _, isOffChain := offChain[parentID]; !isOffChain {
 			break
 		}
 
-		// Prevent infinite loops - limit to reasonable branch length
-		if branchLength > 1000 {
-			s.logger.Warnf("Branch length calculation exceeded 1000 blocks, stopping")
-			break
+		// Walk to parent — single query fetching only parent_id.
+		if parentID == currentID {
+			break // genesis self-reference
 		}
+		var nextParentID uint32
+		if err := s.db.QueryRowContext(ctx, `SELECT parent_id FROM blocks WHERE id = $1`, parentID).Scan(&nextParentID); err != nil {
+			return branchLength, errors.NewStorageError("failed to query parent block", err)
+		}
+		currentID = parentID
+		parentID = nextParentID
 	}
 
 	return branchLength, nil
-}
-
-// isBlockInMainChain checks if a given block is part of the main chain
-// by walking back from the main chain tip
-func (s *SQL) isBlockInMainChain(ctx context.Context, blockHash, mainChainTipHash *chainhash.Hash) (bool, error) {
-	if blockHash.String() == mainChainTipHash.String() {
-		return true, nil
-	}
-
-	currentHash := mainChainTipHash
-	for i := 0; i < 1000; i++ { // Prevent infinite loops
-		if currentHash.String() == blockHash.String() {
-			return true, nil
-		}
-
-		// Get parent
-		q := `SELECT parent_id FROM blocks WHERE hash = $1`
-
-		var parentID sql.NullInt64
-
-		err := s.db.QueryRowContext(ctx, q, currentHash.CloneBytes()).Scan(&parentID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return false, nil
-			}
-
-			return false, errors.NewStorageError("failed to query parent block", err)
-		}
-
-		if !parentID.Valid {
-			// Reached genesis
-			return false, nil
-		}
-
-		// Get parent hash
-		q = `SELECT hash FROM blocks WHERE id = $1`
-
-		var parentHashBytes []byte
-
-		err = s.db.QueryRowContext(ctx, q, parentID.Int64).Scan(&parentHashBytes)
-		if err != nil {
-			return false, errors.NewStorageError("failed to query parent hash", err)
-		}
-
-		currentHash, err = chainhash.NewHash(parentHashBytes)
-		if err != nil {
-			return false, errors.NewStorageError("failed to create parent hash", err)
-		}
-	}
-
-	return false, nil
 }

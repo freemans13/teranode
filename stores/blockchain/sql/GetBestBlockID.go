@@ -8,6 +8,12 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
+// bestBlockIDResult is the cached value for getBestBlockID.
+type bestBlockIDResult struct {
+	id   uint32
+	hash *chainhash.Hash
+}
+
 // getBestBlockID returns the database ID and hash of the best (most-work) valid block.
 // This is a lightweight alternative to GetBestBlockHeader for code paths that only need
 // the block's identity (chain-membership checks, fork detection, off-chain set rebuild)
@@ -20,14 +26,9 @@ func (s *SQL) getBestBlockID(ctx context.Context) (uint32, *chainhash.Hash, erro
 	cacheID := chainhash.HashH([]byte("getBestBlockID"))
 	cacheOp := s.responseCache.Begin(cacheID)
 
-	cached := cacheOp.Get()
-	if cached != nil {
-		if result, ok := cached.Value().([2]interface{}); ok {
-			if id, ok := result[0].(uint32); ok {
-				if hash, ok := result[1].(*chainhash.Hash); ok {
-					return id, hash, nil
-				}
-			}
+	if cached := cacheOp.Get(); cached != nil {
+		if r, ok := cached.Value().(bestBlockIDResult); ok {
+			return r.id, r.hash, nil
 		}
 	}
 
@@ -56,7 +57,7 @@ func (s *SQL) getBestBlockID(ctx context.Context) (uint32, *chainhash.Hash, erro
 		return 0, nil, errors.NewStorageError("getBestBlockID: invalid hash bytes", err)
 	}
 
-	cacheOp.Set([2]interface{}{id, hash}, s.cacheTTL)
+	cacheOp.Set(bestBlockIDResult{id: id, hash: hash}, s.cacheTTL)
 
 	return id, hash, nil
 }
