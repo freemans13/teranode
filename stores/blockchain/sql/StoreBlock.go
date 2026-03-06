@@ -112,17 +112,20 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	// Reset response cache to invalidate cached block headers and best block
 	s.ResetResponseCache()
 
-	// Detect forks using post-insert state: if the new block's parent now has
-	// multiple children, a fork exists. This is race-resilient because it queries
-	// the authoritative DB state after the insert, rather than comparing against
-	// a pre-insert best header that could be stale due to concurrent StoreBlock calls.
-	// During normal sync (extending the tip), the parent has exactly 1 child, so
-	// this branch is never taken.
-	var parentChildCount int
-	if countErr := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM blocks WHERE parent_id = (SELECT parent_id FROM blocks WHERE id = $1)`,
-		newBlockID,
-	).Scan(&parentChildCount); countErr == nil && parentChildCount > 1 {
+	// Detect forks by comparing the newly inserted block's ID with the best
+	// (most-work) block's ID. After the insert, GetBestBlockHeader returns the
+	// block with the highest cumulative chain work. If the new block IS the best
+	// block, we are extending the main chain and no rebuild is needed. If
+	// another block is the best, the new block created or extended a fork and
+	// the off-chain set must be rebuilt. This handles all cases:
+	//   - Normal sync (extending tip): newBlockID == bestID → no rebuild
+	//   - Fork creation: newBlockID != bestID → rebuild
+	//   - Fork extension: newBlockID != bestID → rebuild
+	//   - Genesis: newBlockID == bestID → no rebuild
+	_, bestMeta, bestErr := s.GetBestBlockHeader(ctx)
+	if bestErr != nil {
+		s.logger.Errorf("StoreBlock: failed to get best block header: %v", bestErr)
+	} else if uint64(bestMeta.ID) != newBlockID {
 		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
 			s.logger.Errorf("StoreBlock: %v", rebuildErr)
 		}

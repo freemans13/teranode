@@ -19,29 +19,27 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 		return errors.NewStorageError("block %s does not exist", blockHash.String())
 	}
 
-	// Go defers execute LIFO, so register in reverse order of desired execution.
-	// Desired: ResetResponseCache → resetChainWalkCache → rebuildOffChainSet
-	// (rebuildOffChainSet calls GetBestBlockHeader which reads the response cache,
-	// so the cache must be reset before the rebuild runs.)
-	// Use context.Background() because the caller's ctx may have been
-	// cancelled after the DB update succeeded — the rebuild must still run
-	// to keep the in-memory membership state consistent.
-	defer func() {
-		if rebuildErr := s.rebuildOffChainSet(context.Background()); rebuildErr != nil {
-			s.logger.Errorf("RevalidateBlock: %v", rebuildErr)
-		}
-	}()
-	defer s.resetChainWalkCache()
-	defer s.ResetResponseCache()
-
-	// recursively update all children blocks to invalid in 1 query
+	// Update the block to valid (not invalid) and clear the mined_set flag.
 	q := `
 		UPDATE blocks
 		SET invalid = false, mined_set = false
 		WHERE hash = $1
 	`
 	if _, err = s.db.ExecContext(ctx, q, blockHash.CloneBytes()); err != nil {
-		return errors.NewStorageError("error updating block to invalid", err)
+		return errors.NewStorageError("error updating block to valid", err)
+	}
+
+	// Invalidate caches and rebuild the off-chain set only after the UPDATE
+	// succeeds. Order matters: ResetResponseCache must run before
+	// rebuildOffChainSet because the rebuild calls GetBestBlockHeader which
+	// reads the response cache.
+	// Use context.Background() because the caller's ctx may have been
+	// cancelled after the DB update succeeded — the rebuild must still run
+	// to keep the in-memory membership state consistent.
+	s.ResetResponseCache()
+	s.resetChainWalkCache()
+	if rebuildErr := s.rebuildOffChainSet(context.Background()); rebuildErr != nil {
+		s.logger.Errorf("RevalidateBlock: %v", rebuildErr)
 	}
 
 	return nil

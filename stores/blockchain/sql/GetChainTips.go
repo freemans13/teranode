@@ -60,7 +60,7 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 }
 
 // getChainTipsUncached retrieves chain tips directly from the database, bypassing the
-// response cache. Used by rebuildOffChainSet which needs fresh data after chain changes.
+// response cache. Useful when fresh data is needed after chain changes.
 func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, error) {
 	// First, get the best block (main chain tip) to determine which is active
 	bestHeader, _, err := s.GetBestBlockHeader(ctx)

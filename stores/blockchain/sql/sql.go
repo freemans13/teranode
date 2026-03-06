@@ -175,7 +175,7 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 		return nil, errors.NewStorageError("failed to insert genesis transaction", err)
 	}
 
-	// Rebuild the off-chain set from existing chain tips so that
+	// Rebuild the off-chain set using a CTE walk of the main chain so that
 	// CheckBlockIsInCurrentChain works correctly after a process restart.
 	// This is fatal because the in-memory lookup has no DB fallback — if the
 	// off-chain set is empty, fork/orphan blocks would incorrectly return true.
@@ -732,7 +732,7 @@ func (s *SQL) resetChainWalkCache() {
 // chain topologies including nested forks (fork-of-a-fork).
 //
 // This is called when:
-//   - A fork is detected in StoreBlock (new block's parent != current tip)
+//   - A fork is detected in StoreBlock (new block is not the best block after insert)
 //   - A block is invalidated (InvalidateBlock)
 //   - A block is revalidated (RevalidateBlock)
 //   - At startup to seed the off-chain set from existing data
