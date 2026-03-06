@@ -28,7 +28,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -66,18 +65,6 @@ type SQL struct {
 	cacheTTL time.Duration
 	// chainParams contains the blockchain network parameters (mainnet, testnet, etc.)
 	chainParams *chaincfg.Params
-	// chainMembershipCache caches block IDs confirmed to be on the main chain.
-	// Unlike responseCache, this is only invalidated on chain reorganizations
-	// (InvalidateBlock/RevalidateBlock), not on every StoreBlock/SetBlock* call.
-	// This avoids taking offChainBlockIDsMu.RLock on every call during sync.
-	// Bounded to maxChainMembershipCacheSize entries to cap memory usage; once
-	// full, new entries are not cached and lookups fall through to Tier 2/3.
-	chainMembershipCache     sync.Map // map[uint32]bool
-	chainMembershipCacheSize atomic.Int64
-	// chainMembershipGen is incremented on reorgs to prevent stale cache writes.
-	// Before a DB query, the caller captures the current generation; after the query,
-	// it only writes to chainMembershipCache if the generation hasn't changed.
-	chainMembershipGen atomic.Uint64
 	// offChainBlockIDs holds the set of block IDs known to NOT be on the main chain
 	// (fork/orphan blocks). This set is tiny (a few hundred entries on all of mainnet)
 	// and allows CheckBlockIsInCurrentChain to answer with a pure in-memory lookup
@@ -85,10 +72,6 @@ type SQL struct {
 	// Rebuilt via rebuildOffChainSet() on fork detection, invalidation, or revalidation.
 	offChainBlockIDs   map[uint32]struct{}
 	offChainBlockIDsMu sync.RWMutex
-	// maxBlockID tracks the highest block ID ever stored. Used by
-	// CheckBlockIsInCurrentChain to reject non-existent block IDs without a DB query.
-	// Updated atomically in StoreBlock after each successful insert.
-	maxBlockID atomic.Uint64
 	// chainWalkCache is a dedicated cache for chain-walking queries (GetBlockHeaderIDs,
 	// GetBlockHeaders) that follow parent_id links. Unlike responseCache, this is only
 	// invalidated on chain reorganizations (InvalidateBlock/RevalidateBlock), because
@@ -190,17 +173,6 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	err = s.insertGenesisTransaction(logger)
 	if err != nil {
 		return nil, errors.NewStorageError("failed to insert genesis transaction", err)
-	}
-
-	// Seed maxBlockID from existing data so CheckBlockIsInCurrentChain
-	// can reject non-existent block IDs without a DB query.
-	// This is fatal because the in-memory lookup has no DB fallback — if seeding
-	// fails, maxBlockID stays 0 and all blocks would incorrectly return false.
-	var maxID sql.NullInt64
-	if err = db.QueryRow(`SELECT MAX(id) FROM blocks`).Scan(&maxID); err != nil {
-		return nil, errors.NewStorageError("failed to seed maxBlockID from DB", err)
-	} else if maxID.Valid {
-		s.maxBlockID.Store(uint64(maxID.Int64))
 	}
 
 	// Rebuild the off-chain set from existing chain tips so that
@@ -754,21 +726,6 @@ func (s *SQL) resetChainWalkCache() {
 	s.chainWalkCache.DeleteAll()
 }
 
-// ResetChainMembershipCache clears the chain membership cache.
-// This must be called when a chain reorganization occurs (block invalidation or
-// revalidation) since block chain membership may have changed.
-// Unlike ResetResponseCache, this is NOT called on routine operations like
-// StoreBlock or SetBlockMinedSet, because a block's membership in the current
-// chain does not change when new blocks are appended — only when reorgs happen.
-func (s *SQL) ResetChainMembershipCache() {
-	s.chainMembershipGen.Add(1)
-	s.chainMembershipCache.Range(func(key, _ any) bool {
-		s.chainMembershipCache.Delete(key)
-		return true
-	})
-	s.chainMembershipCacheSize.Store(0)
-}
-
 // rebuildOffChainSet rebuilds the set of block IDs that are NOT on the main chain.
 // It uses a recursive CTE to walk the main chain from the best block backward via
 // parent_id, then finds all block IDs NOT on that path. This correctly handles all
@@ -828,9 +785,6 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 	s.offChainBlockIDsMu.Lock()
 	s.offChainBlockIDs = offChain
 	s.offChainBlockIDsMu.Unlock()
-
-	// Also reset the positive membership cache since chain structure changed
-	s.ResetChainMembershipCache()
 
 	if len(offChain) > 0 {
 		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs", len(offChain))

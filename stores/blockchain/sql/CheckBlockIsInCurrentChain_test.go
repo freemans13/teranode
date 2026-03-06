@@ -88,11 +88,12 @@ func TestCheckBlockIsInCurrentChain_BlockNotInChain(t *testing.T) {
 	_, _, err = s.StoreBlock(context.Background(), block2, "")
 	require.NoError(t, err)
 
-	// Check with a non-existent block ID only
+	// Non-existent block IDs are not in the off-chain set, so they're treated
+	// as on-chain. In practice, callers only pass block IDs from the database.
 	nonExistentID := uint32(999999)
 	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{nonExistentID})
 	require.NoError(t, err)
-	assert.False(t, result, "Query with non-existent block should return false")
+	assert.True(t, result, "Unknown block IDs not in off-chain set are treated as on-chain")
 }
 
 func TestCheckBlockIsInCurrentChain_SingleNonExistentBlock(t *testing.T) {
@@ -108,11 +109,12 @@ func TestCheckBlockIsInCurrentChain_SingleNonExistentBlock(t *testing.T) {
 	_, _, err = s.StoreBlock(context.Background(), block1, "")
 	require.NoError(t, err)
 
-	// Check with only a non-existent block ID
+	// Non-existent block IDs are not in the off-chain set, so they're treated
+	// as on-chain. In practice, callers only pass block IDs from the database.
 	nonExistentID := uint32(999999)
 	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{nonExistentID})
 	require.NoError(t, err)
-	assert.False(t, result, "Non-existent block should return false")
+	assert.True(t, result, "Unknown block IDs not in off-chain set are treated as on-chain")
 }
 
 func TestCheckBlockIsInCurrentChain_MixedValidAndInvalidBlocks(t *testing.T) {
@@ -131,11 +133,12 @@ func TestCheckBlockIsInCurrentChain_MixedValidAndInvalidBlocks(t *testing.T) {
 	_, _, err = s.StoreBlock(context.Background(), block2, "")
 	require.NoError(t, err)
 
-	// Test with only invalid block IDs
+	// Non-existent block IDs are not in the off-chain set, so they're treated
+	// as on-chain. In practice, callers only pass block IDs from the database.
 	mixedIDs := []uint32{999999, 999998}
 	result, err := s.CheckBlockIsInCurrentChain(context.Background(), mixedIDs)
 	require.NoError(t, err)
-	assert.False(t, result, "Invalid block IDs should return false")
+	assert.True(t, result, "Unknown block IDs not in off-chain set are treated as on-chain")
 }
 
 func TestCheckBlockIsInCurrentChain_ContextCancellation(t *testing.T) {
@@ -155,9 +158,8 @@ func TestCheckBlockIsInCurrentChain_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// With the off-chain set and maxBlockID, the lookup is fully in-memory
-	// and does not require a DB call, so a cancelled context does not cause an error.
-	// The function should still return the correct result.
+	// The off-chain set lookup is fully in-memory and does not require a DB call,
+	// so a cancelled context does not cause an error.
 	result, err := s.CheckBlockIsInCurrentChain(ctx, []uint32{uint32(blockID)})
 	assert.NoError(t, err)
 	assert.True(t, result, "In-memory lookup should succeed even with cancelled context")
@@ -174,12 +176,12 @@ func TestCheckBlockIsInCurrentChain_BestBlockHeaderError(t *testing.T) {
 	// Close the database connection to simulate error
 	s.Close()
 
-	// With the off-chain set and maxBlockID, the lookup is fully in-memory.
-	// No blocks were stored (maxBlockID=0), so block ID 1 exceeds maxBlockID
-	// and returns false without hitting the DB.
+	// The off-chain set lookup is fully in-memory, so it still works after
+	// the DB is closed. With no forks at startup, the off-chain set is empty
+	// and all block IDs are treated as on-chain.
 	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{1})
 	assert.NoError(t, err)
-	assert.False(t, result, "Block ID beyond maxBlockID should return false")
+	assert.True(t, result, "In-memory lookup should succeed even with closed DB")
 }
 
 func TestCheckBlockIsInCurrentChain_LargeBlockIDList(t *testing.T) {
@@ -240,12 +242,12 @@ func TestCheckBlockIsInCurrentChain_RecursionDepthCalculation(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result, "Blocks in chain should return true")
 
-	// Test edge case where lowest block ID might be greater than best block ID
-	// This tests the recursionDepthBlockID = 0 branch
+	// Non-existent block IDs are not in the off-chain set, so they're treated
+	// as on-chain. In practice, callers only pass block IDs from the database.
 	veryHighBlockID := uint32(999999)
 	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{veryHighBlockID})
 	require.NoError(t, err)
-	assert.False(t, result, "Very high block ID should return false")
+	assert.True(t, result, "Unknown block IDs not in off-chain set are treated as on-chain")
 }
 
 func TestCheckBlockIsInCurrentChain_SQLiteEngine(t *testing.T) {

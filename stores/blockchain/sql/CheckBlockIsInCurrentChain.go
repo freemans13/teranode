@@ -16,26 +16,13 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
-// maxChainMembershipCacheSize caps the number of entries in chainMembershipCache to prevent
-// unbounded memory growth during long sync runs. Once full, new lookups skip caching and
-// fall through to Tier 2/3 which are also O(1). The cache is cleared on reorgs.
-const maxChainMembershipCacheSize = 1_000_000
-
 // CheckBlockIsInCurrentChain determines if specified blocks are part of the current main chain.
-// This implements a specialized blockchain validation method not directly defined in the Store interface.
 //
-// The implementation is fully in-memory with zero SQL queries, using a three-tier strategy:
-//
-//  1. chainMembershipCache (sync.Map): Fast positive cache — block IDs previously confirmed
-//     on the main chain. Survives StoreBlock/SetBlock* calls, only cleared on reorgs.
-//
-//  2. offChainBlockIDs (map[uint32]struct{}): Small in-memory set of block IDs known to NOT
-//     be on the main chain (fork/orphan blocks). Rebuilt on fork detection, invalidation, or
-//     revalidation via rebuildOffChainSet(). Typically contains only a few hundred entries
-//     across all of mainnet history.
-//
-//  3. maxBlockID (atomic.Uint64): Tracks the highest block ID ever stored. Any requested ID
-//     above this cannot exist, so we return false without DB access.
+// The implementation is fully in-memory with zero SQL queries. It checks each block ID
+// against offChainBlockIDs — a small set of block IDs known to NOT be on the main chain
+// (fork/orphan blocks). This set is rebuilt via rebuildOffChainSet() on fork detection,
+// invalidation, or revalidation, and typically contains only a few hundred entries across
+// all of mainnet history.
 //
 // Parameters:
 //   - ctx: Context for the operation (unused for DB, retained for tracing)
@@ -54,31 +41,6 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return false, nil
 	}
 
-	// Capture cache generation before the lookups so we can detect if a reorg
-	// invalidated the cache while the lookup was in progress. Only cache results
-	// if the generation hasn't changed.
-	cacheGen := s.chainMembershipGen.Load()
-
-	// Tier 1: Fast path — check if all block IDs are already confirmed on the main chain.
-	// This cache survives StoreBlock/SetBlock* calls and is only cleared on reorgs.
-	allCached := true
-	for _, id := range blockIDs {
-		if _, ok := s.chainMembershipCache.Load(id); !ok {
-			allCached = false
-			break
-		}
-	}
-
-	// Only trust the fast-path result if the cache generation has not changed
-	// since we started the lookup. If a reorg occurred concurrently, fall
-	// through to Tier 2/3 to recompute the answer without relying on stale
-	// cache entries.
-	if allCached && cacheGen == s.chainMembershipGen.Load() {
-		return true, nil
-	}
-
-	// Tier 2: Off-chain set — check if any block ID is a known fork/orphan block.
-	// This set is typically tiny (a few hundred entries on all of mainnet).
 	s.offChainBlockIDsMu.RLock()
 	offChain := s.offChainBlockIDs
 	s.offChainBlockIDsMu.RUnlock()
@@ -86,44 +48,6 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	for _, id := range blockIDs {
 		if _, isOffChain := offChain[id]; isOffChain {
 			return false, nil
-		}
-	}
-
-	// Tier 3: Existence check — reject block IDs beyond what's been stored.
-	// maxBlockID is updated atomically on every StoreBlock.
-	maxID := uint32(s.maxBlockID.Load()) //nolint:gosec // block IDs fit in uint32
-	for _, id := range blockIDs {
-		if id > maxID {
-			return false, nil
-		}
-	}
-
-	// Verify that no reorg occurred during the Tier 2/3 lookups. If the generation
-	// changed, the offChainBlockIDs snapshot we used may be stale — retry once with
-	// the updated set rather than returning a potentially incorrect result.
-	if cacheGen != s.chainMembershipGen.Load() {
-		// Re-read the off-chain set after the reorg and re-check Tier 2.
-		s.offChainBlockIDsMu.RLock()
-		offChain = s.offChainBlockIDs
-		s.offChainBlockIDsMu.RUnlock()
-
-		for _, id := range blockIDs {
-			if _, isOffChain := offChain[id]; isOffChain {
-				return false, nil
-			}
-		}
-		// Don't cache after a reorg race — let the next call cache with stable gen.
-		return true, nil
-	}
-
-	// All block IDs exist, none are off-chain — they're on the main chain.
-	// Cache them for future Tier 1 hits, but only if the cache hasn't
-	// exceeded its size cap.
-	if s.chainMembershipCacheSize.Load() < maxChainMembershipCacheSize {
-		for _, id := range blockIDs {
-			if _, loaded := s.chainMembershipCache.LoadOrStore(id, true); !loaded {
-				s.chainMembershipCacheSize.Add(1)
-			}
 		}
 	}
 
