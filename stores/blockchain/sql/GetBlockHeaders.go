@@ -75,6 +75,15 @@ func (s *SQL) GetBlockHeaders(ctx context.Context, blockHashFrom *chainhash.Hash
 	// Try to get from chain walk cache (dedicated cache for parent_id walks).
 	// This cache survives StoreBlock/SetBlock* wipes — only cleared on reorgs —
 	// because parent_id links are immutable once stored.
+	//
+	// NOTE: The cached result includes mutable metadata (mined_set, subtrees_set,
+	// processed_at, invalid). The "invalid" field is safe because InvalidateBlock
+	// and RevalidateBlock already reset chainWalkCache. The operational fields
+	// (mined_set, subtrees_set, processed_at, persisted_at) may be stale, but
+	// callers of GetBlockHeaders (block validation) depend only on immutable header
+	// data (hash, height, previous_hash, chainwork). Clearing chainWalkCache on
+	// every SetBlock* call would re-introduce the cache-thrashing problem this
+	// cache was designed to solve.
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlockHeaders-%s-%d", blockHashFrom.String(), numberOfHeaders)))
 	cacheOp := s.chainWalkCache.Begin(cacheID)
 

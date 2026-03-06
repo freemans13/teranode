@@ -204,11 +204,11 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	}
 
 	// Rebuild the off-chain set from existing chain tips so that
-	// CheckBlockIsInCurrentChain works correctly after a process restart
-	// (without this, all IDs <= maxBlockID would be treated as on-main-chain
-	// until the first fork detection or reorg triggers a rebuild).
+	// CheckBlockIsInCurrentChain works correctly after a process restart.
+	// This is fatal because the in-memory lookup has no DB fallback — if the
+	// off-chain set is empty, fork/orphan blocks would incorrectly return true.
 	if rebuildErr := s.rebuildOffChainSet(context.Background()); rebuildErr != nil {
-		logger.Warnf("failed to seed off-chain set during startup: %v", rebuildErr)
+		return nil, errors.NewStorageError("failed to seed off-chain set during startup", rebuildErr)
 	}
 
 	return s, nil
@@ -770,49 +770,59 @@ func (s *SQL) ResetChainMembershipCache() {
 }
 
 // rebuildOffChainSet rebuilds the set of block IDs that are NOT on the main chain.
-// It calls GetChainTips to find all fork tips, then walks each non-active tip back
-// to the fork point (where it meets the main chain), collecting the off-chain block IDs.
+// It uses a recursive CTE to walk the main chain from the best block backward via
+// parent_id, then finds all block IDs NOT on that path. This correctly handles all
+// chain topologies including nested forks (fork-of-a-fork).
 //
 // This is called when:
 //   - A fork is detected in StoreBlock (new block's parent != current tip)
 //   - A block is invalidated (InvalidateBlock)
 //   - A block is revalidated (RevalidateBlock)
+//   - At startup to seed the off-chain set from existing data
 //
 // The off-chain set is typically tiny (a few hundred blocks on all of mainnet history)
-// so this operation is fast even when it runs.
+// so this operation is fast even when it runs. The CTE walks the full main chain once
+// (O(chain_depth)), which is acceptable since rebuilds are infrequent.
 func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
-	tips, err := s.getChainTipsForRebuild(ctx)
-	if err != nil {
-		// Keep the previous off-chain set — stale but better than nothing.
-		return errors.NewStorageError("rebuildOffChainSet: failed to get chain tips", err)
-	}
-
-	// Get the best block ID directly from GetBestBlockHeader. We can't rely on
-	// finding an "active" tip in the tips list because after invalidation the best
-	// block may not be a chain tip (it still has children, even if they're invalid).
-	var bestBlockID uint32
 	bestHeader, bestMeta, bestErr := s.GetBestBlockHeader(ctx)
-	if bestErr == nil && bestHeader != nil {
-		bestBlockID = bestMeta.ID
+	if bestErr != nil {
+		return errors.NewStorageError("rebuildOffChainSet: failed to get best block header", bestErr)
 	}
+	if bestHeader == nil || bestMeta == nil {
+		return errors.NewStorageError("rebuildOffChainSet: best block header or metadata is nil", nil)
+	}
+	bestBlockID := bestMeta.ID
+
+	// Walk the main chain from bestBlockID backward to genesis via parent_id,
+	// then find all block IDs NOT on that path. This is provably correct for all
+	// chain topologies (including nested forks) because any block not reachable
+	// from the best block via parent_id links is by definition off-chain.
+	// The "b.id != m.id" condition prevents infinite recursion at the genesis
+	// block which has parent_id = id (self-referencing).
+	q := `
+		WITH RECURSIVE main_chain AS (
+			SELECT id, parent_id FROM blocks WHERE id = $1
+			UNION ALL
+			SELECT b.id, b.parent_id FROM blocks b INNER JOIN main_chain m ON b.id = m.parent_id WHERE b.id != m.id
+		)
+		SELECT b.id FROM blocks b LEFT JOIN main_chain m ON b.id = m.id WHERE m.id IS NULL
+	`
+	rows, err := s.db.QueryContext(ctx, q, bestBlockID)
+	if err != nil {
+		return errors.NewStorageError("rebuildOffChainSet: failed to query off-chain blocks", err)
+	}
+	defer rows.Close()
 
 	offChain := make(map[uint32]struct{})
-
-	for _, tip := range tips {
-		if tip.Status == statusActive {
-			continue
+	for rows.Next() {
+		var id uint32
+		if err = rows.Scan(&id); err != nil {
+			return errors.NewStorageError("rebuildOffChainSet: failed to scan off-chain block ID", err)
 		}
-
-		// Walk this fork tip back to the fork point, collecting block IDs
-		forkIDs, walkErr := s.collectForkBlockIDs(ctx, tip, bestBlockID)
-		if walkErr != nil {
-			// Keep the previous off-chain set — partial rebuild is worse than stale.
-			return errors.NewStorageError("rebuildOffChainSet: failed to walk fork tip "+tip.Hash, walkErr)
-		}
-
-		for _, id := range forkIDs {
-			offChain[id] = struct{}{}
-		}
+		offChain[id] = struct{}{}
+	}
+	if err = rows.Err(); err != nil {
+		return errors.NewStorageError("rebuildOffChainSet: error iterating off-chain blocks", err)
 	}
 
 	s.offChainBlockIDsMu.Lock()
@@ -823,13 +833,7 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 	s.ResetChainMembershipCache()
 
 	if len(offChain) > 0 {
-		forkTipCount := 0
-		for _, tip := range tips {
-			if tip.Status != statusActive {
-				forkTipCount++
-			}
-		}
-		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs across %d fork tips", len(offChain), forkTipCount)
+		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs", len(offChain))
 	}
 
 	return nil

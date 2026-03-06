@@ -98,11 +98,6 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Capture the current best block header before storing, to detect forks.
-	// If the new block's previous_hash doesn't match the current best block's hash,
-	// a fork exists and we need to rebuild the off-chain set.
-	bestHeader, _, bestErr := s.GetBestBlockHeader(ctx)
-
 	// Apply options
 	storeBlockOptions := options.StoreBlockOptions{}
 	for _, opt := range opts {
@@ -130,11 +125,17 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	// Reset response cache to invalidate cached block headers and best block
 	s.ResetResponseCache()
 
-	// If the new block's parent is not the previous best block, a fork was created.
-	// Rebuild the off-chain set so CheckBlockIsInCurrentChain can use it.
-	// During normal sync (extending the tip), the previous_hash matches the best
-	// block's hash, so this branch is never taken.
-	if bestErr == nil && !block.Header.HashPrevBlock.IsEqual(bestHeader.Hash()) {
+	// Detect forks using post-insert state: if the new block's parent now has
+	// multiple children, a fork exists. This is race-resilient because it queries
+	// the authoritative DB state after the insert, rather than comparing against
+	// a pre-insert best header that could be stale due to concurrent StoreBlock calls.
+	// During normal sync (extending the tip), the parent has exactly 1 child, so
+	// this branch is never taken.
+	var parentChildCount int
+	if countErr := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM blocks WHERE parent_id = (SELECT parent_id FROM blocks WHERE id = $1)`,
+		newBlockID,
+	).Scan(&parentChildCount); countErr == nil && parentChildCount > 1 {
 		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
 			s.logger.Errorf("StoreBlock: %v", rebuildErr)
 		}

@@ -23,8 +23,11 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 	// Desired: ResetResponseCache → resetChainWalkCache → rebuildOffChainSet
 	// (rebuildOffChainSet calls GetBestBlockHeader which reads the response cache,
 	// so the cache must be reset before the rebuild runs.)
+	// Use context.Background() because the caller's ctx may have been
+	// cancelled after the DB update succeeded — the rebuild must still run
+	// to keep the in-memory membership state consistent.
 	defer func() {
-		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
+		if rebuildErr := s.rebuildOffChainSet(context.Background()); rebuildErr != nil {
 			s.logger.Errorf("RevalidateBlock: %v", rebuildErr)
 		}
 	}()

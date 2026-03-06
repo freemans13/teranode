@@ -109,8 +109,11 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 		// Invalidate caches to ensure cached blocks reflect updated invalid field
 		s.ResetResponseCache()
 		s.resetChainWalkCache()
-		// Rebuild the off-chain set and membership cache after invalidation
-		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
+		// Rebuild the off-chain set and membership cache after invalidation.
+		// Use context.Background() because the caller's ctx may have been
+		// cancelled after the DB update succeeded — the rebuild must still run
+		// to keep the in-memory membership state consistent.
+		if rebuildErr := s.rebuildOffChainSet(context.Background()); rebuildErr != nil {
 			s.logger.Errorf("InvalidateBlock: %v", rebuildErr)
 		}
 	}()

@@ -98,11 +98,28 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		}
 	}
 
+	// Verify that no reorg occurred during the Tier 2/3 lookups. If the generation
+	// changed, the offChainBlockIDs snapshot we used may be stale — retry once with
+	// the updated set rather than returning a potentially incorrect result.
+	if cacheGen != s.chainMembershipGen.Load() {
+		// Re-read the off-chain set after the reorg and re-check Tier 2.
+		s.offChainBlockIDsMu.RLock()
+		offChain = s.offChainBlockIDs
+		s.offChainBlockIDsMu.RUnlock()
+
+		for _, id := range blockIDs {
+			if _, isOffChain := offChain[id]; isOffChain {
+				return false, nil
+			}
+		}
+		// Don't cache after a reorg race — let the next call cache with stable gen.
+		return true, nil
+	}
+
 	// All block IDs exist, none are off-chain — they're on the main chain.
-	// Cache them for future Tier 1 hits, but only if no reorg occurred during
-	// the lookup (generation unchanged since we captured it before Tier 1),
-	// and only if the cache hasn't exceeded its size cap.
-	if cacheGen == s.chainMembershipGen.Load() && s.chainMembershipCacheSize.Load() < maxChainMembershipCacheSize {
+	// Cache them for future Tier 1 hits, but only if the cache hasn't
+	// exceeded its size cap.
+	if s.chainMembershipCacheSize.Load() < maxChainMembershipCacheSize {
 		for _, id := range blockIDs {
 			if _, loaded := s.chainMembershipCache.LoadOrStore(id, true); !loaded {
 				s.chainMembershipCacheSize.Add(1)
