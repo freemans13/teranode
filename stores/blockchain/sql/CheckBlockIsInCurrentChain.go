@@ -49,6 +49,11 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return false, nil
 	}
 
+	// Capture cache generation before the lookups so we can detect if a reorg
+	// invalidated the cache while the lookup was in progress. Only cache results
+	// if the generation hasn't changed.
+	cacheGen := s.chainMembershipGen.Load()
+
 	// Tier 1: Fast path — check if all block IDs are already confirmed on the main chain.
 	// This cache survives StoreBlock/SetBlock* calls and is only cleared on reorgs.
 	allCached := true
@@ -85,8 +90,8 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	}
 
 	// All block IDs exist, none are off-chain — they're on the main chain.
-	// Cache them for future Tier 1 hits.
-	cacheGen := s.chainMembershipGen.Load()
+	// Cache them for future Tier 1 hits, but only if no reorg occurred during
+	// the lookup (generation unchanged since we captured it before Tier 1).
 	if cacheGen == s.chainMembershipGen.Load() {
 		for _, id := range blockIDs {
 			s.chainMembershipCache.Store(id, true)

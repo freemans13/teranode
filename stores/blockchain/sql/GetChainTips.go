@@ -166,6 +166,82 @@ func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, erro
 	return chainTips, nil
 }
 
+// getChainTipsForRebuild is a lightweight version of getChainTipsUncached that skips
+// the expensive calculateBranchLength call. Used by rebuildOffChainSet which only needs
+// to know tip status (active vs fork) and hash to collect fork block IDs.
+// collectForkBlockIDs handles branchlen == 0 gracefully with a 1000-block safety limit.
+func (s *SQL) getChainTipsForRebuild(ctx context.Context) ([]*model.ChainTip, error) {
+	bestHeader, _, err := s.GetBestBlockHeader(ctx)
+	if err != nil {
+		return nil, errors.NewStorageError("failed to get best block header", err)
+	}
+
+	q := `
+		SELECT
+			b.hash,
+			b.height,
+			b.invalid,
+			b.subtrees_set,
+			b.processed_at IS NOT NULL as fully_processed
+		FROM blocks b
+		LEFT JOIN blocks children ON children.parent_id = b.id AND children.id != b.id
+		WHERE children.id IS NULL
+		ORDER BY b.chain_work DESC, b.id ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, errors.NewStorageError("failed to query chain tips for rebuild", err)
+	}
+	defer rows.Close()
+
+	var chainTips []*model.ChainTip
+
+	for rows.Next() {
+		var (
+			hashBytes      []byte
+			height         uint32
+			invalid        bool
+			subtreesSet    bool
+			fullyProcessed bool
+		)
+
+		if err := rows.Scan(&hashBytes, &height, &invalid, &subtreesSet, &fullyProcessed); err != nil {
+			return nil, errors.NewStorageError("failed to scan chain tip row", err)
+		}
+
+		tipHash, err := chainhash.NewHash(hashBytes)
+		if err != nil {
+			return nil, errors.NewStorageError("failed to create hash from bytes", err)
+		}
+
+		status := statusHeadersOnly
+		switch {
+		case invalid:
+			status = statusInvalid
+		case tipHash.String() == bestHeader.Hash().String():
+			status = statusActive
+		case fullyProcessed:
+			status = statusValidFork
+		case subtreesSet:
+			status = statusValidHeaders
+		}
+
+		chainTips = append(chainTips, &model.ChainTip{
+			Height:    height,
+			Hash:      tipHash.String(),
+			Branchlen: 0, // Not calculated — collectForkBlockIDs uses 1000-block safety limit
+			Status:    status,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, errors.NewStorageError("error iterating chain tip rows for rebuild", err)
+	}
+
+	return chainTips, nil
+}
+
 // calculateBranchLength calculates the length of a branch from a tip back to
 // the common ancestor with the main chain.
 func (s *SQL) calculateBranchLength(ctx context.Context, tipHashBytes []byte, mainChainTipHash *chainhash.Hash) (uint32, error) {
@@ -292,11 +368,18 @@ func (s *SQL) isBlockInMainChain(ctx context.Context, blockHash, mainChainTipHas
 
 // collectForkBlockIDs walks backward from a non-active chain tip, collecting the
 // database IDs of all blocks on the fork branch (blocks NOT on the main chain).
-// It walks back branchlen steps from the fork tip, which is exactly the set of
-// blocks that diverge from the main chain.
 //
-// If branchlen is 0 (unknown), it falls back to walking up to 1000 blocks.
-func (s *SQL) collectForkBlockIDs(ctx context.Context, tip *model.ChainTip) ([]uint32, error) {
+// The fork point is detected dynamically by checking at each step whether:
+//   - The parent block has multiple children (structural fork point), OR
+//   - The parent block is the best (active) block (handles invalidated block case)
+//
+// This avoids the expensive calculateBranchLength call which does O(branch_length *
+// main_chain_length) queries per tip.
+//
+// Parameters:
+//   - bestBlockID: the database ID of the current best (active) block, used to detect
+//     the fork point for invalidated blocks that don't create a structural fork.
+func (s *SQL) collectForkBlockIDs(ctx context.Context, tip *model.ChainTip, bestBlockID uint32) ([]uint32, error) {
 	if tip.Status == statusActive {
 		return nil, nil
 	}
@@ -306,15 +389,10 @@ func (s *SQL) collectForkBlockIDs(ctx context.Context, tip *model.ChainTip) ([]u
 		return nil, errors.NewStorageError("failed to parse fork tip hash", err)
 	}
 
-	maxWalk := tip.Branchlen
-	if maxWalk == 0 {
-		maxWalk = 1000 // safety limit for unknown branch length
-	}
-
 	var blockIDs []uint32
 	currentHash := tipHash
 
-	for i := uint32(0); i < maxWalk; i++ {
+	for i := 0; i < 1000; i++ { // safety limit
 		q := `SELECT id, parent_id FROM blocks WHERE hash = $1`
 
 		var (
@@ -336,11 +414,31 @@ func (s *SQL) collectForkBlockIDs(ctx context.Context, tip *model.ChainTip) ([]u
 			break // reached genesis
 		}
 
+		parentIDVal := uint32(parentID.Int64) //nolint:gosec // block IDs fit in uint32
+
+		// Stop if parent is the best block (handles invalidated block case where
+		// the fork tip is an invalidated block directly after the main chain tip).
+		if parentIDVal == bestBlockID {
+			break
+		}
+
+		// Stop if parent has multiple children — this means the parent is the
+		// fork point where this branch diverges from the main chain.
+		var childCount int
+		err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blocks WHERE parent_id = $1`, parentIDVal).Scan(&childCount)
+		if err != nil {
+			return nil, errors.NewStorageError("failed to count parent children", err)
+		}
+
+		if childCount > 1 {
+			break // Parent is fork point
+		}
+
 		// Get parent hash to continue walking
 		q = `SELECT hash FROM blocks WHERE id = $1`
 
 		var parentHashBytes []byte
-		err = s.db.QueryRowContext(ctx, q, parentID.Int64).Scan(&parentHashBytes)
+		err = s.db.QueryRowContext(ctx, q, parentIDVal).Scan(&parentHashBytes)
 		if err != nil {
 			return nil, errors.NewStorageError("failed to query fork parent hash", err)
 		}

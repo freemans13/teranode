@@ -765,10 +765,19 @@ func (s *SQL) ResetChainMembershipCache() {
 // The off-chain set is typically tiny (a few hundred blocks on all of mainnet history)
 // so this operation is fast even when it runs.
 func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
-	tips, err := s.getChainTipsUncached(ctx)
+	tips, err := s.getChainTipsForRebuild(ctx)
 	if err != nil {
 		// Keep the previous off-chain set — stale but better than nothing.
-		return fmt.Errorf("rebuildOffChainSet: failed to get chain tips: %w", err)
+		return errors.NewStorageError("rebuildOffChainSet: failed to get chain tips", err)
+	}
+
+	// Get the best block ID directly from GetBestBlockHeader. We can't rely on
+	// finding an "active" tip in the tips list because after invalidation the best
+	// block may not be a chain tip (it still has children, even if they're invalid).
+	var bestBlockID uint32
+	bestHeader, bestMeta, bestErr := s.GetBestBlockHeader(ctx)
+	if bestErr == nil && bestHeader != nil {
+		bestBlockID = bestMeta.ID
 	}
 
 	offChain := make(map[uint32]struct{})
@@ -779,10 +788,10 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 		}
 
 		// Walk this fork tip back to the fork point, collecting block IDs
-		forkIDs, walkErr := s.collectForkBlockIDs(ctx, tip)
+		forkIDs, walkErr := s.collectForkBlockIDs(ctx, tip, bestBlockID)
 		if walkErr != nil {
 			// Keep the previous off-chain set — partial rebuild is worse than stale.
-			return fmt.Errorf("rebuildOffChainSet: failed to walk fork tip %s: %w", tip.Hash, walkErr)
+			return errors.NewStorageError("rebuildOffChainSet: failed to walk fork tip "+tip.Hash, walkErr)
 		}
 
 		for _, id := range forkIDs {
