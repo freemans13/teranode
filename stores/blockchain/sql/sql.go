@@ -747,14 +747,10 @@ func (s *SQL) resetChainWalkCache() {
 // so this operation is fast even when it runs. The CTE walks the full main chain once
 // (O(chain_depth)), which is acceptable since rebuilds are infrequent.
 func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
-	bestHeader, bestMeta, bestErr := s.GetBestBlockHeader(ctx)
+	bestBlockID, _, bestErr := s.getBestBlockID(ctx)
 	if bestErr != nil {
-		return errors.NewStorageError("rebuildOffChainSet: failed to get best block header", bestErr)
+		return errors.NewStorageError("rebuildOffChainSet: failed to get best block ID", bestErr)
 	}
-	if bestHeader == nil || bestMeta == nil {
-		return errors.NewStorageError("rebuildOffChainSet: best block header or metadata is nil", nil)
-	}
-	bestBlockID := bestMeta.ID
 
 	// Walk the main chain from bestBlockID backward to genesis via parent_id,
 	// then find all block IDs NOT on that path. This is provably correct for all
