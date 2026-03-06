@@ -33,12 +33,15 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 	// succeeds. Order matters: ResetResponseCache must run before
 	// rebuildOffChainSet because the rebuild calls GetBestBlockHeader which
 	// reads the response cache.
-	// Use context.Background() because the caller's ctx may have been
-	// cancelled after the DB update succeeded — the rebuild must still run
-	// to keep the in-memory membership state consistent.
+	// Use a non-cancelable context with a timeout because the caller's ctx may
+	// have been cancelled after the DB update succeeded — the rebuild must still
+	// run to keep the in-memory membership state consistent, but should not
+	// block indefinitely if the DB is unhealthy.
 	s.ResetResponseCache()
 	s.resetChainWalkCache()
-	if rebuildErr := s.rebuildOffChainSet(context.Background()); rebuildErr != nil {
+	rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+	defer rebuildCancel()
+	if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
 		s.logger.Errorf("RevalidateBlock: %v", rebuildErr)
 	}
 

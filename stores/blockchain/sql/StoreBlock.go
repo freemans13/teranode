@@ -104,6 +104,10 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		opt(&storeBlockOptions)
 	}
 
+	// Capture the current best block hash before insert for reorg detection.
+	// GetBestBlockHeader is cached, so this is essentially free.
+	preBestHeader, _, _ := s.GetBestBlockHeader(ctx)
+
 	newBlockID, height, _, _, err := s.storeBlock(ctx, block, peerID, storeBlockOptions)
 	if err != nil {
 		return 0, height, err
@@ -112,20 +116,25 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	// Reset response cache to invalidate cached block headers and best block
 	s.ResetResponseCache()
 
-	// Detect forks by comparing the newly inserted block's ID with the best
-	// (most-work) block's ID. After the insert, GetBestBlockHeader returns the
-	// block with the highest cumulative chain work. If the new block IS the best
-	// block, we are extending the main chain and no rebuild is needed. If
-	// another block is the best, the new block created or extended a fork and
-	// the off-chain set must be rebuilt. This handles all cases:
-	//   - Normal sync (extending tip): newBlockID == bestID → no rebuild
-	//   - Fork creation: newBlockID != bestID → rebuild
-	//   - Fork extension: newBlockID != bestID → rebuild
-	//   - Genesis: newBlockID == bestID → no rebuild
-	_, bestMeta, bestErr := s.GetBestBlockHeader(ctx)
+	// Detect forks and reorgs by comparing the newly inserted block against
+	// the post-insert best block. Three cases require an off-chain set rebuild:
+	//   1. Fork creation/extension: new block is NOT the best → rebuild
+	//   2. Reorg: new block IS the best, but its parent was NOT the previous
+	//      best block (a competing chain overtook) → rebuild
+	//   3. Error getting best block → log and skip (can't determine)
+	// The only case that skips the rebuild is normal chain extension: new block
+	// IS the best AND its parent was the previous best block.
+	_, postBestMeta, bestErr := s.GetBestBlockHeader(ctx)
 	if bestErr != nil {
 		s.logger.Errorf("StoreBlock: failed to get best block header: %v", bestErr)
-	} else if uint64(bestMeta.ID) != newBlockID {
+	} else if uint64(postBestMeta.ID) != newBlockID {
+		// Case 1: new block is on a fork (not the best)
+		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
+			s.logger.Errorf("StoreBlock: %v", rebuildErr)
+		}
+	} else if preBestHeader != nil && *block.Header.HashPrevBlock != *preBestHeader.Hash() {
+		// Case 2: new block is the best but doesn't extend the old best (reorg)
+		s.resetChainWalkCache()
 		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
 			s.logger.Errorf("StoreBlock: %v", rebuildErr)
 		}

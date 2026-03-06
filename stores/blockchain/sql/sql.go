@@ -47,6 +47,12 @@ import (
 // several minutes, and the cached results (parent_id walks) are immutable.
 const chainWalkCacheTTL = 10 * time.Minute
 
+// rebuildOffChainSetTimeout bounds the duration of rebuildOffChainSet calls made with
+// context.Background() (in InvalidateBlock, RevalidateBlock). This prevents the rebuild
+// from blocking indefinitely if the DB is slow/unhealthy while still surviving caller
+// context cancellation.
+const rebuildOffChainSetTimeout = 30 * time.Second
+
 // SQL implements the blockchain.Store interface using SQL database backends.
 // It provides a complete implementation of blockchain data storage and retrieval
 // operations with support for different SQL engines, caching mechanisms, and

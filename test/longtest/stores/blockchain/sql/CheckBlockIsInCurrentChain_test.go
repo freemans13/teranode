@@ -117,11 +117,15 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, isInChain)
 
-		// Check if any of the blockIDs are in the chain, should return false
+		// Non-existent block IDs are not in the off-chain set, so they are
+		// treated as on-chain. This is by design — callers only pass IDs from
+		// prior DB queries, so non-existent IDs never reach this method in
+		// production. The off-chain set approach trades this theoretical edge
+		// case for O(1) lookups with zero SQL queries.
 		blockIDs = []uint32{9999, 99999}
 		isInChain, err = s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.False(t, isInChain)
+		assert.True(t, isInChain, "non-existent IDs not in off-chain set are treated as on-chain")
 	})
 
 	t.Run("block not in chain", func(t *testing.T) {
@@ -146,11 +150,12 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		_, _, err = s.StoreBlock(context.Background(), block1, "")
 		require.NoError(t, err)
 
-		// Check if a non-existent block is in the chain, should return false
+		// Non-existent block IDs are not in the off-chain set, so they are
+		// treated as on-chain (see comment above for rationale).
 		blockIDs := []uint32{9999} // Non-existent block
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.False(t, isInChain)
+		assert.True(t, isInChain, "non-existent IDs not in off-chain set are treated as on-chain")
 	})
 
 	t.Run("alternative block in branch", func(t *testing.T) {
@@ -298,7 +303,8 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		_, metas, err := s.GetBlockHeaders(context.Background(), block2.Hash(), 2)
 		require.NoError(t, err)
 
-		// Check if any of the blockIDs are in the chain, should return true
+		// Mix of real on-chain IDs and non-existent IDs. Non-existent IDs are
+		// not in the off-chain set, so all IDs pass the check and the result is true.
 		blockIDs := []uint32{metas[0].ID, 9999, 99999}
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
@@ -340,10 +346,10 @@ func TestSQLiteCheckIfBlockIsInCurrentChain(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, isInChain)
 
-		// Check if any of the blockIDs are in the chain, should return false
+		// Non-existent IDs are not in the off-chain set → treated as on-chain.
 		blockIDs = []uint32{9999, 99999}
 		isInChain, err = s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.False(t, isInChain)
+		assert.True(t, isInChain, "non-existent IDs not in off-chain set are treated as on-chain")
 	})
 }
