@@ -16,6 +16,11 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
+// maxChainMembershipCacheSize caps the number of entries in chainMembershipCache to prevent
+// unbounded memory growth during long sync runs. Once full, new lookups skip caching and
+// fall through to Tier 2/3 which are also O(1). The cache is cleared on reorgs.
+const maxChainMembershipCacheSize = 1_000_000
+
 // CheckBlockIsInCurrentChain determines if specified blocks are part of the current main chain.
 // This implements a specialized blockchain validation method not directly defined in the Store interface.
 //
@@ -64,7 +69,11 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		}
 	}
 
-	if allCached {
+	// Only trust the fast-path result if the cache generation has not changed
+	// since we started the lookup. If a reorg occurred concurrently, fall
+	// through to Tier 2/3 to recompute the answer without relying on stale
+	// cache entries.
+	if allCached && cacheGen == s.chainMembershipGen.Load() {
 		return true, nil
 	}
 
@@ -91,10 +100,13 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 
 	// All block IDs exist, none are off-chain — they're on the main chain.
 	// Cache them for future Tier 1 hits, but only if no reorg occurred during
-	// the lookup (generation unchanged since we captured it before Tier 1).
-	if cacheGen == s.chainMembershipGen.Load() {
+	// the lookup (generation unchanged since we captured it before Tier 1),
+	// and only if the cache hasn't exceeded its size cap.
+	if cacheGen == s.chainMembershipGen.Load() && s.chainMembershipCacheSize.Load() < maxChainMembershipCacheSize {
 		for _, id := range blockIDs {
-			s.chainMembershipCache.Store(id, true)
+			if _, loaded := s.chainMembershipCache.LoadOrStore(id, true); !loaded {
+				s.chainMembershipCacheSize.Add(1)
+			}
 		}
 	}
 

@@ -69,8 +69,11 @@ type SQL struct {
 	// chainMembershipCache caches block IDs confirmed to be on the main chain.
 	// Unlike responseCache, this is only invalidated on chain reorganizations
 	// (InvalidateBlock/RevalidateBlock), not on every StoreBlock/SetBlock* call.
-	// This dramatically reduces redundant recursive CTE queries during sync.
-	chainMembershipCache sync.Map // map[uint32]bool
+	// This avoids taking offChainBlockIDsMu.RLock on every call during sync.
+	// Bounded to maxChainMembershipCacheSize entries to cap memory usage; once
+	// full, new entries are not cached and lookups fall through to Tier 2/3.
+	chainMembershipCache     sync.Map // map[uint32]bool
+	chainMembershipCacheSize atomic.Int64
 	// chainMembershipGen is incremented on reorgs to prevent stale cache writes.
 	// Before a DB query, the caller captures the current generation; after the query,
 	// it only writes to chainMembershipCache if the generation hasn't changed.
@@ -191,9 +194,11 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 
 	// Seed maxBlockID from existing data so CheckBlockIsInCurrentChain
 	// can reject non-existent block IDs without a DB query.
+	// This is fatal because the in-memory lookup has no DB fallback — if seeding
+	// fails, maxBlockID stays 0 and all blocks would incorrectly return false.
 	var maxID sql.NullInt64
 	if err = db.QueryRow(`SELECT MAX(id) FROM blocks`).Scan(&maxID); err != nil {
-		logger.Warnf("failed to seed maxBlockID from DB: %v — all blocks will fall through to DB query", err)
+		return nil, errors.NewStorageError("failed to seed maxBlockID from DB", err)
 	} else if maxID.Valid {
 		s.maxBlockID.Store(uint64(maxID.Int64))
 	}
@@ -761,6 +766,7 @@ func (s *SQL) ResetChainMembershipCache() {
 		s.chainMembershipCache.Delete(key)
 		return true
 	})
+	s.chainMembershipCacheSize.Store(0)
 }
 
 // rebuildOffChainSet rebuilds the set of block IDs that are NOT on the main chain.
@@ -817,7 +823,13 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 	s.ResetChainMembershipCache()
 
 	if len(offChain) > 0 {
-		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs across %d fork tips", len(offChain), len(tips)-1)
+		forkTipCount := 0
+		for _, tip := range tips {
+			if tip.Status != statusActive {
+				forkTipCount++
+			}
+		}
+		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs across %d fork tips", len(offChain), forkTipCount)
 	}
 
 	return nil

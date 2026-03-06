@@ -450,7 +450,9 @@ func (s *SQL) collectForkBlockIDs(ctx context.Context, tip *model.ChainTip, best
 		}
 
 		if i == maxForkWalkIterations-1 {
-			s.logger.Warnf("collectForkBlockIDs: hit %d iteration safety limit for fork tip %s — off-chain set may be incomplete", maxForkWalkIterations, tip.Hash)
+			// Return an error so rebuildOffChainSet keeps the previous (stale but complete)
+			// off-chain set rather than using a partial one that could cause false positives.
+			return nil, errors.NewStorageError("collectForkBlockIDs: hit %d iteration safety limit for fork tip %s", maxForkWalkIterations, tip.Hash)
 		}
 	}
 
