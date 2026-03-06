@@ -106,7 +106,10 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 
 	// Capture the current best block hash before insert for reorg detection.
 	// getBestBlockID is cached, so this is essentially free.
-	_, preBestHash, _ := s.getBestBlockID(ctx)
+	_, preBestHash, preBestErr := s.getBestBlockID(ctx)
+	if preBestErr != nil {
+		s.logger.Warnf("StoreBlock: failed to get pre-insert best block ID: %v", preBestErr)
+	}
 
 	newBlockID, height, _, _, err := s.storeBlock(ctx, block, peerID, storeBlockOptions)
 	if err != nil {
@@ -128,14 +131,20 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 	if bestErr != nil {
 		s.logger.Errorf("StoreBlock: failed to get best block ID: %v", bestErr)
 	} else if uint64(postBestID) != newBlockID {
-		// Case 1: new block is on a fork (not the best)
-		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
+		// Case 1: new block is on a fork (not the best).
+		// Use a bounded context because the caller's ctx may be cancelled
+		// after the insert succeeded — the rebuild must still run.
+		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+		defer rebuildCancel()
+		if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
 			s.logger.Errorf("StoreBlock: %v", rebuildErr)
 		}
 	} else if preBestHash != nil && *block.Header.HashPrevBlock != *preBestHash {
 		// Case 2: new block is the best but doesn't extend the old best (reorg)
 		s.resetChainWalkCache()
-		if rebuildErr := s.rebuildOffChainSet(ctx); rebuildErr != nil {
+		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+		defer rebuildCancel()
+		if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
 			s.logger.Errorf("StoreBlock: %v", rebuildErr)
 		}
 	}

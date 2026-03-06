@@ -58,8 +58,9 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 	return tips, nil
 }
 
-// getChainTipsUncached retrieves chain tips directly from the database, bypassing the
-// response cache. Useful when fresh data is needed after chain changes.
+// getChainTipsUncached queries chain tips directly from the database. The chain tips
+// query itself bypasses the response cache; getBestBlockID uses the response cache
+// but that's fine since it's invalidated before any rebuild.
 func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, error) {
 	// Only need the best block's hash to identify the active tip.
 	_, bestHash, err := s.getBestBlockID(ctx)

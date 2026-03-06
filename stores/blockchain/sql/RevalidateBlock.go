@@ -31,7 +31,7 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 
 	// Invalidate caches and rebuild the off-chain set only after the UPDATE
 	// succeeds. Order matters: ResetResponseCache must run before
-	// rebuildOffChainSet because the rebuild calls GetBestBlockHeader which
+	// rebuildOffChainSet because the rebuild calls getBestBlockID which
 	// reads the response cache.
 	// Use a non-cancelable context with a timeout because the caller's ctx may
 	// have been cancelled after the DB update succeeded — the rebuild must still

@@ -122,6 +122,42 @@ func TestCheckBlockIsInCurrentChain_ClosedDB(t *testing.T) {
 	assert.True(t, result, "In-memory lookup should succeed even with closed DB")
 }
 
+func TestCheckBlockIsInCurrentChain_MixedOnChainAndOffChain(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	storeURL, err := url.Parse("sqlitememory:///")
+	require.NoError(t, err)
+
+	s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Build main chain: genesis -> block1 -> block2
+	blockID1, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	blockID2, _, err := s.StoreBlock(context.Background(), block2, "")
+	require.NoError(t, err)
+
+	// Store a fork block at the same height as block2 (off-chain)
+	forkID, _, err := s.StoreBlock(context.Background(), blockAlternative2, "")
+	require.NoError(t, err)
+
+	// Mixed: one on-chain block + one off-chain block should return false
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID1), uint32(forkID)})
+	require.NoError(t, err)
+	assert.False(t, result, "Mixed on-chain and off-chain should return false (ALL-of semantics)")
+
+	// All on-chain should still return true
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID1), uint32(blockID2)})
+	require.NoError(t, err)
+	assert.True(t, result, "All on-chain blocks should return true")
+
+	// Single off-chain block should return false
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(forkID)})
+	require.NoError(t, err)
+	assert.False(t, result, "Single off-chain block should return false")
+}
+
 func TestCheckBlockIsInCurrentChain_InvalidatedBlock(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	storeURL, err := url.Parse("sqlitememory:///")

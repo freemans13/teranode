@@ -185,7 +185,10 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	// CheckBlockIsInCurrentChain works correctly after a process restart.
 	// This is fatal because the in-memory lookup has no DB fallback — if the
 	// off-chain set is empty, fork/orphan blocks would incorrectly return true.
-	if rebuildErr := s.rebuildOffChainSet(context.Background()); rebuildErr != nil {
+	rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+	defer rebuildCancel()
+	if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+		s.Close()
 		return nil, errors.NewStorageError("failed to seed off-chain set during startup", rebuildErr)
 	}
 
