@@ -1355,11 +1355,20 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			go func() {
 				defer optimisticMiningWg.Done()
 
+				blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(decoupledCtx, block.Header.HashPrevBlock, u.settings.BlockValidation.MaxPreviousBlockHeadersToCheck)
+				if err != nil {
+					u.logger.Errorf("[ValidateBlock][%s] failed to get block header ids: %v", block.String(), err)
+
+					u.ReValidateBlock(block, baseURL)
+
+					return
+				}
+
 				u.logger.Infof("[ValidateBlock][%s] validating block in background", block.Hash().String())
 
 				// Create meta regenerator with peer URL for potential meta file recovery
 				metaRegenerator := u.createMetaRegenerator([]string{baseURL})
-				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, u.settings, metaRegenerator); !ok {
+				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 					u.logger.Errorf("[ValidateBlock][%s] InvalidateBlock block is not valid in background: %v", block.String(), err)
 
 					if errors.Is(err, errors.ErrBlockInvalid) {
@@ -1399,12 +1408,17 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// get all 100 previous block headers on the main chain
 			u.logger.Infof("[ValidateBlock][%s] GetBlockHeaders", block.Header.Hash().String())
 
-			blockHeaders, _, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, 100)
+			blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, 100)
 			if err != nil {
 				u.logger.Errorf("[ValidateBlock][%s] failed to get block headers: %s", block.String(), err)
 				u.ReValidateBlock(block, baseURL)
 
 				return errors.NewServiceError("[ValidateBlock][%s] failed to get block headers", block.String(), err)
+			}
+
+			blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
+			for i, blockHeaderMeta := range blockHeadersMeta {
+				blockHeaderIDs[i] = blockHeaderMeta.ID
 			}
 
 			u.logger.Infof("[ValidateBlock][%s] GetBlockHeaders DONE", block.Header.Hash().String())
@@ -1414,7 +1428,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 			// Create meta regenerator with peer URL for potential meta file recovery
 			metaRegenerator := u.createMetaRegenerator([]string{baseURL})
-			if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, u.settings, metaRegenerator); !ok {
+			if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 				reason := "unknown"
 				if err != nil {
 					reason = err.Error()
@@ -1703,6 +1717,12 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 		return errors.NewServiceError("[reValidateBlock][%s] failed to get block headers", blockData.block.String(), err)
 	}
 
+	// Extract block header IDs from the fresh block headers metadata
+	blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
+	for i, blockHeaderMeta := range blockHeadersMeta {
+		blockHeaderIDs[i] = blockHeaderMeta.ID
+	}
+
 	// Check if parent block is invalid during revalidation
 	// If parent is invalid, no point revalidating the child
 	if len(blockHeadersMeta) > 0 && blockHeadersMeta[0].Invalid {
@@ -1721,7 +1741,7 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 
 	// Create meta regenerator with peer URL for potential meta file recovery during revalidation
 	metaRegenerator := u.createMetaRegenerator([]string{blockData.baseURL})
-	if ok, err := blockData.block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, u.settings, metaRegenerator); !ok {
+	if ok, err := blockData.block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 		u.logger.Errorf("[ReValidateBlock][%s] InvalidateBlock block is not valid in background: %v", blockData.block.String(), err)
 
 		if errors.Is(err, errors.ErrBlockInvalid) {

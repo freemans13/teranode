@@ -53,7 +53,7 @@ func TestBlock_ValidBlockWithMultipleTransactions(t *testing.T) {
 	}
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
 
-	v, err := block.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, txMetaStore, currentChain, tSettings, nil)
+	v, err := block.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, txMetaStore, currentChain, nil, tSettings, nil)
 	require.NoError(t, err)
 	require.True(t, v)
 }
@@ -384,7 +384,7 @@ func TestBlock_WithDuplicateTransaction(t *testing.T) {
 	}
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
 
-	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, teranode_model.TestCachedTxMetaStore, currentChain, tSettings, nil)
+	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, teranode_model.TestCachedTxMetaStore, currentChain, nil, tSettings, nil)
 	require.Error(t, err)
 	require.False(t, v)
 }
@@ -435,7 +435,7 @@ func TestBigBlock_Valid(t *testing.T) {
 
 	start := time.Now()
 
-	v, err := block.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, teranode_model.TestCachedTxMetaStore, currentChain, tSettings, nil)
+	v, err := block.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, teranode_model.TestCachedTxMetaStore, currentChain, nil, tSettings, nil)
 	require.NoError(t, err)
 	t.Logf("Time taken: %s\n", time.Since(start))
 

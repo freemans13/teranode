@@ -1227,9 +1227,10 @@ func TestBlockValidationRequestMissingTransaction(t *testing.T) {
 	}
 
 	blockIDsMap, err := utxoStore.SetMinedMulti(t.Context(), []*chainhash.Hash{tx0.TxIDChainHash()}, utxostore.MinedBlockInfo{
-		BlockID:     0,
-		BlockHeight: 1,
-		SubtreeIdx:  0,
+		BlockID:        0,
+		BlockHeight:    1,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
 	})
 	require.NoError(t, err)
 	require.Len(t, blockIDsMap, 1)

@@ -1290,14 +1290,19 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 		return nil, errors.WrapGRPC(err)
 	}
 
-	blockHeaders, _, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, u.settings.BlockValidation.PreviousBlockHeaderCount)
+	blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, u.settings.BlockValidation.PreviousBlockHeaderCount)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewServiceError("[ValidateBlock][%s] failed to get block headers", block.String(), err))
 	}
 
+	blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
+	for i, meta := range blockHeadersMeta {
+		blockHeaderIDs[i] = meta.ID
+	}
+
 	// Create meta regenerator for potential meta file recovery (no peer URL for gRPC, local store only)
 	metaRegenerator := u.blockValidation.createMetaRegenerator(nil)
-	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, u.settings, metaRegenerator); !ok {
+	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err))
 	}
 

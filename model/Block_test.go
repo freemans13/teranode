@@ -171,7 +171,7 @@ func TestZeroCoverageFunctions(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
 
-		err := block.checkParentExistsOnChain(ctx, createTestUTXOStore(t), parentTxStruct)
+		err := block.checkParentExistsOnChain(ctx, ulogger.TestLogger{}, createTestUTXOStore(t), parentTxStruct, map[uint32]struct{}{})
 		// Don't assert on error - just call the function
 		_ = err
 	})
@@ -202,7 +202,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		currentChain := []*BlockHeader{}
 
 		// This should hit many validation paths
-		valid, err := block.Valid(ctx, logger, subtreeStore, txMetaStore, currentChain, settings, nil)
+		valid, err := block.Valid(ctx, logger, subtreeStore, txMetaStore, currentChain, nil, settings, nil)
 		// May pass or fail, but we're testing coverage
 		_ = valid
 		_ = err
@@ -234,7 +234,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should fail validation (may hit difficulty or timestamp validation)
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, nil, tSettings, nil)
 		assert.False(t, valid)
 		assert.Error(t, err) // Just verify it fails - the specific error depends on validation order
 	})
@@ -258,7 +258,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the nil coinbase validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, nil, tSettings, nil)
 		assert.False(t, valid)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "no coinbase tx")
@@ -291,7 +291,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the median timestamp validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), currentChain, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), currentChain, nil, tSettings, nil)
 		// May pass or fail, but we're testing the median timestamp code path
 		_ = valid
 		_ = err
@@ -316,7 +316,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the coinbase height validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, nil, tSettings, nil)
 		// Will likely fail due to height mismatch, but we're testing the code path
 		_ = valid
 		_ = err
@@ -344,7 +344,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		subtreeStore := &mockSubtreeStore{shouldError: true} // Empty store
 
 		// This should hit the subtree validation path
-		valid, err := block.Valid(ctx, logger, subtreeStore, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, subtreeStore, createTestUTXOStore(t), []*BlockHeader{}, nil, tSettings, nil)
 		// Will likely fail due to missing subtree, but we're testing the code path
 		_ = valid
 		_ = err
@@ -367,7 +367,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should skip median timestamp validation due to empty chain
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), []*BlockHeader{}, nil, tSettings, nil)
 		// Should hit the empty chain path
 		_ = valid
 		_ = err
@@ -1115,7 +1115,7 @@ func TestBlock_ValidWithOneTransaction(t *testing.T) {
 	}
 
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
-	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, utxoStore, currentChain, settings, nil)
+	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, utxoStore, currentChain, nil, settings, nil)
 	require.NoError(t, err)
 	require.True(t, v)
 }
@@ -1215,30 +1215,36 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 
 	block := &Block{}
 
-	t.Run("test parent is mined", func(t *testing.T) {
+	// currentBlockHeaderIDsMap includes both block IDs 100 and 101 (our ancestor chain)
+	currentBlockHeaderIDsMap := map[uint32]struct{}{
+		100: {},
+		101: {},
+	}
+
+	t.Run("test parent is mined on our chain", func(t *testing.T) {
 		parentTxStruct := missingParentTx{
 			parentTxHash: *txParent.TxIDChainHash(),
 			txHash:       *tx.TxIDChainHash(),
 		}
 
-		err := block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
+		err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
 		require.NoError(t, err)
 	})
 
-	t.Run("test parent is mined in different block", func(t *testing.T) {
-		// swap parent/tx hashes - both are mined so both should pass
+	t.Run("test parent is mined in different block on our chain", func(t *testing.T) {
+		// swap parent/tx hashes - both are mined on our chain so both should pass
 		parentTxStruct := missingParentTx{
 			parentTxHash: *tx.TxIDChainHash(),
 			txHash:       *txParent.TxIDChainHash(),
 		}
 
-		err := block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
+		err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
 		require.NoError(t, err)
 	})
 
-	t.Run("test parent is unmined", func(t *testing.T) {
+	t.Run("test parent has no block IDs (unmined)", func(t *testing.T) {
 		txParentUnmined := newTx(3)
-		// Create without MinedBlockInfo at blockHeight > 0 so UnminedSince is set to a non-zero value
+		// Create without MinedBlockInfo — the tx has no block IDs
 		_, err = utxoStore.Create(context.Background(), txParentUnmined, 50)
 		require.NoError(t, err)
 		parentTxStruct := missingParentTx{
@@ -1246,7 +1252,7 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 			txHash:       *tx.TxIDChainHash(),
 		}
 
-		err = block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
+		err = block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
 		require.Error(t, err)
 		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
 	})
@@ -1258,14 +1264,16 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 			txHash:       *tx.TxIDChainHash(),
 		}
 
-		err := block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
+		err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
 		require.Error(t, err)
 		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
 	})
 
 	t.Run("test parent mined in old block still passes", func(t *testing.T) {
-		// Parent mined in block 1 (old block) - with UnminedSince-based check, it should still pass
-		// because the parent IS mined (UnminedSince=0 regardless of how old the block is)
+		// Parent mined in block 1, which is older than our header window (100-101).
+		// Since fork depth is capped at coinbase maturity (~100 blocks) and our header window
+		// covers that range, a parent mined deeper than the window is necessarily an ancestor
+		// of both the main chain and any valid fork.
 		blockID1 := uint32(1)
 		txOldParent := newTx(4)
 		_, err = utxoStore.Create(context.Background(), txOldParent, blockID1, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 1}))
@@ -1275,7 +1283,52 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 			txHash:       *tx.TxIDChainHash(),
 		}
 
-		err = block.checkParentExistsOnChain(context.Background(), utxoStore, parentTxStruct)
+		err = block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
+		require.NoError(t, err)
+	})
+
+	t.Run("test parent mined on competing fork is rejected", func(t *testing.T) {
+		// Scenario: parent is mined in block 200 (on chain A / main tip).
+		// We are validating a block on chain B, whose ancestor block IDs are 150-199.
+		// Block 200 is NOT in chain B's ancestor set, so the parent check must fail.
+		// This proves the BlockIDs check correctly rejects parents mined on a competing fork.
+		txForkParent := newTx(5)
+		_, err = utxoStore.Create(context.Background(), txForkParent, 200,
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 200, BlockHeight: 200}))
+		require.NoError(t, err)
+
+		// Chain B's ancestor block IDs: 150-199 (does NOT include block 200)
+		chainBHeaderIDs := make(map[uint32]struct{}, 50)
+		for id := uint32(150); id < 200; id++ {
+			chainBHeaderIDs[id] = struct{}{}
+		}
+
+		parentTxStruct := missingParentTx{
+			parentTxHash: *txForkParent.TxIDChainHash(),
+			txHash:       *tx.TxIDChainHash(),
+		}
+
+		err = block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, chainBHeaderIDs)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+		require.Contains(t, err.Error(), "is not valid on our current chain")
+	})
+
+	t.Run("test genesis block ID special case passes", func(t *testing.T) {
+		// Transactions imported from a restore have BlockIDs=[0] (GenesisBlockID).
+		// These should always pass regardless of the header window.
+		txGenesisImported := newTx(6)
+		_, err = utxoStore.Create(context.Background(), txGenesisImported, 0,
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 0, BlockHeight: 0}))
+		require.NoError(t, err)
+
+		parentTxStruct := missingParentTx{
+			parentTxHash: *txGenesisImported.TxIDChainHash(),
+			txHash:       *tx.TxIDChainHash(),
+		}
+
+		// Even with an empty header IDs map, genesis-imported txs should pass
+		err = block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, map[uint32]struct{}{})
 		require.NoError(t, err)
 	})
 }
@@ -1988,7 +2041,7 @@ func TestBlock_Valid_MoreCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// Call with txMetaStore to trigger validOrderAndBlessed path
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, nil, tSettings, nil)
 
 		// This might error due to missing subtrees, but we're testing the path
 		_ = valid
@@ -2215,21 +2268,21 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 		txMetaStore := createTestUTXOStore(t)
 
 		// Test with nil subtreeStore to skip the subtree check
-		valid, err := block.Valid(ctx, logger, nil, nil, []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, nil, nil, []*BlockHeader{}, nil, tSettings, nil)
 
 		// Should succeed because we're skipping most validation
 		require.NoError(t, err)
 		assert.True(t, valid)
 
 		// Test with subtreeStore but no txMetaStore to test different paths
-		valid, err = block.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, tSettings, nil)
+		valid, err = block.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, nil, tSettings, nil)
 
 		// This will error due to missing subtrees but tests the path
 		_ = valid
 		_ = err
 
 		// Test with txMetaStore to trigger validOrderAndBlessed
-		valid, err = block.Valid(ctx, logger, nil, txMetaStore, []*BlockHeader{}, tSettings, nil)
+		valid, err = block.Valid(ctx, logger, nil, txMetaStore, []*BlockHeader{}, nil, tSettings, nil)
 
 		_ = valid
 		_ = err
@@ -2334,13 +2387,13 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 
 		// Test with only subtreeStore
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
-		_, err = block.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, tSettings, nil)
+		_, err = block.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, nil, tSettings, nil)
 		// Will error but exercises the subtree validation path
 		_ = err
 
 		// Test checkBlockRewardAndFees path with height > 0
 		block.Height = 100
-		_, err = block.Valid(ctx, logger, nil, nil, []*BlockHeader{}, tSettings, nil)
+		_, err = block.Valid(ctx, logger, nil, nil, []*BlockHeader{}, nil, tSettings, nil)
 		// Will error but exercises checkBlockRewardAndFees path
 		_ = err
 	})
@@ -2489,7 +2542,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		require.NoError(t, err)
 
 		block1.SubtreeSlices = []*subtreepkg.Subtree{subtree}
-		_, err = block1.Valid(ctx, logger, nil, nil, []*BlockHeader{}, tSettings, nil)
+		_, err = block1.Valid(ctx, logger, nil, nil, []*BlockHeader{}, nil, tSettings, nil)
 		_ = err // Exercises checkBlockRewardAndFees path safely
 
 		// Test path 2: GetAndValidateSubtrees path
@@ -2500,14 +2553,14 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		block2.Subtrees = []*chainhash.Hash{hash1}
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
 
-		_, err = block2.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, tSettings, nil)
+		_, err = block2.Valid(ctx, logger, mockSubtreeStore, nil, []*BlockHeader{}, nil, tSettings, nil)
 		_ = err // Exercises GetAndValidateSubtrees path
 
 		// Test path 3: validOrderAndBlessed path with txMetaStore
 		block3, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
 		require.NoError(t, err)
 		txMetaStore := createTestUTXOStore(t)
-		_, err = block3.Valid(ctx, logger, nil, txMetaStore, []*BlockHeader{}, tSettings, nil)
+		_, err = block3.Valid(ctx, logger, nil, txMetaStore, []*BlockHeader{}, nil, tSettings, nil)
 		_ = err // Exercises validOrderAndBlessed path
 
 		// Test path 4: CheckMerkleRoot path
@@ -2521,7 +2574,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		require.NoError(t, err)
 
 		block4.SubtreeSlices = []*subtreepkg.Subtree{subtree2}
-		_, err = block4.Valid(ctx, logger, nil, nil, []*BlockHeader{}, tSettings, nil)
+		_, err = block4.Valid(ctx, logger, nil, nil, []*BlockHeader{}, nil, tSettings, nil)
 		_ = err // Exercises CheckMerkleRoot path
 	})
 
@@ -3977,7 +4030,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		txMetaStore := createTestUTXOStore(t)
 
 		// This should fail the coinbase placeholder check
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, nil, tSettings, nil)
 		require.Error(t, err)
 		require.False(t, valid)
 		assert.Contains(t, err.Error(), "first transaction in first subtree is not a coinbase placeholder")
@@ -4026,7 +4079,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		txMetaStore := createTestUTXOStore(t)
 
 		// This should fail validation - coinbase placeholder must be in first subtree, first position
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, nil, tSettings, nil)
 		require.Error(t, err)
 		require.False(t, valid)
 		assert.Contains(t, err.Error(), "first transaction in first subtree is not a coinbase placeholder")
@@ -4057,7 +4110,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 
 		// With empty subtree slices, the validation should pass this check
 		// (it will fail on other validations)
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, tSettings, nil)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, []*BlockHeader{}, nil, tSettings, nil)
 		_ = valid
 		_ = err
 		// The coinbase placeholder check should be skipped for empty subtrees
