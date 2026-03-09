@@ -37,12 +37,13 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		s, err := storesql.New(ulogger.TestLogger{}, storeURL, tSettings)
 		require.NoError(t, err)
 
-		// Non-existent block IDs are not in the off-chain set, so they are
-		// treated as on-chain. See rationale in the "multiple blocks in chain" subtest.
-		blockIDs := []uint32{1, 2, 3}
+		// Non-existent block IDs above maxBlockID are rejected by the upper-bound
+		// check and correctly return false. IDs 1, 2, 3 may be within the genesis
+		// block range so use very high IDs to test the boundary.
+		blockIDs := []uint32{999999, 999998, 999997}
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.True(t, isInChain, "non-existent IDs not in off-chain set are treated as on-chain")
+		assert.False(t, isInChain, "non-existent IDs above maxBlockID should return false")
 	})
 
 	t.Run("single block in chain", func(t *testing.T) {
@@ -118,15 +119,12 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, isInChain)
 
-		// Non-existent block IDs are not in the off-chain set, so they are
-		// treated as on-chain. This is by design — callers only pass IDs from
-		// prior DB queries, so non-existent IDs never reach this method in
-		// production. The off-chain set approach trades this theoretical edge
-		// case for O(1) lookups with zero SQL queries.
+		// Non-existent block IDs above maxBlockID are rejected by the upper-bound
+		// check and correctly return false.
 		blockIDs = []uint32{9999, 99999}
 		isInChain, err = s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.True(t, isInChain, "non-existent IDs not in off-chain set are treated as on-chain")
+		assert.False(t, isInChain, "non-existent IDs above maxBlockID should return false")
 	})
 
 	t.Run("block not in chain", func(t *testing.T) {
@@ -151,12 +149,12 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		_, _, err = s.StoreBlock(context.Background(), block1, "")
 		require.NoError(t, err)
 
-		// Non-existent block IDs are not in the off-chain set, so they are
-		// treated as on-chain (see comment above for rationale).
+		// Non-existent block IDs above maxBlockID are rejected by the upper-bound
+		// check and correctly return false.
 		blockIDs := []uint32{9999} // Non-existent block
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.True(t, isInChain, "non-existent IDs not in off-chain set are treated as on-chain")
+		assert.False(t, isInChain, "non-existent IDs above maxBlockID should return false")
 	})
 
 	t.Run("alternative block in branch", func(t *testing.T) {
@@ -304,8 +302,8 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		_, metas, err := s.GetBlockHeaders(context.Background(), block2.Hash(), 2)
 		require.NoError(t, err)
 
-		// Mix of real on-chain IDs and non-existent IDs. Non-existent IDs are
-		// not in the off-chain set, so all IDs pass the check and the result is true.
+		// Mix of real on-chain IDs and non-existent IDs. Non-existent IDs above
+		// maxBlockID are skipped; the real on-chain ID causes the result to be true.
 		blockIDs := []uint32{metas[0].ID, 9999, 99999}
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
@@ -347,10 +345,10 @@ func TestSQLiteCheckIfBlockIsInCurrentChain(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, isInChain)
 
-		// Non-existent IDs are not in the off-chain set → treated as on-chain.
+		// Non-existent IDs above maxBlockID are rejected and return false.
 		blockIDs = []uint32{9999, 99999}
 		isInChain, err = s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.True(t, isInChain, "non-existent IDs not in off-chain set are treated as on-chain")
+		assert.False(t, isInChain, "non-existent IDs above maxBlockID should return false")
 	})
 }

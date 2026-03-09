@@ -116,6 +116,9 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		return 0, height, err
 	}
 
+	// Track the highest block ID for the maxBlockID upper-bound check.
+	s.updateMaxBlockID(newBlockID)
+
 	// Reset response cache to invalidate cached best block ID and headers
 	s.ResetResponseCache()
 
@@ -137,20 +140,22 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		s.logger.Errorf("StoreBlock: failed to get best block ID: %v", bestErr)
 	} else if uint64(postBestID) != newBlockID {
 		// Case 1: new block is on a fork (not the best).
-		// Use a bounded context because the caller's ctx may be cancelled
-		// after the insert succeeded — the rebuild must still run.
 		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
 		defer rebuildCancel()
-		if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+		if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
 			s.logger.Errorf("StoreBlock: %v", rebuildErr)
+		} else {
+			s.lastSuccessfulRebuild.Store(time.Now().Unix())
 		}
 	} else if preBestHash != nil && *block.Header.HashPrevBlock != *preBestHash {
 		// Case 2: new block is the best but doesn't extend the old best (reorg)
 		s.resetChainWalkCache()
 		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
 		defer rebuildCancel()
-		if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+		if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
 			s.logger.Errorf("StoreBlock: %v", rebuildErr)
+		} else {
+			s.lastSuccessfulRebuild.Store(time.Now().Unix())
 		}
 	}
 

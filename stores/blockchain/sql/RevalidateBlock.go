@@ -2,6 +2,7 @@ package sql
 
 import (
 	"context"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -41,8 +42,10 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 	s.resetChainWalkCache()
 	rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
 	defer rebuildCancel()
-	if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+	if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
 		s.logger.Errorf("RevalidateBlock: %v", rebuildErr)
+	} else {
+		s.lastSuccessfulRebuild.Store(time.Now().Unix())
 	}
 
 	return nil

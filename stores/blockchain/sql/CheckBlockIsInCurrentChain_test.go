@@ -78,11 +78,11 @@ func TestCheckBlockIsInCurrentChain_NonExistentBlockID(t *testing.T) {
 	_, _, err = s.StoreBlock(context.Background(), block1, "")
 	require.NoError(t, err)
 
-	// Non-existent block IDs are not in the off-chain set, so they're treated
-	// as on-chain. In practice, callers only pass block IDs from the database.
+	// Non-existent block IDs above maxBlockID are rejected by the upper-bound
+	// check and correctly return false.
 	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{999999})
 	require.NoError(t, err)
-	assert.True(t, result, "Unknown block IDs not in off-chain set are treated as on-chain")
+	assert.False(t, result, "Non-existent block IDs above maxBlockID should return false")
 }
 
 func TestCheckBlockIsInCurrentChain_ContextCancellation(t *testing.T) {
@@ -114,10 +114,14 @@ func TestCheckBlockIsInCurrentChain_ClosedDB(t *testing.T) {
 	s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
 	require.NoError(t, err)
 
+	// Store a block so maxBlockID is > 0, then close
+	blockID, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
 	s.Close()
 
 	// The off-chain set lookup is fully in-memory — closed DB has no effect.
-	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{1})
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID)})
 	assert.NoError(t, err)
 	assert.True(t, result, "In-memory lookup should succeed even with closed DB")
 }
