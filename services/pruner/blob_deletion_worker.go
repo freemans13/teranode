@@ -154,13 +154,21 @@ func (s *Server) processBlobDeletionsAtHeight(blockHeight uint32, blockHash chai
 		// Warn when an entire batch has no files on disk — strong signal of a
 		// volume mount misconfiguration (e.g. pruner cannot see the real blob store).
 		if notFoundCount > 0 && notFoundCount == int64(len(deletions)) {
-			storeURL, _ := s.settings.GetBlobStoreURL(int32(storetypes.SUBTREESTORE))
-			urlStr := "<unknown>"
-			if storeURL != nil {
-				urlStr = storeURL.String()
+			// Log the store type(s) actually present in this batch, not a hardcoded type.
+			storeTypes := make(map[storetypes.BlobStoreType]struct{})
+			for _, d := range deletions {
+				storeTypes[storetypes.BlobStoreType(d.StoreType)] = struct{}{}
 			}
-			s.logger.Warnf("[pruner][%s:%d] blob deletion: all %d blobs in batch were already missing from disk — verify the pruner pod has the correct volume mount for the blob store at %s",
-				blockHashStr, blockHeight, len(deletions), urlStr)
+			storeInfo := make([]string, 0, len(storeTypes))
+			for st := range storeTypes {
+				urlStr := st.String()
+				if u, err := s.settings.GetBlobStoreURL(int32(st)); err == nil && u != nil {
+					urlStr = st.String() + "=" + u.String()
+				}
+				storeInfo = append(storeInfo, urlStr)
+			}
+			s.logger.Warnf("[pruner][%s:%d] blob deletion: all %d blobs in batch were already missing from disk — verify the pruner pod has the correct volume mount for blob store(s): %v",
+				blockHashStr, blockHeight, len(deletions), storeInfo)
 		}
 
 		// Complete the batch in a single gRPC call

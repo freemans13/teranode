@@ -138,7 +138,8 @@ func RunCreateTransactionMapBenchmark(numSubtrees, txsPerSubtree int, cpuProfile
 			return CreateTransactionMapBenchmarkResult{}, errors.NewProcessingError("failed to serialize subtree: %w", err)
 		}
 
-		if err := subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes, options.WithDeleteAt(tSettings.GlobalBlockHeightRetention)); err != nil {
+		// DAH = currentBlockHeight + retention. Benchmark runs at height 0, so DAH = retention.
+		if err := subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes, options.WithDeleteAt(0+tSettings.GlobalBlockHeightRetention)); err != nil {
 			return CreateTransactionMapBenchmarkResult{}, errors.NewProcessingError("failed to store subtree: %w", err)
 		}
 

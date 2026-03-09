@@ -303,8 +303,11 @@ func FileOptionsToQuery(fileType fileformat.FileType, opts ...FileOption) url.Va
 // a peer, the receiver applies its own DAH policy — not the sender's. The receiving node's
 // file store applies DAH automatically via constructFilename() using its local
 // BlockHeightRetention setting (see file.go constructFilename: dah = currentBlockHeight +
-// BlockHeightRetention). The "blockHeightRetention" key is reserved for explicit overrides
-// but is not sent in normal peer-to-peer blob transfers.
+// BlockHeightRetention).
+//
+// The "blockHeightRetention" query key, despite its name, maps to WithDeleteAt() and is
+// treated as an absolute DAH value (not a relative retention window). It is not sent in
+// normal peer-to-peer blob transfers; it exists for explicit override scenarios only.
 //
 // Parameters:
 //   - query: URL query parameters to convert
