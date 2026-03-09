@@ -217,7 +217,9 @@ func (s *Server) processOneDeletion(ctx context.Context, deletion *blockchain_ap
 	existed, existsErr := blobStore.Exists(ctx, deletion.BlobKey, fileType)
 	if existsErr != nil {
 		s.logger.Debugf("[pruner][%s:%d] blob deletion: exists check failed for key=%x: %v", blockHashStr, blockHeight, deletion.BlobKey, existsErr)
-		// Fall through to Del which will report the real error
+		// Assume existed so we don't inflate not-found counts due to transient errors.
+		// Fall through to Del which will report the real error if the store is down.
+		existed = true
 	}
 
 	// Delete blob (idempotent — succeeds even if file is already gone)
