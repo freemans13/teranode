@@ -152,9 +152,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	// Initialize spend batcher — mirrors aerospike/aerospike.go batcher setup.
 	// Batches individual spend operations to control DB connection concurrency.
+	// Always use background=false for SQL: batch callbacks must be serialized to
+	// prevent PostgreSQL deadlocks from concurrent transactions locking overlapping
+	// rows in different orders. Aerospike uses background=true because it has no
+	// DB-level row locking.
 	spendBatchSize := tSettings.UtxoStore.SpendBatcherSize
 	spendBatchDuration := time.Duration(tSettings.UtxoStore.SpendBatcherDurationMillis) * time.Millisecond
-	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, !tSettings.BatcherDrainMode)
+	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, false)
 	if tSettings.BatcherDrainMode {
 		s.spendBatcher.SetDrainMode(true)
 	}
@@ -981,11 +985,16 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 // the timeout fires. Same SQL for both PostgreSQL and SQLite.
 // Mirrors aerospike/spend.go sendSpendBatchLua.
 //
-// Two-phase design prevents deadlocks:
+// Two-phase design:
 //
-//	Phase 1: SELECT + UPDATE outputs (each output row is unique across batches, no contention)
+//	Phase 1: SELECT + UPDATE outputs (validates and marks each output as spent)
 //	Phase 2: UPDATE transactions for DAH, deduplicated and sorted by transaction_id
-//	         (consistent lock ordering across all batches eliminates circular waits)
+//
+// The batcher is configured with background=false so batch callbacks are serialized.
+// This prevents PostgreSQL deadlocks that occur when concurrent batches lock
+// overlapping output rows (same transaction_id, different idx) in different orders.
+// Aerospike doesn't need this because it uses optimistic single-key operations
+// without DB-level row locking.
 func (s *Store) sendSpendBatch(batch []*batchSpend) {
 	txn, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
