@@ -1064,7 +1064,9 @@ func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) erro
 	}
 
 	retention := s.settings.GetUtxoStoreBlockHeightRetention()
-	newDAH := int64(s.blockHeight.Load() + retention)
+	// +1 because blockHeight is updated asynchronously via blockchain notifications
+	// and lags behind during block processing (mirrors aerospike set_mined.go:162)
+	newDAH := int64(s.blockHeight.Load() + 1 + retention)
 
 	if conflicting {
 		// Conflicting: set DAH only if not already set (mirrors aerospike line 944-951)
@@ -1462,7 +1464,8 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 	if s.settings != nil {
 		retention = s.settings.GetUtxoStoreBlockHeightRetention()
 	}
-	newDAH := int64(s.blockHeight.Load() + retention)
+	// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
+	newDAH := int64(s.blockHeight.Load() + 1 + retention)
 
 	var qBulkUpdate string
 	if minedBlockInfo.OnLongestChain {
@@ -1603,7 +1606,8 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 	if s.settings != nil {
 		retentionOrig = s.settings.GetUtxoStoreBlockHeightRetention()
 	}
-	newDAHOrig := int64(s.blockHeight.Load() + retentionOrig)
+	// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
+	newDAHOrig := int64(s.blockHeight.Load() + 1 + retentionOrig)
 
 	var qLongestChain string
 	if retentionOrig > 0 {
@@ -1904,7 +1908,8 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	var deleteAtHeight sql.NullInt64
 
 	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && setValue {
-		if err := deleteAtHeight.Scan(int64(s.blockHeight.Load() + s.settings.GetUtxoStoreBlockHeightRetention())); err != nil {
+		// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
+		if err := deleteAtHeight.Scan(int64(s.blockHeight.Load() + 1 + s.settings.GetUtxoStoreBlockHeightRetention())); err != nil {
 			return nil, nil, err
 		}
 	}
