@@ -864,17 +864,17 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		AND o.idx = $2
 	`
 
-	if s.engine == "postgres" {
-		// use FOR UPDATE without SKIP LOCKED to ensure we wait for locked rows
-		// rather than skipping them, which can cause false "not found" errors
-		q1 += ` FOR UPDATE`
-	}
+	// No FOR UPDATE: use optimistic locking via the spending_data IS NULL guard
+	// on the UPDATE instead. This avoids row-level lock contention when many
+	// concurrent goroutines spend different outputs from the same parent tx.
+	// Mirrors aerospike which uses atomic expressions without locking.
 
 	q2 := `
 		UPDATE outputs
 		SET spending_data = $1
 		WHERE transaction_id = $2
 		AND idx = $3
+		AND spending_data IS NULL
 	`
 
 	var errorFound bool
@@ -926,7 +926,7 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 					spend.Err = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
 				} else {
 					errorFound = true
-					spend.Err = errors.NewStorageError("[Spend] failed: SELECT output FOR UPDATE %s:%d - %v", spend.TxID, spend.Vout, err)
+					spend.Err = errors.NewStorageError("[Spend] failed: SELECT output %s:%d - %v", spend.TxID, spend.Vout, err)
 				}
 
 				continue
@@ -1016,8 +1016,16 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 			}
 
 			if affected == 0 {
+				// The UPDATE's spending_data IS NULL guard rejected the write.
+				// If the SELECT already showed it as spent with the same spending data
+				// (idempotent re-spend), this is expected — skip without error.
+				if len(spendingDataBytes) > 0 && spend.SpendingData != nil && bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
+					// Idempotent: same tx spending the same output again, no error
+					continue
+				}
+				// Otherwise the output was concurrently spent by a different tx.
 				errorFound = true
-				spend.Err = errors.NewStorageError("[Spend] utxo not spent for %s:%d", spend.TxID, spend.Vout)
+				spend.Err = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
 
 				continue
 			}
