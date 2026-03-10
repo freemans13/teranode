@@ -1029,9 +1029,14 @@ func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) erro
 		return nil
 	}
 
-	// check whether the transaction has any unspent outputs
+	// Check transaction state: unspent outputs, conflicting, mined status, longest chain.
+	// Mirrors aerospike setDeleteAtHeight which requires:
+	//   allSpent AND hasBlockIDs AND isOnLongestChain (for non-conflicting txs)
 	qUnspent := `
-		SELECT count(o.idx), t.conflicting
+		SELECT count(o.idx), t.conflicting, t.preserve_until IS NOT NULL,
+		       EXISTS(SELECT 1 FROM block_ids WHERE transaction_id = t.id) AS has_blocks,
+		       t.unmined_since IS NULL AS is_on_longest_chain,
+		       t.delete_at_height
 		FROM transactions t
 		LEFT JOIN outputs o ON t.id = o.transaction_id
 		   AND o.spending_data IS NULL
@@ -1042,24 +1047,48 @@ func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) erro
 	var (
 		unspent              int
 		conflicting          bool
+		hasPreserveUntil     bool
+		hasBlocks            bool
+		isOnLongestChain     bool
+		existingDAH          sql.NullInt64
 		deleteAtHeightOrNull sql.NullInt64
 	)
 
-	if err := txn.QueryRowContext(ctx, qUnspent, transactionID).Scan(&unspent, &conflicting); err != nil {
+	if err := txn.QueryRowContext(ctx, qUnspent, transactionID).Scan(&unspent, &conflicting, &hasPreserveUntil, &hasBlocks, &isOnLongestChain, &existingDAH); err != nil {
 		return errors.NewStorageError("[setDAH] error checking for unspent outputs for %d", transactionID, err)
 	}
 
-	if unspent == 0 || conflicting {
-		// Transaction is fully spent or conflicting
-		// Set DAH at normal retention - cleanup service will verify child stability (288 blocks)
-		// before actually deleting, providing the real safety guarantee
-		conservativeRetention := s.settings.GetUtxoStoreBlockHeightRetention()
-		_ = deleteAtHeightOrNull.Scan(int64(s.blockHeight.Load() + conservativeRetention))
-
-		// Note: We do NOT track spending children separately
-		// They are derived from outputs.spending_data when needed by cleanup
-		// This ensures we verify ALL children (not just one) before parent deletion
+	// If preserve_until is set, don't touch DAH (mirrors aerospike)
+	if hasPreserveUntil {
+		return nil
 	}
+
+	retention := s.settings.GetUtxoStoreBlockHeightRetention()
+	newDAH := int64(s.blockHeight.Load() + retention)
+
+	if conflicting {
+		// Conflicting: set DAH only if not already set (mirrors aerospike line 944-951)
+		if !existingDAH.Valid {
+			_ = deleteAtHeightOrNull.Scan(newDAH)
+		} else {
+			// Keep existing DAH
+			deleteAtHeightOrNull = existingDAH
+		}
+	} else if unspent == 0 && hasBlocks && isOnLongestChain {
+		// All outputs spent AND mined AND on longest chain: set/bump DAH
+		// Mirrors aerospike: allSpent AND hasBlockIDs AND isOnLongestChain
+		if !existingDAH.Valid || existingDAH.Int64 < newDAH {
+			_ = deleteAtHeightOrNull.Scan(newDAH)
+		} else {
+			// Keep existing higher DAH
+			deleteAtHeightOrNull = existingDAH
+		}
+	} else if existingDAH.Valid {
+		// Conditions no longer met (e.g., unspend, no longer on longest chain):
+		// Clear DAH (mirrors aerospike clearing DAH when conditions aren't met)
+		// deleteAtHeightOrNull stays NULL
+	}
+	// else: conditions not met and no existing DAH, leave as NULL
 
 	// Update delete_at_height
 	qUpdate := `
@@ -1422,25 +1451,54 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 	default:
 	}
 
-	// Step 3: Bulk update transactions to mark as mined
-	qBulkUpdateLongestChain := `
-		UPDATE transactions
-		SET locked = false, unmined_since = NULL
-		WHERE hash = ANY($1::bytea[])
-	`
+	// Step 3: Bulk update transactions to mark as mined and bump DAH forward
+	// This mirrors aerospike's setMined->setDeleteAtHeight behavior:
+	// When a transaction is marked as mined on the longest chain:
+	//   - If all UTXOs are spent AND delete_at_height exists, bump it forward to max(existing, currentHeight + retention)
+	//   - If preserve_until is set, don't touch delete_at_height
+	// When not on longest chain:
+	//   - Clear delete_at_height (conditions for deletion no longer met)
+	var retention uint32
+	if s.settings != nil {
+		retention = s.settings.GetUtxoStoreBlockHeightRetention()
+	}
+	newDAH := int64(s.blockHeight.Load() + retention)
 
-	qBulkUpdateNotLongestChain := `
-		UPDATE transactions
-		SET locked = false
-		WHERE hash = ANY($1::bytea[])
-	`
-
+	var qBulkUpdate string
 	if minedBlockInfo.OnLongestChain {
-		if _, err = txn.ExecContext(ctx, qBulkUpdateLongestChain, pq.Array(existingHashBytes)); err != nil {
-			return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+		if retention > 0 {
+			qBulkUpdate = `
+				UPDATE transactions
+				SET locked = false
+				   ,unmined_since = NULL
+				   ,delete_at_height = CASE
+				        WHEN preserve_until IS NOT NULL THEN delete_at_height
+				        WHEN delete_at_height IS NOT NULL AND delete_at_height < $2 THEN $2
+				        ELSE delete_at_height
+				    END
+				WHERE hash = ANY($1::bytea[])
+			`
+			if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes), newDAH); err != nil {
+				return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+			}
+		} else {
+			qBulkUpdate = `
+				UPDATE transactions
+				SET locked = false, unmined_since = NULL
+				WHERE hash = ANY($1::bytea[])
+			`
+			if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes)); err != nil {
+				return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+			}
 		}
 	} else {
-		if _, err = txn.ExecContext(ctx, qBulkUpdateNotLongestChain, pq.Array(existingHashBytes)); err != nil {
+		// Not on longest chain: clear delete_at_height (mirrors aerospike clearing DAH when isOnLongestChain is false)
+		qBulkUpdate = `
+			UPDATE transactions
+			SET locked = false, delete_at_height = NULL
+			WHERE hash = ANY($1::bytea[])
+		`
+		if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes)); err != nil {
 			return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
 		}
 	}
@@ -1540,16 +1598,40 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 		AND block_id = $2;
 	`
 
-	qLongestChain := `
-		UPDATE transactions SET
-		 locked = false
-		,unmined_since = NULL
-		WHERE hash = $1;
-	`
+	// Bump DAH forward on setMined, mirroring aerospike's setMined->setDeleteAtHeight behavior
+	var retentionOrig uint32
+	if s.settings != nil {
+		retentionOrig = s.settings.GetUtxoStoreBlockHeightRetention()
+	}
+	newDAHOrig := int64(s.blockHeight.Load() + retentionOrig)
 
+	var qLongestChain string
+	if retentionOrig > 0 {
+		qLongestChain = `
+			UPDATE transactions SET
+			 locked = false
+			,unmined_since = NULL
+			,delete_at_height = CASE
+			    WHEN preserve_until IS NOT NULL THEN delete_at_height
+			    WHEN delete_at_height IS NOT NULL AND delete_at_height < $2 THEN $2
+			    ELSE delete_at_height
+			 END
+			WHERE hash = $1;
+		`
+	} else {
+		qLongestChain = `
+			UPDATE transactions SET
+			 locked = false
+			,unmined_since = NULL
+			WHERE hash = $1;
+		`
+	}
+
+	// Not on longest chain: clear delete_at_height (mirrors aerospike clearing DAH)
 	qNotOnLongestChain := `
 		UPDATE transactions SET
 		 locked = false
+		,delete_at_height = NULL
 		WHERE hash = $1;
 	`
 
@@ -1609,8 +1691,14 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 		// Only update transactions that exist in blockIDsMap (which means they exist in the database)
 		if _, exists := blockIDsMap[*hash]; exists {
 			if minedBlockInfo.OnLongestChain {
-				if _, err = txn.ExecContext(ctx, qLongestChain, hash[:]); err != nil {
-					return nil, errors.NewStorageError("SQL error calling update longest chain on tx %s:%v", hash.String(), err)
+				if retentionOrig > 0 {
+					if _, err = txn.ExecContext(ctx, qLongestChain, hash[:], newDAHOrig); err != nil {
+						return nil, errors.NewStorageError("SQL error calling update longest chain on tx %s:%v", hash.String(), err)
+					}
+				} else {
+					if _, err = txn.ExecContext(ctx, qLongestChain, hash[:]); err != nil {
+						return nil, errors.NewStorageError("SQL error calling update longest chain on tx %s:%v", hash.String(), err)
+					}
 				}
 			} else {
 				if _, err = txn.ExecContext(ctx, qNotOnLongestChain, hash[:]); err != nil {
@@ -1821,13 +1909,26 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		}
 	}
 
-	qUpdate := `
+	// When setting conflicting=true: set DAH only if not already set (mirrors aerospike line 944-951).
+	// When clearing conflicting: clear DAH (conditions for deletion no longer met).
+	var qUpdate string
+	if setValue {
+		qUpdate = `
+			UPDATE transactions SET
+			 conflicting = $2
+			,delete_at_height = COALESCE(delete_at_height, $3)
+			WHERE hash = $1
+			RETURNING id
+		`
+	} else {
+		qUpdate = `
 			UPDATE transactions SET
 			 conflicting = $2
 			,delete_at_height = $3
 			WHERE hash = $1
 			RETURNING id
 		`
+	}
 
 	affectedParentSpends := make([]*utxo.Spend, 0, len(txHashes))
 	spendingTxHashes := make([]chainhash.Hash, 0, len(txHashes))
@@ -1915,11 +2016,22 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 }
 
 func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
-	q := `
+	// When locking (setValue=true), clear delete_at_height.
+	// Mirrors aerospike setLocked (line 1124-1127): locked tx should not be pruned.
+	var q string
+	if setValue {
+		q = `
+			UPDATE transactions
+			SET locked = $2, delete_at_height = NULL
+			WHERE hash = $1
+		`
+	} else {
+		q = `
 			UPDATE transactions
 			SET locked = $2
 			WHERE hash = $1
 		`
+	}
 
 	for _, conflictingTxHash := range txHashes {
 		_, err := s.db.ExecContext(ctx, q, conflictingTxHash[:], setValue)

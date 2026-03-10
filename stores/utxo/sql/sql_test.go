@@ -686,7 +686,7 @@ func TestSetTTL(t *testing.T) {
 
 	assert.Nil(t, tombstoneMillis)
 
-	// update all outputs to be spent
+	// update all outputs to be spent (but tx is NOT mined yet)
 	_, err = txn.ExecContext(ctx, "UPDATE outputs SET spending_data = $1 WHERE transaction_id = $2", spendpkg.NewSpendingData(tx.TxIDChainHash(), 1).Bytes(), transactionID)
 	require.NoError(t, err)
 
@@ -696,6 +696,22 @@ func TestSetTTL(t *testing.T) {
 	err = txn.QueryRowContext(ctx, "SELECT delete_at_height FROM transactions WHERE hash = $1", tx.TxIDChainHash()[:]).Scan(&tombstoneMillis)
 	require.NoError(t, err)
 
+	// DAH should NOT be set for unmined tx (mirrors aerospike: requires hasBlockIDs AND isOnLongestChain)
+	assert.Nil(t, tombstoneMillis)
+
+	// Now mark the tx as mined (add block_id and clear unmined_since) to simulate being on longest chain
+	_, err = txn.ExecContext(ctx, "INSERT INTO block_ids (transaction_id, block_id, block_height, subtree_idx) VALUES ($1, $2, $3, $4)", transactionID, tx.TxIDChainHash()[:], 100, 0)
+	require.NoError(t, err)
+	_, err = txn.ExecContext(ctx, "UPDATE transactions SET unmined_since = NULL WHERE id = $1", transactionID)
+	require.NoError(t, err)
+
+	err = store.setDAH(ctx, txn, transactionID)
+	require.NoError(t, err)
+
+	err = txn.QueryRowContext(ctx, "SELECT delete_at_height FROM transactions WHERE hash = $1", tx.TxIDChainHash()[:]).Scan(&tombstoneMillis)
+	require.NoError(t, err)
+
+	// Now DAH should be set: all outputs spent AND mined AND on longest chain
 	assert.NotNil(t, tombstoneMillis)
 
 	// unset one of the outputs to be unspent
@@ -710,7 +726,7 @@ func TestSetTTL(t *testing.T) {
 
 	assert.Nil(t, tombstoneMillis)
 
-	// mark the tx as conflicting, should set a tombstone
+	// mark the tx as conflicting, should set a tombstone (conflicting doesn't need to be mined)
 	_, err = txn.ExecContext(ctx, "UPDATE transactions SET conflicting = true WHERE id = $1", transactionID)
 	require.NoError(t, err)
 
