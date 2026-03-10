@@ -1032,6 +1032,12 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	}
 
 	if errorFound {
+		// Log individual spend errors for diagnostics (mirrors aerospike which logs per-spend errors)
+		for _, spend := range spends {
+			if spend != nil && spend.Err != nil {
+				s.logger.Warnf("[Spend][%s] input %s:%d error: %v", tx.TxID(), spend.TxID, spend.Vout, spend.Err)
+			}
+		}
 		return spends, errors.NewUtxoError("One or more UTXOs could not be spent")
 	} else {
 		if err = txn.Commit(); err != nil {
