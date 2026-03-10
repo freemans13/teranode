@@ -11,7 +11,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/usql"
-	pq "github.com/lib/pq"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -143,7 +142,7 @@ func (m *MockResult) RowsAffected() (int64, error) {
 	return args.Get(0).(int64), args.Error(1)
 }
 
-// CreateMockStore creates a Store instance with mocked database for testing setMinedMultiBulk
+// CreateMockStore creates a Store instance with mocked database for testing
 func CreateMockStore(logger ulogger.Logger) (*Store, sqlmock.Sqlmock) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -159,139 +158,6 @@ func CreateMockStore(logger ulogger.Logger) (*Store, sqlmock.Sqlmock) {
 	}
 
 	return store, mock
-}
-
-// SetupSetMinedMultiBulkMocks configures common mock expectations for setMinedMultiBulk testing
-func SetupSetMinedMultiBulkMocks(mock sqlmock.Sqlmock, hashes []*chainhash.Hash, minedInfo utxo.MinedBlockInfo) {
-	// Convert hashes to byte arrays for expectations
-	hashBytes := make([][]byte, len(hashes))
-	for i, hash := range hashes {
-		hashBytes[i] = hash[:]
-	}
-
-	// Mock transaction begin
-	mock.ExpectBegin()
-
-	// Mock Step 1: Check which transactions exist
-	existsRows := sqlmock.NewRows([]string{"hash"})
-	for _, hashByte := range hashBytes {
-		existsRows.AddRow(hashByte)
-	}
-	mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash = ANY\(\$1::bytea\[\]\)`).
-		WithArgs(pq.Array(hashBytes)).
-		WillReturnRows(existsRows)
-
-	// Note: Step 2 varies based on UnsetMined flag - this mock assumes UnsetMined=false (insert)
-
-	// Mock Step 2: Insert block_ids (use AnyArg for first param since hash order can change)
-	mock.ExpectExec(`INSERT INTO block_ids \(transaction_id, block_id, block_height, subtree_idx\) SELECT t\.id, \$2, \$3, \$4 FROM transactions t WHERE t\.hash = ANY\(\$1::bytea\[\]\) ON CONFLICT DO NOTHING`).
-		WithArgs(sqlmock.AnyArg(), minedInfo.BlockID, minedInfo.BlockHeight, minedInfo.SubtreeIdx).
-		WillReturnResult(sqlmock.NewResult(0, int64(len(hashes))))
-
-	// Mock Step 3: Update transactions to mark as mined
-	mock.ExpectExec(`UPDATE transactions SET locked = false, unmined_since = NULL WHERE hash = ANY\(\$1::bytea\[\]\)`).
-		WithArgs(sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, int64(len(hashes))))
-
-	// Mock Step 4: Get block IDs for the transactions
-	blockIDRows := sqlmock.NewRows([]string{"hash", "array_agg"})
-	for _, hashByte := range hashBytes {
-		blockIDRows.AddRow(hashByte, pq.Int32Array{int32(minedInfo.BlockID)}) // Mock block ID array
-	}
-	mock.ExpectQuery(`SELECT t\.hash, array_agg\(b\.block_id ORDER BY b\.block_id\) FROM transactions t LEFT JOIN block_ids b ON t\.id = b\.transaction_id WHERE t\.hash = ANY\(\$1::bytea\[\]\) GROUP BY t\.hash`).
-		WithArgs(sqlmock.AnyArg()).
-		WillReturnRows(blockIDRows)
-
-	// Mock transaction commit
-	mock.ExpectCommit()
-}
-
-// SetupSetMinedMultiBulkErrorMocks configures mock expectations for error scenarios
-func SetupSetMinedMultiBulkErrorMocks(mock sqlmock.Sqlmock, errorType string) {
-	switch errorType {
-	case "begin_error":
-		mock.ExpectBegin().WillReturnError(sql.ErrConnDone)
-
-	case "check_exists_error":
-		mock.ExpectBegin()
-		mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WillReturnError(sql.ErrNoRows)
-		mock.ExpectRollback()
-
-	case "insert_block_ids_error":
-		mock.ExpectBegin()
-		// First query succeeds with some results
-		existsRows := sqlmock.NewRows([]string{"hash"})
-		existsRows.AddRow([]byte("test-hash"))
-		mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WillReturnRows(existsRows)
-		// Insert block_ids fails
-		mock.ExpectExec(`INSERT INTO block_ids \(transaction_id, block_id, block_height, subtree_idx\) SELECT t\.id, \$2, \$3, \$4 FROM transactions t WHERE t\.hash = ANY\(\$1::bytea\[\]\) ON CONFLICT DO NOTHING`).
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-			WillReturnError(sql.ErrConnDone)
-		mock.ExpectRollback()
-
-	case "update_error":
-		mock.ExpectBegin()
-		// First operations succeed
-		existsRows := sqlmock.NewRows([]string{"hash"})
-		existsRows.AddRow([]byte("test-hash"))
-		mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WillReturnRows(existsRows)
-		mock.ExpectExec(`INSERT INTO block_ids \(transaction_id, block_id, block_height, subtree_idx\) SELECT t\.id, \$2, \$3, \$4 FROM transactions t WHERE t\.hash = ANY\(\$1::bytea\[\]\) ON CONFLICT DO NOTHING`).
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-		// Update fails
-		mock.ExpectExec(`UPDATE transactions SET locked = false, unmined_since = NULL WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WithArgs(sqlmock.AnyArg()).
-			WillReturnError(sql.ErrTxDone)
-		mock.ExpectRollback()
-
-	case "get_block_ids_error":
-		mock.ExpectBegin()
-		// First three operations succeed
-		existsRows := sqlmock.NewRows([]string{"hash"})
-		existsRows.AddRow([]byte("test-hash"))
-		mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WillReturnRows(existsRows)
-		mock.ExpectExec(`INSERT INTO block_ids \(transaction_id, block_id, block_height, subtree_idx\) SELECT t\.id, \$2, \$3, \$4 FROM transactions t WHERE t\.hash = ANY\(\$1::bytea\[\]\) ON CONFLICT DO NOTHING`).
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec(`UPDATE transactions SET locked = false, unmined_since = NULL WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WithArgs(sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-		// Get block IDs fails
-		mock.ExpectQuery(`SELECT t\.hash, array_agg\(b\.block_id ORDER BY b\.block_id\) FROM transactions t LEFT JOIN block_ids b ON t\.id = b\.transaction_id WHERE t\.hash = ANY\(\$1::bytea\[\]\) GROUP BY t\.hash`).
-			WithArgs(sqlmock.AnyArg()).
-			WillReturnError(sql.ErrConnDone)
-		mock.ExpectRollback()
-
-	case "commit_error":
-		mock.ExpectBegin()
-		// All operations succeed but commit fails
-		existsRows := sqlmock.NewRows([]string{"hash"})
-		existsRows.AddRow([]byte("test-hash"))
-		mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WillReturnRows(existsRows)
-		mock.ExpectExec(`INSERT INTO block_ids \(transaction_id, block_id, block_height, subtree_idx\) SELECT t\.id, \$2, \$3, \$4 FROM transactions t WHERE t\.hash = ANY\(\$1::bytea\[\]\) ON CONFLICT DO NOTHING`).
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec(`UPDATE transactions SET locked = false, unmined_since = NULL WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WithArgs(sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-		blockIDRows := sqlmock.NewRows([]string{"hash", "array_agg"})
-		blockIDRows.AddRow([]byte("test"), pq.Int32Array{1})
-		mock.ExpectQuery(`SELECT t\.hash, array_agg\(b\.block_id ORDER BY b\.block_id\) FROM transactions t LEFT JOIN block_ids b ON t\.id = b\.transaction_id WHERE t\.hash = ANY\(\$1::bytea\[\]\) GROUP BY t\.hash`).
-			WithArgs(sqlmock.AnyArg()).
-			WillReturnRows(blockIDRows)
-		mock.ExpectCommit().WillReturnError(sql.ErrTxDone)
-
-	case "rollback_error":
-		mock.ExpectBegin()
-		mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash = ANY\(\$1::bytea\[\]\)`).
-			WillReturnError(sql.ErrConnDone)
-		mock.ExpectRollback().WillReturnError(sql.ErrConnDone)
-	}
 }
 
 // CreateTestHashes creates a slice of test chainhash.Hash objects for testing

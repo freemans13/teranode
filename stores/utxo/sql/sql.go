@@ -1457,69 +1457,35 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 }
 
 func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
-	// Check if we're using PostgreSQL or SQLite
-	isPostgres := s.storeURL.Scheme == "postgres"
-
-	// For SQLite or small batches, fall back to the original implementation
-	// SQLite doesn't support array operations, and small batches don't benefit from bulk operations
-	if !isPostgres || len(hashes) < 10 {
-		// Add timeout context for the original implementation
-		ctxWithTimeout, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-		defer cancelTimeout()
-		return s.setMinedMultiOriginal(ctxWithTimeout, hashes, minedBlockInfo)
-	}
-
-	// For very large batches, split into smaller chunks to avoid long-running transactions
-	const maxBatchSize = 500
-	if len(hashes) > maxBatchSize {
-		return s.setMinedMultiBatched(ctx, hashes, minedBlockInfo, maxBatchSize)
-	}
-
-	// Add timeout context and call the bulk implementation
-	ctxWithTimeout, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
-	return s.setMinedMultiBulk(ctxWithTimeout, hashes, minedBlockInfo)
-}
-
-// setMinedMultiBatched handles very large batches by splitting them into smaller chunks
-// This avoids long-running transactions that can cause timeouts and deadlocks
-func (s *Store) setMinedMultiBatched(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo, batchSize int) (map[chainhash.Hash][]uint32, error) {
-	// Check if context is already cancelled
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if len(hashes) == 0 {
+		return make(map[chainhash.Hash][]uint32), nil
 	}
 
 	resultMap := make(map[chainhash.Hash][]uint32)
 
-	// Process hashes in batches
-	for i := 0; i < len(hashes); i += batchSize {
-		end := i + batchSize
+	// Process hashes in chunks to stay within SQLite's parameter limit (999)
+	for i := 0; i < len(hashes); i += maxINClauseSize {
+		end := i + maxINClauseSize
 		if end > len(hashes) {
 			end = len(hashes)
 		}
 
-		batch := hashes[i:end]
-
-		// Check context before processing each batch
+		// Check context before processing each chunk
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 
-		// Process this batch with a timeout
 		ctxWithTimeout, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-		batchResult, err := s.setMinedMultiBulk(ctxWithTimeout, batch, minedBlockInfo)
+		chunkResult, err := s.setMinedMultiChunk(ctxWithTimeout, hashes[i:end], minedBlockInfo)
 		cancelTimeout()
 
 		if err != nil {
-			return nil, errors.NewStorageError("SQL error in batched operation (batch %d-%d): %v", i, end-1, err)
+			return nil, errors.NewStorageError("SQL error in SetMinedMulti (chunk %d-%d): %v", i, end-1, err)
 		}
 
-		// Merge results
-		for hash, blockIDs := range batchResult {
+		for hash, blockIDs := range chunkResult {
 			resultMap[hash] = blockIDs
 		}
 	}
@@ -1527,13 +1493,13 @@ func (s *Store) setMinedMultiBatched(ctx context.Context, hashes []*chainhash.Ha
 	return resultMap, nil
 }
 
-// setMinedMultiBulk is the core bulk implementation for medium-sized batches
-func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
-	// Check if context is already cancelled before starting
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+// setMinedMultiChunk processes a single chunk of hashes (up to maxINClauseSize).
+// Uses portable IN ($1,$2,...,$N) clauses that work on both PostgreSQL and SQLite.
+func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	// Convert hashes to byte arrays
+	hashBytes := make([][]byte, len(hashes))
+	for i, hash := range hashes {
+		hashBytes[i] = hash[:]
 	}
 
 	// Start a database transaction
@@ -1542,59 +1508,38 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 		return nil, err
 	}
 
-	// Use a flag to track if we should rollback
 	committed := false
 	defer func() {
 		if !committed {
 			if rollbackErr := txn.Rollback(); rollbackErr != nil {
-				// Log rollback error but don't override original error
-				s.logger.Warnf("Failed to rollback bulk transaction: %v", rollbackErr)
+				s.logger.Warnf("Failed to rollback SetMinedMulti transaction: %v", rollbackErr)
 			}
 		}
 	}()
 
-	// Convert hashes to byte arrays for PostgreSQL
-	hashBytes := make([][]byte, len(hashes))
-	for i, hash := range hashes {
-		hashBytes[i] = hash[:]
-	}
+	// Step 1: Check which transactions exist using IN clause
+	inClause, inArgs := buildINClause(hashBytes, 1)
+	qCheckExists := fmt.Sprintf(`SELECT hash FROM transactions WHERE hash IN %s`, inClause)
 
-	// Step 1: Bulk check which transactions exist
-	// Using ANY array operator for bulk comparison
-	qCheckExists := `
-		SELECT hash
-		FROM transactions
-		WHERE hash = ANY($1::bytea[])
-	`
-
-	// Check context before first database operation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
-	rows, err := txn.QueryContext(ctx, qCheckExists, pq.Array(hashBytes))
+	rows, err := txn.QueryContext(ctx, qCheckExists, inArgs...)
 	if err != nil {
 		return nil, errors.NewStorageError("SQL error checking transaction existence: %v", err)
 	}
 
 	existingHashes := make(map[chainhash.Hash]bool)
 	for rows.Next() {
-		var hashBytes []byte
-		if err := rows.Scan(&hashBytes); err != nil {
+		var hb []byte
+		if err := rows.Scan(&hb); err != nil {
 			rows.Close()
 			return nil, errors.NewStorageError("SQL error scanning existing hash: %v", err)
 		}
-		var hash chainhash.Hash
-		copy(hash[:], hashBytes)
-		existingHashes[hash] = true
+		var h chainhash.Hash
+		copy(h[:], hb)
+		existingHashes[h] = true
 	}
 	rows.Close()
 
-	// If no transactions exist, return early
 	if len(existingHashes) == 0 {
-		// Commit empty transaction
 		if err = txn.Commit(); err != nil {
 			return nil, errors.NewStorageError("SQL error committing empty transaction: %v", err)
 		}
@@ -1602,60 +1547,46 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 		return make(map[chainhash.Hash][]uint32), nil
 	}
 
-	// Prepare array of existing hashes only
+	// Build IN clause for existing hashes only
 	existingHashBytes := make([][]byte, 0, len(existingHashes))
-	for hash := range existingHashes {
-		h := hash // Create a copy to avoid pointer issues
-		existingHashBytes = append(existingHashBytes, h[:])
+	for h := range existingHashes {
+		hCopy := h
+		existingHashBytes = append(existingHashBytes, hCopy[:])
 	}
 
-	// Check context before block_ids operations
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
+	// Step 2: Insert or delete block_ids
 	if minedBlockInfo.UnsetMined {
-		// Step 2a: Bulk delete block_ids for unsetting mined status
-		qBulkRemove := `
+		// DELETE block_ids: block_id is $1, hashes start at $2
+		inClause2, inArgs2 := buildINClause(existingHashBytes, 2)
+		qRemove := fmt.Sprintf(`
 			DELETE FROM block_ids
 			WHERE transaction_id IN (
-				SELECT id FROM transactions WHERE hash = ANY($1::bytea[])
+				SELECT id FROM transactions WHERE hash IN %s
 			)
-			AND block_id = $2
-		`
-		if _, err = txn.ExecContext(ctx, qBulkRemove, pq.Array(existingHashBytes), minedBlockInfo.BlockID); err != nil {
-			return nil, errors.NewStorageError("SQL error bulk removing block_ids: %v", err)
+			AND block_id = $1
+		`, inClause2)
+		args := append([]interface{}{minedBlockInfo.BlockID}, inArgs2...)
+		if _, err = txn.ExecContext(ctx, qRemove, args...); err != nil {
+			return nil, errors.NewStorageError("SQL error removing block_ids: %v", err)
 		}
 	} else {
-		// Step 2b: Bulk insert block_ids for setting mined status
-		qBulkInsert := `
+		// INSERT block_ids: block_id=$1, block_height=$2, subtree_idx=$3, hashes start at $4
+		inClause2, inArgs2 := buildINClause(existingHashBytes, 4)
+		qInsert := fmt.Sprintf(`
 			INSERT INTO block_ids (transaction_id, block_id, block_height, subtree_idx)
-			SELECT t.id, $2, $3, $4
+			SELECT t.id, $1, $2, $3
 			FROM transactions t
-			WHERE t.hash = ANY($1::bytea[])
+			WHERE t.hash IN %s
 			ON CONFLICT DO NOTHING
-		`
-		if _, err = txn.ExecContext(ctx, qBulkInsert, pq.Array(existingHashBytes), minedBlockInfo.BlockID, minedBlockInfo.BlockHeight, minedBlockInfo.SubtreeIdx); err != nil {
-			return nil, errors.NewStorageError("SQL error bulk inserting block_ids: %v", err)
+		`, inClause2)
+		args := append([]interface{}{minedBlockInfo.BlockID, minedBlockInfo.BlockHeight, minedBlockInfo.SubtreeIdx}, inArgs2...)
+		if _, err = txn.ExecContext(ctx, qInsert, args...); err != nil {
+			return nil, errors.NewStorageError("SQL error inserting block_ids: %v", err)
 		}
 	}
 
-	// Check context before transaction updates
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
-	// Step 3: Bulk update transactions to mark as mined and bump DAH forward
-	// This mirrors aerospike's setMined->setDeleteAtHeight behavior:
-	// When a transaction is marked as mined on the longest chain:
-	//   - If all UTXOs are spent AND delete_at_height exists, bump it forward to max(existing, currentHeight + retention)
-	//   - If preserve_until is set, don't touch delete_at_height
-	// When not on longest chain:
-	//   - Clear delete_at_height (conditions for deletion no longer met)
+	// Step 3: Update transaction fields (locked, unmined_since, delete_at_height)
+	// Mirrors aerospike's setMined->setDeleteAtHeight behavior
 	var retention uint32
 	if s.settings != nil {
 		retention = s.settings.GetUtxoStoreBlockHeightRetention()
@@ -1663,283 +1594,99 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 	// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
 	newDAH := int64(s.blockHeight.Load() + 1 + retention)
 
-	var qBulkUpdate string
 	if minedBlockInfo.OnLongestChain {
 		if retention > 0 {
+			// DAH is $1, hashes start at $2
 			// Mirrors aerospike Lua setDeleteAtHeight logic:
 			// 1. If preserve_until is set -> don't touch DAH
 			// 2. If DAH already exists and is less than new value -> bump it forward
 			// 3. If DAH is NULL and all UTXOs are spent -> set DAH for the first time
 			// 4. Otherwise -> leave DAH unchanged
-			qBulkUpdate = `
-				UPDATE transactions t
+			inClause3, inArgs3 := buildINClause(existingHashBytes, 2)
+			qUpdate := fmt.Sprintf(`
+				UPDATE transactions
 				SET locked = false
 				   ,unmined_since = NULL
 				   ,delete_at_height = CASE
-				        WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
-				        WHEN t.delete_at_height IS NOT NULL AND t.delete_at_height < $2 THEN $2
-				        WHEN t.delete_at_height IS NULL
+				        WHEN preserve_until IS NOT NULL THEN delete_at_height
+				        WHEN delete_at_height IS NOT NULL AND delete_at_height < $1 THEN $1
+				        WHEN delete_at_height IS NULL
 				             AND NOT EXISTS (
 				                 SELECT 1 FROM outputs o
-				                 WHERE o.transaction_id = t.id AND o.spending_data IS NULL
+				                 WHERE o.transaction_id = transactions.id AND o.spending_data IS NULL
 				             )
-				             THEN $2
-				        ELSE t.delete_at_height
+				             THEN $1
+				        ELSE delete_at_height
 				    END
-				WHERE t.hash = ANY($1::bytea[])
-			`
-			if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes), newDAH); err != nil {
-				return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+				WHERE hash IN %s
+			`, inClause3)
+			args := append([]interface{}{newDAH}, inArgs3...)
+			if _, err = txn.ExecContext(ctx, qUpdate, args...); err != nil {
+				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
 			}
 		} else {
-			qBulkUpdate = `
+			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
+			qUpdate := fmt.Sprintf(`
 				UPDATE transactions
 				SET locked = false, unmined_since = NULL
-				WHERE hash = ANY($1::bytea[])
-			`
-			if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes)); err != nil {
-				return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+				WHERE hash IN %s
+			`, inClause3)
+			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
+				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
 			}
 		}
 	} else {
-		// Not on longest chain: clear delete_at_height AND set unmined_since to thisBlockHeight
-		// Mirrors aerospike Lua setMined which sets unminedSince when isOnLongestChain is false
+		// Not on longest chain: clear delete_at_height, set unmined_since
 		// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
 		thisBlockHeight := s.blockHeight.Load() + 1
-		qBulkUpdate = `
+		inClause3, inArgs3 := buildINClause(existingHashBytes, 2)
+		qUpdate := fmt.Sprintf(`
 			UPDATE transactions
-			SET locked = false, delete_at_height = NULL, unmined_since = $2
-			WHERE hash = ANY($1::bytea[])
-		`
-		if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes), thisBlockHeight); err != nil {
-			return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+			SET locked = false, delete_at_height = NULL, unmined_since = $1
+			WHERE hash IN %s
+		`, inClause3)
+		args := append([]interface{}{thisBlockHeight}, inArgs3...)
+		if _, err = txn.ExecContext(ctx, qUpdate, args...); err != nil {
+			return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
 		}
 	}
 
-	// Check context before final fetch operation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
-	// Step 4: Bulk fetch all block IDs for the transactions
-	qBulkGetBlockIDs := `
-		SELECT t.hash, array_agg(b.block_id ORDER BY b.block_id)
+	// Step 4: Fetch block_ids for all existing transactions (aggregate in Go, no array_agg)
+	inClause4, inArgs4 := buildINClause(existingHashBytes, 1)
+	qGetBlockIDs := fmt.Sprintf(`
+		SELECT t.hash, b.block_id
 		FROM transactions t
 		LEFT JOIN block_ids b ON t.id = b.transaction_id
-		WHERE t.hash = ANY($1::bytea[])
-		GROUP BY t.hash
-	`
+		WHERE t.hash IN %s
+		ORDER BY t.hash, b.block_id
+	`, inClause4)
 
-	rows, err = txn.QueryContext(ctx, qBulkGetBlockIDs, pq.Array(existingHashBytes))
+	rows, err = txn.QueryContext(ctx, qGetBlockIDs, inArgs4...)
 	if err != nil {
-		return nil, errors.NewStorageError("SQL error bulk fetching block IDs: %v", err)
+		return nil, errors.NewStorageError("SQL error fetching block IDs: %v", err)
 	}
 
 	blockIDsMap := make(map[chainhash.Hash][]uint32)
 	for rows.Next() {
-		var hashBytes []byte
-		var blockIDs pq.Int32Array
-		if err := rows.Scan(&hashBytes, &blockIDs); err != nil {
+		var hb []byte
+		var blockID *uint32 // nullable from LEFT JOIN
+		if err := rows.Scan(&hb, &blockID); err != nil {
 			rows.Close()
 			return nil, errors.NewStorageError("SQL error scanning block IDs: %v", err)
 		}
-		var hash chainhash.Hash
-		copy(hash[:], hashBytes)
-
-		// Convert pq.Int32Array to []uint32, filtering out NULLs (converted to 0)
-		var uint32BlockIDs []uint32
-		for _, id := range blockIDs {
-			if id > 0 { // Skip NULL values which become 0
-				uint32BlockIDs = append(uint32BlockIDs, uint32(id))
-			}
+		var h chainhash.Hash
+		copy(h[:], hb)
+		if blockID != nil && *blockID > 0 {
+			blockIDsMap[h] = append(blockIDsMap[h], *blockID)
+		} else if _, exists := blockIDsMap[h]; !exists {
+			// Ensure the hash is in the map even with no block_ids
+			blockIDsMap[h] = nil
 		}
-		blockIDsMap[hash] = uint32BlockIDs
 	}
 	rows.Close()
 
-	// Commit the transaction
 	if err = txn.Commit(); err != nil {
-		return nil, errors.NewStorageError("SQL error committing transaction: %v", err)
-	}
-	committed = true
-
-	return blockIDsMap, nil
-}
-
-// setMinedMultiOriginal is the original implementation that works with both SQLite and PostgreSQL
-// but uses individual queries for each transaction (slower for large batches)
-func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
-	// Start a database transaction
-	txn, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-
-	// Use a flag to track if we should rollback
-	committed := false
-	defer func() {
-		if !committed {
-			if rollbackErr := txn.Rollback(); rollbackErr != nil {
-				// Log rollback error but don't override original error
-				s.logger.Warnf("Failed to rollback original transaction: %v", rollbackErr)
-			}
-		}
-	}()
-
-	// Update the block_ids
-	q := `
-		INSERT INTO block_ids (
-			transaction_id,
-			block_id,
-			block_height,
-			subtree_idx
-		) VALUES (
-			(SELECT id FROM transactions WHERE hash = $1),
-			$2,
-			$3,
-			$4
-		)
-		ON CONFLICT DO NOTHING;
-    `
-
-	// remove if minedBlockInfo.SetMined is false
-	qRemove := `
-		DELETE FROM block_ids
-		WHERE transaction_id = (SELECT id FROM transactions WHERE hash = $1)
-		AND block_id = $2;
-	`
-
-	// Bump DAH forward on setMined, mirroring aerospike's setMined->setDeleteAtHeight behavior
-	var retentionOrig uint32
-	if s.settings != nil {
-		retentionOrig = s.settings.GetUtxoStoreBlockHeightRetention()
-	}
-	// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
-	newDAHOrig := int64(s.blockHeight.Load() + 1 + retentionOrig)
-
-	var qLongestChain string
-	if retentionOrig > 0 {
-		// Mirrors aerospike Lua setDeleteAtHeight logic:
-		// 1. If preserve_until is set -> don't touch DAH
-		// 2. If DAH already exists and is less than new value -> bump it forward
-		// 3. If DAH is NULL and all UTXOs are spent -> set DAH for the first time
-		// 4. Otherwise -> leave DAH unchanged
-		qLongestChain = `
-			UPDATE transactions SET
-			 locked = false
-			,unmined_since = NULL
-			,delete_at_height = CASE
-			    WHEN preserve_until IS NOT NULL THEN delete_at_height
-			    WHEN delete_at_height IS NOT NULL AND delete_at_height < $2 THEN $2
-			    WHEN delete_at_height IS NULL
-			         AND NOT EXISTS (
-			             SELECT 1 FROM outputs o
-			             WHERE o.transaction_id = transactions.id AND o.spending_data IS NULL
-			         )
-			         THEN $2
-			    ELSE delete_at_height
-			 END
-			WHERE hash = $1;
-		`
-	} else {
-		qLongestChain = `
-			UPDATE transactions SET
-			 locked = false
-			,unmined_since = NULL
-			WHERE hash = $1;
-		`
-	}
-
-	// Not on longest chain: clear delete_at_height AND set unmined_since to thisBlockHeight
-	// Mirrors aerospike Lua setMined which sets unminedSince when isOnLongestChain is false
-	// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
-	thisBlockHeight := s.blockHeight.Load() + 1
-	qNotOnLongestChain := `
-		UPDATE transactions SET
-		 locked = false
-		,delete_at_height = NULL
-		,unmined_since = $2
-		WHERE hash = $1;
-	`
-
-	qGet := `
-		SELECT block_id FROM block_ids
-		WHERE transaction_id = (SELECT id FROM transactions WHERE hash = $1)
-	`
-
-	blockIDsMap := make(map[chainhash.Hash][]uint32)
-
-	for _, hash := range hashes {
-		// First check if the transaction exists
-		var txExists bool
-		err := txn.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", hash[:]).Scan(&txExists)
-		if err != nil {
-			return nil, errors.NewStorageError("SQL error checking transaction existence for %s: %v", hash.String(), err)
-		}
-
-		// Skip if transaction doesn't exist yet (it might be processed later in the same block)
-		if !txExists {
-			continue
-		}
-
-		if minedBlockInfo.UnsetMined {
-			// remove the block ID from the transaction
-			if _, err = txn.ExecContext(ctx, qRemove, hash[:], minedBlockInfo.BlockID); err != nil {
-				return nil, errors.NewStorageError("SQL error calling SetMinedMulti on tx %s:%v", hash.String(), err)
-			}
-		} else {
-			if _, err = txn.ExecContext(ctx, q, hash[:], minedBlockInfo.BlockID, minedBlockInfo.BlockHeight, minedBlockInfo.SubtreeIdx); err != nil {
-				return nil, errors.NewStorageError("SQL error calling SetMinedMulti on tx %s:%v", hash.String(), err)
-			}
-		}
-
-		// get the current block IDs for the transaction
-		rows, err := txn.QueryContext(ctx, qGet, hash[:])
-		if err != nil {
-			return nil, errors.NewStorageError("SQL error calling get block IDs on tx %s:%v", hash.String(), err)
-		}
-
-		var blockIDs []uint32
-		for rows.Next() {
-			var blockID uint32
-			if err := rows.Scan(&blockID); err != nil {
-				rows.Close()
-
-				return nil, errors.NewStorageError("SQL error scanning block ID on tx %s:%v", hash.String(), err)
-			}
-			blockIDs = append(blockIDs, blockID)
-		}
-		rows.Close()
-
-		blockIDsMap[*hash] = blockIDs
-	}
-
-	for _, hash := range hashes {
-		// Only update transactions that exist in blockIDsMap (which means they exist in the database)
-		if _, exists := blockIDsMap[*hash]; exists {
-			if minedBlockInfo.OnLongestChain {
-				if retentionOrig > 0 {
-					if _, err = txn.ExecContext(ctx, qLongestChain, hash[:], newDAHOrig); err != nil {
-						return nil, errors.NewStorageError("SQL error calling update longest chain on tx %s:%v", hash.String(), err)
-					}
-				} else {
-					if _, err = txn.ExecContext(ctx, qLongestChain, hash[:]); err != nil {
-						return nil, errors.NewStorageError("SQL error calling update longest chain on tx %s:%v", hash.String(), err)
-					}
-				}
-			} else {
-				if _, err = txn.ExecContext(ctx, qNotOnLongestChain, hash[:], thisBlockHeight); err != nil {
-					return nil, errors.NewStorageError("SQL error calling update locked on tx %s:%v", hash.String(), err)
-				}
-			}
-		}
-	}
-
-	// Commit the transaction
-	if err = txn.Commit(); err != nil {
-		return nil, errors.NewStorageError("SQL error committing original transaction: %v", err)
+		return nil, errors.NewStorageError("SQL error committing SetMinedMulti transaction: %v", err)
 	}
 	committed = true
 
@@ -2351,70 +2098,99 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 //   - error: Aggregated errors (up to 10) if any failures occurred
 //   - Note: Function calls logger.Fatalf for missing transactions before returning
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
-	var q string
-	allErrors := make([]error, 0, 10) // Pre-allocate capacity for up to 10 errors
-	missingTxErrors := make([]error, 0, 10)
+	if len(txHashes) == 0 {
+		return nil
+	}
+
 	attempted := len(txHashes)
+	totalUpdated := 0
+	allErrors := make([]error, 0, 10)
 	errorCount := 0
 
-	if onLongestChain {
-		// Transaction is on longest chain - unset unminedSince field (set to NULL)
-		q = `
-			UPDATE transactions
-			SET unmined_since = NULL
-			WHERE hash = $1
-		`
+	// Convert all hashes to byte arrays up front
+	allHashBytes := make([][]byte, len(txHashes))
+	for i := range txHashes {
+		allHashBytes[i] = txHashes[i][:]
+	}
 
-		for _, txHash := range txHashes {
-			result, err := s.db.ExecContext(ctx, q, txHash[:])
-			if err != nil {
-				errorCount++
-				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
-				if len(allErrors) < 10 {
-					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
-					allErrors = append(allErrors, errors.NewStorageError("failed to mark transaction %s as on longest chain", txHash, err))
-				}
-				// Continue processing remaining transactions
+	currentBlockHeight := s.GetBlockHeight()
+
+	// Process in chunks to stay within SQLite's parameter limit
+	for i := 0; i < len(allHashBytes); i += maxINClauseSize {
+		end := i + maxINClauseSize
+		if end > len(allHashBytes) {
+			end = len(allHashBytes)
+		}
+		chunk := allHashBytes[i:end]
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		var q string
+		var args []interface{}
+
+		if onLongestChain {
+			// hashes start at $1
+			inClause, inArgs := buildINClause(chunk, 1)
+			q = fmt.Sprintf(`UPDATE transactions SET unmined_since = NULL WHERE hash IN %s`, inClause)
+			args = inArgs
+		} else {
+			// currentBlockHeight is $1, hashes start at $2
+			inClause, inArgs := buildINClause(chunk, 2)
+			q = fmt.Sprintf(`UPDATE transactions SET unmined_since = $1 WHERE hash IN %s`, inClause)
+			args = append([]interface{}{currentBlockHeight}, inArgs...)
+		}
+
+		result, err := s.db.ExecContext(ctx, q, args...)
+		if err != nil {
+			errorCount += len(chunk)
+			if len(allErrors) < 10 {
+				s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
+				allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d: %v", i, end-1, err))
+			}
+			continue
+		}
+
+		rowsAffected, _ := result.RowsAffected()
+		totalUpdated += int(rowsAffected)
+
+		// If fewer rows updated than expected, find which ones are missing
+		if int(rowsAffected) < len(chunk) {
+			missingCount := len(chunk) - int(rowsAffected)
+			errorCount += missingCount
+
+			// Query to find which hashes actually exist to identify the missing ones
+			qCheck := fmt.Sprintf(`SELECT hash FROM transactions WHERE hash IN %s`, func() string {
+				cl, _ := buildINClause(chunk, 1)
+				return cl
+			}())
+			_, checkArgs := buildINClause(chunk, 1)
+			rows, qErr := s.db.QueryContext(ctx, qCheck, checkArgs...)
+			if qErr != nil {
+				s.logger.Errorf("[MarkTransactionsOnLongestChain] could not identify missing txs in chunk %d-%d: %v", i, end-1, qErr)
 			} else {
-				// Check if transaction was actually found and updated
-				rowsAffected, _ := result.RowsAffected()
-				if rowsAffected == 0 {
-					errorCount++
-					// Transaction not found - this is FATAL (data corruption)
-					if len(missingTxErrors) < 10 {
-						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash))
+				foundHashes := make(map[string]bool)
+				for rows.Next() {
+					var hb []byte
+					if scanErr := rows.Scan(&hb); scanErr == nil {
+						foundHashes[string(hb)] = true
 					}
 				}
-			}
-		}
-	} else {
-		// Transaction is not on longest chain - set unminedSince to current block height
-		currentBlockHeight := s.GetBlockHeight()
+				rows.Close()
 
-		q = `
-			UPDATE transactions
-			SET unmined_since = $2
-			WHERE hash = $1
-		`
-
-		for _, txHash := range txHashes {
-			result, err := s.db.ExecContext(ctx, q, txHash[:], currentBlockHeight)
-			if err != nil {
-				errorCount++
-				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
-				if len(allErrors) < 10 {
-					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
-					allErrors = append(allErrors, errors.NewStorageError("failed to mark transaction %s as not on longest chain", txHash, err))
-				}
-				// Continue processing remaining transactions
-			} else {
-				// Check if transaction was actually found and updated
-				rowsAffected, _ := result.RowsAffected()
-				if rowsAffected == 0 {
-					errorCount++
-					// Transaction not found - this is FATAL (data corruption)
-					if len(missingTxErrors) < 10 {
-						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash))
+				missingLogged := 0
+				for _, hb := range chunk {
+					if !foundHashes[string(hb)] {
+						var h chainhash.Hash
+						copy(h[:], hb)
+						s.logger.Fatalf("CRITICAL: MISSING transaction %s during MarkTransactionsOnLongestChain - data integrity compromised", h)
+						missingLogged++
+						if missingLogged >= 10 {
+							break
+						}
 					}
 				}
 			}
@@ -2422,17 +2198,9 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	}
 
 	// Log summary
-	succeeded := attempted - errorCount
-	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, succeeded=%d, failed=%d, onLongestChain=%t",
-		attempted, succeeded, errorCount, onLongestChain)
+	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, updated=%d, failed=%d, onLongestChain=%t",
+		attempted, totalUpdated, errorCount, onLongestChain)
 
-	// FATAL if we have missing transactions - this indicates data corruption
-	if len(missingTxErrors) > 0 {
-		s.logger.Fatalf("CRITICAL: %d missing transactions during MarkTransactionsOnLongestChain - data integrity compromised. First errors: %v",
-			len(missingTxErrors), errors.Join(missingTxErrors...))
-	}
-
-	// Return aggregated errors (up to 10) for other error types
 	if len(allErrors) > 0 {
 		if errorCount > 10 {
 			s.logger.Errorf("[MarkTransactionsOnLongestChain] only returned first 10 of %d errors", errorCount)
@@ -3064,33 +2832,43 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		return nil
 	}
 
-	// Build placeholders for IN clause
-	placeholders := make([]string, 0, len(txIDs))
-	args := make([]interface{}, 0, len(txIDs))
+	totalAffected := int64(0)
 
-	for _, txID := range txIDs {
-		placeholders = append(placeholders, "?")
-		args = append(args, txID[:])
+	// Process in chunks to stay within SQLite's parameter limit
+	for i := 0; i < len(txIDs); i += maxINClauseSize {
+		end := i + maxINClauseSize
+		if end > len(txIDs) {
+			end = len(txIDs)
+		}
+
+		chunk := make([][]byte, end-i)
+		for j, txID := range txIDs[i:end] {
+			chunk[j] = txID[:]
+		}
+
+		// preserveUntilHeight is $1, hashes start at $2
+		inClause, inArgs := buildINClause(chunk, 2)
+		query := fmt.Sprintf(`
+			UPDATE transactions
+			SET preserve_until = $1, delete_at_height = NULL
+			WHERE hash IN %s
+		`, inClause)
+		args := append([]interface{}{preserveUntilHeight}, inArgs...)
+
+		result, err := s.db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return errors.NewStorageError("failed to preserve transactions", err)
+		}
+
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			s.logger.Warnf("[PreserveTransactions] Could not get rows affected: %v", err)
+		} else {
+			totalAffected += rowsAffected
+		}
 	}
-	args = append([]interface{}{preserveUntilHeight}, args...)
 
-	query := fmt.Sprintf(`
-    UPDATE transactions
-    SET preserve_until = ?, delete_at_height = NULL
-    WHERE hash IN (%s)
-	`, strings.Join(placeholders, ","))
-
-	result, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return errors.NewStorageError("failed to preserve transactions", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		s.logger.Warnf("[PreserveTransactions] Could not get rows affected: %v", err)
-	} else {
-		s.logger.Debugf("[PreserveTransactions] Successfully preserved %d out of %d transactions", rowsAffected, len(txIDs))
-	}
+	s.logger.Debugf("[PreserveTransactions] Successfully preserved %d out of %d transactions", totalAffected, len(txIDs))
 
 	return nil
 }
@@ -3103,8 +2881,8 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 
 	query := `
 		UPDATE transactions
-		SET delete_at_height = ?, preserve_until = NULL
-		WHERE preserve_until IS NOT NULL AND preserve_until <= ?
+		SET delete_at_height = $1, preserve_until = NULL
+		WHERE preserve_until IS NOT NULL AND preserve_until <= $2
 	`
 
 	result, err := s.db.ExecContext(ctx, query, deleteAtHeight, currentHeight)
@@ -3125,6 +2903,24 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 // RawDB returns the underlying *usql.DB connection. For test/debug use only.
 func (s *Store) RawDB() *usql.DB {
 	return s.db
+}
+
+// maxINClauseSize is the maximum number of hash placeholders in a single IN clause.
+// SQLite's SQLITE_MAX_VARIABLE_NUMBER default is 999. We use 400 to leave
+// headroom for additional parameters in the same query (e.g. block_id, height).
+const maxINClauseSize = 400
+
+// buildINClause generates a SQL IN clause placeholder string and corresponding args.
+// startIdx is the 1-based parameter index for the first placeholder ($startIdx, $startIdx+1, ...).
+// Returns the clause string like "($3,$4,$5)" and the args slice.
+func buildINClause(hashes [][]byte, startIdx int) (string, []interface{}) {
+	placeholders := make([]string, len(hashes))
+	args := make([]interface{}, len(hashes))
+	for i, h := range hashes {
+		placeholders[i] = fmt.Sprintf("$%d", startIdx+i)
+		args[i] = h
+	}
+	return "(" + strings.Join(placeholders, ",") + ")", args
 }
 
 // isLockError checks if the error is a database lock/deadlock error
