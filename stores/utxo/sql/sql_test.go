@@ -649,6 +649,72 @@ func Test_SmokeTests(t *testing.T) {
 
 		tests.Conflicting(t, db)
 	})
+
+	t.Run("spend error types", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.SpendErrorTypes(t, db)
+	})
+
+	t.Run("get spend not found", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		tests.GetSpendNotFound(t, db)
+	})
+
+	t.Run("set block height zero", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		tests.SetBlockHeightZero(t, db)
+	})
+
+	t.Run("set locked behavior", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.SetLockedBehavior(t, db)
+	})
+
+	t.Run("set conflicting behavior", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.SetConflictingBehavior(t, db)
+	})
+
+	t.Run("set mined unmined since", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.SetMinedUnminedSince(t, db)
+	})
+
+	t.Run("spend idempotent", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.SpendIdempotent(t, db)
+	})
+
+	t.Run("set mined with spent", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.SetMinedWithSpent(t, db)
+	})
 }
 
 func TestSetTTL(t *testing.T) {
@@ -716,6 +782,52 @@ func TestSetTTL(t *testing.T) {
 	// Now DAH should be set: all outputs spent AND mined AND on longest chain
 	assert.NotNil(t, tombstoneMillis)
 
+	// Verify the exact DAH value: blockHeight + 1 + retention (mirrors aerospike set_mined.go:162)
+	retention := store.settings.GetUtxoStoreBlockHeightRetention()
+	expectedDAH := int64(store.blockHeight.Load() + 1 + retention)
+	require.Equal(t, expectedDAH, *tombstoneMillis, "DAH should be blockHeight + 1 + retention")
+
+	// Verify DAH bump: advance block height, re-run setDAH — DAH should increase
+	oldDAH := *tombstoneMillis
+	store.blockHeight.Store(store.blockHeight.Load() + 100) // advance 100 blocks
+	expectedBumpedDAH := int64(store.blockHeight.Load() + 1 + retention)
+
+	err = store.setDAH(ctx, txn, transactionID)
+	require.NoError(t, err)
+
+	err = txn.QueryRowContext(ctx, "SELECT delete_at_height FROM transactions WHERE hash = $1", tx.TxIDChainHash()[:]).Scan(&tombstoneMillis)
+	require.NoError(t, err)
+
+	assert.NotNil(t, tombstoneMillis)
+	assert.Greater(t, *tombstoneMillis, oldDAH, "DAH should increase when block height advances")
+	require.Equal(t, expectedBumpedDAH, *tombstoneMillis, "bumped DAH should be new blockHeight + 1 + retention")
+
+	// Verify DAH clear on lock: set locked=true → setDAH should NOT clear DAH (that's done by SetLocked directly).
+	// However, when conditions no longer met (e.g., mark as unmined_since), setDAH should clear it.
+	_, err = txn.ExecContext(ctx, "UPDATE transactions SET unmined_since = 100 WHERE id = $1", transactionID)
+	require.NoError(t, err)
+
+	err = store.setDAH(ctx, txn, transactionID)
+	require.NoError(t, err)
+
+	err = txn.QueryRowContext(ctx, "SELECT delete_at_height FROM transactions WHERE hash = $1", tx.TxIDChainHash()[:]).Scan(&tombstoneMillis)
+	require.NoError(t, err)
+
+	// DAH should be cleared because isOnLongestChain is now false (unmined_since IS NOT NULL)
+	assert.Nil(t, tombstoneMillis, "DAH should be cleared when tx is no longer on longest chain")
+
+	// Restore on longest chain
+	_, err = txn.ExecContext(ctx, "UPDATE transactions SET unmined_since = NULL WHERE id = $1", transactionID)
+	require.NoError(t, err)
+
+	err = store.setDAH(ctx, txn, transactionID)
+	require.NoError(t, err)
+
+	err = txn.QueryRowContext(ctx, "SELECT delete_at_height FROM transactions WHERE hash = $1", tx.TxIDChainHash()[:]).Scan(&tombstoneMillis)
+	require.NoError(t, err)
+
+	assert.NotNil(t, tombstoneMillis, "DAH should be restored when tx is back on longest chain")
+
 	// unset one of the outputs to be unspent
 	_, err = txn.ExecContext(ctx, "UPDATE outputs SET spending_data = NULL WHERE transaction_id = $1 AND idx = 0", transactionID)
 	require.NoError(t, err)
@@ -739,6 +851,19 @@ func TestSetTTL(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotNil(t, tombstoneMillis)
+
+	// Verify conflicting COALESCE: DAH is already set, calling setDAH again should NOT overwrite it
+	existingConflictingDAH := *tombstoneMillis
+	store.blockHeight.Store(store.blockHeight.Load() + 50) // advance more
+
+	err = store.setDAH(ctx, txn, transactionID)
+	require.NoError(t, err)
+
+	err = txn.QueryRowContext(ctx, "SELECT delete_at_height FROM transactions WHERE hash = $1", tx.TxIDChainHash()[:]).Scan(&tombstoneMillis)
+	require.NoError(t, err)
+
+	assert.NotNil(t, tombstoneMillis)
+	assert.Equal(t, existingConflictingDAH, *tombstoneMillis, "conflicting DAH should not be overwritten (COALESCE behavior)")
 }
 
 func TestUnmined(t *testing.T) {
