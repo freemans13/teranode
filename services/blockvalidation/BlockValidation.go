@@ -1868,7 +1868,16 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 	defer deferFn()
 
-	currentChainBlockIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Hash(), 10_000)
+	// Use the parent block's hash for the initial chain lookup. The current block
+	// may not yet be stored in the blockchain (AddBlock happens after this check),
+	// but the parent always exists. This ensures GetBlockHeaderIDs returns results
+	// for the fast in-memory lookup, avoiding expensive per-tx CheckBlockIsInCurrentChain
+	// gRPC calls for the common case.
+	lookupHash := block.Hash()
+	if block.Header != nil && block.Header.HashPrevBlock != nil {
+		lookupHash = block.Header.HashPrevBlock
+	}
+	currentChainBlockIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, lookupHash, 10_000)
 	if err != nil {
 		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] failed to get block header ids", block.String(), err)
 	}
@@ -1878,9 +1887,15 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 		currentChainBlockIDsMap[blockID] = struct{}{}
 	}
 
+	if u.logger != nil {
+		u.logger.Infof("[checkOldBlockIDs][%s] loaded %d chain block IDs for fast lookup, checking %d old block ID entries", block.Hash().String(), len(currentChainBlockIDs), oldBlockIDsMap.Length())
+	}
+
 	currentChainLookupCache := make(map[string]bool, len(currentChainBlockIDs))
 
 	var builder strings.Builder
+
+	var fastPathCount, slowPathCount, cacheHitCount int
 
 	// range over the oldBlockIDsMap to get txID - oldBlockID pairs
 	oldBlockIDsMap.Iterate(func(txID chainhash.Hash, blockIDs []uint32) bool {
@@ -1893,6 +1908,7 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 		for _, blockID := range blockIDs {
 			if _, ok := currentChainBlockIDsMap[blockID]; ok {
 				// all good, continue
+				fastPathCount++
 				return true
 			}
 		}
@@ -1913,6 +1929,7 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 		// check whether we already checked exactly the same blockIDs and can use a cache
 		if blocksPartOfCurrentChain, ok := currentChainLookupCache[blockIDsString]; ok {
+			cacheHitCount++
 			if !blocksPartOfCurrentChain {
 				iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain using cache", block.String(), txID, blockIDs)
 				return false
@@ -1920,6 +1937,8 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 			return true
 		}
+
+		slowPathCount++
 
 		// Flag to check if the old blocks are part of the current chain
 		blocksPartOfCurrentChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, blockIDs)
@@ -1940,6 +1959,10 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 		return true
 	})
+
+	if u.logger != nil {
+		u.logger.Infof("[checkOldBlockIDs][%s] done: fastPath=%d, slowPath=%d, cacheHit=%d", block.Hash().String(), fastPathCount, slowPathCount, cacheHitCount)
+	}
 
 	return
 }
