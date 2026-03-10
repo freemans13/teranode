@@ -1776,28 +1776,324 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 	}, nil
 }
 
-// BatchDecorate efficiently fetches metadata for multiple transactions.
-// This is used to optimize bulk operations on transactions.
-func (s *Store) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*utxo.UnresolvedMetaData, fields ...fields.FieldName) error {
-	// No per-batch timeout here: each individual Get() call applies its own DBTimeout.
-	// A single timeout across N sequential queries causes deadline exceeded on large batches.
-	for _, unresolvedMetaData := range unresolvedMetaDataSlice {
+// BatchDecorate efficiently fetches metadata for multiple transactions using
+// bulk IN-clause queries instead of individual per-transaction queries.
+// For a batch of N transactions needing inputs and block_ids, this executes
+// ~3 queries per chunk (transactions + inputs + block_ids) instead of ~3*N.
+func (s *Store) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*utxo.UnresolvedMetaData, requestedFields ...fields.FieldName) error {
+	bins := utxo.MetaFieldsWithTx
+	if len(requestedFields) > 0 {
+		bins = requestedFields
+	}
+
+	// Filter out nil entries and collect non-nil ones
+	items := make([]*utxo.UnresolvedMetaData, 0, len(unresolvedMetaDataSlice))
+	for _, item := range unresolvedMetaDataSlice {
+		if item != nil {
+			items = append(items, item)
+		}
+	}
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	// Process in chunks of maxINClauseSize
+	for i := 0; i < len(items); i += maxINClauseSize {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-
 		default:
-			if unresolvedMetaData == nil {
-				continue
-			}
+		}
 
-			data, err := s.Get(ctx, &unresolvedMetaData.Hash, fields...)
-			if err != nil {
-				unresolvedMetaData.Err = err
-			} else {
-				unresolvedMetaData.Data = data
+		end := i + maxINClauseSize
+		if end > len(items) {
+			end = len(items)
+		}
+
+		if err := s.batchDecorateChunk(ctx, items[i:end], bins); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// batchDecorateTxRow holds intermediate results for a single transaction during bulk fetch.
+type batchDecorateTxRow struct {
+	id       int
+	data     *meta.Data
+	version  uint32
+	lockTime uint32
+	hash     chainhash.Hash
+}
+
+// batchDecorateChunk fetches metadata for a chunk of transactions using bulk queries.
+// It runs one query per table (transactions, inputs, block_ids, outputs) rather than
+// one query per transaction per table.
+func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.UnresolvedMetaData, bins []fields.FieldName) error {
+	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
+	defer cancelTimeout()
+
+	// Build hash list and hash→item index for result mapping
+	hashes := make([][]byte, len(items))
+	hashToItems := make(map[chainhash.Hash][]*utxo.UnresolvedMetaData, len(items))
+	for i, item := range items {
+		hashes[i] = item.Hash[:]
+		hashToItems[item.Hash] = append(hashToItems[item.Hash], item)
+	}
+
+	// Query 1: Bulk fetch from transactions table
+	inClause, inArgs := buildINClause(hashes, 1)
+
+	q := `SELECT hash, id, version, lock_time, fee, size_in_bytes, coinbase, frozen, conflicting, locked, unmined_since FROM transactions WHERE hash IN ` + inClause
+
+	rows, err := s.db.QueryContext(ctx, q, inArgs...)
+	if err != nil {
+		return err
+	}
+
+	// Map internal DB id → txRow for subsequent queries
+	idToTx := make(map[int]*batchDecorateTxRow, len(items))
+	// Map hash → txRow for result assembly
+	hashToTx := make(map[chainhash.Hash]*batchDecorateTxRow, len(items))
+
+	for rows.Next() {
+		var (
+			hashBytes    []byte
+			unminedSince sql.NullInt64
+		)
+
+		row := &batchDecorateTxRow{data: &meta.Data{}}
+		if err := rows.Scan(&hashBytes, &row.id, &row.version, &row.lockTime, &row.data.Fee, &row.data.SizeInBytes, &row.data.IsCoinbase, &row.data.Frozen, &row.data.Conflicting, &row.data.Locked, &unminedSince); err != nil {
+			rows.Close()
+			return err
+		}
+
+		copy(row.hash[:], hashBytes)
+
+		if unminedSince.Valid {
+			const maxUint32 = 0xFFFFFFFF
+			if unminedSince.Int64 >= 0 && unminedSince.Int64 <= maxUint32 {
+				row.data.UnminedSince = uint32(unminedSince.Int64)
 			}
 		}
+
+		idToTx[row.id] = row
+		hashToTx[row.hash] = row
+	}
+	rows.Close()
+
+	// Mark not-found transactions
+	for _, item := range items {
+		if _, found := hashToTx[item.Hash]; !found {
+			item.Err = errors.NewTxNotFoundError("transaction %s not found", &item.Hash, nil)
+		}
+	}
+
+	if len(idToTx) == 0 {
+		return nil
+	}
+
+	// Build ID list for subsequent queries
+	ids := make([]int, 0, len(idToTx))
+	for id := range idToTx {
+		ids = append(ids, id)
+	}
+
+	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
+	needOutputs := contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos)
+	needBlockIDs := contains(bins, fields.BlockIDs)
+
+	// Query 2: Bulk fetch inputs
+	if needInputs {
+		if err := s.batchDecorateInputs(ctx, ids, idToTx); err != nil {
+			return err
+		}
+	}
+
+	// Query 3: Bulk fetch outputs
+	if needOutputs {
+		if err := s.batchDecorateOutputs(ctx, ids, idToTx); err != nil {
+			return err
+		}
+	}
+
+	// Query 4: Bulk fetch block_ids
+	if needBlockIDs {
+		if err := s.batchDecorateBlockIDs(ctx, ids, idToTx); err != nil {
+			return err
+		}
+	}
+
+	// Assemble results into UnresolvedMetaData items
+	for hash, matchedItems := range hashToItems {
+		row, found := hashToTx[hash]
+		if !found {
+			continue // already marked as error above
+		}
+
+		// Build tx if needed for Tx or TxInpoints fields
+		var tx *bt.Tx
+		if contains(bins, fields.Tx) || contains(bins, fields.TxInpoints) {
+			tx = &bt.Tx{
+				Version:  row.version,
+				LockTime: row.lockTime,
+			}
+			if needInputs {
+				tx.Inputs = row.data.Tx.Inputs // inputs were stored in data.Tx
+			}
+			if needOutputs {
+				tx.Outputs = row.data.Tx.Outputs // outputs were stored in data.Tx
+			}
+		}
+
+		if contains(bins, fields.TxInpoints) && row.data.Tx != nil && len(row.data.Tx.Inputs) > 0 {
+			row.data.TxInpoints, _ = subtree.NewTxInpointsFromInputs(row.data.Tx.Inputs)
+		}
+
+		if contains(bins, fields.Tx) {
+			row.data.Tx = tx
+		} else {
+			row.data.Tx = nil // don't leak the temporary tx used for inputs/outputs
+		}
+
+		for _, item := range matchedItems {
+			item.Data = row.data
+		}
+	}
+
+	return nil
+}
+
+// batchDecorateInputs bulk-fetches inputs for multiple transactions.
+func (s *Store) batchDecorateInputs(ctx context.Context, ids []int, idToTx map[int]*batchDecorateTxRow) error {
+	idPlaceholders := make([]string, len(ids))
+	idArgs := make([]interface{}, len(ids))
+	for i, id := range ids {
+		idPlaceholders[i] = fmt.Sprintf("$%d", i+1)
+		idArgs[i] = id
+	}
+	inClause := "(" + strings.Join(idPlaceholders, ",") + ")"
+
+	q := `SELECT transaction_id, previous_transaction_hash, previous_tx_idx, previous_tx_satoshis, previous_tx_script, unlocking_script, sequence_number FROM inputs WHERE transaction_id IN ` + inClause + ` ORDER BY transaction_id, idx`
+
+	rows, err := s.db.QueryContext(ctx, q, idArgs...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			txID            int
+			prevTxHashBytes []byte
+		)
+		input := &bt.Input{}
+		if err := rows.Scan(&txID, &prevTxHashBytes, &input.PreviousTxOutIndex, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
+			return err
+		}
+
+		row := idToTx[txID]
+		if row == nil {
+			continue
+		}
+
+		previousTxHash, err := chainhash.NewHash(prevTxHashBytes)
+		if err != nil {
+			return err
+		}
+		if err := input.PreviousTxIDAdd(previousTxHash); err != nil {
+			return err
+		}
+
+		// Store inputs in data.Tx temporarily
+		if row.data.Tx == nil {
+			row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
+		}
+		row.data.Tx.Inputs = append(row.data.Tx.Inputs, input)
+	}
+
+	return nil
+}
+
+// batchDecorateOutputs bulk-fetches outputs for multiple transactions.
+func (s *Store) batchDecorateOutputs(ctx context.Context, ids []int, idToTx map[int]*batchDecorateTxRow) error {
+	idPlaceholders := make([]string, len(ids))
+	idArgs := make([]interface{}, len(ids))
+	for i, id := range ids {
+		idPlaceholders[i] = fmt.Sprintf("$%d", i+1)
+		idArgs[i] = id
+	}
+	inClause := "(" + strings.Join(idPlaceholders, ",") + ")"
+
+	q := `SELECT transaction_id, locking_script, satoshis FROM outputs WHERE transaction_id IN ` + inClause + ` ORDER BY transaction_id, idx`
+
+	rows, err := s.db.QueryContext(ctx, q, idArgs...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var txID int
+		output := &bt.Output{}
+		if err := rows.Scan(&txID, &output.LockingScript, &output.Satoshis); err != nil {
+			return err
+		}
+
+		row := idToTx[txID]
+		if row == nil {
+			continue
+		}
+
+		// Store outputs in data.Tx temporarily
+		if row.data.Tx == nil {
+			row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
+		}
+		row.data.Tx.Outputs = append(row.data.Tx.Outputs, output)
+	}
+
+	return nil
+}
+
+// batchDecorateBlockIDs bulk-fetches block_ids for multiple transactions.
+func (s *Store) batchDecorateBlockIDs(ctx context.Context, ids []int, idToTx map[int]*batchDecorateTxRow) error {
+	idPlaceholders := make([]string, len(ids))
+	idArgs := make([]interface{}, len(ids))
+	for i, id := range ids {
+		idPlaceholders[i] = fmt.Sprintf("$%d", i+1)
+		idArgs[i] = id
+	}
+	inClause := "(" + strings.Join(idPlaceholders, ",") + ")"
+
+	q := `SELECT transaction_id, block_id, block_height, subtree_idx FROM block_ids WHERE transaction_id IN ` + inClause + ` ORDER BY transaction_id, block_id`
+
+	rows, err := s.db.QueryContext(ctx, q, idArgs...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			txID        int
+			blockID     uint32
+			blockHeight uint32
+			subtreeIdx  int
+		)
+		if err := rows.Scan(&txID, &blockID, &blockHeight, &subtreeIdx); err != nil {
+			return err
+		}
+
+		row := idToTx[txID]
+		if row == nil {
+			continue
+		}
+
+		row.data.BlockIDs = append(row.data.BlockIDs, blockID)
+		row.data.BlockHeights = append(row.data.BlockHeights, blockHeight)
+		row.data.SubtreeIdxs = append(row.data.SubtreeIdxs, subtreeIdx)
 	}
 
 	return nil
