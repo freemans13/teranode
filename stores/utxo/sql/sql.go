@@ -877,6 +877,11 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		AND spending_data IS NULL
 	`
 
+	// Single-statement DAH update: avoids the separate SELECT + UPDATE of setDAH().
+	// Combines the unspent-output check and conditional DAH update into one query.
+	retention := s.settings.GetUtxoStoreBlockHeightRetention()
+	newDAH := int64(s.blockHeight.Load() + 1 + retention)
+
 	var errorFound bool
 
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
@@ -1030,9 +1035,27 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 				continue
 			}
 
-			if err = s.setDAH(ctx, txn, transactionID); err != nil {
-				errorFound = true
-				spend.Err = err
+			// Inline DAH update: single statement instead of setDAH()'s 2 queries.
+			// Only runs when retention is configured.
+			if retention > 0 {
+				qDAH := `
+					UPDATE transactions
+					SET delete_at_height = CASE
+						WHEN preserve_until IS NOT NULL THEN delete_at_height
+						WHEN conflicting AND delete_at_height IS NULL THEN $2
+						WHEN NOT EXISTS(SELECT 1 FROM outputs o WHERE o.transaction_id = $1 AND o.spending_data IS NULL)
+						     AND EXISTS(SELECT 1 FROM block_ids WHERE transaction_id = $1)
+						     AND unmined_since IS NULL
+						     AND (delete_at_height IS NULL OR delete_at_height < $2)
+						     THEN $2
+						ELSE delete_at_height
+					END
+					WHERE id = $1
+				`
+				if _, err = txn.ExecContext(ctx, qDAH, transactionID, newDAH); err != nil {
+					errorFound = true
+					spend.Err = errors.NewStorageError("[Spend] failed: DAH update for %s:%d", spend.TxID, spend.Vout, err)
+				}
 			}
 
 			prometheusUtxoSpend.Inc()
