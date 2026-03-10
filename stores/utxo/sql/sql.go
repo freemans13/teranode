@@ -49,9 +49,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
@@ -67,9 +69,20 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/usql"
 	pq "github.com/lib/pq"
+	"golang.org/x/sync/errgroup"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
+
+// batchSpend represents a single UTXO spend request in a batch.
+// Mirrors aerospike/spend.go batchSpend struct.
+type batchSpend struct {
+	spend             *utxo.Spend // UTXO to spend
+	blockHeight       uint32      // Current block height
+	errCh             chan error  // Channel for completion notification
+	ignoreConflicting bool
+	ignoreLocked      bool
+}
 
 // Store implements the UTXO store interface using a SQL database backend.
 type Store struct {
@@ -80,6 +93,8 @@ type Store struct {
 	engine          string
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
+	ctx             context.Context
+	spendBatcher    *batcher.Batcher[batchSpend]
 }
 
 // New creates a new SQL-based UTXO store.
@@ -130,6 +145,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		engine:          storeURL.Scheme,
 		blockHeight:     atomic.Uint32{},
 		medianBlockTime: atomic.Uint32{},
+		ctx:             ctx,
+	}
+
+	// Initialize spend batcher — mirrors aerospike/aerospike.go batcher setup.
+	// Batches individual spend operations to control DB connection concurrency.
+	spendBatchSize := tSettings.UtxoStore.SpendBatcherSize
+	spendBatchDuration := time.Duration(tSettings.UtxoStore.SpendBatcherDurationMillis) * time.Millisecond
+	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, !tSettings.BatcherDrainMode)
+	if tSettings.BatcherDrainMode {
+		s.spendBatcher.SetDrainMode(true)
 	}
 
 	return s, nil
@@ -787,9 +812,6 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		return nil, errors.NewProcessingError("blockHeight must be greater than zero")
 	}
 
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
-
 	defer func() {
 		if recoverErr := recover(); recoverErr != nil {
 			prometheusUtxoErrors.WithLabelValues("Spend", "Failed Spend Cleaning").Inc()
@@ -797,36 +819,9 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		}
 	}()
 
-	// try the operation with retry logic for lock errors
-	var spends []*utxo.Spend
-	var err error
+	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
+	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
 
-	for attempt := 0; attempt <= 3; attempt++ {
-		spends, err = s.spendWithRetry(ctx, tx, blockHeight, ignoreFlags...)
-
-		// if no error or not a lock error, return immediately
-		if err == nil || !isLockError(err) {
-			return spends, err
-		}
-
-		// for lock errors, retry with backoff
-		if attempt < 3 {
-			backoff := time.Duration(100<<attempt) * time.Millisecond // 100ms, 200ms, 400ms
-			s.logger.Warnf("Database lock error during spend (attempt %d): %v, retrying in %v", attempt+1, err, backoff)
-
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff):
-				// continue to next attempt
-			}
-		}
-	}
-
-	return spends, err
-}
-
-func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	spends, err := utxo.GetSpends(tx)
 	if err != nil {
 		return nil, err
@@ -836,14 +831,161 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		return nil, errors.NewProcessingError("No spends provided", nil)
 	}
 
-	// Track whether the spending tx already exists in the store (for "already blessed" recovery)
-	txAlreadyExists := false
+	// Mirrors aerospike spend.go:287-420 — enqueue each spend into the batcher,
+	// wait for batch callback to signal completion via errCh.
+	var (
+		mu              sync.Mutex
+		txAlreadyExists bool
+		spentSpends     = make([]*utxo.Spend, 0, len(spends))
+		g               errgroup.Group
+	)
 
-	txn, err := s.db.Begin()
-	if err != nil {
-		return nil, err
+	for idx, spend := range spends {
+		if spend == nil {
+			return nil, errors.NewProcessingError("spend should not be nil")
+		}
+
+		idx := idx
+		spend := spend
+
+		g.Go(func() error {
+			errCh := make(chan error, 1)
+			s.spendBatcher.Put(&batchSpend{
+				spend:             spend,
+				blockHeight:       blockHeight,
+				errCh:             errCh,
+				ignoreConflicting: useIgnoreConflicting,
+				ignoreLocked:      useIgnoreLocked,
+			})
+
+			// Wait for batch response with timeout to prevent indefinite blocking
+			spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
+			if spendTimeout <= 0 {
+				spendTimeout = 30 * time.Second
+			}
+
+			timer := time.NewTimer(spendTimeout)
+			defer timer.Stop()
+
+			var batchErr error
+			select {
+			case batchErr = <-errCh:
+				// Batch completed successfully or with error
+			case <-ctx.Done():
+				spends[idx].Err = errors.NewContextCanceledError("[SPEND][%s:%d] context canceled while waiting for batch response", spend.TxID.String(), spend.Vout)
+				return nil
+			case <-timer.C:
+				prometheusUtxoErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
+				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND][%s:%d] batch operation timed out after %s", spend.TxID.String(), spend.Vout, spendTimeout)
+				return nil
+			}
+
+			// Handle "already blessed" — parent tx not found but spending tx exists.
+			// Mirrors aerospike spend.go:343-361.
+			if batchErr != nil && errors.Is(batchErr, errors.ErrTxNotFound) {
+				mu.Lock()
+				exists := txAlreadyExists
+				mu.Unlock()
+
+				if exists {
+					batchErr = nil
+				} else {
+					var spendingTxExists bool
+					_ = s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists)
+					if spendingTxExists {
+						s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
+						batchErr = nil
+
+						mu.Lock()
+						txAlreadyExists = true
+						mu.Unlock()
+					}
+				}
+			}
+
+			if batchErr != nil {
+				spends[idx].Err = batchErr
+
+				s.logger.Debugf("[SPEND][%s:%d] error in sql spend: %+v", spend.TxID.String(), spend.Vout, batchErr)
+
+				var errSpent *errors.UtxoSpentErrData
+				if errors.AsData(batchErr, &errSpent) {
+					spends[idx].ConflictingTxID = errSpent.SpendingData.TxID
+				}
+
+				return nil
+			}
+
+			mu.Lock()
+			spentSpends = append(spentSpends, spend)
+			mu.Unlock()
+
+			return nil
+		})
 	}
 
+	if err = g.Wait(); err != nil {
+		return nil, errors.NewError("error in sql spend (batched mode)", err)
+	}
+
+	if len(spends) != len(spentSpends) {
+		// Rollback successful spends when the transaction has genuine validation failures
+		// (double-spend, frozen, conflicting, hash mismatch). For transient errors, skip
+		// rollback — the optimistic locking makes spends idempotent for the same spender.
+		if needsSpendRollback(spends) {
+			if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
+				s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
+			}
+		}
+
+		var spendErrors error
+		for _, spend := range spends {
+			if spend.Err != nil {
+				if spendErrors != nil {
+					spendErrors = errors.Join(spendErrors, spend.Err)
+				} else {
+					spendErrors = spend.Err
+				}
+			}
+		}
+
+		return spends, errors.NewUtxoError("error in sql spend (batched mode) - errors", spendErrors)
+	}
+
+	prometheusUtxoSpend.Add(float64(len(spends)))
+
+	return spends, nil
+}
+
+// needsSpendRollback returns true if any spend failed due to a validation error
+// that indicates the transaction is genuinely invalid. Mirrors aerospike/spend.go.
+func needsSpendRollback(spends []*utxo.Spend) bool {
+	for _, spend := range spends {
+		if spend.Err == nil {
+			continue
+		}
+		if errors.Is(spend.Err, errors.ErrSpent) ||
+			errors.Is(spend.Err, errors.ErrTxConflicting) ||
+			errors.Is(spend.Err, errors.ErrFrozen) ||
+			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) {
+			return true
+		}
+	}
+	return false
+}
+
+// sendSpendBatch is the batcher callback that processes a batch of spend operations
+// in a single DB transaction. Called by the go-batcher when the batch is full or
+// the timeout fires. Same SQL for both PostgreSQL and SQLite.
+// Mirrors aerospike/spend.go sendSpendBatchLua.
+func (s *Store) sendSpendBatch(batch []*batchSpend) {
+	txn, err := s.db.BeginTx(s.ctx, nil)
+	if err != nil {
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] failed to begin transaction", err)
+		}
+		return
+	}
 	defer func() {
 		_ = txn.Rollback()
 	}()
@@ -864,11 +1006,7 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		AND o.idx = $2
 	`
 
-	// No FOR UPDATE: use optimistic locking via the spending_data IS NULL guard
-	// on the UPDATE instead. This avoids row-level lock contention when many
-	// concurrent goroutines spend different outputs from the same parent tx.
-	// Mirrors aerospike which uses atomic expressions without locking.
-
+	// Optimistic locking: spending_data IS NULL guard prevents concurrent double-spend
 	q2 := `
 		UPDATE outputs
 		SET spending_data = $1
@@ -877,207 +1015,164 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		AND spending_data IS NULL
 	`
 
-	// Single-statement DAH update: avoids the separate SELECT + UPDATE of setDAH().
-	// Combines the unspent-output check and conditional DAH update into one query.
 	retention := s.settings.GetUtxoStoreBlockHeightRetention()
 	newDAH := int64(s.blockHeight.Load() + 1 + retention)
 
-	var errorFound bool
+	successItems := make([]*batchSpend, 0, len(batch))
+	aborted := false
 
-	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
-	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
-
-	for _, spend := range spends {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-
-		default:
-			if spend == nil {
-				continue
-			}
-
-			var (
-				transactionID          int
-				coinbaseSpendingHeight uint32
-				utxoHash               []byte
-				spendingDataBytes      []byte
-				frozen                 bool
-				conflicting            bool
-				locked                 bool
-				spendableIn            *uint32
-			)
-
-			err = txn.QueryRowContext(ctx, q1, spend.TxID[:], spend.Vout).Scan(&transactionID, &coinbaseSpendingHeight, &utxoHash, &spendingDataBytes, &frozen, &conflicting, &locked, &spendableIn)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					// Output not found - check if the spending tx itself already exists in the
-					// store (already blessed). This can happen when the parent tx has been pruned
-					// but the spending tx was already validated. Mirrors aerospike spend.go:343-361.
-					if txAlreadyExists {
-						// Already confirmed tx exists, skip lookup
-						continue
-					}
-
-					var spendingTxExists bool
-					_ = s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists)
-					if spendingTxExists {
-						s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
-						txAlreadyExists = true
-						continue
-					}
-
-					errorFound = true
-					spend.Err = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
-				} else {
-					errorFound = true
-					spend.Err = errors.NewStorageError("[Spend] failed: SELECT output %s:%d - %v", spend.TxID, spend.Vout, err)
-				}
-
-				continue
-			}
-
-			// If the utxo is frozen, it cannot be spent
-			if frozen {
-				errorFound = true
-				spend.Err = errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
-
-				continue
-			}
-
-			// If the tx is marked as conflicting, it cannot be spent
-			if conflicting && !useIgnoreConflicting {
-				errorFound = true
-				spend.Err = errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
-
-				continue
-			}
-
-			if locked && !useIgnoreLocked {
-				errorFound = true
-				spend.Err = errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
-
-				continue
-			}
-
-			if spendableIn != nil {
-				if *spendableIn > 0 && blockHeight < *spendableIn {
-					errorFound = true
-					spend.Err = errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
-
-					continue
-				}
-			}
-
-			// Check if the utxo is already spent
-			if len(spendingDataBytes) > 0 {
-				if spend.SpendingData != nil && !bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
-					spendingData, err := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
-					if err != nil {
-						errorFound = true
-						spend.Err = errors.NewProcessingError("failed to create spending data from bytes", err)
-
-						continue
-					}
-
-					errorFound = true
-					spend.Err = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
-					spend.ConflictingTxID = spendingData.TxID
-
-					continue
-				}
-			}
-
-			// Check the utxo hash is correct
-			if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
-				errorFound = true
-				spend.Err = errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
-
-				continue
-			}
-
-			// If this utxo has a coinbase spending height, check it is time to spend it
-			if coinbaseSpendingHeight > 0 && coinbaseSpendingHeight > blockHeight {
-				errorFound = true
-				spend.Err = errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d", spend.TxID, spend.Vout, coinbaseSpendingHeight, blockHeight)
-
-				continue
-			}
-
-			result, err := txn.ExecContext(ctx, q2, spend.SpendingData.Bytes(), transactionID, spend.Vout)
-			if err != nil {
-				errorFound = true
-				spend.Err = errors.NewStorageError("[Spend] failed: UPDATE outputs: error spending utxo for %s:%d", spend.TxID, spend.Vout, err)
-
-				continue
-			}
-
-			affected, err := result.RowsAffected()
-			if err != nil {
-				errorFound = true
-				spend.Err = errors.NewStorageError("[Spend] failed getting affected rows: utxo not spent for %s:%d", spend.TxID, spend.Vout, err)
-
-				continue
-			}
-
-			if affected == 0 {
-				// The UPDATE's spending_data IS NULL guard rejected the write.
-				// If the SELECT already showed it as spent with the same spending data
-				// (idempotent re-spend), this is expected — skip without error.
-				if len(spendingDataBytes) > 0 && spend.SpendingData != nil && bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
-					// Idempotent: same tx spending the same output again, no error
-					continue
-				}
-				// Otherwise the output was concurrently spent by a different tx.
-				errorFound = true
-				spend.Err = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
-
-				continue
-			}
-
-			// Skip DAH during block validation (IgnoreLocked=true) — SetMinedMulti
-			// handles DAH after all spends are done, so per-spend DAH is redundant
-			// and would cause excessive DB load for large blocks.
-			if retention > 0 && !useIgnoreLocked {
-				qDAH := `
-					UPDATE transactions
-					SET delete_at_height = CASE
-						WHEN preserve_until IS NOT NULL THEN delete_at_height
-						WHEN conflicting AND delete_at_height IS NULL THEN $2
-						WHEN NOT EXISTS(SELECT 1 FROM outputs o WHERE o.transaction_id = $1 AND o.spending_data IS NULL)
-						     AND EXISTS(SELECT 1 FROM block_ids WHERE transaction_id = $1)
-						     AND unmined_since IS NULL
-						     AND (delete_at_height IS NULL OR delete_at_height < $2)
-						     THEN $2
-						ELSE delete_at_height
-					END
-					WHERE id = $1
-				`
-				if _, err = txn.ExecContext(ctx, qDAH, transactionID, newDAH); err != nil {
-					errorFound = true
-					spend.Err = errors.NewStorageError("[Spend] failed: DAH update for %s:%d", spend.TxID, spend.Vout, err)
-				}
-			}
-
-			prometheusUtxoSpend.Inc()
+	for _, item := range batch {
+		if aborted {
+			item.errCh <- errors.NewStorageError("[Spend] batch aborted due to previous DB error")
+			continue
 		}
+
+		spend := item.spend
+
+		var (
+			transactionID          int
+			coinbaseSpendingHeight uint32
+			utxoHash               []byte
+			spendingDataBytes      []byte
+			frozen                 bool
+			conflicting            bool
+			locked                 bool
+			spendableIn            *uint32
+		)
+
+		err = txn.QueryRowContext(s.ctx, q1, spend.TxID[:], spend.Vout).Scan(
+			&transactionID, &coinbaseSpendingHeight, &utxoHash,
+			&spendingDataBytes, &frozen, &conflicting, &locked, &spendableIn,
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				item.errCh <- errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+			} else {
+				item.errCh <- errors.NewStorageError("[Spend] failed: SELECT output %s:%d - %v", spend.TxID, spend.Vout, err)
+				aborted = true // real DB error — PostgreSQL transaction is now in error state
+			}
+			continue
+		}
+
+		// Validate the UTXO state — same checks as before
+		if frozen {
+			item.errCh <- errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
+			continue
+		}
+
+		if conflicting && !item.ignoreConflicting {
+			item.errCh <- errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
+			continue
+		}
+
+		if locked && !item.ignoreLocked {
+			item.errCh <- errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
+			continue
+		}
+
+		if spendableIn != nil && *spendableIn > 0 && item.blockHeight < *spendableIn {
+			item.errCh <- errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
+			continue
+		}
+
+		// Check if already spent by a different transaction
+		if len(spendingDataBytes) > 0 {
+			if spend.SpendingData != nil && !bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
+				// Parse the existing (conflicting) spending data from the DB so
+				// the caller can extract ConflictingTxID via errors.AsData
+				existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
+				if parseErr != nil {
+					item.errCh <- errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+					continue
+				}
+				item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
+				continue
+			}
+		}
+
+		// Check UTXO hash matches
+		if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
+			item.errCh <- errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
+			continue
+		}
+
+		// Check coinbase maturity
+		if coinbaseSpendingHeight > 0 && coinbaseSpendingHeight > item.blockHeight {
+			item.errCh <- errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d", spend.TxID, spend.Vout, coinbaseSpendingHeight, item.blockHeight)
+			continue
+		}
+
+		// UPDATE with optimistic locking
+		result, err := txn.ExecContext(s.ctx, q2, spend.SpendingData.Bytes(), transactionID, spend.Vout)
+		if err != nil {
+			item.errCh <- errors.NewStorageError("[Spend] failed: UPDATE outputs: error spending utxo for %s:%d", spend.TxID, spend.Vout, err)
+			aborted = true
+			continue
+		}
+
+		affected, err := result.RowsAffected()
+		if err != nil {
+			item.errCh <- errors.NewStorageError("[Spend] failed getting affected rows: utxo not spent for %s:%d", spend.TxID, spend.Vout, err)
+			aborted = true
+			continue
+		}
+
+		if affected == 0 {
+			// Idempotent re-spend: same tx spending the same output again
+			if len(spendingDataBytes) > 0 && spend.SpendingData != nil && bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
+				successItems = append(successItems, item)
+				continue
+			}
+			// Concurrently spent by a different tx
+			item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
+			continue
+		}
+
+		// DAH update — always runs (no skip during block validation)
+		if retention > 0 {
+			qDAH := `
+				UPDATE transactions
+				SET delete_at_height = CASE
+					WHEN preserve_until IS NOT NULL THEN delete_at_height
+					WHEN conflicting AND delete_at_height IS NULL THEN $2
+					WHEN NOT EXISTS(SELECT 1 FROM outputs o WHERE o.transaction_id = $1 AND o.spending_data IS NULL)
+					     AND EXISTS(SELECT 1 FROM block_ids WHERE transaction_id = $1)
+					     AND unmined_since IS NULL
+					     AND (delete_at_height IS NULL OR delete_at_height < $2)
+					     THEN $2
+					ELSE delete_at_height
+				END
+				WHERE id = $1
+			`
+			if _, err = txn.ExecContext(s.ctx, qDAH, transactionID, newDAH); err != nil {
+				item.errCh <- errors.NewStorageError("[Spend] failed: DAH update for %s:%d", spend.TxID, spend.Vout, err)
+				aborted = true
+				continue
+			}
+		}
+
+		successItems = append(successItems, item)
 	}
 
-	if errorFound {
-		// Log individual spend errors for diagnostics (mirrors aerospike which logs per-spend errors)
-		for _, spend := range spends {
-			if spend != nil && spend.Err != nil {
-				s.logger.Warnf("[Spend][%s] input %s:%d error: %v", tx.TxID(), spend.TxID, spend.Vout, spend.Err)
-			}
+	// If the batch was aborted by a DB error, roll back all successful items
+	if aborted {
+		for _, item := range successItems {
+			item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DB error")
 		}
-		return spends, errors.NewUtxoError("One or more UTXOs could not be spent")
-	} else {
-		if err = txn.Commit(); err != nil {
-			return nil, errors.NewStorageError("[Spend] failed to commit transaction", err)
-		}
+		return
 	}
 
-	return spends, nil
+	// Commit the transaction — signal success only after commit succeeds
+	if err := txn.Commit(); err != nil {
+		for _, item := range successItems {
+			item.errCh <- errors.NewStorageError("[Spend] failed to commit transaction", err)
+		}
+		return
+	}
+
+	for _, item := range successItems {
+		item.errCh <- nil
+	}
 }
 
 func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) error {
