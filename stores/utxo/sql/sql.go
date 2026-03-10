@@ -1779,9 +1779,8 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 // BatchDecorate efficiently fetches metadata for multiple transactions.
 // This is used to optimize bulk operations on transactions.
 func (s *Store) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*utxo.UnresolvedMetaData, fields ...fields.FieldName) error {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
-
+	// No per-batch timeout here: each individual Get() call applies its own DBTimeout.
+	// A single timeout across N sequential queries causes deadline exceeded on large batches.
 	for _, unresolvedMetaData := range unresolvedMetaDataSlice {
 		select {
 		case <-ctx.Done():
