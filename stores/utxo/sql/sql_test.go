@@ -1551,12 +1551,9 @@ func TestGetSpendEdgeCases(t *testing.T) {
 	}
 
 	result, err = store.GetSpend(ctx, nonExistentSpend)
-	// Should handle non-existent spends gracefully
-	if err != nil {
-		t.Logf("GetSpend for non-existent UTXO returned error: %v", err)
-	} else {
-		assert.NotNil(t, result)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, int(utxo.Status_NOT_FOUND), result.Status)
 }
 
 func TestCreateCoinbaseAndFeeCalculation(t *testing.T) {

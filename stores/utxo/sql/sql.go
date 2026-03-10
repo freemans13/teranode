@@ -136,6 +136,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 }
 
 func (s *Store) SetBlockHeight(blockHeight uint32) error {
+	if blockHeight == 0 {
+		return errors.NewInvalidArgumentError("block height cannot be zero")
+	}
+
 	s.logger.Debugf("setting block height to %d", blockHeight)
 	s.blockHeight.Store(blockHeight)
 
@@ -832,6 +836,9 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		return nil, errors.NewProcessingError("No spends provided", nil)
 	}
 
+	// Track whether the spending tx already exists in the store (for "already blessed" recovery)
+	txAlreadyExists := false
+
 	txn, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -898,16 +905,27 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 
 			err = txn.QueryRowContext(ctx, q1, spend.TxID[:], spend.Vout).Scan(&transactionID, &coinbaseSpendingHeight, &utxoHash, &spendingDataBytes, &frozen, &conflicting, &locked, &spendableIn)
 			if err != nil {
-				errorFound = true
-
 				if errors.Is(err, sql.ErrNoRows) {
-					// with SKIP LOCKED, this could mean the row is locked by another transaction or it genuinely doesn't exist
-					if s.engine == "postgres" {
-						spend.Err = errors.NewStorageError("output %s:%d not found or locked by another transaction", spend.TxID, spend.Vout)
-					} else {
-						spend.Err = errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+					// Output not found - check if the spending tx itself already exists in the
+					// store (already blessed). This can happen when the parent tx has been pruned
+					// but the spending tx was already validated. Mirrors aerospike spend.go:343-361.
+					if txAlreadyExists {
+						// Already confirmed tx exists, skip lookup
+						continue
 					}
+
+					var spendingTxExists bool
+					_ = s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists)
+					if spendingTxExists {
+						s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
+						txAlreadyExists = true
+						continue
+					}
+
+					errorFound = true
+					spend.Err = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
 				} else {
+					errorFound = true
 					spend.Err = errors.NewStorageError("[Spend] failed: SELECT output FOR UPDATE %s:%d - %v", spend.TxID, spend.Vout, err)
 				}
 
@@ -968,7 +986,7 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 			// Check the utxo hash is correct
 			if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
 				errorFound = true
-				spend.Err = errors.NewStorageError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
+				spend.Err = errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 
 				continue
 			}
@@ -976,7 +994,7 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 			// If this utxo has a coinbase spending height, check it is time to spend it
 			if coinbaseSpendingHeight > 0 && coinbaseSpendingHeight > blockHeight {
 				errorFound = true
-				spend.Err = errors.NewStorageError("[Spend] coinbase utxo not ready to spend for %s:%d", spend.TxID, spend.Vout)
+				spend.Err = errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d", spend.TxID, spend.Vout, coinbaseSpendingHeight, blockHeight)
 
 				continue
 			}
@@ -1470,16 +1488,27 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 	var qBulkUpdate string
 	if minedBlockInfo.OnLongestChain {
 		if retention > 0 {
+			// Mirrors aerospike Lua setDeleteAtHeight logic:
+			// 1. If preserve_until is set -> don't touch DAH
+			// 2. If DAH already exists and is less than new value -> bump it forward
+			// 3. If DAH is NULL and all UTXOs are spent -> set DAH for the first time
+			// 4. Otherwise -> leave DAH unchanged
 			qBulkUpdate = `
-				UPDATE transactions
+				UPDATE transactions t
 				SET locked = false
 				   ,unmined_since = NULL
 				   ,delete_at_height = CASE
-				        WHEN preserve_until IS NOT NULL THEN delete_at_height
-				        WHEN delete_at_height IS NOT NULL AND delete_at_height < $2 THEN $2
-				        ELSE delete_at_height
+				        WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
+				        WHEN t.delete_at_height IS NOT NULL AND t.delete_at_height < $2 THEN $2
+				        WHEN t.delete_at_height IS NULL
+				             AND NOT EXISTS (
+				                 SELECT 1 FROM outputs o
+				                 WHERE o.transaction_id = t.id AND o.spending_data IS NULL
+				             )
+				             THEN $2
+				        ELSE t.delete_at_height
 				    END
-				WHERE hash = ANY($1::bytea[])
+				WHERE t.hash = ANY($1::bytea[])
 			`
 			if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes), newDAH); err != nil {
 				return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
@@ -1495,13 +1524,16 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 			}
 		}
 	} else {
-		// Not on longest chain: clear delete_at_height (mirrors aerospike clearing DAH when isOnLongestChain is false)
+		// Not on longest chain: clear delete_at_height AND set unmined_since to thisBlockHeight
+		// Mirrors aerospike Lua setMined which sets unminedSince when isOnLongestChain is false
+		// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
+		thisBlockHeight := s.blockHeight.Load() + 1
 		qBulkUpdate = `
 			UPDATE transactions
-			SET locked = false, delete_at_height = NULL
+			SET locked = false, delete_at_height = NULL, unmined_since = $2
 			WHERE hash = ANY($1::bytea[])
 		`
-		if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes)); err != nil {
+		if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes), thisBlockHeight); err != nil {
 			return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
 		}
 	}
@@ -1611,6 +1643,11 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 
 	var qLongestChain string
 	if retentionOrig > 0 {
+		// Mirrors aerospike Lua setDeleteAtHeight logic:
+		// 1. If preserve_until is set -> don't touch DAH
+		// 2. If DAH already exists and is less than new value -> bump it forward
+		// 3. If DAH is NULL and all UTXOs are spent -> set DAH for the first time
+		// 4. Otherwise -> leave DAH unchanged
 		qLongestChain = `
 			UPDATE transactions SET
 			 locked = false
@@ -1618,6 +1655,12 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 			,delete_at_height = CASE
 			    WHEN preserve_until IS NOT NULL THEN delete_at_height
 			    WHEN delete_at_height IS NOT NULL AND delete_at_height < $2 THEN $2
+			    WHEN delete_at_height IS NULL
+			         AND NOT EXISTS (
+			             SELECT 1 FROM outputs o
+			             WHERE o.transaction_id = transactions.id AND o.spending_data IS NULL
+			         )
+			         THEN $2
 			    ELSE delete_at_height
 			 END
 			WHERE hash = $1;
@@ -1631,11 +1674,15 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 		`
 	}
 
-	// Not on longest chain: clear delete_at_height (mirrors aerospike clearing DAH)
+	// Not on longest chain: clear delete_at_height AND set unmined_since to thisBlockHeight
+	// Mirrors aerospike Lua setMined which sets unminedSince when isOnLongestChain is false
+	// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
+	thisBlockHeight := s.blockHeight.Load() + 1
 	qNotOnLongestChain := `
 		UPDATE transactions SET
 		 locked = false
 		,delete_at_height = NULL
+		,unmined_since = $2
 		WHERE hash = $1;
 	`
 
@@ -1705,7 +1752,7 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 					}
 				}
 			} else {
-				if _, err = txn.ExecContext(ctx, qNotOnLongestChain, hash[:]); err != nil {
+				if _, err = txn.ExecContext(ctx, qNotOnLongestChain, hash[:], thisBlockHeight); err != nil {
 					return nil, errors.NewStorageError("SQL error calling update locked on tx %s:%v", hash.String(), err)
 				}
 			}
@@ -1753,7 +1800,10 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 	err := s.db.QueryRowContext(ctx, q, spend.TxID[:], spend.Vout).Scan(&utxoHash, &coinbaseSpendingHeight, &spendingDataBytes, &frozen, &spendableIn, &conflicting, &locked)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errors.NewNotFoundError("utxo not found for %s:%d", spend.TxID, spend.Vout)
+			// Match aerospike behavior: return NOT_FOUND status instead of error
+			return &utxo.SpendResponse{
+				Status: int(utxo.Status_NOT_FOUND),
+			}, nil
 		}
 
 		return nil, err
@@ -1761,7 +1811,7 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 
 	// check utxoHash is the same as expected
 	if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
-		return nil, errors.NewStorageError("utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
+		return nil, errors.NewUtxoHashMismatchError("utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 
 	var spendingData *spendpkg.SpendingData
@@ -2022,27 +2072,56 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 
 func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
 	// When locking (setValue=true), clear delete_at_height.
-	// Mirrors aerospike setLocked (line 1124-1127): locked tx should not be pruned.
-	var q string
+	// Mirrors aerospike setLocked: locked tx should not be pruned.
+	// When unlocking (setValue=false), recalculate DAH based on current state.
+	// Mirrors aerospike setLocked which restores DAH when conditions are met.
+
 	if setValue {
-		q = `
+		// Locking: simple update, clear DAH
+		q := `
 			UPDATE transactions
-			SET locked = $2, delete_at_height = NULL
+			SET locked = true, delete_at_height = NULL
 			WHERE hash = $1
 		`
-	} else {
-		q = `
-			UPDATE transactions
-			SET locked = $2
-			WHERE hash = $1
-		`
+		for _, txHash := range txHashes {
+			if _, err := s.db.ExecContext(ctx, q, txHash[:]); err != nil {
+				return errors.NewStorageError("failed to set locked flag for %s", txHash, err)
+			}
+		}
+		return nil
 	}
 
-	for _, conflictingTxHash := range txHashes {
-		_, err := s.db.ExecContext(ctx, q, conflictingTxHash[:], setValue)
+	// Unlocking: need a transaction to recalculate DAH via setDAH
+	txn, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = txn.Rollback()
+	}()
+
+	q := `
+		UPDATE transactions
+		SET locked = false
+		WHERE hash = $1
+		RETURNING id
+	`
+
+	for _, txHash := range txHashes {
+		var transactionID int
+		err := txn.QueryRowContext(ctx, q, txHash[:]).Scan(&transactionID)
 		if err != nil {
-			return errors.NewStorageError("failed to set locked flag for %s", conflictingTxHash, err)
+			return errors.NewStorageError("failed to clear locked flag for %s", txHash, err)
 		}
+
+		// Recalculate DAH now that the tx is unlocked
+		if err = s.setDAH(ctx, txn, transactionID); err != nil {
+			return err
+		}
+	}
+
+	if err = txn.Commit(); err != nil {
+		return errors.NewStorageError("failed to commit unlock transaction", err)
 	}
 
 	return nil
