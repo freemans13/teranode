@@ -1456,6 +1456,90 @@ func TestPreviousOutputsDecorateEdgeCases(t *testing.T) {
 	}
 }
 
+func TestBatchPreviousOutputsDecorate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, childTx := setup(ctx, t)
+
+	// Create a parent transaction that the child tx references
+	parentTx, err := bt.NewTxFromString("010000000000000000ef012935b177236ec1cb75cd9fba86d84acac9d76ced9c1b22ba8de4cd2de85a8393000000004948304502200f653627aff050093a83dabc12a2a9b627041d424f2eb18849a2d587f1acd38f022100a23f94acd94a4d24049140d5fbe12448a880fd8f8c1c2b4141f83bef2be409be01ffffffff00f2052a01000000434104ed83808a903a7e25be91349815f5d545f0c9dbec60b8ea914a6d6cbe9f830628039641231e2dbc1c0ca809f13405eb01f3a06614717f7859b788bd1305d9a3f2ac0100f2052a010000001976a91471d7dd96d9edda09180fe9d57a477b5acc9cad1188ac00000000")
+	require.NoError(t, err)
+
+	_, err = store.Create(ctx, parentTx, 0)
+	require.NoError(t, err)
+
+	t.Run("single tx batch", func(t *testing.T) {
+		// Reset input decoration
+		childTx.Inputs[0].PreviousTxScript = nil
+		childTx.Inputs[0].PreviousTxSatoshis = 0
+
+		err := store.BatchPreviousOutputsDecorate(ctx, []*bt.Tx{childTx})
+		require.NoError(t, err)
+
+		assert.NotNil(t, childTx.Inputs[0].PreviousTxScript, "Input should have previous tx script")
+		assert.Equal(t, uint64(5_000_000_000), childTx.Inputs[0].PreviousTxSatoshis)
+	})
+
+	t.Run("empty batch", func(t *testing.T) {
+		err := store.BatchPreviousOutputsDecorate(ctx, []*bt.Tx{})
+		require.NoError(t, err)
+
+		err = store.BatchPreviousOutputsDecorate(ctx, nil)
+		require.NoError(t, err)
+	})
+
+	t.Run("already decorated inputs are skipped", func(t *testing.T) {
+		// childTx was already decorated above, calling again should be a no-op
+		err := store.BatchPreviousOutputsDecorate(ctx, []*bt.Tx{childTx})
+		require.NoError(t, err)
+
+		assert.NotNil(t, childTx.Inputs[0].PreviousTxScript)
+		assert.Equal(t, uint64(5_000_000_000), childTx.Inputs[0].PreviousTxSatoshis)
+	})
+
+	t.Run("multiple txs referencing same parent", func(t *testing.T) {
+		// Create a second child that also references the same parent tx
+		childTx2, err := bt.NewTxFromString("010000000000000000ef01032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a18700000000" +
+			"8c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5" +
+			"ee1af1ebcc6028d9cdb1c3af7748014104f46db5e9d61a9dc27b8d64ad23e7383a4e6ca164593c2527c038c0857eb67ee8e825dca65046b82c933158" +
+			"6c82e0fd1f633f25f87c161bc6f8a630121df2b3d3ffffffff00f2052a010000001976a91471d7dd96d9edda09180fe9d57a477b5acc9cad1188ac02" +
+			"00e32321000000001976a914c398efa9c392ba6013c5e04ee729755ef7f58b3288ac000fe208010000001976a914948c765a6914d43f2a7ac177da2c" +
+			"2f6b52de3d7c88ac00000000")
+		require.NoError(t, err)
+
+		// Clear decoration
+		childTx.Inputs[0].PreviousTxScript = nil
+		childTx.Inputs[0].PreviousTxSatoshis = 0
+		childTx2.Inputs[0].PreviousTxScript = nil
+		childTx2.Inputs[0].PreviousTxSatoshis = 0
+
+		err = store.BatchPreviousOutputsDecorate(ctx, []*bt.Tx{childTx, childTx2})
+		require.NoError(t, err)
+
+		assert.NotNil(t, childTx.Inputs[0].PreviousTxScript)
+		assert.Equal(t, uint64(5_000_000_000), childTx.Inputs[0].PreviousTxSatoshis)
+		assert.NotNil(t, childTx2.Inputs[0].PreviousTxScript)
+		assert.Equal(t, uint64(5_000_000_000), childTx2.Inputs[0].PreviousTxSatoshis)
+	})
+
+	t.Run("missing parent returns error", func(t *testing.T) {
+		// Build a tx with an input that references a non-existent parent
+		fakeHash := chainhash.HashH([]byte("non-existent-parent-tx"))
+		missingParentTx := bt.NewTx()
+		input := &bt.Input{
+			PreviousTxOutIndex: 0,
+			SequenceNumber:     0xffffffff,
+		}
+		require.NoError(t, input.PreviousTxIDAdd(&fakeHash))
+		missingParentTx.Inputs = append(missingParentTx.Inputs, input)
+
+		err := store.BatchPreviousOutputsDecorate(ctx, []*bt.Tx{missingParentTx})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to decorate previous outputs")
+	})
+}
+
 func TestSpendAndUnspendEdgeCases(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

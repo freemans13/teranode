@@ -56,6 +56,7 @@ import (
 
 	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-subtree"
@@ -2146,6 +2147,135 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	// The caller (ExtendTransaction) will handle this by trying alternative methods
 	if len(missingInputs) > 0 {
 		return errors.NewProcessingError("failed to decorate previous outputs for tx %s", tx.TxIDChainHash())
+	}
+
+	return nil
+}
+
+// BatchPreviousOutputsDecorate fetches previous output information for inputs across
+// multiple transactions in a single bulk query. Instead of issuing one query per input,
+// it collects all unique parent tx hashes, queries them in chunks using IN clauses,
+// and maps results back to the requesting inputs.
+func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
+	if len(txs) == 0 {
+		return nil
+	}
+
+	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
+	defer cancelTimeout()
+
+	// Collect all (parentTxHash, outputIdx) pairs that need decoration
+	type inputRef struct {
+		txIdx    int
+		inputIdx int
+		outIdx   uint32
+	}
+	// Map from parent tx hash -> list of input references that need that parent's outputs
+	needsByParent := make(map[chainhash.Hash][]inputRef)
+
+	for txIdx, tx := range txs {
+		if tx == nil {
+			continue
+		}
+		for inputIdx, input := range tx.Inputs {
+			if input == nil || input.PreviousTxScript != nil {
+				continue // already decorated or nil
+			}
+			parentHash := *input.PreviousTxIDChainHash()
+			needsByParent[parentHash] = append(needsByParent[parentHash], inputRef{
+				txIdx:    txIdx,
+				inputIdx: inputIdx,
+				outIdx:   input.PreviousTxOutIndex,
+			})
+		}
+	}
+
+	if len(needsByParent) == 0 {
+		return nil
+	}
+
+	// Collect unique parent hashes into a slice for chunked querying
+	parentHashes := make([][]byte, 0, len(needsByParent))
+	for h := range needsByParent {
+		hCopy := h
+		parentHashes = append(parentHashes, hCopy[:])
+	}
+
+	// Query in chunks using IN clause
+	// Result key: (parentHash, outputIdx) -> (lockingScript, satoshis)
+	type outputInfo struct {
+		lockingScript []byte
+		satoshis      uint64
+	}
+	type outputKey struct {
+		hash chainhash.Hash
+		idx  uint32
+	}
+	results := make(map[outputKey]*outputInfo)
+
+	for chunkStart := 0; chunkStart < len(parentHashes); chunkStart += maxINClauseSize {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		chunkEnd := chunkStart + maxINClauseSize
+		if chunkEnd > len(parentHashes) {
+			chunkEnd = len(parentHashes)
+		}
+		chunk := parentHashes[chunkStart:chunkEnd]
+
+		inClause, args := buildINClause(chunk, 1)
+
+		q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
+			FROM outputs o
+			JOIN transactions t ON o.transaction_id = t.id
+			WHERE t.hash IN ` + inClause
+
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+
+		for rows.Next() {
+			var hashBytes []byte
+			var idx uint32
+			var lockingScript []byte
+			var satoshis uint64
+			if err := rows.Scan(&hashBytes, &idx, &lockingScript, &satoshis); err != nil {
+				rows.Close()
+				return err
+			}
+			var h chainhash.Hash
+			copy(h[:], hashBytes)
+			results[outputKey{hash: h, idx: idx}] = &outputInfo{
+				lockingScript: lockingScript,
+				satoshis:      satoshis,
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+
+	// Map results back to inputs
+	var missingInputs int
+	for parentHash, refs := range needsByParent {
+		for _, ref := range refs {
+			key := outputKey{hash: parentHash, idx: ref.outIdx}
+			if info, ok := results[key]; ok {
+				txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxScript = bscript.NewFromBytes(info.lockingScript)
+				txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxSatoshis = info.satoshis
+			} else {
+				missingInputs++
+			}
+		}
+	}
+
+	if missingInputs > 0 {
+		return errors.NewProcessingError("failed to decorate previous outputs: %d inputs could not be resolved", missingInputs)
 	}
 
 	return nil
