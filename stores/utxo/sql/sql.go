@@ -1033,11 +1033,10 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 	`
 
 	retention := s.settings.GetUtxoStoreBlockHeightRetention()
-	newDAH := int64(s.blockHeight.Load() + 1 + retention)
 
 	successItems := make([]*batchSpend, 0, len(batch))
 	validationErrors := make(map[int]error) // index -> validation error (non-retryable)
-	dahTxIDs := make(map[int]struct{})      // deduplicated transaction_ids needing DAH update
+	dahTxIDs := make(map[int]uint32)        // transaction_id -> max blockHeight for DAH calculation
 	aborted := false
 
 	// Phase 1: SELECT + validate + UPDATE outputs
@@ -1148,7 +1147,11 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 
 		successItems = append(successItems, item)
 		if retention > 0 {
-			dahTxIDs[transactionID] = struct{}{}
+			// Track the max blockHeight per parent transaction_id for DAH calculation.
+			// Matches Aerospike which uses the spend caller's blockHeight, not the global store height.
+			if existing, ok := dahTxIDs[transactionID]; !ok || item.blockHeight > existing {
+				dahTxIDs[transactionID] = item.blockHeight
+			}
 		}
 	}
 
@@ -1191,6 +1194,9 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 		`
 
 		for _, txID := range sortedIDs {
+			// Use the spend caller's blockHeight (not global store height) to match Aerospike behavior.
+			// Aerospike Lua: newDeleteHeight = currentBlockHeight + blockHeightRetention
+			newDAH := int64(dahTxIDs[txID]) + int64(retention)
 			if _, err = txn.ExecContext(s.ctx, qDAH, txID, newDAH); err != nil {
 				// DAH failure — roll back the entire batch
 				for i, item := range batch {
