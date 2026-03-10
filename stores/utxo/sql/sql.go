@@ -1035,9 +1035,10 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint3
 				continue
 			}
 
-			// Inline DAH update: single statement instead of setDAH()'s 2 queries.
-			// Only runs when retention is configured.
-			if retention > 0 {
+			// Skip DAH during block validation (IgnoreLocked=true) — SetMinedMulti
+			// handles DAH after all spends are done, so per-spend DAH is redundant
+			// and would cause excessive DB load for large blocks.
+			if retention > 0 && !useIgnoreLocked {
 				qDAH := `
 					UPDATE transactions
 					SET delete_at_height = CASE
