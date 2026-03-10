@@ -978,13 +978,32 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 // in a single DB transaction. Called by the go-batcher when the batch is full or
 // the timeout fires. Same SQL for both PostgreSQL and SQLite.
 // Mirrors aerospike/spend.go sendSpendBatchLua.
+//
+// On PostgreSQL deadlock (concurrent batches locking transaction rows in different
+// order during DAH update), the entire batch is retried up to 3 times.
 func (s *Store) sendSpendBatch(batch []*batchSpend) {
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		retryable := s.executeSendSpendBatch(batch, attempt)
+		if !retryable {
+			return
+		}
+		// Small backoff before retry: 1ms, 2ms, 4ms
+		time.Sleep(time.Millisecond << uint(attempt))
+	}
+}
+
+// executeSendSpendBatch runs one attempt of the spend batch in a single DB transaction.
+// Returns true if the batch should be retried (deadlock detected), false otherwise
+// (success, validation errors, or non-retryable DB errors).
+func (s *Store) executeSendSpendBatch(batch []*batchSpend, attempt int) (retryable bool) {
 	txn, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
 		for _, item := range batch {
 			item.errCh <- errors.NewStorageError("[Spend] failed to begin transaction", err)
 		}
-		return
+		return false
 	}
 	defer func() {
 		_ = txn.Rollback()
@@ -1019,12 +1038,13 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 	newDAH := int64(s.blockHeight.Load() + 1 + retention)
 
 	successItems := make([]*batchSpend, 0, len(batch))
+	validationErrors := make(map[int]error) // index -> validation error (non-retryable)
 	aborted := false
+	deadlockDetected := false
 
-	for _, item := range batch {
+	for i, item := range batch {
 		if aborted {
-			item.errCh <- errors.NewStorageError("[Spend] batch aborted due to previous DB error")
-			continue
+			break // don't send errors yet — may retry
 		}
 
 		spend := item.spend
@@ -1046,32 +1066,34 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				item.errCh <- errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
-			} else {
-				item.errCh <- errors.NewStorageError("[Spend] failed: SELECT output %s:%d - %v", spend.TxID, spend.Vout, err)
-				aborted = true // real DB error — PostgreSQL transaction is now in error state
+				validationErrors[i] = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+				continue
 			}
-			continue
+			if isLockError(err) {
+				deadlockDetected = true
+			}
+			aborted = true
+			break
 		}
 
 		// Validate the UTXO state — same checks as before
 		if frozen {
-			item.errCh <- errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
+			validationErrors[i] = errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
 			continue
 		}
 
 		if conflicting && !item.ignoreConflicting {
-			item.errCh <- errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
+			validationErrors[i] = errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
 			continue
 		}
 
 		if locked && !item.ignoreLocked {
-			item.errCh <- errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
+			validationErrors[i] = errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
 			continue
 		}
 
 		if spendableIn != nil && *spendableIn > 0 && item.blockHeight < *spendableIn {
-			item.errCh <- errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
+			validationErrors[i] = errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
 			continue
 		}
 
@@ -1082,39 +1104,40 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 				// the caller can extract ConflictingTxID via errors.AsData
 				existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
 				if parseErr != nil {
-					item.errCh <- errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+					validationErrors[i] = errors.NewProcessingError("failed to create spending data from bytes", parseErr)
 					continue
 				}
-				item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
+				validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
 				continue
 			}
 		}
 
 		// Check UTXO hash matches
 		if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
-			item.errCh <- errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
+			validationErrors[i] = errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 			continue
 		}
 
 		// Check coinbase maturity
 		if coinbaseSpendingHeight > 0 && coinbaseSpendingHeight > item.blockHeight {
-			item.errCh <- errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d", spend.TxID, spend.Vout, coinbaseSpendingHeight, item.blockHeight)
+			validationErrors[i] = errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d", spend.TxID, spend.Vout, coinbaseSpendingHeight, item.blockHeight)
 			continue
 		}
 
 		// UPDATE with optimistic locking
 		result, err := txn.ExecContext(s.ctx, q2, spend.SpendingData.Bytes(), transactionID, spend.Vout)
 		if err != nil {
-			item.errCh <- errors.NewStorageError("[Spend] failed: UPDATE outputs: error spending utxo for %s:%d", spend.TxID, spend.Vout, err)
+			if isLockError(err) {
+				deadlockDetected = true
+			}
 			aborted = true
-			continue
+			break
 		}
 
 		affected, err := result.RowsAffected()
 		if err != nil {
-			item.errCh <- errors.NewStorageError("[Spend] failed getting affected rows: utxo not spent for %s:%d", spend.TxID, spend.Vout, err)
 			aborted = true
-			continue
+			break
 		}
 
 		if affected == 0 {
@@ -1124,7 +1147,7 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 				continue
 			}
 			// Concurrently spent by a different tx
-			item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
+			validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
 			continue
 		}
 
@@ -1145,34 +1168,64 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 				WHERE id = $1
 			`
 			if _, err = txn.ExecContext(s.ctx, qDAH, transactionID, newDAH); err != nil {
-				item.errCh <- errors.NewStorageError("[Spend] failed: DAH update for %s:%d", spend.TxID, spend.Vout, err)
+				if isLockError(err) {
+					deadlockDetected = true
+				}
 				aborted = true
-				continue
+				break
 			}
 		}
 
 		successItems = append(successItems, item)
 	}
 
-	// If the batch was aborted by a DB error, roll back all successful items
-	if aborted {
-		for _, item := range successItems {
-			item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DB error")
+	// If deadlock detected, retry the whole batch (don't send any errors to channels)
+	if deadlockDetected {
+		if attempt < 2 { // will retry
+			s.logger.Warnf("[sendSpendBatch] deadlock detected on attempt %d, retrying batch of %d items", attempt+1, len(batch))
+			return true
 		}
-		return
+		// Final attempt failed — fall through to send errors
+		s.logger.Errorf("[sendSpendBatch] deadlock detected on final attempt %d, failing batch of %d items", attempt+1, len(batch))
+	}
+
+	// If aborted by a non-retryable DB error (or final deadlock attempt), send errors
+	if aborted {
+		for i, item := range batch {
+			if valErr, ok := validationErrors[i]; ok {
+				item.errCh <- valErr
+			} else {
+				item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DB error")
+			}
+		}
+		return false
 	}
 
 	// Commit the transaction — signal success only after commit succeeds
 	if err := txn.Commit(); err != nil {
-		for _, item := range successItems {
-			item.errCh <- errors.NewStorageError("[Spend] failed to commit transaction", err)
+		if isLockError(err) && attempt < 2 {
+			s.logger.Warnf("[sendSpendBatch] deadlock detected during commit on attempt %d, retrying batch of %d items", attempt+1, len(batch))
+			return true
 		}
-		return
+		for i, item := range batch {
+			if valErr, ok := validationErrors[i]; ok {
+				item.errCh <- valErr
+			} else {
+				item.errCh <- errors.NewStorageError("[Spend] failed to commit transaction", err)
+			}
+		}
+		return false
 	}
 
-	for _, item := range successItems {
-		item.errCh <- nil
+	// Send validation errors and success signals
+	for i, item := range batch {
+		if valErr, ok := validationErrors[i]; ok {
+			item.errCh <- valErr
+		} else {
+			item.errCh <- nil
+		}
 	}
+	return false
 }
 
 func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) error {
