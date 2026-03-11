@@ -726,6 +726,9 @@ func PublicError(err error) *Error {
 }
 
 // WrapGRPCPublic wraps an error for gRPC without exposing internal details.
+// It includes a sanitized TError detail (code + message only) so that UnwrapGRPC
+// can reconstruct the correct application error code on the client side.
+// No file paths, line numbers, function names, wrapped error chains, or error data are included.
 func WrapGRPCPublic(err error) error {
 	if err == nil {
 		return nil
@@ -737,6 +740,16 @@ func WrapGRPCPublic(err error) error {
 	}
 
 	st := status.New(ErrorCodeToGRPCCode(publicErr.code), publicErr.message)
+
+	// Attach a sanitized TError detail so clients can recover the application error code
+	detail, pbErr := anypb.New(&TError{
+		Code:    publicErr.code,
+		Message: publicErr.message,
+	})
+	if pbErr == nil {
+		st, _ = st.WithDetails(detail)
+	}
+
 	return st.Err()
 }
 
