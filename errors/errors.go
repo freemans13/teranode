@@ -739,14 +739,17 @@ func WrapGRPCPublic(err error) error {
 		return nil
 	}
 
-	st := status.New(ErrorCodeToGRPCCode(publicErr.code), publicErr.message)
+	// Sanitize message for valid UTF-8 to prevent gRPC/protobuf marshaling failures
+	sanitizedMsg := RemoveInvalidUTF8(publicErr.message)
+
+	st := status.New(ErrorCodeToGRPCCode(publicErr.code), sanitizedMsg)
 
 	// Attach a sanitized TError detail so clients can recover the application error code.
-	// This cannot practically fail since TError is a simple proto message, but if it does,
-	// we fall through and return the bare status (same as pre-fix behavior).
+	// After UTF-8 sanitization this cannot practically fail, but if it does we fall
+	// through and return the bare status (same as pre-fix behavior).
 	detail, pbErr := anypb.New(&TError{
 		Code:    publicErr.code,
-		Message: publicErr.message,
+		Message: sanitizedMsg,
 	})
 	if pbErr == nil {
 		if newSt, detailsErr := st.WithDetails(detail); detailsErr == nil {
