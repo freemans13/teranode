@@ -2238,6 +2238,7 @@ func TestWrapGRPCPublic(t *testing.T) {
 
 		// Verify the detail contains only code and message, no internal info
 		unwrapped := UnwrapGRPC(result)
+		require.NotNil(t, unwrapped)
 		require.Equal(t, ERR_SERVICE_ERROR, unwrapped.code)
 		require.Equal(t, "service unavailable", unwrapped.message)
 		require.Empty(t, unwrapped.file)

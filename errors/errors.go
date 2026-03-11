@@ -725,10 +725,11 @@ func PublicError(err error) *Error {
 	}
 }
 
-// WrapGRPCPublic wraps an error for gRPC without exposing internal details.
+// WrapGRPCPublic wraps an error for gRPC without exposing internal structured details.
 // It includes a sanitized TError detail (code + message only) so that UnwrapGRPC
 // can reconstruct the correct application error code on the client side.
-// No file paths, line numbers, function names, wrapped error chains, or error data are included.
+// Structured metadata such as file paths, line numbers, function names, wrapped error
+// chains, and error data is omitted; the error message itself is preserved (UTF-8 sanitized).
 func WrapGRPCPublic(err error) error {
 	if err == nil {
 		return nil
