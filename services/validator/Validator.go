@@ -310,40 +310,9 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 	ctxLogger := v.logger.WithTraceContext(ctx)
 	ctxLogger.Debugf("[ValidateWithOptions] Validate tx %s", tx.TxID())
 
-	// Retry logic for TX_LOCKED errors with exponential backoff
-	// TX_LOCKED occurs when multiple transactions try to spend the same UTXO concurrently
-	// This should resolve quickly once the first transaction completes, so we use short backoff times
-	const maxRetries = 3
-	const baseBackoff = 10 * time.Millisecond
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		txMetaData, err = v.validateInternal(ctx, tx, blockHeight, validationOptions)
-
-		// If no error or not a TX_LOCKED error, return immediately (don't retry)
-		if err == nil || !errors.Is(err, errors.ErrTxLocked) {
-			break
-		}
-
-		// TX_LOCKED error - retry with exponential backoff if not last attempt
-		if attempt < maxRetries-1 {
-			// Exponential backoff: 10ms, 20ms, 40ms
-			backoff := time.Duration(1<<attempt) * baseBackoff
-			if attempt < 2 {
-				ctxLogger.Debugf("[ValidateWithOptions] TX_LOCKED for tx %s, retrying in %v (attempt %d/%d): %v", tx.TxID(), backoff, attempt+1, maxRetries, err)
-			} else {
-				ctxLogger.Warnf("[ValidateWithOptions] TX_LOCKED for tx %s, retrying in %v (attempt %d/%d): %v", tx.TxID(), backoff, attempt+1, maxRetries, err)
-			}
-
-			select {
-			case <-ctx.Done():
-				return txMetaData, ctx.Err()
-			case <-time.After(backoff):
-				// Continue to next attempt
-			}
-		} else {
-			ctxLogger.Warnf("[ValidateWithOptions] TX_LOCKED for tx %s after %d attempts, giving up: %v", tx.TxID(), maxRetries, err)
-		}
-	}
+	// No retry for TX_LOCKED: the caller (tx-blaster) handles locked transactions
+	// by parking them in a locked queue and retrying after a new block is mined.
+	txMetaData, err = v.validateInternal(ctx, tx, blockHeight, validationOptions)
 
 	if err != nil {
 		if v.rejectedTxKafkaProducerClient != nil { // tests may not set this
@@ -686,9 +655,12 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	}
 
 	// send the txMetaData over to the subtree validation kafka topic
+	// If this fails, log the error but continue to the two-phase commit so the tx
+	// doesn't remain locked. A missing txmeta message is recoverable; a stuck lock is not.
+	var kafkaErr error
 	if v.txmetaKafkaProducerClient != nil {
-		if err = v.sendTxMetaToKafka(txMetaData, tx.TxIDChainHash()); err != nil {
-			return nil, err
+		if kafkaErr = v.sendTxMetaToKafka(txMetaData, tx.TxIDChainHash()); kafkaErr != nil {
+			v.logger.Errorf("[Validate][%s] failed to send txmeta to kafka, continuing to 2PC: %v", txID, kafkaErr)
 		}
 	}
 
@@ -700,6 +672,11 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		}
 
 		txMetaData.Locked = false
+	}
+
+	// If kafka publish failed, return the error after the 2PC has been completed
+	if kafkaErr != nil {
+		return txMetaData, kafkaErr
 	}
 
 	return txMetaData, nil
