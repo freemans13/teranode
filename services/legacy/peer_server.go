@@ -922,6 +922,15 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte) {
 		return
 	}
 
+	// If the block exists, check if it was marked invalid — invalid blocks
+	// should be reprocessed rather than silently dropped
+	if exists {
+		_, meta, headerErr := sp.server.blockchainClient.GetBlockHeader(sp.ctx, block.Hash())
+		if headerErr == nil && meta.Invalid {
+			exists = false
+		}
+	}
+
 	if !exists {
 		// Queue the block up to be handled by the block
 		// manager and intentionally block further receives
