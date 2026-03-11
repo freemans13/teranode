@@ -320,6 +320,11 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 		ctxLogger.Errorf("[ValidateWithOptions] invalid TxLockedMaxRetries (%d); clamping to 0", maxRetries)
 		maxRetries = 0
 	}
+	const maxSafeRetries = 20 // cap to prevent bit-shift overflow in backoff calculation (2^20 * 10ms ≈ 10s)
+	if maxRetries > maxSafeRetries {
+		ctxLogger.Warnf("[ValidateWithOptions] TxLockedMaxRetries (%d) exceeds safe limit; clamping to %d", maxRetries, maxSafeRetries)
+		maxRetries = maxSafeRetries
+	}
 	const baseBackoff = 10 * time.Millisecond
 
 	// Loop runs maxRetries+1 times: 1 initial attempt + maxRetries retries.
