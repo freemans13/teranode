@@ -741,13 +741,17 @@ func WrapGRPCPublic(err error) error {
 
 	st := status.New(ErrorCodeToGRPCCode(publicErr.code), publicErr.message)
 
-	// Attach a sanitized TError detail so clients can recover the application error code
+	// Attach a sanitized TError detail so clients can recover the application error code.
+	// This cannot practically fail since TError is a simple proto message, but if it does,
+	// we fall through and return the bare status (same as pre-fix behavior).
 	detail, pbErr := anypb.New(&TError{
 		Code:    publicErr.code,
 		Message: publicErr.message,
 	})
 	if pbErr == nil {
-		st, _ = st.WithDetails(detail)
+		if newSt, detailsErr := st.WithDetails(detail); detailsErr == nil {
+			st = newSt
+		}
 	}
 
 	return st.Err()

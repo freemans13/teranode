@@ -2330,13 +2330,17 @@ func TestWrapGRPCPublic(t *testing.T) {
 				grpcErr := WrapGRPCPublic(tc.err)
 				require.NotNil(t, grpcErr)
 
-				// Simulate client-side: unwrap with UnwrapGRPC
+				// Simulate client-side: the package-level Is() handles gRPC-wrapped errors
+				// by calling UnwrapGRPC internally before comparing error codes
+				require.True(t, Is(grpcErr, tc.sentinel),
+					"Is(grpcErr, sentinel) should match %s after WrapGRPCPublic, got %v",
+					tc.sentinel.code.String(), grpcErr)
+
+				// Also verify direct UnwrapGRPC + Is works (what propagation.Client does)
 				unwrapped := UnwrapGRPC(grpcErr)
 				require.NotNil(t, unwrapped)
-
-				// The client should be able to detect the error type via errors.Is
-				require.True(t, unwrapped.Is(tc.sentinel),
-					"errors.Is should match %s after WrapGRPCPublic round-trip, got code %s",
+				require.True(t, Is(unwrapped, tc.sentinel),
+					"Is(unwrapped, sentinel) should match %s after UnwrapGRPC, got code %s",
 					tc.sentinel.code.String(), unwrapped.code.String())
 			})
 		}
