@@ -654,15 +654,15 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		}
 	}
 
-	// send the txMetaData over to the subtree validation kafka topic
-	// If this fails, log the error but continue to the two-phase commit so the tx
-	// doesn't remain locked. A missing txmeta message is recoverable; a stuck lock is not.
-	// We intentionally do NOT return the kafka error to the caller: the tx has been
-	// validated, spent, and created in the UTXO store — returning an error would cause
-	// callers to treat an accepted tx as failed and trigger duplicate retries.
+	// Serialize and enqueue txmeta for the subtree validation kafka topic.
+	// If this fails (e.g. serialization error), log but continue to the two-phase commit
+	// so the tx doesn't remain locked. A missing txmeta message is recoverable; a stuck
+	// lock is not. We intentionally do NOT return this error to the caller: the tx has
+	// been validated, spent, and created in the UTXO store — returning an error would
+	// cause callers to treat an accepted tx as failed and trigger duplicate retries.
 	if v.txmetaKafkaProducerClient != nil {
-		if kafkaErr := v.sendTxMetaToKafka(txMetaData, tx.TxIDChainHash()); kafkaErr != nil {
-			v.logger.Errorf("[Validate][%s] failed to send txmeta to kafka, continuing to 2PC: %v", txID, kafkaErr)
+		if txMetaErr := v.sendTxMetaToKafka(txMetaData, tx.TxIDChainHash()); txMetaErr != nil {
+			v.logger.Errorf("[Validate][%s] failed to serialize/enqueue txmeta for kafka, continuing to 2PC: %v", txID, txMetaErr)
 		}
 	}
 
