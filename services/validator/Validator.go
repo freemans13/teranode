@@ -316,8 +316,14 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 	// condition that resolves once the parent's lock clears. Set maxRetries to 0 to
 	// disable and return TX_LOCKED immediately to the caller.
 	maxRetries := v.settings.Validator.TxLockedMaxRetries
+	if maxRetries < 0 {
+		ctxLogger.Errorf("[ValidateWithOptions] invalid TxLockedMaxRetries (%d); clamping to 0", maxRetries)
+		maxRetries = 0
+	}
 	const baseBackoff = 10 * time.Millisecond
 
+	// Loop runs maxRetries+1 times: 1 initial attempt + maxRetries retries.
+	// e.g. maxRetries=3 → attempts 0,1,2,3 → 1 initial + 3 retries with 10/20/40ms backoff.
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		txMetaData, err = v.validateInternal(ctx, tx, blockHeight, validationOptions)
 
@@ -328,13 +334,13 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 
 		// TX_LOCKED error on the last attempt — give up
 		if attempt >= maxRetries {
-			ctxLogger.Warnf("[ValidateWithOptions] TX_LOCKED for tx %s after %d attempts, giving up: %v", tx.TxID(), attempt+1, err)
+			ctxLogger.Warnf("[ValidateWithOptions] TX_LOCKED for tx %s after %d retries, giving up: %v", tx.TxID(), attempt, err)
 			break
 		}
 
 		// Exponential backoff: 10ms, 20ms, 40ms, ...
-		backoff := time.Duration(1<<attempt) * baseBackoff
-		ctxLogger.Debugf("[ValidateWithOptions] TX_LOCKED for tx %s, retrying in %v (attempt %d/%d): %v", tx.TxID(), backoff, attempt+1, maxRetries, err)
+		backoff := time.Duration(1<<uint(attempt)) * baseBackoff
+		ctxLogger.Debugf("[ValidateWithOptions] TX_LOCKED for tx %s, retrying in %v (retry %d/%d): %v", tx.TxID(), backoff, attempt+1, maxRetries, err)
 
 		select {
 		case <-ctx.Done():
