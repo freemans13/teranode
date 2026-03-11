@@ -1654,7 +1654,19 @@ func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 	switch invVect.Type {
 	case wire.InvTypeBlock:
 		// check whether this block exists in the blockchain service
-		return sm.blockchainClient.GetBlockExists(sm.ctx, &invVect.Hash)
+		exists, err := sm.blockchainClient.GetBlockExists(sm.ctx, &invVect.Hash)
+		if err != nil || !exists {
+			return false, err
+		}
+
+		// block exists, but check if it was marked invalid — invalid blocks
+		// should be re-requested so they can be reprocessed
+		_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &invVect.Hash)
+		if err != nil {
+			return false, nil
+		}
+
+		return !meta.Invalid, nil
 
 	case wire.InvTypeTx:
 		// check whether this transaction exists in the utxo store
