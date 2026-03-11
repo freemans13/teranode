@@ -1295,16 +1295,18 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	})
 
 	t.Run("test parent is not in a previous block", func(t *testing.T) {
-		// swap parent/tx hashes to simulate a missing parent
+		// swap parent/tx hashes to simulate a parent whose block ID is within the
+		// numeric range of cached IDs but not actually in the set. This now defers
+		// to the validator's checkOldBlockIDs (which has a larger lookup) instead
+		// of erroring, because block IDs can have gaps due to orphan/invalid blocks.
 		parentTxStruct := missingParentTx{
 			parentTxHash: *tx.TxIDChainHash(),
 			txHash:       *txParent.TxIDChainHash(),
 		}
 
 		oldBlockIDs, err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
-		require.Error(t, err)
-		require.True(t, len(oldBlockIDs) == 0)
-		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+		require.NoError(t, err)
+		require.True(t, len(oldBlockIDs) > 0, "should defer to checkOldBlockIDs")
 	})
 
 	t.Run("test parent has no block ID", func(t *testing.T) {
