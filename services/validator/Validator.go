@@ -310,9 +310,38 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 	ctxLogger := v.logger.WithTraceContext(ctx)
 	ctxLogger.Debugf("[ValidateWithOptions] Validate tx %s", tx.TxID())
 
-	// No retry for TX_LOCKED here: callers are responsible for handling locked
-	// transactions, for example by queuing them and retrying after a new block is mined.
-	txMetaData, err = v.validateInternal(ctx, tx, blockHeight, validationOptions)
+	// Configurable retry for TX_LOCKED errors with exponential backoff.
+	// TX_LOCKED occurs when a parent and child tx arrive nearly simultaneously and the
+	// parent hasn't finished its 2-phase commit (unlock). This is a short-lived race
+	// condition that resolves once the parent's lock clears. Set maxRetries to 0 to
+	// disable and return TX_LOCKED immediately to the caller.
+	maxRetries := v.settings.Validator.TxLockedMaxRetries
+	const baseBackoff = 10 * time.Millisecond
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		txMetaData, err = v.validateInternal(ctx, tx, blockHeight, validationOptions)
+
+		// If no error or not a TX_LOCKED error, break immediately (don't retry)
+		if err == nil || !errors.Is(err, errors.ErrTxLocked) {
+			break
+		}
+
+		// TX_LOCKED error on the last attempt — give up
+		if attempt >= maxRetries {
+			ctxLogger.Warnf("[ValidateWithOptions] TX_LOCKED for tx %s after %d attempts, giving up: %v", tx.TxID(), attempt+1, err)
+			break
+		}
+
+		// Exponential backoff: 10ms, 20ms, 40ms, ...
+		backoff := time.Duration(1<<attempt) * baseBackoff
+		ctxLogger.Debugf("[ValidateWithOptions] TX_LOCKED for tx %s, retrying in %v (attempt %d/%d): %v", tx.TxID(), backoff, attempt+1, maxRetries, err)
+
+		select {
+		case <-ctx.Done():
+			return txMetaData, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
 
 	if err != nil {
 		if v.rejectedTxKafkaProducerClient != nil { // tests may not set this
