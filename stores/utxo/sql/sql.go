@@ -980,6 +980,16 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 	return false
 }
 
+// isDeadlock checks if a database error is a PostgreSQL deadlock (SQLSTATE 40P01)
+// or a SQLite BUSY error that should be retried.
+func isDeadlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "deadlock detected") || strings.Contains(msg, "database is locked")
+}
+
 // sendSpendBatch is the batcher callback that processes a batch of spend operations
 // in a single DB transaction. Called by the go-batcher when the batch is full or
 // the timeout fires. Same SQL for both PostgreSQL and SQLite.
@@ -996,12 +1006,32 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 // Aerospike doesn't need this because it uses optimistic single-key operations
 // without DB-level row locking.
 func (s *Store) sendSpendBatch(batch []*batchSpend) {
+	const maxRetries = 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		retryable := s.trySendSpendBatch(batch)
+		if !retryable {
+			return
+		}
+		s.logger.Warnf("[Spend] deadlock detected (attempt %d/%d), retrying batch of %d items", attempt+1, maxRetries, len(batch))
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	}
+	// Exhausted retries — send error to all items
+	for _, item := range batch {
+		item.errCh <- errors.NewStorageError("[Spend] deadlock persisted after %d retries", maxRetries)
+	}
+}
+
+// trySendSpendBatch attempts to process a spend batch in a single DB transaction.
+// Returns true if the error was a retryable deadlock and the batch should be retried.
+// Returns false if the batch completed (success or non-retryable error) and results
+// have been sent to all item errCh channels.
+func (s *Store) trySendSpendBatch(batch []*batchSpend) (retryable bool) {
 	txn, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
 		for _, item := range batch {
 			item.errCh <- errors.NewStorageError("[Spend] failed to begin transaction", err)
 		}
-		return
+		return false
 	}
 	defer func() {
 		_ = txn.Rollback()
@@ -1068,6 +1098,9 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 				validationErrors[i] = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
 				continue
 			}
+			if isDeadlock(err) {
+				return true // retryable
+			}
 			item.errCh <- errors.NewStorageError("[Spend] failed: SELECT output %s:%d - %v", spend.TxID, spend.Vout, err)
 			aborted = true
 			continue
@@ -1122,6 +1155,9 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 		// UPDATE outputs with optimistic locking
 		result, err := txn.ExecContext(s.ctx, q2, spend.SpendingData.Bytes(), transactionID, spend.Vout)
 		if err != nil {
+			if isDeadlock(err) {
+				return true // retryable
+			}
 			item.errCh <- errors.NewStorageError("[Spend] failed: UPDATE outputs for %s:%d", spend.TxID, spend.Vout, err)
 			aborted = true
 			continue
@@ -1167,7 +1203,7 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 		for _, item := range successItems {
 			item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DB error")
 		}
-		return
+		return false
 	}
 
 	// Phase 2: DAH updates — sorted by transaction_id for consistent lock ordering
@@ -1198,6 +1234,9 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 			// Aerospike Lua: newDeleteHeight = currentBlockHeight + blockHeightRetention
 			newDAH := int64(dahTxIDs[txID]) + int64(retention)
 			if _, err = txn.ExecContext(s.ctx, qDAH, txID, newDAH); err != nil {
+				if isDeadlock(err) {
+					return true // retryable
+				}
 				// DAH failure — roll back the entire batch
 				for i, item := range batch {
 					if valErr, ok := validationErrors[i]; ok {
@@ -1207,13 +1246,16 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 				for _, item := range successItems {
 					item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DAH update error", err)
 				}
-				return
+				return false
 			}
 		}
 	}
 
 	// Commit
 	if err := txn.Commit(); err != nil {
+		if isDeadlock(err) {
+			return true // retryable
+		}
 		for i, item := range batch {
 			if valErr, ok := validationErrors[i]; ok {
 				item.errCh <- valErr
@@ -1222,7 +1264,7 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 		for _, item := range successItems {
 			item.errCh <- errors.NewStorageError("[Spend] failed to commit transaction", err)
 		}
-		return
+		return false
 	}
 
 	// Signal results: validation errors and successes
@@ -1234,6 +1276,7 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 	for _, item := range successItems {
 		item.errCh <- nil
 	}
+	return false
 }
 
 func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) error {
