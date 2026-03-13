@@ -492,6 +492,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DistributorFailureTolerance: getInt("distributor_failure_tolerance", 0, alternativeContext...),
 			DistributorTimeout:          getDuration("distributor_timeout", 30*time.Second, alternativeContext...),
 		},
+		GCTuning: GCTuningSettings{
+			Enabled:  getBool("gc_tuning_enabled", true, alternativeContext...),
+			Ratio:    getFloat64("gc_tuning_ratio", 0.9, alternativeContext...),
+			GCTarget: getInt("gc_tuning_gogc", 100, alternativeContext...),
+		},
 		Pruner: PrunerSettings{
 			GRPCAddress:                    getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
 			GRPCListenAddress:              getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
