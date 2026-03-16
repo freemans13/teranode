@@ -68,12 +68,13 @@ func configureGOMEMLIMIT(ratio float64) {
 		return
 	}
 
-	memlimit := int64(float64(limit) * ratio)
-	if memlimit <= 0 || memlimit > math.MaxInt64 {
-		fmt.Printf("GC tuning: computed GOMEMLIMIT %d is out of range, skipping\n", memlimit)
+	memlimitFloat := float64(limit) * ratio
+	if memlimitFloat <= 0 || memlimitFloat > float64(math.MaxInt64) {
+		fmt.Printf("GC tuning: computed GOMEMLIMIT %.0f is out of range, skipping\n", memlimitFloat)
 		return
 	}
 
+	memlimit := int64(memlimitFloat)
 	prev := debug.SetMemoryLimit(memlimit)
 	fmt.Printf("GC tuning: GOMEMLIMIT set to %s (%.0f%% of %s cgroup limit, was %s)\n",
 		formatBytes(memlimit), ratio*100, formatBytes(int64(limit)), formatBytes(prev))
