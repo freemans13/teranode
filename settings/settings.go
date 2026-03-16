@@ -249,7 +249,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ProcessRemainderTxHashesConcurrency:  getInt("blockassembly_processRemainderTxHashesConcurrency", 375, alternativeContext...),
 			SendBatchSize:                        getInt("blockassembly_sendBatchSize", 100, alternativeContext...),
 			SendBatchTimeout:                     getInt("blockassembly_sendBatchTimeout", 2, alternativeContext...),
-			SendBatchMaxConcurrent:               getInt("blockassembly_sendBatchMaxConcurrent", 3, alternativeContext...),
+			SendBatchMaxConcurrent:               getInt("blockassembly_sendBatchMaxConcurrent", 0, alternativeContext...),
 			SubtreeProcessorBatcherSize:          getInt("blockassembly_subtreeProcessorBatcherSize", 1000, alternativeContext...),
 			SubtreeProcessorConcurrentReads:      getInt("blockassembly_subtreeProcessorConcurrentReads", 375, alternativeContext...),
 			NewSubtreeChanBuffer:                 getInt("blockassembly_newSubtreeChanBuffer", 1_000, alternativeContext...),
@@ -577,7 +577,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GRPCAddresses:         getMultiString("propagation_grpcAddresses", "|", []string{}, alternativeContext...),
 			GRPCListenAddress:     getString("propagation_grpcListenAddress", "", alternativeContext...),
 			HTTPBodyLimit:         getString("propagation_httpBodyLimit", "100MB", alternativeContext...),
-			BatchConcurrencyLimit: getInt("propagation_batchConcurrencyLimit", 256, alternativeContext...),
+			BatchConcurrencyLimit: getInt("propagation_batchConcurrencyLimit", 0, alternativeContext...),
 		},
 		RPC: RPCSettings{
 			RPCUser:           getString("rpc_user", "", alternativeContext...),
