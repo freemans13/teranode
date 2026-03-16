@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	prometheusgolang "github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sercand/kuberesolver/v6"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -84,7 +85,7 @@ type ConnectionOptions struct {
 // grpcClientRetriesTotal tracks gRPC client retry attempts by caller service and status code.
 // This counter increments each time a gRPC call is retried (not on the initial attempt),
 // providing visibility into retry pressure across service-to-service communication.
-var grpcClientRetriesTotal = prometheusgolang.NewCounterVec(
+var grpcClientRetriesTotal = promauto.NewCounterVec(
 	prometheusgolang.CounterOpts{
 		Namespace: "teranode",
 		Name:      "grpc_client_retries_total",
