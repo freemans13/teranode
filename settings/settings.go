@@ -578,6 +578,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GRPCListenAddress:     getString("propagation_grpcListenAddress", "", alternativeContext...),
 			HTTPBodyLimit:         getString("propagation_httpBodyLimit", "100MB", alternativeContext...),
 			BatchConcurrencyLimit: getInt("propagation_batchConcurrencyLimit", 0, alternativeContext...),
+			BatchHandlerLimit:     getInt("propagation_batchHandlerLimit", 0, alternativeContext...),
 		},
 		RPC: RPCSettings{
 			RPCUser:           getString("rpc_user", "", alternativeContext...),

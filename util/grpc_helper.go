@@ -84,6 +84,7 @@ type ConnectionOptions struct {
 // grpcClientRetriesTotal tracks gRPC client retry attempts by caller service and status code.
 // This counter increments each time a gRPC call is retried (not on the initial attempt),
 // providing visibility into retry pressure across service-to-service communication.
+// Initialized in init() so it is available before any gRPC clients are created.
 var grpcClientRetriesTotal *prometheusgolang.CounterVec
 
 // ---------------------------------------------------------------------
@@ -91,6 +92,16 @@ var grpcClientRetriesTotal *prometheusgolang.CounterVec
 func init() {
 	// The secret sauce
 	resolver.SetDefaultScheme("dns")
+
+	grpcClientRetriesTotal = prometheusgolang.NewCounterVec(
+		prometheusgolang.CounterOpts{
+			Namespace: "teranode",
+			Name:      "grpc_client_retries_total",
+			Help:      "Total number of gRPC client retry attempts by caller service and status code",
+		},
+		[]string{"grpc_caller", "grpc_code"},
+	)
+	prometheusgolang.MustRegister(grpcClientRetriesTotal)
 }
 
 // GetGRPCClient creates a new gRPC client connection with the specified options.
@@ -314,22 +325,11 @@ func getGRPCServer(connectionOptions *ConnectionOptions, opts []grpc.ServerOptio
 	return server, nil
 }
 
-// RegisterPrometheusMetrics registers the gRPC server and client metrics with the global Prometheus registry.
+// RegisterPrometheusMetrics registers the gRPC server metrics with the global Prometheus registry.
 // This should be called once during application startup to enable gRPC metrics collection.
 func RegisterPrometheusMetrics() {
 	prometheusRegisterServerOnce.Do(func() {
 		prometheusgolang.MustRegister(prometheusMetrics)
-	})
-	prometheusRegisterClientOnce.Do(func() {
-		grpcClientRetriesTotal = prometheusgolang.NewCounterVec(
-			prometheusgolang.CounterOpts{
-				Namespace: "teranode",
-				Name:      "grpc_client_retries_total",
-				Help:      "Total number of gRPC client retry attempts by caller service and status code",
-			},
-			[]string{"grpc_caller", "grpc_code"},
-		)
-		prometheusgolang.MustRegister(grpcClientRetriesTotal)
 	})
 }
 
@@ -366,11 +366,11 @@ func retryInterceptor(maxRetries int, retryBackoff time.Duration, callerName str
 				break
 			}
 
-			if grpcClientRetriesTotal != nil {
+			// Only count and sleep if there is a subsequent attempt
+			if i < maxRetries-1 {
 				grpcClientRetriesTotal.WithLabelValues(callerName, status.Code(err).String()).Inc()
+				time.Sleep(retryBackoff)
 			}
-
-			time.Sleep(retryBackoff)
 		}
 
 		return err
