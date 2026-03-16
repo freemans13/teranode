@@ -13,7 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.8
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.0
-	github.com/bsv-blockchain/go-bt/v2 v2.6.0
+	github.com/bsv-blockchain/go-bt/v2 v2.6.1
 	github.com/bsv-blockchain/go-chaincfg v1.5.5
 	github.com/bsv-blockchain/go-sdk v1.2.18
 	github.com/bsv-blockchain/go-subtree v1.2.0
@@ -57,7 +57,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.40.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
-	golang.org/x/sync v0.19.0
+	golang.org/x/sync v0.20.0
 	golang.org/x/sys v0.41.0
 	golang.org/x/term v0.40.0
 	golang.org/x/text v0.34.0
@@ -183,12 +183,12 @@ require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.3
 	github.com/bsv-blockchain/go-alert-system v0.1.3
-	github.com/bsv-blockchain/go-batcher v1.2.9
+	github.com/bsv-blockchain/go-batcher v1.2.10
 	github.com/bsv-blockchain/go-bn v1.1.2
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.10
 	github.com/bsv-blockchain/go-safe-conversion v1.1.2
-	github.com/bsv-blockchain/go-tx-map v1.3.2
+	github.com/bsv-blockchain/go-tx-map v1.3.3
 	github.com/bsv-blockchain/go-wire v1.2.1
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10

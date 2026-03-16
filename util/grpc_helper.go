@@ -78,7 +78,20 @@ type ConnectionOptions struct {
 	Credentials      PasswordCredentials // Credentials to pass to downstream middleware (optional)
 	MaxConnectionAge time.Duration       // The maximum amount of time a connection may exist before it will be closed by sending a GoAway
 	APIKey           string              // API key for authentication
+	CallerName       string              // Name of the calling service for retry metrics (e.g. "validator", "propagation")
 }
+
+// grpcClientRetriesTotal tracks gRPC client retry attempts by caller service and status code.
+// This counter increments each time a gRPC call is retried (not on the initial attempt),
+// providing visibility into retry pressure across service-to-service communication.
+var grpcClientRetriesTotal = prometheusgolang.NewCounterVec(
+	prometheusgolang.CounterOpts{
+		Namespace: "teranode",
+		Name:      "grpc_client_retries_total",
+		Help:      "Total number of gRPC client retry attempts by caller service and status code",
+	},
+	[]string{"grpc_caller", "grpc_code"},
+)
 
 // ---------------------------------------------------------------------
 
@@ -201,7 +214,7 @@ func GetGRPCClient(_ context.Context, address string, connectionOptions *Connect
 			connectionOptions.RetryBackoff = defaultRetryBackoff
 		}
 
-		opts = append(opts, grpc.WithChainUnaryInterceptor(retryInterceptor(connectionOptions.MaxRetries, connectionOptions.RetryBackoff)))
+		opts = append(opts, grpc.WithChainUnaryInterceptor(retryInterceptor(connectionOptions.MaxRetries, connectionOptions.RetryBackoff, connectionOptions.CallerName)))
 	}
 
 	conn, err := grpc.NewClient(address, opts...)
@@ -327,7 +340,7 @@ func RegisterPrometheusMetrics() {
 //
 // Returns:
 //   - grpc.UnaryClientInterceptor: Interceptor function that wraps requests with retry logic
-func retryInterceptor(maxRetries int, retryBackoff time.Duration) grpc.UnaryClientInterceptor {
+func retryInterceptor(maxRetries int, retryBackoff time.Duration, callerName string) grpc.UnaryClientInterceptor {
 	return func(
 		ctx context.Context,
 		method string,
@@ -349,7 +362,8 @@ func retryInterceptor(maxRetries int, retryBackoff time.Duration) grpc.UnaryClie
 				break
 			}
 
-			// log.Printf("Retry attempt %d for request: %s\n", i+1, method)
+			grpcClientRetriesTotal.WithLabelValues(callerName, status.Code(err).String()).Inc()
+
 			time.Sleep(retryBackoff)
 		}
 
