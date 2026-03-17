@@ -1639,17 +1639,15 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 			}
 		}
 	} else {
-		// Not on longest chain: clear delete_at_height, set unmined_since
-		// +1 because blockHeight lags during block processing (mirrors aerospike set_mined.go:162)
-		thisBlockHeight := s.blockHeight.Load() + 1
-		inClause3, inArgs3 := buildINClause(existingHashBytes, 2)
+		// Not on longest chain: clear delete_at_height, set locked = false
+		// Do NOT set unmined_since here — that's MarkTransactionsOnLongestChain's job
+		inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
 		qUpdate := fmt.Sprintf(`
 			UPDATE transactions
-			SET locked = false, delete_at_height = NULL, unmined_since = $1
+			SET locked = false, delete_at_height = NULL
 			WHERE hash IN %s
 		`, inClause3)
-		args := append([]interface{}{thisBlockHeight}, inArgs3...)
-		if _, err = txn.ExecContext(ctx, qUpdate, args...); err != nil {
+		if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
 			return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
 		}
 	}
