@@ -896,7 +896,9 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 					batchErr = nil
 				} else {
 					var spendingTxExists bool
-					_ = s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists)
+					if scanErr := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
+						s.logger.Errorf("[Spend][%s] failed to check if spending tx exists: %v", tx.TxID(), scanErr)
+					}
 					if spendingTxExists {
 						s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
 						batchErr = nil
@@ -1953,10 +1955,10 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 			row.data.TxInpoints, _ = subtree.NewTxInpointsFromInputs(row.data.Tx.Inputs)
 		}
 
-		if contains(bins, fields.Tx) {
+		if contains(bins, fields.Tx) || needInputs || needOutputs {
 			row.data.Tx = tx
 		} else {
-			row.data.Tx = nil // don't leak the temporary tx used for inputs/outputs
+			row.data.Tx = nil
 		}
 
 		for _, item := range matchedItems {
