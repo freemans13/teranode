@@ -382,6 +382,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseLocalValidator:         getBool("useLocalValidator", false, alternativeContext...),
 			TxMetaKafkaBatchSize:      getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
 			TxMetaKafkaBatchTimeoutMs: getInt("validator_txmeta_kafka_batchTimeoutMs", 5, alternativeContext...),
+			TxLockedMaxRetries:        getInt("validator_txlocked_maxRetries", 3, alternativeContext...),
 		},
 		Region: RegionSettings{
 			Name: getString("regionName", "defaultRegionName", alternativeContext...),
@@ -490,6 +491,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			P2PPort:                     getInt("p2p_port_coinbase", 9906, alternativeContext...),
 			DistributorFailureTolerance: getInt("distributor_failure_tolerance", 0, alternativeContext...),
 			DistributorTimeout:          getDuration("distributor_timeout", 30*time.Second, alternativeContext...),
+		},
+		GCTuning: GCTuningSettings{
+			Enabled:  getBool("gc_tuning_enabled", true, alternativeContext...),
+			Ratio:    getFloat64("gc_tuning_ratio", 0.9, alternativeContext...),
+			GCTarget: getInt("gc_tuning_gogc", 100, alternativeContext...),
 		},
 		Pruner: PrunerSettings{
 			GRPCAddress:                    getString("pruner_grpcAddress", "localhost:8096", alternativeContext...),
