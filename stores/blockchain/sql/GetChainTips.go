@@ -239,11 +239,10 @@ func (s *SQL) calculateBranchLengthSQL(ctx context.Context, tipHashBytes []byte,
 	branchLength := uint32(0)
 	currentHash := tipHash
 
+	var unusedHeight uint32
 	for {
-		var (
-			parentID sql.NullInt64
-		)
-		err := s.db.QueryRowContext(ctx, `SELECT parent_id, height FROM blocks WHERE hash = $1`, currentHash.CloneBytes()).Scan(&parentID, new(uint32))
+		var parentID sql.NullInt64
+		err := s.db.QueryRowContext(ctx, `SELECT parent_id, height FROM blocks WHERE hash = $1`, currentHash.CloneBytes()).Scan(&parentID, &unusedHeight)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				break
