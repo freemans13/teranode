@@ -103,6 +103,11 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 	startHash := bestBlockHeader.Hash()
 	startHeight := bestBlockMeta.Height
 
+	// locatorHeader/locatorHeight are used for building the block locator.
+	// They default to the chain tip but may be capped to UTXO height below.
+	locatorHeader := bestBlockHeader
+	locatorHeight := bestBlockMeta.Height
+
 	// Cap block locator at UTXO height when the blockchain store is ahead.
 	//
 	// The blockchain store (PostgreSQL) is updated synchronously by AddBlock during
@@ -130,16 +135,16 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 				u.logger.Warnf("[catchup][%s] failed to get block at UTXO height %d, using blockchain height: %v",
 					blockUpTo.Hash().String(), utxoHeight, capErr)
 			} else {
+				locatorHeader = utxoBlock.Header
+				locatorHeight = utxoHeight
 				startHash = utxoBlock.Header.Hash()
 				startHeight = utxoHeight
-				bestBlockHeader = utxoBlock.Header
-				bestBlockMeta = &model.BlockHeaderMeta{Height: utxoHeight}
 			}
 		}
 	}
 
 	// Create block locator
-	locatorHashes, err := u.blockchainClient.GetBlockLocator(ctx, bestBlockHeader.Hash(), bestBlockMeta.Height)
+	locatorHashes, err := u.blockchainClient.GetBlockLocator(ctx, locatorHeader.Hash(), locatorHeight)
 	if err != nil {
 		if circuitBreaker != nil {
 			circuitBreaker.RecordFailure()
