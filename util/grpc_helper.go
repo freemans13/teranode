@@ -84,24 +84,22 @@ type ConnectionOptions struct {
 // grpcClientRetriesTotal tracks gRPC client retry attempts by caller service and status code.
 // This counter increments each time a gRPC call is retried (not on the initial attempt),
 // providing visibility into retry pressure across service-to-service communication.
-// Initialized in init() so it is available before any gRPC clients are created.
-var grpcClientRetriesTotal *prometheusgolang.CounterVec
+// Constructed in init() so the pointer is set before any gRPC client goroutine runs,
+// but registered with Prometheus in RegisterPrometheusMetrics() to keep registration explicit.
+var grpcClientRetriesTotal = prometheusgolang.NewCounterVec(
+	prometheusgolang.CounterOpts{
+		Namespace: "teranode",
+		Name:      "grpc_client_retries_total",
+		Help:      "Total number of gRPC client retry attempts by caller service and status code",
+	},
+	[]string{"grpc_caller", "grpc_code"},
+)
 
 // ---------------------------------------------------------------------
 
 func init() {
 	// The secret sauce
 	resolver.SetDefaultScheme("dns")
-
-	grpcClientRetriesTotal = prometheusgolang.NewCounterVec(
-		prometheusgolang.CounterOpts{
-			Namespace: "teranode",
-			Name:      "grpc_client_retries_total",
-			Help:      "Total number of gRPC client retry attempts by caller service and status code",
-		},
-		[]string{"grpc_caller", "grpc_code"},
-	)
-	prometheusgolang.MustRegister(grpcClientRetriesTotal)
 }
 
 // GetGRPCClient creates a new gRPC client connection with the specified options.
@@ -325,11 +323,14 @@ func getGRPCServer(connectionOptions *ConnectionOptions, opts []grpc.ServerOptio
 	return server, nil
 }
 
-// RegisterPrometheusMetrics registers the gRPC server metrics with the global Prometheus registry.
+// RegisterPrometheusMetrics registers gRPC metrics with the global Prometheus registry.
 // This should be called once during application startup to enable gRPC metrics collection.
+// Server interceptor metrics and the client retry counter are registered here;
+// client interceptor metrics are registered separately in GetGRPCClient via prometheusRegisterClientOnce.
 func RegisterPrometheusMetrics() {
 	prometheusRegisterServerOnce.Do(func() {
 		prometheusgolang.MustRegister(prometheusMetrics)
+		prometheusgolang.MustRegister(grpcClientRetriesTotal)
 	})
 }
 
