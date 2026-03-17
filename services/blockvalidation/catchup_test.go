@@ -1265,12 +1265,13 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		)
 
 		// Mock GetBlockHeadersFromHeight for locator capping (blockchain height 10000 > UTXO height 1018)
+		// Required (no .Maybe()) — test must fail if capping is removed
 		mockBlockchainClient.On("GetBlockHeadersFromHeight", mock.Anything, uint32(1018), uint32(1)).
-			Return([]*model.BlockHeader{bestBlock.Header}, []*model.BlockHeaderMeta{{Height: 1018}}, nil).Maybe()
+			Return([]*model.BlockHeader{bestBlock.Header}, []*model.BlockHeaderMeta{{Height: 1018}}, nil)
 
-		// Mock GetBlockLocator
+		// Mock GetBlockLocator — expect the capped height (1018), not the blockchain height (10000)
 		locatorHashes := []*chainhash.Hash{bestBlock.Header.Hash()}
-		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
+		mockBlockchainClient.On("GetBlockLocator", mock.Anything, bestBlock.Header.Hash(), uint32(1018)).Return(locatorHashes, nil)
 
 		// Mock GetBlockHeader to return not found for new headers
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(
@@ -3772,12 +3773,12 @@ func TestCatchup_MemoryLimitAfterDuplicateRemoval(t *testing.T) {
 	}
 }
 
-// TestProof_BlockchainAheadOfUTXO_CausesNoCommonAncestor proves the regression:
-// when the blockchain store is ahead of the UTXO store, findCommonAncestor rejects
-// all headers because they're above the UTXO height, resulting in "no common ancestor".
-// The fix in catchupGetBlockHeaders caps the locator at UTXO height so headers start
-// from a height that findCommonAncestor will accept.
-func TestProof_BlockchainAheadOfUTXO_CausesNoCommonAncestor(t *testing.T) {
+// TestFindCommonAncestor_RejectsHeadersAboveUTXOHeight documents findCommonAncestor's
+// contract: it rejects any block whose height exceeds the UTXO height, even if the
+// block exists in the blockchain store. This is why catchupGetBlockHeaders must cap
+// the locator at UTXO height — without capping, the peer returns headers starting
+// from blockchain height, and findCommonAncestor rejects them all.
+func TestFindCommonAncestor_RejectsHeadersAboveUTXOHeight(t *testing.T) {
 	server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
 
@@ -3822,9 +3823,10 @@ func TestProof_BlockchainAheadOfUTXO_CausesNoCommonAncestor(t *testing.T) {
 	assert.Contains(t, err.Error(), "no common ancestor found")
 }
 
-// TestProof_SameHeight_FindsCommonAncestor is the control case: when blockchain
-// and UTXO heights are aligned, findCommonAncestor succeeds normally.
-func TestProof_SameHeight_FindsCommonAncestor(t *testing.T) {
+// TestFindCommonAncestor_AcceptsHeadersAtOrBelowUTXOHeight documents the complementary
+// contract: findCommonAncestor accepts blocks whose heights are within the UTXO range.
+// This is the normal case when the locator is properly capped.
+func TestFindCommonAncestor_AcceptsHeadersAtOrBelowUTXOHeight(t *testing.T) {
 	server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
 

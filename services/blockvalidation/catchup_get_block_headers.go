@@ -123,14 +123,17 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 				blockUpTo.Hash().String(), bestBlockMeta.Height, utxoHeight)
 
 			headers, metas, capErr := u.blockchainClient.GetBlockHeadersFromHeight(ctx, utxoHeight, 1)
-			if capErr == nil && len(headers) > 0 && len(metas) > 0 {
-				startHash = headers[0].Hash()
-				startHeight = utxoHeight
-				bestBlockHeader = headers[0]
-				bestBlockMeta = metas[0]
-			} else {
+			if capErr != nil {
 				u.logger.Warnf("[catchup][%s] failed to get block header at UTXO height %d, using blockchain height: %v",
 					blockUpTo.Hash().String(), utxoHeight, capErr)
+			} else if len(headers) != 1 || len(metas) != 1 {
+				u.logger.Warnf("[catchup][%s] unexpected response for block header at UTXO height %d (got %d headers, %d metas), using blockchain height",
+					blockUpTo.Hash().String(), utxoHeight, len(headers), len(metas))
+			} else {
+				startHash = headers[0].Hash()
+				startHeight = metas[0].Height
+				bestBlockHeader = headers[0]
+				bestBlockMeta = metas[0]
 			}
 		}
 	}
