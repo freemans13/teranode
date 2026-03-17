@@ -102,6 +102,10 @@ type SQL struct {
 	lastSuccessfulRebuild atomic.Int64
 	// backgroundDone signals the background refresh goroutine to stop.
 	backgroundDone chan struct{}
+	// useInMemoryChainCheck controls whether CheckBlockIsInCurrentChain uses the
+	// in-memory off-chain set (true) or the original SQL recursive CTE (false).
+	// Read once at construction from settings; not changed at runtime.
+	useInMemoryChainCheck bool
 }
 
 // New creates and initializes a new SQL blockchain store instance.
@@ -182,16 +186,22 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 		return nil, errors.NewStorageError("unknown database engine: %s", storeURL.Scheme)
 	}
 
+	useInMemory := tSettings.BlockChain.UseInMemoryChainCheck
+
 	s := &SQL{
-		db:               db,
-		engine:           util.SQLEngine(storeURL.Scheme),
-		logger:           logger,
-		responseCache:    NewGenerationalCache(),
-		chainWalkCache:   NewGenerationalCache(),
-		cacheTTL:         2 * time.Minute,
-		chainParams:      tSettings.ChainCfgParams,
-		offChainBlockIDs: make(map[uint32]struct{}),
-		backgroundDone:   make(chan struct{}),
+		db:                    db,
+		engine:                util.SQLEngine(storeURL.Scheme),
+		logger:                logger,
+		responseCache:         NewGenerationalCache(),
+		cacheTTL:              2 * time.Minute,
+		chainParams:           tSettings.ChainCfgParams,
+		useInMemoryChainCheck: useInMemory,
+	}
+
+	if useInMemory {
+		s.chainWalkCache = NewGenerationalCache()
+		s.offChainBlockIDs = make(map[uint32]struct{})
+		s.backgroundDone = make(chan struct{})
 	}
 
 	err = s.insertGenesisTransaction(logger)
@@ -199,22 +209,24 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 		return nil, errors.NewStorageError("failed to insert genesis transaction", err)
 	}
 
-	// Rebuild the off-chain set using a CTE walk of the main chain so that
-	// CheckBlockIsInCurrentChain works correctly after a process restart.
-	// This is fatal because the in-memory lookup has no DB fallback — if the
-	// off-chain set is empty, fork/orphan blocks would incorrectly return true.
-	rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
-	defer rebuildCancel()
-	if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
-		s.Close()
-		return nil, errors.NewStorageError("failed to seed off-chain set during startup", rebuildErr)
-	}
-	s.lastSuccessfulRebuild.Store(time.Now().Unix())
+	if useInMemory {
+		// Rebuild the off-chain set using a CTE walk of the main chain so that
+		// CheckBlockIsInCurrentChain works correctly after a process restart.
+		// This is fatal because the in-memory lookup has no DB fallback — if the
+		// off-chain set is empty, fork/orphan blocks would incorrectly return true.
+		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+		defer rebuildCancel()
+		if rebuildErr := s.rebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+			s.Close()
+			return nil, errors.NewStorageError("failed to seed off-chain set during startup", rebuildErr)
+		}
+		s.lastSuccessfulRebuild.Store(time.Now().Unix())
 
-	// Start periodic background refresh of the off-chain set as a safety net.
-	// This catches any missed rebuilds (e.g. due to transient DB errors during
-	// event-driven rebuilds) without requiring a process restart.
-	go s.backgroundRefreshLoop()
+		// Start periodic background refresh of the off-chain set as a safety net.
+		// This catches any missed rebuilds (e.g. due to transient DB errors during
+		// event-driven rebuilds) without requiring a process restart.
+		go s.backgroundRefreshLoop()
+	}
 
 	return s, nil
 }
@@ -239,14 +251,18 @@ func (s *SQL) GetDBEngine() util.SQLEngine {
 
 func (s *SQL) Close() error {
 	// Signal the background refresh goroutine to stop.
-	select {
-	case <-s.backgroundDone:
-		// Already closed
-	default:
-		close(s.backgroundDone)
+	if s.backgroundDone != nil {
+		select {
+		case <-s.backgroundDone:
+			// Already closed
+		default:
+			close(s.backgroundDone)
+		}
 	}
 	s.responseCache.Stop()
-	s.chainWalkCache.Stop()
+	if s.chainWalkCache != nil {
+		s.chainWalkCache.Stop()
+	}
 	return s.db.Close()
 }
 
@@ -763,7 +779,9 @@ func (s *SQL) ResetResponseCache() {
 // "invalid" status of blocks may change, affecting which blocks are walked.
 // Unlike responseCache, this is NOT cleared on StoreBlock or SetBlock* calls.
 func (s *SQL) resetChainWalkCache() {
-	s.chainWalkCache.DeleteAll()
+	if s.chainWalkCache != nil {
+		s.chainWalkCache.DeleteAll()
+	}
 }
 
 // triggerRebuildOffChainSet deduplicates concurrent rebuild requests using singleflight.

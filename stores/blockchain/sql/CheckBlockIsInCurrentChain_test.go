@@ -85,13 +85,8 @@ func TestCheckBlockIsInCurrentChain_NonExistentBlockID(t *testing.T) {
 	assert.False(t, result, "Non-existent block IDs above maxBlockID should return false")
 }
 
-func TestCheckBlockIsInCurrentChain_ContextCancellation(t *testing.T) {
-	tSettings := test.CreateBaseTestSettings(t)
-	storeURL, err := url.Parse("sqlitememory:///")
-	require.NoError(t, err)
-
-	s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
-	require.NoError(t, err)
+func TestCheckBlockIsInCurrentChain_InMemory_ContextCancellation(t *testing.T) {
+	s := newStoreWithInMemoryChainCheck(t)
 	defer s.Close()
 
 	blockID, _, err := s.StoreBlock(context.Background(), block1, "")
@@ -106,13 +101,8 @@ func TestCheckBlockIsInCurrentChain_ContextCancellation(t *testing.T) {
 	assert.True(t, result, "In-memory lookup should succeed even with cancelled context")
 }
 
-func TestCheckBlockIsInCurrentChain_ClosedDB(t *testing.T) {
-	tSettings := test.CreateBaseTestSettings(t)
-	storeURL, err := url.Parse("sqlitememory:///")
-	require.NoError(t, err)
-
-	s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
-	require.NoError(t, err)
+func TestCheckBlockIsInCurrentChain_InMemory_ClosedDB(t *testing.T) {
+	s := newStoreWithInMemoryChainCheck(t)
 
 	// Store a block so maxBlockID is > 0, then close
 	blockID, _, err := s.StoreBlock(context.Background(), block1, "")
@@ -193,4 +183,109 @@ func TestCheckBlockIsInCurrentChain_InvalidatedBlock(t *testing.T) {
 	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID2)})
 	require.NoError(t, err)
 	assert.False(t, result, "Invalidated block should be off-chain")
+}
+
+// newStoreWithInMemoryChainCheck creates a SQL store with useInMemoryChainCheck enabled.
+func newStoreWithInMemoryChainCheck(t *testing.T) *SQL {
+	t.Helper()
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockChain.UseInMemoryChainCheck = true
+	storeURL, err := url.Parse("sqlitememory:///")
+	require.NoError(t, err)
+
+	s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
+	require.NoError(t, err)
+	return s
+}
+
+func TestCheckBlockIsInCurrentChain_InMemory_SingleBlockInChain(t *testing.T) {
+	s := newStoreWithInMemoryChainCheck(t)
+	defer s.Close()
+
+	blockID, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID)})
+	require.NoError(t, err)
+	assert.True(t, result, "Block in main chain should return true (in-memory path)")
+}
+
+func TestCheckBlockIsInCurrentChain_InMemory_MultipleBlocksInChain(t *testing.T) {
+	s := newStoreWithInMemoryChainCheck(t)
+	defer s.Close()
+
+	blockID1, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	blockID2, _, err := s.StoreBlock(context.Background(), block2, "")
+	require.NoError(t, err)
+
+	blockID3, _, err := s.StoreBlock(context.Background(), block3, "")
+	require.NoError(t, err)
+
+	blockIDs := []uint32{uint32(blockID1), uint32(blockID2), uint32(blockID3)}
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
+	require.NoError(t, err)
+	assert.True(t, result, "All blocks in main chain should return true (in-memory path)")
+}
+
+func TestCheckBlockIsInCurrentChain_InMemory_NonExistentBlockID(t *testing.T) {
+	s := newStoreWithInMemoryChainCheck(t)
+	defer s.Close()
+
+	_, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{999999})
+	require.NoError(t, err)
+	assert.False(t, result, "Non-existent block IDs above maxBlockID should return false (in-memory path)")
+}
+
+func TestCheckBlockIsInCurrentChain_InMemory_MixedOnChainAndOffChain(t *testing.T) {
+	s := newStoreWithInMemoryChainCheck(t)
+	defer s.Close()
+
+	blockID1, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	blockID2, _, err := s.StoreBlock(context.Background(), block2, "")
+	require.NoError(t, err)
+
+	forkID, _, err := s.StoreBlock(context.Background(), blockAlternative2, "")
+	require.NoError(t, err)
+
+	// Mixed: ANY-of semantics
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID1), uint32(forkID)})
+	require.NoError(t, err)
+	assert.True(t, result, "Mixed on-chain and off-chain should return true (in-memory path)")
+
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID1), uint32(blockID2)})
+	require.NoError(t, err)
+	assert.True(t, result, "All on-chain blocks should return true (in-memory path)")
+
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(forkID)})
+	require.NoError(t, err)
+	assert.False(t, result, "Single off-chain block should return false (in-memory path)")
+}
+
+func TestCheckBlockIsInCurrentChain_InMemory_InvalidatedBlock(t *testing.T) {
+	s := newStoreWithInMemoryChainCheck(t)
+	defer s.Close()
+
+	blockID1, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	blockID2, _, err := s.StoreBlock(context.Background(), block2, "")
+	require.NoError(t, err)
+
+	_, err = s.InvalidateBlock(context.Background(), block2.Header.Hash())
+	require.NoError(t, err)
+
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID1)})
+	require.NoError(t, err)
+	assert.True(t, result, "Valid block should still be in chain (in-memory path)")
+
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID2)})
+	require.NoError(t, err)
+	assert.False(t, result, "Invalidated block should be off-chain (in-memory path)")
 }

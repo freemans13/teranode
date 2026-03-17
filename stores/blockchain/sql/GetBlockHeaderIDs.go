@@ -75,11 +75,17 @@ func (s *SQL) GetBlockHeaderIDs(ctx context.Context, blockHashFrom *chainhash.Ha
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Try to get from chain walk cache (dedicated cache for parent_id walks).
-	// This cache survives StoreBlock/SetBlock* wipes — only cleared on reorgs —
-	// because parent_id links are immutable once stored.
+	// Use chain walk cache when in-memory mode is on (survives StoreBlock wipes),
+	// otherwise fall back to response cache (original behavior).
+	cache := s.responseCache
+	cacheTTL := s.cacheTTL
+	if s.useInMemoryChainCheck {
+		cache = s.chainWalkCache
+		cacheTTL = chainWalkCacheTTL
+	}
+
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlockHeaderIDs-%s-%d", blockHashFrom.String(), numberOfHeaders)))
-	cacheOp := s.chainWalkCache.Begin(cacheID)
+	cacheOp := cache.Begin(cacheID)
 
 	cached := cacheOp.Get()
 	if cached != nil {
@@ -154,8 +160,7 @@ func (s *SQL) GetBlockHeaderIDs(ctx context.Context, blockHashFrom *chainhash.Ha
 		ids = append(ids, id)
 	}
 
-	// Cache the result in chain walk cache (10-min TTL, survives StoreBlock/SetBlock* wipes)
-	cacheOp.Set(ids, chainWalkCacheTTL)
+	cacheOp.Set(ids, cacheTTL)
 
 	return ids, nil
 }

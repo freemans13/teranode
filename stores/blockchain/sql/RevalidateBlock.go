@@ -30,22 +30,16 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 		return errors.NewStorageError("error updating block to valid", err)
 	}
 
-	// Invalidate caches and rebuild the off-chain set only after the UPDATE
-	// succeeds. Order matters: ResetResponseCache must run before
-	// rebuildOffChainSet because the rebuild calls getBestBlockID which
-	// reads the response cache.
-	// Use a non-cancelable context with a timeout because the caller's ctx may
-	// have been cancelled after the DB update succeeded — the rebuild must still
-	// run to keep the in-memory membership state consistent, but should not
-	// block indefinitely if the DB is unhealthy.
 	s.ResetResponseCache()
-	s.resetChainWalkCache()
-	rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
-	defer rebuildCancel()
-	if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
-		s.logger.Errorf("RevalidateBlock: %v", rebuildErr)
-	} else {
-		s.lastSuccessfulRebuild.Store(time.Now().Unix())
+	if s.useInMemoryChainCheck {
+		s.resetChainWalkCache()
+		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+		defer rebuildCancel()
+		if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+			s.logger.Errorf("RevalidateBlock: %v", rebuildErr)
+		} else {
+			s.lastSuccessfulRebuild.Store(time.Now().Unix())
+		}
 	}
 
 	return nil

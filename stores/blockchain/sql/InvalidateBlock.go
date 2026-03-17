@@ -109,18 +109,15 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (i
 
 		// Invalidate caches to ensure cached blocks reflect updated invalid field
 		s.ResetResponseCache()
-		s.resetChainWalkCache()
-		// Rebuild the off-chain set and membership cache after invalidation.
-		// Use a non-cancelable context with a timeout because the caller's ctx
-		// may have been cancelled after the DB update succeeded — the rebuild
-		// must still run to keep the in-memory membership state consistent, but
-		// should not block indefinitely if the DB is unhealthy.
-		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
-		defer rebuildCancel()
-		if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
-			s.logger.Errorf("InvalidateBlock: %v", rebuildErr)
-		} else {
-			s.lastSuccessfulRebuild.Store(time.Now().Unix())
+		if s.useInMemoryChainCheck {
+			s.resetChainWalkCache()
+			rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+			defer rebuildCancel()
+			if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+				s.logger.Errorf("InvalidateBlock: %v", rebuildErr)
+			} else {
+				s.lastSuccessfulRebuild.Store(time.Now().Unix())
+			}
 		}
 	}()
 

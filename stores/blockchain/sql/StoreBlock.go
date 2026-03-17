@@ -104,11 +104,15 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		opt(&storeBlockOptions)
 	}
 
-	// Capture the current best block hash before insert for reorg detection.
-	// getBestBlockID is cached, so this is essentially free.
-	_, preBestHash, preBestErr := s.getBestBlockID(ctx)
-	if preBestErr != nil {
-		s.logger.Warnf("StoreBlock: failed to get pre-insert best block ID: %v", preBestErr)
+	var preBestHash *chainhash.Hash
+	if s.useInMemoryChainCheck {
+		// Capture the current best block hash before insert for reorg detection.
+		// getBestBlockID is cached, so this is essentially free.
+		var preBestErr error
+		_, preBestHash, preBestErr = s.getBestBlockID(ctx)
+		if preBestErr != nil {
+			s.logger.Warnf("StoreBlock: failed to get pre-insert best block ID: %v", preBestErr)
+		}
 	}
 
 	newBlockID, height, _, _, err := s.storeBlock(ctx, block, peerID, storeBlockOptions)
@@ -116,46 +120,37 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		return 0, height, err
 	}
 
-	// Track the highest block ID for the maxBlockID upper-bound check.
-	s.updateMaxBlockID(newBlockID)
-
 	// Reset response cache to invalidate cached best block ID and headers
 	s.ResetResponseCache()
 
-	// Detect forks and reorgs by comparing the newly inserted block against
-	// the post-insert best block. Three cases require an off-chain set rebuild:
-	//   1. Fork creation/extension: new block is NOT the best → rebuild
-	//   2. Reorg: new block IS the best, but its parent was NOT the previous
-	//      best block (a competing chain overtook) → rebuild
-	//   3. Error getting best block → log and skip (can't determine)
-	// The only case that skips the rebuild is normal chain extension: new block
-	// IS the best AND its parent was the previous best block.
-	// Use a bounded context for the post-insert best block lookup because the
-	// caller's ctx may be cancelled after the DB insert succeeded. The fork/reorg
-	// detection must still run to keep in-memory chain membership consistent.
-	postBestCtx, postBestCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
-	defer postBestCancel()
-	postBestID, _, bestErr := s.getBestBlockID(postBestCtx)
-	if bestErr != nil {
-		s.logger.Errorf("StoreBlock: failed to get best block ID: %v", bestErr)
-	} else if uint64(postBestID) != newBlockID {
-		// Case 1: new block is on a fork (not the best).
-		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
-		defer rebuildCancel()
-		if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
-			s.logger.Errorf("StoreBlock: %v", rebuildErr)
-		} else {
-			s.lastSuccessfulRebuild.Store(time.Now().Unix())
-		}
-	} else if preBestHash != nil && *block.Header.HashPrevBlock != *preBestHash {
-		// Case 2: new block is the best but doesn't extend the old best (reorg)
-		s.resetChainWalkCache()
-		rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
-		defer rebuildCancel()
-		if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
-			s.logger.Errorf("StoreBlock: %v", rebuildErr)
-		} else {
-			s.lastSuccessfulRebuild.Store(time.Now().Unix())
+	if s.useInMemoryChainCheck {
+		// Track the highest block ID for the maxBlockID upper-bound check.
+		s.updateMaxBlockID(newBlockID)
+
+		// Detect forks and reorgs by comparing the newly inserted block against
+		// the post-insert best block.
+		postBestCtx, postBestCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+		defer postBestCancel()
+		postBestID, _, bestErr := s.getBestBlockID(postBestCtx)
+		if bestErr != nil {
+			s.logger.Errorf("StoreBlock: failed to get best block ID: %v", bestErr)
+		} else if uint64(postBestID) != newBlockID {
+			rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+			defer rebuildCancel()
+			if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+				s.logger.Errorf("StoreBlock: %v", rebuildErr)
+			} else {
+				s.lastSuccessfulRebuild.Store(time.Now().Unix())
+			}
+		} else if preBestHash != nil && *block.Header.HashPrevBlock != *preBestHash {
+			s.resetChainWalkCache()
+			rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+			defer rebuildCancel()
+			if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+				s.logger.Errorf("StoreBlock: %v", rebuildErr)
+			} else {
+				s.lastSuccessfulRebuild.Store(time.Now().Unix())
+			}
 		}
 	}
 
