@@ -390,47 +390,60 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 	return txMeta, nil
 }
 
-// createInputsBatched inserts all transaction inputs in a single multi-value INSERT.
+// createInputsBatched inserts all transaction inputs in chunked multi-value INSERTs.
 func (s *Store) createInputsBatched(ctx context.Context, txn *sql.Tx, transactionID int, tx *bt.Tx) error {
 	if len(tx.Inputs) == 0 {
 		return nil
 	}
 
 	const colsPerRow = 8
+	const maxRowsPerChunk = maxPostgresParams / colsPerRow
 	baseSQL := `INSERT INTO inputs (transaction_id,idx,previous_transaction_hash,previous_tx_idx,previous_tx_satoshis,previous_tx_script,unlocking_script,sequence_number) VALUES `
-	q := buildMultiValueInsert(baseSQL, colsPerRow, len(tx.Inputs), 1)
 
-	args := make([]interface{}, 0, len(tx.Inputs)*colsPerRow)
-	for i, input := range tx.Inputs {
-		args = append(args,
-			transactionID,
-			i,
-			input.PreviousTxIDChainHash()[:],
-			input.PreviousTxOutIndex,
-			input.PreviousTxSatoshis,
-			input.PreviousTxScript,
-			input.UnlockingScript,
-			input.SequenceNumber,
-		)
-	}
+	for chunkStart := 0; chunkStart < len(tx.Inputs); chunkStart += maxRowsPerChunk {
+		chunkEnd := chunkStart + maxRowsPerChunk
+		if chunkEnd > len(tx.Inputs) {
+			chunkEnd = len(tx.Inputs)
+		}
+		chunkSize := chunkEnd - chunkStart
 
-	_, err := txn.ExecContext(ctx, q, args...)
-	if err != nil {
-		return classifyInsertError(err, tx.IsCoinbase(), "input")
+		q := buildMultiValueInsert(baseSQL, colsPerRow, chunkSize, 1)
+		args := make([]interface{}, 0, chunkSize*colsPerRow)
+		for i := chunkStart; i < chunkEnd; i++ {
+			input := tx.Inputs[i]
+			args = append(args,
+				transactionID,
+				i,
+				input.PreviousTxIDChainHash()[:],
+				input.PreviousTxOutIndex,
+				input.PreviousTxSatoshis,
+				input.PreviousTxScript,
+				input.UnlockingScript,
+				input.SequenceNumber,
+			)
+		}
+
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
+			return classifyInsertError(err, tx.IsCoinbase(), "input")
+		}
 	}
 	return nil
 }
 
-// createOutputsBatched inserts all transaction outputs in a single multi-value INSERT.
+// createOutputsBatched inserts all transaction outputs in chunked multi-value INSERTs.
 func (s *Store) createOutputsBatched(ctx context.Context, txn *sql.Tx, transactionID int, txHash *chainhash.Hash, tx *bt.Tx, isCoinbase bool, blockHeight uint32) error {
-	// Count non-nil outputs
-	var outputCount int
-	for _, output := range tx.Outputs {
+	// Collect non-nil outputs with their original indices
+	type outputEntry struct {
+		index  int
+		output *bt.Output
+	}
+	outputs := make([]outputEntry, 0, len(tx.Outputs))
+	for i, output := range tx.Outputs {
 		if output != nil {
-			outputCount++
+			outputs = append(outputs, outputEntry{index: i, output: output})
 		}
 	}
-	if outputCount == 0 {
+	if len(outputs) == 0 {
 		return nil
 	}
 
@@ -440,57 +453,69 @@ func (s *Store) createOutputsBatched(ctx context.Context, txn *sql.Tx, transacti
 	}
 
 	const colsPerRow = 7
+	const maxRowsPerChunk = maxPostgresParams / colsPerRow
 	baseSQL := `INSERT INTO outputs (transaction_id,idx,locking_script,satoshis,coinbase_spending_height,utxo_hash,spending_data) VALUES `
-	q := buildMultiValueInsert(baseSQL, colsPerRow, outputCount, 1)
 
-	args := make([]interface{}, 0, outputCount*colsPerRow)
-	for i, output := range tx.Outputs {
-		if output == nil {
-			continue
+	for chunkStart := 0; chunkStart < len(outputs); chunkStart += maxRowsPerChunk {
+		chunkEnd := chunkStart + maxRowsPerChunk
+		if chunkEnd > len(outputs) {
+			chunkEnd = len(outputs)
+		}
+		chunkSize := chunkEnd - chunkStart
+
+		q := buildMultiValueInsert(baseSQL, colsPerRow, chunkSize, 1)
+		args := make([]interface{}, 0, chunkSize*colsPerRow)
+		for _, entry := range outputs[chunkStart:chunkEnd] {
+			iUint32, err := safeconversion.IntToUint32(entry.index)
+			if err != nil {
+				return err
+			}
+
+			utxoHash, err := util.UTXOHashFromOutput(txHash, entry.output, iUint32)
+			if err != nil {
+				return err
+			}
+
+			args = append(args,
+				transactionID,
+				entry.index,
+				entry.output.LockingScript,
+				entry.output.Satoshis,
+				coinbaseSpendingHeight,
+				utxoHash[:],
+				nil,
+			)
 		}
 
-		iUint32, err := safeconversion.IntToUint32(i)
-		if err != nil {
-			return err
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
+			return classifyInsertError(err, tx.IsCoinbase(), "output")
 		}
-
-		utxoHash, err := util.UTXOHashFromOutput(txHash, output, iUint32)
-		if err != nil {
-			return err
-		}
-
-		args = append(args,
-			transactionID,
-			i,
-			output.LockingScript,
-			output.Satoshis,
-			coinbaseSpendingHeight,
-			utxoHash[:],
-			nil,
-		)
-	}
-
-	_, err := txn.ExecContext(ctx, q, args...)
-	if err != nil {
-		return classifyInsertError(err, tx.IsCoinbase(), "output")
 	}
 	return nil
 }
 
-// createBlockIDsBatched inserts all block_ids in a single multi-value INSERT.
+// createBlockIDsBatched inserts all block_ids in chunked multi-value INSERTs.
 func (s *Store) createBlockIDsBatched(ctx context.Context, txn *sql.Tx, transactionID int, blockInfos []utxo.MinedBlockInfo) error {
 	const colsPerRow = 4
+	const maxRowsPerChunk = maxPostgresParams / colsPerRow
 	baseSQL := `INSERT INTO block_ids (transaction_id,block_id,block_height,subtree_idx) VALUES `
-	q := buildMultiValueInsert(baseSQL, colsPerRow, len(blockInfos), 1)
 
-	args := make([]interface{}, 0, len(blockInfos)*colsPerRow)
-	for _, blockMeta := range blockInfos {
-		args = append(args, transactionID, blockMeta.BlockID, blockMeta.BlockHeight, blockMeta.SubtreeIdx)
-	}
+	for chunkStart := 0; chunkStart < len(blockInfos); chunkStart += maxRowsPerChunk {
+		chunkEnd := chunkStart + maxRowsPerChunk
+		if chunkEnd > len(blockInfos) {
+			chunkEnd = len(blockInfos)
+		}
+		chunk := blockInfos[chunkStart:chunkEnd]
 
-	_, err := txn.ExecContext(ctx, q, args...)
-	if err != nil {
-		return classifyInsertError(err, false, "block_ids")
+		q := buildMultiValueInsert(baseSQL, colsPerRow, len(chunk), 1)
+		args := make([]interface{}, 0, len(chunk)*colsPerRow)
+		for _, blockMeta := range chunk {
+			args = append(args, transactionID, blockMeta.BlockID, blockMeta.BlockHeight, blockMeta.SubtreeIdx)
+		}
+
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
+			return classifyInsertError(err, false, "block_ids")
+		}
 	}
 	return nil
 }
@@ -3721,6 +3746,10 @@ func (s *Store) RawDB() *usql.DB {
 // maxINClauseSize is the maximum number of hash placeholders in a single IN clause.
 // SQLite's SQLITE_MAX_VARIABLE_NUMBER default is 999. We use 400 to leave
 // headroom for additional parameters in the same query (e.g. block_id, height).
+// maxPostgresParams is the safe upper bound for SQL bind parameters per statement.
+// PostgreSQL supports 65535, but SQLite defaults to 999. Use the lower limit to cover both.
+const maxPostgresParams = 999
+
 const maxINClauseSize = 400
 
 // buildINClause generates a SQL IN clause placeholder string and corresponding args.
