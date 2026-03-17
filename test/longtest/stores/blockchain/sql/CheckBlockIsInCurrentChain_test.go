@@ -37,13 +37,12 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		s, err := storesql.New(ulogger.TestLogger{}, storeURL, tSettings)
 		require.NoError(t, err)
 
-		// Non-existent block IDs above maxBlockID are rejected by the upper-bound
-		// check and correctly return false. IDs 1, 2, 3 may be within the genesis
-		// block range so use very high IDs to test the boundary.
+		// Non-existent block IDs that are not encountered during the chain walk
+		// correctly return false. Use very high IDs to avoid colliding with real blocks.
 		blockIDs := []uint32{999999, 999998, 999997}
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.False(t, isInChain, "non-existent IDs above maxBlockID should return false")
+		assert.False(t, isInChain, "non-existent IDs should return false")
 	})
 
 	t.Run("single block in chain", func(t *testing.T) {
@@ -119,12 +118,11 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, isInChain)
 
-		// Non-existent block IDs above maxBlockID are rejected by the upper-bound
-		// check and correctly return false.
+		// Non-existent IDs not on the chain walk correctly return false.
 		blockIDs = []uint32{9999, 99999}
 		isInChain, err = s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.False(t, isInChain, "non-existent IDs above maxBlockID should return false")
+		assert.False(t, isInChain, "non-existent IDs should return false")
 	})
 
 	t.Run("block not in chain", func(t *testing.T) {
@@ -149,12 +147,11 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		_, _, err = s.StoreBlock(context.Background(), block1, "")
 		require.NoError(t, err)
 
-		// Non-existent block IDs above maxBlockID are rejected by the upper-bound
-		// check and correctly return false.
+		// Non-existent IDs not on the chain walk correctly return false.
 		blockIDs := []uint32{9999} // Non-existent block
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.False(t, isInChain, "non-existent IDs above maxBlockID should return false")
+		assert.False(t, isInChain, "non-existent IDs should return false")
 	})
 
 	t.Run("alternative block in branch", func(t *testing.T) {
@@ -302,8 +299,8 @@ func Test_PostgresCheckIfBlockIsInCurrentChain(t *testing.T) {
 		_, metas, err := s.GetBlockHeaders(context.Background(), block2.Hash(), 2)
 		require.NoError(t, err)
 
-		// Mix of real on-chain IDs and non-existent IDs. Non-existent IDs above
-		// maxBlockID are skipped; the real on-chain ID causes the result to be true.
+		// Mix of real on-chain IDs and non-existent IDs. The chain walk finds
+		// the real on-chain ID, so the result is true (ANY-of semantics).
 		blockIDs := []uint32{metas[0].ID, 9999, 99999}
 		isInChain, err := s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
@@ -345,10 +342,10 @@ func TestSQLiteCheckIfBlockIsInCurrentChain(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, isInChain)
 
-		// Non-existent IDs above maxBlockID are rejected and return false.
+		// Non-existent IDs not on the chain walk correctly return false.
 		blockIDs = []uint32{9999, 99999}
 		isInChain, err = s.CheckBlockIsInCurrentChain(context.Background(), blockIDs)
 		require.NoError(t, err)
-		assert.False(t, isInChain, "non-existent IDs above maxBlockID should return false")
+		assert.False(t, isInChain, "non-existent IDs should return false")
 	})
 }

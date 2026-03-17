@@ -16,7 +16,7 @@ import (
 //
 // Returns true as soon as any block ID passes all checks (ANY-of semantics).
 func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32) (bool, error) {
-	_, _, deferFn := tracing.Tracer("SyncManager").Start(ctx, "sql:CheckIfBlockIsInCurrentChain",
+	ctx, _, deferFn := tracing.Tracer("SyncManager").Start(ctx, "sql:CheckIfBlockIsInCurrentChain",
 		tracing.WithDebugLogMessage(s.logger, "[CheckIfBlockIsInCurrentChain] checking if blocks (%v) are in current chain", blockIDs),
 	)
 	defer deferFn()
@@ -36,8 +36,12 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	s.offChainBlockIDsMu.RUnlock()
 
 	// ANY-of semantics: return true if at least one block is on the main chain.
+	// This matches the old CTE behavior and is required by callers like
+	// BlockValidation.checkOldBlockIDs which passes candidate block IDs for a
+	// transaction across forks and needs true if any candidate is on-chain.
 	for _, id := range blockIDs {
-		if maxID > 0 && id > maxID {
+		// IDs above the highest known block cannot exist in the database.
+		if id > maxID {
 			continue
 		}
 		if _, isOffChain := offChain[id]; !isOffChain {

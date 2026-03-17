@@ -268,6 +268,26 @@ func TestCheckBlockIsInCurrentChain_InMemory_MixedOnChainAndOffChain(t *testing.
 	assert.False(t, result, "Single off-chain block should return false (in-memory path)")
 }
 
+func TestCheckBlockIsInCurrentChain_InMemory_GenesisOnly(t *testing.T) {
+	// When only genesis exists, maxBlockID is 0 (genesis has id=0).
+	// Non-zero IDs should return false, not be incorrectly treated as on-chain.
+	s := newStoreWithInMemoryChainCheck(t)
+	defer s.Close()
+
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{1})
+	require.NoError(t, err)
+	assert.False(t, result, "Non-existent ID should return false when only genesis exists")
+
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{999})
+	require.NoError(t, err)
+	assert.False(t, result, "Non-existent ID should return false when only genesis exists")
+
+	// Genesis block (id=0) should be on-chain
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{0})
+	require.NoError(t, err)
+	assert.True(t, result, "Genesis block should be on-chain")
+}
+
 func TestCheckBlockIsInCurrentChain_InMemory_InvalidatedBlock(t *testing.T) {
 	s := newStoreWithInMemoryChainCheck(t)
 	defer s.Close()

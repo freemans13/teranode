@@ -55,7 +55,9 @@ func (s *SQL) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 	return tips, nil
 }
 
-// getChainTipsUncached uses getBestBlockID and in-memory offChainBlockIDs for branch length.
+// getChainTipsUncached retrieves chain tips directly from the database, bypassing the
+// GetChainTips response cache. Note that getBestBlockID may use its own caching; only the
+// chain-tip query itself is guaranteed fresh. Uses in-memory offChainBlockIDs for branch length.
 func (s *SQL) getChainTipsUncached(ctx context.Context) ([]*model.ChainTip, error) {
 	_, bestHash, err := s.getBestBlockID(ctx)
 	if err != nil {

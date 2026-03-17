@@ -142,7 +142,9 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 			} else {
 				s.lastSuccessfulRebuild.Store(time.Now().Unix())
 			}
-		} else if preBestHash != nil && *block.Header.HashPrevBlock != *preBestHash {
+		} else if preBestHash == nil || *block.Header.HashPrevBlock != *preBestHash {
+			// Case 2: new block is the best but doesn't extend the old best (reorg),
+			// or preBestHash was unavailable — take the conservative path and rebuild.
 			s.resetChainWalkCache()
 			rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
 			defer rebuildCancel()
