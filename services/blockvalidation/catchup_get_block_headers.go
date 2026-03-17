@@ -118,18 +118,18 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 	// height onwards, and findCommonAncestor rejects them all — "no common ancestor found".
 	if u.utxoStore != nil {
 		utxoHeight := u.utxoStore.GetBlockHeight()
-		if utxoHeight > 0 && bestBlockMeta.Height > utxoHeight {
+		if bestBlockMeta.Height > utxoHeight {
 			u.logger.Infof("[catchup][%s] blockchain height %d ahead of UTXO height %d, capping locator",
 				blockUpTo.Hash().String(), bestBlockMeta.Height, utxoHeight)
 
-			utxoBlock, capErr := u.blockchainClient.GetBlockByHeight(ctx, utxoHeight)
-			if capErr == nil {
-				startHash = utxoBlock.Header.Hash()
+			headers, metas, capErr := u.blockchainClient.GetBlockHeadersFromHeight(ctx, utxoHeight, 1)
+			if capErr == nil && len(headers) > 0 && len(metas) > 0 {
+				startHash = headers[0].Hash()
 				startHeight = utxoHeight
-				bestBlockHeader = utxoBlock.Header
-				bestBlockMeta = &model.BlockHeaderMeta{Height: utxoHeight}
+				bestBlockHeader = headers[0]
+				bestBlockMeta = metas[0]
 			} else {
-				u.logger.Warnf("[catchup][%s] failed to get block at UTXO height %d, using blockchain height: %v",
+				u.logger.Warnf("[catchup][%s] failed to get block header at UTXO height %d, using blockchain height: %v",
 					blockUpTo.Hash().String(), utxoHeight, capErr)
 			}
 		}

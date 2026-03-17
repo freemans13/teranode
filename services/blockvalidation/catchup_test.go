@@ -1264,9 +1264,9 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 			nil,
 		)
 
-		// Mock GetBlockByHeight for locator capping (blockchain height 10000 > UTXO height 1018)
-		mockBlockchainClient.On("GetBlockByHeight", mock.Anything, mock.Anything).
-			Return(bestBlock, nil).Maybe()
+		// Mock GetBlockHeadersFromHeight for locator capping (blockchain height 10000 > UTXO height 1018)
+		mockBlockchainClient.On("GetBlockHeadersFromHeight", mock.Anything, uint32(1018), uint32(1)).
+			Return([]*model.BlockHeader{bestBlock.Header}, []*model.BlockHeaderMeta{{Height: 1018}}, nil).Maybe()
 
 		// Mock GetBlockLocator
 		locatorHashes := []*chainhash.Hash{bestBlock.Header.Hash()}
@@ -3074,6 +3074,9 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 	mockBlockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(defaultNBitsCatchup, nil).Maybe()
 	// Mock GetBlockIsMined for parent block verification during validation
 	mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	// Permissive default for locator capping (blockchain height > UTXO height fallback)
+	mockBlockchainClient.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
+		Return(([]*model.BlockHeader)(nil), ([]*model.BlockHeaderMeta)(nil), errors.NewServiceError("not mocked")).Maybe()
 	mockUTXOStore := &utxo.MockUtxostore{}
 
 	bv := &BlockValidation{
@@ -3168,6 +3171,9 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 	mockBlockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(defaultNBitsCatchup, nil).Maybe()
 	// Mock GetBlockIsMined for parent block verification during validation
 	mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	// Permissive default for locator capping (blockchain height > UTXO height fallback)
+	mockBlockchainClient.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
+		Return(([]*model.BlockHeader)(nil), ([]*model.BlockHeaderMeta)(nil), errors.NewServiceError("not mocked")).Maybe()
 	mockUTXOStore := &utxo.MockUtxostore{}
 
 	bv := &BlockValidation{
@@ -3764,4 +3770,100 @@ func TestCatchup_MemoryLimitAfterDuplicateRemoval(t *testing.T) {
 		assert.True(t, lastHeader.Hash().IsEqual(expectedLastHeader.Hash()),
 			"Last header should be header 10000 (unique), not a duplicate of header 9999")
 	}
+}
+
+// TestProof_BlockchainAheadOfUTXO_CausesNoCommonAncestor proves the regression:
+// when the blockchain store is ahead of the UTXO store, findCommonAncestor rejects
+// all headers because they're above the UTXO height, resulting in "no common ancestor".
+// The fix in catchupGetBlockHeaders caps the locator at UTXO height so headers start
+// from a height that findCommonAncestor will accept.
+func TestProof_BlockchainAheadOfUTXO_CausesNoCommonAncestor(t *testing.T) {
+	server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	// Blockchain is at height 200, UTXO is at height 100
+	// This is the divergence scenario that causes the bug
+	mockUTXOStore.On("GetBlockHeight").Return(uint32(100))
+
+	blocks := testhelpers.CreateTestBlockChain(t, 5)
+
+	// Simulate peer headers that all exist in blockchain store but are ABOVE UTXO height
+	// This is what happens when the locator starts from blockchain height (200)
+	// instead of UTXO height (100)
+	peerHeaders := make([]*model.BlockHeader, 3)
+	for i := 0; i < 3; i++ {
+		peerHeaders[i] = blocks[i].Header
+	}
+
+	// All headers exist in blockchain store
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+
+	// But their heights are all above UTXO height (100) — this is the problem
+	for i, header := range peerHeaders {
+		mockBlockchainClient.On("GetBlockHeader", mock.Anything, header.Hash()).Return(
+			header,
+			&model.BlockHeaderMeta{Height: uint32(150 + i)}, // Heights 150, 151, 152 — all > 100
+			nil,
+		)
+	}
+
+	catchupCtx := &CatchupContext{
+		blockUpTo: blocks[4],
+		headersFetchResult: &catchup.Result{
+			Headers: peerHeaders,
+		},
+	}
+
+	err := server.findCommonAncestor(context.Background(), catchupCtx)
+
+	// Without the locator capping fix, findCommonAncestor rejects all headers
+	// because their heights (150+) exceed UTXO height (100)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no common ancestor found")
+}
+
+// TestProof_SameHeight_FindsCommonAncestor is the control case: when blockchain
+// and UTXO heights are aligned, findCommonAncestor succeeds normally.
+func TestProof_SameHeight_FindsCommonAncestor(t *testing.T) {
+	server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	// Both stores at height 100 — no divergence
+	mockUTXOStore.On("GetBlockHeight").Return(uint32(100))
+
+	blocks := testhelpers.CreateTestBlockChain(t, 5)
+
+	// Peer headers at or below UTXO height
+	peerHeaders := make([]*model.BlockHeader, 3)
+	for i := 0; i < 3; i++ {
+		peerHeaders[i] = blocks[i].Header
+	}
+
+	// First two headers exist in our chain at heights within UTXO range
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, peerHeaders[0].Hash()).Return(true, nil)
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, peerHeaders[1].Hash()).Return(true, nil)
+	// Third header doesn't exist — this is where our chain diverges
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, peerHeaders[2].Hash()).Return(false, nil)
+
+	// Heights are at or below UTXO height
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[0].Hash()).Return(
+		peerHeaders[0], &model.BlockHeaderMeta{Height: 98}, nil,
+	)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[1].Hash()).Return(
+		peerHeaders[1], &model.BlockHeaderMeta{Height: 99}, nil,
+	)
+
+	catchupCtx := &CatchupContext{
+		blockUpTo: blocks[4],
+		headersFetchResult: &catchup.Result{
+			Headers: peerHeaders,
+		},
+	}
+
+	err := server.findCommonAncestor(context.Background(), catchupCtx)
+
+	// With aligned heights, findCommonAncestor finds peerHeaders[1] at height 99
+	require.NoError(t, err)
+	assert.Equal(t, 1, catchupCtx.commonAncestorIndex)
+	assert.Equal(t, uint32(99), catchupCtx.commonAncestorMeta.Height)
 }
