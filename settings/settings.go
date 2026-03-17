@@ -429,6 +429,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MaxMinedRoutines:                   getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
 			MaxMinedBatchSize:                  getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment:     getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
+			BatchSQLOperations:                 getBool("utxostore_batch_sql_operations", true, alternativeContext...),
 			DisableDAHCleaner:                  getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 			ReAssignedUtxoSpendableAfterBlocks: getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
 		},

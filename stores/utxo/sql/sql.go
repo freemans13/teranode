@@ -350,8 +350,154 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 		return nil, errors.NewStorageError("Failed to insert transaction", err)
 	}
 
-	// Insert the inputs...
-	q = `
+	// Insert inputs, outputs, and block_ids — use batched or per-row depending on setting
+	if s.settings.UtxoStore.BatchSQLOperations {
+		if err = s.createInputsBatched(ctx, txn, transactionID, tx); err != nil {
+			return nil, err
+		}
+		if err = s.createOutputsBatched(ctx, txn, transactionID, txHash, tx, isCoinbase, blockHeight); err != nil {
+			return nil, err
+		}
+		if len(options.MinedBlockInfos) > 0 {
+			if err = s.createBlockIDsBatched(ctx, txn, transactionID, options.MinedBlockInfos); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		if err = s.createInputsPerRow(ctx, txn, transactionID, tx); err != nil {
+			return nil, err
+		}
+		if err = s.createOutputsPerRow(ctx, txn, transactionID, txHash, tx, isCoinbase, blockHeight); err != nil {
+			return nil, err
+		}
+		if len(options.MinedBlockInfos) > 0 {
+			if err = s.createBlockIDsPerRow(ctx, txn, transactionID, options.MinedBlockInfos); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if txMeta.Conflicting {
+		if err = s.updateParentConflictingChildren(ctx, transactionID, tx, txn); err != nil {
+			return nil, err
+		}
+	}
+
+	if err = txn.Commit(); err != nil {
+		return nil, err
+	}
+
+	return txMeta, nil
+}
+
+// createInputsBatched inserts all transaction inputs in a single multi-value INSERT.
+func (s *Store) createInputsBatched(ctx context.Context, txn *sql.Tx, transactionID int, tx *bt.Tx) error {
+	if len(tx.Inputs) == 0 {
+		return nil
+	}
+
+	const colsPerRow = 8
+	baseSQL := `INSERT INTO inputs (transaction_id,idx,previous_transaction_hash,previous_tx_idx,previous_tx_satoshis,previous_tx_script,unlocking_script,sequence_number) VALUES `
+	q := buildMultiValueInsert(baseSQL, colsPerRow, len(tx.Inputs), 1)
+
+	args := make([]interface{}, 0, len(tx.Inputs)*colsPerRow)
+	for i, input := range tx.Inputs {
+		args = append(args,
+			transactionID,
+			i,
+			input.PreviousTxIDChainHash()[:],
+			input.PreviousTxOutIndex,
+			input.PreviousTxSatoshis,
+			input.PreviousTxScript,
+			input.UnlockingScript,
+			input.SequenceNumber,
+		)
+	}
+
+	_, err := txn.ExecContext(ctx, q, args...)
+	if err != nil {
+		return classifyInsertError(err, tx.IsCoinbase(), "input")
+	}
+	return nil
+}
+
+// createOutputsBatched inserts all transaction outputs in a single multi-value INSERT.
+func (s *Store) createOutputsBatched(ctx context.Context, txn *sql.Tx, transactionID int, txHash *chainhash.Hash, tx *bt.Tx, isCoinbase bool, blockHeight uint32) error {
+	// Count non-nil outputs
+	var outputCount int
+	for _, output := range tx.Outputs {
+		if output != nil {
+			outputCount++
+		}
+	}
+	if outputCount == 0 {
+		return nil
+	}
+
+	var coinbaseSpendingHeight uint32
+	if isCoinbase {
+		coinbaseSpendingHeight = blockHeight + uint32(s.settings.ChainCfgParams.CoinbaseMaturity)
+	}
+
+	const colsPerRow = 7
+	baseSQL := `INSERT INTO outputs (transaction_id,idx,locking_script,satoshis,coinbase_spending_height,utxo_hash,spending_data) VALUES `
+	q := buildMultiValueInsert(baseSQL, colsPerRow, outputCount, 1)
+
+	args := make([]interface{}, 0, outputCount*colsPerRow)
+	for i, output := range tx.Outputs {
+		if output == nil {
+			continue
+		}
+
+		iUint32, err := safeconversion.IntToUint32(i)
+		if err != nil {
+			return err
+		}
+
+		utxoHash, err := util.UTXOHashFromOutput(txHash, output, iUint32)
+		if err != nil {
+			return err
+		}
+
+		args = append(args,
+			transactionID,
+			i,
+			output.LockingScript,
+			output.Satoshis,
+			coinbaseSpendingHeight,
+			utxoHash[:],
+			nil,
+		)
+	}
+
+	_, err := txn.ExecContext(ctx, q, args...)
+	if err != nil {
+		return classifyInsertError(err, tx.IsCoinbase(), "output")
+	}
+	return nil
+}
+
+// createBlockIDsBatched inserts all block_ids in a single multi-value INSERT.
+func (s *Store) createBlockIDsBatched(ctx context.Context, txn *sql.Tx, transactionID int, blockInfos []utxo.MinedBlockInfo) error {
+	const colsPerRow = 4
+	baseSQL := `INSERT INTO block_ids (transaction_id,block_id,block_height,subtree_idx) VALUES `
+	q := buildMultiValueInsert(baseSQL, colsPerRow, len(blockInfos), 1)
+
+	args := make([]interface{}, 0, len(blockInfos)*colsPerRow)
+	for _, blockMeta := range blockInfos {
+		args = append(args, transactionID, blockMeta.BlockID, blockMeta.BlockHeight, blockMeta.SubtreeIdx)
+	}
+
+	_, err := txn.ExecContext(ctx, q, args...)
+	if err != nil {
+		return classifyInsertError(err, false, "block_ids")
+	}
+	return nil
+}
+
+// createInputsPerRow inserts transaction inputs one row at a time (original behavior).
+func (s *Store) createInputsPerRow(ctx context.Context, txn *sql.Tx, transactionID int, tx *bt.Tx) error {
+	q := `
 		INSERT INTO inputs (
 		 transaction_id
 		,idx
@@ -372,13 +518,10 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 		,$8
 		)
 	`
-
 	for i, input := range tx.Inputs {
-		_, err = txn.ExecContext(
-			ctx,
-			q,
-			transactionID,
-			i,
+		_, err := txn.ExecContext(
+			ctx, q,
+			transactionID, i,
 			input.PreviousTxIDChainHash()[:],
 			input.PreviousTxOutIndex,
 			input.PreviousTxSatoshis,
@@ -387,18 +530,15 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 			input.SequenceNumber,
 		)
 		if err != nil {
-			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-				return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v): %v", tx.IsCoinbase(), err)
-			} else if sqliteErr, ok := err.(*sqlite.Error); ok && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
-				return nil, errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v): %v", tx.IsCoinbase(), sqliteErr)
-			}
-
-			return nil, errors.NewStorageError("Failed to insert input", err)
+			return classifyInsertError(err, tx.IsCoinbase(), "input")
 		}
 	}
+	return nil
+}
 
-	// Insert the outputs...
-	q = `
+// createOutputsPerRow inserts transaction outputs one row at a time (original behavior).
+func (s *Store) createOutputsPerRow(ctx context.Context, txn *sql.Tx, transactionID int, txHash *chainhash.Hash, tx *bt.Tx, isCoinbase bool, blockHeight uint32) error {
+	q := `
 		INSERT INTO outputs (
 		 transaction_id
 		,idx
@@ -419,87 +559,74 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 	`
 
 	var coinbaseSpendingHeight uint32
-
 	if isCoinbase {
 		coinbaseSpendingHeight = blockHeight + uint32(s.settings.ChainCfgParams.CoinbaseMaturity)
 	}
 
 	for i, output := range tx.Outputs {
-		if output != nil {
-			iUint32, err := safeconversion.IntToUint32(i)
-			if err != nil {
-				return nil, err
-			}
+		if output == nil {
+			continue
+		}
 
-			utxoHash, err := util.UTXOHashFromOutput(txHash, output, iUint32)
-			if err != nil {
-				return nil, err
-			}
+		iUint32, err := safeconversion.IntToUint32(i)
+		if err != nil {
+			return err
+		}
 
-			_, err = txn.ExecContext(
-				ctx,
-				q,
-				transactionID,
-				i,
-				output.LockingScript,
-				output.Satoshis,
-				coinbaseSpendingHeight,
-				utxoHash[:],
-				nil,
-			)
-			if err != nil {
-				if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-					return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v): %v", tx.IsCoinbase(), err)
-				} else if sqliteErr, ok := err.(*sqlite.Error); ok && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
-					return nil, errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v): %v", tx.IsCoinbase(), sqliteErr)
-				}
+		utxoHash, err := util.UTXOHashFromOutput(txHash, output, iUint32)
+		if err != nil {
+			return err
+		}
 
-				return nil, errors.NewStorageError("Failed to insert output", err)
-			}
+		_, err = txn.ExecContext(
+			ctx, q,
+			transactionID, i,
+			output.LockingScript,
+			output.Satoshis,
+			coinbaseSpendingHeight,
+			utxoHash[:],
+			nil,
+		)
+		if err != nil {
+			return classifyInsertError(err, tx.IsCoinbase(), "output")
 		}
 	}
+	return nil
+}
 
-	if len(options.MinedBlockInfos) > 0 {
-		// Insert the block_ids...
-		q = `
-			INSERT INTO block_ids (
-		 	 transaction_id
-			,block_id
-			,block_height
-			,subtree_idx
-			) VALUES (
-			 $1
-			,$2
-			,$3
-			,$4
-			)
-		`
-
-		for _, blockMeta := range options.MinedBlockInfos {
-			_, err = txn.ExecContext(ctx, q, transactionID, blockMeta.BlockID, blockMeta.BlockHeight, blockMeta.SubtreeIdx)
-			if err != nil {
-				if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-					return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v): %v", tx.IsCoinbase(), err)
-				} else if sqliteErr, ok := err.(*sqlite.Error); ok && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
-					return nil, errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v): %v", tx.IsCoinbase(), sqliteErr)
-				}
-
-				return nil, errors.NewStorageError("Failed to insert block_ids", err)
-			}
+// createBlockIDsPerRow inserts block_ids one row at a time (original behavior).
+func (s *Store) createBlockIDsPerRow(ctx context.Context, txn *sql.Tx, transactionID int, blockInfos []utxo.MinedBlockInfo) error {
+	q := `
+		INSERT INTO block_ids (
+		 transaction_id
+		,block_id
+		,block_height
+		,subtree_idx
+		) VALUES (
+		 $1
+		,$2
+		,$3
+		,$4
+		)
+	`
+	for _, blockMeta := range blockInfos {
+		_, err := txn.ExecContext(ctx, q, transactionID, blockMeta.BlockID, blockMeta.BlockHeight, blockMeta.SubtreeIdx)
+		if err != nil {
+			return classifyInsertError(err, false, "block_ids")
 		}
 	}
+	return nil
+}
 
-	if txMeta.Conflicting {
-		if err = s.updateParentConflictingChildren(ctx, transactionID, tx, txn); err != nil {
-			return nil, err
-		}
+// classifyInsertError converts constraint violation errors into appropriate typed errors.
+func classifyInsertError(err error, isCoinbase bool, entity string) error {
+	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		return errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v): %v", isCoinbase, err)
 	}
-
-	if err = txn.Commit(); err != nil {
-		return nil, err
+	if sqliteErr, ok := err.(*sqlite.Error); ok && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+		return errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v): %v", isCoinbase, sqliteErr)
 	}
-
-	return txMeta, nil
+	return errors.NewStorageError("Failed to insert %s", entity, err)
 }
 
 func (s *Store) updateParentConflictingChildren(ctx context.Context, transactionID int, tx *bt.Tx, txn *sql.Tx) error {
@@ -1025,6 +1152,264 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 // Returns false if the batch completed (success or non-retryable error) and results
 // have been sent to all item errCh channels.
 func (s *Store) trySendSpendBatch(batch []*batchSpend) (retryable bool) {
+	if s.settings.UtxoStore.BatchSQLOperations && s.engine == "postgres" {
+		return s.trySendSpendBatchBulk(batch)
+	}
+	return s.trySendSpendBatchPerRow(batch)
+}
+
+// spendSelectResult holds the result of a bulk SELECT for a single spend item.
+type spendSelectResult struct {
+	batchIdx               int
+	transactionID          int
+	coinbaseSpendingHeight uint32
+	utxoHash               []byte
+	spendingDataBytes      []byte
+	frozen                 bool
+	conflicting            bool
+	locked                 bool
+	spendableIn            *uint32
+}
+
+// trySendSpendBatchBulk uses bulk SELECT + bulk UPDATE for PostgreSQL.
+func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
+	txn, err := s.db.BeginTx(s.ctx, nil)
+	if err != nil {
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] failed to begin transaction", err)
+		}
+		return false
+	}
+	defer func() {
+		_ = txn.Rollback()
+	}()
+
+	// Phase 1: Bulk SELECT — fetch all output states in one query
+	// Build VALUES list: (hash, idx, batch_idx)
+	var sb strings.Builder
+	sb.WriteString(`
+		SELECT v.batch_idx,
+		       o.transaction_id, o.coinbase_spending_height, o.utxo_hash,
+		       o.spending_data, o.frozen OR t.frozen AS frozen, t.conflicting, t.locked, o.spendableIn
+		FROM (VALUES `)
+	args := make([]interface{}, 0, len(batch)*3)
+	paramIdx := 1
+	for i, item := range batch {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(fmt.Sprintf("($%d::bytea,$%d::int,$%d::int)", paramIdx, paramIdx+1, paramIdx+2))
+		args = append(args, item.spend.TxID[:], item.spend.Vout, i)
+		paramIdx += 3
+	}
+	sb.WriteString(`) AS v(hash,idx,batch_idx)
+		JOIN transactions t ON t.hash = v.hash
+		JOIN outputs o ON o.transaction_id = t.id AND o.idx = v.idx`)
+
+	rows, err := txn.QueryContext(s.ctx, sb.String(), args...)
+	if err != nil {
+		if isDeadlock(err) {
+			return true
+		}
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] failed: bulk SELECT outputs", err)
+		}
+		return false
+	}
+
+	// Parse results into a map by batch index
+	resultMap := make(map[int]*spendSelectResult, len(batch))
+	for rows.Next() {
+		r := &spendSelectResult{}
+		if err := rows.Scan(&r.batchIdx, &r.transactionID, &r.coinbaseSpendingHeight,
+			&r.utxoHash, &r.spendingDataBytes, &r.frozen, &r.conflicting, &r.locked, &r.spendableIn); err != nil {
+			rows.Close()
+			if isDeadlock(err) {
+				return true
+			}
+			for _, item := range batch {
+				item.errCh <- errors.NewStorageError("[Spend] failed: scanning bulk SELECT results", err)
+			}
+			return false
+		}
+		resultMap[r.batchIdx] = r
+	}
+	if err := rows.Close(); err != nil {
+		if isDeadlock(err) {
+			return true
+		}
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] failed: closing bulk SELECT results", err)
+		}
+		return false
+	}
+
+	// Phase 2: Validate each item and build the bulk UPDATE set
+	validationErrors := make(map[int]error, len(batch))
+	type updateItem struct {
+		batchIdx      int
+		transactionID int
+		vout          uint32
+		spendingData  []byte
+	}
+	var toUpdate []updateItem
+
+	for i, item := range batch {
+		spend := item.spend
+		r, found := resultMap[i]
+		if !found {
+			validationErrors[i] = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+			continue
+		}
+
+		if r.frozen {
+			validationErrors[i] = errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
+			continue
+		}
+		if r.conflicting && !item.ignoreConflicting {
+			validationErrors[i] = errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
+			continue
+		}
+		if r.locked && !item.ignoreLocked {
+			validationErrors[i] = errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
+			continue
+		}
+		if r.spendableIn != nil && *r.spendableIn > 0 && item.blockHeight < *r.spendableIn {
+			validationErrors[i] = errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *r.spendableIn)
+			continue
+		}
+
+		// Check if already spent by a different transaction
+		if len(r.spendingDataBytes) > 0 {
+			if spend.SpendingData != nil && !bytes.Equal(r.spendingDataBytes, spend.SpendingData.Bytes()) {
+				existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(r.spendingDataBytes)
+				if parseErr != nil {
+					validationErrors[i] = errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+					continue
+				}
+				validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
+				continue
+			}
+			// Idempotent re-spend: same spending data — treat as success without UPDATE
+			continue
+		}
+
+		if !bytes.Equal(r.utxoHash, spend.UTXOHash[:]) {
+			validationErrors[i] = errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
+			continue
+		}
+		if r.coinbaseSpendingHeight > 0 && r.coinbaseSpendingHeight > item.blockHeight {
+			validationErrors[i] = errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d", spend.TxID, spend.Vout, r.coinbaseSpendingHeight, item.blockHeight)
+			continue
+		}
+
+		toUpdate = append(toUpdate, updateItem{
+			batchIdx:      i,
+			transactionID: r.transactionID,
+			vout:          spend.Vout,
+			spendingData:  spend.SpendingData.Bytes(),
+		})
+	}
+
+	// Phase 3: Bulk UPDATE with optimistic locking
+	updatedSet := make(map[int]bool) // batchIdx -> updated
+	if len(toUpdate) > 0 {
+		var ub strings.Builder
+		ub.WriteString(`
+			UPDATE outputs o
+			SET spending_data = v.spending_data
+			FROM (VALUES `)
+		updateArgs := make([]interface{}, 0, len(toUpdate)*4)
+		pidx := 1
+		for j, u := range toUpdate {
+			if j > 0 {
+				ub.WriteByte(',')
+			}
+			ub.WriteString(fmt.Sprintf("($%d::int,$%d::int,$%d::bytea,$%d::int)", pidx, pidx+1, pidx+2, pidx+3))
+			updateArgs = append(updateArgs, u.transactionID, u.vout, u.spendingData, u.batchIdx)
+			pidx += 4
+		}
+		ub.WriteString(`) AS v(transaction_id,idx,spending_data,batch_idx)
+			WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx AND o.spending_data IS NULL
+			RETURNING v.batch_idx`)
+
+		uRows, err := txn.QueryContext(s.ctx, ub.String(), updateArgs...)
+		if err != nil {
+			if isDeadlock(err) {
+				return true
+			}
+			for i, item := range batch {
+				if valErr, ok := validationErrors[i]; ok {
+					item.errCh <- valErr
+				} else {
+					item.errCh <- errors.NewStorageError("[Spend] failed: bulk UPDATE outputs", err)
+				}
+			}
+			return false
+		}
+
+		for uRows.Next() {
+			var bIdx int
+			if err := uRows.Scan(&bIdx); err != nil {
+				uRows.Close()
+				if isDeadlock(err) {
+					return true
+				}
+				for _, item := range batch {
+					item.errCh <- errors.NewStorageError("[Spend] failed: scanning bulk UPDATE results", err)
+				}
+				return false
+			}
+			updatedSet[bIdx] = true
+		}
+		if err := uRows.Close(); err != nil {
+			if isDeadlock(err) {
+				return true
+			}
+			for _, item := range batch {
+				item.errCh <- errors.NewStorageError("[Spend] failed: closing bulk UPDATE results", err)
+			}
+			return false
+		}
+
+		// Check for items that were not updated (concurrent spend between SELECT and UPDATE)
+		for _, u := range toUpdate {
+			if !updatedSet[u.batchIdx] {
+				spend := batch[u.batchIdx].spend
+				validationErrors[u.batchIdx] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
+			}
+		}
+	}
+
+	// Commit
+	if err := txn.Commit(); err != nil {
+		if isDeadlock(err) {
+			return true
+		}
+		for i, item := range batch {
+			if valErr, ok := validationErrors[i]; ok {
+				item.errCh <- valErr
+			} else {
+				item.errCh <- errors.NewStorageError("[Spend] failed to commit transaction", err)
+			}
+		}
+		return false
+	}
+
+	// Signal results
+	for i, item := range batch {
+		if valErr, ok := validationErrors[i]; ok {
+			item.errCh <- valErr
+		} else {
+			item.errCh <- nil // success
+		}
+	}
+	return false
+}
+
+// trySendSpendBatchPerRow processes a spend batch with per-row SELECT+UPDATE (original behavior).
+// Used for SQLite or when BatchSQLOperations is disabled.
+func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 	txn, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
 		for _, item := range batch {
@@ -3348,6 +3733,34 @@ func buildINClause(hashes [][]byte, startIdx int) (string, []interface{}) {
 		args[i] = h
 	}
 	return "(" + strings.Join(placeholders, ",") + ")", args
+}
+
+// buildMultiValueInsert generates a multi-row VALUES clause with positional parameters.
+// baseSQL is the INSERT ... VALUES prefix (without the actual values).
+// colsPerRow is the number of columns per row.
+// numRows is the number of rows to insert.
+// Returns the full SQL string and the starting parameter index for args population.
+// Example: buildMultiValueInsert("INSERT INTO t (a,b) VALUES ", 2, 3, 1)
+// -> "INSERT INTO t (a,b) VALUES ($1,$2),($3,$4),($5,$6)"
+func buildMultiValueInsert(baseSQL string, colsPerRow, numRows, startIdx int) string {
+	var sb strings.Builder
+	sb.WriteString(baseSQL)
+	paramIdx := startIdx
+	for row := 0; row < numRows; row++ {
+		if row > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('(')
+		for col := 0; col < colsPerRow; col++ {
+			if col > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(fmt.Sprintf("$%d", paramIdx))
+			paramIdx++
+		}
+		sb.WriteByte(')')
+	}
+	return sb.String()
 }
 
 // isLockError checks if the error is a database lock/deadlock error
