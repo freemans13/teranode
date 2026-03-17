@@ -1330,7 +1330,8 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			pidx += 4
 		}
 		ub.WriteString(`) AS v(transaction_id,idx,spending_data,batch_idx)
-			WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx AND o.spending_data IS NULL
+			WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx
+			AND (o.spending_data IS NULL OR o.spending_data = v.spending_data)
 			RETURNING v.batch_idx`)
 
 		uRows, err := txn.QueryContext(s.ctx, ub.String(), updateArgs...)

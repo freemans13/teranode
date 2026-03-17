@@ -600,12 +600,14 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 
 							return nil, err
 						}
+						// GetMeta succeeded — tx already exists, treat as conflicting
+					} else {
+						// Non-TxExists error from CreateInUtxoStore
+						err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed for conflicting tx", txID, utxoMapErr)
+						span.RecordError(err)
+
+						return nil, err
 					}
-
-					err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, utxoMapErr)
-					span.RecordError(err)
-
-					return txMetaData, err
 				}
 
 				// We successfully added the tx to the utxo store as a conflicting tx,
