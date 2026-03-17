@@ -768,7 +768,7 @@ func TestSetTTL(t *testing.T) {
 	assert.Nil(t, tombstoneMillis)
 
 	// Now mark the tx as mined (add block_id and clear unmined_since) to simulate being on longest chain
-	_, err = txn.ExecContext(ctx, "INSERT INTO block_ids (transaction_id, block_id, block_height, subtree_idx) VALUES ($1, $2, $3, $4)", transactionID, tx.TxIDChainHash()[:], 100, 0)
+	_, err = txn.ExecContext(ctx, "INSERT INTO block_ids (transaction_id, block_id, block_height, subtree_idx) VALUES ($1, $2, $3, $4)", transactionID, 100, 100, 0)
 	require.NoError(t, err)
 	_, err = txn.ExecContext(ctx, "UPDATE transactions SET unmined_since = NULL WHERE id = $1", transactionID)
 	require.NoError(t, err)

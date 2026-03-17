@@ -994,10 +994,8 @@ func isDeadlock(err error) bool {
 // the timeout fires. Same SQL for both PostgreSQL and SQLite.
 // Mirrors aerospike/spend.go sendSpendBatchLua.
 //
-// Two-phase design:
-//
-//	Phase 1: SELECT + UPDATE outputs (validates and marks each output as spent)
-//	Phase 2: UPDATE transactions for DAH, deduplicated and sorted by transaction_id
+// Single-phase design: SELECT + UPDATE outputs (validates and marks each output as spent).
+// DAH updates are handled separately by SetMinedMulti and setDAH, not during Spend.
 //
 // The batcher is configured with background=false so batch callbacks are serialized.
 // This prevents PostgreSQL deadlocks that occur when concurrent batches lock
@@ -1172,7 +1170,9 @@ func (s *Store) trySendSpendBatch(batch []*batchSpend) (retryable bool) {
 				successItems = append(successItems, item)
 				continue
 			}
-			// Concurrently spent by a different tx
+			// Concurrently spent by a different tx between SELECT and UPDATE.
+			// spendingDataBytes was NULL from SELECT (WHERE spending_data IS NULL),
+			// so we don't have the actual conflicting spender — use current spend data.
 			validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
 			continue
 		}
@@ -1888,7 +1888,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	// Mark not-found transactions
 	for _, item := range items {
 		if _, found := hashToTx[item.Hash]; !found {
-			item.Err = errors.NewTxNotFoundError("transaction %s not found", &item.Hash, nil)
+			item.Err = errors.NewTxNotFoundError("transaction %s not found", &item.Hash)
 		}
 	}
 
