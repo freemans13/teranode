@@ -48,7 +48,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1062,11 +1061,8 @@ func (s *Store) trySendSpendBatch(batch []*batchSpend) (retryable bool) {
 		AND spending_data IS NULL
 	`
 
-	retention := s.settings.GetUtxoStoreBlockHeightRetention()
-
 	successItems := make([]*batchSpend, 0, len(batch))
 	validationErrors := make(map[int]error) // index -> validation error (non-retryable)
-	dahTxIDs := make(map[int]uint32)        // transaction_id -> max blockHeight for DAH calculation
 	aborted := false
 
 	// Phase 1: SELECT + validate + UPDATE outputs
@@ -1182,13 +1178,6 @@ func (s *Store) trySendSpendBatch(batch []*batchSpend) (retryable bool) {
 		}
 
 		successItems = append(successItems, item)
-		if retention > 0 {
-			// Track the max blockHeight per parent transaction_id for DAH calculation.
-			// Matches Aerospike which uses the spend caller's blockHeight, not the global store height.
-			if existing, ok := dahTxIDs[transactionID]; !ok || item.blockHeight > existing {
-				dahTxIDs[transactionID] = item.blockHeight
-			}
-		}
 	}
 
 	// If aborted, roll back — send errors for items not yet notified
@@ -1204,51 +1193,6 @@ func (s *Store) trySendSpendBatch(batch []*batchSpend) (retryable bool) {
 			item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DB error")
 		}
 		return false
-	}
-
-	// Phase 2: DAH updates — sorted by transaction_id for consistent lock ordering
-	if len(dahTxIDs) > 0 {
-		sortedIDs := make([]int, 0, len(dahTxIDs))
-		for id := range dahTxIDs {
-			sortedIDs = append(sortedIDs, id)
-		}
-		sort.Ints(sortedIDs)
-
-		qDAH := `
-			UPDATE transactions
-			SET delete_at_height = CASE
-				WHEN preserve_until IS NOT NULL THEN delete_at_height
-				WHEN conflicting AND delete_at_height IS NULL THEN $2
-				WHEN NOT EXISTS(SELECT 1 FROM outputs o WHERE o.transaction_id = $1 AND o.spending_data IS NULL)
-				     AND EXISTS(SELECT 1 FROM block_ids WHERE transaction_id = $1)
-				     AND unmined_since IS NULL
-				     AND (delete_at_height IS NULL OR delete_at_height < $2)
-				     THEN $2
-				ELSE delete_at_height
-			END
-			WHERE id = $1
-		`
-
-		for _, txID := range sortedIDs {
-			// Use the spend caller's blockHeight (not global store height) to match Aerospike behavior.
-			// Aerospike Lua: newDeleteHeight = currentBlockHeight + blockHeightRetention
-			newDAH := int64(dahTxIDs[txID]) + int64(retention)
-			if _, err = txn.ExecContext(s.ctx, qDAH, txID, newDAH); err != nil {
-				if isDeadlock(err) {
-					return true // retryable
-				}
-				// DAH failure — roll back the entire batch
-				for i, item := range batch {
-					if valErr, ok := validationErrors[i]; ok {
-						item.errCh <- valErr
-					}
-				}
-				for _, item := range successItems {
-					item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DAH update error", err)
-				}
-				return false
-			}
-		}
 	}
 
 	// Commit
