@@ -794,25 +794,26 @@ func TestClient_Store_BatchMode_MaxConcurrent(t *testing.T) {
 		}()
 	}
 
-	// Wait for concurrent calls to reach the limit
+	// Wait for exactly 2 concurrent calls to be blocked at the gate
 	require.Eventually(t, func() bool {
-		return concurrentCalls.Load() >= 2
-	}, 2*time.Second, 10*time.Millisecond, "should reach max concurrent")
+		return concurrentCalls.Load() == 2
+	}, 2*time.Second, 10*time.Millisecond, "should reach max concurrent of 2")
 
-	// Give time for a third batch to start (it shouldn't exceed max)
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify we don't exceed maxConcurrent
-	require.LessOrEqual(t, maxConcurrentSeen.Load(), int32(2),
-		"concurrent calls should not exceed maxConcurrent=2")
+	// With 2 calls blocked at the gate, exactly 2 should have started (3rd is queued by the limiter)
+	require.Equal(t, int32(2), callCount.Load(),
+		"only 2 batches should have started while at max concurrency")
 
 	// Release all blocked calls
 	close(gate)
 
-	// Wait for all batches to complete
+	// Wait for all 3 batches to complete (the queued 3rd batch should now proceed)
 	require.Eventually(t, func() bool {
 		return callCount.Load() >= 3
-	}, 2*time.Second, 10*time.Millisecond, "all batches should complete")
+	}, 2*time.Second, 10*time.Millisecond, "all batches should complete after gate opens")
+
+	// Verify concurrency never exceeded the limit
+	require.LessOrEqual(t, maxConcurrentSeen.Load(), int32(2),
+		"concurrent calls should never exceed maxConcurrent=2")
 }
 
 func TestNewClientWithAddress_ConfigErrors(t *testing.T) {

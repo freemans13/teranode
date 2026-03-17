@@ -73,7 +73,7 @@ type ConnectionOptions struct {
 	CertFile         string              // CA cert file if SecurityLevel > 0
 	CaCertFile       string              // CA cert file if SecurityLevel > 0
 	KeyFile          string              // Client key file if SecurityLevel > 1
-	MaxRetries       int                 // Max number of retries for transient errors
+	MaxRetries       int                 // Total number of attempts including the initial call (e.g. 3 = 1 initial + 2 retries)
 	RetryBackoff     time.Duration       // Backoff between retries
 	Credentials      PasswordCredentials // Credentials to pass to downstream middleware (optional)
 	MaxConnectionAge time.Duration       // The maximum amount of time a connection may exist before it will be closed by sending a GoAway
@@ -84,8 +84,8 @@ type ConnectionOptions struct {
 // grpcClientRetriesTotal tracks gRPC client retry attempts by caller service and status code.
 // This counter increments each time a gRPC call is retried (not on the initial attempt),
 // providing visibility into retry pressure across service-to-service communication.
-// Constructed in init() so the pointer is set before any gRPC client goroutine runs,
-// but registered with Prometheus in RegisterPrometheusMetrics() to keep registration explicit.
+// Constructed at package-level var initialization so the pointer is available before any
+// gRPC client goroutine runs. Registered with Prometheus in RegisterPrometheusMetrics().
 var grpcClientRetriesTotal = prometheusgolang.NewCounterVec(
 	prometheusgolang.CounterOpts{
 		Namespace: "teranode",
@@ -336,16 +336,17 @@ func RegisterPrometheusMetrics() {
 
 // retryInterceptor creates a gRPC unary client interceptor that implements retry logic
 // for transient errors. It retries requests that fail with codes.Unavailable or
-// codes.DeadlineExceeded up to the specified maximum number of times, with a fixed
-// backoff delay between attempts.
+// codes.DeadlineExceeded, with a fixed backoff delay between attempts.
 //
 // Parameters:
-//   - maxRetries: Maximum number of retry attempts
+//   - maxAttempts: Total number of attempts including the initial call (e.g. 3 means 1 initial + 2 retries).
+//     The grpc_client_retries_total metric increments only for actual retries (up to maxAttempts-1 per call).
 //   - retryBackoff: Time to wait between retry attempts
+//   - callerName: Service name label for the grpc_client_retries_total Prometheus counter
 //
 // Returns:
 //   - grpc.UnaryClientInterceptor: Interceptor function that wraps requests with retry logic
-func retryInterceptor(maxRetries int, retryBackoff time.Duration, callerName string) grpc.UnaryClientInterceptor {
+func retryInterceptor(maxAttempts int, retryBackoff time.Duration, callerName string) grpc.UnaryClientInterceptor {
 	return func(
 		ctx context.Context,
 		method string,
@@ -356,7 +357,7 @@ func retryInterceptor(maxRetries int, retryBackoff time.Duration, callerName str
 	) error {
 		var err error
 
-		for i := 0; i < maxRetries; i++ {
+		for i := 0; i < maxAttempts; i++ {
 			err = invoker(ctx, method, req, reply, cc, opts...)
 			if err == nil {
 				return nil
@@ -368,7 +369,7 @@ func retryInterceptor(maxRetries int, retryBackoff time.Duration, callerName str
 			}
 
 			// Only count and sleep if there is a subsequent attempt
-			if i < maxRetries-1 {
+			if i < maxAttempts-1 {
 				grpcClientRetriesTotal.WithLabelValues(callerName, status.Code(err).String()).Inc()
 				time.Sleep(retryBackoff)
 			}
