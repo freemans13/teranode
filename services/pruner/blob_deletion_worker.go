@@ -140,13 +140,14 @@ func (s *Server) processBlobDeletionsAtHeight(blockHeight uint32, blockHash chai
 				}
 			} else {
 				completedIDs = append(completedIDs, deletion.Id)
+				storeID := storetypes.BlobStoreType(deletion.StoreType).String()
 				switch result {
 				case deletionDeleted:
 					deletedCount++
 					blobDeletionProcessedTotal.Inc()
 				case deletionNotFound:
 					notFoundCount++
-					blobDeletionNotFoundTotal.Inc()
+					blobDeletionNotFoundTotal.WithLabelValues(storeID).Inc()
 				}
 			}
 		}

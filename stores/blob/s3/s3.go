@@ -337,9 +337,15 @@ func (g *S3) Set(ctx context.Context, key []byte, fileType fileformat.FileType, 
 // SetDAH is intentionally a no-op for S3. S3 is used exclusively as permanent storage —
 // only the block persister promotes blobs to S3 with DAH=0 (permanent). Blobs in S3
 // are never scheduled for automatic deletion by block height.
+// A non-zero DAH is logged as a warning to surface accidental attempts to apply finite
+// retention to S3, which would otherwise be silently ignored.
 func (g *S3) SetDAH(ctx context.Context, key []byte, fileType fileformat.FileType, dah uint32, opts ...options.FileOption) error {
 	_, _, endSpan := tracing.Tracer("s3").Start(ctx, "s3:SetDAH")
 	defer endSpan()
+
+	if dah != 0 {
+		g.logger.Warnf("[S3][SetDAH] non-zero DAH (%d) requested for key=%x — S3 is permanent storage, DAH is not applied", dah, key)
+	}
 
 	return nil
 }
