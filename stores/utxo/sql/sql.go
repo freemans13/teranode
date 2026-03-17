@@ -1679,7 +1679,7 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 		}
 		var h chainhash.Hash
 		copy(h[:], hb)
-		if blockID != nil && *blockID > 0 {
+		if blockID != nil {
 			blockIDsMap[h] = append(blockIDsMap[h], *blockID)
 		} else if _, exists := blockIDsMap[h]; !exists {
 			// Ensure the hash is in the map even with no block_ids
@@ -1943,11 +1943,11 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 				Version:  row.version,
 				LockTime: row.lockTime,
 			}
-			if needInputs {
-				tx.Inputs = row.data.Tx.Inputs // inputs were stored in data.Tx
+			if needInputs && row.data.Tx != nil {
+				tx.Inputs = row.data.Tx.Inputs
 			}
-			if needOutputs {
-				tx.Outputs = row.data.Tx.Outputs // outputs were stored in data.Tx
+			if needOutputs && row.data.Tx != nil {
+				tx.Outputs = row.data.Tx.Outputs
 			}
 		}
 
