@@ -122,18 +122,18 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 			u.logger.Infof("[catchup][%s] blockchain height %d ahead of UTXO height %d, capping locator",
 				blockUpTo.Hash().String(), bestBlockMeta.Height, utxoHeight)
 
-			headers, metas, capErr := u.blockchainClient.GetBlockHeadersFromHeight(ctx, utxoHeight, 1)
+			// Use GetBlockByHeight which walks the best chain (by chain_work) via a
+			// recursive CTE, guaranteeing we get the main-chain block. GetBlockHeadersFromHeight
+			// returns all forks at a height and would silently break capping during fork scenarios.
+			utxoBlock, capErr := u.blockchainClient.GetBlockByHeight(ctx, utxoHeight)
 			if capErr != nil {
-				u.logger.Warnf("[catchup][%s] failed to get block header at UTXO height %d, using blockchain height: %v",
+				u.logger.Warnf("[catchup][%s] failed to get block at UTXO height %d, using blockchain height: %v",
 					blockUpTo.Hash().String(), utxoHeight, capErr)
-			} else if len(headers) != 1 || len(metas) != 1 {
-				u.logger.Warnf("[catchup][%s] unexpected response for block header at UTXO height %d (got %d headers, %d metas), using blockchain height",
-					blockUpTo.Hash().String(), utxoHeight, len(headers), len(metas))
 			} else {
-				startHash = headers[0].Hash()
-				startHeight = metas[0].Height
-				bestBlockHeader = headers[0]
-				bestBlockMeta = metas[0]
+				startHash = utxoBlock.Header.Hash()
+				startHeight = utxoHeight
+				bestBlockHeader = utxoBlock.Header
+				bestBlockMeta = &model.BlockHeaderMeta{Height: utxoHeight}
 			}
 		}
 	}

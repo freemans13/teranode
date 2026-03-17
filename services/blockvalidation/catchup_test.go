@@ -1245,33 +1245,38 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		ctx := context.Background()
 		server, mockBlockchainClient, _, _ := createServerWithEnhancedCatchup(t)
 
-		// Create a few test blocks for mocking
-		blocks := testhelpers.CreateTestBlockChain(t, 2)
-		targetBlock := blocks[1]
+		// Create test blocks: 3 blocks so we have distinct headers for tip vs UTXO height
+		blocks := testhelpers.CreateTestBlockChain(t, 3)
+		targetBlock := blocks[2]
 		targetBlock.Height = 150000 // Simulate a large chain
 
-		bestBlock := blocks[0]
+		bestBlock := blocks[1]
 		bestBlock.Height = 10000
+
+		// Distinct block for UTXO height — must differ from bestBlock to catch hash/height mismatches
+		utxoBlock := blocks[0]
+		utxoBlock.Height = 1018
 
 		// Mock GetBlockExists to return false for target and any other blocks
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Header.Hash()).Return(false, nil)
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 
-		// Mock GetBestBlockHeader
+		// Mock GetBestBlockHeader — returns blockchain tip at height 10000
 		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
 			bestBlock.Header,
 			&model.BlockHeaderMeta{Height: bestBlock.Height, ID: 10000},
 			nil,
 		)
 
-		// Mock GetBlockHeadersFromHeight for locator capping (blockchain height 10000 > UTXO height 1018)
+		// Mock GetBlockByHeight for locator capping (blockchain height 10000 > UTXO height 1018)
 		// Required (no .Maybe()) — test must fail if capping is removed
-		mockBlockchainClient.On("GetBlockHeadersFromHeight", mock.Anything, uint32(1018), uint32(1)).
-			Return([]*model.BlockHeader{bestBlock.Header}, []*model.BlockHeaderMeta{{Height: 1018}}, nil)
+		// Returns utxoBlock (distinct from bestBlock) to catch hash/height mismatches
+		mockBlockchainClient.On("GetBlockByHeight", mock.Anything, uint32(1018)).
+			Return(utxoBlock, nil)
 
-		// Mock GetBlockLocator — expect the capped height (1018), not the blockchain height (10000)
-		locatorHashes := []*chainhash.Hash{bestBlock.Header.Hash()}
-		mockBlockchainClient.On("GetBlockLocator", mock.Anything, bestBlock.Header.Hash(), uint32(1018)).Return(locatorHashes, nil)
+		// Mock GetBlockLocator — expect the capped hash and height, not the blockchain tip
+		locatorHashes := []*chainhash.Hash{utxoBlock.Header.Hash()}
+		mockBlockchainClient.On("GetBlockLocator", mock.Anything, utxoBlock.Header.Hash(), uint32(1018)).Return(locatorHashes, nil)
 
 		// Mock GetBlockHeader to return not found for new headers
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(
@@ -3076,8 +3081,8 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 	// Mock GetBlockIsMined for parent block verification during validation
 	mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil).Maybe()
 	// Permissive default for locator capping (blockchain height > UTXO height fallback)
-	mockBlockchainClient.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
-		Return(([]*model.BlockHeader)(nil), ([]*model.BlockHeaderMeta)(nil), errors.NewServiceError("not mocked")).Maybe()
+	mockBlockchainClient.On("GetBlockByHeight", mock.Anything, mock.Anything).
+		Return((*model.Block)(nil), errors.NewServiceError("not mocked")).Maybe()
 	mockUTXOStore := &utxo.MockUtxostore{}
 
 	bv := &BlockValidation{
@@ -3173,8 +3178,8 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 	// Mock GetBlockIsMined for parent block verification during validation
 	mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil).Maybe()
 	// Permissive default for locator capping (blockchain height > UTXO height fallback)
-	mockBlockchainClient.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
-		Return(([]*model.BlockHeader)(nil), ([]*model.BlockHeaderMeta)(nil), errors.NewServiceError("not mocked")).Maybe()
+	mockBlockchainClient.On("GetBlockByHeight", mock.Anything, mock.Anything).
+		Return((*model.Block)(nil), errors.NewServiceError("not mocked")).Maybe()
 	mockUTXOStore := &utxo.MockUtxostore{}
 
 	bv := &BlockValidation{

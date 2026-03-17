@@ -78,10 +78,10 @@ func (s *CatchupTestSuite) setupMocks() {
 	// Provide a permissive default for Spend to avoid unexpected calls from concurrent validation goroutines.
 	s.MockUTXOStore.On("Spend", mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, nil).Maybe()
 
-	// Permissive default for GetBlockHeadersFromHeight — used by locator capping when
+	// Permissive default for GetBlockByHeight — used by locator capping when
 	// blockchain height > UTXO height. Returns error so capping falls back to blockchain height.
-	s.MockBlockchain.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
-		Return(([]*model.BlockHeader)(nil), ([]*model.BlockHeaderMeta)(nil), errors.NewServiceError("not mocked")).Maybe()
+	s.MockBlockchain.On("GetBlockByHeight", mock.Anything, mock.Anything).
+		Return((*model.Block)(nil), errors.NewServiceError("not mocked")).Maybe()
 }
 
 // createServer creates the Server instance with all dependencies
