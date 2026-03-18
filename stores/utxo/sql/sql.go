@@ -3214,10 +3214,9 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		DO $$
 		BEGIN
 			IF EXISTS (
-				SELECT 1 FROM information_schema.table_constraints
-				WHERE table_name = 'inputs'
-				AND constraint_type = 'FOREIGN KEY'
-				AND constraint_name = 'inputs_transaction_id_fkey'
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'inputs_transaction_id_fkey'
+				AND contype = 'f'
 			) THEN
 				ALTER TABLE inputs DROP CONSTRAINT inputs_transaction_id_fkey;
 			END IF;
@@ -3232,10 +3231,9 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		DO $$
 		BEGIN
 			IF NOT EXISTS (
-				SELECT 1 FROM information_schema.table_constraints
-				WHERE table_name = 'inputs'
-				AND constraint_type = 'FOREIGN KEY'
-				AND constraint_name = 'inputs_transaction_id_fkey'
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'inputs_transaction_id_fkey'
+				AND contype = 'f'
 			) THEN
 				ALTER TABLE inputs
 				ADD CONSTRAINT inputs_transaction_id_fkey
@@ -3274,10 +3272,9 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		DO $$
 		BEGIN
 			IF EXISTS (
-				SELECT 1 FROM information_schema.table_constraints
-				WHERE table_name = 'outputs'
-				AND constraint_type = 'FOREIGN KEY'
-				AND constraint_name = 'outputs_transaction_id_fkey'
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'outputs_transaction_id_fkey'
+				AND contype = 'f'
 			) THEN
 				ALTER TABLE outputs DROP CONSTRAINT outputs_transaction_id_fkey;
 			END IF;
@@ -3292,10 +3289,9 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		DO $$
 		BEGIN
 			IF NOT EXISTS (
-				SELECT 1 FROM information_schema.table_constraints
-				WHERE table_name = 'outputs'
-				AND constraint_type = 'FOREIGN KEY'
-				AND constraint_name = 'outputs_transaction_id_fkey'
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'outputs_transaction_id_fkey'
+				AND contype = 'f'
 			) THEN
 				ALTER TABLE outputs
 				ADD CONSTRAINT outputs_transaction_id_fkey
@@ -3325,11 +3321,11 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 	if _, err := db.Exec(`
 		DO $$
 		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'block_ids' AND column_name = 'block_height') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'block_ids'::regclass AND attname = 'block_height' AND NOT attisdropped) THEN
 				ALTER TABLE block_ids ADD COLUMN block_height BIGINT NOT NULL;
 			END IF;
 
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'block_ids' AND column_name = 'subtree_idx') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'block_ids'::regclass AND attname = 'subtree_idx' AND NOT attisdropped) THEN
 				ALTER TABLE block_ids ADD COLUMN subtree_idx BIGINT NOT NULL;
 			END IF;
 		END $$;
@@ -3342,7 +3338,7 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 	if _, err := db.Exec(`
 		DO $$
 		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'transactions' AND column_name = 'unmined_since') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'transactions'::regclass AND attname = 'unmined_since' AND NOT attisdropped) THEN
 				ALTER TABLE transactions ADD COLUMN unmined_since BIGINT;
 			END IF;
 		END $$;
@@ -3355,7 +3351,7 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 	if _, err := db.Exec(`
 		DO $$
 		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'transactions' AND column_name = 'preserve_until') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'transactions'::regclass AND attname = 'preserve_until' AND NOT attisdropped) THEN
 				ALTER TABLE transactions ADD COLUMN preserve_until BIGINT;
 			END IF;
 		END $$;
@@ -3369,9 +3365,9 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		DO $$
 		BEGIN
 			IF EXISTS (
-				SELECT 1 FROM information_schema.table_constraints
-				WHERE table_name = 'block_ids'
-				AND constraint_type = 'FOREIGN KEY'
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'block_ids_transaction_id_fkey'
+				AND contype = 'f'
 			) THEN
 				ALTER TABLE block_ids DROP CONSTRAINT block_ids_transaction_id_fkey;
 			END IF;
@@ -3386,10 +3382,9 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		DO $$
 		BEGIN
 			IF NOT EXISTS (
-				SELECT 1 FROM information_schema.table_constraints
-				WHERE table_name = 'block_ids'
-				AND constraint_type = 'FOREIGN KEY'
-				AND constraint_name = 'block_ids_transaction_id_fkey'
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'block_ids_transaction_id_fkey'
+				AND contype = 'f'
 			) THEN
 				ALTER TABLE block_ids
 				ADD CONSTRAINT block_ids_transaction_id_fkey
