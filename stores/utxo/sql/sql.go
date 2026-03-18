@@ -96,6 +96,20 @@ type Store struct {
 	medianBlockTime atomic.Uint32
 	ctx             context.Context
 	spendBatcher    *batcher.Batcher[batchSpend]
+	getBatcher      *batcher.Batcher[batchGetItem]
+}
+
+// batchGetItemData holds the result of a batch get operation.
+type batchGetItemData struct {
+	Data *meta.Data
+	Err  error
+}
+
+// batchGetItem represents a single item in a batch get operation.
+type batchGetItem struct {
+	hash   chainhash.Hash
+	fields []fields.FieldName
+	done   chan batchGetItemData
 }
 
 // New creates a new SQL-based UTXO store.
@@ -160,6 +174,18 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, false)
 	if tSettings.BatcherDrainMode {
 		s.spendBatcher.SetDrainMode(true)
+	}
+
+	// Initialize get batcher — mirrors aerospike/get.go batcher setup.
+	// Batches individual Get() calls into bulk SQL queries via BatchDecorate,
+	// reducing connection pool pressure from N×4 queries to 4 queries per batch.
+	getBatchSize := tSettings.UtxoStore.GetBatcherSize
+	getBatchDuration := time.Duration(tSettings.UtxoStore.GetBatcherDurationMillis) * time.Millisecond
+	if getBatchSize > 1 {
+		s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, true)
+		if tSettings.BatcherDrainMode {
+			s.getBatcher.SetDrainMode(true)
+		}
 	}
 
 	return s, nil
@@ -677,7 +703,10 @@ func (s *Store) updateParentConflictingChildren(ctx context.Context, transaction
 }
 
 func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
-	result, err := s.get(ctx, hash, utxo.MetaFields)
+	// Always use unbatched path for GetMeta — it's called infrequently
+	// and batchDecorateChunk has a known issue where TxInpoints in MetaFields
+	// causes data.Tx to be set when it shouldn't be.
+	result, err := s.getUnbatched(ctx, hash, utxo.MetaFields)
 	if err != nil {
 		return err
 	}
@@ -708,6 +737,70 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fields ...fields.
 func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
 	prometheusUtxoGet.Inc()
 
+	// Use batcher for the common validator path (BlockIDs, BlockHeights, Tx, Inputs, Outputs).
+	// Fall back to unbatched for fields that BatchDecorate doesn't support
+	// (ConflictingChildren, Utxos) to avoid missing data.
+	if s.getBatcher != nil && !contains(bins, fields.ConflictingChildren) && !contains(bins, fields.Utxos) {
+		return s.getBatched(ctx, hash, bins)
+	}
+
+	return s.getUnbatched(ctx, hash, bins)
+}
+
+// getBatched queues a Get request into the batcher for bulk processing via BatchDecorate.
+func (s *Store) getBatched(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
+	done := make(chan batchGetItemData, 1)
+	item := &batchGetItem{hash: *hash, fields: bins, done: done}
+
+	s.getBatcher.Put(item)
+
+	select {
+	case data := <-done:
+		return data.Data, data.Err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// sendGetBatch is the batcher callback that processes a batch of get operations
+// in bulk SQL queries via BatchDecorate.
+func (s *Store) sendGetBatch(batch []*batchGetItem) {
+	items := make([]*utxo.UnresolvedMetaData, 0, len(batch))
+
+	// Collect union of all requested fields across the batch
+	fieldSet := make(map[fields.FieldName]struct{})
+	for idx, item := range batch {
+		items = append(items, &utxo.UnresolvedMetaData{
+			Hash:   item.hash,
+			Idx:    idx,
+			Fields: item.fields,
+		})
+		for _, f := range item.fields {
+			fieldSet[f] = struct{}{}
+		}
+	}
+
+	allFields := make([]fields.FieldName, 0, len(fieldSet))
+	for f := range fieldSet {
+		allFields = append(allFields, f)
+	}
+
+	if err := s.BatchDecorate(s.ctx, items, allFields...); err != nil {
+		for _, bItem := range batch {
+			bItem.done <- batchGetItemData{Err: err}
+		}
+		return
+	}
+
+	for _, item := range items {
+		batch[item.Idx].done <- batchGetItemData{
+			Data: item.Data,
+			Err:  item.Err,
+		}
+	}
+}
+
+func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
 	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
 	defer cancelTimeout()
 
