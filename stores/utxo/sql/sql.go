@@ -1280,8 +1280,6 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 }
 
 func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
 
 	// Always get the transaction row
 
@@ -2325,8 +2323,6 @@ func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) erro
 // This removes the spending transaction ID and any expiration timestamp.
 // Commonly used during blockchain reorganizations.
 func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) error {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
 
 	txn, err := s.db.Begin()
 	if err != nil {
@@ -2402,8 +2398,6 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 // Delete removes a transaction and all its associated data.
 // This includes inputs, outputs, and block references.
 func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
 
 	// Start a database transaction
 	txn, err := s.db.Begin()
@@ -2496,9 +2490,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		default:
 		}
 
-		ctxWithTimeout, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-		chunkResult, err := s.setMinedMultiChunk(ctxWithTimeout, hashes[i:end], minedBlockInfo)
-		cancelTimeout()
+		chunkResult, err := s.setMinedMultiChunk(ctx, hashes[i:end], minedBlockInfo)
 
 		if err != nil {
 			return nil, errors.NewStorageError("SQL error in SetMinedMulti (chunk %d-%d): %v", i, end-1, err)
@@ -2711,8 +2703,6 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 }
 
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
 
 	q := `
 		SELECT
@@ -2849,8 +2839,6 @@ type batchDecorateTxRow struct {
 // It runs one query per table (transactions, inputs, block_ids, outputs) rather than
 // one query per transaction per table.
 func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.UnresolvedMetaData, bins []fields.FieldName) error {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
 
 	// Build hash list and hash→item index for result mapping
 	hashes := make([][]byte, len(items))
@@ -3121,8 +3109,6 @@ func (s *Store) batchDecorateBlockIDs(ctx context.Context, ids []int, idToTx map
 // Uses 60s timeout instead of DBTimeout (5s) because during legacy sync the DB is
 // under heavy contention from concurrent creates/spends and queries can be slow.
 func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
-	ctx, cancelTimeout := context.WithTimeout(ctx, 60*time.Second)
-	defer cancelTimeout()
 
 	// Collect inputs that need decoration, grouped by parent tx hash
 	type inputRef struct {
@@ -3249,8 +3235,6 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		return nil
 	}
 
-	ctx, cancelTimeout := context.WithTimeout(ctx, 60*time.Second)
-	defer cancelTimeout()
 
 	// Collect all (parentTxHash, outputIdx) pairs that need decoration
 	type inputRef struct {
@@ -4252,8 +4236,6 @@ func createSqliteSchema(db *usql.DB) error {
 // QueryOldUnminedTransactions returns transaction hashes for unmined transactions older than the cutoff height.
 // This method is used by the store-agnostic cleanup implementation.
 func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error) {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	defer cancelTimeout()
 
 	// Query to find old unmined transactions (extracted from PreserveParentsOfOldUnminedTransactions)
 	q := `
