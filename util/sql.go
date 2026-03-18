@@ -76,10 +76,9 @@ func InitPostgresDB(logger ulogger.Logger, storeURL *url.URL, tSettings *setting
 
 	// Use pgx/stdlib with QueryExecModeExec to skip prepared statement overhead.
 	// QueryExecModeExec uses the extended protocol but skips Parse, sending inline params.
-	// CacheStatement was tested twice: (1) with multi-value INSERTs — 10% CPU cache churn from
-	// varying SQL strings; (2) with CTE+UNNEST — fixed SQL eliminated churn but PostgreSQL's
-	// CTE executor + UNNEST decoding doubled batch times vs simple multi-value INSERTs.
-	// The 2-flush SendBatch pipeline with QueryExecModeExec gives the best throughput.
+	// Testing CTE+UNNEST with ExecModeExec to isolate CTE execution cost from
+	// CacheStatement's generic plan overhead. Previous CTE test used CacheStatement
+	// which may have caused slow batch times via generic plan degradation.
 	connConfig, err := pgx.ParseConfig(dbInfo)
 	if err != nil {
 		return nil, errors.NewServiceError("failed to parse postgres config", err)
