@@ -458,6 +458,13 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
+	// Don't start legacy sync if catchup is active
+	isCatching, _ := sm.blockchainClient.IsFSMCurrentState(sm.ctx, teranodeblockchain.FSMStateCATCHINGBLOCKS)
+	if isCatching {
+		sm.logger.Warnf("[startSync] Skipping — CATCHINGBLOCKS active")
+		return
+	}
+
 	sm.logger.Debugf("startSync - Syncing from %v", sm.loadSyncPeer())
 
 	bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
@@ -1223,6 +1230,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	}
 
 	sm.logger.Debugf("[handleBlockMsg][%s] calling HandleBlockDirect", bmsg.blockHash)
+
+	// If catchup is active, don't process blocks via legacy sync — the two modes are mutually exclusive
+	if catchingBlocks {
+		sm.logger.Infof("[handleBlockMsg][%s] Skipping HandleBlockDirect — CATCHINGBLOCKS active", bmsg.blockHash)
+		return nil
+	}
 
 	// if not in Legacy Sync mode, we need to potentially download the block,
 	// promote block to the block validation via kafka (p2p -> blockvalidation message),
