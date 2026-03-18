@@ -100,6 +100,7 @@ type Store struct {
 	ctx             context.Context
 	spendBatcher    *batcher.Batcher[batchSpend]
 	getBatcher      *batcher.Batcher[batchGetItem]
+	createBatcher   *batcher.Batcher[batchCreateItem]
 }
 
 // batchGetItemData holds the result of a batch get operation.
@@ -113,6 +114,20 @@ type batchGetItem struct {
 	hash   chainhash.Hash
 	fields []fields.FieldName
 	done   chan batchGetItemData
+}
+
+// batchCreateResult holds the result routed back to a Create() caller.
+type batchCreateResult struct {
+	Data *meta.Data
+	Err  error
+}
+
+// batchCreateItem represents a single Create() request queued into the createBatcher.
+type batchCreateItem struct {
+	tx          *bt.Tx
+	blockHeight uint32
+	options     *utxo.CreateOptions
+	done        chan batchCreateResult
 }
 
 // New creates a new SQL-based UTXO store.
@@ -191,6 +206,19 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 	}
 
+	// Initialize create batcher — mirrors aerospike/aerospike.go storeBatcher setup.
+	// Batches individual Create() calls into a single pgx.SendBatch with N CTEs,
+	// reducing N network round-trips to 1. background=true because each CTE inserts
+	// a unique transaction hash — no row overlap, no deadlock risk between batches.
+	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.StoreBatcherSize > 1 {
+		storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
+		storeBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
+		s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
+		if tSettings.BatcherDrainMode {
+			s.createBatcher.SetDrainMode(true)
+		}
+	}
+
 	return s, nil
 }
 
@@ -252,8 +280,10 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "sql:Create")
 	defer deferFn()
 
-	// ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
-	// defer cancelTimeout()
+	// Postgres with createBatcher: enqueue and wait for batch callback
+	if s.createBatcher != nil {
+		return s.createBatched(ctx, tx, blockHeight, options)
+	}
 
 	// Try the operation with retry logic for lock errors
 	var txMeta *meta.Data
@@ -282,6 +312,25 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	}
 
 	return txMeta, err
+}
+
+// createBatched enqueues a Create request into the createBatcher for bulk processing.
+// Mirrors aerospike/create.go storeBatcher.Put pattern.
+func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
+	done := make(chan batchCreateResult, 1)
+	s.createBatcher.Put(&batchCreateItem{
+		tx:          tx,
+		blockHeight: blockHeight,
+		options:     options,
+		done:        done,
+	})
+
+	select {
+	case result := <-done:
+		return result.Data, result.Err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
@@ -795,6 +844,170 @@ func (s *Store) insertConflictingChildrenPgx(ctx context.Context, btTx *bt.Tx, t
 		}
 		return pgxTx.Commit(ctx)
 	})
+}
+
+// preparedCreate holds pre-computed data for one item in a create batch.
+type preparedCreate struct {
+	txHash       *chainhash.Hash
+	txMeta       *meta.Data
+	isCoinbase   bool
+	unminedSince interface{}
+	inpArrs      inputArrayParams
+	outArrs      outputArrayParams
+	blkArrs      blockIDArrayParams
+}
+
+// sendCreateBatch is the batcher callback that processes a batch of Create operations
+// in a single pgx.SendBatch — N CTEs in one network flush.
+// Mirrors aerospike/create.go sendStoreBatch.
+func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
+	// Phase 1: Pre-compute all array parameters (CPU only, no DB)
+	prepared := make([]preparedCreate, len(batch))
+	for i, item := range batch {
+		txMeta, err := util.TxMetaDataFromTx(item.tx)
+		if err != nil {
+			item.done <- batchCreateResult{Err: errors.NewProcessingError("failed to get tx meta data", err)}
+			continue
+		}
+
+		if item.options.Conflicting {
+			txMeta.Conflicting = true
+		}
+		if item.options.Locked {
+			txMeta.Locked = true
+		}
+
+		var unminedSince interface{}
+		if len(item.options.MinedBlockInfos) == 0 {
+			unminedSince = item.blockHeight
+		}
+
+		var txHash *chainhash.Hash
+		if item.options.TxID != nil {
+			txHash = item.options.TxID
+		} else {
+			txHash = item.tx.TxIDChainHash()
+		}
+
+		isCoinbase := item.tx.IsCoinbase()
+		if item.options.IsCoinbase != nil {
+			isCoinbase = *item.options.IsCoinbase
+		}
+
+		inpArrs := buildInputArrays(item.tx)
+		outArrs, err := buildOutputArrays(s.settings, txHash, item.tx, isCoinbase, item.blockHeight)
+		if err != nil {
+			item.done <- batchCreateResult{Err: err}
+			continue
+		}
+		blkArrs := buildBlockIDArrays(item.options.MinedBlockInfos)
+
+		prepared[i] = preparedCreate{
+			txHash:       txHash,
+			txMeta:       txMeta,
+			isCoinbase:   isCoinbase,
+			unminedSince: unminedSince,
+			inpArrs:      inpArrs,
+			outArrs:      outArrs,
+			blkArrs:      blkArrs,
+		}
+	}
+
+	// Count valid items (those without prep errors — they already got their done channel written)
+	validIndices := make([]int, 0, len(batch))
+	for i := range batch {
+		if prepared[i].txHash != nil {
+			validIndices = append(validIndices, i)
+		}
+	}
+	if len(validIndices) == 0 {
+		return
+	}
+
+	// Phase 2: Get one pgx connection, queue all valid CTEs into SendBatch
+	sqlConn, err := s.db.Conn(s.ctx)
+	if err != nil {
+		for _, idx := range validIndices {
+			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to get db connection", err)}
+		}
+		return
+	}
+	defer sqlConn.Close()
+
+	connErr := sqlConn.Raw(func(driverConn interface{}) error {
+		pgxConn := driverConn.(*stdlib.Conn).Conn()
+		pgxBatch := &pgx.Batch{}
+
+		for _, idx := range validIndices {
+			p := &prepared[idx]
+			item := batch[idx]
+			pgxBatch.Queue(createCTESQL,
+				// $1-$10: transaction scalars
+				p.txHash[:], item.tx.Version, item.tx.LockTime,
+				p.txMeta.Fee, p.txMeta.SizeInBytes,
+				p.isCoinbase, item.options.Frozen, item.options.Conflicting,
+				item.options.Locked, p.unminedSince,
+				// $11-$17: input arrays
+				p.inpArrs.idx, p.inpArrs.prevHash, p.inpArrs.prevIdx,
+				p.inpArrs.prevSatoshis, p.inpArrs.prevScript,
+				p.inpArrs.unlockScript, p.inpArrs.seqNum,
+				// $18-$22: output arrays
+				p.outArrs.idx, p.outArrs.lockingScript,
+				p.outArrs.satoshis, p.outArrs.coinbaseSpendingHeight,
+				p.outArrs.utxoHash,
+				// $23-$25: block_id arrays
+				p.blkArrs.blockID, p.blkArrs.blockHeight,
+				p.blkArrs.subtreeIdx,
+			)
+		}
+
+		br := pgxConn.SendBatch(s.ctx, pgxBatch)
+
+		// Read results and route to callers
+		for _, idx := range validIndices {
+			p := &prepared[idx]
+			_, execErr := br.Exec()
+			if execErr != nil {
+				if pgErr := asPgUniqueViolation(execErr); pgErr != nil {
+					batch[idx].done <- batchCreateResult{
+						Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", p.isCoinbase, execErr),
+					}
+				} else {
+					batch[idx].done <- batchCreateResult{
+						Err: errors.NewStorageError("Failed to create UTXO", execErr),
+					}
+				}
+			} else {
+				batch[idx].done <- batchCreateResult{Data: p.txMeta}
+			}
+		}
+
+		if closeErr := br.Close(); closeErr != nil {
+			s.logger.Warnf("[sendCreateBatch] error closing batch results: %v", closeErr)
+		}
+		return nil
+	})
+	if connErr != nil {
+		// Raw callback error — send to any items that haven't received a result yet
+		for _, idx := range validIndices {
+			select {
+			case batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("batch connection error", connErr)}:
+			default:
+				// already sent a result
+			}
+		}
+		return
+	}
+
+	// Phase 3: Handle conflicting children (rare path — separate round-trips only when needed)
+	for _, idx := range validIndices {
+		p := &prepared[idx]
+		if p.txMeta != nil && p.txMeta.Conflicting {
+			if conflictErr := s.insertConflictingChildrenPgx(s.ctx, batch[idx].tx, p.txHash); conflictErr != nil {
+				s.logger.Warnf("[sendCreateBatch] failed to insert conflicting children for %x: %v", p.txHash[:], conflictErr)
+			}
+		}
+	}
 }
 
 // createInputsPerRow inserts transaction inputs one row at a time (original behavior).
