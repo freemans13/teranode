@@ -3209,41 +3209,20 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not create inputs table - [%+v]", err)
 	}
 
-	// Drop and recreate the foreign key constraint for inputs table if it exists
+	// Ensure inputs FK has ON DELETE CASCADE — only drop+recreate if it exists without CASCADE
 	if _, err := db.Exec(`
 		DO $$
 		BEGIN
-			IF EXISTS (
-				SELECT 1 FROM pg_constraint
-				WHERE conname = 'inputs_transaction_id_fkey'
-				AND contype = 'f'
-			) THEN
+			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'inputs_transaction_id_fkey' AND contype = 'f' AND confdeltype != 'c') THEN
 				ALTER TABLE inputs DROP CONSTRAINT inputs_transaction_id_fkey;
 			END IF;
-		END $$;
-	`); err != nil {
-		_ = db.Close()
-		return errors.NewStorageError("could not drop existing foreign key constraint on inputs table - [%+v]", err)
-	}
-
-	// Add the new foreign key constraint with ON DELETE CASCADE for inputs
-	if _, err := db.Exec(`
-		DO $$
-		BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint
-				WHERE conname = 'inputs_transaction_id_fkey'
-				AND contype = 'f'
-			) THEN
-				ALTER TABLE inputs
-				ADD CONSTRAINT inputs_transaction_id_fkey
-				FOREIGN KEY (transaction_id)
-				REFERENCES transactions(id) ON DELETE CASCADE;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'inputs_transaction_id_fkey' AND contype = 'f') THEN
+				ALTER TABLE inputs ADD CONSTRAINT inputs_transaction_id_fkey FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE;
 			END IF;
 		END $$;
 	`); err != nil {
 		_ = db.Close()
-		return errors.NewStorageError("could not add new foreign key constraint with CASCADE on inputs table - [%+v]", err)
+		return errors.NewStorageError("could not ensure CASCADE foreign key on inputs table - [%+v]", err)
 	}
 
 	// All fields are NOT NULL except for the spending_data which is NULL for unspent outputs.
@@ -3267,41 +3246,20 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not create outputs table - [%+v]", err)
 	}
 
-	// Drop and recreate the foreign key constraint for outputs table if it exists
+	// Ensure outputs FK has ON DELETE CASCADE — only drop+recreate if it exists without CASCADE
 	if _, err := db.Exec(`
 		DO $$
 		BEGIN
-			IF EXISTS (
-				SELECT 1 FROM pg_constraint
-				WHERE conname = 'outputs_transaction_id_fkey'
-				AND contype = 'f'
-			) THEN
+			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'outputs_transaction_id_fkey' AND contype = 'f' AND confdeltype != 'c') THEN
 				ALTER TABLE outputs DROP CONSTRAINT outputs_transaction_id_fkey;
 			END IF;
-		END $$;
-	`); err != nil {
-		_ = db.Close()
-		return errors.NewStorageError("could not drop existing foreign key constraint on outputs table - [%+v]", err)
-	}
-
-	// Add the new foreign key constraint with ON DELETE CASCADE for outputs
-	if _, err := db.Exec(`
-		DO $$
-		BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint
-				WHERE conname = 'outputs_transaction_id_fkey'
-				AND contype = 'f'
-			) THEN
-				ALTER TABLE outputs
-				ADD CONSTRAINT outputs_transaction_id_fkey
-				FOREIGN KEY (transaction_id)
-				REFERENCES transactions(id) ON DELETE CASCADE;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'outputs_transaction_id_fkey' AND contype = 'f') THEN
+				ALTER TABLE outputs ADD CONSTRAINT outputs_transaction_id_fkey FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE;
 			END IF;
 		END $$;
 	`); err != nil {
 		_ = db.Close()
-		return errors.NewStorageError("could not add new foreign key constraint with CASCADE on outputs table - [%+v]", err)
+		return errors.NewStorageError("could not ensure CASCADE foreign key on outputs table - [%+v]", err)
 	}
 
 	if _, err := db.Exec(`
@@ -3360,41 +3318,20 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not add preserve_until column to transactions table - [%+v]", err)
 	}
 
-	// Drop the existing foreign key constraint if it exists
+	// Ensure block_ids FK has ON DELETE CASCADE — only drop+recreate if it exists without CASCADE
 	if _, err := db.Exec(`
 		DO $$
 		BEGIN
-			IF EXISTS (
-				SELECT 1 FROM pg_constraint
-				WHERE conname = 'block_ids_transaction_id_fkey'
-				AND contype = 'f'
-			) THEN
+			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'block_ids_transaction_id_fkey' AND contype = 'f' AND confdeltype != 'c') THEN
 				ALTER TABLE block_ids DROP CONSTRAINT block_ids_transaction_id_fkey;
 			END IF;
-		END $$;
-	`); err != nil {
-		_ = db.Close()
-		return errors.NewStorageError("could not drop existing foreign key constraint - [%+v]", err)
-	}
-
-	// Add the new foreign key constraint with ON DELETE CASCADE
-	if _, err := db.Exec(`
-		DO $$
-		BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint
-				WHERE conname = 'block_ids_transaction_id_fkey'
-				AND contype = 'f'
-			) THEN
-				ALTER TABLE block_ids
-				ADD CONSTRAINT block_ids_transaction_id_fkey
-				FOREIGN KEY (transaction_id)
-				REFERENCES transactions(id) ON DELETE CASCADE;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'block_ids_transaction_id_fkey' AND contype = 'f') THEN
+				ALTER TABLE block_ids ADD CONSTRAINT block_ids_transaction_id_fkey FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE;
 			END IF;
 		END $$;
 	`); err != nil {
 		_ = db.Close()
-		return errors.NewStorageError("could not add new foreign key constraint with CASCADE - [%+v]", err)
+		return errors.NewStorageError("could not ensure CASCADE foreign key on block_ids table - [%+v]", err)
 	}
 
 	if _, err := db.Exec(`

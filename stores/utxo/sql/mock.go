@@ -219,14 +219,9 @@ func SetupCreatePostgresSchemaSuccessMocks(mockDB *MockDB) {
 		return strings.Contains(query, "CREATE TABLE IF NOT EXISTS inputs")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 6. DROP CONSTRAINT inputs_transaction_id_fkey (DO $$ block)
+	// 6. Ensure CASCADE FK on inputs (combined DROP if non-CASCADE + ADD if missing)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
-		return strings.Contains(query, "DO $$") && strings.Contains(query, "inputs_transaction_id_fkey") && strings.Contains(query, "DROP CONSTRAINT")
-	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
-
-	// 7. ADD CONSTRAINT inputs_transaction_id_fkey (DO $$ block)
-	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
-		return strings.Contains(query, "DO $$") && strings.Contains(query, "inputs_transaction_id_fkey") && strings.Contains(query, "ADD CONSTRAINT")
+		return strings.Contains(query, "DO $$") && strings.Contains(query, "inputs_transaction_id_fkey") && strings.Contains(query, "confdeltype")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
 	// 8. CREATE TABLE outputs
@@ -234,14 +229,9 @@ func SetupCreatePostgresSchemaSuccessMocks(mockDB *MockDB) {
 		return strings.Contains(query, "CREATE TABLE IF NOT EXISTS outputs")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 9. DROP CONSTRAINT outputs_transaction_id_fkey (DO $$ block)
+	// 9. Ensure CASCADE FK on outputs (combined DROP if non-CASCADE + ADD if missing)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
-		return strings.Contains(query, "DO $$") && strings.Contains(query, "outputs_transaction_id_fkey") && strings.Contains(query, "DROP CONSTRAINT")
-	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
-
-	// 10. ADD CONSTRAINT outputs_transaction_id_fkey (DO $$ block)
-	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
-		return strings.Contains(query, "DO $$") && strings.Contains(query, "outputs_transaction_id_fkey") && strings.Contains(query, "ADD CONSTRAINT")
+		return strings.Contains(query, "DO $$") && strings.Contains(query, "outputs_transaction_id_fkey") && strings.Contains(query, "confdeltype")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
 	// 11. CREATE TABLE block_ids
@@ -264,14 +254,9 @@ func SetupCreatePostgresSchemaSuccessMocks(mockDB *MockDB) {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "preserve_until") && strings.Contains(query, "ADD COLUMN")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 14. DROP CONSTRAINT block_ids_transaction_id_fkey (DO $$ block)
+	// 14. Ensure CASCADE FK on block_ids (combined DROP if non-CASCADE + ADD if missing)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
-		return strings.Contains(query, "DO $$") && strings.Contains(query, "block_ids_transaction_id_fkey") && strings.Contains(query, "DROP CONSTRAINT")
-	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
-
-	// 15. ADD CONSTRAINT block_ids_transaction_id_fkey (DO $$ block)
-	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
-		return strings.Contains(query, "DO $$") && strings.Contains(query, "block_ids_transaction_id_fkey") && strings.Contains(query, "ADD CONSTRAINT")
+		return strings.Contains(query, "DO $$") && strings.Contains(query, "block_ids_transaction_id_fkey") && strings.Contains(query, "confdeltype")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
 	// 16. CREATE TABLE IF NOT EXISTS conflicting_children
@@ -296,27 +281,18 @@ func SetupCreatePostgresSchemaErrorMocks(mockDB *MockDB, errorAtStep int) {
 		},
 		func(q string) bool { return strings.Contains(q, "CREATE TABLE IF NOT EXISTS inputs") },
 		func(q string) bool {
-			return strings.Contains(q, "inputs_transaction_id_fkey") && strings.Contains(q, "DROP CONSTRAINT")
-		},
-		func(q string) bool {
-			return strings.Contains(q, "inputs_transaction_id_fkey") && strings.Contains(q, "ADD CONSTRAINT")
+			return strings.Contains(q, "inputs_transaction_id_fkey") && strings.Contains(q, "confdeltype")
 		},
 		func(q string) bool { return strings.Contains(q, "CREATE TABLE IF NOT EXISTS outputs") },
 		func(q string) bool {
-			return strings.Contains(q, "outputs_transaction_id_fkey") && strings.Contains(q, "DROP CONSTRAINT")
-		},
-		func(q string) bool {
-			return strings.Contains(q, "outputs_transaction_id_fkey") && strings.Contains(q, "ADD CONSTRAINT")
+			return strings.Contains(q, "outputs_transaction_id_fkey") && strings.Contains(q, "confdeltype")
 		},
 		func(q string) bool { return strings.Contains(q, "CREATE TABLE IF NOT EXISTS block_ids") },
 		func(q string) bool { return strings.Contains(q, "block_height") && strings.Contains(q, "ADD COLUMN") },
 		func(q string) bool { return strings.Contains(q, "unmined_since") && strings.Contains(q, "ADD COLUMN") },
 		func(q string) bool { return strings.Contains(q, "preserve_until") && strings.Contains(q, "ADD COLUMN") },
 		func(q string) bool {
-			return strings.Contains(q, "block_ids_transaction_id_fkey") && strings.Contains(q, "DROP CONSTRAINT")
-		},
-		func(q string) bool {
-			return strings.Contains(q, "block_ids_transaction_id_fkey") && strings.Contains(q, "ADD CONSTRAINT")
+			return strings.Contains(q, "block_ids_transaction_id_fkey") && strings.Contains(q, "confdeltype")
 		},
 		func(q string) bool { return strings.Contains(q, "CREATE TABLE IF NOT EXISTS conflicting_children") },
 	}
