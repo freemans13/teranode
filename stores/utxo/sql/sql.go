@@ -3117,10 +3117,11 @@ func (s *Store) batchDecorateBlockIDs(ctx context.Context, ids []int, idToTx map
 }
 
 // PreviousOutputsDecorate fetches output information for transaction inputs.
-// Uses bulk IN query instead of per-input sequential queries to avoid DBTimeout
-// exhaustion for transactions with many inputs.
+// Uses bulk IN query instead of per-input sequential queries.
+// Uses 60s timeout instead of DBTimeout (5s) because during legacy sync the DB is
+// under heavy contention from concurrent creates/spends and queries can be slow.
 func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
+	ctx, cancelTimeout := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelTimeout()
 
 	// Collect inputs that need decoration, grouped by parent tx hash
@@ -3248,7 +3249,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		return nil
 	}
 
-	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
+	ctx, cancelTimeout := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelTimeout()
 
 	// Collect all (parentTxHash, outputIdx) pairs that need decoration
