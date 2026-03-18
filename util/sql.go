@@ -74,17 +74,16 @@ func InitPostgresDB(logger ulogger.Logger, storeURL *url.URL, tSettings *setting
 	// Build connection string for pgx
 	dbInfo := fmt.Sprintf("user=%s password=%s dbname=%s sslmode=%s host=%s port=%d", dbUser, dbPassword, dbName, sslMode, dbHost, dbPort)
 
-	// Use pgx/stdlib with QueryExecModeExec to skip prepared statement overhead.
-	// QueryExecModeExec uses the extended protocol but skips Parse, sending inline params.
-	// QueryExecModeCacheStatement was tested but caused 10% CPU overhead from cache churn —
-	// multi-value INSERTs generate many unique SQL strings that cycle through the LRU cache,
-	// triggering constant DEALLOCATE round-trips. SendBatch pipelining works regardless of
-	// exec mode, so QueryExecModeExec gives us the best of both: no Parse overhead + pipelining.
+	// Use pgx/stdlib with QueryExecModeCacheStatement for per-connection statement caching.
+	// The UTXO create path uses a single CTE+UNNEST SQL string (always identical regardless of
+	// tx size), so the cache has a 100% hit rate — Parse once, then Bind+Execute in binary format.
+	// Previous attempt with multi-value INSERTs caused cache churn (10% CPU deallocating evicted
+	// statements) because each row count generated a unique SQL string. UNNEST eliminates this.
 	connConfig, err := pgx.ParseConfig(dbInfo)
 	if err != nil {
 		return nil, errors.NewServiceError("failed to parse postgres config", err)
 	}
-	connConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+	connConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
 
 	sqlDB := stdlib.OpenDB(*connConfig)
 	db := usql.WrapDB(sqlDB)
