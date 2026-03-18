@@ -3117,52 +3117,114 @@ func (s *Store) batchDecorateBlockIDs(ctx context.Context, ids []int, idToTx map
 }
 
 // PreviousOutputsDecorate fetches output information for transaction inputs.
+// Uses bulk IN query instead of per-input sequential queries to avoid DBTimeout
+// exhaustion for transactions with many inputs.
 func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	ctx, cancelTimeout := context.WithTimeout(ctx, s.settings.UtxoStore.DBTimeout)
 	defer cancelTimeout()
 
-	q := `
-		SELECT
-		 o.locking_script
-		,o.satoshis
-		FROM outputs o
-		JOIN transactions t ON o.transaction_id = t.id
-		WHERE t.hash = $1
-		AND o.idx = $2
-	`
+	// Collect inputs that need decoration, grouped by parent tx hash
+	type inputRef struct {
+		inputIdx int
+		outIdx   uint32
+	}
+	needsByParent := make(map[chainhash.Hash][]inputRef)
 
-	var missingInputs []int
 	for i, input := range tx.Inputs {
+		if input == nil || input.PreviousTxScript != nil {
+			continue
+		}
+		parentHash := *input.PreviousTxIDChainHash()
+		needsByParent[parentHash] = append(needsByParent[parentHash], inputRef{
+			inputIdx: i,
+			outIdx:   input.PreviousTxOutIndex,
+		})
+	}
+
+	if len(needsByParent) == 0 {
+		return nil
+	}
+
+	// Collect unique parent hashes for chunked IN query
+	parentHashes := make([][]byte, 0, len(needsByParent))
+	for h := range needsByParent {
+		hCopy := h
+		parentHashes = append(parentHashes, hCopy[:])
+	}
+
+	// Bulk query: fetch all needed outputs in chunks
+	type outputKey struct {
+		hash chainhash.Hash
+		idx  uint32
+	}
+	type outputInfo struct {
+		lockingScript []byte
+		satoshis      uint64
+	}
+	results := make(map[outputKey]*outputInfo)
+
+	for chunkStart := 0; chunkStart < len(parentHashes); chunkStart += maxINClauseSize {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-
 		default:
-			if input == nil {
-				continue
-			}
+		}
 
-			// Skip if already decorated
-			if input.PreviousTxScript != nil {
-				continue
-			}
+		chunkEnd := chunkStart + maxINClauseSize
+		if chunkEnd > len(parentHashes) {
+			chunkEnd = len(parentHashes)
+		}
+		chunk := parentHashes[chunkStart:chunkEnd]
 
-			err := s.db.QueryRowContext(ctx, q, input.PreviousTxIDChainHash()[:], input.PreviousTxOutIndex).Scan(&input.PreviousTxScript, &input.PreviousTxSatoshis)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					// Track missing inputs - they might be in the same block being processed
-					missingInputs = append(missingInputs, i)
-					continue
-				}
+		inClause, args := buildINClause(chunk, 1)
+		q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
+			FROM outputs o
+			JOIN transactions t ON o.transaction_id = t.id
+			WHERE t.hash IN ` + inClause
+
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+
+		for rows.Next() {
+			var hashBytes []byte
+			var idx uint32
+			var lockingScript []byte
+			var satoshis uint64
+			if err := rows.Scan(&hashBytes, &idx, &lockingScript, &satoshis); err != nil {
+				rows.Close()
 				return err
+			}
+			var h chainhash.Hash
+			copy(h[:], hashBytes)
+			results[outputKey{hash: h, idx: idx}] = &outputInfo{
+				lockingScript: lockingScript,
+				satoshis:      satoshis,
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+
+	// Map results back to inputs and track missing
+	var missingInputs []int
+	for parentHash, refs := range needsByParent {
+		for _, ref := range refs {
+			key := outputKey{hash: parentHash, idx: ref.outIdx}
+			if info, ok := results[key]; ok {
+				tx.Inputs[ref.inputIdx].PreviousTxScript = bscript.NewFromBytes(info.lockingScript)
+				tx.Inputs[ref.inputIdx].PreviousTxSatoshis = info.satoshis
+			} else {
+				missingInputs = append(missingInputs, ref.inputIdx)
 			}
 		}
 	}
 
-	// If we have missing inputs, return an error indicating they couldn't be found
-	// The caller (ExtendTransaction) will handle this by trying alternative methods
 	if len(missingInputs) > 0 {
-		// Diagnostic: log each missing parent and check if the tx row exists (outputs missing vs tx missing)
+		// Diagnostic: log each missing parent and check if the tx row exists
 		for _, idx := range missingInputs {
 			input := tx.Inputs[idx]
 			parentHash := input.PreviousTxIDChainHash()
