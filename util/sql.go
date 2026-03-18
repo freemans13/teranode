@@ -12,6 +12,8 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/usql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/labstack/gommon/random"
 )
 
@@ -69,12 +71,21 @@ func InitPostgresDB(logger ulogger.Logger, storeURL *url.URL, tSettings *setting
 		sslMode = val[0] // Use the first value if multiple are provided
 	}
 
+	// Build connection string for pgx
 	dbInfo := fmt.Sprintf("user=%s password=%s dbname=%s sslmode=%s host=%s port=%d", dbUser, dbPassword, dbName, sslMode, dbHost, dbPort)
 
-	db, err := usql.Open(storeURL.Scheme, dbInfo)
+	// Use pgx/stdlib with QueryExecModeExec to eliminate prepared statement overhead.
+	// QueryExecModeExec sends queries using the extended protocol but skips the Parse step,
+	// reducing 4 protocol messages (Parse→Bind→Execute→Close) to 1 (Exec with inline params).
+	connConfig, err := pgx.ParseConfig(dbInfo)
 	if err != nil {
-		return nil, errors.NewServiceError("failed to open postgres DB", err)
+		return nil, errors.NewServiceError("failed to parse postgres config", err)
 	}
+	connConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+
+	sqlDB := stdlib.OpenDB(*connConfig)
+	db := usql.WrapDB(sqlDB)
+
 
 	logger.Infof("Using postgres DB: %s@%s:%d/%s", dbUser, dbHost, dbPort, dbName)
 

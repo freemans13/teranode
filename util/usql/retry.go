@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -37,16 +38,18 @@ func isRetriable(err error) bool {
 		return false
 	}
 
-	// PostgreSQL errors
+	// PostgreSQL errors (pgx driver)
+	if pgErr := asPgError(err); pgErr != nil {
+		code := pgErr.Code
+		return strings.HasPrefix(code, "08") || // Connection errors
+			code == "40001" || // Serialization failure
+			code == "40P01" || // Deadlock
+			code == "55P03" || // Lock not available
+			code == "57P03" // Cannot connect now
+	}
+
+	// PostgreSQL errors (lib/pq fallback)
 	if pqErr, ok := err.(*pq.Error); ok {
-		// Retriable PostgreSQL error codes:
-		// 08000: connection_exception
-		// 08003: connection_does_not_exist
-		// 08006: connection_failure
-		// 40001: serialization_failure (transaction conflicts)
-		// 40P01: deadlock_detected
-		// 55P03: lock_not_available
-		// 57P03: cannot_connect_now
 		code := string(pqErr.Code)
 		return strings.HasPrefix(code, "08") || // Connection errors
 			code == "40001" || // Serialization failure
@@ -399,4 +402,20 @@ func retryExecOperationNoContext(config RetryConfig, operation func() (sql.Resul
 	}
 
 	return result, lastErr
+}
+
+// asPgError unwraps err looking for a *pgconn.PgError (pgx driver).
+// Equivalent to errors.As without importing the standard errors package.
+func asPgError(err error) *pgconn.PgError {
+	for err != nil {
+		if pgErr, ok := err.(*pgconn.PgError); ok {
+			return pgErr
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return nil
+		}
+		err = u.Unwrap()
+	}
+	return nil
 }

@@ -69,6 +69,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/usql"
+	"github.com/jackc/pgx/v5/pgconn"
 	pq "github.com/lib/pq"
 	"golang.org/x/sync/errgroup"
 	"modernc.org/sqlite"
@@ -367,7 +368,7 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 		unminedSince,
 	).Scan(&transactionID)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		if pgErr := asPgUniqueViolation(err); pgErr != nil {
 			return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", tx.IsCoinbase(), err)
 		} else if sqliteErr, ok := err.(*sqlite.Error); ok && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
 			return nil, errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", tx.IsCoinbase(), sqliteErr)
@@ -671,13 +672,26 @@ func (s *Store) createBlockIDsPerRow(ctx context.Context, txn *sql.Tx, transacti
 
 // classifyInsertError converts constraint violation errors into appropriate typed errors.
 func classifyInsertError(err error, isCoinbase bool, entity string) error {
-	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+	if pgErr := asPgUniqueViolation(err); pgErr != nil {
 		return errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v): %v", isCoinbase, err)
 	}
 	if sqliteErr, ok := err.(*sqlite.Error); ok && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
 		return errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v): %v", isCoinbase, sqliteErr)
 	}
 	return errors.NewStorageError("Failed to insert %s", entity, err)
+}
+
+// asPgUniqueViolation checks if err is a PostgreSQL unique constraint violation (23505)
+// from either pgx (pgconn.PgError) or lib/pq (pq.Error).
+func asPgUniqueViolation(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return pgErr
+	}
+	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		return pqErr
+	}
+	return nil
 }
 
 func (s *Store) updateParentConflictingChildren(ctx context.Context, transactionID int, tx *bt.Tx, txn *sql.Tx) error {
@@ -3855,11 +3869,14 @@ func isLockError(err error) bool {
 		return false
 	}
 
-	// PostgreSQL deadlock/lock errors
+	// PostgreSQL deadlock/lock errors (pgx driver)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "40001" || pgErr.Code == "40P01" || pgErr.Code == "55P03"
+	}
+
+	// PostgreSQL deadlock/lock errors (lib/pq fallback)
 	if pqErr, ok := err.(*pq.Error); ok {
-		// 40001: serialization_failure
-		// 40P01: deadlock_detected
-		// 55P03: lock_not_available
 		return pqErr.Code == "40001" || pqErr.Code == "40P01" || pqErr.Code == "55P03"
 	}
 
