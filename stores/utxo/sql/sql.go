@@ -329,6 +329,7 @@ func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32
 	case result := <-done:
 		return result.Data, result.Err
 	case <-ctx.Done():
+		s.logger.Warnf("[createBatched] context cancelled while waiting for batcher result — tx may or may not be created")
 		return nil, ctx.Err()
 	}
 }
@@ -973,6 +974,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 						Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", p.isCoinbase, execErr),
 					}
 				} else {
+					s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", p.txHash[:], execErr)
 					batch[idx].done <- batchCreateResult{
 						Err: errors.NewStorageError("Failed to create UTXO", execErr),
 					}
@@ -3160,6 +3162,15 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	// If we have missing inputs, return an error indicating they couldn't be found
 	// The caller (ExtendTransaction) will handle this by trying alternative methods
 	if len(missingInputs) > 0 {
+		// Diagnostic: log each missing parent and check if the tx row exists (outputs missing vs tx missing)
+		for _, idx := range missingInputs {
+			input := tx.Inputs[idx]
+			parentHash := input.PreviousTxIDChainHash()
+			var txExists bool
+			_ = s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)`, parentHash[:]).Scan(&txExists)
+			s.logger.Warnf("[PreviousOutputsDecorate] missing parent output: child=%x input[%d] parent=%x vout=%d parentTxExists=%v",
+				tx.TxIDChainHash()[:], idx, parentHash[:], input.PreviousTxOutIndex, txExists)
+		}
 		return errors.NewProcessingError("failed to decorate previous outputs for tx %s", tx.TxIDChainHash())
 	}
 
