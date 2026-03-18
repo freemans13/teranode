@@ -1429,17 +1429,39 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		})
 	}
 
-	// Phase 3: Bulk UPDATE with optimistic locking
+	// Phase 3: Deduplicate toUpdate entries targeting the same (transactionID, vout).
+	// Within a single UPDATE statement, PostgreSQL can only affect each row once.
+	// Duplicate entries (from parallel processing of the same tx) would cause the
+	// second entry to be missing from RETURNING, triggering a false UtxoSpentError.
+	type utxoKey struct {
+		transactionID int
+		vout          uint32
+	}
+	seenKeys := make(map[utxoKey]int, len(toUpdate)) // key -> first batchIdx
+	var dedupedUpdate []updateItem
+	for _, u := range toUpdate {
+		key := utxoKey{u.transactionID, u.vout}
+		if firstIdx, seen := seenKeys[key]; seen {
+			// Duplicate: same UTXO being spent by the same tx — link to first entry
+			// The first entry will be updated; this duplicate is idempotent
+			_ = firstIdx // tracked via updatedSet after UPDATE
+		} else {
+			seenKeys[key] = u.batchIdx
+			dedupedUpdate = append(dedupedUpdate, u)
+		}
+	}
+
+	// Bulk UPDATE with optimistic locking
 	updatedSet := make(map[int]bool) // batchIdx -> updated
-	if len(toUpdate) > 0 {
+	if len(dedupedUpdate) > 0 {
 		var ub strings.Builder
 		ub.WriteString(`
 			UPDATE outputs o
 			SET spending_data = v.spending_data
 			FROM (VALUES `)
-		updateArgs := make([]interface{}, 0, len(toUpdate)*4)
+		updateArgs := make([]interface{}, 0, len(dedupedUpdate)*4)
 		pidx := 1
-		for j, u := range toUpdate {
+		for j, u := range dedupedUpdate {
 			if j > 0 {
 				ub.WriteByte(',')
 			}
@@ -1492,10 +1514,19 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		}
 
 		// Check for items that were not updated (concurrent spend between SELECT and UPDATE)
-		for _, u := range toUpdate {
+		for _, u := range dedupedUpdate {
 			if !updatedSet[u.batchIdx] {
 				spend := batch[u.batchIdx].spend
 				validationErrors[u.batchIdx] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
+			}
+		}
+		// Mark duplicate batch entries as successful (same UTXO, same spending data — idempotent)
+		for _, u := range toUpdate {
+			key := utxoKey{u.transactionID, u.vout}
+			if firstIdx, ok := seenKeys[key]; ok && firstIdx != u.batchIdx {
+				if updatedSet[firstIdx] {
+					updatedSet[u.batchIdx] = true
+				}
 			}
 		}
 	}
