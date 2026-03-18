@@ -612,6 +612,7 @@ const createCTESQL = `
 WITH new_tx AS (
 	INSERT INTO transactions (hash,version,lock_time,fee,size_in_bytes,coinbase,frozen,conflicting,locked,unmined_since)
 	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+	ON CONFLICT (hash) DO NOTHING
 	RETURNING id
 ), ins_inputs AS (
 	INSERT INTO inputs (transaction_id,idx,previous_transaction_hash,previous_tx_idx,previous_tx_satoshis,previous_tx_script,unlocking_script,sequence_number)
@@ -623,11 +624,13 @@ WITH new_tx AS (
 	SELECT new_tx.id, u.idx, u.locking_script, u.satoshis, u.csh, u.utxo_hash, NULL
 	FROM new_tx, UNNEST($18::int[],$19::bytea[],$20::bigint[],$21::int[],$22::bytea[])
 		AS u(idx, locking_script, satoshis, csh, utxo_hash)
+), ins_block_ids AS (
+	INSERT INTO block_ids (transaction_id,block_id,block_height,subtree_idx)
+	SELECT new_tx.id, u.block_id, u.block_height, u.subtree_idx
+	FROM new_tx, UNNEST($23::int[],$24::int[],$25::int[])
+		AS u(block_id, block_height, subtree_idx)
 )
-INSERT INTO block_ids (transaction_id,block_id,block_height,subtree_idx)
-SELECT new_tx.id, u.block_id, u.block_height, u.subtree_idx
-FROM new_tx, UNNEST($23::int[],$24::int[],$25::int[])
-	AS u(block_id, block_height, subtree_idx)
+SELECT id FROM new_tx
 `
 
 // createCTE executes a single CTE statement with UNNEST arrays to insert a transaction
@@ -649,9 +652,10 @@ func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, 
 	}
 	defer sqlConn.Close()
 
+	var inserted bool
 	err = sqlConn.Raw(func(driverConn interface{}) error {
 		pgxConn := driverConn.(*stdlib.Conn).Conn()
-		_, execErr := pgxConn.Exec(ctx, createCTESQL,
+		rows, execErr := pgxConn.Query(ctx, createCTESQL,
 			// $1-$10: transaction scalars
 			txHash[:], btTx.Version, btTx.LockTime, txMeta.Fee, txMeta.SizeInBytes,
 			isCoinbase, options.Frozen, options.Conflicting, options.Locked, unminedSince,
@@ -665,13 +669,18 @@ func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, 
 			// $23-$25: block_id arrays
 			blkArrs.blockID, blkArrs.blockHeight, blkArrs.subtreeIdx,
 		)
-		return execErr
+		if execErr != nil {
+			return execErr
+		}
+		defer rows.Close()
+		inserted = rows.Next() // true if new_tx returned a row (insert succeeded)
+		return rows.Err()
 	})
 	if err != nil {
-		if pgErr := asPgUniqueViolation(err); pgErr != nil {
-			return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", btTx.IsCoinbase(), err)
-		}
 		return nil, errors.NewStorageError("Failed to create UTXO", err)
+	}
+	if !inserted {
+		return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", isCoinbase)
 	}
 
 	// Handle conflicting children (rare path — separate round-trip only when needed)
@@ -967,17 +976,24 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 		// Read results and route to callers
 		for _, idx := range validIndices {
 			p := &prepared[idx]
-			_, execErr := br.Exec()
-			if execErr != nil {
-				if pgErr := asPgUniqueViolation(execErr); pgErr != nil {
-					batch[idx].done <- batchCreateResult{
-						Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", p.isCoinbase, execErr),
-					}
-				} else {
-					s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", p.txHash[:], execErr)
-					batch[idx].done <- batchCreateResult{
-						Err: errors.NewStorageError("Failed to create UTXO", execErr),
-					}
+			rows, queryErr := br.Query()
+			var inserted bool
+			if queryErr == nil {
+				inserted = rows.Next() // true if new_tx returned a row (insert succeeded)
+				if err := rows.Err(); err != nil {
+					queryErr = err
+				}
+				rows.Close()
+			}
+			if queryErr != nil {
+				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", p.txHash[:], queryErr)
+				batch[idx].done <- batchCreateResult{
+					Err: errors.NewStorageError("Failed to create UTXO", queryErr),
+				}
+			} else if !inserted {
+				// ON CONFLICT (hash) DO NOTHING — new_tx returned 0 rows, tx already exists
+				batch[idx].done <- batchCreateResult{
+					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", p.isCoinbase),
 				}
 			} else {
 				batch[idx].done <- batchCreateResult{Data: p.txMeta}
