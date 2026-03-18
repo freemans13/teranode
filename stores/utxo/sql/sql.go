@@ -69,7 +69,9 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/usql"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
 	pq "github.com/lib/pq"
 	"golang.org/x/sync/errgroup"
 	"modernc.org/sqlite"
@@ -301,6 +303,23 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 		unminedSince = blockHeight // Set UnminedSince only for unmined transactions
 	}
 
+	var txHash *chainhash.Hash
+	if options.TxID != nil {
+		txHash = options.TxID
+	} else {
+		txHash = tx.TxIDChainHash()
+	}
+
+	isCoinbase := tx.IsCoinbase()
+	if options.IsCoinbase != nil {
+		isCoinbase = *options.IsCoinbase
+	}
+
+	// Postgres with batching: pipeline all inserts in a single network flush
+	if s.settings.UtxoStore.BatchSQLOperations && s.engine == "postgres" {
+		return s.createPipelined(ctx, tx, blockHeight, options, txHash, txMeta, isCoinbase, unminedSince)
+	}
+
 	// Insert the transaction row...
 	q := `
 		INSERT INTO transactions (
@@ -340,18 +359,6 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 	}()
 
 	var transactionID int
-
-	var txHash *chainhash.Hash
-	if options.TxID != nil {
-		txHash = options.TxID
-	} else {
-		txHash = tx.TxIDChainHash()
-	}
-
-	isCoinbase := tx.IsCoinbase()
-	if options.IsCoinbase != nil {
-		isCoinbase = *options.IsCoinbase
-	}
 
 	err = txn.QueryRowContext(
 		ctx,
@@ -545,6 +552,173 @@ func (s *Store) createBlockIDsBatched(ctx context.Context, txn *sql.Tx, transact
 		}
 	}
 	return nil
+}
+
+// createPipelined executes the entire UTXO create flow using pgx's native SendBatch,
+// sending the transaction INSERT + all input/output/block_id INSERTs in a single network flush.
+// This eliminates per-statement round-trips within the transaction (postgres only).
+func (s *Store) createPipelined(ctx context.Context, btTx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions, txHash *chainhash.Hash, txMeta *meta.Data, isCoinbase bool, unminedSince interface{}) (*meta.Data, error) {
+	sqlConn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer sqlConn.Close()
+
+	err = sqlConn.Raw(func(driverConn interface{}) error {
+		pgxConn := driverConn.(*stdlib.Conn).Conn()
+
+		pgxTx, txErr := pgxConn.Begin(ctx)
+		if txErr != nil {
+			return txErr
+		}
+		defer pgxTx.Rollback(ctx) //nolint:errcheck
+
+		// INSERT transaction row (needs RETURNING id, so executed separately before the batch)
+		var transactionID int
+		txErr = pgxTx.QueryRow(ctx,
+			`INSERT INTO transactions (hash,version,lock_time,fee,size_in_bytes,coinbase,frozen,conflicting,locked,unmined_since) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+			txHash[:], btTx.Version, btTx.LockTime, txMeta.Fee, txMeta.SizeInBytes, isCoinbase, options.Frozen, options.Conflicting, options.Locked, unminedSince,
+		).Scan(&transactionID)
+		if txErr != nil {
+			if pgErr := asPgUniqueViolation(txErr); pgErr != nil {
+				return errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", btTx.IsCoinbase(), txErr)
+			}
+			return errors.NewStorageError("Failed to insert transaction", txErr)
+		}
+
+		// Build batch queries for inputs, outputs, block_ids
+		queries, allArgs, buildErr := s.buildCreateBatchQueries(transactionID, txHash, btTx, isCoinbase, blockHeight, options.MinedBlockInfos)
+		if buildErr != nil {
+			return buildErr
+		}
+
+		// Send all insert queries in a single network flush
+		if len(queries) > 0 {
+			batch := &pgx.Batch{}
+			for i, q := range queries {
+				batch.Queue(q, allArgs[i]...)
+			}
+			br := pgxTx.SendBatch(ctx, batch)
+			if batchErr := br.Close(); batchErr != nil {
+				return classifyInsertError(batchErr, btTx.IsCoinbase(), "batch")
+			}
+		}
+
+		// Handle conflicting children (rare path — not worth batching)
+		if txMeta.Conflicting {
+			conflictQ := `INSERT INTO conflicting_children (transaction_id, child_transaction_id) VALUES ((SELECT id FROM transactions WHERE hash = $1), $2) ON CONFLICT DO NOTHING`
+			for _, input := range btTx.Inputs {
+				if _, execErr := pgxTx.Exec(ctx, conflictQ, input.PreviousTxIDChainHash()[:], transactionID); execErr != nil {
+					return errors.NewStorageError("Failed to insert conflicting_children", execErr)
+				}
+			}
+		}
+
+		return pgxTx.Commit(ctx)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return txMeta, nil
+}
+
+// buildCreateBatchQueries collects all input/output/block_id INSERT queries and args
+// without executing them. Used by createPipelined to send them as a pgx batch.
+func (s *Store) buildCreateBatchQueries(transactionID int, txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blockHeight uint32, blockInfos []utxo.MinedBlockInfo) ([]string, [][]interface{}, error) {
+	var queries []string
+	var allArgs [][]interface{}
+
+	// Inputs
+	if len(btTx.Inputs) > 0 {
+		const colsPerRow = 8
+		const maxRowsPerChunk = maxPostgresParams / colsPerRow
+		baseSQL := `INSERT INTO inputs (transaction_id,idx,previous_transaction_hash,previous_tx_idx,previous_tx_satoshis,previous_tx_script,unlocking_script,sequence_number) VALUES `
+
+		for chunkStart := 0; chunkStart < len(btTx.Inputs); chunkStart += maxRowsPerChunk {
+			chunkEnd := chunkStart + maxRowsPerChunk
+			if chunkEnd > len(btTx.Inputs) {
+				chunkEnd = len(btTx.Inputs)
+			}
+			chunkSize := chunkEnd - chunkStart
+			q := buildMultiValueInsert(baseSQL, colsPerRow, chunkSize, 1)
+			args := make([]interface{}, 0, chunkSize*colsPerRow)
+			for i := chunkStart; i < chunkEnd; i++ {
+				input := btTx.Inputs[i]
+				args = append(args, transactionID, i, input.PreviousTxIDChainHash()[:], input.PreviousTxOutIndex, input.PreviousTxSatoshis, input.PreviousTxScript, input.UnlockingScript, input.SequenceNumber)
+			}
+			queries = append(queries, q)
+			allArgs = append(allArgs, args)
+		}
+	}
+
+	// Outputs (filter nil entries, compute UTXO hash)
+	type outputEntry struct {
+		index  int
+		output *bt.Output
+	}
+	outputs := make([]outputEntry, 0, len(btTx.Outputs))
+	for i, output := range btTx.Outputs {
+		if output != nil {
+			outputs = append(outputs, outputEntry{index: i, output: output})
+		}
+	}
+	if len(outputs) > 0 {
+		var coinbaseSpendingHeight uint32
+		if isCoinbase {
+			coinbaseSpendingHeight = blockHeight + uint32(s.settings.ChainCfgParams.CoinbaseMaturity)
+		}
+
+		const colsPerRow = 7
+		const maxRowsPerChunk = maxPostgresParams / colsPerRow
+		baseSQL := `INSERT INTO outputs (transaction_id,idx,locking_script,satoshis,coinbase_spending_height,utxo_hash,spending_data) VALUES `
+
+		for chunkStart := 0; chunkStart < len(outputs); chunkStart += maxRowsPerChunk {
+			chunkEnd := chunkStart + maxRowsPerChunk
+			if chunkEnd > len(outputs) {
+				chunkEnd = len(outputs)
+			}
+			chunkSize := chunkEnd - chunkStart
+			q := buildMultiValueInsert(baseSQL, colsPerRow, chunkSize, 1)
+			args := make([]interface{}, 0, chunkSize*colsPerRow)
+			for _, entry := range outputs[chunkStart:chunkEnd] {
+				iUint32, err := safeconversion.IntToUint32(entry.index)
+				if err != nil {
+					return nil, nil, err
+				}
+				utxoHash, err := util.UTXOHashFromOutput(txHash, entry.output, iUint32)
+				if err != nil {
+					return nil, nil, err
+				}
+				args = append(args, transactionID, entry.index, entry.output.LockingScript, entry.output.Satoshis, coinbaseSpendingHeight, utxoHash[:], nil)
+			}
+			queries = append(queries, q)
+			allArgs = append(allArgs, args)
+		}
+	}
+
+	// Block IDs
+	if len(blockInfos) > 0 {
+		const colsPerRow = 4
+		const maxRowsPerChunk = maxPostgresParams / colsPerRow
+		baseSQL := `INSERT INTO block_ids (transaction_id,block_id,block_height,subtree_idx) VALUES `
+
+		for chunkStart := 0; chunkStart < len(blockInfos); chunkStart += maxRowsPerChunk {
+			chunkEnd := chunkStart + maxRowsPerChunk
+			if chunkEnd > len(blockInfos) {
+				chunkEnd = len(blockInfos)
+			}
+			chunk := blockInfos[chunkStart:chunkEnd]
+			q := buildMultiValueInsert(baseSQL, colsPerRow, len(chunk), 1)
+			args := make([]interface{}, 0, len(chunk)*colsPerRow)
+			for _, blockMeta := range chunk {
+				args = append(args, transactionID, blockMeta.BlockID, blockMeta.BlockHeight, blockMeta.SubtreeIdx)
+			}
+			queries = append(queries, q)
+			allArgs = append(allArgs, args)
+		}
+	}
+
+	return queries, allArgs, nil
 }
 
 // createInputsPerRow inserts transaction inputs one row at a time (original behavior).
@@ -2971,6 +3145,31 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	return affectedParentSpends, spendingTxHashes, nil
 }
 
+// setLockedPipelined pipelines all lock UPDATE statements in a single network flush (postgres only).
+func (s *Store) setLockedPipelined(ctx context.Context, txHashes []chainhash.Hash) error {
+	sqlConn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer sqlConn.Close()
+
+	return sqlConn.Raw(func(driverConn interface{}) error {
+		pgxConn := driverConn.(*stdlib.Conn).Conn()
+
+		batch := &pgx.Batch{}
+		q := `UPDATE transactions SET locked = true, delete_at_height = NULL WHERE hash = $1`
+		for i := range txHashes {
+			batch.Queue(q, txHashes[i][:])
+		}
+
+		br := pgxConn.SendBatch(ctx, batch)
+		if batchErr := br.Close(); batchErr != nil {
+			return errors.NewStorageError("failed to pipeline set locked", batchErr)
+		}
+		return nil
+	})
+}
+
 func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
 	// When locking (setValue=true), clear delete_at_height.
 	// Mirrors aerospike setLocked: locked tx should not be pruned.
@@ -2978,7 +3177,11 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	// Mirrors aerospike setLocked which restores DAH when conditions are met.
 
 	if setValue {
-		// Locking: simple update, clear DAH
+		// Postgres: pipeline all lock UPDATEs in a single network flush
+		if s.engine == "postgres" {
+			return s.setLockedPipelined(ctx, txHashes)
+		}
+		// SQLite: sequential updates
 		q := `
 			UPDATE transactions
 			SET locked = true, delete_at_height = NULL

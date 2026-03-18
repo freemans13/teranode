@@ -74,14 +74,15 @@ func InitPostgresDB(logger ulogger.Logger, storeURL *url.URL, tSettings *setting
 	// Build connection string for pgx
 	dbInfo := fmt.Sprintf("user=%s password=%s dbname=%s sslmode=%s host=%s port=%d", dbUser, dbPassword, dbName, sslMode, dbHost, dbPort)
 
-	// Use pgx/stdlib with QueryExecModeExec to eliminate prepared statement overhead.
-	// QueryExecModeExec sends queries using the extended protocol but skips the Parse step,
-	// reducing 4 protocol messages (Parse→Bind→Execute→Close) to 1 (Exec with inline params).
+	// Use pgx/stdlib with QueryExecModeCacheStatement for per-connection LRU statement caching.
+	// First execution of each unique SQL string pays Parse cost; subsequent calls skip it
+	// entirely (just Bind+Execute). Cache capacity is 512 statements per connection (pgx default).
+	// Batched UTXO inserts reuse a bounded set of SQL strings (max ~250 variants), so hit rates are high.
 	connConfig, err := pgx.ParseConfig(dbInfo)
 	if err != nil {
 		return nil, errors.NewServiceError("failed to parse postgres config", err)
 	}
-	connConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+	connConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
 
 	sqlDB := stdlib.OpenDB(*connConfig)
 	db := usql.WrapDB(sqlDB)
