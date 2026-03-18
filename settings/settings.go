@@ -290,6 +290,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			StoreDBTimeoutMillis:  getInt("blockchain_store_dbTimeoutMillis", 5000, alternativeContext...),
 			InitializeNodeInState: getString("blockchain_initializeNodeInState", "", alternativeContext...),
 			PostgresPool:          getPostgresPoolSettings("blockchain", alternativeContext...),
+			UseInMemoryChainCheck: getBool("blockchain_use_in_memory_chain_check", false, alternativeContext...),
 			HeartbeatInterval:     getDuration("blockchain_heartbeat_interval", 10*time.Second, alternativeContext...),
 		},
 		BlockValidation: BlockValidationSettings{
