@@ -3558,7 +3558,12 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		return nil
 	}
 
-	// Unlocking: need a transaction to recalculate DAH via setDAH
+	// Postgres: bulk unlock + DAH in chunked UPDATE statements
+	if s.engine == "postgres" {
+		return s.setUnlockedBulk(ctx, txHashes)
+	}
+
+	// SQLite: sequential unlock + DAH
 	txn, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -3589,6 +3594,88 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 
 	if err = txn.Commit(); err != nil {
 		return errors.NewStorageError("failed to commit unlock transaction", err)
+	}
+
+	return nil
+}
+
+// setUnlockedBulk performs a bulk unlock + DAH recalculation for Postgres.
+// Replaces 3N sequential queries (unlock + setDAH SELECT + setDAH UPDATE per tx)
+// with 1 UPDATE per chunk of maxINClauseSize hashes.
+func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) error {
+	retention := s.settings.GetUtxoStoreBlockHeightRetention()
+
+	for i := 0; i < len(txHashes); i += maxINClauseSize {
+		end := i + maxINClauseSize
+		if end > len(txHashes) {
+			end = len(txHashes)
+		}
+		chunk := txHashes[i:end]
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		hashBytes := make([][]byte, len(chunk))
+		for j := range chunk {
+			hashBytes[j] = chunk[j][:]
+		}
+
+		if retention == 0 {
+			// No DAH needed — simple bulk unlock
+			inClause, args := buildINClause(hashBytes, 1)
+			q := fmt.Sprintf(`UPDATE transactions SET locked = false WHERE hash IN %s`, inClause)
+			if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+				return errors.NewStorageError("failed to bulk unlock transactions", err)
+			}
+		} else {
+			// Bulk unlock + DAH recalculation in a single UPDATE.
+			// The CTE computes per-row state (unspent count, conflicting, etc.)
+			// and the UPDATE applies the DAH logic from setDAH in one pass.
+			newDAH := int64(s.blockHeight.Load() + 1 + retention)
+
+			// $1 = newDAH, hashes start at $2
+			inClause, hashArgs := buildINClause(hashBytes, 2)
+			args := make([]interface{}, 0, 1+len(hashArgs))
+			args = append(args, newDAH)
+			args = append(args, hashArgs...)
+
+			q := fmt.Sprintf(`
+				WITH tx_state AS (
+					SELECT t.id,
+					       t.conflicting,
+					       t.preserve_until IS NOT NULL AS has_preserve,
+					       t.unmined_since IS NULL AS on_longest_chain,
+					       t.delete_at_height,
+					       (SELECT count(*) FROM outputs o
+					        WHERE o.transaction_id = t.id AND o.spending_data IS NULL) AS unspent,
+					       EXISTS(SELECT 1 FROM block_ids bi
+					        WHERE bi.transaction_id = t.id) AS has_blocks
+					FROM transactions t
+					WHERE t.hash IN %s
+				)
+				UPDATE transactions t
+				SET locked = false,
+				    delete_at_height = CASE
+				        WHEN s.has_preserve THEN t.delete_at_height
+				        WHEN s.conflicting AND t.delete_at_height IS NULL THEN $1
+				        WHEN s.conflicting THEN t.delete_at_height
+				        WHEN s.unspent = 0 AND s.has_blocks AND s.on_longest_chain
+				             AND (t.delete_at_height IS NULL OR t.delete_at_height < $1) THEN $1
+				        WHEN s.unspent = 0 AND s.has_blocks AND s.on_longest_chain THEN t.delete_at_height
+				        WHEN t.delete_at_height IS NOT NULL THEN NULL
+				        ELSE t.delete_at_height
+				    END
+				FROM tx_state s
+				WHERE t.id = s.id
+			`, inClause)
+
+			if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+				return errors.NewStorageError("failed to bulk unlock+DAH transactions", err)
+			}
+		}
 	}
 
 	return nil
