@@ -2089,20 +2089,31 @@ func TestCheckBlockSubtrees_SkipSubtreeDataFetchWhenLocalTxsAvailable(t *testing
 		BaseUrl: "http://test-peer.local",
 	}
 
+	// Disable ValidateSubtreeInternal's fallback subtree_data fetch so any
+	// /subtree_data/ request can only originate from CheckBlockSubtrees itself.
+	server.settings.SubtreeValidation.PercentageMissingGetFullData = 101
+
 	// Run CheckBlockSubtrees — will eventually fail during ValidateSubtreeInternal
 	// because we don't have the actual tx data, but the optimization path should be taken.
-	// ValidateSubtreeInternal may still fetch subtree_data as a fallback for missing txs,
-	// but the CheckBlockSubtrees fetch path should be skipped.
 	_, err = server.CheckBlockSubtrees(context.Background(), request)
 
 	// Verify block assembly state was queried — the optimization was triggered
 	mockBA.AssertCalled(t, "GetBlockAssemblyState", mock.Anything)
 
 	// If there's an error, it should NOT be "failed to get subtree data from" which
-	// comes from CheckBlockSubtrees' fetch path. Any subtree_data fetches should only
-	// come from ValidateSubtreeInternal's fallback path.
+	// comes from CheckBlockSubtrees' fetch path.
 	if err != nil {
 		assert.NotContains(t, err.Error(), "failed to get subtree data from",
 			"CheckBlockSubtrees should skip subtree_data fetch when local txs available")
+	}
+
+	// Assert no subtree_data fetch was performed — with ValidateSubtreeInternal's
+	// fallback disabled, any call here can only come from CheckBlockSubtrees.
+	callCounts := httpmock.GetCallCountInfo()
+	for k, v := range callCounts {
+		if v > 0 {
+			assert.NotContains(t, k, "subtree_data",
+				"subtree_data should NOT be fetched when local txs are available")
+		}
 	}
 }
