@@ -768,8 +768,7 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// all headers before requesting any blocks, which can take longer than maxLastBlockTime.
 	isLastBlockTimeViolation := !sm.headersFirstMode.Load() && (lastBlockSince > maxLastBlockTime)
 
-	// Check network speed of the sync peer and its last block time. If we're currently
-	// flushing the cache skip this round.
+	// If no violations detected, the sync peer is healthy — nothing to do.
 	if !isNetworkSpeedViolation && !isLastBlockTimeViolation {
 		return
 	}

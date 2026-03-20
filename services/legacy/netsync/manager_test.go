@@ -794,7 +794,7 @@ func TestHandleCheckSyncPeer_HeadersFirstMode(t *testing.T) {
 		assert.Equal(t, sp, sm.loadSyncPeer())
 	})
 
-	t.Run("normal mode allows last block time violation through", func(t *testing.T) {
+	t.Run("normal mode retains peer when no violations", func(t *testing.T) {
 		sp := &peer.Peer{}
 		sps := &syncPeerState{
 			lastBlockTime: time.Now(), // recent — no violation
