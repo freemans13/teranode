@@ -170,6 +170,9 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 	select {
 	case <-ready:
 		subscriptionTimer.Stop()
+		// Reset grace period so heartbeat timeout starts from subscription
+		// readiness, not client creation (avoids false 503 after slow subscribe).
+		c.createdAt = time.Now().UnixNano()
 		logger.Infof("[Blockchain] Subscription ready for %s", source)
 	case <-subscriptionTimer.C:
 		logger.Warnf("[Blockchain] Subscription not ready after %v for %s, proceeding anyway", subscriptionTimeout, source)
