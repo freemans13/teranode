@@ -166,12 +166,15 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 	// requests before the blockchain subscription is ready, causing stale state
 	// (e.g. getinfo returning block height 0).
 	subscriptionTimeout := tSettings.BlockChain.SubscriptionTimeout
+	subscriptionTimer := time.NewTimer(subscriptionTimeout)
 	select {
 	case <-ready:
+		subscriptionTimer.Stop()
 		logger.Infof("[Blockchain] Subscription ready for %s", source)
-	case <-time.After(subscriptionTimeout):
+	case <-subscriptionTimer.C:
 		logger.Warnf("[Blockchain] Subscription not ready after %v for %s, proceeding anyway", subscriptionTimeout, source)
 	case <-ctx.Done():
+		subscriptionTimer.Stop()
 		return nil, ctx.Err()
 	}
 
