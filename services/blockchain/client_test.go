@@ -184,7 +184,7 @@ func TestClientHealth(t *testing.T) {
 		code, msg, err := c.Health(context.Background(), false)
 		require.Error(t, err)
 		assert.Equal(t, http.StatusFailedDependency, code)
-		assert.Contains(t, msg, "not ready")
+		assert.Contains(t, msg, "grpc error")
 	})
 
 	t.Run("readiness check returns OK", func(t *testing.T) {

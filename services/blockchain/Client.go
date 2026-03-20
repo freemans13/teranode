@@ -235,8 +235,11 @@ func (c *Client) Health(ctx context.Context, checkLiveness bool) (int, string, e
 	// If all dependencies are ready, return http.StatusOK
 	// A failed dependency check does not imply the service needs restarting
 	resp, err := c.client.HealthGRPC(ctx, &emptypb.Empty{})
-	if err != nil || !resp.GetOk() {
-		return http.StatusFailedDependency, resp.GetDetails(), errors.UnwrapGRPC(err)
+	if err != nil {
+		return http.StatusFailedDependency, err.Error(), errors.UnwrapGRPC(err)
+	}
+	if !resp.GetOk() {
+		return http.StatusFailedDependency, resp.GetDetails(), nil
 	}
 
 	// Check subscription health via heartbeat recency
