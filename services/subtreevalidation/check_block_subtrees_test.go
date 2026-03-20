@@ -518,7 +518,7 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 		}
 
 		// Subtree is missing — quorum will lock, mark as missing, then try to HTTP-fetch,
-		// which fails deterministically because port 0 is invalid. The important thing is it detected missing via quorum.
+		// from http://127.0.0.1:0, which fails deterministically because nothing listens there. The important thing is it detected missing via quorum.
 		_, err = server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
