@@ -255,9 +255,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 				}
 
-				// PHASE 2: Exact pre-allocation
-				subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
-
 				subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 				if err != nil {
 					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
@@ -265,6 +262,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 				if !subtreeDataExists {
 					if !localTxsAvailable {
+						// Pre-allocate only when we will populate the slice
+						subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
+
 						// get the subtree data from the peer and process it directly
 						url := fmt.Sprintf("%s/subtree_data/%s", request.BaseUrl, subtreeHash.String())
 
@@ -300,6 +300,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 					// When localTxsAvailable, skip fetch — ValidateSubtreeInternal will use local UTXO store
 				} else {
+					// Pre-allocate only when we will populate the slice
+					subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
+
 					// SubtreeData exists, extract transactions from stored file
 					err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx])
 					if err != nil {
