@@ -165,7 +165,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 	// returning the client. Without this, callers (e.g. RPC) may start serving
 	// requests before the blockchain subscription is ready, causing stale state
 	// (e.g. getinfo returning block height 0).
-	subscriptionTimeout := 30 * time.Second
+	subscriptionTimeout := tSettings.BlockChain.SubscriptionTimeout
 	select {
 	case <-ready:
 		logger.Infof("[Blockchain] Subscription ready for %s", source)
@@ -250,6 +250,11 @@ func (c *Client) Health(ctx context.Context, checkLiveness bool) (int, string, e
 // checkSubscriptionHealth verifies the blockchain subscription is active by
 // checking heartbeat recency. Returns 503 if the subscription appears stale.
 func (c *Client) checkSubscriptionHealth() (int, string) {
+	if c.createdAt == 0 {
+		// Client not created via constructor (e.g. test mock) — skip subscription check
+		return http.StatusOK, "subscription check skipped (no createdAt)"
+	}
+
 	lastHB := c.lastHeartbeat.Load()
 	heartbeatTimeout := 3 * c.settings.BlockChain.HeartbeatInterval
 
@@ -1242,6 +1247,7 @@ func (c *Client) GetSubscribers(ctx context.Context) ([]string, error) {
 //
 // Returns:
 //   - chan *blockchain_api.Notification: Channel for receiving blockchain notifications
+//   - <-chan struct{}: Ready channel that closes when subscription is established and FSM state fetched
 //   - error: Any error encountered during subscription establishment
 func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *blockchain_api.Notification, <-chan struct{}, error) {
 	// Use a buffered channel to prevent blocking on sends
