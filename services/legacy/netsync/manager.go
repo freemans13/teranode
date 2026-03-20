@@ -754,19 +754,21 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// Update network stats at the end of this tick.
 	defer sps.updateNetwork(sp)
 
-	validNetworkSpeed := sps.validNetworkSpeed(sm.minSyncPeerNetworkSpeed)
+	headersFirst := sm.headersFirstMode.Load()
 	lastBlockSince := time.Since(sps.getLastBlockTime())
 
-	sm.logger.Debugf("[CheckSyncPeer] sync peer %s check, network violations: %v (limit %v), time since last block: %v (limit %v), headers-first mode: %v", sp.String(), validNetworkSpeed, maxNetworkViolations, lastBlockSince, maxLastBlockTime, sm.headersFirstMode.Load())
+	// Skip violation checks entirely during headers-first mode to avoid
+	// side effects (validNetworkSpeed increments violation counter).
+	var isNetworkSpeedViolation, isLastBlockTimeViolation bool
+	if !headersFirst {
+		validNetworkSpeed := sps.validNetworkSpeed(sm.minSyncPeerNetworkSpeed)
+		isNetworkSpeedViolation = validNetworkSpeed >= maxNetworkViolations
+		isLastBlockTimeViolation = lastBlockSince > maxLastBlockTime
 
-	// Don't check network speed during headers-first mode, as we're intentionally
-	// downloading small headers (80 bytes each) rather than full blocks. The peer
-	// may appear slow because we're not requesting much data, not because it's actually slow.
-	isNetworkSpeedViolation := !sm.headersFirstMode.Load() && (validNetworkSpeed >= maxNetworkViolations)
-
-	// Don't check last block time during headers-first mode, as we're downloading
-	// all headers before requesting any blocks, which can take longer than maxLastBlockTime.
-	isLastBlockTimeViolation := !sm.headersFirstMode.Load() && (lastBlockSince > maxLastBlockTime)
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check, network violations: %v (limit %v), time since last block: %v (limit %v)", sp.String(), validNetworkSpeed, maxNetworkViolations, lastBlockSince, maxLastBlockTime)
+	} else {
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check skipped (headers-first mode), time since last block: %v", sp.String(), lastBlockSince)
+	}
 
 	// If no violations detected, the sync peer is healthy — nothing to do.
 	if !isNetworkSpeedViolation && !isLastBlockTimeViolation {
