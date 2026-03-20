@@ -7,6 +7,7 @@ package blockchain
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ type Client struct {
 	subscribersMu         sync.Mutex                         // Mutex for subscribers list
 	lastBlockNotification *blockchain_api.Notification       // Last block notification received
 	lastHeartbeat         atomic.Int64                       // Unix nano timestamp of last heartbeat
+	createdAt             int64                              // Unix nano timestamp — used for startup grace period
 }
 
 // BestBlockHeader represents the best block header in the blockchain.
@@ -150,6 +152,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 		running:     &running,
 		conn:        baConn,
 		subscribers: make([]clientSubscriber, 0),
+		createdAt:   time.Now().UnixNano(),
 	}
 
 	// start a subscription to the blockchain service and wait for it to be ready
@@ -236,7 +239,36 @@ func (c *Client) Health(ctx context.Context, checkLiveness bool) (int, string, e
 		return http.StatusFailedDependency, resp.GetDetails(), errors.UnwrapGRPC(err)
 	}
 
+	// Check subscription health via heartbeat recency
+	if code, msg := c.checkSubscriptionHealth(); code != http.StatusOK {
+		return code, msg, nil
+	}
+
 	return http.StatusOK, resp.GetDetails(), nil
+}
+
+// checkSubscriptionHealth verifies the blockchain subscription is active by
+// checking heartbeat recency. Returns 503 if the subscription appears stale.
+func (c *Client) checkSubscriptionHealth() (int, string) {
+	lastHB := c.lastHeartbeat.Load()
+	heartbeatTimeout := 3 * c.settings.BlockChain.HeartbeatInterval
+
+	if lastHB == 0 {
+		// No heartbeat yet — check if still within startup grace period
+		if time.Since(time.Unix(0, c.createdAt)) > heartbeatTimeout {
+			return http.StatusServiceUnavailable,
+				fmt.Sprintf("subscription not established (no heartbeat received after %v)", heartbeatTimeout)
+		}
+		return http.StatusOK, "subscription: waiting for first heartbeat"
+	}
+
+	heartbeatAge := time.Since(time.Unix(0, lastHB))
+	if heartbeatAge > heartbeatTimeout {
+		return http.StatusServiceUnavailable,
+			fmt.Sprintf("subscription stale (last heartbeat %v ago, timeout %v)", heartbeatAge.Round(time.Second), heartbeatTimeout)
+	}
+
+	return http.StatusOK, fmt.Sprintf("subscription healthy (last heartbeat %v ago)", heartbeatAge.Round(time.Second))
 }
 
 // AddBlock sends a request to add a new block to the blockchain.
