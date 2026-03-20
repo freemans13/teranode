@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -103,8 +104,10 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	// and let ValidateSubtreeInternal validate using local UTXO store lookups instead.
 	var localTxsAvailable bool
 	if u.blockAssemblyClient != nil {
-		state, baErr := u.blockAssemblyClient.GetBlockAssemblyState(ctx)
-		if baErr == nil && state != nil && state.TxCount > uint64(block.TransactionCount) {
+		baCtx, baCancel := context.WithTimeout(ctx, 2*time.Second)
+		state, baErr := u.blockAssemblyClient.GetBlockAssemblyState(baCtx)
+		baCancel()
+		if baErr == nil && state != nil && state.TxCount >= uint64(block.TransactionCount) {
 			localTxsAvailable = true
 			u.logger.Infof("[CheckBlockSubtrees] Block assembly has %d txs, block needs %d — skipping subtree_data fetch from peer", state.TxCount, block.TransactionCount)
 		}

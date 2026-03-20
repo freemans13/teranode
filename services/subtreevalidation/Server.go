@@ -161,6 +161,8 @@ type Server struct {
 //   - blockchainClient: Client for blockchain interaction
 //   - subtreeConsumerClient: Kafka consumer for subtree-related messages
 //   - txmetaConsumerClient: Kafka consumer for transaction metadata messages
+//   - p2pClient: Client for P2P peer communication (byte tracking, peer info)
+//   - blockAssemblyClient: Client for block assembly service (local tx availability check)
 //
 // Returns:
 //   - *Server: Fully initialized server instance ready for starting
