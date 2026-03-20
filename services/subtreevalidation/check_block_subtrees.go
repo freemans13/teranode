@@ -86,7 +86,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		if u.quorum != nil {
 			locked, exists, release, err := u.quorum.TryLockIfNotExistsWithTimeout(ctx, subtreeHash, fileformat.FileTypeSubtree)
 			if err != nil {
-				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to check if subtree exists in store", err)
+				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to acquire quorum lock or determine subtree existence", err)
 			}
 			if locked {
 				// File doesn't exist and no one else is working on it — release lock and mark missing

@@ -420,6 +420,251 @@ func TestCheckBlockSubtrees(t *testing.T) {
 	})
 }
 
+func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
+	testHeaders := testhelpers.CreateTestHeaders(t, 1)
+
+	t.Run("SubtreeExistsViaQuorum", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		// Set up quorum using the server's subtreeStore as the exister
+		quorumDir := t.TempDir()
+		q, err := NewQuorum(&ulogger.TestLogger{}, server.subtreeStore, quorumDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+		server.quorum = q
+
+		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+			mock.Anything).
+			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+		// Create a subtree hash and store it so it "exists"
+		subtreeHash := chainhash.Hash{}
+		copy(subtreeHash[:], []byte("quorum_test_subtree_exists__"))
+
+		err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtree, []byte("validated"))
+		require.NoError(t, err)
+
+		header := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{},
+			Nonce:          0,
+		}
+
+		coinbaseTx := &bt.Tx{Version: 1}
+		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 2, 500, 0, 0)
+		require.NoError(t, err)
+
+		blockBytes, err := block.Bytes()
+		require.NoError(t, err)
+
+		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+			Block:   blockBytes,
+			BaseUrl: "http://test.com",
+		}
+
+		// Subtree exists — should return blessed with no missing subtrees
+		response, err := server.CheckBlockSubtrees(context.Background(), request)
+		require.NoError(t, err)
+		assert.True(t, response.Blessed)
+	})
+
+	t.Run("SubtreeMissingViaQuorum_LocksAndMarks", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		// Set up quorum — subtree does NOT exist in store
+		quorumDir := t.TempDir()
+		q, err := NewQuorum(&ulogger.TestLogger{}, server.subtreeStore, quorumDir, WithTimeout(100*time.Millisecond))
+		require.NoError(t, err)
+		server.quorum = q
+
+		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+			mock.Anything).
+			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+		subtreeHash := chainhash.Hash{}
+		copy(subtreeHash[:], []byte("quorum_test_subtree_missing_"))
+
+		header := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{},
+			Nonce:          0,
+		}
+
+		coinbaseTx := &bt.Tx{Version: 1}
+		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 2, 500, 0, 0)
+		require.NoError(t, err)
+
+		blockBytes, err := block.Bytes()
+		require.NoError(t, err)
+
+		server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
+			mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1, 2, 3}, nil)
+		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+			mock.Anything, blockchain.FSMStateRUNNING).
+			Return(true, nil)
+
+		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+			Block:   blockBytes,
+			BaseUrl: "http://test.com",
+		}
+
+		// Subtree is missing — quorum will lock, mark as missing, then try to HTTP-fetch
+		// which fails because test.com isn't real. The important thing is it detected missing via quorum.
+		_, err = server.CheckBlockSubtrees(context.Background(), request)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
+	})
+
+	t.Run("QuorumTimeout_TreatsAsMissing", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		// Set up quorum with very short timeout
+		quorumDir := t.TempDir()
+		q, err := NewQuorum(&ulogger.TestLogger{}, server.subtreeStore, quorumDir, WithTimeout(30*time.Millisecond))
+		require.NoError(t, err)
+		server.quorum = q
+
+		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+			mock.Anything).
+			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+		subtreeHash := chainhash.Hash{}
+		copy(subtreeHash[:], []byte("quorum_test_subtree_timeout_"))
+
+		// Pre-create a lock file and keep it fresh to force timeout
+		lockFilePath := fmt.Sprintf("%s/%s.lock", quorumDir, subtreeHash.String())
+		require.NoError(t, os.WriteFile(lockFilePath, []byte("locked"), 0600))
+		defer os.Remove(lockFilePath)
+
+		stopRefresh := make(chan struct{})
+		defer close(stopRefresh)
+		go func() {
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopRefresh:
+					return
+				case <-ticker.C:
+					now := time.Now()
+					_ = os.Chtimes(lockFilePath, now, now)
+				}
+			}
+		}()
+
+		header := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{},
+			Nonce:          0,
+		}
+
+		coinbaseTx := &bt.Tx{Version: 1}
+		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 2, 500, 0, 0)
+		require.NoError(t, err)
+
+		blockBytes, err := block.Bytes()
+		require.NoError(t, err)
+
+		server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
+			mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1, 2, 3}, nil)
+		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+			mock.Anything, blockchain.FSMStateRUNNING).
+			Return(true, nil)
+
+		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+			Block:   blockBytes,
+			BaseUrl: "http://test.com",
+		}
+
+		// Timeout returns (false, false, nil) — not an error — subtree treated as missing.
+		// The downstream HTTP fetch will fail, but the quorum timeout itself should not error.
+		_, err = server.CheckBlockSubtrees(context.Background(), request)
+		require.Error(t, err)
+		// The error should be from the HTTP fetch, not from quorum timeout
+		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
+		assert.NotContains(t, err.Error(), "quorum lock")
+	})
+
+	t.Run("QuorumContextCancelled_ReturnsError", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		quorumDir := t.TempDir()
+		q, err := NewQuorum(&ulogger.TestLogger{}, server.subtreeStore, quorumDir, WithTimeout(5*time.Second))
+		require.NoError(t, err)
+		server.quorum = q
+
+		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+			mock.Anything).
+			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+		subtreeHash := chainhash.Hash{}
+		copy(subtreeHash[:], []byte("quorum_test_ctx_cancelled__"))
+
+		// Pre-create a lock file and keep it fresh
+		lockFilePath := fmt.Sprintf("%s/%s.lock", quorumDir, subtreeHash.String())
+		require.NoError(t, os.WriteFile(lockFilePath, []byte("locked"), 0600))
+		defer os.Remove(lockFilePath)
+
+		stopRefresh := make(chan struct{})
+		defer close(stopRefresh)
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopRefresh:
+					return
+				case <-ticker.C:
+					now := time.Now()
+					_ = os.Chtimes(lockFilePath, now, now)
+				}
+			}
+		}()
+
+		header := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{},
+			Nonce:          0,
+		}
+
+		coinbaseTx := &bt.Tx{Version: 1}
+		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 2, 500, 0, 0)
+		require.NoError(t, err)
+
+		blockBytes, err := block.Bytes()
+		require.NoError(t, err)
+
+		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+			Block:   blockBytes,
+			BaseUrl: "http://test.com",
+		}
+
+		// Cancel context immediately — should return error
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err = server.CheckBlockSubtrees(ctx, request)
+		require.Error(t, err)
+	})
+}
+
 func TestExtractAndCollectTransactions(t *testing.T) {
 	t.Run("Success", func(t *testing.T) {
 		server, cleanup := setupTestServer(t)
