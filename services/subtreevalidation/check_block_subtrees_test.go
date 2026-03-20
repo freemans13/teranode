@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
@@ -513,11 +514,11 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 
 		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
 			Block:   blockBytes,
-			BaseUrl: "http://test.com",
+			BaseUrl: "http://127.0.0.1:0",
 		}
 
-		// Subtree is missing — quorum will lock, mark as missing, then try to HTTP-fetch
-		// which fails because test.com isn't real. The important thing is it detected missing via quorum.
+		// Subtree is missing — quorum will lock, mark as missing, then try to HTTP-fetch,
+		// which fails deterministically because port 0 is invalid. The important thing is it detected missing via quorum.
 		_, err = server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
@@ -541,7 +542,7 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 		copy(subtreeHash[:], []byte("quorum_test_subtree_timeout_"))
 
 		// Pre-create a lock file and keep it fresh to force timeout
-		lockFilePath := fmt.Sprintf("%s/%s.lock", quorumDir, subtreeHash.String())
+		lockFilePath := filepath.Join(quorumDir, subtreeHash.String()+".lock")
 		require.NoError(t, os.WriteFile(lockFilePath, []byte("locked"), 0600))
 		defer os.Remove(lockFilePath)
 
@@ -586,10 +587,10 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 
 		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
 			Block:   blockBytes,
-			BaseUrl: "http://test.com",
+			BaseUrl: "http://127.0.0.1:0",
 		}
 
-		// Timeout returns (false, false, nil) — not an error — subtree treated as missing.
+		// Timeout returns (false, false, noopFunc, nil) — not an error — subtree treated as missing.
 		// The downstream HTTP fetch will fail, but the quorum timeout itself should not error.
 		_, err = server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
@@ -615,7 +616,7 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 		copy(subtreeHash[:], []byte("quorum_test_ctx_cancelled__"))
 
 		// Pre-create a lock file and keep it fresh
-		lockFilePath := fmt.Sprintf("%s/%s.lock", quorumDir, subtreeHash.String())
+		lockFilePath := filepath.Join(quorumDir, subtreeHash.String()+".lock")
 		require.NoError(t, os.WriteFile(lockFilePath, []byte("locked"), 0600))
 		defer os.Remove(lockFilePath)
 
@@ -653,7 +654,7 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 
 		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
 			Block:   blockBytes,
-			BaseUrl: "http://test.com",
+			BaseUrl: "http://127.0.0.1:0",
 		}
 
 		// Cancel context immediately — should return error
@@ -662,6 +663,64 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 
 		_, err = server.CheckBlockSubtrees(ctx, request)
 		require.Error(t, err)
+	})
+
+	// Tests the actual race scenario: lock exists (in-flight handler), subtree file appears
+	// before timeout, CheckBlockSubtrees sees exists=true and does NOT mark it missing.
+	t.Run("InFlightHandler_CompletesBeforeTimeout", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		quorumDir := t.TempDir()
+		q, err := NewQuorum(&ulogger.TestLogger{}, server.subtreeStore, quorumDir, WithTimeout(2*time.Second))
+		require.NoError(t, err)
+		server.quorum = q
+
+		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+			mock.Anything).
+			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+		subtreeHash := chainhash.Hash{}
+		copy(subtreeHash[:], []byte("quorum_test_inflight_race___"))
+
+		// Pre-create lock file to simulate in-flight handler
+		lockFilePath := filepath.Join(quorumDir, subtreeHash.String()+".lock")
+		require.NoError(t, os.WriteFile(lockFilePath, []byte("locked"), 0600))
+
+		// Simulate in-flight handler completing: after a short delay, store the subtree
+		// and release the lock file. TryLockIfNotExistsWithTimeout will retry and see exists=true.
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			_ = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtree, []byte("validated"))
+			os.Remove(lockFilePath)
+		}()
+
+		header := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{},
+			Nonce:          0,
+		}
+
+		coinbaseTx := &bt.Tx{Version: 1}
+		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 2, 500, 0, 0)
+		require.NoError(t, err)
+
+		blockBytes, err := block.Bytes()
+		require.NoError(t, err)
+
+		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+			Block:   blockBytes,
+			BaseUrl: "http://127.0.0.1:0",
+		}
+
+		// The in-flight handler completes and stores the subtree before timeout.
+		// CheckBlockSubtrees should see exists=true and return blessed (no missing subtrees).
+		response, err := server.CheckBlockSubtrees(context.Background(), request)
+		require.NoError(t, err)
+		assert.True(t, response.Blessed)
 	})
 }
 

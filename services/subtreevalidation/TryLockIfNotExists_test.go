@@ -289,7 +289,7 @@ func TestTryLockIfNotExistsWithTimeout(t *testing.T) {
 		releaseFunc()
 	})
 
-	// Scenario 8: Lock file exists and is kept fresh -> internal timeout returns (false, false, nil, nil)
+	// Scenario 8: Lock file exists and is kept fresh -> internal timeout returns (false, false, noopFunc, nil)
 	t.Run("LockFileKeptFreshInternalTimeout", func(t *testing.T) {
 		tempDir := t.TempDir()
 		exister := newMockExister(false)
