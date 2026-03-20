@@ -764,16 +764,20 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// may appear slow because we're not requesting much data, not because it's actually slow.
 	isNetworkSpeedViolation := !sm.headersFirstMode.Load() && (validNetworkSpeed >= maxNetworkViolations)
 
+	// Don't check last block time during headers-first mode, as we're downloading
+	// all headers before requesting any blocks, which can take longer than maxLastBlockTime.
+	isLastBlockTimeViolation := !sm.headersFirstMode.Load() && (lastBlockSince > maxLastBlockTime)
+
 	// Check network speed of the sync peer and its last block time. If we're currently
 	// flushing the cache skip this round.
-	if !isNetworkSpeedViolation && (lastBlockSince <= maxLastBlockTime) {
+	if !isNetworkSpeedViolation && !isLastBlockTimeViolation {
 		return
 	}
 
 	var reason string
 	if isNetworkSpeedViolation {
 		reason = "network speed violation"
-	} else if lastBlockSince > maxLastBlockTime {
+	} else if isLastBlockTimeViolation {
 		reason = "last block time out of range"
 	}
 	sm.logger.Debugf("[CheckSyncPeer] sync peer %s is stalled due to %s, updating sync peer", sp.String(), reason)
