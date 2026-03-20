@@ -784,6 +784,12 @@ func (d *Daemon) startValidationService(
 			return err
 		}
 
+		// Create blockassembly client to check local tx availability
+		blockAssemblyClient, err := blockassembly.NewClient(ctx, createLogger(loggerBlockAssembly), appSettings)
+		if err != nil {
+			return err
+		}
+
 		// Create the SubtreeValidation service
 		var service *subtreevalidation.Server
 
@@ -799,6 +805,7 @@ func (d *Daemon) startValidationService(
 			subtreeConsumerClient,
 			txMetaConsumerClient,
 			p2pClient,
+			blockAssemblyClient,
 		)
 		if err != nil {
 			return err

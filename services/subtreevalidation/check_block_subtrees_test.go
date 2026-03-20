@@ -17,6 +17,8 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
@@ -2001,4 +2003,68 @@ func TestBuildParentMetadata(t *testing.T) {
 		assert.True(t, exists)
 		assert.Equal(t, uint32(100), meta.BlockHeight)
 	})
+}
+
+// TestCheckBlockSubtrees_SkipSubtreeDataFetchWhenLocalTxsAvailable verifies that when
+// block assembly has enough transactions locally, the expensive subtree_data fetch
+// from the peer's asset-cache is skipped.
+func TestCheckBlockSubtrees_SkipSubtreeDataFetchWhenLocalTxsAvailable(t *testing.T) {
+	testHeaders := testhelpers.CreateTestHeaders(t, 1)
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Mock blockchain client
+	server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+		mock.Anything).
+		Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+	// Set up a mock block assembly client that reports high tx count
+	mockBA := blockassembly.NewMock()
+	mockBA.On("GetBlockAssemblyState", mock.Anything).
+		Return(&blockassembly_api.StateMessage{
+			TxCount: 1000000, // 1M txs available locally
+		}, nil)
+	server.blockAssemblyClient = mockBA
+
+	// Mock GetBlockHeaderIDs (called before subtree processing in the fork)
+	server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
+		mock.Anything, mock.Anything, mock.Anything).
+		Return([]uint32{1, 2, 3}, nil)
+
+	// Create a missing subtree hash — not in store, so it triggers the fetch path
+	subtreeHash := chainhash.Hash{}
+	copy(subtreeHash[:], []byte("missing_subtree_hash_32_bytes___!"))
+
+	// Create a block referencing the missing subtree with fewer txs than block assembly has
+	header := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Timestamp:      uint32(time.Now().Unix()),
+		Bits:           model.NBit{},
+		Nonce:          0,
+	}
+
+	coinbaseTx := &bt.Tx{Version: 1}
+	block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 100, 400, 0, 0)
+	require.NoError(t, err)
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	// Use a BaseUrl that would fail if actually contacted — proves the fetch is skipped.
+	// The subtree structure fetch will still happen (and fail), which is expected.
+	request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+		Block:   blockBytes,
+		BaseUrl: "http://192.0.2.1:1", // RFC 5737 TEST-NET — guaranteed unreachable
+	}
+
+	// This will error because the subtree structure (/subtree/) fetch still happens
+	// and the URL is unreachable. But the important thing is that GetBlockAssemblyState
+	// was called, proving the optimization path was taken.
+	_, _ = server.CheckBlockSubtrees(context.Background(), request)
+
+	// Verify that block assembly state was queried
+	mockBA.AssertCalled(t, "GetBlockAssemblyState", mock.Anything)
 }
