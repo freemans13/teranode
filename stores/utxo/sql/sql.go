@@ -1371,10 +1371,12 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 			input := &bt.Input{}
 
 			var previousTxHashBytes []byte
+			var previousTxIdx int64
 
-			if err := rows.Scan(&previousTxHashBytes, &input.PreviousTxOutIndex, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
+			if err := rows.Scan(&previousTxHashBytes, &previousTxIdx, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
 				return nil, err
 			}
+			input.PreviousTxOutIndex = uint32(previousTxIdx)
 
 			previousTxHash, err := chainhash.NewHash(previousTxHashBytes)
 			if err != nil {
@@ -3011,9 +3013,11 @@ func (s *Store) batchDecorateInputs(ctx context.Context, ids []int, idToTx map[i
 			prevTxHashBytes []byte
 		)
 		input := &bt.Input{}
-		if err := rows.Scan(&txID, &prevTxHashBytes, &input.PreviousTxOutIndex, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
+		var previousTxIdx int64
+		if err := rows.Scan(&txID, &prevTxHashBytes, &previousTxIdx, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
 			return err
 		}
+		input.PreviousTxOutIndex = uint32(previousTxIdx)
 
 		row := idToTx[txID]
 		if row == nil {
