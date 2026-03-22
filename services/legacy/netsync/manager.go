@@ -1658,19 +1658,14 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 	switch invVect.Type {
 	case wire.InvTypeBlock:
-		// check whether this block exists in the blockchain service
-		exists, err := sm.blockchainClient.GetBlockExists(sm.ctx, &invVect.Hash)
-		if err != nil || !exists {
-			return false, err
-		}
-
-		// block exists, but check if it was marked invalid — invalid blocks
-		// should be re-requested so they can be reprocessed
+		// single round-trip: GetBlockHeader tells us both existence and validity
 		_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &invVect.Hash)
 		if err != nil {
+			// block not found (or transient error) — trigger re-request
 			return false, nil
 		}
 
+		// block exists but was marked invalid — re-request so it can be reprocessed
 		return !meta.Invalid, nil
 
 	case wire.InvTypeTx:

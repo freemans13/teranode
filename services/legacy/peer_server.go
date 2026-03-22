@@ -926,7 +926,9 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte) {
 	// should be reprocessed rather than silently dropped
 	if exists {
 		_, meta, headerErr := sp.server.blockchainClient.GetBlockHeader(sp.ctx, block.Hash())
-		if headerErr == nil && meta.Invalid {
+		if headerErr != nil {
+			sp.server.logger.Warnf("GetBlockHeader failed for %s: %v", block.Hash(), headerErr)
+		} else if meta.Invalid {
 			exists = false
 		}
 	}
