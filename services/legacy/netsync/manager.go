@@ -757,18 +757,18 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	headersFirst := sm.headersFirstMode.Load()
 	lastBlockSince := time.Since(sps.getLastBlockTime())
 
-	// Skip violation checks entirely during headers-first mode to avoid
-	// side effects (validNetworkSpeed increments violation counter).
-	var isNetworkSpeedViolation, isLastBlockTimeViolation bool
+	// During headers-first mode, only suppress network speed checks since
+	// downloading 80-byte headers makes the peer appear slow. Still check
+	// last-block-time so stalled peers get rotated even during headers-first.
+	var isNetworkSpeedViolation bool
 	if !headersFirst {
 		validNetworkSpeed := sps.validNetworkSpeed(sm.minSyncPeerNetworkSpeed)
 		isNetworkSpeedViolation = validNetworkSpeed >= maxNetworkViolations
-		isLastBlockTimeViolation = lastBlockSince > maxLastBlockTime
-
 		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check, network violations: %v (limit %v), time since last block: %v (limit %v)", sp.String(), validNetworkSpeed, maxNetworkViolations, lastBlockSince, maxLastBlockTime)
 	} else {
-		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check skipped (headers-first mode), time since last block: %v", sp.String(), lastBlockSince)
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check (headers-first mode, speed check skipped), time since last block: %v (limit %v)", sp.String(), lastBlockSince, maxLastBlockTime)
 	}
+	isLastBlockTimeViolation := lastBlockSince > maxLastBlockTime
 
 	// If no violations detected, the sync peer is healthy — nothing to do.
 	if !isNetworkSpeedViolation && !isLastBlockTimeViolation {
