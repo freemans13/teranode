@@ -50,9 +50,6 @@ type FileStorer struct {
 	// mu protects readerError and bufferedWriter writes
 	mu sync.Mutex
 
-	// reader is the read end of the pipe, kept to close with error on failure
-	reader *io.PipeReader
-
 	// done signals when the background goroutine completes
 	done chan struct{}
 
@@ -102,7 +99,6 @@ func NewFileStorer(ctx context.Context, logger ulogger.Logger, tSettings *settin
 		store:          store,
 		key:            key,
 		fileType:       fileType,
-		reader:         reader,
 		writer:         writer,
 		bufferedWriter: bufferedWriter,
 		done:           make(chan struct{}),
@@ -127,7 +123,7 @@ func NewFileStorer(ctx context.Context, logger ulogger.Logger, tSettings *settin
 			// This unblocks any Write() call stuck on pipe.write(), which holds
 			// fs.mu. Without this, we deadlock: Write holds mu waiting for the
 			// pipe to drain, and we wait for mu to set readerError.
-			reader.CloseWithError(err)
+			_ = reader.CloseWithError(err)
 
 			fs.mu.Lock()
 			fs.readerError = err
