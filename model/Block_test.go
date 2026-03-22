@@ -1278,8 +1278,11 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	_, err = utxoStore.Create(context.Background(), tx, blockID101, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 101, BlockHeight: 101}))
 	require.NoError(t, err)
 
+	blockID102 := uint32(102)
+
 	currentBlockHeaderIDsMap := make(map[uint32]struct{})
 	currentBlockHeaderIDsMap[blockID100] = struct{}{}
+	currentBlockHeaderIDsMap[blockID102] = struct{}{}
 
 	block := &Block{}
 
@@ -1295,10 +1298,10 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	})
 
 	t.Run("test parent is not in a previous block", func(t *testing.T) {
-		// swap parent/tx hashes to simulate a parent whose block ID is within the
-		// numeric range of cached IDs but not actually in the set. This now defers
-		// to the validator's checkOldBlockIDs (which has a larger lookup) instead
-		// of erroring, because block IDs can have gaps due to orphan/invalid blocks.
+		// swap parent/tx hashes so the parent resolves to block ID 101, which falls
+		// within the cached range [100, 102] but is missing from the set (a gap).
+		// This defers to the validator's checkOldBlockIDs instead of erroring,
+		// because block IDs can have gaps due to orphan/invalid blocks.
 		parentTxStruct := missingParentTx{
 			parentTxHash: *tx.TxIDChainHash(),
 			txHash:       *txParent.TxIDChainHash(),

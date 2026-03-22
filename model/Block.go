@@ -901,10 +901,8 @@ func (b *Block) checkParentExistsOnChain(gCtx context.Context, logger ulogger.Lo
 
 	if len(foundInPreviousBlocks) == 0 && minBlockID > 0 {
 		// Parent tx's block ID was not found in our cached set of recent chain block IDs.
-		// This can happen for two reasons:
-		// 1. The parent block is genuinely older than the cached range (minBlockID < minSetBlockID)
-		// 2. The parent block is within the numeric range but missing from the set because
-		//    block IDs are non-contiguous (orphan/invalid blocks consume IDs, creating gaps)
+		// This can happen when the parent block is older than the cached range or when
+		// block IDs are non-contiguous (orphan/invalid blocks consume IDs, creating gaps).
 		// In both cases, defer to checkOldBlockIDs in the validator which uses a larger
 		// lookup (10,000 IDs) plus a CheckBlockIsInCurrentChain slow path.
 		logger.Debugf("[BLOCK][%s] parent transaction %s of tx %s block ID %d not in cached %d IDs - checking later in validator", b.String(), parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String(), minBlockID, len(currentBlockHeaderIDsMap))
