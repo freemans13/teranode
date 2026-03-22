@@ -218,8 +218,11 @@ func (c *Client) Health(ctx context.Context, checkLiveness bool) (int, string, e
 	// If all dependencies are ready, return http.StatusOK
 	// A failed dependency check does not imply the service needs restarting
 	resp, err := c.client.HealthGRPC(ctx, &emptypb.Empty{})
-	if err != nil || !resp.GetOk() {
-		return http.StatusFailedDependency, resp.GetDetails(), errors.UnwrapGRPC(err)
+	if err != nil {
+		return http.StatusFailedDependency, err.Error(), errors.UnwrapGRPC(err)
+	}
+	if !resp.GetOk() {
+		return http.StatusFailedDependency, resp.GetDetails(), nil
 	}
 
 	return http.StatusOK, resp.GetDetails(), nil
@@ -1196,7 +1199,6 @@ func (c *Client) GetSubscribers(ctx context.Context) ([]string, error) {
 //
 // Returns:
 //   - chan *blockchain_api.Notification: Channel for receiving blockchain notifications
-//   - <-chan struct{}: Ready channel that closes when subscription is established and FSM state fetched
 //   - error: Any error encountered during subscription establishment
 func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *blockchain_api.Notification, error) {
 	// Use a buffered channel to prevent blocking on sends
