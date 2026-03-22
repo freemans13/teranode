@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
 	"modernc.org/sqlite"
 )
@@ -520,6 +521,12 @@ RETURNING id
 //   - error: A domain-specific error with appropriate context, typically wrapped as
 //     a BlockAlreadyExistsError for duplicates or a more general StorageError for other issues
 func (*SQL) parseSQLError(err error, block *model.Block) error {
+	// check whether this is a pgx postgres exists constraint error
+	var pgxErr *pgconn.PgError
+	if errors.As(err, &pgxErr) && pgxErr.Code == "23505" { // Duplicate constraint violation
+		return errors.NewBlockExistsError("block already exists in the database: %s", block.Hash().String(), err)
+	}
+
 	// check whether this is a postgres exists constraint error
 	var pqErr *pq.Error
 	if errors.As(err, &pqErr) && pqErr.Code == "23505" { // Duplicate constraint violation

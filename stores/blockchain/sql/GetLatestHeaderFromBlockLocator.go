@@ -38,7 +38,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // GetLatestBlockHeaderFromBlockLocator retrieves the latest block header from the database by a block locator.
@@ -120,7 +120,7 @@ func (s *SQL) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestBloc
 
 	if s.engine == util.Postgres {
 		// Convert []chainhash.Hash to [][]byte
-		hashBytes := make([][]byte, len(blockLocator))
+		hashBytes := make(pgtype.FlatArray[[]byte], len(blockLocator))
 		for i, hash := range blockLocator {
 			hashBytes[i] = hash[:]
 		}
@@ -129,7 +129,7 @@ func (s *SQL) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestBloc
 			AND b.hash = ANY($2)
 			ORDER BY b.height DESC
 			LIMIT 1`
-		args = []interface{}{bestBlockHash[:], pq.Array(hashBytes)}
+		args = []interface{}{bestBlockHash[:], hashBytes}
 	} else {
 		// SQLite: Generate dynamic placeholders for IN clause
 		placeholders := make([]string, len(blockLocator))
