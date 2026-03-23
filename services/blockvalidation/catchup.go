@@ -778,22 +778,13 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	// Channel for async subtree file writes (only used by quick validation)
 	var writeJobsChan chan *SubtreeWriteJob
 
-	bestBlockHeader, _, err := u.blockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		return errors.NewProcessingError("failed to get best block header", err)
+	// Transition FSM to CATCHINGBLOCKS for all catchup (chain-extending and fork blocks).
+	// If the FSM rejects the transition (e.g. node is LEGACYSYNCING), the error propagates
+	// up to the catchupCh handler which handles it gracefully without penalizing the peer.
+	if err := u.setFSMCatchingBlocks(ctx, catchupCtx, &size); err != nil {
+		return err
 	}
-
-	// Check if we need to change FSM state
-	newBlocksOnOurChain := len(catchupCtx.blockHeaders) > 0 && catchupCtx.blockHeaders[0].HashPrevBlock.IsEqual(bestBlockHeader.Hash())
-
-	// Set FSM state if needed
-	if newBlocksOnOurChain {
-		if err := u.setFSMCatchingBlocks(ctx, catchupCtx, &size); err != nil {
-			return err
-		}
-
-		defer u.restoreFSMState(ctx, catchupCtx)
-	}
+	defer u.restoreFSMState(ctx, catchupCtx)
 
 	// Create error group for concurrent operations
 	errorGroup, gCtx := errgroup.WithContext(ctx)
@@ -828,7 +819,7 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	})
 
 	// Wait for both operations to complete
-	err = errorGroup.Wait()
+	err := errorGroup.Wait()
 	if err != nil {
 		catchupCtx.catchupError = err
 	}
@@ -951,7 +942,7 @@ func (u *Server) setFSMCatchingBlocks(ctx context.Context, catchupCtx *CatchupCo
 	u.logger.Infof("[catchup][%s] Setting node to CATCHINGBLOCKS state for %d blocks", catchupCtx.blockUpTo.Hash().String(), size.Load())
 
 	if err := u.blockchainClient.CatchUpBlocks(ctx); err != nil {
-		return errors.NewProcessingError("[catchup][%s] failed to send CATCHUPBLOCKS event: %w", catchupCtx.blockUpTo.Hash().String(), err)
+		return errors.NewStateError("[catchup][%s] FSM rejected CATCHUPBLOCKS transition: %w", catchupCtx.blockUpTo.Hash().String(), err)
 	}
 
 	return nil

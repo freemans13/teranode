@@ -621,6 +621,14 @@ func (u *Server) Init(ctx context.Context) (err error) {
 							continue
 						}
 
+						// FSM rejected the transition (e.g. LEGACYSYNCING active) — not a peer issue
+						if errors.Is(err, errors.ErrStateError) {
+							u.logger.Warnf("[catchup] FSM rejected catchup for block %s (node not in RUNNING state), clearing markers", c.block.Hash().String())
+							u.processBlockNotify.Delete(*c.block.Hash())
+							u.catchupAlternatives.Delete(*c.block.Hash())
+							continue
+						}
+
 						// Report catchup failure to P2P service
 						u.reportCatchupFailure(ctx, c.peerID)
 
