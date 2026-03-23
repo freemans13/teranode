@@ -629,6 +629,14 @@ func (u *Server) Init(ctx context.Context) (err error) {
 							continue
 						}
 
+						// Local infrastructure/service failure (e.g. blockchain service unavailable) — not a peer issue
+						if errors.Is(err, errors.ErrServiceError) {
+							u.logger.Warnf("[catchup] Local service error during catchup for block %s, clearing markers to allow retry: %v", c.block.Hash().String(), err)
+							u.processBlockNotify.Delete(*c.block.Hash())
+							u.catchupAlternatives.Delete(*c.block.Hash())
+							continue
+						}
+
 						// Report catchup failure to P2P service
 						u.reportCatchupFailure(ctx, c.peerID)
 
