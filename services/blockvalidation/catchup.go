@@ -942,7 +942,7 @@ func (u *Server) setFSMCatchingBlocks(ctx context.Context, catchupCtx *CatchupCo
 	u.logger.Infof("[catchup][%s] Setting node to CATCHINGBLOCKS state for %d blocks", catchupCtx.blockUpTo.Hash().String(), size.Load())
 
 	if err := u.blockchainClient.CatchUpBlocks(ctx); err != nil {
-		return errors.NewStateError("[catchup][%s] FSM rejected CATCHUPBLOCKS transition: %w", catchupCtx.blockUpTo.Hash().String(), err)
+		return errors.NewStateError("[catchup][%s] FSM rejected CATCHUPBLOCKS transition", catchupCtx.blockUpTo.Hash().String(), err)
 	}
 
 	return nil
