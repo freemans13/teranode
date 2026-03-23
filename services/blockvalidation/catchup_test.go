@@ -3889,7 +3889,7 @@ func TestFetchAndValidateBlocks_FSMRejectsWhenNotRunning(t *testing.T) {
 	// Override the permissive CatchUpBlocks mock to simulate FSM rejection
 	// (e.g. node is in LEGACYSYNCING state, so CATCHUPBLOCKS event is invalid)
 	mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "CatchUpBlocks")
-	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(errors.NewServiceError("event CATCHUPBLOCKS inappropriate in current state LEGACYSYNCING"))
+	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(errors.NewStateError("event CATCHUPBLOCKS inappropriate in current state LEGACYSYNCING"))
 
 	blocks := testhelpers.CreateTestBlockChain(t, 3)
 	catchupCtx := &CatchupContext{
