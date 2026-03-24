@@ -676,9 +676,27 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			// When missed == len(txHashes), the cache is either disabled or empty (e.g. Kafka
 			// txmeta topic not configured), so retrying would just add unnecessary delay.
 			u.logger.Debugf("[ValidateSubtreeInternal][%s] [attempt #%d] %d txs missing from cache, waiting for propagation", v.SubtreeHash.String(), attempt, missed)
-			select {
-			case <-ctx.Done():
-			case <-time.After(retrySleepDuration):
+			deadline := time.Now().Add(retrySleepDuration)
+		priorityWait:
+			for {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					break
+				}
+
+				sleep := 10 * time.Millisecond
+				if remaining < sleep {
+					sleep = remaining
+				}
+
+				select {
+				case <-ctx.Done():
+					break priorityWait
+				case <-time.After(sleep):
+					if u.isPrioritySubtreeCheckActive(v.SubtreeHash.String()) {
+						break priorityWait
+					}
+				}
 			}
 			continue
 		}
