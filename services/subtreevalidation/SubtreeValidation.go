@@ -664,8 +664,8 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		}
 
 		if failFast && abandonTxThreshold > 0 && missed > abandonTxThreshold {
-			// Not recoverable, returning processing error
-			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] [attempt #%d] failed to get tx meta from cache", v.SubtreeHash.String(), attempt, err)
+			// Not recoverable — too many txs missing from cache exceeds abandon threshold
+			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] [attempt #%d] too many txs missing from cache (%d missed, threshold %d)", v.SubtreeHash.String(), attempt, missed, abandonTxThreshold)
 		}
 
 		if missed > 0 && missed < len(txHashes) && attempt <= maxRetries {
