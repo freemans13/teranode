@@ -668,36 +668,39 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] [attempt #%d] too many txs missing from cache (%d missed, threshold %d)", v.SubtreeHash.String(), attempt, missed, abandonTxThreshold)
 		}
 
-		if missed > 0 && missed < len(txHashes) && attempt <= maxRetries {
+		// Determine how many txHashes are actually checkable in the cache. The coinbase
+		// placeholder is not stored in the cache and is not counted as missed by
+		// processTxMetaUsingCache, so exclude it from the comparison.
+		checkable := len(txHashes)
+		if checkable > 0 && txHashes[0].Equal(*subtreepkg.CoinbasePlaceholderHash) {
+			checkable--
+		}
+
+		if missed > 0 && missed < checkable && attempt <= maxRetries {
 			// Some (but not all) txs are missing from the cache — propagation is likely still
 			// processing them. Wait and retry step 1 (cache lookup) rather than falling through
 			// to the expensive store lookup and network fetch, since the txs will appear in the
 			// cache shortly.
-			// When missed == len(txHashes), the cache is either disabled or empty (e.g. Kafka
+			// When missed == checkable, the cache is either disabled or empty (e.g. Kafka
 			// txmeta topic not configured), so retrying would just add unnecessary delay.
 			u.logger.Debugf("[ValidateSubtreeInternal][%s] [attempt #%d] %d txs missing from cache, waiting for propagation", v.SubtreeHash.String(), attempt, missed)
-			deadline := time.Now().Add(retrySleepDuration)
+			ticker := time.NewTicker(10 * time.Millisecond)
+			deadline := time.NewTimer(retrySleepDuration)
 		priorityWait:
 			for {
-				remaining := time.Until(deadline)
-				if remaining <= 0 {
-					break
-				}
-
-				sleep := 10 * time.Millisecond
-				if remaining < sleep {
-					sleep = remaining
-				}
-
 				select {
 				case <-ctx.Done():
 					break priorityWait
-				case <-time.After(sleep):
+				case <-deadline.C:
+					break priorityWait
+				case <-ticker.C:
 					if u.isPrioritySubtreeCheckActive(v.SubtreeHash.String()) {
 						break priorityWait
 					}
 				}
 			}
+			ticker.Stop()
+			deadline.Stop()
 			continue
 		}
 

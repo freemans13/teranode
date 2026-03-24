@@ -149,6 +149,7 @@ func TestValidateSubtreeInternal_CacheMissRetry(t *testing.T) {
 
 	cache, err := txmetacache.NewTxMetaCache(ctx, tSettings, logger, utxoStore, txmetacache.Unallocated)
 	require.NoError(t, err)
+	require.IsType(t, &txmetacache.TxMetaCache{}, cache)
 	txMetaCache := cache.(*txmetacache.TxMetaCache)
 
 	// Create transactions and build subtree
@@ -184,9 +185,18 @@ func TestValidateSubtreeInternal_CacheMissRetry(t *testing.T) {
 	require.NoError(t, err)
 	txMeta2, err := utxoStore.Create(ctx, tx2, 0)
 	require.NoError(t, err)
-	txMeta3, err := utxoStore.Create(ctx, tx3, 0)
+
+	// For txMeta3/txMeta4, use a separate helper store so that the Server's underlying
+	// utxoStore does NOT contain them. This ensures ValidateSubtreeInternal cannot fall
+	// back to processTxMetaUsingStore to find these txmetas — the only way to succeed
+	// is via the cache-miss retry logic being tested.
+	helperStoreURL, err := url.Parse("sqlitememory:///helper")
 	require.NoError(t, err)
-	txMeta4, err := utxoStore.Create(ctx, tx4, 0)
+	helperStore, err := sql.New(ctx, logger, tSettings, helperStoreURL)
+	require.NoError(t, err)
+	txMeta3, err := helperStore.Create(ctx, tx3, 0)
+	require.NoError(t, err)
+	txMeta4, err := helperStore.Create(ctx, tx4, 0)
 	require.NoError(t, err)
 
 	// Populate only tx1 and tx2 in the cache — tx3 and tx4 are "still in propagation"
