@@ -601,7 +601,11 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 	retrySleepDuration := u.settings.BlockValidation.RetrySleep
 
-	// TODO document, what does this do?
+	// failFast is an optimisation that avoids checking every tx in the cache when most are missing.
+	// During the warmup phase (first N subtrees), failFast is disabled so we do full checks.
+	// After warmup, if the cache has too many misses, we short-circuit with ErrThresholdExceeded
+	// and retry later rather than wasting time checking all txs individually.
+	// failFast is always disabled on the final retry attempt to ensure a complete check.
 	subtreeWarmupCount := u.settings.BlockValidation.ValidationWarmupCount
 
 	subtreeWarmupCountInt32, err := safeconversion.IntToInt32(subtreeWarmupCount)
@@ -609,7 +613,6 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		return nil, err
 	}
 
-	// TODO document, what is the logic here?
 	failFast := v.AllowFailFast && failFastValidation && u.subtreeCount.Add(1) > subtreeWarmupCountInt32
 
 	// txMetaSlice will be populated with the txMeta data for each txHash
