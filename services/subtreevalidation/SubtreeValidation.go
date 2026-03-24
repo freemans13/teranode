@@ -701,6 +701,9 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			}
 			ticker.Stop()
 			deadline.Stop()
+			if ctx.Err() != nil {
+				return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] context cancelled while waiting for cache retry", v.SubtreeHash.String(), ctx.Err())
+			}
 			continue
 		}
 
