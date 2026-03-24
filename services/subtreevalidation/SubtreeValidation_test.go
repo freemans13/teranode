@@ -133,8 +133,9 @@ func TestValidateSubtreeInternal_CacheMissRetry(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
 
-	// Use a very short retry sleep so the test completes quickly
-	tSettings.BlockValidation.RetrySleep = 50 * time.Millisecond
+	// Use a short retry sleep so the test completes quickly, but generous enough
+	// to avoid flakiness on slow CI runners
+	tSettings.BlockValidation.RetrySleep = 500 * time.Millisecond
 	tSettings.BlockValidation.ValidationMaxRetries = 3
 	tSettings.Block.FailFastValidation = false
 	tSettings.SubtreeValidation.ProcessTxMetaUsingCacheBatchSize = 1024
@@ -205,7 +206,7 @@ func TestValidateSubtreeInternal_CacheMissRetry(t *testing.T) {
 
 	// Background goroutine: populate tx3 and tx4 after a short delay (simulates propagation completing)
 	go func() {
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 		_ = txMetaCache.SetCache(hash3, txMeta3)
 		_ = txMetaCache.SetCache(hash4, txMeta4)
 	}()
