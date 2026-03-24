@@ -433,6 +433,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockHeightRetentionAdjustment:     getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
 			DisableDAHCleaner:                  getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 			ReAssignedUtxoSpendableAfterBlocks: getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
+			QueryIdleTimeoutSeconds:            getInt("utxostore_queryIdleTimeoutSeconds", 60, alternativeContext...),
 		},
 		P2P: P2PSettings{
 			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),

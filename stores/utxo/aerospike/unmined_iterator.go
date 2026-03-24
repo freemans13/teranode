@@ -290,6 +290,14 @@ func (it *unminedTxIterator) processRecordset(ctx context.Context, results <-cha
 		_ = flush() // Best effort flush on exit
 	}()
 
+	// Create a reusable timer for idle timeout detection to avoid allocating a new
+	// timer on every iteration (time.After would create GC pressure during high-throughput scans).
+	var idleTimer *time.Timer
+	if it.queryIdleTimeout > 0 {
+		idleTimer = time.NewTimer(it.queryIdleTimeout)
+		defer idleTimer.Stop()
+	}
+
 	for {
 		// Only check context every contextCheckPeriod iterations for performance
 		if itemsProcessed%contextCheckPeriod == 0 {
@@ -305,15 +313,19 @@ func (it *unminedTxIterator) processRecordset(ctx context.Context, results <-cha
 		// arrives within the idle timeout the connection is likely dead (e.g. Aerospike node restart).
 		var rec *as.Result
 		var ok bool
-		if it.queryIdleTimeout > 0 {
+		if idleTimer != nil {
+			idleTimer.Reset(it.queryIdleTimeout)
 			select {
 			case rec, ok = <-results:
+				if !idleTimer.Stop() {
+					<-idleTimer.C
+				}
 				if !ok || rec == nil {
 					return
 				}
 			case <-ctx.Done():
 				return
-			case <-time.After(it.queryIdleTimeout):
+			case <-idleTimer.C:
 				it.store.logger.Errorf("[processRecordset] no records received from Aerospike partition query in %v — connection may be stalled, aborting worker", it.queryIdleTimeout)
 				select {
 				case it.errorChan <- errors.NewProcessingError("Aerospike partition query stalled: no records received in %v", it.queryIdleTimeout):
@@ -535,6 +547,17 @@ func (it *unminedTxIterator) Next(ctx context.Context) ([]*utxo.UnminedTransacti
 		return nil, it.err
 	case batch, ok := <-it.resultChan:
 		if !ok {
+			// resultChan closed — all workers finished. Check if any worker reported an error
+			// that arrived after our earlier non-blocking check (e.g. idle timeout error).
+			select {
+			case err := <-it.errorChan:
+				if err != nil {
+					it.err = err
+					it.closeWithLogging()
+					return nil, err
+				}
+			default:
+			}
 			it.closeWithLogging()
 			return nil, nil
 		}
