@@ -668,10 +668,13 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] [attempt #%d] failed to get tx meta from cache", v.SubtreeHash.String(), attempt, err)
 		}
 
-		if missed > 0 && attempt <= maxRetries {
-			// Some txs are not yet in the cache — propagation is likely still processing them.
-			// Wait and retry step 1 (cache lookup) rather than falling through to the expensive
-			// store lookup and network fetch, since the txs will appear in the cache shortly.
+		if missed > 0 && missed < len(txHashes) && attempt <= maxRetries {
+			// Some (but not all) txs are missing from the cache — propagation is likely still
+			// processing them. Wait and retry step 1 (cache lookup) rather than falling through
+			// to the expensive store lookup and network fetch, since the txs will appear in the
+			// cache shortly.
+			// When missed == len(txHashes), the cache is either disabled or empty (e.g. Kafka
+			// txmeta topic not configured), so retrying would just add unnecessary delay.
 			u.logger.Debugf("[ValidateSubtreeInternal][%s] [attempt #%d] %d txs missing from cache, waiting for propagation", v.SubtreeHash.String(), attempt, missed)
 			select {
 			case <-ctx.Done():
