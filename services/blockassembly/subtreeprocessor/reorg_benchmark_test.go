@@ -75,11 +75,24 @@ func setupReorgBenchmark(b *testing.B, blockTxCount, mempoolTxCount int, subtree
 
 	newSubtreeChan := make(chan NewSubtreeRequest, 1024)
 
+	done := make(chan struct{})
+	b.Cleanup(func() {
+		close(done)
+	})
+
 	// Drain subtree channel in background
 	go func() {
-		for req := range newSubtreeChan {
-			if req.ErrChan != nil {
-				req.ErrChan <- nil
+		for {
+			select {
+			case req, ok := <-newSubtreeChan:
+				if !ok {
+					return
+				}
+				if req.ErrChan != nil {
+					req.ErrChan <- nil
+				}
+			case <-done:
+				return
 			}
 		}
 	}()
@@ -1048,4 +1061,4 @@ func populateMempoolT(t *testing.T, state *reorgBenchState) {
 }
 
 // init ensures the unused import for bt is used
-var _ = bt.NewTx()
+var _ *bt.Tx

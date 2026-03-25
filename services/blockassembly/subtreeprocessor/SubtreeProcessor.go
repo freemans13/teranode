@@ -1854,8 +1854,23 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 		}
 
 		if currentSt.IsComplete() {
-			// Move completed subtree to chainedSubtrees
+			// Move completed subtree to chainedSubtrees and reset currentSubtree
+			// to avoid it being referenced in both places
 			stp.chainedSubtrees = append(stp.chainedSubtrees, currentSt)
+
+			// Update SubtreeIndex for diskTxMap bookkeeping
+			if stp.diskTxMap != nil {
+				idx := int16(len(stp.chainedSubtrees)) // chainedSubtrees just grew by 1
+				for _, node := range currentSt.Nodes {
+					_ = stp.diskTxMap.UpdateSubtreeIndex(node.Hash, idx)
+				}
+			}
+
+			newSt, err := stp.newSubtree(subtreeSize)
+			if err != nil {
+				return err
+			}
+			stp.currentSubtree.Store(newSt)
 			currentSt = nil
 		}
 	}
@@ -1882,7 +1897,7 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 			chunk := remainingNodes[start:end]
 
 			g.Go(func() error {
-				st, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
+				st, err := stp.newSubtree(subtreeSize)
 				if err != nil {
 					return err
 				}
@@ -1902,13 +1917,24 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 			return err
 		}
 
+		// Update SubtreeIndex for diskTxMap bookkeeping before appending
+		baseIdx := len(stp.chainedSubtrees)
+		if stp.diskTxMap != nil {
+			for i, st := range fullSubtrees {
+				idx := int16(baseIdx + i + 1) // +1 so 0 means "unassigned"
+				for _, node := range st.Nodes {
+					_ = stp.diskTxMap.UpdateSubtreeIndex(node.Hash, idx)
+				}
+			}
+		}
+
 		stp.chainedSubtrees = append(stp.chainedSubtrees, fullSubtrees...)
 	}
 
 	// Phase 3: Handle last partial subtree (becomes new currentSubtree)
 	lastStart := numFullSubtrees * subtreeSize
 	if lastCount > 0 {
-		st, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
+		st, err := stp.newSubtree(subtreeSize)
 		if err != nil {
 			return err
 		}
@@ -1922,7 +1948,7 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 		stp.currentSubtree.Store(st)
 	} else if currentSt == nil {
 		// All nodes consumed into full subtrees, create empty currentSubtree
-		st, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
+		st, err := stp.newSubtree(subtreeSize)
 		if err != nil {
 			return err
 		}
@@ -2994,7 +3020,7 @@ func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, inv
 		txMeta := txMetas[idx]
 		if txMeta == nil {
 			// transaction not found, not OK
-			return nil, errors.NewProcessingError("[reorgBlocks] error getting transaction %s from longest chain", hash.String(), err)
+			return nil, errors.NewProcessingError("[reorgBlocks] transaction %s not found on longest chain", hash.String())
 		}
 
 		if len(txMeta.BlockIDs) == 1 && txMeta.BlockIDs[0] == invalidBlock.ID {
@@ -3146,7 +3172,9 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 	for _, st := range previousChainedSubtrees {
 		totalPreviousNodes += len(st.Nodes)
 	}
-	totalPreviousNodes += len(previousCurrentSubtree.Nodes)
+	if previousCurrentSubtree != nil {
+		totalPreviousNodes += len(previousCurrentSubtree.Nodes)
+	}
 
 	allNodes := make([]subtreepkg.Node, 0, totalBlockNodes+totalPreviousNodes)
 
@@ -3198,11 +3226,13 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 			allNodes = append(allNodes, node)
 		}
 	}
-	for _, node := range previousCurrentSubtree.Nodes {
-		if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			continue
+	if previousCurrentSubtree != nil {
+		for _, node := range previousCurrentSubtree.Nodes {
+			if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				continue
+			}
+			allNodes = append(allNodes, node)
 		}
-		allNodes = append(allNodes, node)
 	}
 
 	// Step 5: Determine subtree size

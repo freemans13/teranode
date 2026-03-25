@@ -190,6 +190,13 @@ func (s *SplitTxInpointsMap) ParallelBulkSetIfNotExists(
 		return
 	}
 
+	if len(inpoints) != n {
+		panic("SplitTxInpointsMap.ParallelBulkSetIfNotExists: len(inpoints) must equal len(hashes)")
+	}
+	if wasSet == nil || len(wasSet) != n {
+		panic("SplitTxInpointsMap.ParallelBulkSetIfNotExists: len(wasSet) must equal len(hashes)")
+	}
+
 	// Phase 1: Group indices by bucket (O(N), no locks)
 	bucketIndices := make([][]int, s.nrOfBuckets)
 	for i := 0; i < n; i++ {
