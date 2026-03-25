@@ -14,16 +14,14 @@ import (
 )
 
 // getCounterValue reads the current value of a prometheus counter with the given label.
-func getCounterValue(cv *prometheus.CounterVec, label string) float64 {
+// Fails the test if the metric cannot be read.
+func getCounterValue(t *testing.T, cv *prometheus.CounterVec, label string) float64 {
+	t.Helper()
 	m := &dto.Metric{}
 	counter, err := cv.GetMetricWithLabelValues(label)
-	if err != nil {
-		return 0
-	}
-	_ = counter.Write(m)
-	if m.Counter == nil {
-		return 0
-	}
+	require.NoError(t, err, "failed to get metric with label %q", label)
+	require.NoError(t, counter.Write(m), "failed to write metric")
+	require.NotNil(t, m.Counter, "metric counter is nil")
 	return m.Counter.GetValue()
 }
 
@@ -51,7 +49,7 @@ func TestMinBlockHeightSkipsPruning(t *testing.T) {
 	}
 
 	// Capture skip metric before test
-	skipsBefore := getCounterValue(prunerSkipped, "below_min_height")
+	skipsBefore := getCounterValue(t, prunerSkipped, "below_min_height")
 
 	// Start the processor in a goroutine
 	go server.prunerProcessor(ctx)
@@ -62,8 +60,10 @@ func TestMinBlockHeightSkipsPruning(t *testing.T) {
 	// Send a signal at exactly the minimum height - should also be skipped (<=)
 	server.pruneNotify <- pruneSignal{blockHeight: 100, blockHash: chainhash.Hash{}}
 
-	// Wait deterministically until the processor has consumed both signals
-	require.Eventually(t, func() bool { return len(server.pruneNotify) == 0 }, time.Second, 10*time.Millisecond)
+	// Wait for the counter to reflect both skips (deterministic sync on the metric itself)
+	require.Eventually(t, func() bool {
+		return getCounterValue(t, prunerSkipped, "below_min_height")-skipsBefore >= 2
+	}, time.Second, 10*time.Millisecond)
 
 	// Verify no phase processing occurred by checking lastProcessedHeight is still 0
 	// (if pruning had run, it would have been updated)
@@ -78,8 +78,8 @@ func TestMinBlockHeightSkipsPruning(t *testing.T) {
 		// Expected: no blob notification
 	}
 
-	// Verify prunerSkipped metric incremented twice (once for height 50, once for height 100)
-	skipsAfter := getCounterValue(prunerSkipped, "below_min_height")
+	// Verify prunerSkipped metric incremented exactly twice
+	skipsAfter := getCounterValue(t, prunerSkipped, "below_min_height")
 	require.Equal(t, float64(2), skipsAfter-skipsBefore,
 		"prunerSkipped{reason=below_min_height} should have incremented by 2")
 }
