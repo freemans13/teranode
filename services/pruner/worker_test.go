@@ -8,11 +8,28 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
+// getCounterValue reads the current value of a prometheus counter with the given label.
+func getCounterValue(cv *prometheus.CounterVec, label string) float64 {
+	m := &dto.Metric{}
+	counter, err := cv.GetMetricWithLabelValues(label)
+	if err != nil {
+		return 0
+	}
+	_ = counter.Write(m)
+	if m.Counter == nil {
+		return 0
+	}
+	return m.Counter.GetValue()
+}
+
 // TestMinBlockHeightSkipsPruning verifies that prunerProcessor skips all pruning
-// operations when blockHeight <= MinBlockHeight and increments the skip metric.
+// operations when blockHeight <= MinBlockHeight and increments the prunerSkipped
+// metric with reason "below_min_height".
 func TestMinBlockHeightSkipsPruning(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -24,7 +41,7 @@ func TestMinBlockHeightSkipsPruning(t *testing.T) {
 	server := &Server{
 		ctx:         ctx,
 		logger:      logger,
-		pruneNotify: make(chan pruneSignal, 1),
+		pruneNotify: make(chan pruneSignal, 2),
 		blobNotify:  make(chan pruneSignal, 1),
 		settings: &settings.Settings{
 			Pruner: settings.PrunerSettings{
@@ -32,6 +49,9 @@ func TestMinBlockHeightSkipsPruning(t *testing.T) {
 			},
 		},
 	}
+
+	// Capture skip metric before test
+	skipsBefore := getCounterValue(prunerSkipped, "below_min_height")
 
 	// Start the processor in a goroutine
 	go server.prunerProcessor(ctx)
@@ -42,8 +62,8 @@ func TestMinBlockHeightSkipsPruning(t *testing.T) {
 	// Send a signal at exactly the minimum height - should also be skipped (<=)
 	server.pruneNotify <- pruneSignal{blockHeight: 100, blockHash: chainhash.Hash{}}
 
-	// Give the processor time to consume both signals
-	time.Sleep(100 * time.Millisecond)
+	// Wait deterministically until the processor has consumed both signals
+	require.Eventually(t, func() bool { return len(server.pruneNotify) == 0 }, time.Second, 10*time.Millisecond)
 
 	// Verify no phase processing occurred by checking lastProcessedHeight is still 0
 	// (if pruning had run, it would have been updated)
@@ -57,6 +77,11 @@ func TestMinBlockHeightSkipsPruning(t *testing.T) {
 	default:
 		// Expected: no blob notification
 	}
+
+	// Verify prunerSkipped metric incremented twice (once for height 50, once for height 100)
+	skipsAfter := getCounterValue(prunerSkipped, "below_min_height")
+	require.Equal(t, float64(2), skipsAfter-skipsBefore,
+		"prunerSkipped{reason=below_min_height} should have incremented by 2")
 }
 
 // TestMinBlockHeightZeroAllowsPruning verifies that with MinBlockHeight=0 (default),
@@ -85,11 +110,8 @@ func TestMinBlockHeightZeroAllowsPruning(t *testing.T) {
 	go server.prunerProcessor(ctx)
 
 	// Send a signal at height 1 - should proceed past the min height check
-	// (will hit block assembly safety check and skip, but that's after the min height guard)
+	// and the block assembly safety check (which passes when blockAssemblyClient is nil).
 	server.pruneNotify <- pruneSignal{blockHeight: 1, blockHash: chainhash.Hash{}}
-
-	// Give the processor time to consume the signal
-	time.Sleep(100 * time.Millisecond)
 
 	// With MinBlockHeight=0 and no block assembly client (nil), pruning should proceed.
 	// The blobNotify channel should have received a signal (block assembly check passes when client is nil).
