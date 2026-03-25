@@ -1831,7 +1831,7 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 // Parameters:
 //   - nodes: Flat slice of non-coinbase transaction nodes to build into subtrees
 //   - subtreeSize: Target number of nodes per subtree (including coinbase for first)
-func (stp *SubtreeProcessor) bulkBuildSubtrees(nodes []subtreepkg.Node, subtreeSize int) error {
+func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subtreepkg.Node, subtreeSize int) error {
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -1873,7 +1873,7 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(nodes []subtreepkg.Node, subtreeS
 
 	if numFullSubtrees > 0 {
 		fullSubtrees := make([]*subtreepkg.Subtree, numFullSubtrees)
-		g, _ := errgroup.WithContext(context.Background())
+		g, _ := errgroup.WithContext(ctx)
 
 		for i := 0; i < numFullSubtrees; i++ {
 			i := i
@@ -3001,22 +3001,26 @@ func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, inv
 			// the transaction is only in the invalid block, so it is definitely not on the longest chain
 			checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
 		} else {
+			foundInRecentBlock := false
 			for _, blockID := range txMeta.BlockIDs {
 				if lastBlockHeaderIDs[blockID] {
 					// the transaction is still in one of the last 1000 blocks, so it is still on the longest chain
 					// do not mark it as not on the longest chain
-					continue
+					foundInRecentBlock = true
+					break
 				}
 			}
 
-			// check BlockIDs to see if the transaction is still on the longest chain
-			onLongestChain, err := stp.blockchainClient.CheckBlockIsInCurrentChain(ctx, txMeta.BlockIDs)
-			if err != nil {
-				return nil, errors.NewProcessingError("[reorgBlocks] error checking if transaction is on longest chain", err)
-			}
+			if !foundInRecentBlock {
+				// check BlockIDs to see if the transaction is still on the longest chain
+				onLongestChain, err := stp.blockchainClient.CheckBlockIsInCurrentChain(ctx, txMeta.BlockIDs)
+				if err != nil {
+					return nil, errors.NewProcessingError("[reorgBlocks] error checking if transaction is on longest chain", err)
+				}
 
-			if !onLongestChain {
-				checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
+				if !onLongestChain {
+					checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
+				}
 			}
 		}
 	}
@@ -3221,7 +3225,7 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 	stp.closeChainedSubtrees()
 
 	// Step 7: Bulk build subtrees from all collected nodes
-	if err := stp.bulkBuildSubtrees(allNodes, subtreeSize); err != nil {
+	if err := stp.bulkBuildSubtrees(ctx, allNodes, subtreeSize); err != nil {
 		return nil, nil, errors.NewProcessingError("[moveBackBlock:BulkBuild][%s] error bulk building subtrees", block.String(), err)
 	}
 
@@ -4142,7 +4146,7 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 
 	// Phase 3: Bulk build subtrees from inserted nodes
 	subtreeSize := int(stp.currentItemsPerFile.Load())
-	if err := stp.bulkBuildSubtrees(insertedNodes, subtreeSize); err != nil {
+	if err := stp.bulkBuildSubtrees(ctx, insertedNodes, subtreeSize); err != nil {
 		return errors.NewProcessingError("[processRemainderTxHashes] bulk build error", err)
 	}
 
