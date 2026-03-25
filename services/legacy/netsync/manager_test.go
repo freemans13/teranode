@@ -750,6 +750,29 @@ func createSpendingTx(prevTx *bsvutil.Tx, index uint32, scriptSig []byte, addres
 }
 
 func TestHandleCheckSyncPeer_HeadersFirstMode(t *testing.T) {
+	t.Run("headers-first mode detects last block time violation", func(t *testing.T) {
+		sp := &peer.Peer{} // zero-value peer is sufficient for this test
+		sps := &syncPeerState{
+			lastBlockTime: time.Now().Add(-10 * time.Minute), // way past maxLastBlockTime (3 min)
+			ticks:         1,                                 // non-zero so validNetworkSpeed runs
+		}
+
+		sm := &SyncManager{
+			logger:     ulogger.TestLogger{},
+			peerStates: txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		}
+		sm.storeSyncPeer(sp, sps)
+		sm.headersFirstMode.Store(true)
+		sm.peerStates.Set(sp, &peerSyncState{})
+
+		// Last-block-time violations are no longer skipped during headers-first mode.
+		// The violation is detected and the peer rotation path is entered, which panics
+		// here because the test uses a minimal SyncManager without full peer setup.
+		assert.Panics(t, func() {
+			sm.handleCheckSyncPeer()
+		})
+	})
+
 	t.Run("headers-first mode skips network speed violation", func(t *testing.T) {
 		sp := &peer.Peer{}
 		sps := &syncPeerState{
