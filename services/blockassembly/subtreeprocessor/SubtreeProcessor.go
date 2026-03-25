@@ -2831,7 +2831,10 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 
 		if losingTxHashesMap != nil && losingTxHashesMap.Length() > 0 {
-			rawLosingTxHashes = append(rawLosingTxHashes, losingTxHashesMap.Keys()...)
+			losingTxHashesMap.Iter(func(hash chainhash.Hash, _ uint64) bool {
+				rawLosingTxHashes = append(rawLosingTxHashes, hash)
+				return true
+			})
 		}
 
 		stp.currentBlockHeader.Store(block.Header)
