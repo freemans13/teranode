@@ -1978,6 +1978,12 @@ func (stp *SubtreeProcessor) updateChainedSubtreeCounts() {
 //   - startIdx: index in chainedSubtrees where new subtrees start
 //   - skipNotification: whether to skip network announcement
 func (stp *SubtreeProcessor) finalizeBulkBuildSubtrees(startIdx int, skipNotification bool) {
+	type errChanEntry struct {
+		ch   chan error
+		hash string
+	}
+	var errChans []errChanEntry
+
 	for i := startIdx; i < len(stp.chainedSubtrees); i++ {
 		st := stp.chainedSubtrees[i]
 
@@ -1990,20 +1996,28 @@ func (stp *SubtreeProcessor) finalizeBulkBuildSubtrees(startIdx int, skipNotific
 
 		stp.subtreesInBlock++
 
-		// Send to newSubtreeChan for persistence
-		errCh := make(chan error)
+		// Send to newSubtreeChan for persistence (batch send, then batch wait)
+		errCh := make(chan error, 1)
+		subtreeCopy := st // capture for closure
 		stp.newSubtreeChan <- NewSubtreeRequest{
 			Subtree:          st,
 			ParentTxMap:      stp.currentTxMap,
+			DeletedTxs:       stp.deletedTxs,
 			SkipNotification: skipNotification,
 			ErrChan:          errCh,
+			OnStorageComplete: func() {
+				stp.cleanupDeletedTxs(subtreeCopy)
+			},
 		}
 
-		go func(hash string) {
-			if err := <-errCh; err != nil {
-				stp.logger.Errorf("[%s] error sending subtree to newSubtreeChan: %v", hash, err)
-			}
-		}(st.RootHash().String())
+		errChans = append(errChans, errChanEntry{ch: errCh, hash: st.RootHash().String()})
+	}
+
+	// Batch wait for all persistence results
+	for _, entry := range errChans {
+		if err := <-entry.ch; err != nil {
+			stp.logger.Errorf("[%s] error sending subtree to newSubtreeChan: %v", entry.hash, err)
+		}
 	}
 
 	if !skipNotification && startIdx < len(stp.chainedSubtrees) {
@@ -2997,11 +3011,9 @@ func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, inv
 
 	// we need to check each transaction in the block we moved back and see if it is still on the longest chain or not
 	for idx, hash := range markNotOnLongestChain {
-		idx := idx
-		hashRef := &hash
-
+		h := hash // per-iteration copy for pointer safety
 		g.Go(func() error {
-			txMeta, err := stp.utxoStore.Get(gCtx, hashRef, fields.BlockIDs)
+			txMeta, err := stp.utxoStore.Get(gCtx, &h, fields.BlockIDs)
 			if err != nil {
 				return errors.NewProcessingError("[reorgBlocks] error getting transaction from utxo store", err)
 			}
