@@ -105,6 +105,7 @@ var (
 type batcherIfc[T any] interface {
 	Put(item *T, payloadSize ...int)
 	Trigger()
+	SetDrainMode(enabled bool)
 }
 
 // Store implements the UTXO store interface using Aerospike.
@@ -262,16 +263,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 	storeBatchDuration := tSettings.Aerospike.StoreBatcherDuration
 
-	if storeBatchSize > 1 {
-		s.storeBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendStoreBatch, true)
-	} else {
-		s.logger.Warnf("Store batch size is set to %d, store batching is disabled", storeBatchSize)
-	}
+	s.storeBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendStoreBatch, !tSettings.BatcherDrainMode)
 
 	getBatchSize := s.settings.UtxoStore.GetBatcherSize
 	getBatchDurationStr := s.settings.UtxoStore.GetBatcherDurationMillis
 	getBatchDuration := time.Duration(getBatchDurationStr) * time.Millisecond
-	s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, true)
+	s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, !tSettings.BatcherDrainMode)
 
 	// Make sure the udf lua scripts are installed in the cluster
 	// update the version of the lua script when a new version is launched, do not re-use the old one
@@ -297,7 +294,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	spendBatchSize := s.settings.UtxoStore.SpendBatcherSize
 	spendBatchDurationStr := s.settings.UtxoStore.SpendBatcherDurationMillis
 	spendBatchDuration := time.Duration(spendBatchDurationStr) * time.Millisecond
-	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatchLua, true)
+	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatchLua, !tSettings.BatcherDrainMode)
 
 	if failureThreshold := tSettings.UtxoStore.SpendCircuitBreakerFailureCount; failureThreshold > 0 {
 		s.spendCircuitBreaker = newCircuitBreaker(
@@ -325,7 +322,14 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	lockedBatcherSize := tSettings.UtxoStore.LockedBatcherSize
 	lockedBatchDurationStr := tSettings.UtxoStore.LockedBatcherDurationMillis
 	lockedBatchDuration := time.Duration(lockedBatchDurationStr) * time.Millisecond
-	s.lockedBatcher = batcher.New(lockedBatcherSize, lockedBatchDuration, s.setLockedBatch, true)
+	s.lockedBatcher = batcher.New(lockedBatcherSize, lockedBatchDuration, s.setLockedBatch, !tSettings.BatcherDrainMode)
+
+	if tSettings.BatcherDrainMode {
+		s.getBatcher.SetDrainMode(true)
+		s.spendBatcher.SetDrainMode(true)
+		s.lockedBatcher.SetDrainMode(true)
+		s.storeBatcher.SetDrainMode(true)
+	}
 
 	logger.Infof("[Aerospike] map txmeta store initialised with namespace: %s, set: %s", namespace, setName)
 
@@ -678,10 +682,11 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(txIDs))
 
+	var keyErrors int
 	for i, txID := range txIDs {
 		key, err := aerospike.NewKey(s.namespace, s.setName, txID[:])
 		if err != nil {
-			s.logger.Errorf("[PreserveTransactions] Failed to create key for tx %s: %v", txID.String(), err)
+			keyErrors++
 			continue
 		}
 
@@ -694,6 +699,10 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		)
 	}
 
+	if keyErrors > 0 {
+		s.logger.Errorf("[PreserveTransactions] Failed to create keys for %d/%d transactions", keyErrors, len(txIDs))
+	}
+
 	// Execute batch operation
 	err := s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
@@ -702,6 +711,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 
 	// Check results and handle external transactions
 	preservedCount := 0
+	var parseErrors, luaErrors, noResponseErrors int
 
 	for i, record := range batchRecords {
 		batchRecord := record.BatchRec()
@@ -714,8 +724,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		if response != nil && response.Bins != nil && response.Bins[LuaSuccess.String()] != nil {
 			res, err := s.ParseLuaMapResponse(response.Bins[LuaSuccess.String()])
 			if err != nil {
-				s.logger.Errorf("[PreserveTransactions] Failed to parse response for tx %s: %v",
-					txIDs[i].String(), err)
+				parseErrors++
 				continue
 			}
 
@@ -723,15 +732,17 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 			case LuaStatusOK:
 				preservedCount++
 			case LuaStatusError:
-				if res.ErrorCode == LuaErrorCodeTxNotFound {
-					s.logger.Debugf("[PreserveTransactions] Transaction not found for tx %s", txIDs[i].String())
-				} else {
-					s.logger.Errorf("[PreserveTransactions] Error preserving tx %s: %s", txIDs[i].String(), res.Message)
+				if res.ErrorCode != LuaErrorCodeTxNotFound {
+					luaErrors++
 				}
 			}
 		} else {
-			s.logger.Errorf("[PreserveTransactions] No response received for tx %s", txIDs[i].String())
+			noResponseErrors++
 		}
+	}
+
+	if parseErrors > 0 || luaErrors > 0 || noResponseErrors > 0 {
+		s.logger.Errorf("[PreserveTransactions] Errors processing %d transactions: %d parse failures, %d lua errors, %d missing responses", len(txIDs), parseErrors, luaErrors, noResponseErrors)
 	}
 
 	s.logger.Debugf("[PreserveTransactions] Successfully preserved %d out of %d transactions", preservedCount, len(txIDs))
@@ -769,10 +780,11 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	txIDs := make([]chainhash.Hash, 0, batchSize)
 
 	processedCount := 0
+	var readErrors, keyErrors, batchErrors int
 
 	for res := range recordset.Results() {
 		if res.Err != nil {
-			s.logger.Errorf("[ProcessExpiredPreservations] Error reading record: %v", res.Err)
+			readErrors++
 			continue
 		}
 
@@ -797,7 +809,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, txHash[:])
 		if err != nil {
-			s.logger.Errorf("[ProcessExpiredPreservations] Failed to create key for tx %s: %v", txHash.String(), err)
+			keyErrors++
 			continue
 		}
 
@@ -816,7 +828,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 		// Process batch when full
 		if len(batch) >= batchSize {
 			if err := s.processBatchExpiredPreservations(ctx, batch, txIDs); err != nil {
-				s.logger.Errorf("[ProcessExpiredPreservations] Failed to process batch: %v", err)
+				batchErrors++
 			} else {
 				processedCount += len(batch)
 			}
@@ -829,10 +841,14 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	// Process remaining records
 	if len(batch) > 0 {
 		if err := s.processBatchExpiredPreservations(ctx, batch, txIDs); err != nil {
-			s.logger.Errorf("[ProcessExpiredPreservations] Failed to process final batch: %v", err)
+			batchErrors++
 		} else {
 			processedCount += len(batch)
 		}
+	}
+
+	if readErrors > 0 || keyErrors > 0 || batchErrors > 0 {
+		s.logger.Errorf("[ProcessExpiredPreservations] Errors at height %d: %d read failures, %d key failures, %d batch failures", currentHeight, readErrors, keyErrors, batchErrors)
 	}
 
 	s.logger.Infof("[ProcessExpiredPreservations] Processed %d expired preservations at height %d", processedCount, currentHeight)

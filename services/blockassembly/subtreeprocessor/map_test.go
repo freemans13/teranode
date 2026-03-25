@@ -15,7 +15,7 @@ func makeHash(b byte) chainhash.Hash {
 	return h
 }
 
-func makeInpoints(id byte) *subtreepkg.TxInpoints {
+func makeTestInpoints(id byte) *subtreepkg.TxInpoints {
 	var h chainhash.Hash
 	h[0] = id
 	return &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{h}}
@@ -25,7 +25,7 @@ func TestSplitTxInpointsMap_SetIfNotExists(t *testing.T) {
 	m := NewSplitTxInpointsMap(16)
 
 	h := makeHash(1)
-	inp := makeInpoints(1)
+	inp := makeTestInpoints(1)
 
 	// First insert should succeed
 	result, wasSet := m.SetIfNotExists(h, inp)
@@ -33,7 +33,7 @@ func TestSplitTxInpointsMap_SetIfNotExists(t *testing.T) {
 	require.Equal(t, inp, result)
 
 	// Second insert should return existing
-	inp2 := makeInpoints(2)
+	inp2 := makeTestInpoints(2)
 	result, wasSet = m.SetIfNotExists(h, inp2)
 	require.False(t, wasSet)
 	require.Equal(t, inp, result) // original value returned
@@ -43,7 +43,7 @@ func TestSplitTxInpointsMap_GetSetDelete(t *testing.T) {
 	m := NewSplitTxInpointsMap(16)
 
 	h := makeHash(42)
-	inp := makeInpoints(42)
+	inp := makeTestInpoints(42)
 
 	// Get on empty map
 	_, ok := m.Get(h)
@@ -73,7 +73,7 @@ func TestSplitTxInpointsMap_Clear(t *testing.T) {
 	m := NewSplitTxInpointsMap(16)
 
 	for i := byte(0); i < 100; i++ {
-		m.Set(makeHash(i), makeInpoints(i))
+		m.Set(makeHash(i), makeTestInpoints(i))
 	}
 	require.Equal(t, 100, m.Length())
 
@@ -99,7 +99,7 @@ func TestSplitTxInpointsMap_ConcurrentAccess(t *testing.T) {
 			var h chainhash.Hash
 			h[0] = byte(idx)
 			h[1] = byte(idx >> 8)
-			m.Set(h, makeInpoints(byte(idx)))
+			m.Set(h, makeTestInpoints(byte(idx)))
 		}(i)
 	}
 	wg.Wait()
@@ -128,7 +128,7 @@ func TestSplitTxInpointsMap_BucketDistribution(t *testing.T) {
 		h[0] = byte(i)
 		h[1] = byte(i >> 8)
 		h[2] = byte(i >> 16)
-		m.Set(h, makeInpoints(byte(i)))
+		m.Set(h, makeTestInpoints(byte(i)))
 	}
 
 	require.Equal(t, 1000, m.Length())
@@ -156,7 +156,7 @@ func TestParallelBulkSetIfNotExists_Correctness(t *testing.T) {
 		hashes[i][0] = byte(i)
 		hashes[i][1] = byte(i >> 8)
 		hashes[i][2] = byte(i >> 16)
-		inpoints[i] = makeInpoints(byte(i))
+		inpoints[i] = makeTestInpoints(byte(i))
 	}
 
 	wasSet := make([]bool, n)
@@ -186,7 +186,7 @@ func TestParallelBulkSetIfNotExists_Duplicates(t *testing.T) {
 	for i := 0; i < n; i++ {
 		hashes[i][0] = byte(i)
 		hashes[i][1] = byte(i >> 8)
-		inpoints[i] = makeInpoints(byte(i))
+		inpoints[i] = makeTestInpoints(byte(i))
 	}
 
 	// Insert first half
@@ -197,7 +197,7 @@ func TestParallelBulkSetIfNotExists_Duplicates(t *testing.T) {
 	// Bulk insert all — first half should be duplicates
 	newInpoints := make([]*subtreepkg.TxInpoints, n)
 	for i := 0; i < n; i++ {
-		newInpoints[i] = makeInpoints(byte(i + 100))
+		newInpoints[i] = makeTestInpoints(byte(i + 100))
 	}
 
 	wasSet := make([]bool, n)
@@ -228,7 +228,7 @@ func TestParallelBulkSetIfNotExists_ConcurrentSafety(t *testing.T) {
 	for i := 0; i < n; i++ {
 		hashes[i][0] = byte(i)
 		hashes[i][1] = byte(i >> 8)
-		inpoints[i] = makeInpoints(byte(i))
+		inpoints[i] = makeTestInpoints(byte(i))
 	}
 
 	// Run two concurrent bulk inserts with overlapping keys

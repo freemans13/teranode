@@ -1248,7 +1248,7 @@ func TestCheckDuplicateTransactions(t *testing.T) {
 		123, 0, 0)
 	require.NoError(t, err)
 
-	err = b.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency)
+	err = b.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency, nil)
 	_ = err // To stop lint warning
 }
 
@@ -1278,8 +1278,11 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	_, err = utxoStore.Create(context.Background(), tx, blockID101, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 101, BlockHeight: 101}))
 	require.NoError(t, err)
 
+	blockID102 := uint32(102)
+
 	currentBlockHeaderIDsMap := make(map[uint32]struct{})
 	currentBlockHeaderIDsMap[blockID100] = struct{}{}
+	currentBlockHeaderIDsMap[blockID102] = struct{}{}
 
 	block := &Block{}
 
@@ -1295,16 +1298,18 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	})
 
 	t.Run("test parent is not in a previous block", func(t *testing.T) {
-		// swap parent/tx hashes to simulate a missing parent
+		// swap parent/tx hashes so the parent resolves to block ID 101, which falls
+		// within the cached range [100, 102] but is missing from the set (a gap).
+		// This defers to the validator's checkOldBlockIDs instead of erroring,
+		// because block IDs can have gaps due to orphan/invalid blocks.
 		parentTxStruct := missingParentTx{
 			parentTxHash: *tx.TxIDChainHash(),
 			txHash:       *txParent.TxIDChainHash(),
 		}
 
 		oldBlockIDs, err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
-		require.Error(t, err)
-		require.True(t, len(oldBlockIDs) == 0)
-		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+		require.NoError(t, err)
+		require.True(t, len(oldBlockIDs) > 0, "should defer to checkOldBlockIDs")
 	})
 
 	t.Run("test parent has no block ID", func(t *testing.T) {
@@ -1786,7 +1791,7 @@ func TestBlock_ValidOrderAndBlessed_ErrorCases(t *testing.T) {
 			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "txMap is nil")
 	})
@@ -1820,7 +1825,7 @@ func TestBlock_ValidOrderAndBlessed_WithSubtrees(t *testing.T) {
 			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		require.NoError(t, err) // Should succeed with empty subtrees
 	})
 }
@@ -2485,7 +2490,7 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should now trigger validateSubtree function
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		// Will likely error due to missing metadata but exercises the validateSubtree path
 		_ = err
 	})
@@ -2546,7 +2551,7 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This exercises more complex validation paths
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		// Will error but exercises multiple validation functions
 		_ = err
 	})
@@ -2678,7 +2683,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		// This should exercise deep validation paths including:
 		// - validateSubtree with multiple nodes
 		// - validateTransaction for each transaction
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		_ = err // Will error but exercises many code paths
 	})
 
@@ -2708,7 +2713,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		block.SubtreeSlices = []*subtreepkg.Subtree{subtree1, subtree2}
 
 		// Test checkDuplicateTransactions
-		err = block.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency)
+		err = block.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency, nil)
 		assert.Error(t, err) // Should detect duplicates
 		assert.Contains(t, err.Error(), "duplicate transaction")
 	})
@@ -4091,7 +4096,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		}
 
 		// This should pass validation - coinbase placeholder is in correct position
-		err = block.validOrderAndBlessed(ctx, logger, deps, 1)
+		err = block.validOrderAndBlessed(ctx, logger, deps, 1, nil)
 		// Note: this will likely fail on other validation checks, but it should pass the coinbase placeholder check
 		_ = err
 	})

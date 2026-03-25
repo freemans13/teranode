@@ -24,7 +24,6 @@ make build-teranode-cli
 
 # Build specific components
 make build-chainintegrity
-make build-tx-blaster
 ```
 
 ### Testing Commands
@@ -46,6 +45,22 @@ make testall
 
 # Run a single test
 go test -v -race -tags "testtxmetacache" -run TestNameHere ./path/to/package
+
+# Test Retry Support (for flaky tests)
+# Note: Only sequentialtest and smoketest support TEST_RETRY_COUNT.
+# make test and make longtest do NOT support TEST_RETRY_COUNT.
+
+# E2E tests with retry (custom retry wrapper with timeout extension)
+make smoketest TEST_RETRY_COUNT=3
+make sequentialtest TEST_RETRY_COUNT=5 TEST_RETRY_DELAY=3  # delay is seconds between retries
+
+# Disable retries (set to 1)
+make smoketest TEST_RETRY_COUNT=1
+
+# Database-specific sequential tests with retry
+make sequentialtest-aerospike TEST_RETRY_COUNT=5
+make sequentialtest-postgres TEST_RETRY_COUNT=3
+make sequentialtest-sqlite TEST_RETRY_COUNT=3
 ```
 
 ### Linting Commands
@@ -81,23 +96,27 @@ make dev-dashboard
 Teranode consists of multiple specialized services communicating via gRPC and Kafka:
 
 **Core Services:**
+- **Alert** (`services/alert/`): Bitcoin SV network alert system
 - **Asset Server** (`services/asset/`): HTTP/WebSocket interface to blockchain data stores
 - **Propagation** (`services/propagation/`): Receives and forwards transactions (gRPC/UDP/HTTP)
 - **Validator** (`services/validator/`): Validates transactions against consensus rules
 - **Block Validation** (`services/blockvalidation/`): Validates complete blocks
 - **Block Assembly** (`services/blockassembly/`): Assembles new blocks from validated transactions
+- **Block Persister** (`services/blockpersister/`): Persists finalized blocks to storage
 - **Blockchain** (`services/blockchain/`): Manages blockchain state and FSM
+- **Pruner** (`services/pruner/`): Prunes old UTXO and block data
 - **Subtree Validation** (`services/subtreevalidation/`): Validates merkle subtrees
+- **UTXO Persister** (`services/utxopersister/`): Persists UTXO set snapshots to blob storage
 
 **Overlay Services:**
-- **P2P** (`services/p2p/`): Peer-to-peer network communication
+- **P2P** (`services/p2p/`): Peer-to-peer network communication (includes bootstrap peer discovery)
 - **RPC** (`services/rpc/`): Bitcoin-compatible JSON-RPC interface
 - **Legacy** (`services/legacy/`): Backward compatibility with existing Bitcoin nodes
 
 **Data Stores:**
-- **UTXO Store** (`stores/utxo/`): Manages unspent transaction outputs (Aerospike-backed)
+- **UTXO Store** (`stores/utxo/`): Manages unspent transaction outputs (supports Aerospike, SQL, and null backends)
 - **Blob Store** (`stores/blob/`): Stores transactions and subtrees (S3/filesystem)
-- **Blockchain Store** (`stores/blockchain/`): Block header and chain state (PostgreSQL)
+- **Blockchain Store** (`stores/blockchain/`): Block header and chain state (PostgreSQL, SQLite)
 
 ### Communication Patterns
 - **gRPC**: Service-to-service synchronous communication
@@ -120,12 +139,32 @@ Teranode consists of multiple specialized services communicating via gRPC and Ka
 - Environment contexts: `dev`, `test`, `docker`, `operator`
 
 ### Port Configuration
-Services use standardized ports with optional prefixes for multi-node setups:
-- Asset Server: 8090
-- RPC: 9292
-- P2P: 9905
-- Blockchain gRPC: 8087
-- Validator gRPC: 8081
+Services use standardized ports with optional prefixes for multi-node setups. Full configuration is in `settings.conf` lines 88-140.
+
+| Service | Port | Protocol |
+|---------|------|----------|
+| Asset Server | 8090 | HTTP |
+| Blockchain | 8087 | gRPC |
+| Blockchain | 8082 | HTTP |
+| Block Assembly | 8085 | gRPC |
+| Block Persister | 8083 | HTTP |
+| Block Validation | 8088 | gRPC |
+| Legacy | 8099 | gRPC |
+| Legacy | 8098 | HTTP |
+| P2P | 9904 | gRPC |
+| P2P | 9906 | HTTP |
+| P2P | 9905 | libp2p TCP (configured via `p2p_listen_addresses`) |
+| Propagation | 8084 | gRPC |
+| Propagation | 8833 | HTTP |
+| Pruner | 8096 | gRPC |
+| RPC | 9292 | HTTP (configured via `rpc_listener_url`) |
+| Subtree Validation | 8086 | gRPC |
+| Validator | 8081 | gRPC |
+| Validator | 8834 | HTTP |
+| Alert P2P | 9908 | TCP |
+| Health Check | 8000 | HTTP |
+| Jaeger (UDP) | 6831 | UDP |
+| Jaeger (HTTP) | 4318 | HTTP |
 
 ## Available Agents
 
@@ -135,12 +174,13 @@ Claude will automatically use specialized agents in `.claude/agents/` when appro
 - **test-writer-fixer**: Automatically runs tests after code changes
 - **api-tester**: API load testing and contract validation
 - **backend-architect**: System design and architecture decisions
+- **document-reviewer**: Documentation quality review and accuracy audit
 
 These agents work together - for example, when implementing a new Bitcoin feature:
 1. bitcoin-expert provides protocol guidance
 2. backend-architect designs the implementation
 3. test-writer-fixer ensures tests pass
-4. performance-benchmarker validates performance
+4. api-tester validates performance and load
 
 ## Bitcoin-Specific Context
 
@@ -295,3 +335,82 @@ git checkout -b <new-branch-name>
 - **Push work**: Sync upstream → resolve conflicts (with user approval) → push to fork → show PR link
 - **New branch**: Switch to main → sync upstream → create branch
 - **Sync with upstream**: `git checkout main && git fetch upstream && git reset --hard upstream/main`
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **teranode** (27349 symbols, 94911 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+
+## When Debugging
+
+1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
+2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
+3. `READ gitnexus://repo/teranode/process/{processName}` — trace the full execution flow step by step
+4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
+
+## When Refactoring
+
+- **Renaming**: MUST use `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` first. Review the preview — graph edits are safe, text_search edits need manual review. Then run with `dry_run: false`.
+- **Extracting/Splitting**: MUST run `gitnexus_context({name: "target"})` to see all incoming/outgoing refs, then `gitnexus_impact({target: "target", direction: "upstream"})` to find all external callers before moving code.
+- After any refactor: run `gitnexus_detect_changes({scope: "all"})` to verify only expected files changed.
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
+- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+
+## Tools Quick Reference
+
+| Tool | When to use | Command |
+|------|-------------|---------|
+| `query` | Find code by concept | `gitnexus_query({query: "auth validation"})` |
+| `context` | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})` |
+| `impact` | Blast radius before editing | `gitnexus_impact({target: "X", direction: "upstream"})` |
+| `detect_changes` | Pre-commit scope check | `gitnexus_detect_changes({scope: "staged"})` |
+| `rename` | Safe multi-file rename | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
+| `cypher` | Custom graph queries | `gitnexus_cypher({query: "MATCH ..."})` |
+
+## Impact Risk Levels
+
+| Depth | Meaning | Action |
+|-------|---------|--------|
+| d=1 | WILL BREAK — direct callers/importers | MUST update these |
+| d=2 | LIKELY AFFECTED — indirect deps | Should test |
+| d=3 | MAY NEED TESTING — transitive | Test if critical path |
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/teranode/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/teranode/clusters` | All functional areas |
+| `gitnexus://repo/teranode/processes` | All execution flows |
+| `gitnexus://repo/teranode/process/{name}` | Step-by-step execution trace |
+
+## Self-Check Before Finishing
+
+Before completing any code modification task, verify:
+1. `gitnexus_impact` was run for all modified symbols
+2. No HIGH/CRITICAL risk warnings were ignored
+3. `gitnexus_detect_changes()` confirms changes match expected scope
+4. All d=1 (WILL BREAK) dependents were updated
+
+## CLI
+
+- Re-index: `npx gitnexus analyze`
+- Check freshness: `npx gitnexus status`
+- Generate docs: `npx gitnexus wiki`
+
+<!-- gitnexus:end -->

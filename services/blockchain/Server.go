@@ -45,7 +45,6 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/looplab/fsm"
-	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -696,29 +695,7 @@ func (b *Blockchain) startSubscriptions() {
 
 			// Send initial notification to let the subscriber know the subscription is ready
 			// and provide the current blockchain state
-			go func(sub subscriber) {
-				chainTip, _, err := b.store.GetBestBlockHeader(context.Background())
-				var initialNotification *blockchain_api.Notification
-				if err != nil {
-					// If no best block exists yet (e.g., empty blockchain), send notification with genesis hash
-					b.logger.Warnf("[Blockchain][startSubscriptions] No best block header available for initial notification to %s: %v", sub.source, err)
-					initialNotification = &blockchain_api.Notification{
-						Type: model.NotificationType_Block,
-						Hash: b.settings.ChainCfgParams.GenesisHash.CloneBytes(),
-					}
-				} else {
-					initialNotification = &blockchain_api.Notification{
-						Type: model.NotificationType_Block,
-						Hash: chainTip.Hash().CloneBytes(),
-					}
-				}
-
-				b.logger.Infof("[Blockchain][startSubscriptions] Sending initial notification to %s", sub.source)
-				if err := sub.subscription.Send(initialNotification); err != nil {
-					b.logger.Errorf("[Blockchain][startSubscriptions] Failed to send initial notification to %s: %v", sub.source, err)
-					b.deadSubscriptions <- sub
-				}
-			}(s)
+			go b.sendInitialNotification(s)
 
 		case s := <-b.deadSubscriptions:
 			b.subscribersMu.Lock()
@@ -728,6 +705,30 @@ func (b *Blockchain) startSubscriptions() {
 			safeClose(s.done)
 			b.logger.Infof("[Blockchain][startSubscriptions] Subscription removed (Total=%d).", remaining)
 		}
+	}
+}
+
+// sendInitialNotification sends the current chain tip (or genesis) to a new subscriber.
+func (b *Blockchain) sendInitialNotification(sub subscriber) {
+	chainTip, _, err := b.store.GetBestBlockHeader(context.Background())
+	var initialNotification *blockchain_api.Notification
+	if err != nil {
+		b.logger.Warnf("[Blockchain][startSubscriptions] No best block header available for initial notification to %s: %v", sub.source, err)
+		initialNotification = &blockchain_api.Notification{
+			Type: model.NotificationType_Block,
+			Hash: b.settings.ChainCfgParams.GenesisHash.CloneBytes(),
+		}
+	} else {
+		initialNotification = &blockchain_api.Notification{
+			Type: model.NotificationType_Block,
+			Hash: chainTip.Hash().CloneBytes(),
+		}
+	}
+
+	b.logger.Infof("[Blockchain][startSubscriptions] Sending initial notification to %s", sub.source)
+	if err := sub.subscription.Send(initialNotification); err != nil {
+		b.logger.Errorf("[Blockchain][startSubscriptions] Failed to send initial notification to %s: %v", sub.source, err)
+		b.deadSubscriptions <- sub
 	}
 }
 
@@ -923,7 +924,7 @@ func (b *Blockchain) GetBlock(ctx context.Context, request *blockchain_api.GetBl
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlock",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetBlock),
-		tracing.WithDebugLogMessage(b.logger, "[GetBlock] called for %s", utils.ReverseAndHexEncodeSlice(request.Hash)),
+		tracing.WithDebugLogMessage(b.logger, "[GetBlock] called for %s", util.ReverseAndHexEncodeSlice(request.Hash)),
 	)
 	defer deferFn()
 
@@ -963,7 +964,7 @@ func (b *Blockchain) GetBlocks(ctx context.Context, req *blockchain_api.GetBlock
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlocks",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetBlockHeaders),
-		tracing.WithLogMessage(b.logger, "[GetBlocks] called for %s", utils.ReverseAndHexEncodeSlice(req.Hash)),
+		tracing.WithLogMessage(b.logger, "[GetBlocks] called for %s", util.ReverseAndHexEncodeSlice(req.Hash)),
 	)
 	defer deferFn()
 
@@ -1993,7 +1994,7 @@ func (b *Blockchain) InvalidateBlock(ctx context.Context, request *blockchain_ap
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "InvalidateBlock",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainInvalidateBlock),
-		tracing.WithDebugLogMessage(b.logger, "[InvalidateBlock] called with hash %s", utils.ReverseAndHexEncodeSlice(request.BlockHash)),
+		tracing.WithDebugLogMessage(b.logger, "[InvalidateBlock] called with hash %s", util.ReverseAndHexEncodeSlice(request.BlockHash)),
 	)
 	defer deferFn()
 
@@ -2170,7 +2171,7 @@ func (b *Blockchain) SendNotification(ctx context.Context, req *blockchain_api.N
 	_, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "RevalidateBlock",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainSendNotification),
-		tracing.WithLogMessage(b.logger, "[SendNotification] called for %s notification type %s", utils.ReverseAndHexEncodeSlice(req.Hash), req.Type.String()),
+		tracing.WithLogMessage(b.logger, "[SendNotification] called for %s notification type %s", util.ReverseAndHexEncodeSlice(req.Hash), req.Type.String()),
 	)
 	defer deferFn()
 
@@ -2516,7 +2517,12 @@ func (b *Blockchain) SendFSMEvent(ctx context.Context, eventReq *blockchain_api.
 	err := b.finiteStateMachine.Event(ctx, eventReq.Event.String())
 	if err != nil {
 		b.logger.Debugf("[Blockchain Server] Error sending event to FSM, state has not changed.")
-		return nil, err
+		switch err.(type) {
+		case fsm.InvalidEventError, fsm.NoTransitionError:
+			return nil, errors.WrapGRPC(errors.NewStateError("[Blockchain Server] FSM event %s rejected in state %s", eventReq.Event.String(), priorState, err))
+		default:
+			return nil, errors.WrapGRPC(err)
+		}
 	}
 
 	state := b.finiteStateMachine.Current()

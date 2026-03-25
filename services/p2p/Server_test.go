@@ -580,8 +580,10 @@ func TestHandleBlockTopic(t *testing.T) {
 		mockP2PNode.On("UpdatePeerHeight", mock.Anything, mock.Anything).Return()
 
 		// Create a mock banManager that returns false for any peer
+		// and expects AddScore to be called for peer ID spoofing
 		mockBanManager := new(MockPeerBanManager)
 		mockBanManager.On("IsBanned", mock.Anything).Return(false)
+		mockBanManager.On("AddScore", mock.Anything, ReasonProtocolViolation).Return(100, false)
 
 		// Create mock kafka producer
 		mockKafkaProducer := new(MockKafkaProducer)
@@ -691,8 +693,10 @@ func TestHandleSubtreeTopic(t *testing.T) {
 		mockP2PNode.On("UpdatePeerHeight", mock.Anything, mock.Anything).Return()
 
 		// Create a mock banManager that returns false for any peer
+		// and expects AddScore to be called for peer ID spoofing
 		mockBanManager := new(MockPeerBanManager)
 		mockBanManager.On("IsBanned", mock.Anything).Return(false)
+		mockBanManager.On("AddScore", mock.Anything, ReasonProtocolViolation).Return(100, false)
 
 		// Create mock kafka producer
 		mockKafkaProducer := new(MockKafkaProducer)
@@ -1487,8 +1491,9 @@ func TestSelfMessageFiltering(t *testing.T) {
 		msgBytes, err := json.Marshal(blockMsg)
 		require.NoError(t, err)
 
-		// Handle the message (from parameter doesn't matter, we check PeerID)
-		server.handleBlockTopic(context.Background(), msgBytes, "someOtherPeer")
+		// Handle the message with matching fromID to avoid spoofing detection
+		// Self-message filtering checks isOwnMessage which uses both fromID and message.PeerID
+		server.handleBlockTopic(context.Background(), msgBytes, GetID.String())
 
 		// Should NOT publish to Kafka
 		select {
@@ -1530,8 +1535,9 @@ func TestSelfMessageFiltering(t *testing.T) {
 		msgBytes, err := json.Marshal(subtreeMsg)
 		require.NoError(t, err)
 
-		// Handle the message
-		server.handleSubtreeTopic(context.Background(), msgBytes, "someOtherPeer")
+		// Handle the message with matching fromID to avoid spoofing detection
+		// Self-message filtering checks isOwnMessage which uses both fromID and message.PeerID
+		server.handleSubtreeTopic(context.Background(), msgBytes, GetID.String())
 
 		// Should NOT publish to Kafka
 		select {
@@ -3271,6 +3277,67 @@ func TestIsBannedCoverage(t *testing.T) {
 	assert.NotNil(t, resp)
 	// Since we're using mock ban manager, this will return false
 	assert.False(t, resp.IsBanned)
+}
+
+func TestIsBannedChecksBothBanSystems(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("banned by banList only", func(t *testing.T) {
+		mockBanList := &MockBanList{}
+		mockBanList.On("IsBanned", "192.168.1.100").Return(true)
+
+		mockBanMgr := &MockPeerBanManager{}
+		mockBanMgr.On("IsBanned", "192.168.1.100").Return(false)
+
+		server := &Server{
+			logger:     ulogger.New("test"),
+			settings:   &settings.Settings{},
+			banList:    mockBanList,
+			banManager: mockBanMgr,
+		}
+
+		resp, err := server.IsBanned(ctx, &p2p_api.IsBannedRequest{IpOrSubnet: "192.168.1.100"})
+		require.NoError(t, err)
+		assert.True(t, resp.IsBanned)
+	})
+
+	t.Run("banned by banManager only", func(t *testing.T) {
+		mockBanList := &MockBanList{}
+		mockBanList.On("IsBanned", "test-peer-id").Return(false)
+
+		mockBanMgr := &MockPeerBanManager{}
+		mockBanMgr.On("IsBanned", "test-peer-id").Return(true)
+
+		server := &Server{
+			logger:     ulogger.New("test"),
+			settings:   &settings.Settings{},
+			banList:    mockBanList,
+			banManager: mockBanMgr,
+		}
+
+		resp, err := server.IsBanned(ctx, &p2p_api.IsBannedRequest{IpOrSubnet: "test-peer-id"})
+		require.NoError(t, err)
+		assert.True(t, resp.IsBanned)
+	})
+
+	t.Run("not banned by either", func(t *testing.T) {
+		mockBanList := &MockBanList{}
+		mockBanList.On("IsBanned", "192.168.1.200").Return(false)
+
+		mockBanMgr := &MockPeerBanManager{}
+		mockBanMgr.On("IsBanned", "192.168.1.200").Return(false)
+
+		server := &Server{
+			logger:     ulogger.New("test"),
+			settings:   &settings.Settings{},
+			banList:    mockBanList,
+			banManager: mockBanMgr,
+		}
+
+		resp, err := server.IsBanned(ctx, &p2p_api.IsBannedRequest{IpOrSubnet: "192.168.1.200"})
+		require.NoError(t, err)
+		assert.False(t, resp.IsBanned)
+	})
 }
 
 func TestListBannedCoverage(t *testing.T) {
