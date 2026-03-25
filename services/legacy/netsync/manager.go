@@ -754,26 +754,31 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// Update network stats at the end of this tick.
 	defer sps.updateNetwork(sp)
 
-	validNetworkSpeed := sps.validNetworkSpeed(sm.minSyncPeerNetworkSpeed)
+	headersFirst := sm.headersFirstMode.Load()
 	lastBlockSince := time.Since(sps.getLastBlockTime())
 
-	sm.logger.Debugf("[CheckSyncPeer] sync peer %s check, network violations: %v (limit %v), time since last block: %v (limit %v), headers-first mode: %v", sp.String(), validNetworkSpeed, maxNetworkViolations, lastBlockSince, maxLastBlockTime, sm.headersFirstMode.Load())
+	// During headers-first mode, skip network speed checks only — headers are
+	// 80 bytes each so the peer looks slow but isn't. Last-block-time checks
+	// still run so we detect genuinely stalled peers (e.g. CATCHINGBLOCKS stuck).
+	var isNetworkSpeedViolation bool
+	if !headersFirst {
+		validNetworkSpeed := sps.validNetworkSpeed(sm.minSyncPeerNetworkSpeed)
+		isNetworkSpeedViolation = validNetworkSpeed >= maxNetworkViolations
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check, network violations: %v (limit %v), time since last block: %v (limit %v)", sp.String(), validNetworkSpeed, maxNetworkViolations, lastBlockSince, maxLastBlockTime)
+	} else {
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check (headers-first, network speed skipped), time since last block: %v (limit %v)", sp.String(), lastBlockSince, maxLastBlockTime)
+	}
+	isLastBlockTimeViolation := lastBlockSince > maxLastBlockTime
 
-	// Don't check network speed during headers-first mode, as we're intentionally
-	// downloading small headers (80 bytes each) rather than full blocks. The peer
-	// may appear slow because we're not requesting much data, not because it's actually slow.
-	isNetworkSpeedViolation := !sm.headersFirstMode.Load() && (validNetworkSpeed >= maxNetworkViolations)
-
-	// Check network speed of the sync peer and its last block time. If we're currently
-	// flushing the cache skip this round.
-	if !isNetworkSpeedViolation && (lastBlockSince <= maxLastBlockTime) {
+	// If no violations detected, the sync peer is healthy — nothing to do.
+	if !isNetworkSpeedViolation && !isLastBlockTimeViolation {
 		return
 	}
 
 	var reason string
 	if isNetworkSpeedViolation {
 		reason = "network speed violation"
-	} else if lastBlockSince > maxLastBlockTime {
+	} else if isLastBlockTimeViolation {
 		reason = "last block time out of range"
 	}
 	sm.logger.Debugf("[CheckSyncPeer] sync peer %s is stalled due to %s, updating sync peer", sp.String(), reason)

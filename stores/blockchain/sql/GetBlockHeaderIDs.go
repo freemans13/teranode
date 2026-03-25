@@ -160,7 +160,13 @@ func (s *SQL) GetBlockHeaderIDs(ctx context.Context, blockHashFrom *chainhash.Ha
 		ids = append(ids, id)
 	}
 
-	cacheOp.Set(ids, cacheTTL)
+	// Only cache non-empty results. Empty results can occur when GetBlockHeaderIDs
+	// is called for a block hash that hasn't been stored yet (e.g., checkOldBlockIDs
+	// during ValidateBlock runs before AddBlock). Caching empty results in chainWalkCache
+	// causes persistent failures because chainWalkCache survives StoreBlock cache wipes.
+	if len(ids) > 0 {
+		cacheOp.Set(ids, cacheTTL)
+	}
 
 	return ids, nil
 }
