@@ -598,14 +598,6 @@ func (u *Server) Init(ctx context.Context) (err error) {
 
 			case c := <-u.catchupCh:
 				{
-					// Don't process catchup if legacy sync is active
-					isLegacy, _ := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateLEGACYSYNCING)
-					if isLegacy {
-						u.logger.Warnf("[catchup] Rejecting catchup for block %s — LEGACYSYNCING active", c.block.Hash().String())
-						u.processBlockNotify.Delete(*c.block.Hash())
-						continue
-					}
-
 					// Check if peer is bad or malicious before attempting catchup
 					if u.isPeerBad(c.peerID) || u.isPeerMalicious(ctx, c.peerID) {
 						u.logger.Warnf("[catchup][%s] peer %s (%s) is marked as bad or malicious, trying alternative peers", c.block.Hash().String(), c.peerID, c.baseURL)
@@ -921,14 +913,6 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 	// Check queue depth and determine if we might need catchup mode
 	queueSize := u.blockPriorityQueue.Size()
 	shouldConsiderCatchup := u.settings.BlockValidation.UseCatchupWhenBehind && (queueSize > 10 || len(u.blockFoundCh) > 3)
-
-	if shouldConsiderCatchup {
-		// Don't consider catchup when legacy sync is active
-		isLegacy, _ := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateLEGACYSYNCING)
-		if isLegacy {
-			shouldConsiderCatchup = false
-		}
-	}
 
 	if shouldConsiderCatchup {
 		// Fetch the block to classify it before deciding on catchup

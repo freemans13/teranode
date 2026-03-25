@@ -762,12 +762,6 @@ func (u *Server) verifyChainContinuity(ctx context.Context, catchupCtx *CatchupC
 // Returns:
 //   - error: If fetching or validation fails
 func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *CatchupContext) error {
-	// Safety net: refuse to run catchup if legacy sync is active
-	isLegacy, _ := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateLEGACYSYNCING)
-	if isLegacy {
-		return errors.NewProcessingError("[catchup] cannot run while LEGACYSYNCING")
-	}
-
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "fetchAndValidateBlocks",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[catchup:fetchAndValidateBlocks][%s] starting to fetch and validate %d blocks", catchupCtx.blockUpTo.Hash().String(), len(catchupCtx.blockHeaders)),
