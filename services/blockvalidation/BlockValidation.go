@@ -705,7 +705,7 @@ func (u *BlockValidation) processSubtreesNotSet(ctx context.Context, g *errgroup
 			block := block
 
 			g.Go(func() error {
-				u.logger.Debugf("[BlockValidation:start] processing block subtrees DAH not set: %s", block.Hash().String())
+				u.logger.Infof("[BlockValidation:start] processing block subtrees DAH not set: %s", block.Hash().String())
 
 				if err := u.updateSubtreesDAH(ctx, block); err != nil {
 					u.logger.Errorf("[BlockValidation:start] failed to update subtrees DAH: %s", err)
@@ -1874,10 +1874,10 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	// HashPrevBlock works correctly in both cases. The old code used block.Hash()
 	// which returned empty in the normal path, defeating the fast-path map and
 	// forcing every entry through individual CheckBlockIsInCurrentChain gRPC calls.
-	lookupHash := block.Hash()
-	if block.Header != nil && block.Header.HashPrevBlock != nil {
-		lookupHash = block.Header.HashPrevBlock
+	if block.Header == nil || block.Header.HashPrevBlock == nil {
+		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] block header or HashPrevBlock is nil", block.String())
 	}
+	lookupHash := block.Header.HashPrevBlock
 
 	currentChainBlockIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, lookupHash, 10_000)
 	if err != nil {

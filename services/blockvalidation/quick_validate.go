@@ -1080,7 +1080,7 @@ func (u *BlockValidation) processSubtreeBatch(
 	if len(txsNeedingExtension) > 0 {
 		if err := u.utxoStore.BatchPreviousOutputsDecorate(ctx, txsNeedingExtension); err != nil {
 			cancelReaders()
-			return nil, errors.NewProcessingError("[processSubtreeBatch][%s] failed to extend %d transactions: %v", block.Hash().String(), len(txsNeedingExtension), err)
+			return nil, errors.NewProcessingError("[processSubtreeBatch][%s] failed to extend transactions: %v", block.Hash().String(), err)
 		}
 	}
 

@@ -1816,11 +1816,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		return nil
 	}
 
-	timeout := s.settings.UtxoStore.DBTimeout
-	if timeout < 60*time.Second {
-		timeout = 60 * time.Second
-	}
-	ctx, cancelTimeout := context.WithTimeout(ctx, timeout)
+	ctx, cancelTimeout := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelTimeout()
 
 	// Collect all (parentTxHash, outputIdx) pairs that need decoration
@@ -1921,8 +1917,6 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 
 	// Map results back to inputs
 	var missingInputs int
-	var firstMissingParent chainhash.Hash
-	var firstMissingOutIdx uint32
 	for parentHash, refs := range needsByParent {
 		for _, ref := range refs {
 			key := outputKey{hash: parentHash, idx: ref.outIdx}
@@ -1930,17 +1924,13 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 				txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxScript = bscript.NewFromBytes(info.lockingScript)
 				txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxSatoshis = info.satoshis
 			} else {
-				if missingInputs == 0 {
-					firstMissingParent = parentHash
-					firstMissingOutIdx = ref.outIdx
-				}
 				missingInputs++
 			}
 		}
 	}
 
 	if missingInputs > 0 {
-		return errors.NewProcessingError("failed to decorate previous outputs: %d inputs could not be resolved (first missing: parent=%x vout=%d)", missingInputs, firstMissingParent[:], firstMissingOutIdx)
+		return errors.NewProcessingError("failed to decorate previous outputs: %d inputs could not be resolved", missingInputs)
 	}
 
 	return nil
