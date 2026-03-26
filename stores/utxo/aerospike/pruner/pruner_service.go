@@ -510,15 +510,16 @@ func (s *Service) partitionWorker(
 		defer readerDone.Done()
 		defer close(pipeline)
 		for {
+			// Read from Aerospike with cancellation support to avoid blocking on stalled recordsets
+			var rec *aerospike.Result
 			select {
 			case <-ctx.Done():
 				return
-			default:
-			}
-
-			rec, ok := <-recordset.Results()
-			if !ok || rec == nil {
-				return
+			case r, ok := <-recordset.Results():
+				if !ok || r == nil {
+					return
+				}
+				rec = r
 			}
 
 			// Register TXID in shared set before forwarding (if record is valid)
@@ -526,7 +527,9 @@ func (s *Service) partitionWorker(
 				if txIDBytes, ok := rec.Record.Bins[s.fieldTxID].([]byte); ok && len(txIDBytes) == 32 {
 					var h chainhash.Hash
 					copy(h[:], txIDBytes)
-					prunedSet.Add(h)
+					if prunedSet != nil {
+						prunedSet.Add(h)
+					}
 				}
 			}
 
@@ -543,7 +546,12 @@ func (s *Service) partitionWorker(
 				}
 			}
 
-			pipeline <- rec
+			// Send to pipeline with cancellation support to avoid deadlock on shutdown
+			select {
+			case pipeline <- rec:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -579,6 +587,8 @@ func (s *Service) partitionWorker(
 	for rec := range pipeline {
 		select {
 		case <-ctx.Done():
+			// Close recordset to unblock the reader from recordset.Results()
+			recordset.Close()
 			readerDone.Wait()
 			return 0, 0, ctx.Err()
 		default:
@@ -981,25 +991,11 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 				return 0, 0, err
 			}
 
-			// Accumulate parent updates, skipping parents already pruned in this session.
-			// Use a local map so that once a parent TX is treated as pruned, all subsequent
-			// inputs referencing the same parent are also skipped, even though
-			// prunedSet.CheckAndRemove is destructive.
-			prunedParentsSeen := make(map[chainhash.Hash]struct{})
-
+			// Accumulate parent updates, skipping parents already pruned in this session
 			for _, input := range inputs {
 				// Check if parent TX was already pruned — if so, skip the update
 				parentTxID := input.PreviousTxIDChainHash()
-
-				// First, consult the local session cache
-				if _, alreadySeen := prunedParentsSeen[*parentTxID]; alreadySeen {
-					prometheusUtxoParentsSkippedPruned.Inc()
-					continue
-				}
-
-				// Then, consult the shared pruned set (which removes on first match)
 				if prunedSet != nil && prunedSet.CheckAndRemove(*parentTxID) {
-					prunedParentsSeen[*parentTxID] = struct{}{}
 					prometheusUtxoParentsSkippedPruned.Inc()
 					continue
 				}
