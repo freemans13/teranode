@@ -663,8 +663,14 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 		partitionStart += partitionCount
 	}
 
-	// Shared set tracking TXIDs scanned for pruning — used to skip wasteful parent updates
-	prunedSet := NewPrunedTxSet(256)
+	// Shared set tracking TXIDs scanned for pruning — used to skip wasteful parent updates.
+	// Only allocated when parent updates are enabled AND defensive mode is off.
+	// In defensive mode, records may be skipped (child not stable) after the reader registers
+	// them, which would incorrectly suppress parent updates for records still in Aerospike.
+	var prunedSet *PrunedTxSet
+	if !s.skipParentUpdates && !s.defensiveEnabled {
+		prunedSet = NewPrunedTxSet(256)
+	}
 
 	// Cumulative counters persist across retry attempts
 	var cumulativeProcessed, cumulativeSkipped int64
@@ -1000,7 +1006,7 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 					continue
 				}
 
-				keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.utxoBatchSize)
+				keySource := uaerospike.CalculateKeySource(parentTxID, input.PreviousTxOutIndex, s.utxoBatchSize)
 				parentKeyStr := string(keySource)
 
 				if existing, ok := allParentUpdates[parentKeyStr]; ok {
