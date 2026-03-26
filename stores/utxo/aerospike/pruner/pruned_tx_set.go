@@ -46,13 +46,18 @@ func (s *PrunedTxSet) shard(h chainhash.Hash) *prunedTxShard {
 	return &s.shards[h[0]&s.mask]
 }
 
-// Add registers a TXID as pruned.
+// Add registers a TXID as pruned. Duplicate adds are idempotent and do not affect the count.
 func (s *PrunedTxSet) Add(h chainhash.Hash) {
 	sh := s.shard(h)
 	sh.mu.Lock()
-	sh.m[h] = struct{}{}
+	_, exists := sh.m[h]
+	if !exists {
+		sh.m[h] = struct{}{}
+	}
 	sh.mu.Unlock()
-	s.count.Add(1)
+	if !exists {
+		s.count.Add(1)
+	}
 }
 
 // Contains checks if a TXID is in the set without removing it.

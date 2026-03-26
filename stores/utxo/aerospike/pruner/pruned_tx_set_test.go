@@ -156,6 +156,24 @@ func TestPrunedTxSet_SimulateChainPruning(t *testing.T) {
 	assert.Equal(t, 1, set.Len())
 }
 
+func TestPrunedTxSet_DuplicateAdd(t *testing.T) {
+	set := NewPrunedTxSet(16)
+
+	h1 := makeHash(0x01)
+
+	set.Add(h1)
+	assert.Equal(t, 1, set.Len())
+
+	// Adding the same TXID again should not increment the count
+	set.Add(h1)
+	assert.Equal(t, 1, set.Len())
+
+	// Should still be removable exactly once
+	assert.True(t, set.CheckAndRemove(h1))
+	assert.Equal(t, 0, set.Len())
+	assert.False(t, set.CheckAndRemove(h1))
+}
+
 func TestPrunedTxSet_ParentNotInBlock(t *testing.T) {
 	// TX_child's parent is NOT in this block — should not be found
 	set := NewPrunedTxSet(16)

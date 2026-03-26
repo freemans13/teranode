@@ -490,7 +490,16 @@ func (s *Service) partitionWorker(
 
 	// Two-stage pipeline: reader registers TXIDs in shared set before processor handles them
 	// This eliminates cross-worker race conditions for parent-update skipping
-	const readAheadBuffer = 10000
+	// Derive read-ahead buffer size from chunkSize with a conservative cap so memory scales predictably.
+	readAheadBase := s.chunkSize
+	if readAheadBase <= 0 {
+		readAheadBase = 1000 // fall back to default chunk size if unset
+	}
+	// Allow modest read-ahead, but cap to avoid excessive buffered records.
+	readAheadBuffer := int(math.Min(float64(readAheadBase*2), 10000))
+	if readAheadBuffer < 1 {
+		readAheadBuffer = 1
+	}
 	pipeline := make(chan *aerospike.Result, readAheadBuffer)
 
 	// Stage 1: Reader — streams from Aerospike, registers TXIDs, forwards to pipeline
@@ -972,11 +981,25 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 				return 0, 0, err
 			}
 
-			// Accumulate parent updates, skipping parents already pruned in this session
+			// Accumulate parent updates, skipping parents already pruned in this session.
+			// Use a local map so that once a parent TX is treated as pruned, all subsequent
+			// inputs referencing the same parent are also skipped, even though
+			// prunedSet.CheckAndRemove is destructive.
+			prunedParentsSeen := make(map[chainhash.Hash]struct{})
+
 			for _, input := range inputs {
 				// Check if parent TX was already pruned — if so, skip the update
 				parentTxID := input.PreviousTxIDChainHash()
+
+				// First, consult the local session cache
+				if _, alreadySeen := prunedParentsSeen[*parentTxID]; alreadySeen {
+					prometheusUtxoParentsSkippedPruned.Inc()
+					continue
+				}
+
+				// Then, consult the shared pruned set (which removes on first match)
 				if prunedSet != nil && prunedSet.CheckAndRemove(*parentTxID) {
+					prunedParentsSeen[*parentTxID] = struct{}{}
 					prometheusUtxoParentsSkippedPruned.Inc()
 					continue
 				}
