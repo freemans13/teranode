@@ -24,6 +24,7 @@ import (
 	inmemorykafka "github.com/bsv-blockchain/teranode/util/kafka/in_memory_kafka"
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -168,11 +169,22 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 		return client, nil
 	}
 
+	// ProducerBatchMaxBytes is the max size of a single record batch on the wire.
+	// franz-go requires at least 512 bytes (Kafka protocol minimum for a record batch).
+	// Small flush_bytes values (e.g. 64) were valid with sarama as a flush threshold
+	// but are too small for franz-go's batch max bytes.
+	const minBatchMaxBytes = 512
+	batchMaxBytes := int32(cfg.FlushBytes)
+	if batchMaxBytes < minBatchMaxBytes {
+		logger.Warnf("flush_bytes=%d for topic %s is below franz-go minimum %d, clamping to %d", cfg.FlushBytes, cfg.Topic, minBatchMaxBytes, minBatchMaxBytes)
+		batchMaxBytes = minBatchMaxBytes
+	}
+
 	// Build franz-go client options
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.BrokersURL...),
 		kgo.DefaultProduceTopic(cfg.Topic),
-		kgo.ProducerBatchMaxBytes(int32(cfg.FlushBytes)),
+		kgo.ProducerBatchMaxBytes(batchMaxBytes),
 		kgo.ProducerLinger(cfg.FlushFrequency),
 		kgo.MaxBufferedRecords(cfg.FlushMessages),
 		kgo.DisableIdempotentWrite(),
@@ -441,10 +453,13 @@ func createTopicWithFranz(ctx context.Context, client *kgo.Client, cfg KafkaProd
 
 	resp, err := admin.CreateTopic(ctx, cfg.Partitions, cfg.ReplicationFactor, configs, cfg.Topic)
 	if err != nil {
+		if errors.Is(err, kerr.TopicAlreadyExists) {
+			return nil
+		}
 		return errors.NewProcessingError("unable to create topic", err)
 	}
 
-	if resp.Err != nil && resp.Err.Error() != "TOPIC_ALREADY_EXISTS" {
+	if resp.Err != nil && !errors.Is(resp.Err, kerr.TopicAlreadyExists) {
 		_, alterErr := admin.AlterTopicConfigs(ctx, []kadm.AlterConfig{
 			{Name: "retention.ms", Value: stringPtr(fmt.Sprintf("%d", retentionMs))},
 			{Name: "delete.retention.ms", Value: stringPtr(fmt.Sprintf("%d", retentionMs))},
