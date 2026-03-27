@@ -1009,6 +1009,65 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 			blockHash.String(), len(bridgeTxHashes), u.bridge.BlockCount())
 	}
 
+	// When bridge is enabled, run DB writes in background — next block can proceed immediately
+	// Only for normal mined blocks (not unsetMined), since unsetMined must complete synchronously
+	if u.bridge != nil && (len(unsetMined) == 0 || !unsetMined[0]) {
+		// Capture values for the goroutine
+		bgBlockHash := *blockHash
+		bgBlock := block
+		bgIDs := ids
+		bgOnLongestChain := onLongestChain
+		bgUnsetMined := unsetMined
+
+		go func() {
+			bgCtx := context.Background()
+
+			if bgErr := model.UpdateTxMinedStatus(
+				bgCtx,
+				u.logger,
+				u.settings,
+				u.utxoStore,
+				bgBlock,
+				bgIDs[0],
+				bgIDs[0:],
+				bgOnLongestChain,
+				u.blockchainClient,
+				bgUnsetMined...,
+			); bgErr != nil {
+				if errors.Is(bgErr, errors.ErrBlockInvalid) {
+					u.logger.Errorf("[setTxMined][%s] BACKGROUND: block invalid: %v", bgBlockHash.String(), bgErr)
+					_ = u.markBlockAsInvalid(bgCtx, bgBlock, "contains transactions already on our chain: "+bgErr.Error())
+				} else if !errors.Is(bgErr, errors.ErrBlockParentNotMined) {
+					u.logger.Errorf("[setTxMined][%s] BACKGROUND: error updating tx mined status: %v", bgBlockHash.String(), bgErr)
+				}
+				// On error, remove bridge entry so we don't serve stale data
+				u.bridge.RemoveBlock(bgBlockHash)
+				return
+			}
+
+			// Close mmap-backed subtrees
+			for _, st := range bgBlock.SubtreeSlices {
+				if st != nil {
+					st.Close()
+				}
+			}
+			bgBlock.SubtreeSlices = nil
+
+			// Set mined_set = true in blockchain store
+			if bgErr := u.blockchainClient.SetBlockMinedSet(bgCtx, &bgBlockHash); bgErr != nil {
+				u.logger.Errorf("[setTxMined][%s] BACKGROUND: failed to set block mined: %v", bgBlockHash.String(), bgErr)
+				return
+			}
+
+			// Remove from bridge — UTXO store now has the data
+			u.bridge.RemoveBlock(bgBlockHash)
+			u.logger.Infof("[setTxMined][%s] BACKGROUND: SetTxMined complete, bridge holds %d blocks",
+				bgBlockHash.String(), u.bridge.BlockCount())
+		}()
+
+		return nil
+	}
+
 	// add the transactions in this block to the block IDs in the utxo store
 	if err = model.UpdateTxMinedStatus(
 		ctx,
