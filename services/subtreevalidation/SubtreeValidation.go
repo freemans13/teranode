@@ -435,6 +435,17 @@ func (u *Server) checkCounterConflictingOnCurrentChain(ctx context.Context, txHa
 				return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get counter conflicting tx meta", txHash.String(), err)
 			}
 
+			// If BlockIDs are empty (SetTxMined pending) and bridge is available,
+			// query block validation's in-memory bridge for recently-mined block IDs
+			if len(counterConflictingTxMeta.BlockIDs) == 0 && u.blockValidationClient != nil {
+				bridgeBlockIDs, err := u.blockValidationClient.GetBridgeBlockIDs(gCtx, &counterConflictingTxHash)
+				if err != nil {
+					u.logger.Warnf("[checkCounterConflictingOnCurrentChain][%s] bridge lookup failed: %v", txHash.String(), err)
+				} else if len(bridgeBlockIDs) > 0 {
+					counterConflictingTxMeta.BlockIDs = bridgeBlockIDs
+				}
+			}
+
 			counterConflictingTxMetas[idx] = counterConflictingTxMeta
 
 			return nil

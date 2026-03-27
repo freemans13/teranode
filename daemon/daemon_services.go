@@ -793,6 +793,15 @@ func (d *Daemon) startValidationService(
 			blockAssemblyClient = nil
 		}
 
+		// Create block validation client for bridge block ID lookups during conflict checks.
+		// This is optional; if the client cannot be created, subtree validation continues
+		// without bridge lookups (relies on UTXO store meta only).
+		blockValidationClient, err := blockvalidation.NewClient(ctx, createLogger(loggerBlockValidation), appSettings, "subtreevalidation")
+		if err != nil {
+			createLogger(loggerBlockValidation).Warnf("failed to create blockvalidation client for subtreevalidation; continuing without bridge lookup: %v", err)
+			blockValidationClient = nil
+		}
+
 		// Create the SubtreeValidation service
 		var service *subtreevalidation.Server
 
@@ -809,6 +818,7 @@ func (d *Daemon) startValidationService(
 			txMetaConsumerClient,
 			p2pClient,
 			blockAssemblyClient,
+			blockValidationClient,
 		)
 		if err != nil {
 			return err

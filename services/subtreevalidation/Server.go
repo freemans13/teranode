@@ -38,6 +38,12 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// BridgeBlockIDProvider is an interface for querying bridge block IDs from the block
+// validation service. This local interface avoids a circular import with blockvalidation.
+type BridgeBlockIDProvider interface {
+	GetBridgeBlockIDs(ctx context.Context, txHash *chainhash.Hash) ([]uint32, error)
+}
+
 // Server implements the subtree validation service and provides functionality for
 // validating transaction subtrees within the blockchain.
 //
@@ -103,6 +109,10 @@ type Server struct {
 	// Used to check local tx availability before fetching subtree_data from peers
 	blockAssemblyClient blockassembly.ClientI
 
+	// blockValidationClient interfaces with the block validation service
+	// Used to query the MinedTxBridge for recently-mined tx BlockIDs during conflict checks
+	blockValidationClient BridgeBlockIDProvider
+
 	// subtreeConsumerClient consumes subtree-related Kafka messages
 	// Handles incoming subtree validation requests from other services
 	subtreeConsumerClient kafka.KafkaConsumerGroupI
@@ -163,6 +173,7 @@ type Server struct {
 //   - txmetaConsumerClient: Kafka consumer for transaction metadata messages
 //   - p2pClient: Client for P2P peer communication (byte tracking, peer info)
 //   - blockAssemblyClient: Client for block assembly service (local tx availability check)
+//   - blockValidationClient: Client for block validation service (bridge block ID lookup, optional)
 //
 // Returns:
 //   - *Server: Fully initialized server instance ready for starting
@@ -180,6 +191,7 @@ func New(
 	txmetaConsumerClient kafka.KafkaConsumerGroupI,
 	p2pClient P2PClientI,
 	blockAssemblyClient blockassembly.ClientI,
+	blockValidationClient BridgeBlockIDProvider,
 ) (*Server, error) {
 	u := &Server{
 		logger:                            logger,
@@ -194,6 +206,7 @@ func New(
 		prioritySubtreeCheckActiveMapLock: sync.Mutex{},
 		blockchainClient:                  blockchainClient,
 		blockAssemblyClient:               blockAssemblyClient,
+		blockValidationClient:             blockValidationClient,
 		subtreeConsumerClient:             subtreeConsumerClient,
 		txmetaConsumerClient:              txmetaConsumerClient,
 		invalidSubtreeDeDuplicateMap:      expiringmap.New[string, struct{}](time.Minute * 1),
