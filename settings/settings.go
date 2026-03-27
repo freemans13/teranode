@@ -366,7 +366,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupParallelFetchEnabled: getBool("blockvalidation_catchup_parallel_fetch_enabled", true, alternativeContext...),
 			CatchupParallelFetchWorkers: getInt("blockvalidation_catchup_parallel_fetch_workers", 3, alternativeContext...),
 			// MinedTxBridge settings
-			MinedTxBridgeEnabled:   getBool("blockvalidation_mined_tx_bridge_enabled", false, alternativeContext...),
+			MinedTxBridgeEnabled:          getBool("blockvalidation_mined_tx_bridge_enabled", false, alternativeContext...),
 			MinedTxBridgeWarningThreshold: getInt("blockvalidation_mined_tx_bridge_warning_threshold", 10, alternativeContext...),
 		},
 		Validator: ValidatorSettings{
