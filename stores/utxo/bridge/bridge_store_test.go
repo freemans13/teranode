@@ -12,7 +12,8 @@ import (
 )
 
 // mockStore implements utxo.Store with only the methods needed for testing.
-// Unimplemented methods panic so that unexpected calls are caught immediately.
+// Unimplemented methods delegate to the embedded utxo.Store (nil), which will
+// panic on unexpected calls.
 type mockStore struct {
 	utxo.Store
 

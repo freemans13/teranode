@@ -998,11 +998,16 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	// Populate bridge and run DB writes in background only for normal mined blocks (not unsetMined)
 	isUnsetMined := len(unsetMined) > 0 && unsetMined[0]
 	if u.bridge != nil && !isUnsetMined {
-		// Stream tx hashes directly into the bridge's Swiss table to avoid an intermediate slice
+		// Count only non-placeholder hashes to match what the iterator will actually insert
 		txCount := 0
 		for _, st := range block.SubtreeSlices {
-			if st != nil {
-				txCount += len(st.Nodes)
+			if st == nil {
+				continue
+			}
+			for i := range st.Nodes {
+				if !st.Nodes[i].Hash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
+					txCount++
+				}
 			}
 		}
 		u.bridge.AddBlockFromIterator(*blockHash, ids[0], block.Height, txCount, func(visit func(*chainhash.Hash)) {
