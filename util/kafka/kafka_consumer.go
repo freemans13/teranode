@@ -357,7 +357,7 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig) (*KafkaConsumerGroup, error)
 		}, nil
 	}
 
-	// Apply defaults for zero-value timeouts. These match the defaults in
+	// Apply defaults for non-positive (zero or negative) timeouts. These match the defaults in
 	// NewKafkaConsumerGroupFromURL but are needed when callers construct
 	// KafkaConsumerConfig directly without going through the URL parser.
 	if cfg.MaxProcessingTime <= 0 {

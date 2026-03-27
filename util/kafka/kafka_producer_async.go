@@ -461,15 +461,25 @@ func createTopicWithFranz(ctx context.Context, client *kgo.Client, cfg KafkaProd
 		"segment.bytes":       stringPtr(fmt.Sprintf("%d", segmentBytes)),
 	}
 
+	topicAlreadyExists := false
+
 	resp, err := admin.CreateTopic(ctx, cfg.Partitions, cfg.ReplicationFactor, configs, cfg.Topic)
 	if err != nil {
 		if errors.Is(err, kerr.TopicAlreadyExists) {
-			return nil
+			topicAlreadyExists = true
+		} else {
+			return errors.NewProcessingError("unable to create topic", err)
 		}
-		return errors.NewProcessingError("unable to create topic", err)
+	} else if resp.Err != nil {
+		if errors.Is(resp.Err, kerr.TopicAlreadyExists) {
+			topicAlreadyExists = true
+		} else {
+			return errors.NewProcessingError("unable to create topic", resp.Err)
+		}
 	}
 
-	if resp.Err != nil && !errors.Is(resp.Err, kerr.TopicAlreadyExists) {
+	// If topic already existed, ensure configs are up to date
+	if topicAlreadyExists {
 		_, alterErr := admin.AlterTopicConfigs(ctx, []kadm.AlterConfig{
 			{Name: "retention.ms", Value: stringPtr(fmt.Sprintf("%d", retentionMs))},
 			{Name: "delete.retention.ms", Value: stringPtr(fmt.Sprintf("%d", retentionMs))},
