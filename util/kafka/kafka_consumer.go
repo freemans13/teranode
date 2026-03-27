@@ -97,9 +97,12 @@ type consumeWatchdog struct {
 
 func (w *consumeWatchdog) markConsumeStarted() {
 	w.consumeStartTime.Store(time.Now())
-	w.setupCalledTime.Store(time.Time{}) // Reset
-	w.consumeEndTime.Store(time.Time{})  // Reset
+	w.consumeEndTime.Store(time.Time{}) // Reset
 	w.isAttemptingConsume.Store(true)
+	// Note: setupCalledTime is intentionally NOT reset here.
+	// It records the last successful PollFetches return so the watchdog
+	// can distinguish "never polled successfully" from "polled before but
+	// PollFetches is blocking on this iteration."
 }
 
 func (w *consumeWatchdog) markSetupCalled() {
@@ -122,9 +125,12 @@ func (w *consumeWatchdog) isStuckInRefreshMetadata(threshold time.Duration) (boo
 		return false, 0
 	}
 
+	// If PollFetches has returned successfully at least once since this
+	// poll started, the consumer is not stuck — it is just waiting for
+	// new messages. Compare timestamps rather than checking for zero so
+	// we don't false-positive on idle consumers after the first poll.
 	setupTime, _ := w.setupCalledTime.Load().(time.Time)
-	if !setupTime.IsZero() {
-		// Setup was called, not stuck
+	if !setupTime.IsZero() && setupTime.After(startTime) {
 		return false, 0
 	}
 
