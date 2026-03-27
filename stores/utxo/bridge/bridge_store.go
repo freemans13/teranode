@@ -54,65 +54,28 @@ func wantsBlockIDs(f []fields.FieldName) bool {
 	return false
 }
 
-// mergeBlockIDs combines storeIDs and bridgeIDs into a deduplicated slice.
-// The result preserves the original store ordering and appends any bridge IDs
-// not already present. Uses linear scan for small slices to avoid map allocation.
-func mergeBlockIDs(storeIDs []uint32, bridgeIDs []uint32) []uint32 {
-	if len(bridgeIDs) == 0 {
-		return storeIDs
+// mergeBlockRefs appends bridge block references into data's BlockIDs, BlockHeights,
+// and SubtreeIdxs slices, keeping all three aligned. Deduplicates by blockID.
+func mergeBlockRefs(data *meta.Data, refs []BlockRef) {
+	if len(refs) == 0 || data == nil {
+		return
 	}
 
-	total := len(storeIDs) + len(bridgeIDs)
-
-	// Fast path: for small combined cardinality, linear scan avoids map allocation.
-	// Deduplicates both storeIDs and bridgeIDs for consistent behavior with the map path.
-	if total <= 8 {
-		result := make([]uint32, 0, total)
-		for _, sid := range storeIDs {
-			found := false
-			for _, r := range result {
-				if r == sid {
-					found = true
-					break
-				}
-			}
-			if !found {
-				result = append(result, sid)
-			}
-		}
-		for _, bid := range bridgeIDs {
-			found := false
-			for _, r := range result {
-				if r == bid {
-					found = true
-					break
-				}
-			}
-			if !found {
-				result = append(result, bid)
-			}
-		}
-		return result
+	// Build a set of existing blockIDs for deduplication
+	seen := make(map[uint32]struct{}, len(data.BlockIDs)+len(refs))
+	for _, id := range data.BlockIDs {
+		seen[id] = struct{}{}
 	}
 
-	seen := make(map[uint32]struct{}, total)
-	result := make([]uint32, 0, total)
-
-	for _, id := range storeIDs {
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			result = append(result, id)
+	for _, ref := range refs {
+		if _, exists := seen[ref.BlockID]; exists {
+			continue
 		}
+		seen[ref.BlockID] = struct{}{}
+		data.BlockIDs = append(data.BlockIDs, ref.BlockID)
+		data.BlockHeights = append(data.BlockHeights, ref.BlockHeight)
+		data.SubtreeIdxs = append(data.SubtreeIdxs, ref.SubtreeIdx)
 	}
-
-	for _, id := range bridgeIDs {
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			result = append(result, id)
-		}
-	}
-
-	return result
 }
 
 // ---- intercepted methods ---------------------------------------------------
@@ -125,9 +88,8 @@ func (s *BridgeStore) Get(ctx context.Context, hash *chainhash.Hash, f ...fields
 		return data, err
 	}
 
-	bridgeIDs := s.bridge.GetBlockIDsForTx(hash)
-	if len(bridgeIDs) > 0 && data != nil {
-		data.BlockIDs = mergeBlockIDs(data.BlockIDs, bridgeIDs)
+	if data != nil {
+		mergeBlockRefs(data, s.bridge.GetBlockRefsForTx(hash))
 	}
 
 	return data, nil
@@ -141,10 +103,7 @@ func (s *BridgeStore) GetMeta(ctx context.Context, hash *chainhash.Hash, data *m
 		return err
 	}
 
-	bridgeIDs := s.bridge.GetBlockIDsForTx(hash)
-	if len(bridgeIDs) > 0 && data != nil {
-		data.BlockIDs = mergeBlockIDs(data.BlockIDs, bridgeIDs)
-	}
+	mergeBlockRefs(data, s.bridge.GetBlockRefsForTx(hash))
 
 	return nil
 }
@@ -162,10 +121,7 @@ func (s *BridgeStore) BatchDecorate(ctx context.Context, items []*utxo.Unresolve
 			continue
 		}
 
-		bridgeIDs := s.bridge.GetBlockIDsForTx(&item.Hash)
-		if len(bridgeIDs) > 0 {
-			item.Data.BlockIDs = mergeBlockIDs(item.Data.BlockIDs, bridgeIDs)
-		}
+		mergeBlockRefs(item.Data, s.bridge.GetBlockRefsForTx(&item.Hash))
 	}
 
 	return nil
@@ -184,13 +140,33 @@ func (s *BridgeStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Has
 	}
 
 	for _, hash := range hashes {
-		bridgeIDs := s.bridge.GetBlockIDsForTx(hash)
-		if len(bridgeIDs) == 0 {
+		refs := s.bridge.GetBlockRefsForTx(hash)
+		if len(refs) == 0 {
 			continue
 		}
 
 		existing := blockIDsMap[*hash]
-		blockIDsMap[*hash] = mergeBlockIDs(existing, bridgeIDs)
+		// SetMinedMulti returns only blockIDs (no heights/subtrees), so extract IDs from refs
+		bridgeIDs := make([]uint32, 0, len(refs))
+		for _, ref := range refs {
+			bridgeIDs = append(bridgeIDs, ref.BlockID)
+		}
+		// Deduplicate against existing
+		seen := make(map[uint32]struct{}, len(existing)+len(bridgeIDs))
+		merged := make([]uint32, 0, len(existing)+len(bridgeIDs))
+		for _, id := range existing {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				merged = append(merged, id)
+			}
+		}
+		for _, id := range bridgeIDs {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				merged = append(merged, id)
+			}
+		}
+		blockIDsMap[*hash] = merged
 	}
 
 	return blockIDsMap, nil

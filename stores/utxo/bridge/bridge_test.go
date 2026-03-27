@@ -18,6 +18,17 @@ func newHashPtr(b byte) *chainhash.Hash {
 	return &h
 }
 
+func blockIDs(refs []BlockRef) []uint32 {
+	if refs == nil {
+		return nil
+	}
+	ids := make([]uint32, len(refs))
+	for i, r := range refs {
+		ids[i] = r.BlockID
+	}
+	return ids
+}
+
 func TestBridge_AddBlockAndLookup(t *testing.T) {
 	bridge := NewMinedTxBridge(10)
 
@@ -28,16 +39,17 @@ func TestBridge_AddBlockAndLookup(t *testing.T) {
 
 	bridge.AddBlock(blockHash, 42, 100, []*chainhash.Hash{tx1, tx2})
 
-	ids := bridge.GetBlockIDsForTx(tx1)
-	require.NotNil(t, ids)
-	require.Equal(t, []uint32{42}, ids)
+	refs := bridge.GetBlockRefsForTx(tx1)
+	require.NotNil(t, refs)
+	require.Equal(t, []uint32{42}, blockIDs(refs))
+	require.Equal(t, uint32(100), refs[0].BlockHeight)
 
-	ids = bridge.GetBlockIDsForTx(tx2)
-	require.NotNil(t, ids)
-	require.Equal(t, []uint32{42}, ids)
+	refs = bridge.GetBlockRefsForTx(tx2)
+	require.NotNil(t, refs)
+	require.Equal(t, []uint32{42}, blockIDs(refs))
 
-	ids = bridge.GetBlockIDsForTx(missing)
-	require.Nil(t, ids)
+	refs = bridge.GetBlockRefsForTx(missing)
+	require.Nil(t, refs)
 }
 
 func TestBridge_MultipleBlocks(t *testing.T) {
@@ -50,9 +62,9 @@ func TestBridge_MultipleBlocks(t *testing.T) {
 	bridge.AddBlock(blockHash1, 10, 100, []*chainhash.Hash{sharedTx})
 	bridge.AddBlock(blockHash2, 20, 101, []*chainhash.Hash{sharedTx})
 
-	ids := bridge.GetBlockIDsForTx(sharedTx)
-	require.NotNil(t, ids)
-	require.ElementsMatch(t, []uint32{10, 20}, ids)
+	refs := bridge.GetBlockRefsForTx(sharedTx)
+	require.NotNil(t, refs)
+	require.ElementsMatch(t, []uint32{10, 20}, blockIDs(refs))
 }
 
 func TestBridge_RemoveBlock(t *testing.T) {
@@ -62,10 +74,10 @@ func TestBridge_RemoveBlock(t *testing.T) {
 	tx := newHashPtr(0xAA)
 
 	bridge.AddBlock(blockHash, 42, 100, []*chainhash.Hash{tx})
-	require.NotNil(t, bridge.GetBlockIDsForTx(tx))
+	require.NotNil(t, bridge.GetBlockRefsForTx(tx))
 
 	bridge.RemoveBlock(blockHash)
-	require.Nil(t, bridge.GetBlockIDsForTx(tx))
+	require.Nil(t, bridge.GetBlockRefsForTx(tx))
 }
 
 func TestBridge_HasBlock(t *testing.T) {

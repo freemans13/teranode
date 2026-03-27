@@ -112,17 +112,28 @@ func (b *MinedTxBridge) BlockCount() int {
 	return n
 }
 
-// GetBlockIDsForTx scans all block sets and returns the blockIDs of any blocks whose tx
-// set contains the given tx hash. Returns nil if not found.
-func (b *MinedTxBridge) GetBlockIDsForTx(txHash *chainhash.Hash) []uint32 {
+// BlockRef holds the block-level metadata for a tx found in the bridge.
+type BlockRef struct {
+	BlockID     uint32
+	BlockHeight uint32
+	SubtreeIdx  int // 0 — bridge does not track per-tx subtree position
+}
+
+// GetBlockRefsForTx scans all block sets and returns block references for any blocks
+// whose tx set contains the given tx hash. Returns nil if not found.
+func (b *MinedTxBridge) GetBlockRefsForTx(txHash *chainhash.Hash) []BlockRef {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	var ids []uint32
+	var refs []BlockRef
 	for _, set := range b.blocks {
 		if _, found := set.txHashes.Get(*txHash); found {
-			ids = append(ids, set.blockID)
+			refs = append(refs, BlockRef{
+				BlockID:     set.blockID,
+				BlockHeight: set.blockHeight,
+				SubtreeIdx:  0,
+			})
 		}
 	}
-	return ids
+	return refs
 }

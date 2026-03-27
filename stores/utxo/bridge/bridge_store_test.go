@@ -75,7 +75,11 @@ func TestBridgeStore_GetMergesBlockIDs(t *testing.T) {
 
 	inner := &mockStore{
 		getFunc: func(_ context.Context, _ *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
-			return &meta.Data{BlockIDs: []uint32{10}}, nil
+			return &meta.Data{
+				BlockIDs:     []uint32{10},
+				BlockHeights: []uint32{50},
+				SubtreeIdxs:  []int{3},
+			}, nil
 		},
 	}
 
@@ -83,6 +87,11 @@ func TestBridgeStore_GetMergesBlockIDs(t *testing.T) {
 	data, err := store.Get(context.Background(), tx, fields.BlockIDs)
 	require.NoError(t, err)
 	require.ElementsMatch(t, []uint32{10, 42}, data.BlockIDs)
+	// BlockHeights and SubtreeIdxs must stay aligned with BlockIDs
+	require.Equal(t, len(data.BlockIDs), len(data.BlockHeights))
+	require.Equal(t, len(data.BlockIDs), len(data.SubtreeIdxs))
+	// Bridge block height=100 should be present
+	require.Contains(t, data.BlockHeights, uint32(100))
 }
 
 func TestBridgeStore_GetMetaMergesBlockIDs(t *testing.T) {
