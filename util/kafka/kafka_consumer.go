@@ -555,7 +555,11 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 					k.watchdog.markSetupCalled()
 
 					if fetches.IsClientClosed() {
-						return
+						// Client was closed by forceRecovery() — loop back to
+						// pick up the replacement client instead of exiting.
+						k.Config.Logger.Infof("[kafka] client closed (recovery), reconnecting consumer for topic %s", k.Config.Topic)
+						time.Sleep(100 * time.Millisecond)
+						continue
 					}
 
 					if errs := fetches.Errors(); len(errs) > 0 {
