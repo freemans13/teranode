@@ -365,6 +365,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupMinThroughputKBps:    getInt("blockvalidation_catchup_min_throughput_kbps", 100, alternativeContext...),
 			CatchupParallelFetchEnabled: getBool("blockvalidation_catchup_parallel_fetch_enabled", true, alternativeContext...),
 			CatchupParallelFetchWorkers: getInt("blockvalidation_catchup_parallel_fetch_workers", 3, alternativeContext...),
+			// MinedTxBridge settings
+			MinedTxBridgeEnabled:   getBool("blockvalidation_mined_tx_bridge_enabled", false, alternativeContext...),
+			MinedTxBridgeMaxBlocks: getInt("blockvalidation_mined_tx_bridge_max_blocks", 10, alternativeContext...),
 		},
 		Validator: ValidatorSettings{
 			GRPCAddress:               getString("validator_grpcAddress", "localhost:8081", alternativeContext...),
