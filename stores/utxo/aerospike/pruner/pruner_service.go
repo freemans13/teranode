@@ -127,7 +127,6 @@ type Service struct {
 	partitionQueries               int     // Number of parallel partition queries (0 = auto-detect)
 	connectionPoolWarningThreshold float64 // Threshold for connection pool auto-adjustment (0.0-1.0)
 	utxoSetTTL                     bool    // Use TTL expiration instead of hard delete
-	skipParentUpdates              bool    // Skip parent update operations and input fetching
 	partitionWorkerFn              func(ctx context.Context, blockHeight uint32, partitionStart int, partitionCount int) (int64, int64, error)
 
 	// Cached field names (avoid repeated String() allocations in hot paths)
@@ -271,7 +270,6 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		partitionQueries:               settings.Pruner.UTXOPartitionQueries,
 		connectionPoolWarningThreshold: settings.Pruner.ConnectionPoolWarningThreshold,
 		utxoSetTTL:                     settings.Pruner.UTXOSetTTL,
-		skipParentUpdates:              settings.Pruner.SkipParentUpdates,
 		fieldTxID:                      fields.TxID.String(),
 		fieldUtxos:                     fields.Utxos.String(),
 		fieldInputs:                    fields.Inputs.String(),
@@ -459,12 +457,9 @@ func (s *Service) partitionWorker(
 		return 0, 0, err
 	}
 
-	// Fetch bins based on defensive mode and skipParentUpdates setting
+	// Fetch bins based on defensive mode
 	// Note: DeleteAtHeight is only used in query filter (server-side), not in processing logic
-	binNames := []string{s.fieldTxID, s.fieldExternal, s.fieldTotalExtraRecs}
-	if !s.skipParentUpdates {
-		binNames = append(binNames, s.fieldInputs)
-	}
+	binNames := []string{s.fieldTxID, s.fieldExternal, s.fieldTotalExtraRecs, s.fieldInputs}
 	if s.defensiveEnabled {
 		binNames = append(binNames, s.fieldUtxos, s.fieldDeletedChildren)
 	}
@@ -888,10 +883,7 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	}
 
 	// Step 3: Accumulate operations for entire chunk, then flush once (efficient batching)
-	var allParentUpdates map[string]*parentUpdateInfo
-	if !s.skipParentUpdates {
-		allParentUpdates = make(map[string]*parentUpdateInfo, 1000) // Accumulate all parent updates for chunk
-	}
+	allParentUpdates := make(map[string]*parentUpdateInfo, 1000)
 	allDeletions := make([]*aerospike.Key, 0, 1000)      // Accumulate all deletions for chunk
 	allExternalFiles := make([]*externalFileInfo, 0, 10) // Accumulate external files (<1%)
 	processedCount := 0
@@ -945,38 +937,31 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		}
 
 		// Safe to delete - get inputs for parent updates
-		var inputs []*bt.Input
-		if !s.skipParentUpdates {
-			var err error
-			inputs, err = s.getTxInputsFromBins(ctx, blockHeight, rec.Record.Bins, txHash)
-			if err != nil {
-				return 0, 0, err
-			}
+		inputs, err := s.getTxInputsFromBins(ctx, blockHeight, rec.Record.Bins, txHash)
+		if err != nil {
+			return 0, 0, err
+		}
 
-			// Accumulate parent updates
-			for _, input := range inputs {
-				keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.utxoBatchSize)
-				parentKeyStr := string(keySource)
+		// Accumulate parent updates
+		for _, input := range inputs {
+			keySource := uaerospike.CalculateKeySource(input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, s.utxoBatchSize)
+			parentKeyStr := string(keySource)
 
-				if existing, ok := allParentUpdates[parentKeyStr]; ok {
-					existing.childHashes = append(existing.childHashes, txHash)
-				} else {
-					parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
-					if err != nil {
-						return 0, 0, err
-					}
-					allParentUpdates[parentKeyStr] = &parentUpdateInfo{
-						key:         parentKey,
-						childHashes: []*chainhash.Hash{txHash},
-					}
+			if existing, ok := allParentUpdates[parentKeyStr]; ok {
+				existing.childHashes = append(existing.childHashes, txHash)
+			} else {
+				parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
+				if err != nil {
+					return 0, 0, err
+				}
+				allParentUpdates[parentKeyStr] = &parentUpdateInfo{
+					key:         parentKey,
+					childHashes: []*chainhash.Hash{txHash},
 				}
 			}
 		}
 
 		// Accumulate external files
-		// NOTE: When skipParentUpdates=true, inputs are not fetched, so all external
-		// files are classified as FileTypeOutputs. This is acceptable because
-		// skipParentUpdates is only used when external file support is not needed.
 		external, isExternal := rec.Record.Bins[s.fieldExternal].(bool)
 		if isExternal && external {
 			fileType := fileformat.FileTypeOutputs
@@ -1365,12 +1350,11 @@ func (s *Service) getTxInputsFromBins(ctx context.Context, blockHeight uint32, b
 }
 
 // flushCleanupBatches flushes accumulated parent updates, external file deletions, and Aerospike deletions
-func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error { // Execute parent updates first
-	if !s.skipParentUpdates {
-		if len(parentUpdates) > 0 {
-			if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
-				return err
-			}
+func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error {
+	// Execute parent updates first
+	if len(parentUpdates) > 0 {
+		if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
+			return err
 		}
 	}
 
