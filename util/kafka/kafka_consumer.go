@@ -360,16 +360,16 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig) (*KafkaConsumerGroup, error)
 	// Apply defaults for zero-value timeouts. These match the defaults in
 	// NewKafkaConsumerGroupFromURL but are needed when callers construct
 	// KafkaConsumerConfig directly without going through the URL parser.
-	if cfg.MaxProcessingTime == 0 {
+	if cfg.MaxProcessingTime <= 0 {
 		cfg.MaxProcessingTime = 100 * time.Millisecond
 	}
-	if cfg.SessionTimeout == 0 {
+	if cfg.SessionTimeout <= 0 {
 		cfg.SessionTimeout = 10 * time.Second
 	}
-	if cfg.HeartbeatInterval == 0 {
+	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 3 * time.Second
 	}
-	if cfg.RebalanceTimeout == 0 {
+	if cfg.RebalanceTimeout <= 0 {
 		cfg.RebalanceTimeout = 60 * time.Second
 	}
 

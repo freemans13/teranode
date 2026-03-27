@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"os/signal"
@@ -174,11 +175,16 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 	// Small flush_bytes values (e.g. 64) were valid with sarama as a flush threshold
 	// but are too small for franz-go's batch max bytes.
 	const minBatchMaxBytes = 512
-	batchMaxBytes := int32(cfg.FlushBytes)
-	if batchMaxBytes < minBatchMaxBytes {
+	flushBytes := cfg.FlushBytes
+	if flushBytes < minBatchMaxBytes {
 		logger.Warnf("flush_bytes=%d for topic %s is below franz-go minimum %d, clamping to %d", cfg.FlushBytes, cfg.Topic, minBatchMaxBytes, minBatchMaxBytes)
-		batchMaxBytes = minBatchMaxBytes
+		flushBytes = minBatchMaxBytes
 	}
+	if flushBytes > math.MaxInt32 {
+		logger.Warnf("flush_bytes=%d for topic %s exceeds max int32, clamping to %d", cfg.FlushBytes, cfg.Topic, math.MaxInt32)
+		flushBytes = math.MaxInt32
+	}
+	batchMaxBytes := int32(flushBytes) //nolint:gosec // bounds checked above
 
 	// Build franz-go client options
 	opts := []kgo.Opt{
