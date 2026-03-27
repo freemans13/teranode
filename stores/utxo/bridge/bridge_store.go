@@ -25,8 +25,12 @@ type BridgeStore struct {
 
 // NewBridgeStore returns a utxo.Store that transparently merges bridge blockIDs
 // into reads. When enabled is false all methods are pure passthroughs with zero
-// bridge overhead.
+// bridge overhead. If bridge is nil and enabled is true, enabled is forced to
+// false to prevent nil-pointer panics.
 func NewBridgeStore(inner utxo.Store, bridge *MinedTxBridge, enabled bool) utxo.Store {
+	if bridge == nil {
+		enabled = false
+	}
 	return &BridgeStore{
 		inner:   inner,
 		bridge:  bridge,
@@ -52,14 +56,35 @@ func wantsBlockIDs(f []fields.FieldName) bool {
 
 // mergeBlockIDs combines storeIDs and bridgeIDs into a deduplicated slice.
 // The result preserves the original store ordering and appends any bridge IDs
-// not already present.
+// not already present. Uses linear scan for small slices to avoid map allocation.
 func mergeBlockIDs(storeIDs []uint32, bridgeIDs []uint32) []uint32 {
 	if len(bridgeIDs) == 0 {
 		return storeIDs
 	}
 
-	seen := make(map[uint32]struct{}, len(storeIDs)+len(bridgeIDs))
-	result := make([]uint32, 0, len(storeIDs)+len(bridgeIDs))
+	total := len(storeIDs) + len(bridgeIDs)
+
+	// Fast path: for small combined cardinality, linear scan avoids map allocation
+	if total <= 8 {
+		result := make([]uint32, 0, total)
+		result = append(result, storeIDs...)
+		for _, bid := range bridgeIDs {
+			found := false
+			for _, sid := range result {
+				if sid == bid {
+					found = true
+					break
+				}
+			}
+			if !found {
+				result = append(result, bid)
+			}
+		}
+		return result
+	}
+
+	seen := make(map[uint32]struct{}, total)
+	result := make([]uint32, 0, total)
 
 	for _, id := range storeIDs {
 		if _, ok := seen[id]; !ok {

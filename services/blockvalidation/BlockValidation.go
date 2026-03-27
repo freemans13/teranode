@@ -1030,6 +1030,17 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		u.backgroundTasks.Add(1)
 		go func() {
 			defer u.backgroundTasks.Done()
+
+			// Always close mmap-backed subtrees on exit to prevent resource leaks
+			defer func() {
+				for _, st := range bgBlock.SubtreeSlices {
+					if st != nil {
+						st.Close()
+					}
+				}
+				bgBlock.SubtreeSlices = nil
+			}()
+
 			bgCtx := context.Background()
 
 			if bgErr := model.UpdateTxMinedStatus(
@@ -1047,25 +1058,27 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 				if errors.Is(bgErr, errors.ErrBlockInvalid) {
 					u.logger.Errorf("[setTxMined][%s] BACKGROUND: block invalid: %v", bgBlockHash.String(), bgErr)
 					_ = u.markBlockAsInvalid(bgCtx, bgBlock, "contains transactions already on our chain: "+bgErr.Error())
-				} else if !errors.Is(bgErr, errors.ErrBlockParentNotMined) {
+				}
+
+				// ErrBlockParentNotMined likely means duplicate in-flight work — leave the bridge
+				// entry for the goroutine that owns it, don't remove here
+				if errors.Is(bgErr, errors.ErrBlockParentNotMined) {
+					return
+				}
+
+				if !errors.Is(bgErr, errors.ErrBlockInvalid) {
 					u.logger.Errorf("[setTxMined][%s] BACKGROUND: error updating tx mined status: %v", bgBlockHash.String(), bgErr)
 				}
-				// On error, remove bridge entry so we don't serve stale data
+
+				// On non-parent-not-mined errors, remove bridge entry so we don't serve stale data
 				u.bridge.RemoveBlock(bgBlockHash)
 				return
 			}
 
-			// Close mmap-backed subtrees
-			for _, st := range bgBlock.SubtreeSlices {
-				if st != nil {
-					st.Close()
-				}
-			}
-			bgBlock.SubtreeSlices = nil
-
 			// Set mined_set = true in blockchain store
 			if bgErr := u.blockchainClient.SetBlockMinedSet(bgCtx, &bgBlockHash); bgErr != nil {
 				u.logger.Errorf("[setTxMined][%s] BACKGROUND: failed to set block mined: %v", bgBlockHash.String(), bgErr)
+				u.bridge.RemoveBlock(bgBlockHash)
 				return
 			}
 
