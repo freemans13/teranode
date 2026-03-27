@@ -518,7 +518,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlobDeletionBatchSize:          getInt("pruner_blobDeletionBatchSize", 1000, alternativeContext...),                  // Process 1000 deletions per batch
 			BlobDeletionMaxRetries:         getInt("pruner_blobDeletionMaxRetries", 3, alternativeContext...),                    // Retry failed deletions up to 3 times
 			SkipPreserveParents:            getBool("pruner_skipPreserveParents", false, alternativeContext...),                  // Skip Phase 1: preserve parents
-			SkipParentUpdates:              getBool("pruner_skipParentUpdates", false, alternativeContext...),                    // Skip parent updates for performance
 			SkipDeletions:                  getBool("pruner_skipDeletions", false, alternativeContext...),                        // Skip deletions for performance
 		},
 		SubtreeValidation: SubtreeValidationSettings{
