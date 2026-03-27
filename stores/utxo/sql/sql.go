@@ -3247,14 +3247,13 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 }
 
 // BatchPreviousOutputsDecorate fetches previous output information for inputs across
-// multiple transactions in a single bulk query. Instead of issuing one query per input,
-// it collects all unique parent tx hashes, queries them in chunks using IN clauses,
-// and maps results back to the requesting inputs.
+// multiple transactions in bulk. This is more efficient than calling PreviousOutputsDecorate
+// per-transaction because it uses a single IN-clause query per chunk instead of
+// individual lookups per input.
 func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
 	if len(txs) == 0 {
 		return nil
 	}
-
 
 	// Collect all (parentTxHash, outputIdx) pairs that need decoration
 	type inputRef struct {
