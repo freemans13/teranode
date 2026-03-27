@@ -65,6 +65,15 @@ func (m *Mock) GetCatchupStatus(ctx context.Context) (*CatchupStatus, error) {
 	return args.Get(0).(*CatchupStatus), args.Error(1)
 }
 
+// GetBridgeBlockIDs performs a mock bridge block IDs retrieval.
+func (m *Mock) GetBridgeBlockIDs(ctx context.Context, txHash *chainhash.Hash) ([]uint32, error) {
+	args := m.Called(ctx, txHash)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]uint32), args.Error(1)
+}
+
 // mockKafkaConsumer implements kafka.KafkaConsumerGroupI for testing
 type mockKafkaConsumer struct {
 	mock.Mock

@@ -70,6 +70,14 @@ func (m *mockBlockValidationAPIClient) RevalidateBlock(ctx context.Context, in *
 	return args.Get(0).(*blockvalidation_api.EmptyMessage), args.Error(1)
 }
 
+func (m *mockBlockValidationAPIClient) GetBridgeBlockIDs(ctx context.Context, in *blockvalidation_api.GetBridgeBlockIDsRequest, opts ...grpc.CallOption) (*blockvalidation_api.GetBridgeBlockIDsResponse, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockvalidation_api.GetBridgeBlockIDsResponse), args.Error(1)
+}
+
 func createTestClient(mockClient *mockBlockValidationAPIClient) *Client {
 	logger := ulogger.TestLogger{}
 	tSettings := &settings.Settings{

@@ -4756,6 +4756,10 @@ func (m *mockBlockValidationClient) GetCatchupStatus(ctx context.Context) (*bloc
 	return &blockvalidation.CatchupStatus{IsCatchingUp: false}, nil
 }
 
+func (m *mockBlockValidationClient) GetBridgeBlockIDs(ctx context.Context, txHash *chainhash.Hash) ([]uint32, error) {
+	return nil, nil
+}
+
 // TestHandleFreezeComprehensive tests the handleFreeze handler
 func TestHandleFreezeComprehensive(t *testing.T) {
 	logger := mocklogger.NewTestLogger()

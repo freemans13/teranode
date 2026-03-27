@@ -227,6 +227,18 @@ func (s *Client) RevalidateBlock(ctx context.Context, blockHash chainhash.Hash) 
 	return nil
 }
 
+// GetBridgeBlockIDs queries the block validation service for bridge block IDs
+// for a given tx hash. Returns nil if the bridge is not enabled or the tx is not found.
+func (s *Client) GetBridgeBlockIDs(ctx context.Context, txHash *chainhash.Hash) ([]uint32, error) {
+	resp, err := s.apiClient.GetBridgeBlockIDs(ctx, &blockvalidation_api.GetBridgeBlockIDsRequest{
+		TxHash: txHash[:],
+	})
+	if err != nil {
+		return nil, errors.UnwrapGRPC(err)
+	}
+	return resp.BlockIds, nil
+}
+
 // GetCatchupStatus retrieves the current status of blockchain catchup operations.
 // It queries the block validation service for information about ongoing or recent
 // catchup attempts, including progress metrics and peer information.

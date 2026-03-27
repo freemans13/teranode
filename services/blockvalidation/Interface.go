@@ -49,6 +49,9 @@ type Interface interface {
 
 	// GetCatchupStatus returns the current status of blockchain catchup operations.
 	GetCatchupStatus(ctx context.Context) (*CatchupStatus, error)
+
+	// GetBridgeBlockIDs returns block IDs from the in-memory MinedTxBridge for a given tx hash.
+	GetBridgeBlockIDs(ctx context.Context, txHash *chainhash.Hash) ([]uint32, error)
 }
 
 var _ Interface = &MockBlockValidation{}
@@ -77,4 +80,8 @@ func (mv *MockBlockValidation) RevalidateBlock(ctx context.Context, blockHash ch
 
 func (mv *MockBlockValidation) GetCatchupStatus(ctx context.Context) (*CatchupStatus, error) {
 	return &CatchupStatus{IsCatchingUp: false}, nil
+}
+
+func (mv *MockBlockValidation) GetBridgeBlockIDs(ctx context.Context, txHash *chainhash.Hash) ([]uint32, error) {
+	return nil, nil
 }

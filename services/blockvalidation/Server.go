@@ -498,6 +498,24 @@ func (u *Server) GetCatchupStatus(ctx context.Context, _ *blockvalidation_api.Em
 	return resp, nil
 }
 
+// GetBridgeBlockIDs returns block IDs from the in-memory MinedTxBridge for a given tx hash.
+func (u *Server) GetBridgeBlockIDs(ctx context.Context, req *blockvalidation_api.GetBridgeBlockIDsRequest) (*blockvalidation_api.GetBridgeBlockIDsResponse, error) {
+	if u.blockValidation.bridge == nil {
+		return &blockvalidation_api.GetBridgeBlockIDsResponse{}, nil
+	}
+
+	var txHash chainhash.Hash
+	copy(txHash[:], req.TxHash)
+
+	refs := u.blockValidation.bridge.GetBlockRefsForTx(&txHash)
+	ids := make([]uint32, len(refs))
+	for i, ref := range refs {
+		ids[i] = ref.BlockID
+	}
+
+	return &blockvalidation_api.GetBridgeBlockIDsResponse{BlockIds: ids}, nil
+}
+
 // Init initializes the block validation server with required dependencies and services.
 // It establishes connections to subtree validation services, configures UTXO store access,
 // and starts background processing components. This method must be called before Start().
