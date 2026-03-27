@@ -113,10 +113,13 @@ func (b *MinedTxBridge) BlockCount() int {
 }
 
 // BlockRef holds the block-level metadata for a tx found in the bridge.
+// SubtreeIdx is intentionally zero: the bridge is a short-lived overlay and
+// real subtree positions are persisted by the underlying store before any
+// consumer (e.g. merkle proof generation) needs them.
 type BlockRef struct {
 	BlockID     uint32
 	BlockHeight uint32
-	SubtreeIdx  int // 0 — bridge does not track per-tx subtree position
+	SubtreeIdx  int
 }
 
 // GetBlockRefsForTx scans all block sets and returns block references for any blocks
