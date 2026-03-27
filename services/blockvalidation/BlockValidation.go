@@ -42,6 +42,7 @@ import (
 	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/bridge"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/kafka"
@@ -173,6 +174,9 @@ type BlockValidation struct {
 	// backgroundTasks tracks background goroutines to ensure proper shutdown
 	backgroundTasks sync.WaitGroup
 
+	// bridge holds per-block tx hash sets for async SetTxMined
+	bridge *bridge.MinedTxBridge
+
 	// mmapDir, when non-empty, enables mmap-backed subtree loading.
 	mmapDir string
 }
@@ -270,6 +274,14 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		logger.Infof("No Kafka topic configured for invalid blocks, using interface handler only")
 	}
 
+	// Create MinedTxBridge and wrap utxoStore if enabled
+	var txBridge *bridge.MinedTxBridge
+	if tSettings.BlockValidation.MinedTxBridgeEnabled {
+		txBridge = bridge.NewMinedTxBridge(tSettings.BlockValidation.MinedTxBridgeMaxBlocks)
+		utxoStore = bridge.NewBridgeStore(utxoStore, txBridge, true)
+		logger.Infof("MinedTxBridge enabled with max %d blocks", tSettings.BlockValidation.MinedTxBridgeMaxBlocks)
+	}
+
 	bv := &BlockValidation{
 		logger:                      logger,
 		settings:                    tSettings,
@@ -278,6 +290,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		subtreeBlockHeightRetention: tSettings.GetSubtreeValidationBlockHeightRetention(),
 		txStore:                     txStore,
 		utxoStore:                   utxoStore,
+		bridge:                      txBridge,
 		validatorClient:             validatorClient,
 		subtreeValidationClient:     subtreeValidationClient,
 		subtreeDeDuplicator:         NewDeDuplicator(tSettings.GetSubtreeValidationBlockHeightRetention()),
@@ -977,6 +990,25 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewServiceError("[setTxMined][%s] failed to get block header ids", blockHash.String())
 	}
 
+	// Populate bridge with this block's tx hashes (if enabled)
+	if u.bridge != nil {
+		var bridgeTxHashes []*chainhash.Hash
+		for _, st := range block.SubtreeSlices {
+			if st == nil {
+				continue
+			}
+			for i := range st.Nodes {
+				if !st.Nodes[i].Hash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
+					h := st.Nodes[i].Hash
+					bridgeTxHashes = append(bridgeTxHashes, &h)
+				}
+			}
+		}
+		u.bridge.AddBlock(*blockHash, ids[0], block.Height, bridgeTxHashes)
+		u.logger.Infof("[setTxMined][%s] bridge populated with %d txs, bridge now holds %d blocks",
+			blockHash.String(), len(bridgeTxHashes), u.bridge.BlockCount())
+	}
+
 	// add the transactions in this block to the block IDs in the utxo store
 	if err = model.UpdateTxMinedStatus(
 		ctx,
@@ -1015,6 +1047,13 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewServiceError("[setTxMined][%s] failed to set block mined", block.Hash().String(), err)
 	}
 
+	// Remove from bridge — UTXO store now has the data
+	if u.bridge != nil {
+		u.bridge.RemoveBlock(*blockHash)
+		u.logger.Debugf("[setTxMined][%s] bridge entry removed, bridge now holds %d blocks",
+			blockHash.String(), u.bridge.BlockCount())
+	}
+
 	return nil
 }
 
@@ -1041,6 +1080,11 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 //   - bool: True if the parent block has been mined, false otherwise
 //   - error: Any error encountered during the mining status verification
 func (u *BlockValidation) isParentMined(ctx context.Context, blockHeader *model.BlockHeader) (bool, error) {
+	// Fast path: bridge has this block's data — no need to wait for mined_set
+	if u.bridge != nil && u.bridge.HasBlock(*blockHeader.HashPrevBlock) {
+		return true, nil
+	}
+
 	parentBlockMined, err := u.blockchainClient.GetBlockIsMined(ctx, blockHeader.HashPrevBlock)
 	if err != nil {
 		return false, errors.NewServiceError("[isParentMined][%s] failed to get parent mined status", blockHeader.Hash().String(), err)
