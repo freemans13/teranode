@@ -64,14 +64,26 @@ func mergeBlockIDs(storeIDs []uint32, bridgeIDs []uint32) []uint32 {
 
 	total := len(storeIDs) + len(bridgeIDs)
 
-	// Fast path: for small combined cardinality, linear scan avoids map allocation
+	// Fast path: for small combined cardinality, linear scan avoids map allocation.
+	// Deduplicates both storeIDs and bridgeIDs for consistent behavior with the map path.
 	if total <= 8 {
 		result := make([]uint32, 0, total)
-		result = append(result, storeIDs...)
+		for _, sid := range storeIDs {
+			found := false
+			for _, r := range result {
+				if r == sid {
+					found = true
+					break
+				}
+			}
+			if !found {
+				result = append(result, sid)
+			}
+		}
 		for _, bid := range bridgeIDs {
 			found := false
-			for _, sid := range result {
-				if sid == bid {
+			for _, r := range result {
+				if r == bid {
 					found = true
 					break
 				}

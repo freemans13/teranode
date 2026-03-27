@@ -56,6 +56,9 @@ func (b *MinedTxBridge) AddBlock(blockHash chainhash.Hash, blockID uint32, block
 // AddBlockFromIterator builds a Swiss table by iterating over tx hashes via a callback,
 // avoiding intermediate slice allocations. The callback calls visit for each tx hash.
 func (b *MinedTxBridge) AddBlockFromIterator(blockHash chainhash.Hash, blockID uint32, blockHeight uint32, count int, iter func(visit func(*chainhash.Hash))) {
+	if count < 0 {
+		count = 0
+	}
 	m := swiss.NewMap[chainhash.Hash, struct{}](uint32(count))
 	iter(func(h *chainhash.Hash) {
 		m.Put(*h, struct{}{})

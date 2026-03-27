@@ -1041,7 +1041,9 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 				bgBlock.SubtreeSlices = nil
 			}()
 
-			bgCtx := context.Background()
+			// Use a generous timeout to avoid blocking shutdown indefinitely if the DB hangs
+			bgCtx, bgCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer bgCancel()
 
 			if bgErr := model.UpdateTxMinedStatus(
 				bgCtx,
