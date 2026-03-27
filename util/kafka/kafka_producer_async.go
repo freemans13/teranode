@@ -150,6 +150,21 @@ func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, ur
 	return producer, nil
 }
 
+// clampBatchMaxBytes clamps the given flush bytes value to the valid range for
+// franz-go's ProducerBatchMaxBytes (int32). The minimum is 512 bytes (Kafka
+// protocol minimum for a record batch). Small flush_bytes values (e.g. 64) were
+// valid with sarama as a flush threshold but are too small for franz-go.
+func clampBatchMaxBytes(flushBytes int) int32 {
+	const minBatchMaxBytes = 512
+	if flushBytes < minBatchMaxBytes {
+		flushBytes = minBatchMaxBytes
+	}
+	if flushBytes > math.MaxInt32 {
+		flushBytes = math.MaxInt32
+	}
+	return int32(flushBytes) //nolint:gosec // bounds checked above
+}
+
 // NewKafkaAsyncProducer creates a new async producer with the given configuration using franz-go.
 func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*KafkaAsyncProducer, error) {
 	logger.Debugf("Starting async kafka producer for %v", cfg.URL)
@@ -170,21 +185,10 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 		return client, nil
 	}
 
-	// ProducerBatchMaxBytes is the max size of a single record batch on the wire.
-	// franz-go requires at least 512 bytes (Kafka protocol minimum for a record batch).
-	// Small flush_bytes values (e.g. 64) were valid with sarama as a flush threshold
-	// but are too small for franz-go's batch max bytes.
-	const minBatchMaxBytes = 512
-	flushBytes := cfg.FlushBytes
-	if flushBytes < minBatchMaxBytes {
-		logger.Warnf("flush_bytes=%d for topic %s is below franz-go minimum %d, clamping to %d", cfg.FlushBytes, cfg.Topic, minBatchMaxBytes, minBatchMaxBytes)
-		flushBytes = minBatchMaxBytes
+	batchMaxBytes := clampBatchMaxBytes(cfg.FlushBytes)
+	if int(batchMaxBytes) != cfg.FlushBytes {
+		logger.Warnf("flush_bytes=%d for topic %s clamped to %d for franz-go compatibility", cfg.FlushBytes, cfg.Topic, batchMaxBytes)
 	}
-	if flushBytes > math.MaxInt32 {
-		logger.Warnf("flush_bytes=%d for topic %s exceeds max int32, clamping to %d", cfg.FlushBytes, cfg.Topic, math.MaxInt32)
-		flushBytes = math.MaxInt32
-	}
-	batchMaxBytes := int32(flushBytes) //nolint:gosec // bounds checked above
 
 	// Build franz-go client options
 	opts := []kgo.Opt{

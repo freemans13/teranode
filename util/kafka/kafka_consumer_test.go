@@ -436,8 +436,14 @@ func TestNewKafkaConsumerGroup_AppliesDefaultTimeouts(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Use a non-memory Kafka URL so that NewKafkaConsumerGroup
+			// exercises the non-memory path and applies default timeouts.
+			u, err := url.Parse("kafka://localhost:9092")
+			require.NoError(t, err)
+
 			cfg := KafkaConsumerConfig{
 				Logger:            &mockLogger{},
+				URL:               u,
 				BrokersURL:        []string{"localhost:9092"},
 				Topic:             "test-topic",
 				ConsumerGroupID:   "test-group",
@@ -447,22 +453,23 @@ func TestNewKafkaConsumerGroup_AppliesDefaultTimeouts(t *testing.T) {
 				RebalanceTimeout:  tt.rebalanceTimeout,
 			}
 
-			// NewKafkaConsumerGroup will fail to connect (no broker), but
-			// we can verify that defaults are applied to the config before
-			// the connection attempt by checking config after construction.
-			// Since the config is passed by value, we call the defaulting
-			// logic directly by testing via the URL path.
-			//
-			// Instead, test via NewKafkaConsumerGroupFromURL with memory scheme
-			// would bypass the defaults. So we test the defaulting function
-			// indirectly: call NewKafkaConsumerGroup and check that the error
-			// is a connection error (not a timeout validation error).
-			_, err := NewKafkaConsumerGroup(cfg)
-			// We expect a connection error (broker unreachable), NOT a
-			// timeout validation error — proving defaults were applied.
-			require.Error(t, err)
-			assert.NotContains(t, err.Error(), "timeout")
-			assert.NotContains(t, err.Error(), "session")
+			consumer, err := NewKafkaConsumerGroup(cfg)
+			if err != nil {
+				// If construction fails (e.g. due to no broker), it should
+				// not be due to invalid timeout configuration.
+				assert.NotContains(t, err.Error(), "timeout")
+				assert.NotContains(t, err.Error(), "session")
+				return
+			}
+
+			require.NotNil(t, consumer)
+			// When there is no construction error, verify that effective
+			// timeouts are positive, indicating defaults were applied.
+			assert.Greater(t, consumer.Config.MaxProcessingTime, time.Duration(0))
+			assert.Greater(t, consumer.Config.SessionTimeout, time.Duration(0))
+			assert.Greater(t, consumer.Config.HeartbeatInterval, time.Duration(0))
+			assert.Greater(t, consumer.Config.RebalanceTimeout, time.Duration(0))
+			_ = consumer.Close()
 		})
 	}
 }

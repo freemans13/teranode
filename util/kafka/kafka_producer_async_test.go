@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"math"
 	"net/url"
 	"testing"
 	"time"
@@ -395,53 +396,53 @@ func TestKafkaAsyncProducerURLQueryParams(t *testing.T) {
 	}
 }
 
-func TestBatchMaxBytesClamping(t *testing.T) {
+func TestClampBatchMaxBytes(t *testing.T) {
 	tests := []struct {
 		name       string
 		flushBytes int
-		wantErr    bool
+		want       int32
 	}{
 		{
-			name:       "small flush_bytes clamped to minimum",
+			name:       "small value clamped to minimum 512",
 			flushBytes: 64,
-			wantErr:    false,
+			want:       512,
 		},
 		{
-			name:       "zero flush_bytes clamped to minimum",
+			name:       "zero clamped to minimum 512",
 			flushBytes: 0,
-			wantErr:    false,
+			want:       512,
 		},
 		{
-			name:       "valid flush_bytes unchanged",
+			name:       "negative clamped to minimum 512",
+			flushBytes: -1,
+			want:       512,
+		},
+		{
+			name:       "exactly minimum unchanged",
+			flushBytes: 512,
+			want:       512,
+		},
+		{
+			name:       "valid value unchanged",
 			flushBytes: 1024 * 1024,
-			wantErr:    false,
+			want:       1024 * 1024,
+		},
+		{
+			name:       "max int32 unchanged",
+			flushBytes: math.MaxInt32,
+			want:       math.MaxInt32,
+		},
+		{
+			name:       "above max int32 clamped",
+			flushBytes: math.MaxInt32 + 1,
+			want:       math.MaxInt32,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := KafkaProducerConfig{
-				Logger:                &mockAsyncLogger{},
-				URL:                   &url.URL{Scheme: "kafka", Host: "localhost:9092", Path: "/test-topic"},
-				Topic:                 "test-topic",
-				BrokersURL:            []string{"localhost:9092"},
-				Partitions:            1,
-				ReplicationFactor:     1,
-				RetentionPeriodMillis: "600000",
-				SegmentBytes:          "1073741824",
-				FlushBytes:            tt.flushBytes,
-				FlushMessages:         1000,
-				FlushFrequency:        time.Second,
-			}
-
-			// NewKafkaAsyncProducer will fail to connect (no broker), but
-			// it should NOT fail due to batch size validation — the clamping
-			// should handle small values gracefully.
-			_, err := NewKafkaAsyncProducer(&mockAsyncLogger{}, cfg)
-			if err != nil {
-				// Should be a connection/topic error, not a batch size error
-				assert.NotContains(t, err.Error(), "batch")
-			}
+			got := clampBatchMaxBytes(tt.flushBytes)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
