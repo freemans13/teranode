@@ -70,8 +70,10 @@ func (s *SQL) GetLastNBlocks(ctx context.Context, n int64, includeOrphans bool, 
 	defer cancel()
 
 	fromHeightQuery := ""
+	cteDepthQuery := "tb.height - $1" // default: walk limit blocks from tip
 	if fromHeight > 0 {
 		fromHeightQuery = fmt.Sprintf("WHERE b.height <= %d", fromHeight)
+		cteDepthQuery = fmt.Sprintf("%d - $1", fromHeight) // walk limit blocks from fromHeight
 	}
 
 	var q string
@@ -113,7 +115,7 @@ func (s *SQL) GetLastNBlocks(ctx context.Context, n int64, includeOrphans bool, 
 			CROSS JOIN tip_block tb
 			WHERE bb.id != cb.id
 			  AND bb.invalid = false
-			  AND bb.height >= tb.height - $1
+			  AND bb.height >= ` + cteDepthQuery + `
 		)
 		SELECT
 		 b.version
