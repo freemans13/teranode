@@ -31,8 +31,11 @@ type Logger interface {
 
 // NewMinedTxBridge creates a new MinedTxBridge. warningThreshold controls when a
 // warning is logged if the bridge holds too many blocks — it is NOT a hard limit.
-// The bridge never evicts blocks or rejects new ones.
+// The bridge never evicts blocks or rejects new ones. A threshold <= 0 disables warnings.
 func NewMinedTxBridge(warningThreshold int, logger ...Logger) *MinedTxBridge {
+	if warningThreshold < 0 {
+		warningThreshold = 0
+	}
 	b := &MinedTxBridge{
 		blocks:           make(map[chainhash.Hash]*BlockTxSet),
 		warningThreshold: warningThreshold,
@@ -81,7 +84,7 @@ func (b *MinedTxBridge) storeBlock(blockHash chainhash.Hash, blockID uint32, blo
 	count := len(b.blocks)
 	b.mu.Unlock()
 
-	if count > b.warningThreshold && b.logger != nil {
+	if b.warningThreshold > 0 && count > b.warningThreshold && b.logger != nil {
 		b.logger.Warnf("[MinedTxBridge] bridge holds %d blocks, exceeds warning threshold of %d — background SetTxMined may be falling behind", count, b.warningThreshold)
 	}
 }
