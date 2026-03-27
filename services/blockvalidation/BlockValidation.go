@@ -432,6 +432,11 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 							if notification.Type == model.NotificationType_BlockMinedUnset {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockMinedUnset notification: %s", cHash.String())
+								// Remove orphaned block from bridge so it's no longer treated as mined
+								if bv.bridge != nil {
+									bv.bridge.RemoveBlock(cHash)
+									bv.logger.Infof("[BlockValidation:reorg] removed block %s from bridge", cHash.String())
+								}
 								// push block hash to the setMinedChan for immediate processing
 								bv.setMinedChan <- &cHash
 							}
