@@ -437,7 +437,8 @@ func TestClampBatchMaxBytes(t *testing.T) {
 
 	// On 64-bit architectures, also test overflow above MaxInt32
 	if strconv.IntSize > 32 {
-		overflowVal := math.MaxInt32 + 1
+		overflowVal64 := int64(math.MaxInt32) + 1
+		overflowVal := int(overflowVal64)
 		got := clampBatchMaxBytes(overflowVal)
 		assert.Equal(t, int32(math.MaxInt32), got, "above max int32 should be clamped")
 	}
