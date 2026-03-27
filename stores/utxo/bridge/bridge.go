@@ -18,10 +18,10 @@ type BlockTxSet struct {
 // MinedTxBridge is an in-memory bridge that holds per-block tx hash sets so block
 // validation can check whether a tx is mined without waiting for slow DB writes.
 type MinedTxBridge struct {
-	mu        sync.RWMutex
-	blocks    map[chainhash.Hash]*BlockTxSet
-	maxBlocks int
-	logger    Logger
+	mu               sync.RWMutex
+	blocks           map[chainhash.Hash]*BlockTxSet
+	warningThreshold int
+	logger           Logger
 }
 
 // Logger is a minimal logging interface for bridge warnings.
@@ -29,12 +29,13 @@ type Logger interface {
 	Warnf(format string, args ...interface{})
 }
 
-// NewMinedTxBridge creates a new MinedTxBridge. maxBlocks is a soft capacity hint;
-// when exceeded a warning is logged but processing continues.
-func NewMinedTxBridge(maxBlocks int, logger ...Logger) *MinedTxBridge {
+// NewMinedTxBridge creates a new MinedTxBridge. warningThreshold controls when a
+// warning is logged if the bridge holds too many blocks — it is NOT a hard limit.
+// The bridge never evicts blocks or rejects new ones.
+func NewMinedTxBridge(warningThreshold int, logger ...Logger) *MinedTxBridge {
 	b := &MinedTxBridge{
-		blocks:    make(map[chainhash.Hash]*BlockTxSet, maxBlocks),
-		maxBlocks: maxBlocks,
+		blocks:           make(map[chainhash.Hash]*BlockTxSet),
+		warningThreshold: warningThreshold,
 	}
 	if len(logger) > 0 {
 		b.logger = logger[0]
@@ -77,8 +78,8 @@ func (b *MinedTxBridge) storeBlock(blockHash chainhash.Hash, blockID uint32, blo
 	count := len(b.blocks)
 	b.mu.Unlock()
 
-	if count > b.maxBlocks && b.logger != nil {
-		b.logger.Warnf("[MinedTxBridge] bridge holds %d blocks, exceeds soft limit of %d — background SetTxMined may be falling behind", count, b.maxBlocks)
+	if count > b.warningThreshold && b.logger != nil {
+		b.logger.Warnf("[MinedTxBridge] bridge holds %d blocks, exceeds warning threshold of %d — background SetTxMined may be falling behind", count, b.warningThreshold)
 	}
 }
 

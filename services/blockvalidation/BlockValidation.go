@@ -277,9 +277,9 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 	// Create MinedTxBridge and wrap utxoStore if enabled
 	var txBridge *bridge.MinedTxBridge
 	if tSettings.BlockValidation.MinedTxBridgeEnabled {
-		txBridge = bridge.NewMinedTxBridge(tSettings.BlockValidation.MinedTxBridgeMaxBlocks, logger)
+		txBridge = bridge.NewMinedTxBridge(tSettings.BlockValidation.MinedTxBridgeWarningThreshold, logger)
 		utxoStore = bridge.NewBridgeStore(utxoStore, txBridge, true)
-		logger.Infof("MinedTxBridge enabled with max %d blocks", tSettings.BlockValidation.MinedTxBridgeMaxBlocks)
+		logger.Infof("MinedTxBridge enabled with warning threshold %d blocks", tSettings.BlockValidation.MinedTxBridgeWarningThreshold)
 	}
 
 	bv := &BlockValidation{

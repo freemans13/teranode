@@ -83,8 +83,8 @@ func TestBridge_HasBlock(t *testing.T) {
 	require.False(t, bridge.HasBlock(blockHash))
 }
 
-func TestBridge_MaxBlocksLimit(t *testing.T) {
-	// maxBlocks is a soft limit — bridge should accept all 3 blocks even with max=2
+func TestBridge_WarningThresholdNotEnforced(t *testing.T) {
+	// warningThreshold is NOT a hard limit — bridge should accept all 3 blocks even with threshold=2
 	bridge := NewMinedTxBridge(2)
 
 	block1 := newHash(0x01)
