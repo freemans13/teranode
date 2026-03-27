@@ -4,9 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -193,7 +191,3 @@ func TestBridgeStore_BatchDecoratesMergesBlockIDs(t *testing.T) {
 
 // Compile-time check: BridgeStore satisfies utxo.Store.
 var _ utxo.Store = (*BridgeStore)(nil)
-
-// Suppress unused import of settings.
-var _ *settings.Settings
-var _ *bt.Tx

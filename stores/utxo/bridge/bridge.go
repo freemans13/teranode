@@ -22,17 +22,32 @@ type MinedTxBridge struct {
 	mu        sync.RWMutex
 	blocks    map[chainhash.Hash]*BlockTxSet
 	maxBlocks int
+	logger    Logger
 }
 
-// NewMinedTxBridge creates a new MinedTxBridge. maxBlocks is a soft capacity hint.
-func NewMinedTxBridge(maxBlocks int) *MinedTxBridge {
-	return &MinedTxBridge{
+// Logger is a minimal logging interface for bridge warnings.
+type Logger interface {
+	Warnf(format string, args ...interface{})
+}
+
+// NewMinedTxBridge creates a new MinedTxBridge. maxBlocks is a soft capacity hint;
+// when exceeded a warning is logged but processing continues.
+func NewMinedTxBridge(maxBlocks int, logger ...Logger) *MinedTxBridge {
+	b := &MinedTxBridge{
 		blocks:    make(map[chainhash.Hash]*BlockTxSet, maxBlocks),
 		maxBlocks: maxBlocks,
 	}
+	if len(logger) > 0 {
+		b.logger = logger[0]
+	}
+	return b
 }
 
 // truncateHash returns the first 8 bytes of a chainhash.Hash as a uint64 using little-endian byte order.
+// Using 64-bit keys instead of full 32-byte hashes saves ~24 bytes per entry in the Swiss table.
+// False positives from birthday-paradox collisions are harmless: they only add an extra blockID
+// to the merge set, which the authoritative UTXO store data will correct once the background
+// DB write completes and the bridge entry is removed.
 func truncateHash(hash *chainhash.Hash) uint64 {
 	return binary.LittleEndian.Uint64(hash[:8])
 }
@@ -44,6 +59,22 @@ func (b *MinedTxBridge) AddBlock(blockHash chainhash.Hash, blockID uint32, block
 		m.Put(truncateHash(h), struct{}{})
 	}
 
+	b.storeBlock(blockHash, blockID, blockHeight, m)
+}
+
+// AddBlockFromIterator builds a Swiss table by iterating over tx hashes via a callback,
+// avoiding intermediate slice allocations. The callback calls visit for each tx hash.
+func (b *MinedTxBridge) AddBlockFromIterator(blockHash chainhash.Hash, blockID uint32, blockHeight uint32, count int, iter func(visit func(*chainhash.Hash))) {
+	m := swiss.NewMap[uint64, struct{}](uint32(count))
+	iter(func(h *chainhash.Hash) {
+		m.Put(truncateHash(h), struct{}{})
+	})
+
+	b.storeBlock(blockHash, blockID, blockHeight, m)
+}
+
+// storeBlock inserts a block set into the bridge and logs a warning if the soft limit is exceeded.
+func (b *MinedTxBridge) storeBlock(blockHash chainhash.Hash, blockID uint32, blockHeight uint32, m *swiss.Map[uint64, struct{}]) {
 	set := &BlockTxSet{
 		blockHash:   blockHash,
 		blockHeight: blockHeight,
@@ -53,7 +84,12 @@ func (b *MinedTxBridge) AddBlock(blockHash chainhash.Hash, blockID uint32, block
 
 	b.mu.Lock()
 	b.blocks[blockHash] = set
+	count := len(b.blocks)
 	b.mu.Unlock()
+
+	if count > b.maxBlocks && b.logger != nil {
+		b.logger.Warnf("[MinedTxBridge] bridge holds %d blocks, exceeds soft limit of %d — background SetTxMined may be falling behind", count, b.maxBlocks)
+	}
 }
 
 // RemoveBlock removes the block entry for the given blockHash from the bridge.

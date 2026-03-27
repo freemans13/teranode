@@ -277,7 +277,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 	// Create MinedTxBridge and wrap utxoStore if enabled
 	var txBridge *bridge.MinedTxBridge
 	if tSettings.BlockValidation.MinedTxBridgeEnabled {
-		txBridge = bridge.NewMinedTxBridge(tSettings.BlockValidation.MinedTxBridgeMaxBlocks)
+		txBridge = bridge.NewMinedTxBridge(tSettings.BlockValidation.MinedTxBridgeMaxBlocks, logger)
 		utxoStore = bridge.NewBridgeStore(utxoStore, txBridge, true)
 		logger.Infof("MinedTxBridge enabled with max %d blocks", tSettings.BlockValidation.MinedTxBridgeMaxBlocks)
 	}
@@ -995,36 +995,41 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewServiceError("[setTxMined][%s] failed to get block header ids", blockHash.String())
 	}
 
-	// Populate bridge with this block's tx hashes (if enabled)
-	if u.bridge != nil {
-		var bridgeTxHashes []*chainhash.Hash
+	// Populate bridge and run DB writes in background only for normal mined blocks (not unsetMined)
+	isUnsetMined := len(unsetMined) > 0 && unsetMined[0]
+	if u.bridge != nil && !isUnsetMined {
+		// Stream tx hashes directly into the bridge's Swiss table to avoid an intermediate slice
+		txCount := 0
 		for _, st := range block.SubtreeSlices {
-			if st == nil {
-				continue
-			}
-			for i := range st.Nodes {
-				if !st.Nodes[i].Hash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
-					h := st.Nodes[i].Hash
-					bridgeTxHashes = append(bridgeTxHashes, &h)
-				}
+			if st != nil {
+				txCount += len(st.Nodes)
 			}
 		}
-		u.bridge.AddBlock(*blockHash, ids[0], block.Height, bridgeTxHashes)
+		u.bridge.AddBlockFromIterator(*blockHash, ids[0], block.Height, txCount, func(visit func(*chainhash.Hash)) {
+			for _, st := range block.SubtreeSlices {
+				if st == nil {
+					continue
+				}
+				for i := range st.Nodes {
+					if !st.Nodes[i].Hash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
+						visit(&st.Nodes[i].Hash)
+					}
+				}
+			}
+		})
 		u.logger.Infof("[setTxMined][%s] bridge populated with %d txs, bridge now holds %d blocks",
-			blockHash.String(), len(bridgeTxHashes), u.bridge.BlockCount())
-	}
+			blockHash.String(), txCount, u.bridge.BlockCount())
 
-	// When bridge is enabled, run DB writes in background — next block can proceed immediately
-	// Only for normal mined blocks (not unsetMined), since unsetMined must complete synchronously
-	if u.bridge != nil && (len(unsetMined) == 0 || !unsetMined[0]) {
-		// Capture values for the goroutine
+		// Run DB writes in background — next block can proceed immediately
 		bgBlockHash := *blockHash
 		bgBlock := block
 		bgIDs := ids
 		bgOnLongestChain := onLongestChain
 		bgUnsetMined := unsetMined
 
+		u.backgroundTasks.Add(1)
 		go func() {
+			defer u.backgroundTasks.Done()
 			bgCtx := context.Background()
 
 			if bgErr := model.UpdateTxMinedStatus(
