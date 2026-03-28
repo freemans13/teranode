@@ -406,7 +406,6 @@ func TestConsumeWatchdogIdleConsumerNotStuck(t *testing.T) {
 
 	// First poll cycle: start -> PollFetches returns -> markPollSucceeded
 	watchdog.markConsumeStarted()
-	time.Sleep(5 * time.Millisecond)
 	watchdog.markPollSucceeded()
 	assert.True(t, watchdog.hasPolledOnce.Load())
 
@@ -414,9 +413,8 @@ func TestConsumeWatchdogIdleConsumerNotStuck(t *testing.T) {
 	watchdog.markConsumeStarted()
 	assert.True(t, watchdog.isAttemptingConsume.Load())
 
-	// Even after exceeding the threshold, the consumer should NOT be stuck
+	// Regardless of elapsed time, the consumer should NOT be stuck
 	// because hasPolledOnce is true.
-	time.Sleep(20 * time.Millisecond)
 	stuck, _ := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
 	assert.False(t, stuck, "idle consumer after successful poll should not be detected as stuck")
 }
@@ -435,9 +433,10 @@ func TestConsumeWatchdogHasPolledOnceResetOnRecovery(t *testing.T) {
 	watchdog.hasPolledOnce.Store(false)
 	watchdog.markConsumeEnded()
 
-	// New poll cycle on replacement client that gets stuck
+	// New poll cycle on replacement client that gets stuck.
+	// Set consumeStartTime to the past to exceed the threshold deterministically.
 	watchdog.markConsumeStarted()
-	time.Sleep(20 * time.Millisecond)
+	watchdog.consumeStartTime.Store(time.Now().Add(-20 * time.Millisecond))
 
 	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
 	assert.True(t, stuck, "consumer should be detected as stuck after recovery reset")

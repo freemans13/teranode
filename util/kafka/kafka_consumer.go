@@ -553,16 +553,20 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 					k.commitRecords(uncommittedRecords)
 					return
 				default:
-					k.watchdog.markConsumeStarted()
-
 					k.clientMu.Lock()
 					currentClient := k.client
 					k.clientMu.Unlock()
 
 					if currentClient == nil {
+						// Don't call markConsumeStarted() here — resetting
+						// consumeStartTime would prevent the watchdog from
+						// detecting that we've been nil for too long and
+						// triggering another forceRecovery().
 						time.Sleep(100 * time.Millisecond)
 						continue
 					}
+
+					k.watchdog.markConsumeStarted()
 
 					fetches := currentClient.PollFetches(internalCtx)
 
