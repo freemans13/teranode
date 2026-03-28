@@ -260,18 +260,18 @@ func TestConsumeWatchdogMarkConsumeStarted(t *testing.T) {
 	assert.False(t, startTime.IsZero())
 
 	// Verify that lastSuccessfulPollTime is NOT set (never stored on a fresh watchdog)
-	setupTime, ok := watchdog.lastSuccessfulPollTime.Load().(time.Time)
+	pollTime, ok := watchdog.lastSuccessfulPollTime.Load().(time.Time)
 	// ok may be false if no value was stored yet — that's expected on first poll
-	assert.True(t, !ok || setupTime.IsZero(), "lastSuccessfulPollTime should be zero/unset on first poll (never set)")
+	assert.True(t, !ok || pollTime.IsZero(), "lastSuccessfulPollTime should be zero/unset on first poll (never set)")
 
 	// Simulate a successful poll cycle, then start a new one
 	watchdog.markPollSucceeded()
 	watchdog.markConsumeStarted()
 
 	// lastSuccessfulPollTime should be preserved from the previous successful poll
-	setupTime, ok = watchdog.lastSuccessfulPollTime.Load().(time.Time)
+	pollTime, ok = watchdog.lastSuccessfulPollTime.Load().(time.Time)
 	assert.True(t, ok, "lastSuccessfulPollTime should be a time.Time after markPollSucceeded")
-	assert.False(t, setupTime.IsZero(), "lastSuccessfulPollTime should be preserved across polls")
+	assert.False(t, pollTime.IsZero(), "lastSuccessfulPollTime should be preserved across polls")
 }
 
 func TestConsumeWatchdogMarkPollSucceeded(t *testing.T) {
@@ -288,9 +288,9 @@ func TestConsumeWatchdogMarkPollSucceeded(t *testing.T) {
 	assert.False(t, watchdog.isAttemptingConsume.Load())
 
 	// Verify that lastSuccessfulPollTime was set
-	setupTime, ok := watchdog.lastSuccessfulPollTime.Load().(time.Time)
+	pollTime, ok := watchdog.lastSuccessfulPollTime.Load().(time.Time)
 	assert.True(t, ok)
-	assert.False(t, setupTime.IsZero())
+	assert.False(t, pollTime.IsZero())
 }
 
 func TestConsumeWatchdogMarkConsumeEnded(t *testing.T) {

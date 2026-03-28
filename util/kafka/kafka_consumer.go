@@ -89,10 +89,10 @@ type KafkaConsumerConfig struct {
 
 // consumeWatchdog monitors Consume() state to detect when stuck and triggers force recovery.
 type consumeWatchdog struct {
-	consumeStartTime    atomic.Value // time.Time - when Consume() was called
-	lastSuccessfulPollTime     atomic.Value // time.Time - when PollFetches() last returned successfully (no errors, client alive)
-	consumeEndTime      atomic.Value // time.Time - when Consume() returned (error or success)
-	isAttemptingConsume atomic.Bool  // true between PollFetches() call and successful return or error
+	consumeStartTime       atomic.Value // time.Time - when PollFetches() was called for this iteration
+	lastSuccessfulPollTime atomic.Value // time.Time - when PollFetches() last returned successfully (no errors, client alive)
+	consumeEndTime         atomic.Value // time.Time - when the poll iteration ended (error, client-closed, or success)
+	isAttemptingConsume    atomic.Bool  // true between PollFetches() call and successful return or error
 	hasPolledOnce       atomic.Bool  // true after the first successful PollFetches return
 }
 
@@ -165,8 +165,8 @@ func (w *consumeWatchdog) isStuckAfterError(threshold time.Duration) (bool, time
 	}
 
 	// Check if a successful poll occurred after the retry
-	setupTime, _ := w.lastSuccessfulPollTime.Load().(time.Time)
-	if !setupTime.IsZero() && setupTime.After(endTime) {
+	pollTime, _ := w.lastSuccessfulPollTime.Load().(time.Time)
+	if !pollTime.IsZero() && pollTime.After(endTime) {
 		// A successful poll happened after the error, so we're not stuck
 		return false, 0
 	}
