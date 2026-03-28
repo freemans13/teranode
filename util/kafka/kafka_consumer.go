@@ -93,7 +93,7 @@ type consumeWatchdog struct {
 	lastSuccessfulPollTime atomic.Value // time.Time - when PollFetches() last returned successfully (no errors, client alive)
 	consumeEndTime         atomic.Value // time.Time - when the poll iteration ended (error, client-closed, or success)
 	isAttemptingConsume    atomic.Bool  // true between PollFetches() call and successful return or error
-	hasPolledOnce       atomic.Bool  // true after the first successful PollFetches return
+	hasPolledOnce          atomic.Bool  // true after the first successful PollFetches return
 }
 
 func (w *consumeWatchdog) markConsumeStarted() {
