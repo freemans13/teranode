@@ -259,17 +259,18 @@ func TestConsumeWatchdogMarkConsumeStarted(t *testing.T) {
 	assert.True(t, ok)
 	assert.False(t, startTime.IsZero())
 
-	// Verify that setup called time is NOT reset (preserved from prior polls)
-	// so the watchdog can distinguish idle consumers from stuck ones
-	setupTime, _ := watchdog.setupCalledTime.Load().(time.Time)
-	assert.True(t, setupTime.IsZero(), "setupCalledTime should be zero on first poll (never set)")
+	// Verify that setup called time is NOT set (never stored on a fresh watchdog)
+	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
+	// ok may be false if no value was stored yet — that's expected on first poll
+	assert.True(t, !ok || setupTime.IsZero(), "setupCalledTime should be zero/unset on first poll (never set)")
 
 	// Simulate a successful poll cycle, then start a new one
 	watchdog.markSetupCalled()
 	watchdog.markConsumeStarted()
 
 	// setupCalledTime should be preserved from the previous successful poll
-	setupTime, _ = watchdog.setupCalledTime.Load().(time.Time)
+	setupTime, ok = watchdog.setupCalledTime.Load().(time.Time)
+	assert.True(t, ok, "setupCalledTime should be a time.Time after markSetupCalled")
 	assert.False(t, setupTime.IsZero(), "setupCalledTime should be preserved across polls")
 }
 

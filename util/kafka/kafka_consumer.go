@@ -90,7 +90,7 @@ type KafkaConsumerConfig struct {
 // consumeWatchdog monitors Consume() state to detect when stuck and triggers force recovery.
 type consumeWatchdog struct {
 	consumeStartTime    atomic.Value // time.Time - when Consume() was called
-	setupCalledTime     atomic.Value // time.Time - when PollFetches() last returned
+	setupCalledTime     atomic.Value // time.Time - when PollFetches() last returned successfully (no errors, client alive)
 	consumeEndTime      atomic.Value // time.Time - when Consume() returned (error or success)
 	isAttemptingConsume atomic.Bool  // true between Consume() call and Setup() or error
 	hasPolledOnce       atomic.Bool  // true after the first successful PollFetches return
@@ -562,7 +562,6 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 					}
 
 					fetches := currentClient.PollFetches(internalCtx)
-					k.watchdog.markSetupCalled()
 
 					if fetches.IsClientClosed() {
 						// Client was closed by forceRecovery() — loop back to
@@ -584,6 +583,11 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 						k.watchdog.markConsumeEnded()
 						continue
 					}
+
+					// Mark successful poll only after confirming the client is
+					// alive and the fetch had no errors. This ensures hasPolledOnce
+					// is not set on client-closed or error paths.
+					k.watchdog.markSetupCalled()
 
 					fetches.EachRecord(func(record *kgo.Record) {
 						kafkaMsg := &KafkaMessage{
