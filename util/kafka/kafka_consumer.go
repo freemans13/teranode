@@ -322,10 +322,13 @@ func (k *KafkaConsumerGroup) forceRecovery() error {
 
 	if k.client != nil {
 		k.client.Close()
+		k.client = nil // Clear so the consume loop doesn't use the closed client
 	}
 
 	newClient, err := kgo.NewClient(k.clientOpts...)
 	if err != nil {
+		// k.client is nil; the consume loop will sleep on the nil check
+		// until the next watchdog cycle triggers another recovery attempt.
 		return errors.NewServiceError("failed to recreate consumer client for %s", k.Config.Topic, err)
 	}
 
