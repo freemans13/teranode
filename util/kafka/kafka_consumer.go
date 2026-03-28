@@ -90,9 +90,9 @@ type KafkaConsumerConfig struct {
 // consumeWatchdog monitors Consume() state to detect when stuck and triggers force recovery.
 type consumeWatchdog struct {
 	consumeStartTime    atomic.Value // time.Time - when Consume() was called
-	setupCalledTime     atomic.Value // time.Time - when PollFetches() last returned successfully (no errors, client alive)
+	lastSuccessfulPollTime     atomic.Value // time.Time - when PollFetches() last returned successfully (no errors, client alive)
 	consumeEndTime      atomic.Value // time.Time - when Consume() returned (error or success)
-	isAttemptingConsume atomic.Bool  // true between Consume() call and Setup() or error
+	isAttemptingConsume atomic.Bool  // true between PollFetches() call and successful return or error
 	hasPolledOnce       atomic.Bool  // true after the first successful PollFetches return
 }
 
@@ -100,14 +100,14 @@ func (w *consumeWatchdog) markConsumeStarted() {
 	w.consumeStartTime.Store(time.Now())
 	w.consumeEndTime.Store(time.Time{}) // Reset
 	w.isAttemptingConsume.Store(true)
-	// Note: setupCalledTime and hasPolledOnce are intentionally NOT reset
+	// Note: lastSuccessfulPollTime and hasPolledOnce are intentionally NOT reset
 	// here. They record whether PollFetches has returned at least once so
 	// the watchdog can distinguish "idle waiting for messages" from "stuck
 	// in metadata refresh on the very first poll."
 }
 
-func (w *consumeWatchdog) markSetupCalled() {
-	w.setupCalledTime.Store(time.Now())
+func (w *consumeWatchdog) markPollSucceeded() {
+	w.lastSuccessfulPollTime.Store(time.Now())
 	w.isAttemptingConsume.Store(false)
 	w.hasPolledOnce.Store(true)
 }
@@ -164,14 +164,14 @@ func (w *consumeWatchdog) isStuckAfterError(threshold time.Duration) (bool, time
 		return false, 0
 	}
 
-	// Check if Setup() was called after the retry
-	setupTime, _ := w.setupCalledTime.Load().(time.Time)
+	// Check if a successful poll occurred after the retry
+	setupTime, _ := w.lastSuccessfulPollTime.Load().(time.Time)
 	if !setupTime.IsZero() && setupTime.After(endTime) {
-		// Setup was called after the error, so we're not stuck
+		// A successful poll happened after the error, so we're not stuck
 		return false, 0
 	}
 
-	// We've been attempting to consume since the retry started, without Setup() being called
+	// We've been attempting to consume since the retry started, without a successful poll
 	duration := time.Since(startTime)
 	return duration > threshold, duration
 }
@@ -587,7 +587,7 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 					// Mark successful poll only after confirming the client is
 					// alive and the fetch had no errors. This ensures hasPolledOnce
 					// is not set on client-closed or error paths.
-					k.watchdog.markSetupCalled()
+					k.watchdog.markPollSucceeded()
 
 					fetches.EachRecord(func(record *kgo.Record) {
 						kafkaMsg := &KafkaMessage{
