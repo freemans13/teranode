@@ -259,8 +259,8 @@ func TestConsumeWatchdogMarkConsumeStarted(t *testing.T) {
 	assert.True(t, ok)
 	assert.False(t, startTime.IsZero())
 
-	// Verify that setup called time is NOT reset (preserved from prior polls
-	// so the watchdog can distinguish idle consumers from stuck ones)
+	// Verify that setup called time is NOT reset (preserved from prior polls)
+	// so the watchdog can distinguish idle consumers from stuck ones
 	setupTime, _ := watchdog.setupCalledTime.Load().(time.Time)
 	assert.True(t, setupTime.IsZero(), "setupCalledTime should be zero on first poll (never set)")
 
@@ -396,6 +396,51 @@ func TestConsumeWatchdogSequence_NormalFlow(t *testing.T) {
 	// 4. Should not be stuck
 	stuck, _ := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
 	assert.False(t, stuck)
+}
+
+func TestConsumeWatchdogIdleConsumerNotStuck(t *testing.T) {
+	// After a successful first poll, an idle consumer blocking on PollFetches
+	// should NOT be detected as stuck — hasPolledOnce prevents false positives.
+	watchdog := &consumeWatchdog{}
+
+	// First poll cycle: start -> PollFetches returns -> markSetupCalled
+	watchdog.markConsumeStarted()
+	time.Sleep(5 * time.Millisecond)
+	watchdog.markSetupCalled()
+	assert.True(t, watchdog.hasPolledOnce.Load())
+
+	// Second poll cycle: start -> PollFetches blocks (idle, no messages)
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// Even after exceeding the threshold, the consumer should NOT be stuck
+	// because hasPolledOnce is true.
+	time.Sleep(20 * time.Millisecond)
+	stuck, _ := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
+	assert.False(t, stuck, "idle consumer after successful poll should not be detected as stuck")
+}
+
+func TestConsumeWatchdogHasPolledOnceResetOnRecovery(t *testing.T) {
+	// After force recovery resets hasPolledOnce, the watchdog should be able
+	// to detect a stuck consumer again if the replacement client also fails.
+	watchdog := &consumeWatchdog{}
+
+	// Successful first poll
+	watchdog.markConsumeStarted()
+	watchdog.markSetupCalled()
+	assert.True(t, watchdog.hasPolledOnce.Load())
+
+	// Simulate forceRecovery clearing the flag
+	watchdog.hasPolledOnce.Store(false)
+	watchdog.markConsumeEnded()
+
+	// New poll cycle on replacement client that gets stuck
+	watchdog.markConsumeStarted()
+	time.Sleep(20 * time.Millisecond)
+
+	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
+	assert.True(t, stuck, "consumer should be detected as stuck after recovery reset")
+	assert.Greater(t, duration, 10*time.Millisecond)
 }
 
 func TestForceRecovery_WatchdogIntegration(t *testing.T) {

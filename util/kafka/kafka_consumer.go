@@ -90,24 +90,26 @@ type KafkaConsumerConfig struct {
 // consumeWatchdog monitors Consume() state to detect when stuck and triggers force recovery.
 type consumeWatchdog struct {
 	consumeStartTime    atomic.Value // time.Time - when Consume() was called
-	setupCalledTime     atomic.Value // time.Time - when Setup() was called
+	setupCalledTime     atomic.Value // time.Time - when PollFetches() last returned
 	consumeEndTime      atomic.Value // time.Time - when Consume() returned (error or success)
 	isAttemptingConsume atomic.Bool  // true between Consume() call and Setup() or error
+	hasPolledOnce       atomic.Bool  // true after the first successful PollFetches return
 }
 
 func (w *consumeWatchdog) markConsumeStarted() {
 	w.consumeStartTime.Store(time.Now())
 	w.consumeEndTime.Store(time.Time{}) // Reset
 	w.isAttemptingConsume.Store(true)
-	// Note: setupCalledTime is intentionally NOT reset here.
-	// It records the last successful PollFetches return so the watchdog
-	// can distinguish "never polled successfully" from "polled before but
-	// PollFetches is blocking on this iteration."
+	// Note: setupCalledTime and hasPolledOnce are intentionally NOT reset
+	// here. They record whether PollFetches has returned at least once so
+	// the watchdog can distinguish "idle waiting for messages" from "stuck
+	// in metadata refresh on the very first poll."
 }
 
 func (w *consumeWatchdog) markSetupCalled() {
 	w.setupCalledTime.Store(time.Now())
 	w.isAttemptingConsume.Store(false)
+	w.hasPolledOnce.Store(true)
 }
 
 func (w *consumeWatchdog) markConsumeEnded() {
@@ -125,12 +127,10 @@ func (w *consumeWatchdog) isStuckInRefreshMetadata(threshold time.Duration) (boo
 		return false, 0
 	}
 
-	// If PollFetches has returned successfully at least once since this
-	// poll started, the consumer is not stuck — it is just waiting for
-	// new messages. Compare timestamps rather than checking for zero so
-	// we don't false-positive on idle consumers after the first poll.
-	setupTime, _ := w.setupCalledTime.Load().(time.Time)
-	if !setupTime.IsZero() && setupTime.After(startTime) {
+	// If PollFetches has returned at least once, the consumer successfully
+	// connected and is just idle waiting for new messages — not stuck in
+	// metadata refresh. This flag is only cleared on force recovery.
+	if w.hasPolledOnce.Load() {
 		return false, 0
 	}
 
@@ -315,6 +315,10 @@ func (k *KafkaConsumerGroup) forceRecovery() error {
 	defer k.clientMu.Unlock()
 
 	k.Config.Logger.Warnf("[kafka-watchdog] Forcing recovery for topic %s - closing stuck consumer and creating new one", k.Config.Topic)
+
+	// Reset hasPolledOnce so the watchdog can detect a genuinely stuck
+	// consumer if the replacement client also fails to poll.
+	k.watchdog.hasPolledOnce.Store(false)
 
 	if k.client != nil {
 		k.client.Close()
@@ -564,6 +568,7 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 						// Client was closed by forceRecovery() — loop back to
 						// pick up the replacement client instead of exiting.
 						k.Config.Logger.Infof("[kafka] client closed (recovery), reconnecting consumer for topic %s", k.Config.Topic)
+						k.watchdog.markConsumeEnded()
 						time.Sleep(100 * time.Millisecond)
 						continue
 					}
