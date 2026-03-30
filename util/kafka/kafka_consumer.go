@@ -88,8 +88,8 @@ type KafkaConsumerConfig struct {
 
 // KafkaConsumerGroup implements KafkaConsumerGroupI interface using franz-go.
 type KafkaConsumerGroup struct {
-	Config KafkaConsumerConfig
-	client *kgo.Client
+	Config   KafkaConsumerConfig
+	client   *kgo.Client
 	cancelMu sync.Mutex
 	cancel   context.CancelFunc
 
