@@ -152,8 +152,7 @@ func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, ur
 
 // clampBatchMaxBytes clamps the given flush bytes value to the valid range for
 // franz-go's ProducerBatchMaxBytes (int32). The minimum is 512 bytes (Kafka
-// protocol minimum for a record batch). Small flush_bytes values (e.g. 64) were
-// valid with sarama as a flush threshold but are too small for franz-go.
+// protocol minimum for a record batch).
 func clampBatchMaxBytes(flushBytes int) int32 {
 	const minBatchMaxBytes = 512
 	if flushBytes < minBatchMaxBytes {

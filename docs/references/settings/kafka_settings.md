@@ -58,7 +58,6 @@ memory://test_blocks?partitions=2&consumer_ratio=1
 | `sessionTimeout` | int | 10000 | Time (ms) broker waits for heartbeat before considering consumer dead. Must be >= 3 * heartbeatInterval |
 | `heartbeatInterval` | int | 3000 | Frequency (ms) of heartbeats sent to broker |
 | `rebalanceTimeout` | int | 60000 | Max time (ms) for all consumers to join rebalance |
-| `channelBufferSize` | int | 256 | Number of messages buffered in internal channels |
 
 ### Producer Parameters (Async)
 
@@ -198,7 +197,7 @@ URL-based configuration overrides individual settings when provided:
 sessionTimeout >= 3 * heartbeatInterval
 ```
 
-This constraint is validated at consumer creation time. Consumer creation will fail if violated.
+This constraint is validated during consumer creation for both URL-based and direct configuration. Consumer creation will fail if this rule is violated.
 
 **Example Valid Configuration:**
 

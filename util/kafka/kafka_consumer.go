@@ -63,14 +63,13 @@ type KafkaConsumerConfig struct {
 	AutoCommitEnabled bool           // Whether to auto-commit offsets
 	Replay            bool           // Whether to replay messages from the beginning
 
-	// Timeout configuration (query params: maxProcessingTime, sessionTimeout, heartbeatInterval, rebalanceTimeout, channelBufferSize)
+	// Timeout configuration (query params: maxProcessingTime, sessionTimeout, heartbeatInterval, rebalanceTimeout)
 	// Note: MaxProcessingTime configures the Kafka fetch max wait (kgo.FetchMaxWait), i.e., how long the broker
 	// may wait before responding to a fetch request when there are no records immediately available.
 	MaxProcessingTime time.Duration // Max time broker waits before returning fetch results when no records are available (default: 100ms)
 	SessionTimeout    time.Duration // Time broker waits for heartbeat before considering consumer dead (default: 10s)
 	HeartbeatInterval time.Duration // Frequency of heartbeats to broker (default: 3s)
 	RebalanceTimeout  time.Duration // Max time for all consumers to join rebalance (default: 60s)
-	ChannelBufferSize int           // Number of messages buffered in internal channels (default: 256)
 
 	// OffsetReset controls what to do when offset is out of range (query param: offsetReset)
 	// Values: "latest" (default, skip to newest), "earliest" (reprocess from oldest), "" (use Replay setting)
@@ -139,7 +138,6 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 	sessionTimeoutMs := util.GetQueryParamInt(url, "sessionTimeout", 10000)
 	heartbeatIntervalMs := util.GetQueryParamInt(url, "heartbeatInterval", 3000)
 	rebalanceTimeoutMs := util.GetQueryParamInt(url, "rebalanceTimeout", 60000)
-	channelBufferSize := util.GetQueryParamInt(url, "channelBufferSize", 256)
 
 	// Offset reset strategy: how to handle offset-out-of-range (e.g. "latest", "earliest", or "" for default/Replay).
 	offsetReset := url.Query().Get("offsetReset")
@@ -168,7 +166,6 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 		SessionTimeout:     time.Duration(sessionTimeoutMs) * time.Millisecond,
 		HeartbeatInterval:  time.Duration(heartbeatIntervalMs) * time.Millisecond,
 		RebalanceTimeout:   time.Duration(rebalanceTimeoutMs) * time.Millisecond,
-		ChannelBufferSize:  channelBufferSize,
 		OffsetReset:        offsetReset,
 		EnableTLS:          enableTLS,
 		TLSSkipVerify:      tlsSkipVerify,
@@ -258,6 +255,11 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig) (*KafkaConsumerGroup, error)
 	}
 	if cfg.RebalanceTimeout <= 0 {
 		cfg.RebalanceTimeout = 60 * time.Second
+	}
+
+	// Validate timeout constraints (also validated in URL parser, but needed for direct callers)
+	if err := validateTimeoutConfig(cfg); err != nil {
+		return nil, err
 	}
 
 	// Build franz-go client options

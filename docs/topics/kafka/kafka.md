@@ -311,12 +311,11 @@ Advanced URL parameters for fine-tuning consumer behavior and timeout configurat
 | `sessionTimeout` | int (ms) | 10000 | Time broker waits for heartbeat before declaring consumer dead |
 | `heartbeatInterval` | int (ms) | 3000 | Frequency of heartbeats sent to broker |
 | `rebalanceTimeout` | int (ms) | 60000 | Max time for all consumers to join rebalance |
-| `channelBufferSize` | int | 256 | Number of messages buffered in internal channels |
 | `offsetReset` | string | - | Offset reset strategy: "latest", "earliest", or "" (uses replay) |
 
 **Important Constraints**:
 
-- `sessionTimeout` must be >= 3 × `heartbeatInterval` (validated at consumer creation)
+- `sessionTimeout` must be >= 3 × `heartbeatInterval` (validated at consumer creation for both URL-based and direct configuration)
 - For slow processing services (e.g., subtree validation), increase `maxProcessingTime` and `sessionTimeout` proportionally
 
 #### Timeout Configuration for Slow Processing Services
