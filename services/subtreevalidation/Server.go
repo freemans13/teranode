@@ -99,10 +99,6 @@ type Server struct {
 	// Used to retrieve block information and validate chain state
 	blockchainClient blockchain.ClientI
 
-	// blockAssemblyClient interfaces with the block assembly service
-	// Used to check local tx availability before fetching subtree_data from peers
-	blockAssemblyClient blockassembly.ClientI
-
 	// subtreeConsumerClient consumes subtree-related Kafka messages
 	// Handles incoming subtree validation requests from other services
 	subtreeConsumerClient kafka.KafkaConsumerGroupI
@@ -131,6 +127,10 @@ type Server struct {
 
 	// currentBlockIDsMap is used to store the current block IDs for the current best block height
 	currentBlockIDsMap atomic.Pointer[map[uint32]bool]
+
+	// blockAssemblyClient interfaces with the block assembly service
+	// Used to check local tx availability before fetching subtree_data from peers
+	blockAssemblyClient blockassembly.ClientI
 
 	// p2pClient interfaces with the P2P service
 	// Used to report successful subtree fetches to improve peer reputation
@@ -161,8 +161,6 @@ type Server struct {
 //   - blockchainClient: Client for blockchain interaction
 //   - subtreeConsumerClient: Kafka consumer for subtree-related messages
 //   - txmetaConsumerClient: Kafka consumer for transaction metadata messages
-//   - p2pClient: Client for P2P peer communication (byte tracking, peer info)
-//   - blockAssemblyClient: Client for block assembly service (local tx availability check)
 //
 // Returns:
 //   - *Server: Fully initialized server instance ready for starting
@@ -193,11 +191,11 @@ func New(
 		prioritySubtreeCheckActiveMap:     map[string]bool{},
 		prioritySubtreeCheckActiveMapLock: sync.Mutex{},
 		blockchainClient:                  blockchainClient,
-		blockAssemblyClient:               blockAssemblyClient,
 		subtreeConsumerClient:             subtreeConsumerClient,
 		txmetaConsumerClient:              txmetaConsumerClient,
 		invalidSubtreeDeDuplicateMap:      expiringmap.New[string, struct{}](time.Minute * 1),
 		p2pClient:                         p2pClient,
+		blockAssemblyClient:               blockAssemblyClient,
 	}
 
 	var err error

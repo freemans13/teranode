@@ -784,12 +784,12 @@ func (d *Daemon) startValidationService(
 			return err
 		}
 
-		// Create blockassembly client to check local tx availability.
-		// This is an optional optimization; if the client cannot be created,
-		// subtree validation continues using the existing peer-fetch path.
-		blockAssemblyClient, err := blockassembly.NewClient(ctx, createLogger(loggerBlockAssembly), appSettings)
+		// Create the block assembly client for local tx availability check
+		var blockAssemblyClient blockassembly.ClientI
+		blockAssemblyClient, err = d.daemonStores.GetBlockAssemblyClient(ctx, createLogger(loggerBlockAssembly), appSettings)
 		if err != nil {
-			createLogger(loggerBlockAssembly).Warnf("failed to create blockassembly client; continuing without local tx availability optimization: %v", err)
+			// Non-fatal: block assembly client is best-effort for the pre-check optimisation
+			createLogger(loggerSubtreeValidation).Warnf("Failed to create block assembly client: %v", err)
 			blockAssemblyClient = nil
 		}
 
