@@ -244,192 +244,68 @@ func (m *mockLogger) New(string, ...ulogger.Option) ulogger.Logger    { return m
 func (m *mockLogger) Duplicate(...ulogger.Option) ulogger.Logger      { return m }
 func (m *mockLogger) WithTraceContext(context.Context) ulogger.Logger { return m }
 
-// Watchdog tests
-
-func TestConsumeWatchdogMarkConsumeStarted(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	watchdog.markConsumeStarted()
-
-	// Verify that the watchdog is attempting to consume
-	assert.True(t, watchdog.isAttemptingConsume.Load())
-
-	// Verify that consume start time was set
-	startTime, ok := watchdog.consumeStartTime.Load().(time.Time)
-	assert.True(t, ok)
-	assert.False(t, startTime.IsZero())
-
-	// Verify that setup called time was reset
-	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
-	assert.True(t, ok)
-	assert.True(t, setupTime.IsZero())
-}
-
-func TestConsumeWatchdogMarkSetupCalled(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	// First mark consume started
-	watchdog.markConsumeStarted()
-	assert.True(t, watchdog.isAttemptingConsume.Load())
-
-	// Then mark setup called
-	watchdog.markSetupCalled()
-
-	// Verify that the watchdog is no longer attempting to consume
-	assert.False(t, watchdog.isAttemptingConsume.Load())
-
-	// Verify that setup called time was set
-	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
-	assert.True(t, ok)
-	assert.False(t, setupTime.IsZero())
-}
-
-func TestConsumeWatchdogMarkConsumeEnded(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	// First mark consume started
-	watchdog.markConsumeStarted()
-	assert.True(t, watchdog.isAttemptingConsume.Load())
-
-	// Then mark consume ended
-	watchdog.markConsumeEnded()
-
-	// Verify that the watchdog is no longer attempting to consume
-	assert.False(t, watchdog.isAttemptingConsume.Load())
-}
-
-func TestConsumeWatchdogIsStuckInRefreshMetadata_NotAttempting(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	// Don't mark consume started - should not be stuck
-	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Second)
-
-	assert.False(t, stuck)
-	assert.Equal(t, time.Duration(0), duration)
-}
-
-func TestConsumeWatchdogIsStuckInRefreshMetadata_SetupCalled(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	// Mark consume started
-	watchdog.markConsumeStarted()
-
-	// Wait a bit then mark setup called
-	time.Sleep(10 * time.Millisecond)
-	watchdog.markSetupCalled()
-
-	// Should not be stuck because setup was called
-	stuck, duration := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
-
-	assert.False(t, stuck)
-	assert.Equal(t, time.Duration(0), duration)
-}
-
-func TestConsumeWatchdogIsStuckInRefreshMetadata_BelowThreshold(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	// Mark consume started
-	watchdog.markConsumeStarted()
-
-	// Wait less than threshold
-	time.Sleep(10 * time.Millisecond)
-
-	// Should not be stuck because duration is below threshold
-	stuck, duration := watchdog.isStuckInRefreshMetadata(100 * time.Millisecond)
-
-	assert.False(t, stuck)
-	assert.Greater(t, duration, time.Duration(0))
-	assert.Less(t, duration, 100*time.Millisecond)
-}
-
-func TestConsumeWatchdogIsStuckInRefreshMetadata_AboveThreshold(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	// Mark consume started
-	watchdog.markConsumeStarted()
-
-	// Wait more than threshold
-	time.Sleep(50 * time.Millisecond)
-
-	// Should be stuck because duration exceeds threshold and setup was not called
-	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
-
-	assert.True(t, stuck)
-	assert.Greater(t, duration, 10*time.Millisecond)
-}
-
-func TestConsumeWatchdogIsStuckInRefreshMetadata_ZeroStartTime(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	// Set isAttemptingConsume to true but don't set start time
-	watchdog.isAttemptingConsume.Store(true)
-
-	// Should not be stuck because start time is not set
-	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
-
-	assert.False(t, stuck)
-	assert.Equal(t, time.Duration(0), duration)
-}
-
-func TestConsumeWatchdogSequence_NormalFlow(t *testing.T) {
-	watchdog := &consumeWatchdog{}
-
-	// 1. Consume starts
-	watchdog.markConsumeStarted()
-	assert.True(t, watchdog.isAttemptingConsume.Load())
-
-	// 2. Some time passes (simulating RefreshMetadata)
-	time.Sleep(10 * time.Millisecond)
-
-	// 3. Setup is called successfully
-	watchdog.markSetupCalled()
-	assert.False(t, watchdog.isAttemptingConsume.Load())
-
-	// 4. Should not be stuck
-	stuck, _ := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
-	assert.False(t, stuck)
-}
-
-func TestForceRecovery_WatchdogIntegration(t *testing.T) {
-	// Create a watchdog that appears stuck
-	watchdog := &consumeWatchdog{}
-	watchdog.markConsumeStarted()
-	assert.True(t, watchdog.isAttemptingConsume.Load())
-
-	// After simulated recovery, watchdog should be reset
-	watchdog.markConsumeEnded()
-	assert.False(t, watchdog.isAttemptingConsume.Load())
-
-	// Verify watchdog correctly detects stuck state
-	watchdog.markConsumeStarted()
-	time.Sleep(10 * time.Millisecond)
-	stuck, duration := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
-	assert.True(t, stuck)
-	assert.Greater(t, duration, 5*time.Millisecond)
-}
-
-func TestForceRecovery_MutexProtectsConcurrentCalls(t *testing.T) {
-	logger := &mockLogger{}
-	consumer := &KafkaConsumerGroup{
-		Config: KafkaConsumerConfig{
-			Logger:          logger,
-			Topic:           "test-topic",
-			ConsumerGroupID: "test-group",
-			BrokersURL:      []string{"localhost:9092"},
+func TestNewKafkaConsumerGroup_AppliesDefaultTimeouts(t *testing.T) {
+	// Verify that zero-value and negative timeouts get default values applied
+	// when constructing a consumer group with a non-memory scheme.
+	tests := []struct {
+		name              string
+		maxProcessingTime time.Duration
+		sessionTimeout    time.Duration
+		heartbeatInterval time.Duration
+		rebalanceTimeout  time.Duration
+	}{
+		{
+			name:              "zero values get defaults",
+			maxProcessingTime: 0,
+			sessionTimeout:    0,
+			heartbeatInterval: 0,
+			rebalanceTimeout:  0,
 		},
-		watchdog: &consumeWatchdog{},
+		{
+			name:              "negative values get defaults",
+			maxProcessingTime: -1 * time.Second,
+			sessionTimeout:    -1 * time.Second,
+			heartbeatInterval: -1 * time.Second,
+			rebalanceTimeout:  -1 * time.Second,
+		},
 	}
 
-	// Launch multiple concurrent force recovery calls; mutex should prevent panics
-	const numConcurrent = 5
-	done := make(chan bool, numConcurrent)
-	for i := 0; i < numConcurrent; i++ {
-		go func() {
-			_ = consumer.forceRecovery()
-			done <- true
-		}()
-	}
-	for i := 0; i < numConcurrent; i++ {
-		<-done
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Use a non-memory Kafka URL so that NewKafkaConsumerGroup
+			// exercises the non-memory path and applies default timeouts.
+			u, err := url.Parse("kafka://localhost:9092")
+			require.NoError(t, err)
+
+			cfg := KafkaConsumerConfig{
+				Logger:            &mockLogger{},
+				URL:               u,
+				BrokersURL:        []string{"localhost:9092"},
+				Topic:             "test-topic",
+				ConsumerGroupID:   "test-group",
+				MaxProcessingTime: tt.maxProcessingTime,
+				SessionTimeout:    tt.sessionTimeout,
+				HeartbeatInterval: tt.heartbeatInterval,
+				RebalanceTimeout:  tt.rebalanceTimeout,
+			}
+
+			consumer, err := NewKafkaConsumerGroup(cfg)
+			if err != nil {
+				// If construction fails (e.g. due to no broker), it should
+				// not be due to invalid timeout configuration.
+				assert.NotContains(t, err.Error(), "timeout")
+				assert.NotContains(t, err.Error(), "session")
+				return
+			}
+
+			require.NotNil(t, consumer)
+			// When there is no construction error, verify that effective
+			// timeouts are positive, indicating defaults were applied.
+			assert.Greater(t, consumer.Config.MaxProcessingTime, time.Duration(0))
+			assert.Greater(t, consumer.Config.SessionTimeout, time.Duration(0))
+			assert.Greater(t, consumer.Config.HeartbeatInterval, time.Duration(0))
+			assert.Greater(t, consumer.Config.RebalanceTimeout, time.Duration(0))
+			_ = consumer.Close()
+		})
 	}
 }

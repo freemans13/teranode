@@ -483,6 +483,10 @@ func (v *Server) validateTransaction(ctx context.Context, req *validator_api.Val
 		validationOptions.CreateConflicting = *req.CreateConflicting
 	}
 
+	if req.SkipTxmetaPublishing != nil {
+		validationOptions.SkipTxMetaPublishing = *req.SkipTxmetaPublishing
+	}
+
 	txMetaData, err := v.validator.ValidateWithOptions(ctx, tx, req.BlockHeight, validationOptions)
 	if err != nil {
 		prometheusInvalidTransactions.Inc()

@@ -15,7 +15,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
@@ -99,10 +98,6 @@ type Server struct {
 	// Used to retrieve block information and validate chain state
 	blockchainClient blockchain.ClientI
 
-	// blockAssemblyClient interfaces with the block assembly service
-	// Used to check local tx availability before fetching subtree_data from peers
-	blockAssemblyClient blockassembly.ClientI
-
 	// subtreeConsumerClient consumes subtree-related Kafka messages
 	// Handles incoming subtree validation requests from other services
 	subtreeConsumerClient kafka.KafkaConsumerGroupI
@@ -161,8 +156,6 @@ type Server struct {
 //   - blockchainClient: Client for blockchain interaction
 //   - subtreeConsumerClient: Kafka consumer for subtree-related messages
 //   - txmetaConsumerClient: Kafka consumer for transaction metadata messages
-//   - p2pClient: Client for P2P peer communication (byte tracking, peer info)
-//   - blockAssemblyClient: Client for block assembly service (local tx availability check)
 //
 // Returns:
 //   - *Server: Fully initialized server instance ready for starting
@@ -179,7 +172,6 @@ func New(
 	subtreeConsumerClient kafka.KafkaConsumerGroupI,
 	txmetaConsumerClient kafka.KafkaConsumerGroupI,
 	p2pClient P2PClientI,
-	blockAssemblyClient blockassembly.ClientI,
 ) (*Server, error) {
 	u := &Server{
 		logger:                            logger,
@@ -193,7 +185,6 @@ func New(
 		prioritySubtreeCheckActiveMap:     map[string]bool{},
 		prioritySubtreeCheckActiveMapLock: sync.Mutex{},
 		blockchainClient:                  blockchainClient,
-		blockAssemblyClient:               blockAssemblyClient,
 		subtreeConsumerClient:             subtreeConsumerClient,
 		txmetaConsumerClient:              txmetaConsumerClient,
 		invalidSubtreeDeDuplicateMap:      expiringmap.New[string, struct{}](time.Minute * 1),

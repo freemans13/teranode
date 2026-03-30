@@ -225,6 +225,7 @@ func (c *Client) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight
 			AddTxToBlockAssembly: &validationOptions.AddTXToBlockAssembly,
 			SkipPolicyChecks:     &validationOptions.SkipPolicyChecks,
 			CreateConflicting:    &validationOptions.CreateConflicting,
+			SkipTxmetaPublishing: &validationOptions.SkipTxMetaPublishing,
 		})
 		if err != nil {
 			c.logger.Errorf("[ValidateWithOptions] failed to validate non-batched transaction: %v", err)
@@ -251,6 +252,7 @@ func (c *Client) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight
 			AddTxToBlockAssembly: &validationOptions.AddTXToBlockAssembly,
 			SkipPolicyChecks:     &validationOptions.SkipPolicyChecks,
 			CreateConflicting:    &validationOptions.CreateConflicting,
+			SkipTxmetaPublishing: &validationOptions.SkipTxMetaPublishing,
 		},
 		done: doneCh,
 	})

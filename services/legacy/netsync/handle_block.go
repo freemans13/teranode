@@ -668,6 +668,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					validator.WithSkipUtxoCreation(true),
 					validator.WithAddTXToBlockAssembly(false),
 					validator.WithSkipPolicyChecks(true),
+					validator.WithSkipTxMetaPublishing(true),
 				); validateErr != nil {
 					if errors.IsRetryableError(validateErr) {
 						mu.Lock()

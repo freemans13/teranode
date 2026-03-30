@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	inmemorykafka "github.com/bsv-blockchain/teranode/util/kafka/in_memory_kafka"
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -148,6 +150,20 @@ func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, ur
 	return producer, nil
 }
 
+// clampBatchMaxBytes clamps the given flush bytes value to the valid range for
+// franz-go's ProducerBatchMaxBytes (int32). The minimum is 512 bytes (Kafka
+// protocol minimum for a record batch).
+func clampBatchMaxBytes(flushBytes int) int32 {
+	const minBatchMaxBytes = 512
+	if flushBytes < minBatchMaxBytes {
+		flushBytes = minBatchMaxBytes
+	}
+	if flushBytes > math.MaxInt32 {
+		flushBytes = math.MaxInt32
+	}
+	return int32(flushBytes) //nolint:gosec // bounds checked above
+}
+
 // NewKafkaAsyncProducer creates a new async producer with the given configuration using franz-go.
 func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*KafkaAsyncProducer, error) {
 	logger.Debugf("Starting async kafka producer for %v", cfg.URL)
@@ -168,11 +184,16 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 		return client, nil
 	}
 
+	batchMaxBytes := clampBatchMaxBytes(cfg.FlushBytes)
+	if int(batchMaxBytes) != cfg.FlushBytes {
+		logger.Warnf("flush_bytes=%d for topic %s clamped to %d for franz-go compatibility", cfg.FlushBytes, cfg.Topic, batchMaxBytes)
+	}
+
 	// Build franz-go client options
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.BrokersURL...),
 		kgo.DefaultProduceTopic(cfg.Topic),
-		kgo.ProducerBatchMaxBytes(int32(cfg.FlushBytes)),
+		kgo.ProducerBatchMaxBytes(batchMaxBytes),
 		kgo.ProducerLinger(cfg.FlushFrequency),
 		kgo.MaxBufferedRecords(cfg.FlushMessages),
 		kgo.DisableIdempotentWrite(),
@@ -439,12 +460,25 @@ func createTopicWithFranz(ctx context.Context, client *kgo.Client, cfg KafkaProd
 		"segment.bytes":       stringPtr(fmt.Sprintf("%d", segmentBytes)),
 	}
 
+	topicAlreadyExists := false
+
 	resp, err := admin.CreateTopic(ctx, cfg.Partitions, cfg.ReplicationFactor, configs, cfg.Topic)
 	if err != nil {
-		return errors.NewProcessingError("unable to create topic", err)
+		if errors.Is(err, kerr.TopicAlreadyExists) {
+			topicAlreadyExists = true
+		} else {
+			return errors.NewProcessingError("unable to create topic", err)
+		}
+	} else if resp.Err != nil {
+		if errors.Is(resp.Err, kerr.TopicAlreadyExists) {
+			topicAlreadyExists = true
+		} else {
+			return errors.NewProcessingError("unable to create topic", resp.Err)
+		}
 	}
 
-	if resp.Err != nil && resp.Err.Error() != "TOPIC_ALREADY_EXISTS" {
+	// If topic already existed, ensure configs are up to date
+	if topicAlreadyExists {
 		_, alterErr := admin.AlterTopicConfigs(ctx, []kadm.AlterConfig{
 			{Name: "retention.ms", Value: stringPtr(fmt.Sprintf("%d", retentionMs))},
 			{Name: "delete.retention.ms", Value: stringPtr(fmt.Sprintf("%d", retentionMs))},
