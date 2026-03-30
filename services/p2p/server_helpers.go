@@ -124,7 +124,7 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 			PeerId: blockMessage.PeerID,
 		}
 
-		s.logger.Debugf("[handleBlockTopic] Sending block %s to Kafka", hash.String())
+		s.logger.Infof("[handleBlockTopic] Sending block %s to Kafka", hash.String())
 
 		value, err := proto.Marshal(msg)
 		if err != nil {
