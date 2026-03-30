@@ -118,17 +118,77 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 	u.logger.Infof("[CheckBlockSubtrees] Found %d missing subtrees for block %s, proceeding with validation", len(missingSubtrees), block.Hash().String())
 
-	// Check if we likely have all transactions locally via block assembly.
-	// When true, we skip the expensive subtree_data fetch from the peer's asset-cache
-	// and let ValidateSubtreeInternal validate using local UTXO store lookups instead.
-	var localTxsAvailable bool
+	// Decide whether to bulk-download subtree_data from the peer.
+	// Pre-check: if block assembly has very few transactions, we definitely need to download.
+	// Sample check: if block assembly has data, sample tx hashes to verify local availability.
+	var bulkDownload bool
 	if u.blockAssemblyClient != nil {
 		baCtx, baCancel := context.WithTimeout(ctx, 2*time.Second)
 		state, baErr := u.blockAssemblyClient.GetBlockAssemblyState(baCtx)
 		baCancel()
-		if baErr == nil && state != nil && state.TxCount >= uint64(block.TransactionCount) {
-			localTxsAvailable = true
-			u.logger.Infof("[CheckBlockSubtrees] Block assembly has %d txs, block needs %d — skipping subtree_data fetch from peer", state.TxCount, block.TransactionCount)
+		if baErr != nil || state == nil || state.TxCount < uint64(block.TransactionCount)/2 {
+			bulkDownload = true
+			u.logger.Infof("[CheckBlockSubtrees] Block assembly pre-check: bulk download needed (err=%v, txCount=%d, blockTxCount=%d)",
+				baErr, func() uint64 {
+					if state != nil {
+						return state.TxCount
+					}
+					return 0
+				}(), block.TransactionCount)
+		}
+	} else {
+		bulkDownload = true
+	}
+
+	// Sample check: when pre-check didn't trigger bulk download, verify with a sample
+	if !bulkDownload && len(missingSubtrees) > 0 {
+		// Load the first missing subtree's structure to sample from
+		firstHash := missingSubtrees[0]
+		var sampleSubtree *subtreepkg.Subtree
+
+		subtreeToCheckExists, existsErr := u.subtreeStore.Exists(ctx, firstHash[:], fileformat.FileTypeSubtreeToCheck)
+		if existsErr == nil && subtreeToCheckExists {
+			subtreeReader, readErr := u.subtreeStore.GetIoReader(ctx, firstHash[:], fileformat.FileTypeSubtreeToCheck)
+			if readErr == nil {
+				sampleSubtree, _ = subtreepkg.NewSubtreeFromReader(subtreeReader)
+				subtreeReader.Close()
+			}
+		}
+
+		if sampleSubtree == nil {
+			// Subtree structure not locally available — fetch from peer just for sampling
+			url := fmt.Sprintf("%s/subtree/%s", request.BaseUrl, firstHash.String())
+			subtreeNodeBytes, fetchErr := util.DoHTTPRequest(ctx, url)
+			if fetchErr == nil && len(subtreeNodeBytes) > 0 {
+				sampleSubtree, _ = subtreepkg.NewIncompleteTreeByLeafCount(len(subtreeNodeBytes) / chainhash.HashSize)
+				if sampleSubtree != nil {
+					var nodeHash chainhash.Hash
+					for i := 0; i < len(subtreeNodeBytes)/chainhash.HashSize; i++ {
+						copy(nodeHash[:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
+						if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+							_ = sampleSubtree.AddCoinbaseNode()
+						} else {
+							_ = sampleSubtree.AddNode(nodeHash, 0, 0)
+						}
+					}
+				}
+			}
+		}
+
+		if sampleSubtree != nil && len(sampleSubtree.Nodes) > 0 {
+			hitRate := u.sampleLocalAvailability(ctx, sampleSubtree, u.settings.SubtreeValidation.LocalAvailabilitySampleSize)
+			if hitRate < u.settings.SubtreeValidation.LocalAvailabilityThreshold {
+				bulkDownload = true
+				u.logger.Infof("[CheckBlockSubtrees] Sample check: %.1f%% hit rate (threshold %.1f%%) — switching to bulk download",
+					hitRate*100, u.settings.SubtreeValidation.LocalAvailabilityThreshold*100)
+			} else {
+				u.logger.Infof("[CheckBlockSubtrees] Sample check: %.1f%% hit rate — skipping subtree_data download, local txs available",
+					hitRate*100)
+			}
+		} else {
+			// Couldn't load subtree for sampling — fall back to bulk download
+			bulkDownload = true
+			u.logger.Infof("[CheckBlockSubtrees] Could not load subtree for sampling — falling back to bulk download")
 		}
 	}
 
@@ -274,17 +334,22 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 				}
 
-				subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
-				if err != nil {
-					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
-				}
+				if bulkDownload {
+					subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
+					if err != nil {
+						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
+					}
 
-				if !subtreeDataExists {
-					if !localTxsAvailable {
-						// Pre-allocate only when we will populate the slice
+					if subtreeDataExists {
+						// Extract from local file
 						subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
-
-						// get the subtree data from the peer and process it directly
+						err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx])
+						if err != nil {
+							return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to extract transactions", subtreeHash.String(), err)
+						}
+					} else {
+						// Download full subtree_data from peer
+						subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
 						url := fmt.Sprintf("%s/subtree_data/%s", request.BaseUrl, subtreeHash.String())
 
 						body, subtreeDataErr := util.DoHTTPRequestBodyReader(gCtx, url)
@@ -304,7 +369,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 						_ = countingBody.Close()
 
 						// Track bytes downloaded from peer after stream is consumed
-						// Decouple the context to ensure tracking completes even if parent context is cancelled
 						if u.p2pClient != nil && peerID != "" {
 							trackCtx, _, deferFn := tracing.DecoupleTracingSpan(gCtx, "subtreevalidation", "recordBytesDownloaded")
 							defer deferFn()
@@ -317,17 +381,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 							return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to process subtree data stream", subtreeHash.String(), err)
 						}
 					}
-					// When localTxsAvailable, skip fetch — ValidateSubtreeInternal will use local UTXO store
-				} else {
-					// Pre-allocate only when we will populate the slice
-					subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
-
-					// SubtreeData exists, extract transactions from stored file
-					err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx])
-					if err != nil {
-						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to extract transactions", subtreeHash.String(), err)
-					}
 				}
+				// When !bulkDownload: subtreeTxs stays nil — ValidateSubtreeInternal
+				// handles the few missing txs via its 3-stage fallback (cache → UTXO → peer)
 
 				return nil
 			})
@@ -428,33 +484,60 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed during parallel subtree validation", err))
 	}
 
-	// Now validate the subtrees, in order, which should be much faster since we already validated all transactions
-	// and they should have been added to the internal cache
-	for _, subtreeHash := range revalidateSubtrees {
-		// This line is only reached when the base URL is not "legacy"
-		v := ValidateSubtree{
-			SubtreeHash:   subtreeHash,
-			BaseURL:       request.BaseUrl,
-			AllowFailFast: false,
-			PeerID:        peerID,
+	// Phase 2: Sequential revalidation with convergence loop.
+	// Retry failed subtrees until all succeed or no progress is made.
+	// This handles cross-subtree dependencies where SubtreeB depends on outputs
+	// from SubtreeA — if SubtreeA is validated first, SubtreeB can succeed on
+	// the next iteration.
+	remainingSubtrees := revalidateSubtrees
+
+	for attempt := 0; len(remainingSubtrees) > 0; attempt++ {
+		previousCount := len(remainingSubtrees)
+		var stillFailing []chainhash.Hash
+		var lastErr error
+
+		for _, subtreeHash := range remainingSubtrees {
+			v := ValidateSubtree{
+				SubtreeHash:   subtreeHash,
+				BaseURL:       request.BaseUrl,
+				AllowFailFast: false,
+				PeerID:        peerID,
+			}
+
+			subtree, err := u.ValidateSubtreeInternal(
+				ctx,
+				v,
+				block.Height,
+				blockIds,
+				validator.WithSkipPolicyChecks(true),
+				validator.WithCreateConflicting(true),
+				validator.WithIgnoreLocked(true),
+			)
+			if err != nil {
+				u.logger.Debugf("[CheckBlockSubtreesRequest] Convergence attempt %d: subtree %s failed: %v", attempt+1, subtreeHash.String(), err)
+				stillFailing = append(stillFailing, subtreeHash)
+				lastErr = err
+				continue
+			}
+
+			for _, node := range subtree.Nodes {
+				u.orphanage.Delete(node.Hash)
+			}
 		}
 
-		subtree, err := u.ValidateSubtreeInternal(
-			ctx,
-			v,
-			block.Height,
-			blockIds,
-			validator.WithSkipPolicyChecks(true),
-			validator.WithCreateConflicting(true),
-			validator.WithIgnoreLocked(true),
-		)
-		if err != nil {
-			return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err))
+		remainingSubtrees = stillFailing
+
+		if len(remainingSubtrees) > 0 && len(remainingSubtrees) >= previousCount {
+			// No progress — return error for the first still-failing subtree
+			return nil, errors.WrapGRPC(errors.NewProcessingError(
+				"[CheckBlockSubtreesRequest] Failed to validate %d subtrees after %d convergence attempts, first: %s",
+				len(remainingSubtrees), attempt+1, remainingSubtrees[0].String(), lastErr,
+			))
 		}
 
-		// Remove validated transactions from orphanage
-		for _, node := range subtree.Nodes {
-			u.orphanage.Delete(node.Hash)
+		if len(remainingSubtrees) > 0 {
+			u.logger.Infof("[CheckBlockSubtreesRequest] Convergence attempt %d: %d/%d subtrees still failing, retrying",
+				attempt+1, len(remainingSubtrees), previousCount)
 		}
 	}
 
