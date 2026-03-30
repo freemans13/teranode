@@ -59,7 +59,6 @@ memory://test_blocks?partitions=2&consumer_ratio=1
 | `heartbeatInterval` | int | 3000 | Frequency (ms) of heartbeats sent to broker |
 | `rebalanceTimeout` | int | 60000 | Max time (ms) for all consumers to join rebalance |
 | `channelBufferSize` | int | 256 | Number of messages buffered in internal channels |
-| `consumerTimeout` | int | 90000 | Watchdog timeout (ms). Triggers recovery if no messages received and Setup() not called |
 
 ### Producer Parameters (Async)
 
@@ -207,23 +206,8 @@ This constraint is enforced by Sarama. Consumer creation will fail if violated.
 
 **Example Invalid Configuration:**
 
-- `heartbeatInterval=5000` (5s)  
+- `heartbeatInterval=5000` (5s)
 - `sessionTimeout=10000` (10s) ✗ Invalid: 10000 < 15000
-
-## Consumer Watchdog
-
-The consumer watchdog monitors for stuck consumers and automatically recovers by recreating the consumer group.
-
-**Behavior:**
-
-- Checks every 30 seconds
-- Triggers recovery if `Consume()` is stuck for longer than `consumerTimeout` (default 90s)
-- Detects RefreshMetadata hangs and offset-related issues
-- Automatically recreates consumer group on recovery
-
-**Configuration:**
-
-- `consumerTimeout` URL parameter (default: 90000ms)
 
 ## Service Usage
 
@@ -285,7 +269,7 @@ kafka://localhost:9092/blocks?partitions=8&replication=3&retention=3600000&flush
 ### Slow Processing Consumer
 
 ```text
-kafka://localhost:9092/subtrees?partitions=4&maxProcessingTime=30000&sessionTimeout=60000&heartbeatInterval=20000&consumerTimeout=120000
+kafka://localhost:9092/subtrees?partitions=4&maxProcessingTime=30000&sessionTimeout=60000&heartbeatInterval=20000
 ```
 
 ### Low-Latency Producer
