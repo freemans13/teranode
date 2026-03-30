@@ -2,7 +2,9 @@ package kafka
 
 import (
 	"context"
+	"math"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
@@ -391,6 +393,60 @@ func TestKafkaAsyncProducerURLQueryParams(t *testing.T) {
 			require.NotNil(t, producer)
 
 			tt.checkFunc(t, producer)
+		})
+	}
+}
+
+func TestClampBatchMaxBytes(t *testing.T) {
+	tests := []struct {
+		name       string
+		flushBytes int
+		want       int32
+	}{
+		{
+			name:       "small value clamped to minimum 512",
+			flushBytes: 64,
+			want:       512,
+		},
+		{
+			name:       "zero clamped to minimum 512",
+			flushBytes: 0,
+			want:       512,
+		},
+		{
+			name:       "negative clamped to minimum 512",
+			flushBytes: -1,
+			want:       512,
+		},
+		{
+			name:       "exactly minimum unchanged",
+			flushBytes: 512,
+			want:       512,
+		},
+		{
+			name:       "valid value unchanged",
+			flushBytes: 1024 * 1024,
+			want:       1024 * 1024,
+		},
+		{
+			name:       "max int32 unchanged",
+			flushBytes: math.MaxInt32,
+			want:       math.MaxInt32,
+		},
+	}
+
+	// On 64-bit architectures, also test overflow above MaxInt32
+	if strconv.IntSize > 32 {
+		overflowVal64 := int64(math.MaxInt32) + 1
+		overflowVal := int(overflowVal64)
+		got := clampBatchMaxBytes(overflowVal)
+		assert.Equal(t, int32(math.MaxInt32), got, "above max int32 should be clamped")
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clampBatchMaxBytes(tt.flushBytes)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

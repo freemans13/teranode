@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -64,13 +63,13 @@ type KafkaConsumerConfig struct {
 	AutoCommitEnabled bool           // Whether to auto-commit offsets
 	Replay            bool           // Whether to replay messages from the beginning
 
-	// Timeout configuration (query params: maxProcessingTime, sessionTimeout, heartbeatInterval, rebalanceTimeout, channelBufferSize, consumerTimeout)
-	MaxProcessingTime time.Duration // Max time to process a message (default: 100ms)
+	// Timeout configuration (query params: maxProcessingTime, sessionTimeout, heartbeatInterval, rebalanceTimeout)
+	// Note: MaxProcessingTime configures the Kafka fetch max wait (kgo.FetchMaxWait), i.e., how long the broker
+	// may wait before responding to a fetch request when there are no records immediately available.
+	MaxProcessingTime time.Duration // Max time broker waits before returning fetch results when no records are available (default: 100ms)
 	SessionTimeout    time.Duration // Time broker waits for heartbeat before considering consumer dead (default: 10s)
 	HeartbeatInterval time.Duration // Frequency of heartbeats to broker (default: 3s)
 	RebalanceTimeout  time.Duration // Max time for all consumers to join rebalance (default: 60s)
-	ChannelBufferSize int           // Number of messages buffered in internal channels (default: 256)
-	ConsumerTimeout   time.Duration // Max time without messages before watchdog triggers recovery (default: 90s)
 
 	// OffsetReset controls what to do when offset is out of range (query param: offsetReset)
 	// Values: "latest" (default, skip to newest), "earliest" (reprocess from oldest), "" (use Replay setting)
@@ -87,97 +86,12 @@ type KafkaConsumerConfig struct {
 	EnableDebugLogging bool // Enable verbose debug logging
 }
 
-// consumeWatchdog monitors Consume() state to detect when stuck and triggers force recovery.
-type consumeWatchdog struct {
-	consumeStartTime    atomic.Value // time.Time - when Consume() was called
-	setupCalledTime     atomic.Value // time.Time - when Setup() was called
-	consumeEndTime      atomic.Value // time.Time - when Consume() returned (error or success)
-	isAttemptingConsume atomic.Bool  // true between Consume() call and Setup() or error
-}
-
-func (w *consumeWatchdog) markConsumeStarted() {
-	w.consumeStartTime.Store(time.Now())
-	w.setupCalledTime.Store(time.Time{}) // Reset
-	w.consumeEndTime.Store(time.Time{})  // Reset
-	w.isAttemptingConsume.Store(true)
-}
-
-func (w *consumeWatchdog) markSetupCalled() {
-	w.setupCalledTime.Store(time.Now())
-	w.isAttemptingConsume.Store(false)
-}
-
-func (w *consumeWatchdog) markConsumeEnded() {
-	w.consumeEndTime.Store(time.Now())
-	w.isAttemptingConsume.Store(false)
-}
-
-func (w *consumeWatchdog) isStuckInRefreshMetadata(threshold time.Duration) (bool, time.Duration) {
-	if !w.isAttemptingConsume.Load() {
-		return false, 0
-	}
-
-	startTime, ok := w.consumeStartTime.Load().(time.Time)
-	if !ok || startTime.IsZero() {
-		return false, 0
-	}
-
-	setupTime, _ := w.setupCalledTime.Load().(time.Time)
-	if !setupTime.IsZero() {
-		// Setup was called, not stuck
-		return false, 0
-	}
-
-	duration := time.Since(startTime)
-	return duration > threshold, duration
-}
-
-// This catches the case where offset errors cause Consume() to hang in RefreshMetadata on retry.
-func (w *consumeWatchdog) isStuckAfterError(threshold time.Duration) (bool, time.Duration) {
-	// Check if Consume() has ended (returned with error or success)
-	endTime, ok := w.consumeEndTime.Load().(time.Time)
-	if !ok || endTime.IsZero() {
-		// Consume() never ended, use the regular stuck detection
-		return false, 0
-	}
-
-	// Check if we're currently attempting to consume again
-	if !w.isAttemptingConsume.Load() {
-		// Not attempting, so can't be stuck
-		return false, 0
-	}
-
-	// Check when the retry attempt started
-	startTime, ok := w.consumeStartTime.Load().(time.Time)
-	if !ok || startTime.IsZero() {
-		return false, 0
-	}
-
-	// If startTime is before endTime, something is wrong with our tracking
-	if startTime.Before(endTime) {
-		return false, 0
-	}
-
-	// Check if Setup() was called after the retry
-	setupTime, _ := w.setupCalledTime.Load().(time.Time)
-	if !setupTime.IsZero() && setupTime.After(endTime) {
-		// Setup was called after the error, so we're not stuck
-		return false, 0
-	}
-
-	// We've been attempting to consume since the retry started, without Setup() being called
-	duration := time.Since(startTime)
-	return duration > threshold, duration
-}
-
 // KafkaConsumerGroup implements KafkaConsumerGroupI interface using franz-go.
 type KafkaConsumerGroup struct {
-	Config     KafkaConsumerConfig
-	client     *kgo.Client
-	cancel     atomic.Value
-	watchdog   *consumeWatchdog
-	clientMu   sync.Mutex
-	clientOpts []kgo.Opt
+	Config   KafkaConsumerConfig
+	client   *kgo.Client
+	cancelMu sync.Mutex
+	cancel   context.CancelFunc
 
 	// For in-memory support
 	inMemoryConsumer *inmemorykafka.InMemoryConsumerGroup
@@ -225,8 +139,6 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 	sessionTimeoutMs := util.GetQueryParamInt(url, "sessionTimeout", 10000)
 	heartbeatIntervalMs := util.GetQueryParamInt(url, "heartbeatInterval", 3000)
 	rebalanceTimeoutMs := util.GetQueryParamInt(url, "rebalanceTimeout", 60000)
-	channelBufferSize := util.GetQueryParamInt(url, "channelBufferSize", 256)
-	consumerTimeoutMs := util.GetQueryParamInt(url, "consumerTimeout", 90000)
 
 	// Offset reset strategy: how to handle offset-out-of-range (e.g. "latest", "earliest", or "" for default/Replay).
 	offsetReset := url.Query().Get("offsetReset")
@@ -255,8 +167,6 @@ func NewKafkaConsumerGroupFromURL(logger ulogger.Logger, url *url.URL, consumerG
 		SessionTimeout:     time.Duration(sessionTimeoutMs) * time.Millisecond,
 		HeartbeatInterval:  time.Duration(heartbeatIntervalMs) * time.Millisecond,
 		RebalanceTimeout:   time.Duration(rebalanceTimeoutMs) * time.Millisecond,
-		ChannelBufferSize:  channelBufferSize,
-		ConsumerTimeout:    time.Duration(consumerTimeoutMs) * time.Millisecond,
 		OffsetReset:        offsetReset,
 		EnableTLS:          enableTLS,
 		TLSSkipVerify:      tlsSkipVerify,
@@ -281,9 +191,13 @@ func (k *KafkaConsumerGroup) Close() error {
 
 	k.Config.Logger.Infof("[Kafka] %s: initiating shutdown of consumer group for topic %s", k.Config.ConsumerGroupID, k.Config.Topic)
 
-	if k.cancel.Load() != nil {
+	k.cancelMu.Lock()
+	cancelFn := k.cancel
+	k.cancel = nil
+	k.cancelMu.Unlock()
+	if cancelFn != nil {
 		k.Config.Logger.Debugf("[Kafka] %s: canceling context for topic %s", k.Config.ConsumerGroupID, k.Config.Topic)
-		k.cancel.Load().(context.CancelFunc)()
+		cancelFn()
 	}
 
 	if k.isInMemory {
@@ -299,28 +213,6 @@ func (k *KafkaConsumerGroup) Close() error {
 			k.Config.Logger.Infof("[Kafka] %s: successfully closed consumer group for topic %s", k.Config.ConsumerGroupID, k.Config.Topic)
 		}
 	}
-
-	return nil
-}
-
-// forceRecovery forces recovery of a stuck consumer by closing and recreating the client.
-func (k *KafkaConsumerGroup) forceRecovery() error {
-	k.clientMu.Lock()
-	defer k.clientMu.Unlock()
-
-	k.Config.Logger.Warnf("[kafka-watchdog] Forcing recovery for topic %s - closing stuck consumer and creating new one", k.Config.Topic)
-
-	if k.client != nil {
-		k.client.Close()
-	}
-
-	newClient, err := kgo.NewClient(k.clientOpts...)
-	if err != nil {
-		return errors.NewServiceError("failed to recreate consumer client for %s", k.Config.Topic, err)
-	}
-
-	k.client = newClient
-	k.Config.Logger.Infof("[kafka-watchdog] Successfully recreated consumer group for topic %s", k.Config.Topic)
 
 	return nil
 }
@@ -341,8 +233,6 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig) (*KafkaConsumerGroup, error)
 
 	cfg.Logger.Infof("Starting Kafka consumer for topic %s in group %s", cfg.Topic, cfg.ConsumerGroupID)
 
-	InitPrometheusMetrics()
-
 	// Handle in-memory case
 	if cfg.URL.Scheme == memoryScheme {
 		broker := inmemorykafka.GetSharedBroker()
@@ -353,8 +243,28 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig) (*KafkaConsumerGroup, error)
 			Config:           cfg,
 			inMemoryConsumer: consumerGroup,
 			isInMemory:       true,
-			watchdog:         &consumeWatchdog{},
 		}, nil
+	}
+
+	// Apply defaults for non-positive (zero or negative) timeouts. These match the defaults in
+	// NewKafkaConsumerGroupFromURL but are needed when callers construct
+	// KafkaConsumerConfig directly without going through the URL parser.
+	if cfg.MaxProcessingTime <= 0 {
+		cfg.MaxProcessingTime = 100 * time.Millisecond
+	}
+	if cfg.SessionTimeout <= 0 {
+		cfg.SessionTimeout = 10 * time.Second
+	}
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = 3 * time.Second
+	}
+	if cfg.RebalanceTimeout <= 0 {
+		cfg.RebalanceTimeout = 60 * time.Second
+	}
+
+	// Validate timeout constraints (also validated in URL parser, but needed for direct callers)
+	if err := validateTimeoutConfig(cfg); err != nil {
+		return nil, err
 	}
 
 	// Build franz-go client options
@@ -416,10 +326,8 @@ func NewKafkaConsumerGroup(cfg KafkaConsumerConfig) (*KafkaConsumerGroup, error)
 	}
 
 	return &KafkaConsumerGroup{
-		Config:     cfg,
-		client:     client,
-		watchdog:   &consumeWatchdog{},
-		clientOpts: opts,
+		Config: cfg,
+		client: client,
 	}, nil
 }
 
@@ -473,6 +381,11 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 		return
 	}
 
+	if consumerFn == nil {
+		k.Config.Logger.Errorf("kafka consumer %s: consumerFn is nil, cannot start", k.Config.Topic)
+		return
+	}
+
 	// Handle in-memory case
 	if k.isInMemory {
 		k.startInMemory(ctx, consumerFn, opts...)
@@ -494,19 +407,15 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 	// Apply retry/error handling wrappers
 	consumerFn = wrapConsumerFn(ctx, k.Config.Logger, k.Config.Topic, consumerFn, options)
 
+	// Create internal context and store cancel func before spawning goroutines.
+	// Protected by cancelMu to avoid a data race with Close().
+	internalCtx, cancel := context.WithCancel(ctx)
+	k.cancelMu.Lock()
+	k.cancel = cancel
+	k.cancelMu.Unlock()
+
 	go func() {
-		internalCtx, cancel := context.WithCancel(ctx)
-		k.cancel.Store(cancel)
 		defer cancel()
-
-		// Watchdog goroutine
-		const watchdogCheckInterval = 30 * time.Second
-		watchdogStuckThreshold := k.Config.ConsumerTimeout
-		if watchdogStuckThreshold == 0 {
-			watchdogStuckThreshold = 90 * time.Second
-		}
-
-		go k.runWatchdog(internalCtx, watchdogCheckInterval, watchdogStuckThreshold)
 
 		// Main consume loop
 		go func() {
@@ -524,33 +433,16 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 					k.commitRecords(uncommittedRecords)
 					return
 				default:
-					k.watchdog.markConsumeStarted()
-
-					k.clientMu.Lock()
-					currentClient := k.client
-					k.clientMu.Unlock()
-
-					if currentClient == nil {
-						time.Sleep(100 * time.Millisecond)
-						continue
-					}
-
-					fetches := currentClient.PollFetches(internalCtx)
-					k.watchdog.markSetupCalled()
-
-					if fetches.IsClientClosed() {
-						return
-					}
+					fetches := k.client.PollFetches(internalCtx)
 
 					if errs := fetches.Errors(); len(errs) > 0 {
 						for _, err := range errs {
-							if errors.Is(err.Err, context.Canceled) {
+							if errors.Is(err.Err, context.Canceled) || errors.Is(err.Err, kgo.ErrClientClosed) {
 								k.Config.Logger.Debugf("Kafka consumer shutdown: %v", err.Err)
 								return
 							}
 							k.Config.Logger.Errorf("Kafka consumer error on topic %s partition %d: %v", err.Topic, err.Partition, err.Err)
 						}
-						k.watchdog.markConsumeEnded()
 						continue
 					}
 
@@ -587,8 +479,6 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 						uncommittedMu.Unlock()
 					default:
 					}
-
-					k.watchdog.markConsumeEnded()
 				}
 			}
 		}()
@@ -634,35 +524,6 @@ func (k *KafkaConsumerGroup) startInMemory(ctx context.Context, consumerFn func(
 			k.Config.Logger.Errorf("In-memory consumer error: %v", err)
 		}
 	}()
-}
-
-// runWatchdog monitors for stuck consumers
-func (k *KafkaConsumerGroup) runWatchdog(ctx context.Context, checkInterval, threshold time.Duration) {
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			stuck, duration := k.watchdog.isStuckInRefreshMetadata(threshold)
-			if stuck {
-				k.Config.Logger.Errorf("[kafka-consumer-watchdog][topic:%s][group:%s] Consumer stuck for %v. Forcing recovery...",
-					k.Config.Topic, k.Config.ConsumerGroupID, duration)
-
-				prometheusKafkaWatchdogRecoveryAttempts.WithLabelValues(k.Config.Topic, k.Config.ConsumerGroupID).Inc()
-				prometheusKafkaWatchdogStuckDuration.WithLabelValues(k.Config.Topic).Observe(duration.Seconds())
-
-				if err := k.forceRecovery(); err != nil {
-					k.Config.Logger.Errorf("[kafka-consumer-watchdog][topic:%s] Force recovery failed: %v", k.Config.Topic, err)
-				} else {
-					k.Config.Logger.Infof("[kafka-consumer-watchdog][topic:%s] Force recovery successful", k.Config.Topic)
-					k.watchdog.markConsumeEnded()
-				}
-			}
-		}
-	}
 }
 
 // commitRecords commits the offsets for the given records
