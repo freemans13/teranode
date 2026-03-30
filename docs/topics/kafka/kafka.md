@@ -316,7 +316,7 @@ Advanced URL parameters for fine-tuning consumer behavior and timeout configurat
 **Important Constraints**:
 
 - `sessionTimeout` must be >= 3 × `heartbeatInterval` (validated at consumer creation for both URL-based and direct configuration)
-- For slow processing services (e.g., subtree validation), increase `maxProcessingTime` and `sessionTimeout` proportionally
+- For slow processing services (e.g., subtree validation), increase `sessionTimeout` and `heartbeatInterval` to prevent the broker from declaring the consumer dead during long processing
 
 #### Timeout Configuration for Slow Processing Services
 
@@ -328,8 +328,8 @@ kafka://localhost:9092/subtrees?partitions=4&consumer_ratio=1&maxProcessingTime=
 
 This configuration:
 
-- Allows 30 seconds for message processing
-- Gives 90 seconds before broker declares consumer dead (3× heartbeat interval)
+- Sets broker fetch wait to 30 seconds (time broker waits for records before returning empty response)
+- Gives 90 seconds before broker declares consumer dead (3x heartbeat interval)
 - Sends heartbeats every 20 seconds
 
 #### Offset Reset Configuration

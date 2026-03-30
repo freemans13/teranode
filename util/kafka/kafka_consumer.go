@@ -376,6 +376,11 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 		return
 	}
 
+	if consumerFn == nil {
+		k.Config.Logger.Errorf("kafka consumer %s: consumerFn is nil, cannot start", k.Config.Topic)
+		return
+	}
+
 	// Handle in-memory case
 	if k.isInMemory {
 		k.startInMemory(ctx, consumerFn, opts...)
