@@ -64,7 +64,9 @@ type KafkaConsumerConfig struct {
 	Replay            bool           // Whether to replay messages from the beginning
 
 	// Timeout configuration (query params: maxProcessingTime, sessionTimeout, heartbeatInterval, rebalanceTimeout, channelBufferSize)
-	MaxProcessingTime time.Duration // Max time to process a message (default: 100ms)
+	// Note: MaxProcessingTime configures the Kafka fetch max wait (kgo.FetchMaxWait), i.e., how long the broker
+	// may wait before responding to a fetch request when there are no records immediately available.
+	MaxProcessingTime time.Duration // Max time broker waits before returning fetch results when no records are available (default: 100ms)
 	SessionTimeout    time.Duration // Time broker waits for heartbeat before considering consumer dead (default: 10s)
 	HeartbeatInterval time.Duration // Frequency of heartbeats to broker (default: 3s)
 	RebalanceTimeout  time.Duration // Max time for all consumers to join rebalance (default: 60s)
@@ -393,9 +395,12 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 	// Apply retry/error handling wrappers
 	consumerFn = wrapConsumerFn(ctx, k.Config.Logger, k.Config.Topic, consumerFn, options)
 
+	// Create internal context and store cancel func before spawning goroutines
+	// to avoid a data race with Close() which reads k.cancel.
+	internalCtx, cancel := context.WithCancel(ctx)
+	k.cancel = cancel
+
 	go func() {
-		internalCtx, cancel := context.WithCancel(ctx)
-		k.cancel = cancel
 		defer cancel()
 
 		// Main consume loop
@@ -418,7 +423,7 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 
 					if errs := fetches.Errors(); len(errs) > 0 {
 						for _, err := range errs {
-							if errors.Is(err.Err, context.Canceled) {
+							if errors.Is(err.Err, context.Canceled) || errors.Is(err.Err, kgo.ErrClientClosed) {
 								k.Config.Logger.Debugf("Kafka consumer shutdown: %v", err.Err)
 								return
 							}
