@@ -81,6 +81,8 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 		return
 	}
 
+	s.logger.Infof("[handleBlockTopic] CHECKPOINT-A block %s passed isOwnMessage", blockMessage.Hash)
+
 	now := time.Now().UTC()
 
 	// Store the peer ID that sent this block
