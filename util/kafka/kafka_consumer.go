@@ -90,7 +90,8 @@ type KafkaConsumerConfig struct {
 type KafkaConsumerGroup struct {
 	Config KafkaConsumerConfig
 	client *kgo.Client
-	cancel context.CancelFunc
+	cancelMu sync.Mutex
+	cancel   context.CancelFunc
 
 	// For in-memory support
 	inMemoryConsumer *inmemorykafka.InMemoryConsumerGroup
@@ -190,9 +191,13 @@ func (k *KafkaConsumerGroup) Close() error {
 
 	k.Config.Logger.Infof("[Kafka] %s: initiating shutdown of consumer group for topic %s", k.Config.ConsumerGroupID, k.Config.Topic)
 
-	if k.cancel != nil {
+	k.cancelMu.Lock()
+	cancelFn := k.cancel
+	k.cancel = nil
+	k.cancelMu.Unlock()
+	if cancelFn != nil {
 		k.Config.Logger.Debugf("[Kafka] %s: canceling context for topic %s", k.Config.ConsumerGroupID, k.Config.Topic)
-		k.cancel()
+		cancelFn()
 	}
 
 	if k.isInMemory {
@@ -402,10 +407,12 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 	// Apply retry/error handling wrappers
 	consumerFn = wrapConsumerFn(ctx, k.Config.Logger, k.Config.Topic, consumerFn, options)
 
-	// Create internal context and store cancel func before spawning goroutines
-	// to avoid a data race with Close() which reads k.cancel.
+	// Create internal context and store cancel func before spawning goroutines.
+	// Protected by cancelMu to avoid a data race with Close().
 	internalCtx, cancel := context.WithCancel(ctx)
+	k.cancelMu.Lock()
 	k.cancel = cancel
+	k.cancelMu.Unlock()
 
 	go func() {
 		defer cancel()

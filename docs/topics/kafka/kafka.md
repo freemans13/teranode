@@ -323,14 +323,13 @@ Advanced URL parameters for fine-tuning consumer behavior and timeout configurat
 Services that process messages slowly (e.g., subtree validation with large datasets) need increased timeouts to prevent partition abandonment:
 
 ```text
-kafka://localhost:9092/subtrees?partitions=4&consumer_ratio=1&maxProcessingTime=30000&sessionTimeout=90000&heartbeatInterval=20000
+kafka://localhost:9092/subtrees?partitions=4&consumer_ratio=1&sessionTimeout=90000&heartbeatInterval=20000
 ```
 
 This configuration:
 
-- Sets broker fetch wait to 30 seconds (time broker waits for records before returning empty response)
 - Gives 90 seconds before broker declares consumer dead (3x heartbeat interval)
-- Sends heartbeats every 20 seconds
+- Sends heartbeats every 20 seconds, allowing up to ~60 seconds of processing between heartbeats
 
 #### Offset Reset Configuration
 
@@ -349,19 +348,6 @@ kafka://localhost:9092/blocks?offsetReset=earliest
 - `latest`: Skip to newest message (data loss acceptable)
 - `earliest`: Reprocess from oldest available message (no data loss if within retention)
 - `""` (empty): Use `replay` parameter setting (legacy behavior)
-
-#### Channel Buffer Tuning
-
-Increase channel buffer size for high-throughput consumers to reduce context switching:
-
-```text
-kafka://localhost:9092/validator-txs?partitions=8&consumer_ratio=2&channelBufferSize=1024
-```
-
-**Trade-offs**:
-
-- Larger buffers improve throughput but increase memory usage
-- Smaller buffers reduce memory but may cause processing delays
 
 ## 7. Service-Specific Kafka Settings
 

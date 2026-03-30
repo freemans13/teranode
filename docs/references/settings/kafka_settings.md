@@ -84,7 +84,7 @@ memory://test_blocks?partitions=2&consumer_ratio=1
 **Example Consumer URL:**
 
 ```text
-kafka://localhost:9092/subtrees?partitions=8&sessionTimeout=15000&heartbeatInterval=5000&maxProcessingTime=30000
+kafka://localhost:9092/subtrees?partitions=8&sessionTimeout=15000&heartbeatInterval=5000
 ```
 
 **Example Async Producer URL:**
@@ -277,7 +277,7 @@ kafka://localhost:9092/blocks?partitions=8&replication=3&retention=3600000&flush
 ### Slow Processing Consumer
 
 ```text
-kafka://localhost:9092/subtrees?partitions=4&maxProcessingTime=30000&sessionTimeout=60000&heartbeatInterval=20000
+kafka://localhost:9092/subtrees?partitions=4&sessionTimeout=60000&heartbeatInterval=20000
 ```
 
 ### Low-Latency Producer
