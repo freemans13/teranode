@@ -75,7 +75,7 @@ const (
 	// stallResponseTimeoutBlocks is the maximum amount of time a peer will
 	// wait for a block message to be received after sending a getdata
 	// message.
-	stallResponseTimeoutBlocks = 5 * time.Minute
+	stallResponseTimeoutBlocks = 15 * time.Minute
 )
 
 var (
