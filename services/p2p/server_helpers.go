@@ -77,11 +77,9 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 
 	// Ignore our own messages
 	if s.isOwnMessage(fromID, blockMessage.PeerID) {
-		s.logger.Infof("[handleBlockTopic] ignoring own block message for %s from %s", blockMessage.Hash, fromID)
+		s.logger.Debugf("[handleBlockTopic] ignoring own block message for %s", blockMessage.Hash)
 		return
 	}
-
-	s.logger.Infof("[handleBlockTopic] CHECKPOINT-A block %s passed isOwnMessage", blockMessage.Hash)
 
 	now := time.Now().UTC()
 
@@ -104,23 +102,17 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 
 	// Skip notifications from banned peers
 	if s.shouldSkipBannedPeer(blockMessage.PeerID, "handleBlockTopic") {
-		s.logger.Infof("[handleBlockTopic] SKIPPED block %s - banned peer %s", blockMessage.Hash, blockMessage.PeerID)
 		return
 	}
 
-	// Skip notifications from unhealthy peers
-	if s.shouldSkipUnhealthyPeer(blockMessage.PeerID, "handleBlockTopic") {
-		s.logger.Infof("[handleBlockTopic] SKIPPED block %s - unhealthy peer %s", blockMessage.Hash, blockMessage.PeerID)
-		return
-	}
+	// Note: we intentionally do NOT filter blocks from unhealthy peers here.
+	// Block validation handles bad blocks safely, and filtering blocks from
+	// low-reputation peers prevents catchup when the node is behind.
 
 	hash, err = s.parseHash(blockMessage.Hash, "handleBlockTopic")
 	if err != nil {
-		s.logger.Infof("[handleBlockTopic] SKIPPED block %s - parseHash error: %v", blockMessage.Hash, err)
 		return
 	}
-
-	s.logger.Infof("[handleBlockTopic] PASSED all filters for block %s from peer %s", blockMessage.Hash, blockMessage.PeerID)
 
 	// Always send block to kafka - let block validation service decide what to do based on sync state
 	// send block to kafka, if configured
@@ -131,7 +123,7 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 			PeerId: blockMessage.PeerID,
 		}
 
-		s.logger.Infof("[handleBlockTopic] Sending block %s to Kafka", hash.String())
+		s.logger.Debugf("[handleBlockTopic] Sending block %s to Kafka", hash.String())
 
 		value, err := proto.Marshal(msg)
 		if err != nil {
