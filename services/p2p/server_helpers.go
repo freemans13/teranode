@@ -77,7 +77,7 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 
 	// Ignore our own messages
 	if s.isOwnMessage(fromID, blockMessage.PeerID) {
-		s.logger.Debugf("[handleBlockTopic] ignoring own block message for %s", blockMessage.Hash)
+		s.logger.Infof("[handleBlockTopic] ignoring own block message for %s from %s", blockMessage.Hash, fromID)
 		return
 	}
 
