@@ -150,8 +150,16 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		if existsErr == nil && subtreeToCheckExists {
 			subtreeReader, readErr := u.subtreeStore.GetIoReader(ctx, firstHash[:], fileformat.FileTypeSubtreeToCheck)
 			if readErr == nil {
-				sampleSubtree, _ = subtreepkg.NewSubtreeFromReader(subtreeReader)
-				subtreeReader.Close()
+				defer func() {
+					if cerr := subtreeReader.Close(); cerr != nil {
+						u.logger.Infof("[CheckBlockSubtrees] Error closing subtree reader for hash %s: %v", firstHash.String(), cerr)
+					}
+				}()
+				if st, err := subtreepkg.NewSubtreeFromReader(subtreeReader); err == nil {
+					sampleSubtree = st
+				} else {
+					u.logger.Infof("[CheckBlockSubtrees] Failed to deserialize local subtree_to_check for hash %s: %v", firstHash.String(), err)
+				}
 			}
 		}
 
@@ -160,15 +168,33 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			url := fmt.Sprintf("%s/subtree/%s", request.BaseUrl, firstHash.String())
 			subtreeNodeBytes, fetchErr := util.DoHTTPRequest(ctx, url)
 			if fetchErr == nil && len(subtreeNodeBytes) > 0 {
-				sampleSubtree, _ = subtreepkg.NewIncompleteTreeByLeafCount(len(subtreeNodeBytes) / chainhash.HashSize)
-				if sampleSubtree != nil {
-					var nodeHash chainhash.Hash
-					for i := 0; i < len(subtreeNodeBytes)/chainhash.HashSize; i++ {
-						copy(nodeHash[:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
-						if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-							_ = sampleSubtree.AddCoinbaseNode()
-						} else {
-							_ = sampleSubtree.AddNode(nodeHash, 0, 0)
+				if len(subtreeNodeBytes)%chainhash.HashSize != 0 {
+					u.logger.Infof("[CheckBlockSubtrees] Invalid subtree sample from peer: length %d not a multiple of hash size %d",
+						len(subtreeNodeBytes), chainhash.HashSize)
+				} else {
+					leafCount := len(subtreeNodeBytes) / chainhash.HashSize
+					var treeErr error
+					sampleSubtree, treeErr = subtreepkg.NewIncompleteTreeByLeafCount(leafCount)
+					if treeErr != nil {
+						u.logger.Infof("[CheckBlockSubtrees] Failed to create sample subtree with %d leaves: %v", leafCount, treeErr)
+						sampleSubtree = nil
+					} else if sampleSubtree != nil {
+						var nodeHash chainhash.Hash
+						for i := 0; i < leafCount; i++ {
+							copy(nodeHash[:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
+							if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+								if err := sampleSubtree.AddCoinbaseNode(); err != nil {
+									u.logger.Infof("[CheckBlockSubtrees] Failed to add coinbase node at index %d: %v", i, err)
+									sampleSubtree = nil
+									break
+								}
+							} else {
+								if err := sampleSubtree.AddNode(nodeHash, 0, 0); err != nil {
+									u.logger.Infof("[CheckBlockSubtrees] Failed to add node at index %d: %v", i, err)
+									sampleSubtree = nil
+									break
+								}
+							}
 						}
 					}
 				}
@@ -176,11 +202,21 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 
 		if sampleSubtree != nil && len(sampleSubtree.Nodes) > 0 {
-			hitRate := u.sampleLocalAvailability(ctx, sampleSubtree, u.settings.SubtreeValidation.LocalAvailabilitySampleSize)
-			if hitRate < u.settings.SubtreeValidation.LocalAvailabilityThreshold {
+			// Clamp sampling configuration to safe defaults to avoid divide-by-zero and zero-threshold behavior
+			clampedSampleSize := u.settings.SubtreeValidation.LocalAvailabilitySampleSize
+			if clampedSampleSize <= 0 {
+				clampedSampleSize = 100
+			}
+			clampedThreshold := u.settings.SubtreeValidation.LocalAvailabilityThreshold
+			if clampedThreshold <= 0 {
+				clampedThreshold = 0.9
+			}
+
+			hitRate := u.sampleLocalAvailability(ctx, sampleSubtree, clampedSampleSize)
+			if hitRate < clampedThreshold {
 				bulkDownload = true
 				u.logger.Infof("[CheckBlockSubtrees] Sample check: %.1f%% hit rate (threshold %.1f%%) — switching to bulk download",
-					hitRate*100, u.settings.SubtreeValidation.LocalAvailabilityThreshold*100)
+					hitRate*100, clampedThreshold*100)
 			} else {
 				u.logger.Infof("[CheckBlockSubtrees] Sample check: %.1f%% hit rate — skipping subtree_data download, local txs available",
 					hitRate*100)
@@ -494,7 +530,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	for attempt := 0; len(remainingSubtrees) > 0; attempt++ {
 		previousCount := len(remainingSubtrees)
 		var stillFailing []chainhash.Hash
-		var lastErr error
+		subtreeErrors := make(map[chainhash.Hash]error)
 
 		for _, subtreeHash := range remainingSubtrees {
 			v := ValidateSubtree{
@@ -516,7 +552,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			if err != nil {
 				u.logger.Debugf("[CheckBlockSubtreesRequest] Convergence attempt %d: subtree %s failed: %v", attempt+1, subtreeHash.String(), err)
 				stillFailing = append(stillFailing, subtreeHash)
-				lastErr = err
+				subtreeErrors[subtreeHash] = err
 				continue
 			}
 
@@ -529,9 +565,10 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 		if len(remainingSubtrees) > 0 && len(remainingSubtrees) >= previousCount {
 			// No progress — return error for the first still-failing subtree
+			firstHash := remainingSubtrees[0]
 			return nil, errors.WrapGRPC(errors.NewProcessingError(
 				"[CheckBlockSubtreesRequest] Failed to validate %d subtrees after %d convergence attempts, first: %s",
-				len(remainingSubtrees), attempt+1, remainingSubtrees[0].String(), lastErr,
+				len(remainingSubtrees), attempt+1, firstHash.String(), subtreeErrors[firstHash],
 			))
 		}
 

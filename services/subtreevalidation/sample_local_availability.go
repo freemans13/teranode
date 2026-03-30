@@ -25,6 +25,10 @@ func (u *Server) sampleLocalAvailability(ctx context.Context, subtree *subtreepk
 		return 0.0
 	}
 
+	if sampleSize <= 0 {
+		sampleSize = 100
+	}
+
 	if sampleSize > len(nodes) {
 		sampleSize = len(nodes)
 	}

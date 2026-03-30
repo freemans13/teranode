@@ -550,6 +550,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseOrderedLevelAlgorithm:                  getBool("subtreevalidation_useOrderedLevelAlgorithm", true, alternativeContext...),
 			BlocksOnly:                                getBool("subtreevalidation_blocks_only", false, alternativeContext...),
 			CheckBlockSubtreesTimeout:                 getDuration("subtreevalidation_check_block_subtrees_timeout", 30*time.Minute, alternativeContext...),
+			LocalAvailabilitySampleSize:               getInt("subtreevalidation_local_availability_sample_size", 100, alternativeContext...),
+			LocalAvailabilityThreshold:                getFloat64("subtreevalidation_local_availability_threshold", 0.9, alternativeContext...),
 		},
 		Legacy: LegacySettings{
 			WorkingDir:                       getString("legacy_workingDir", "../../data", alternativeContext...),
