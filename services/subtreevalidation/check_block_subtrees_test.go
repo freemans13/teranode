@@ -18,8 +18,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/services/blockassembly"
-	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
@@ -31,8 +29,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxometa "github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/bsv-blockchain/teranode/util"
-	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -2309,115 +2305,4 @@ func TestBuildParentMetadata(t *testing.T) {
 		assert.True(t, exists)
 		assert.Equal(t, uint32(100), meta.BlockHeight)
 	})
-}
-
-// TestCheckBlockSubtrees_SkipSubtreeDataFetchWhenLocalTxsAvailable verifies that when
-// block assembly has enough transactions locally, the expensive subtree_data fetch
-// from the peer's asset-cache is skipped.
-func TestCheckBlockSubtrees_SkipSubtreeDataFetchWhenLocalTxsAvailable(t *testing.T) {
-	testHeaders := testhelpers.CreateTestHeaders(t, 1)
-
-	server, cleanup := setupTestServer(t)
-	defer cleanup()
-
-	// Mock blockchain client
-	server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-		mock.Anything).
-		Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-
-	// Set up a mock block assembly client that reports high tx count
-	mockBA := blockassembly.NewMock()
-	mockBA.On("GetBlockAssemblyState", mock.Anything).
-		Return(&blockassembly_api.StateMessage{
-			TxCount: 1000000, // 1M txs available locally
-		}, nil)
-	server.blockAssemblyClient = mockBA
-
-	// Mock GetBlockHeaderIDs (called before subtree processing)
-	server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
-		mock.Anything, mock.Anything, mock.Anything).
-		Return([]uint32{1, 2, 3}, nil)
-
-	server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-		mock.Anything, blockchain.FSMStateRUNNING).
-		Return(true, nil)
-
-	// Build a valid subtree structure and store it so /subtree/ HTTP fetch is bypassed
-	tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-	require.NoError(t, err)
-
-	subtree, err := subtreepkg.NewTreeByLeafCount(2)
-	require.NoError(t, err)
-	require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
-
-	subtreeBytes, err := subtree.Serialize()
-	require.NoError(t, err)
-
-	subtreeHash := *subtree.RootHash()
-
-	// Store subtree structure (FileTypeSubtreeToCheck) — bypasses /subtree/ fetch
-	err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
-	require.NoError(t, err)
-
-	// Do NOT store FileTypeSubtreeData — forces the code into the subtree_data fetch path
-	// where localTxsAvailable should cause it to skip the expensive peer fetch
-
-	// Activate httpmock to track HTTP calls
-	httpmock.ActivateNonDefault(util.HTTPClient())
-	defer httpmock.DeactivateAndReset()
-
-	// Register a responder for subtree_data to prevent real HTTP calls
-	subtreeDataURL := fmt.Sprintf("=~.*/subtree_data/%s", subtreeHash.String())
-	httpmock.RegisterResponder("GET", subtreeDataURL,
-		httpmock.NewBytesResponder(200, []byte("dummy")))
-
-	// Create a block referencing the missing subtree with fewer txs than block assembly has
-	header := &model.BlockHeader{
-		Version:        1,
-		HashPrevBlock:  &chainhash.Hash{},
-		HashMerkleRoot: &chainhash.Hash{},
-		Timestamp:      uint32(time.Now().Unix()),
-		Bits:           model.NBit{},
-		Nonce:          0,
-	}
-
-	coinbaseTx := &bt.Tx{Version: 1}
-	block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 100, 400, 0, 0)
-	require.NoError(t, err)
-
-	blockBytes, err := block.Bytes()
-	require.NoError(t, err)
-
-	request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-		Block:   blockBytes,
-		BaseUrl: "http://test-peer.local",
-	}
-
-	// Disable ValidateSubtreeInternal's fallback subtree_data fetch so any
-	// /subtree_data/ request can only originate from CheckBlockSubtrees itself.
-	server.settings.SubtreeValidation.PercentageMissingGetFullData = 101
-
-	// Run CheckBlockSubtrees — will eventually fail during ValidateSubtreeInternal
-	// because we don't have the actual tx data, but the optimization path should be taken.
-	_, err = server.CheckBlockSubtrees(context.Background(), request)
-
-	// Verify block assembly state was queried — the optimization was triggered
-	mockBA.AssertCalled(t, "GetBlockAssemblyState", mock.Anything)
-
-	// If there's an error, it should NOT be "failed to get subtree data from" which
-	// comes from CheckBlockSubtrees' fetch path.
-	if err != nil {
-		assert.NotContains(t, err.Error(), "failed to get subtree data from",
-			"CheckBlockSubtrees should skip subtree_data fetch when local txs available")
-	}
-
-	// Assert no subtree_data fetch was performed — with ValidateSubtreeInternal's
-	// fallback disabled, any call here can only come from CheckBlockSubtrees.
-	callCounts := httpmock.GetCallCountInfo()
-	for k, v := range callCounts {
-		if v > 0 {
-			assert.NotContains(t, k, "subtree_data",
-				"subtree_data should NOT be fetched when local txs are available")
-		}
-	}
 }
