@@ -102,18 +102,23 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 
 	// Skip notifications from banned peers
 	if s.shouldSkipBannedPeer(blockMessage.PeerID, "handleBlockTopic") {
+		s.logger.Infof("[handleBlockTopic] SKIPPED block %s - banned peer %s", blockMessage.Hash, blockMessage.PeerID)
 		return
 	}
 
 	// Skip notifications from unhealthy peers
 	if s.shouldSkipUnhealthyPeer(blockMessage.PeerID, "handleBlockTopic") {
+		s.logger.Infof("[handleBlockTopic] SKIPPED block %s - unhealthy peer %s", blockMessage.Hash, blockMessage.PeerID)
 		return
 	}
 
 	hash, err = s.parseHash(blockMessage.Hash, "handleBlockTopic")
 	if err != nil {
+		s.logger.Infof("[handleBlockTopic] SKIPPED block %s - parseHash error: %v", blockMessage.Hash, err)
 		return
 	}
+
+	s.logger.Infof("[handleBlockTopic] PASSED all filters for block %s from peer %s", blockMessage.Hash, blockMessage.PeerID)
 
 	// Always send block to kafka - let block validation service decide what to do based on sync state
 	// send block to kafka, if configured
