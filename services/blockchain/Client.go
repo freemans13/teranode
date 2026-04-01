@@ -668,13 +668,14 @@ func (c *Client) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *m
 	}
 
 	meta := &model.BlockHeaderMeta{
-		Height:      resp.Height,
-		TxCount:     resp.TxCount,
-		SizeInBytes: resp.SizeInBytes,
-		Miner:       resp.Miner,
-		BlockTime:   resp.BlockTime,
-		Timestamp:   resp.Timestamp,
-		ChainWork:   resp.ChainWork,
+		Height:         resp.Height,
+		TxCount:        resp.TxCount,
+		SizeInBytes:    resp.SizeInBytes,
+		Miner:          resp.Miner,
+		BlockTime:      resp.BlockTime,
+		Timestamp:      resp.Timestamp,
+		ChainWork:      resp.ChainWork,
+		MedianTimePast: resp.MedianTimePast,
 	}
 
 	return header, meta, nil
@@ -752,18 +753,19 @@ func (c *Client) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) 
 	}
 
 	meta := &model.BlockHeaderMeta{
-		ID:          resp.Id,
-		Height:      resp.Height,
-		TxCount:     resp.TxCount,
-		SizeInBytes: resp.SizeInBytes,
-		Miner:       resp.Miner,
-		PeerID:      resp.PeerId,
-		BlockTime:   resp.BlockTime,
-		Timestamp:   resp.Timestamp,
-		ChainWork:   resp.ChainWork,
-		MinedSet:    resp.MinedSet,
-		SubtreesSet: resp.SubtreesSet,
-		Invalid:     resp.Invalid,
+		ID:             resp.Id,
+		Height:         resp.Height,
+		TxCount:        resp.TxCount,
+		SizeInBytes:    resp.SizeInBytes,
+		Miner:          resp.Miner,
+		PeerID:         resp.PeerId,
+		BlockTime:      resp.BlockTime,
+		Timestamp:      resp.Timestamp,
+		ChainWork:      resp.ChainWork,
+		MinedSet:       resp.MinedSet,
+		SubtreesSet:    resp.SubtreesSet,
+		Invalid:        resp.Invalid,
+		MedianTimePast: resp.MedianTimePast,
 	}
 
 	if resp.ProcessedAt != nil {
@@ -2420,4 +2422,41 @@ func (c *Client) CompleteBlobDeletionBatch(ctx context.Context, batchToken strin
 	}
 
 	return nil
+}
+
+// GetMedianTimePastForHeights returns the MTP for one or more block heights.
+func (c *Client) GetMedianTimePastForHeights(ctx context.Context, heights []uint32) ([]uint32, error) {
+	resp, err := c.client.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{
+		Heights: heights,
+	})
+	if err != nil {
+		return nil, errors.UnwrapGRPC(err)
+	}
+
+	return resp.MedianTimePast, nil
+}
+
+// GetMedianTimePastRange returns the MTP values for all blocks in [fromHeight, toHeight].
+// Returns a dense slice where result[i] = MTP for height (fromHeight + i).
+// Internally builds a full heights array to reuse the existing GetMedianTimePastByHeights RPC,
+// avoiding the need for a new proto endpoint.
+func (c *Client) GetMedianTimePastRange(ctx context.Context, fromHeight, toHeight uint32) ([]uint32, error) {
+	if toHeight < fromHeight {
+		return []uint32{}, nil
+	}
+
+	count := toHeight - fromHeight + 1
+	heights := make([]uint32, count)
+	for i := range heights {
+		heights[i] = fromHeight + uint32(i)
+	}
+
+	resp, err := c.client.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{
+		Heights: heights,
+	})
+	if err != nil {
+		return nil, errors.UnwrapGRPC(err)
+	}
+
+	return resp.MedianTimePast, nil
 }
