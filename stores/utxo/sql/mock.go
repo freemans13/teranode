@@ -192,74 +192,75 @@ func CreateMockDBForSchema() *MockDB {
 
 // SetupCreatePostgresSchemaSuccessMocks configures mock expectations for successful schema creation
 func SetupCreatePostgresSchemaSuccessMocks(mockDB *MockDB) {
-	// Mock all 15+ DDL operations that createPostgresSchema performs
+	// Mock all DDL operations that createPostgresSchema performs.
+	// Step numbers match the stepMatchers indices in SetupCreatePostgresSchemaErrorMocks.
 
-	// 1. CREATE TABLE transactions
+	// Step 0: CREATE TABLE transactions
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE TABLE IF NOT EXISTS transactions")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 2. CREATE INDEX ux_transactions_hash
+	// Step 1: CREATE INDEX ux_transactions_hash
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_hash")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 3. CREATE INDEX px_unmined_since_transactions
+	// Step 2: CREATE INDEX px_unmined_since_transactions
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE INDEX IF NOT EXISTS px_unmined_since_transactions")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 4. CREATE INDEX ux_transactions_delete_at_height
+	// Step 3: CREATE INDEX ux_transactions_delete_at_height
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE INDEX IF NOT EXISTS ux_transactions_delete_at_height")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 5. CREATE TABLE inputs
+	// Step 4: CREATE TABLE inputs
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE TABLE IF NOT EXISTS inputs")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 6. Ensure CASCADE FK on inputs (combined DROP if non-CASCADE + ADD if missing)
+	// Step 5: Ensure CASCADE FK on inputs (combined DROP if non-CASCADE + ADD if missing)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "inputs_transaction_id_fkey") && strings.Contains(query, "confdeltype")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 8. CREATE TABLE outputs
+	// Step 6: CREATE TABLE outputs
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE TABLE IF NOT EXISTS outputs")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 9. Ensure CASCADE FK on outputs (combined DROP if non-CASCADE + ADD if missing)
+	// Step 7: Ensure CASCADE FK on outputs (combined DROP if non-CASCADE + ADD if missing)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "outputs_transaction_id_fkey") && strings.Contains(query, "confdeltype")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 11. CREATE TABLE block_ids
+	// Step 8: CREATE TABLE block_ids
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE TABLE IF NOT EXISTS block_ids")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 12. ADD COLUMN block_height and subtree_idx to block_ids (DO $$ block)
+	// Step 9: ADD COLUMN block_height and subtree_idx to block_ids (DO $$ block)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "block_ids") && strings.Contains(query, "ADD COLUMN")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 12. ADD COLUMN unmined_since to transactions (DO $$ block)
+	// Step 10: ADD COLUMN unmined_since to transactions (DO $$ block)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "unmined_since") && strings.Contains(query, "ADD COLUMN")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 13. ADD COLUMN preserve_until to transactions (DO $$ block)
+	// Step 11: ADD COLUMN preserve_until to transactions (DO $$ block)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "preserve_until") && strings.Contains(query, "ADD COLUMN")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 14. Ensure CASCADE FK on block_ids (combined DROP if non-CASCADE + ADD if missing)
+	// Step 12: Ensure CASCADE FK on block_ids (combined DROP if non-CASCADE + ADD if missing)
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "DO $$") && strings.Contains(query, "block_ids_transaction_id_fkey") && strings.Contains(query, "confdeltype")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)
 
-	// 16. CREATE TABLE IF NOT EXISTS conflicting_children
+	// Step 13: CREATE TABLE IF NOT EXISTS conflicting_children
 	mockDB.On("Exec", mock.MatchedBy(func(query string) bool {
 		return strings.Contains(query, "CREATE TABLE IF NOT EXISTS conflicting_children")
 	}), mock.Anything).Return(sqlmock.NewResult(0, 0), nil)

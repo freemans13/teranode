@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"testing"
-	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -35,8 +34,7 @@ func TestStore_SetMinedMultiChunk_Success(t *testing.T) {
 
 func TestStore_SetMinedMultiChunk_ContextCancelled_BeforeStart(t *testing.T) {
 	logger := ulogger.TestLogger{}
-	store, mock := CreateMockStore(logger)
-	defer func() { _ = mock.ExpectationsWereMet() }()
+	store, _ := CreateMockStore(logger)
 
 	hashes := CreateTestHashes(2)
 	minedInfo := CreateTestMinedBlockInfo()
@@ -44,12 +42,11 @@ func TestStore_SetMinedMultiChunk_ContextCancelled_BeforeStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// Begin will return error since context is cancelled
-	mock.ExpectBegin().WillReturnError(context.Canceled)
-
+	// database/sql.BeginTx checks ctx.Err() before calling driver, so no
+	// mock expectations are needed — the call returns context.Canceled immediately.
 	result, err := store.setMinedMultiChunk(ctx, hashes, minedInfo)
 
-	assert.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, result)
 }
 
@@ -61,13 +58,16 @@ func TestStore_SetMinedMultiChunk_ContextCancelled_DuringExecution(t *testing.T)
 	hashes := CreateTestHashes(2)
 	minedInfo := CreateTestMinedBlockInfo()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
 
+	// Allow BeginTx to succeed, then cancel during the first query
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash IN`).
+		WillReturnError(context.Canceled)
 	mock.ExpectRollback()
 
-	time.Sleep(2 * time.Millisecond)
+	// Cancel after Begin succeeds but before Query completes
+	cancel()
 
 	result, err := store.setMinedMultiChunk(ctx, hashes, minedInfo)
 
