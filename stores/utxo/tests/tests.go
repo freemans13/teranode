@@ -36,7 +36,7 @@ func newTestTx(t *testing.T, satoshis uint64) *bt.Tx {
 		Satoshis:      Tx.Inputs[0].PreviousTxSatoshis,
 	}))
 	tx.Inputs[0].UnlockingScript = dummyUnlockingScript
-	_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", satoshis)
+	require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", satoshis))
 	return tx
 }
 

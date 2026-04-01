@@ -75,10 +75,10 @@ func InitPostgresDB(logger ulogger.Logger, storeURL *url.URL, tSettings *setting
 	dbInfo := fmt.Sprintf("user=%s password=%s dbname=%s sslmode=%s host=%s port=%d", dbUser, dbPassword, dbName, sslMode, dbHost, dbPort)
 
 	// Use pgx/stdlib with QueryExecModeExec to skip prepared statement overhead.
-	// QueryExecModeExec uses the extended protocol but skips Parse, sending inline params.
-	// Testing CTE+UNNEST with ExecModeExec to isolate CTE execution cost from
-	// CacheStatement's generic plan overhead. Previous CTE test used CacheStatement
-	// which may have caused slow batch times via generic plan degradation.
+	// QueryExecModeExec skips the Prepare step (no Parse/Describe round-trip),
+	// sending parameters as bound values without caching a named statement.
+	// This avoids generic-plan degradation that CacheStatement mode can cause
+	// with CTE+UNNEST batch queries on large datasets.
 	connConfig, err := pgx.ParseConfig(dbInfo)
 	if err != nil {
 		return nil, errors.NewServiceError("failed to parse postgres config", err)

@@ -2531,8 +2531,8 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 		hashBytes[i] = hash[:]
 	}
 
-	// Start a database transaction
-	txn, err := s.db.Begin()
+	// Start a database transaction (use BeginTx so context cancellation is respected)
+	txn, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
