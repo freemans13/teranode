@@ -378,9 +378,9 @@ func Sanity(t *testing.T, db utxostore.Store) {
 
 		// create spending tx
 		spentTx := bt.NewTx()
-		_ = spentTx.From(stx.TxIDChainHash().String(), 0, stx.Outputs[0].LockingScript.String(), stx.Outputs[0].Satoshis)
-		_ = spentTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", i)
-		_ = spentTx.ChangeToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", &bt.FeeQuote{})
+		require.NoError(t, spentTx.From(stx.TxIDChainHash().String(), 0, stx.Outputs[0].LockingScript.String(), stx.Outputs[0].Satoshis))
+		require.NoError(t, spentTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", i))
+		require.NoError(t, spentTx.ChangeToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", &bt.FeeQuote{}))
 
 		_, err = db.Spend(ctx, spentTx, db.GetBlockHeight()+1)
 		require.NoError(t, err)
@@ -457,8 +457,8 @@ func SpendErrorTypes(t *testing.T, db utxostore.Store) {
 		// Build a spending tx that references a parent that doesn't exist in the store.
 		nonExistentHash, _ := chainhash.NewHashFromStr("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 		nonExistentSpendTx := bt.NewTx()
-		_ = nonExistentSpendTx.From(nonExistentHash.String(), 0, Tx.Outputs[0].LockingScript.String(), Tx.Outputs[0].Satoshis)
-		_ = nonExistentSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+		require.NoError(t, nonExistentSpendTx.From(nonExistentHash.String(), 0, Tx.Outputs[0].LockingScript.String(), Tx.Outputs[0].Satoshis))
+		require.NoError(t, nonExistentSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
 
 		resultSpends, err := db.Spend(ctx, nonExistentSpendTx, db.GetBlockHeight()+1)
 		require.Error(t, err)
@@ -478,12 +478,12 @@ func SpendErrorTypes(t *testing.T, db utxostore.Store) {
 		// Build a spending tx but tamper with the PreviousTxScript so the UTXO hash
 		// computed at spend time doesn't match what's stored.
 		tamperedSpendTx := bt.NewTx()
-		_ = tamperedSpendTx.From(
+		require.NoError(t, tamperedSpendTx.From(
 			uniqueTx.TxIDChainHash().String(), 0,
 			Tx.Outputs[1].LockingScript.String(), // wrong locking script → wrong UTXO hash
 			uniqueTx.Outputs[0].Satoshis,
-		)
-		_ = tamperedSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+		))
+		require.NoError(t, tamperedSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
 
 		resultSpends, err := db.Spend(ctx, tamperedSpendTx, db.GetBlockHeight()+1)
 		require.Error(t, err)
@@ -502,9 +502,9 @@ func SpendErrorTypes(t *testing.T, db utxostore.Store) {
 			UnlockingScript:    bscript.NewFromBytes([]byte{0x04, 0xff, 0xff, 0x00, 0x1d}), // coinbase data
 		}
 		// Coinbase inputs have all-zero PreviousTxID
-		_ = coinbaseInput.PreviousTxIDAdd(&chainhash.Hash{})
+		require.NoError(t, coinbaseInput.PreviousTxIDAdd(&chainhash.Hash{}))
 		coinbaseTx.Inputs = []*bt.Input{coinbaseInput}
-		_ = coinbaseTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5_000_000_000)
+		require.NoError(t, coinbaseTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5_000_000_000))
 
 		_, err := db.Create(ctx, coinbaseTx, 1000, utxostore.WithSetCoinbase(true))
 		require.NoError(t, err)
@@ -514,12 +514,12 @@ func SpendErrorTypes(t *testing.T, db utxostore.Store) {
 		// CoinbaseMaturity in test settings is 1, so coinbaseSpendingHeight = 1000 + 1 = 1001.
 		// Spending at blockHeight <= coinbaseSpendingHeight should fail.
 		coinbaseSpendTx := bt.NewTx()
-		_ = coinbaseSpendTx.From(
+		require.NoError(t, coinbaseSpendTx.From(
 			coinbaseTx.TxIDChainHash().String(), 0,
 			coinbaseTx.Outputs[0].LockingScript.String(),
 			coinbaseTx.Outputs[0].Satoshis,
-		)
-		_ = coinbaseSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+		))
+		require.NoError(t, coinbaseSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
 
 		resultSpends, err := db.Spend(ctx, coinbaseSpendTx, 1000)
 		require.Error(t, err)
@@ -539,24 +539,24 @@ func SpendErrorTypes(t *testing.T, db utxostore.Store) {
 
 		// First spend succeeds
 		spendTx1 := bt.NewTx()
-		_ = spendTx1.From(
+		require.NoError(t, spendTx1.From(
 			uniqueTx.TxIDChainHash().String(), 0,
 			uniqueTx.Outputs[0].LockingScript.String(),
 			uniqueTx.Outputs[0].Satoshis,
-		)
-		_ = spendTx1.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+		))
+		require.NoError(t, spendTx1.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
 
 		_, err = db.Spend(ctx, spendTx1, db.GetBlockHeight()+1)
 		require.NoError(t, err)
 
 		// Second spend with a DIFFERENT spending tx → double spend
 		spendTx2 := bt.NewTx()
-		_ = spendTx2.From(
+		require.NoError(t, spendTx2.From(
 			uniqueTx.TxIDChainHash().String(), 0,
 			uniqueTx.Outputs[0].LockingScript.String(),
 			uniqueTx.Outputs[0].Satoshis,
-		)
-		_ = spendTx2.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2000) // different amount → different txid
+		))
+		require.NoError(t, spendTx2.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2000)) // different amount → different txid
 
 		resultSpends, err := db.Spend(ctx, spendTx2, db.GetBlockHeight()+1)
 		require.Error(t, err)
@@ -636,12 +636,12 @@ func SetLockedBehavior(t *testing.T, db utxostore.Store) {
 
 	// Spending a locked tx should fail with ErrTxLocked
 	lockedSpendTx := bt.NewTx()
-	_ = lockedSpendTx.From(
+	require.NoError(t, lockedSpendTx.From(
 		uniqueTx.TxIDChainHash().String(), 0,
 		uniqueTx.Outputs[0].LockingScript.String(),
 		uniqueTx.Outputs[0].Satoshis,
-	)
-	_ = lockedSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+	))
+	require.NoError(t, lockedSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
 
 	resultSpends, err := db.Spend(ctx, lockedSpendTx, db.GetBlockHeight()+1)
 	require.Error(t, err)
@@ -707,12 +707,12 @@ func SetConflictingBehavior(t *testing.T, db utxostore.Store) {
 
 	// Spending should fail with ErrTxConflicting
 	conflictingSpendTx := bt.NewTx()
-	_ = conflictingSpendTx.From(
+	require.NoError(t, conflictingSpendTx.From(
 		Tx.TxIDChainHash().String(), 0,
 		Tx.Outputs[0].LockingScript.String(),
 		Tx.Outputs[0].Satoshis,
-	)
-	_ = conflictingSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+	))
+	require.NoError(t, conflictingSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
 
 	resultSpends, err := db.Spend(ctx, conflictingSpendTx, db.GetBlockHeight()+1)
 	require.Error(t, err)
@@ -799,12 +799,12 @@ func SpendIdempotent(t *testing.T, db utxostore.Store) {
 
 	// Build a spending tx
 	idempotentSpendTx := bt.NewTx()
-	_ = idempotentSpendTx.From(
+	require.NoError(t, idempotentSpendTx.From(
 		uniqueTx.TxIDChainHash().String(), 0,
 		uniqueTx.Outputs[0].LockingScript.String(),
 		uniqueTx.Outputs[0].Satoshis,
-	)
-	_ = idempotentSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+	))
+	require.NoError(t, idempotentSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
 
 	// First spend succeeds
 	_, err = db.Spend(ctx, idempotentSpendTx, db.GetBlockHeight()+1)
@@ -833,12 +833,12 @@ func SetMinedWithSpent(t *testing.T, db utxostore.Store) {
 	// Spend ALL outputs of Tx
 	for vout, output := range Tx.Outputs {
 		spendingTx := bt.NewTx()
-		_ = spendingTx.From(
+		require.NoError(t, spendingTx.From(
 			Tx.TxIDChainHash().String(), uint32(vout),
 			output.LockingScript.String(),
 			output.Satoshis,
-		)
-		_ = spendingTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+		))
+		require.NoError(t, spendingTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
 
 		_, err = db.Spend(ctx, spendingTx, db.GetBlockHeight()+1)
 		require.NoError(t, err, "spending output %d should succeed", vout)
