@@ -50,9 +50,13 @@ func (s *PrunedTxSet) shard(h chainhash.Hash) *prunedTxShard {
 func (s *PrunedTxSet) Add(h chainhash.Hash) {
 	sh := s.shard(h)
 	sh.mu.Lock()
-	sh.m[h] = struct{}{}
+	if _, exists := sh.m[h]; !exists {
+		sh.m[h] = struct{}{}
+		sh.mu.Unlock()
+		s.count.Add(1)
+		return
+	}
 	sh.mu.Unlock()
-	s.count.Add(1)
 }
 
 // Contains checks if a TXID is in the set without removing it.

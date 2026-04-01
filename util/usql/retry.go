@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
 	"modernc.org/sqlite"
@@ -405,17 +406,12 @@ func retryExecOperationNoContext(config RetryConfig, operation func() (sql.Resul
 }
 
 // asPgError unwraps err looking for a *pgconn.PgError (pgx driver).
-// Equivalent to errors.As without importing the standard errors package.
+// Uses errors.As to handle both single-error and multi-error chains
+// (e.g. from errors.Join).
 func asPgError(err error) *pgconn.PgError {
-	for err != nil {
-		if pgErr, ok := err.(*pgconn.PgError); ok {
-			return pgErr
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return nil
-		}
-		err = u.Unwrap()
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr
 	}
 	return nil
 }
