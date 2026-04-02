@@ -105,10 +105,9 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 		return
 	}
 
-	// Skip notifications from unhealthy peers
-	if s.shouldSkipUnhealthyPeer(blockMessage.PeerID, "handleBlockTopic") {
-		return
-	}
+	// Note: we intentionally do NOT filter blocks from unhealthy peers here.
+	// Block validation handles bad blocks safely, and filtering blocks from
+	// low-reputation peers prevents catchup when the node is behind.
 
 	hash, err = s.parseHash(blockMessage.Hash, "handleBlockTopic")
 	if err != nil {
