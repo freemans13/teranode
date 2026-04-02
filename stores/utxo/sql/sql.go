@@ -1166,10 +1166,10 @@ func classifyInsertError(err error, isCoinbase bool, entity string) error {
 // from either pgx (pgconn.PgError) or lib/pq (pq.Error).
 func asPgUniqueViolation(err error) error {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+	if errors.As(err, &pgErr) && pgErr.Code == pgErrUniqueViolation {
 		return pgErr
 	}
-	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == pgErrUniqueViolation {
 		return pqErr
 	}
 	return nil
@@ -4475,6 +4475,8 @@ func (s *Store) RawDB() *usql.DB {
 // headroom for additional parameters in the same query (e.g. block_id, height).
 // maxPostgresParams is the safe upper bound for SQL bind parameters per statement.
 // PostgreSQL supports 65535, but SQLite defaults to 999. Use the lower limit to cover both.
+const pgErrUniqueViolation = "23505"
+
 const maxPostgresParams = 999
 
 const maxINClauseSize = 400
