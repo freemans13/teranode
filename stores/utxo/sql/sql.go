@@ -1727,8 +1727,11 @@ func isDeadlock(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "deadlock detected") || strings.Contains(msg, "database is locked")
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+		return true
+	}
+	return strings.Contains(err.Error(), "database is locked")
 }
 
 // sendSpendBatch is the batcher callback that processes a batch of spend operations

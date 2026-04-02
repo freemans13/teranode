@@ -59,15 +59,13 @@ func TestStore_SetMinedMultiChunk_ContextCancelled_DuringExecution(t *testing.T)
 	minedInfo := CreateTestMinedBlockInfo()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // clean up; cancellation effect is simulated by the mock error below
 
-	// Allow BeginTx to succeed, then cancel during the first query
+	// Allow BeginTx to succeed, then simulate cancellation during the first query
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT hash FROM transactions WHERE hash IN`).
 		WillReturnError(context.Canceled)
 	mock.ExpectRollback()
-
-	// Cancel after Begin succeeds but before Query completes
-	cancel()
 
 	result, err := store.setMinedMultiChunk(ctx, hashes, minedInfo)
 
