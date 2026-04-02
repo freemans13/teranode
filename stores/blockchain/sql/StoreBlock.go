@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
 	"modernc.org/sqlite"
@@ -545,13 +546,13 @@ RETURNING id
 func (*SQL) parseSQLError(err error, block *model.Block) error {
 	// check whether this is a postgres exists constraint error (pgx driver)
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+	if errors.As(err, &pgErr) && pgErr.Code == usql.PgErrUniqueViolation {
 		return errors.NewBlockExistsError("block already exists in the database: %s", block.Hash().String(), err)
 	}
 
 	// check whether this is a postgres exists constraint error (lib/pq fallback)
 	var pqErr *pq.Error
-	if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+	if errors.As(err, &pqErr) && pqErr.Code == usql.PgErrUniqueViolation {
 		return errors.NewBlockExistsError("block already exists in the database: %s", block.Hash().String(), err)
 	}
 

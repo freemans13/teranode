@@ -1166,10 +1166,10 @@ func classifyInsertError(err error, isCoinbase bool, entity string) error {
 // from either pgx (pgconn.PgError) or lib/pq (pq.Error).
 func asPgUniqueViolation(err error) error {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgErrUniqueViolation {
+	if errors.As(err, &pgErr) && pgErr.Code == usql.PgErrUniqueViolation {
 		return pgErr
 	}
-	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == pgErrUniqueViolation {
+	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == usql.PgErrUniqueViolation {
 		return pqErr
 	}
 	return nil
@@ -1728,7 +1728,7 @@ func isDeadlock(err error) bool {
 		return false
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+	if errors.As(err, &pgErr) && pgErr.Code == usql.PgErrDeadlockDetected {
 		return true
 	}
 	return strings.Contains(err.Error(), "database is locked")
@@ -4475,8 +4475,6 @@ func (s *Store) RawDB() *usql.DB {
 // headroom for additional parameters in the same query (e.g. block_id, height).
 // maxPostgresParams is the safe upper bound for SQL bind parameters per statement.
 // PostgreSQL supports 65535, but SQLite defaults to 999. Use the lower limit to cover both.
-const pgErrUniqueViolation = "23505"
-
 const maxPostgresParams = 999
 
 const maxINClauseSize = 400
@@ -4531,12 +4529,12 @@ func isLockError(err error) bool {
 	// PostgreSQL deadlock/lock errors (pgx driver)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		return pgErr.Code == "40001" || pgErr.Code == "40P01" || pgErr.Code == "55P03"
+		return pgErr.Code == usql.PgErrSerializationFail || pgErr.Code == usql.PgErrDeadlockDetected || pgErr.Code == usql.PgErrLockNotAvailable
 	}
 
 	// PostgreSQL deadlock/lock errors (lib/pq fallback)
 	if pqErr, ok := err.(*pq.Error); ok {
-		return pqErr.Code == "40001" || pqErr.Code == "40P01" || pqErr.Code == "55P03"
+		return pqErr.Code == usql.PgErrSerializationFail || pqErr.Code == usql.PgErrDeadlockDetected || pqErr.Code == usql.PgErrLockNotAvailable
 	}
 
 	// SQLite busy/locked errors

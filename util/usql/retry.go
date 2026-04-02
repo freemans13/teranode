@@ -43,20 +43,20 @@ func isRetriable(err error) bool {
 	if pgErr := asPgError(err); pgErr != nil {
 		code := pgErr.Code
 		return strings.HasPrefix(code, "08") || // Connection errors
-			code == "40001" || // Serialization failure
-			code == "40P01" || // Deadlock
-			code == "55P03" || // Lock not available
-			code == "57P03" // Cannot connect now
+			code == PgErrSerializationFail ||
+			code == PgErrDeadlockDetected ||
+			code == PgErrLockNotAvailable ||
+			code == PgErrCannotConnectNow
 	}
 
 	// PostgreSQL errors (lib/pq fallback)
 	if pqErr, ok := err.(*pq.Error); ok {
 		code := string(pqErr.Code)
 		return strings.HasPrefix(code, "08") || // Connection errors
-			code == "40001" || // Serialization failure
-			code == "40P01" || // Deadlock
-			code == "55P03" || // Lock not available
-			code == "57P03" // Cannot connect now
+			code == PgErrSerializationFail ||
+			code == PgErrDeadlockDetected ||
+			code == PgErrLockNotAvailable ||
+			code == PgErrCannotConnectNow
 	}
 
 	// SQLite errors
