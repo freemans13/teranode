@@ -585,9 +585,13 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 		tx.SetTxHash(tx.TxIDChainHash()) // Cache the transaction hash to avoid recomputing it
 
 		// Basic sanity check: ensure the transaction hash matches the expected hash from the subtree
+		// The coinbase placeholder (all-F's) is only valid at index 0 of the first subtree — the actual
+		// coinbase tx hash isn't known when the subtree structure is built. A placeholder anywhere else
+		// indicates an invalid subtree.
 		if txIndex < subtree.Length() {
 			expectedHash := subtree.Nodes[txIndex].Hash
-			if !expectedHash.Equal(*tx.TxIDChainHash()) {
+			isCoinbasePlaceholder := txIndex == 0 && tx.IsCoinbase() && expectedHash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+			if !isCoinbasePlaceholder && !expectedHash.Equal(*tx.TxIDChainHash()) {
 				return txIndex, errors.NewProcessingError("[readTransactionsFromSubtreeDataStream] transaction hash mismatch at index %d: expected %s, got %s", txIndex, expectedHash.String(), tx.TxIDChainHash().String())
 			}
 		} else {
