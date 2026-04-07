@@ -353,7 +353,7 @@ func (s *Server) validateDataHubURL(urlStr string) error {
 	}
 
 	// Skip SSRF checks when private/localhost IPs are allowed (e.g. local dev with host networking)
-	if s.settings.P2P.AllowPrivateIPs {
+	if s != nil && s.settings != nil && s.settings.P2P.AllowPrivateIPs {
 		return nil
 	}
 
