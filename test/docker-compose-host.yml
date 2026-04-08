@@ -6,11 +6,11 @@ x-teranode-base: &teranode-base
     - kafka-shared
 
 x-teranode-commands-base: &teranode-commands-base
-  image: teranode-commands:latest
+  image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode-commands:latest
   network_mode: "host"
 
 x-teranode-coinbase-base: &teranode-coinbase-base
-  image: teranode-coinbase:latest
+  image: 434394763103.dkr.ecr.eu-north-1.amazonaws.com/teranode-coinbase:latest
   network_mode: "host"
   depends_on:
     - postgres
