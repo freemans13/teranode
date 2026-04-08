@@ -291,7 +291,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			InitializeNodeInState: getString("blockchain_initializeNodeInState", "", alternativeContext...),
 			PostgresPool:          getPostgresPoolSettings("blockchain", alternativeContext...),
 			UseInMemoryChainCheck: getBool("blockchain_use_in_memory_chain_check", false, alternativeContext...),
-			SubscriptionTimeout:   getDuration("blockchain_subscription_timeout", 30*time.Second, alternativeContext...),
 			HeartbeatInterval:     getDuration("blockchain_heartbeat_interval", 10*time.Second, alternativeContext...),
 		},
 		BlockValidation: BlockValidationSettings{
