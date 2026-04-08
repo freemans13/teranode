@@ -218,9 +218,8 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 	// Set up mock settings
 	server.settings = &settings.Settings{
 		Pruner: settings.PrunerSettings{
-			SkipBlobDeletion:         false,
-			BlobDeletionSafetyWindow: 0,
-			BlobDeletionBatchSize:    100,
+			SkipBlobDeletion:       false,
+			BlobDeletionBatchSize:  100,
 			BlobDeletionMaxRetries:   3,
 		},
 	}

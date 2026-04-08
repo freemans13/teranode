@@ -139,7 +139,7 @@ func (s *Server) Init(ctx context.Context) error {
 	// Subscribe to blockchain notifications for event-driven pruning:
 	// - BlockPersisted: Triggers pruning when block persister completes (primary)
 	// - Block: Waits for mined_set=true and triggers if persister not running (fallback)
-	// Also tracks persisted height for coordination with store-level pruner safety checks
+	// Also tracks persisted height for coordination with pruner trigger mode selection
 	subscriptionCh, err := s.blockchainClient.Subscribe(ctx, blockchain.SubscriberPruner)
 	if err != nil {
 		return errors.NewServiceError("failed to subscribe to blockchain notifications", err)
