@@ -247,14 +247,35 @@ services:
       - ../data/teranode3/external:/app/data/teranode3/external
       - ./wait.sh:/app/wait.sh
 
-  first-100-blocks-1:
+  # first-100-blocks-1:
+  #   image: curlimages/curl:latest
+  #   profiles:
+  #     - default
+  #   container_name: first-100-blocks-1
+  #   network_mode: "host"
+  #   depends_on:
+  #     - teranode-1
+  #   volumes:
+  #     - ../compose/scripts/generate-blocks.sh:/generate-blocks.sh
+  #   entrypoint:
+  #     [
+  #       "/generate-blocks.sh",
+  #       "--host",
+  #       "localhost",
+  #       "--port",
+  #       "19292",
+  #       "--generate",
+  #     ]
+  #   restart: no
+
+  miner-1:
     image: curlimages/curl:latest
     profiles:
       - default
-    container_name: first-100-blocks-1
-    network_mode: "host"
+    container_name: miner-1
     depends_on:
       - teranode-1
+    network_mode: "host"
     volumes:
       - ../compose/scripts/generate-blocks.sh:/generate-blocks.sh
     entrypoint:
@@ -266,81 +287,46 @@ services:
         "19292",
         "--generate",
       ]
-    restart: no
-
-  miner-1:
-    <<: *teranode-commands-base
-    profiles:
-      - default
-    container_name: miner-1
-    depends_on:
-      - teranode-1
-    environment:
-      SETTINGS_CONTEXT: "docker.host.teranode1"
-    command:
-      [
-        "miner",
-        "-coinbase-addr",
-        "myL4TciLD59ESU9MmKH1rvfYb8QXhFHHN6",
-        "-coinbase-sig",
-        "/teranode1/",
-        "-rpcport",
-        "19292",
-      ]
-    volumes:
-      - ../settings.conf:/app/settings.conf
-      - ../compose/settings_test.conf:/app/settings_local.conf
-      - ../data/miner1:/app/data
     restart: unless-stopped
 
   miner-2:
-    <<: *teranode-commands-base
+    image: curlimages/curl:latest
     profiles:
       - default
     container_name: miner-2
     depends_on:
       - teranode-2
-    environment:
-      SETTINGS_CONTEXT: "docker.host.teranode2"
-    command:
+    network_mode: "host"
+    volumes:
+      - ../compose/scripts/generate-blocks.sh:/generate-blocks.sh
+    entrypoint:
       [
-        "miner",
-        "-coinbase-addr",
-        "1Hh6nxmJrk4jyiJRxodAK32A9EXM8dx6F3",
-        "-coinbase-sig",
-        "/teranode2/",
-        "-rpcport",
+        "/generate-blocks.sh",
+        "--host",
+        "localhost",
+        "--port",
         "29292",
       ]
-    volumes:
-      - ../settings.conf:/app/settings.conf
-      - ../compose/settings_test.conf:/app/settings_local.conf
-      - ../data/miner2:/app/data
     restart: unless-stopped
 
   miner-3:
-    <<: *teranode-commands-base
+    image: curlimages/curl:latest
     profiles:
       - default
     container_name: miner-3
     depends_on:
       - teranode-3
-    environment:
-      SETTINGS_CONTEXT: "docker.host.teranode3"
-    command:
+    network_mode: "host"
+    volumes:
+      - ../compose/scripts/generate-blocks.sh:/generate-blocks.sh
+    entrypoint:
       [
-        "miner",
-        "-coinbase-addr",
-        "16Uy8VwEKAkEmH7RVtCjqyv6L6RfyvkJM2",
-        "-coinbase-sig",
-        "/teranode3/",
-        "-rpcport",
+        "/generate-blocks.sh",
+        "--host",
+        "localhost",
+        "--port",
         "39292",
       ]
-    volumes:
-      - ../settings.conf:/app/settings.conf
-      - ../compose/settings_test.conf:/app/settings_local.conf
-      - ../data/miner3:/app/data
     restart: unless-stopped
 
   block-generator:
