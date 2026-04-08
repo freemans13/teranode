@@ -63,21 +63,7 @@ func (s *Server) processBlobDeletionsAtHeight(blockHeight uint32, blockHash chai
 		return
 	}
 
-	// Safety check: respect persisted height
-	persistedHeight := s.lastPersistedHeight.Load()
-	safetyWindow := s.settings.Pruner.BlobDeletionSafetyWindow
 	safeHeight := blockHeight
-
-	if persistedHeight > 0 && safetyWindow > 0 {
-		if blockHeight > persistedHeight+safetyWindow {
-			s.logger.Debugf("Skipping blob deletion at height %d (persisted: %d, safety: %d)",
-				blockHeight, persistedHeight, safetyWindow)
-			return
-		}
-		if persistedHeight > safetyWindow {
-			safeHeight = persistedHeight - safetyWindow
-		}
-	}
 
 	batchSize := s.settings.Pruner.BlobDeletionBatchSize
 	lockTimeout := 300 // 5 minutes - should be plenty for processing
