@@ -863,6 +863,12 @@ pruner_jobTimeout = 20m  # or higher
 
 3. Verify Block Assembly in RUNNING state
 
+## Removed Settings
+
+### pruner_blobDeletionSafetyWindow (removed)
+
+This setting was removed because the persisted-height safety check it controlled was redundant in both trigger modes. In `OnBlockPersisted` mode the block height already reflects the persisted height, and in `OnBlockMined` mode no block persister is running so the check used stale state from a previous run, causing all blob deletions to be silently skipped. To delay blob deletions, adjust the Delete-At-Height values or the global block height retention setting instead.
+
 ## Related Documentation
 
 - [Pruner Service Topic Documentation](../../../topics/services/pruner.md)
