@@ -220,7 +220,7 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 		Pruner: settings.PrunerSettings{
 			SkipBlobDeletion:       false,
 			BlobDeletionBatchSize:  100,
-			BlobDeletionMaxRetries:   3,
+			BlobDeletionMaxRetries: 3,
 		},
 	}
 
