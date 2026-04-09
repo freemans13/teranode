@@ -402,11 +402,12 @@ func TestBlobDeletionSafetyWindowBoundary(t *testing.T) {
 	t.Log("Processing at height 3 (blockHeight <= safetyWindow=5): should skip")
 	server.processBlobDeletionsAtHeight(3, chainhash.Hash{})
 
-	// Observer should NOT fire (no deletion processing occurred)
+	// Observer should NOT fire — processBlobDeletionsAtHeight is synchronous, so
+	// if it were going to enqueue an event it would have done so before returning.
 	select {
 	case <-observer.complete:
 		t.Fatal("Expected no deletion event when blockHeight <= safetyWindow")
-	case <-time.After(500 * time.Millisecond):
+	default:
 		t.Log("Correctly skipped deletions when blockHeight <= safetyWindow")
 	}
 
@@ -422,7 +423,7 @@ func TestBlobDeletionSafetyWindowBoundary(t *testing.T) {
 	select {
 	case <-observer.complete:
 		t.Fatal("Expected no deletion event when blockHeight == safetyWindow")
-	case <-time.After(500 * time.Millisecond):
+	default:
 		t.Log("Correctly skipped deletions when blockHeight == safetyWindow")
 	}
 

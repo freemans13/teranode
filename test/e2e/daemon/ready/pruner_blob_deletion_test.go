@@ -326,7 +326,7 @@ func TestBlobDeletionSchedulingViaBlobStore(t *testing.T) {
 //	if blockHeight <= safetyWindow: skip all deletions (window not yet satisfied)
 //	safeHeight = blockHeight - safetyWindow
 //	Only blobs with delete_at_height <= safeHeight are eligible for deletion
-//	This ensures data is safely behind the chain tip before blob removal
+//	This ensures data is safely behind the triggering height before blob removal
 //
 // Test flow:
 // 1. Create TestDaemon with block persister + pruner, safety window = 2
