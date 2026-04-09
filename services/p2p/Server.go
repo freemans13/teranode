@@ -55,11 +55,15 @@ import (
 const (
 	banActionAdd = "add" // Action constant for adding a ban
 
-	// Default values for peer map cleanup
-	defaultPeerMapMaxSize         = 100000           // Maximum entries in peer maps
-	defaultPeerMapTTL             = 30 * time.Minute // Time-to-live for peer map entries
-	defaultPeerMapCleanupInterval = 5 * time.Minute  // Cleanup interval
+	// Default values for peer map cleanup (reduced to prevent memory exhaustion)
+	defaultPeerMapMaxSize         = 10000            // Maximum entries in peer maps (reduced from 100k)
+	defaultPeerMapTTL             = 10 * time.Minute // Time-to-live for peer map entries (reduced from 30min)
+	defaultPeerMapCleanupInterval = 1 * time.Minute  // Cleanup interval (reduced from 5min)
 	protocolIDVersion             = "1.0.0"          // Protocol version identifier
+
+	// maxP2PMessageSize limits P2P message sizes to prevent memory exhaustion attacks.
+	// Messages exceeding this limit are rejected before parsing.
+	maxP2PMessageSize = 10 * 1024 * 1024 // 10MB
 )
 
 // peerMapEntry stores peer information with timestamp for TTL tracking
@@ -89,6 +93,7 @@ type Server struct {
 	blockchainClient                  blockchain.ClientI        // Client for blockchain interactions
 	blockAssemblyClient               blockassembly.ClientI     // Client for block assembly operations
 	AssetHTTPAddressURL               string                    // HTTP address URL for assets
+	PropagationURL                    string                    // URL for peers to use for propagating txs (defaults to AssetHTTPAddressURL)
 	e                                 *echo.Echo                // Echo server instance
 	notificationCh                    chan *notificationMsg     // Channel for notifications
 	rejectedTxKafkaConsumerClient     kafka.KafkaConsumerGroupI // Kafka consumer for rejected transactions
@@ -204,8 +209,8 @@ func NewServer(
 	}
 
 	listenMode := tSettings.P2P.ListenMode
-	if listenMode != settings.ListenModeFull && listenMode != settings.ListenModeListenOnly {
-		return nil, errors.NewConfigurationError("listen_mode must be either '%s' or '%s' (got '%s')", settings.ListenModeFull, settings.ListenModeListenOnly, listenMode)
+	if listenMode != settings.ListenModeFull && listenMode != settings.ListenModeListenOnly && listenMode != settings.ListenModeSilent {
+		return nil, errors.NewConfigurationError("listen_mode must be one of '%s', '%s', or '%s' (got '%s')", settings.ListenModeFull, settings.ListenModeListenOnly, settings.ListenModeSilent, listenMode)
 	}
 
 	banlist, banChan, err := GetBanList(ctx, logger, tSettings)
@@ -278,8 +283,13 @@ func NewServer(
 	// - If AdvertiseAddresses is explicitly set, those addresses are used
 	// - If SharePrivateAddresses is true, we pass listen addresses to ensure local connectivity
 	// - Otherwise, go-p2p will automatically filter private IPs and detect public addresses
+	// In silent mode, address advertisement is always suppressed regardless of other settings.
 	var advertiseAddresses []string
-	if len(tSettings.P2P.AdvertiseAddresses) > 0 {
+	if listenMode == settings.ListenModeSilent {
+		// Silent mode: never advertise any addresses so the node remains undiscoverable
+		advertiseAddresses = []string{}
+		logger.Infof("[silent mode] Address advertisement suppressed - node will not be discoverable")
+	} else if len(tSettings.P2P.AdvertiseAddresses) > 0 {
 		// Use explicitly configured advertise addresses
 		advertiseAddresses = tSettings.P2P.AdvertiseAddresses
 		logger.Infof("Using configured advertise addresses: %v", advertiseAddresses)
@@ -307,6 +317,13 @@ func NewServer(
 	if err != nil {
 		return nil, errors.NewServiceError("failed to unmarshal key", err)
 	}
+	// In silent mode, DHT is disabled entirely so the node is not discoverable via DHT.
+	dhtMode := tSettings.P2P.DHTMode
+	if listenMode == settings.ListenModeSilent {
+		dhtMode = "off"
+		logger.Infof("[silent mode] DHT disabled - node will not participate in peer discovery")
+	}
+
 	conf := p2pMessageBus.Config{
 		PrivateKey:         privKey,
 		Name:               tSettings.ClientName,
@@ -314,7 +331,7 @@ func NewServer(
 		PeerCacheFile:      getPeerCacheFilePath(tSettings.P2P.PeerCacheDir),
 		BootstrapPeers:     tSettings.P2P.BootstrapPeers,
 		ProtocolVersion:    bitcoinProtocolVersion,
-		DHTMode:            tSettings.P2P.DHTMode,
+		DHTMode:            dhtMode,
 		DHTCleanupInterval: tSettings.P2P.DHTCleanupInterval,
 		EnableNAT:          tSettings.P2P.EnableNAT,
 		EnableMDNS:         tSettings.P2P.EnableMDNS,
@@ -463,6 +480,13 @@ func (s *Server) Init(ctx context.Context) (err error) {
 
 	s.AssetHTTPAddressURL = AssetHTTPAddressURLString
 
+	// Set propagation URL - defaults to AssetHTTPAddressURL if not configured
+	propagationURL := s.settings.Asset.PropagationPublicURL
+	if propagationURL == "" {
+		propagationURL = s.AssetHTTPAddressURL
+	}
+	s.PropagationURL = propagationURL
+
 	return nil
 }
 
@@ -588,7 +612,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	// Start blockchain subscription before marking service as ready
 	// This ensures we don't miss any block notifications
-	blockchainSubscription, err := s.blockchainClient.Subscribe(ctx, "p2pServer")
+	blockchainSubscription, err := s.blockchainClient.Subscribe(ctx, blockchain.SubscriberP2P)
 	if err != nil {
 		return errors.NewServiceError("error subscribing to blockchain service", err)
 	}
@@ -737,7 +761,7 @@ func (s *Server) invalidBlockHandler(ctx context.Context) func(msg *kafka.KafkaM
 
 func (s *Server) rejectedTxHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
 	return func(msg *kafka.KafkaMessage) error {
-		if s.settings.P2P.ListenMode == settings.ListenModeListenOnly {
+		if s.settings.P2P.ListenMode == settings.ListenModeListenOnly || s.settings.P2P.ListenMode == settings.ListenModeSilent {
 			return nil
 		}
 
@@ -885,6 +909,12 @@ func (s *Server) updateBytesReceived(from string, originatorPeerID string, messa
 }
 
 func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID string) {
+	// Check message size before parsing to prevent memory exhaustion
+	if len(m) > maxP2PMessageSize {
+		s.logger.Errorf("[handleNodeStatusTopic] message size %d exceeds max %d from peer %s", len(m), maxP2PMessageSize, peerID)
+		return
+	}
+
 	var nodeStatusMessage NodeStatusMessage
 
 	if err := json.Unmarshal(m, &nodeStatusMessage); err != nil {
@@ -895,12 +925,24 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID strin
 	// Check if this is our own message
 	isSelf := peerID == s.P2PClient.GetID()
 
-	// If sender ID doesn't match node status ID log an error and return
-	// In future, consider banning this peer as they are maliciously spoofing
+	// Check that sender ID matches the claimed peer ID
 	if peerID != nodeStatusMessage.PeerID {
-		s.logger.Errorf("[handleNodeStatusTopic] node_status peerID %s does not match message ID %s",
-			peerID, nodeStatusMessage.PeerID)
+		s.logger.Errorf("[handleNodeStatusTopic] peer ID spoofing detected: from=%s claimed=%s", peerID, nodeStatusMessage.PeerID)
+		if s.banManager != nil {
+			s.banManager.AddScore(peerID, ReasonProtocolViolation)
+		}
 		return
+	}
+
+	// Validate BaseURL to prevent SSRF attacks
+	if nodeStatusMessage.BaseURL != "" {
+		if err := s.validateDataHubURL(nodeStatusMessage.BaseURL); err != nil {
+			s.logger.Errorf("[handleNodeStatusTopic] invalid BaseURL from peer %s: %v", peerID, err)
+			if s.banManager != nil {
+				s.banManager.AddScore(peerID, ReasonProtocolViolation)
+			}
+			return
+		}
 	}
 
 	// Skip further processing for our own messages (peer height updates, etc.)
@@ -990,10 +1032,11 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID strin
 }
 
 func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Hash) error {
-	if s.settings.P2P.ListenMode == settings.ListenModeListenOnly {
+	if s.settings.P2P.ListenMode == settings.ListenModeListenOnly || s.settings.P2P.ListenMode == settings.ListenModeSilent {
 		return nil
 	}
 
+	ctxLogger := s.logger.WithTraceContext(ctx)
 	var msgBytes []byte
 
 	h, meta, err := s.blockchainClient.GetBlockHeader(ctx, hash)
@@ -1003,7 +1046,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 
 	if meta.Invalid {
 		// do not announce invalid blocks
-		s.logger.Infof("[handleBlockNotification] Not announcing invalid block %s", hash.String())
+		ctxLogger.Infof("[handleBlockNotification] Not announcing invalid block %s", hash.String())
 		return nil
 	}
 
@@ -1028,7 +1071,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 	// Also send a node_status update when best block changes
 	if err = s.handleNodeStatusNotification(ctx); err != nil {
 		// Log the error but don't fail the block notification
-		s.logger.Warnf("[handleBlockNotification] error sending node status update: %v", err)
+		ctxLogger.Warnf("[handleBlockNotification] error sending node status update: %v", err)
 	}
 
 	return nil
@@ -1190,10 +1233,19 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		startTime = s.startTime.Unix()
 	}
 
-	// Set empty baseURL if in listen only mode
+	// Suppress DataHub and propagation URLs in non-publishing modes so this node
+	// cannot be selected as a sync source by remote peers.
+	suppressURLs := s.settings.P2P.ListenMode == settings.ListenModeListenOnly ||
+		s.settings.P2P.ListenMode == settings.ListenModeSilent
+
 	baseURL := s.AssetHTTPAddressURL
-	if s.settings.P2P.ListenMode == settings.ListenModeListenOnly {
+	if suppressURLs {
 		baseURL = ""
+	}
+
+	propagationURL := s.PropagationURL
+	if suppressURLs {
+		propagationURL = ""
 	}
 
 	// Get minimum mining transaction fee from settings
@@ -1258,6 +1310,7 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		Timestamp:           time.Now().UTC().Format(isoFormat),
 		Type:                "node_status",
 		BaseURL:             baseURL,
+		PropagationURL:      propagationURL,
 		PeerID:              peerID,
 		Version:             version,
 		CommitHash:          commit,
@@ -1293,6 +1346,7 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 	nodeStatusMessage := NodeStatusMessage{
 		Type:                "node_status",
 		BaseURL:             msg.BaseURL,
+		PropagationURL:      msg.PropagationURL,
 		PeerID:              msg.PeerID,
 		Version:             msg.Version,
 		CommitHash:          msg.CommitHash,
@@ -1314,6 +1368,18 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 		MinMiningTxFee:      msg.MinMiningTxFee,
 		ConnectedPeersCount: msg.ConnectedPeersCount,
 		Storage:             msg.Storage,
+	}
+
+	// In silent mode, skip publishing to the P2P network so the node remains undiscoverable,
+	// but still forward to local WebSocket clients for monitoring purposes.
+	if s.settings.P2P.ListenMode == settings.ListenModeSilent {
+		s.logger.Debugf("[handleNodeStatusNotification] Silent mode - skipping P2P publish, forwarding to WebSocket only")
+		select {
+		case s.notificationCh <- msg:
+		default:
+			s.logger.Warnf("[handleNodeStatusNotification] notification channel full, dropped node_status notification for %s", msg.PeerID)
+		}
+		return nil
 	}
 
 	msgBytes, err := json.Marshal(nodeStatusMessage)
@@ -1341,7 +1407,7 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 }
 
 func (s *Server) handleSubtreeNotification(ctx context.Context, hash *chainhash.Hash) error {
-	if s.settings.P2P.ListenMode == settings.ListenModeListenOnly {
+	if s.settings.P2P.ListenMode == settings.ListenModeListenOnly || s.settings.P2P.ListenMode == settings.ListenModeSilent {
 		return nil
 	}
 
@@ -1388,6 +1454,7 @@ func (s *Server) handlePeerFailureNotification(_ context.Context, notification *
 }
 
 func (s *Server) processBlockchainNotification(ctx context.Context, notification *blockchain.Notification) error {
+	ctxLogger := s.logger.WithTraceContext(ctx)
 	hash, err := chainhash.NewHash(notification.Hash)
 	if err != nil {
 		// Specific error about hash conversion, not logged here, but returned to caller.
@@ -1396,25 +1463,26 @@ func (s *Server) processBlockchainNotification(ctx context.Context, notification
 
 	switch notification.Type {
 	case model.NotificationType_Block:
-		s.logger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
 		return s.handleBlockNotification(ctx, hash) // These handlers return wrapped errors
 
 	case model.NotificationType_Subtree:
-		s.logger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
 		return s.handleSubtreeNotification(ctx, hash)
 
 	case model.NotificationType_PeerFailure:
-		s.logger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
 		return s.handlePeerFailureNotification(ctx, notification)
 
 	default:
-		s.logger.Warnf("[processBlockchainNotification] Received unhandled notification type: %s for hash %s", notification.Type, hash.String())
+		ctxLogger.Warnf("[processBlockchainNotification] Received unhandled notification type: %s for hash %s", notification.Type, hash.String())
 	}
 
 	return nil // For unhandled types, not an error that stops the listener
 }
 
 func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainSubscription <-chan *blockchain.Notification) {
+	ctxLogger := s.logger.WithTraceContext(ctx)
 
 	// define vars here to prevent too many allocs
 	var notification *blockchain.Notification
@@ -1422,7 +1490,7 @@ func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainS
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Infof("[blockchainSubscriptionListener] P2P service shutting down")
+			ctxLogger.Infof("[blockchainSubscriptionListener] P2P service shutting down")
 			return
 		case notification = <-blockchainSubscription:
 			if notification == nil {
@@ -1435,7 +1503,7 @@ func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainS
 			)
 
 			if syncing, err = s.isBlockchainSyncingOrCatchingUp(ctx); err != nil {
-				s.logger.Errorf("[blockchainSubscriptionListener] error getting blockchain FSM state: %v", err)
+				ctxLogger.Errorf("[blockchainSubscriptionListener] error getting blockchain FSM state: %v", err)
 
 				continue
 			}
@@ -1447,7 +1515,7 @@ func (s *Server) blockchainSubscriptionListener(ctx context.Context, blockchainS
 
 			// received a message
 			if err := s.processBlockchainNotification(ctx, notification); err != nil {
-				s.logger.Errorf("[blockchainSubscriptionListener] Error processing notification (Type: %s, Hash: %s): %v", notification.Type, notification.Hash, err)
+				ctxLogger.Errorf("[blockchainSubscriptionListener] Error processing notification (Type: %s, Hash: %s): %v", notification.Type, notification.Hash, err)
 				continue // Continue to next notification on error
 			}
 		}
@@ -1620,7 +1688,7 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 
 	// Fallback to libp2p client data if registry not available
 	if s.P2PClient == nil {
-		return nil, errors.NewError("[GetPeers] P2PClient is not initialised")
+		return nil, errors.WrapGRPCPublic(errors.NewError("[GetPeers] P2PClient is not initialised"))
 	}
 
 	s.logger.Debugf("Creating reply channel")
@@ -1665,7 +1733,7 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 func (s *Server) BanPeer(ctx context.Context, peer *p2p_api.BanPeerRequest) (*p2p_api.BanPeerResponse, error) {
 	err := s.banList.Add(ctx, peer.Addr, time.Unix(peer.Until, 0))
 	if err != nil {
-		return nil, err
+		return nil, errors.WrapGRPCPublic(err)
 	}
 
 	return &p2p_api.BanPeerResponse{Ok: true}, nil
@@ -1674,16 +1742,17 @@ func (s *Server) BanPeer(ctx context.Context, peer *p2p_api.BanPeerRequest) (*p2
 func (s *Server) UnbanPeer(ctx context.Context, peer *p2p_api.UnbanPeerRequest) (*p2p_api.UnbanPeerResponse, error) {
 	err := s.banList.Remove(ctx, peer.Addr)
 	if err != nil {
-		return nil, err
+		return nil, errors.WrapGRPCPublic(err)
 	}
 
 	return &p2p_api.UnbanPeerResponse{Ok: true}, nil
 }
 
 func (s *Server) IsBanned(ctx context.Context, peer *p2p_api.IsBannedRequest) (*p2p_api.IsBannedResponse, error) {
-	// Only check PeerID-based bans
-	// Note: The field is still called IpOrSubnet for backward compatibility, but we only accept PeerIDs
-	return &p2p_api.IsBannedResponse{IsBanned: s.banManager.IsBanned(peer.IpOrSubnet)}, nil
+	// Check both IP-based bans (banList) and PeerID-based bans (banManager)
+	return &p2p_api.IsBannedResponse{
+		IsBanned: s.banList.IsBanned(peer.IpOrSubnet) || s.banManager.IsBanned(peer.IpOrSubnet),
+	}, nil
 }
 
 func (s *Server) ListBanned(ctx context.Context, _ *emptypb.Empty) (*p2p_api.ListBannedResponse, error) {
@@ -1738,7 +1807,7 @@ func (s *Server) RecordBytesDownloaded(ctx context.Context, req *p2p_api.RecordB
 	peerID, err := peer.Decode(req.PeerId)
 	if err != nil {
 		s.logger.Errorf("[RecordBytesDownloaded] failed to decode peer ID %s: %v", req.PeerId, err)
-		return &p2p_api.RecordBytesDownloadedResponse{Ok: false}, errors.NewServiceError("failed to decode peer ID", err)
+		return &p2p_api.RecordBytesDownloadedResponse{Ok: false}, errors.WrapGRPCPublic(errors.NewServiceError("failed to decode peer ID", err))
 	}
 
 	// Get current peer info from registry
@@ -1842,26 +1911,15 @@ func (s *Server) ReportInvalidSubtree(ctx context.Context, subtreeHash string, p
 	s.logger.Infof("[ReportInvalidSubtree] invalid subtree report for peer %s, subtree %s: %s",
 		peerID, subtreeHash, reason)
 
-	// TODO: The penalty system here should be refactored. Currently all reasons
-	// (peer_cannot_provide_transactions, malformed_transaction_data, transaction_count_mismatch)
-	// are more likely network issues than malicious behavior. This will be addressed in a separate PR.
-	// For now, both RecordMaliciousInteraction and AddBanScore are disabled.
-	//
-	// // Record as malicious interaction for reputation tracking
-	// s.peerRegistry.RecordMaliciousInteraction(peer.ID(peerID))
-	//
-	// // Create the request to add ban score
-	// req := &p2p_api.AddBanScoreRequest{
-	// 	PeerId: peerID,
-	// 	Reason: "invalid_subtree",
-	// }
-	//
-	// // Call the AddBanScore method
-	// _, err = s.AddBanScore(ctx, req)
-	// if err != nil {
-	// 	s.logger.Errorf("[ReportInvalidSubtree] error adding ban score to peer %s: %v", peerID, err)
-	// 	return errors.NewServiceError("error adding ban score to peer %s", peerID, err)
-	// }
+	// Record as a failed interaction for reputation tracking
+	// This will not be too harsh on failures of transient behavior
+	// but also track if we are having trouble fetching data from peers
+	decodedPeerID, err := peer.Decode(peerID)
+	if err != nil {
+		s.logger.Warnf("[ReportInvalidSubtree] failed to decode peer ID %s: %v", peerID, err)
+	} else {
+		s.peerRegistry.RecordInteractionFailure(decodedPeerID)
+	}
 
 	// Remove the subtree from the map to avoid memory leaks
 	s.subtreePeerMap.Delete(subtreeHash)

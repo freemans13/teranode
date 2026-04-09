@@ -227,6 +227,10 @@ func (s *Store) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return s.store.GetUnminedTxIterator(false)
 }
 
+func (s *Store) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (utxo.UnminedTxIterator, error) {
+	return s.store.GetPrunableUnminedTxIterator(cutoffBlockHeight)
+}
+
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
 	resp, err := s.store.GetSpend(ctx, spend)
 	s.logger.Debugf("[UTXOStore][logger][GetSpend] spend %v resp %v err %v : %s", spend, resp, err, caller())
@@ -244,6 +248,13 @@ func (s *Store) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*ut
 func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	err := s.store.PreviousOutputsDecorate(ctx, tx)
 	s.logger.Debugf("[UTXOStore][logger][PreviousOutputsDecorate] outpoints %v err %v : %s", tx, err, caller())
+
+	return err
+}
+
+func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
+	err := s.store.BatchPreviousOutputsDecorate(ctx, txs)
+	s.logger.Debugf("[UTXOStore][logger][BatchPreviousOutputsDecorate] txCount=%d err=%v : %s", len(txs), err, caller())
 
 	return err
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/cmd/bitcointoutxoset"
 	"github.com/bsv-blockchain/teranode/cmd/checkblock"
 	"github.com/bsv-blockchain/teranode/cmd/checkblocktemplate"
+	"github.com/bsv-blockchain/teranode/cmd/diagnose"
 	"github.com/bsv-blockchain/teranode/cmd/filereader"
 	"github.com/bsv-blockchain/teranode/cmd/getfsmstate"
 	"github.com/bsv-blockchain/teranode/cmd/logs"
@@ -55,6 +56,7 @@ var commandHelp = map[string]string{
 	"remainderbench":          "Benchmark processRemainderTransactionsAndDequeue with CPU and memory profiling",
 	"monitor":                 "Live TUI dashboard for monitoring node status",
 	"logs":                    "Interactive log viewer with filtering and search",
+	"diagnose":                "Diagnose node health and validate configuration",
 }
 
 var dangerousCommands = map[string]bool{}
@@ -265,6 +267,19 @@ func Start(args []string, version, commit string) {
 		cmd.Execute = func(args []string) error {
 			return logs.Run(*logFile, *bufferSize)
 		}
+	case "diagnose":
+		checkMode := cmd.FlagSet.Bool("check", false, "Run service health checks (default if no mode specified)")
+		configMode := cmd.FlagSet.Bool("config", false, "Validate configuration without running services")
+		jsonOutput := cmd.FlagSet.Bool("json", false, "Output results as JSON")
+
+		cmd.Execute = func(args []string) error {
+			exitCode := diagnose.Run(logger, tSettings, *checkMode, *configMode, *jsonOutput)
+			if exitCode != 0 {
+				os.Exit(exitCode)
+			}
+
+			return nil
+		}
 	case "setfsmstate":
 		targetFsmState := cmd.FlagSet.String("fsmstate", "", "target fsm state (accepted values: running, idle, catchingblocks, legacysyncing)")
 
@@ -364,9 +379,10 @@ func Start(args []string, version, commit string) {
 		}
 	case "resetblockassembly":
 		fullReset := cmd.FlagSet.Bool("full-reset", false, "Perform a full reset, including clearing mempool and unmined transactions")
+		validateInputs := cmd.FlagSet.Bool("validate-inputs", false, "Validate that each unmined tx's inputs are still spent by this tx (marks invalid ones as conflicting)")
 
 		cmd.Execute = func(args []string) error {
-			err := resetblockassembly.ResetBlockAssembly(logger, tSettings, *fullReset)
+			err := resetblockassembly.ResetBlockAssembly(logger, tSettings, *fullReset, *validateInputs)
 			if err != nil {
 				return errors.NewProcessingError("Failed to reset block assembly", err)
 			}

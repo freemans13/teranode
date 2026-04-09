@@ -1,20 +1,20 @@
 /*
-Package validator implements Bitcoin SV transaction validation functionality.
+Package validator implements BSV Blockchain transaction validation functionality.
 
 This file implements the Go-SDK script verification functionality, providing
-script validation using the Bitcoin SV Go-SDK library implementation.
+script validation using the BSV SDK library implementation.
 */
 package validator
 
 import (
 	"strings"
 
-	"github.com/bitcoin-sv/go-sdk/chainhash"
-	"github.com/bitcoin-sv/go-sdk/script"
-	interpreter_sdk "github.com/bitcoin-sv/go-sdk/script/interpreter"
-	"github.com/bitcoin-sv/go-sdk/transaction"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/script"
+	interpreter_sdk "github.com/bsv-blockchain/go-sdk/script/interpreter"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"

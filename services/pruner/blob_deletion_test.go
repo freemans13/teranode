@@ -8,12 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -35,14 +37,14 @@ func newMockBlockchainClient() *mockBlockchainClient {
 	}
 }
 
-func (m *mockBlockchainClient) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
+func (m *mockBlockchainClient) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
 	id := m.nextID
 	m.nextID++
 	m.scheduledDeletions[id] = &blockchain_api.ScheduledDeletion{
 		Id:             id,
 		BlobKey:        blobKey,
 		FileType:       fileType,
-		StoreType:      storeType,
+		StoreType:      int32(storeType),
 		DeleteAtHeight: deleteAtHeight,
 		RetryCount:     0,
 	}
@@ -194,8 +196,8 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create blob stores map with enum keys
-	blobStores := map[blockchain_api.BlobStoreType]blob.Store{
-		blockchain_api.BlobStoreType_TXSTORE: testStore,
+	blobStores := map[storetypes.BlobStoreType]blob.Store{
+		storetypes.TXSTORE: testStore,
 	}
 
 	// Create test observer
@@ -216,7 +218,7 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 	// Set up mock settings
 	server.settings = &settings.Settings{
 		Pruner: settings.PrunerSettings{
-			BlobDeletionEnabled:      true,
+			SkipBlobDeletion:         false,
 			BlobDeletionSafetyWindow: 0,
 			BlobDeletionBatchSize:    100,
 			BlobDeletionMaxRetries:   3,
@@ -268,7 +270,7 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 
 	// Schedule deletions via mock blockchain client
 	for i, blob := range testBlobs {
-		id, scheduled, err := mockBlockchain.ScheduleBlobDeletion(ctx, blob.key, string(fileformat.FileTypeTesting), blockchain_api.BlobStoreType_TXSTORE, blob.deleteAtHeight)
+		id, scheduled, err := mockBlockchain.ScheduleBlobDeletion(ctx, blob.key, string(fileformat.FileTypeTesting), storetypes.TXSTORE, blob.deleteAtHeight)
 		require.NoError(t, err)
 		require.True(t, scheduled)
 		t.Logf("Scheduled deletion %d with id=%d, DAH=%d", i, id, blob.deleteAtHeight)
@@ -281,7 +283,7 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 
 	// Process deletions at height 10
 	t.Log("Processing deletions at height 10")
-	server.processBlobDeletionsAtHeight(10)
+	server.processBlobDeletionsAtHeight(10, chainhash.Hash{})
 
 	// Wait for completion via observer
 	event, err := observer.waitFor(5 * time.Second)
@@ -317,7 +319,7 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 
 	// Process deletions at height 20
 	t.Log("Processing deletions at height 20")
-	server.processBlobDeletionsAtHeight(20)
+	server.processBlobDeletionsAtHeight(20, chainhash.Hash{})
 
 	// Wait for completion
 	event, err = observer.waitFor(5 * time.Second)
@@ -357,8 +359,8 @@ func TestBlobDeletionIdempotency(t *testing.T) {
 	testStore, err := blob.NewStore(logger, storeURL)
 	require.NoError(t, err)
 
-	blobStores := map[blockchain_api.BlobStoreType]blob.Store{
-		blockchain_api.BlobStoreType_TXSTORE: testStore,
+	blobStores := map[storetypes.BlobStoreType]blob.Store{
+		storetypes.TXSTORE: testStore,
 	}
 
 	observer := &testBlobDeletionObserver{
@@ -376,7 +378,7 @@ func TestBlobDeletionIdempotency(t *testing.T) {
 
 	server.settings = &settings.Settings{
 		Pruner: settings.PrunerSettings{
-			BlobDeletionEnabled:    true,
+			SkipBlobDeletion:       false,
 			BlobDeletionBatchSize:  100,
 			BlobDeletionMaxRetries: 3,
 		},
@@ -401,13 +403,13 @@ func TestBlobDeletionIdempotency(t *testing.T) {
 	require.False(t, exists, "Blob should be deleted")
 
 	// Schedule deletion (blob already gone)
-	id, scheduled, err := mockBlockchain.ScheduleBlobDeletion(ctx, testKey, string(fileformat.FileTypeTesting), blockchain_api.BlobStoreType_TXSTORE, 10)
+	id, scheduled, err := mockBlockchain.ScheduleBlobDeletion(ctx, testKey, string(fileformat.FileTypeTesting), storetypes.TXSTORE, 10)
 	require.NoError(t, err)
 	require.True(t, scheduled)
 	t.Logf("Scheduled deletion of already-deleted blob, id=%d", id)
 
 	// Process deletions (should handle gracefully)
-	server.processBlobDeletionsAtHeight(10)
+	server.processBlobDeletionsAtHeight(10, chainhash.Hash{})
 
 	// Wait for completion (blob already deleted, so it should succeed idempotently)
 	event, err := observer.waitFor(5 * time.Second)

@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -357,6 +358,18 @@ func (c *LocalClient) Subscribe(ctx context.Context, source string) (chan *block
 	return ch, nil
 }
 
+// GetSubscribers returns the list of currently active subscriber source strings.
+func (c *LocalClient) GetSubscribers(_ context.Context) ([]string, error) {
+	c.subscribersMu.RLock()
+	defer c.subscribersMu.RUnlock()
+
+	sources := make([]string, 0, len(c.subscribers))
+	for source := range c.subscribers {
+		sources = append(sources, source)
+	}
+	return sources, nil
+}
+
 func (c *LocalClient) GetState(ctx context.Context, key string) ([]byte, error) {
 	return c.store.GetState(ctx, key)
 }
@@ -536,8 +549,18 @@ func (c *LocalClient) GetBestHeightAndTime(ctx context.Context) (uint32, uint32,
 // Blob deletion methods - LocalClient implementations
 
 // ScheduleBlobDeletion schedules a blob for deletion at a specific block height.
-func (c *LocalClient) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
+func (c *LocalClient) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
 	return 0, false, errors.NewProcessingError("not implemented")
+}
+
+// CancelBlobDeletion cancels a previously scheduled blob deletion.
+func (c *LocalClient) CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType) (bool, error) {
+	return false, errors.NewProcessingError("not implemented")
+}
+
+// ListScheduledDeletions lists scheduled blob deletions with optional filtering.
+func (c *LocalClient) ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType storetypes.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error) {
+	return nil, 0, errors.NewProcessingError("not implemented")
 }
 
 // GetPendingBlobDeletions retrieves blob deletions ready for processing at a specific height.
@@ -568,4 +591,71 @@ func (c *LocalClient) AcquireBlobDeletionBatch(ctx context.Context, height uint3
 // CompleteBlobDeletionBatch completes a previously acquired batch.
 func (c *LocalClient) CompleteBlobDeletionBatch(ctx context.Context, batchToken string, completedIDs []int64, failedIDs []int64, maxRetries int) error {
 	return errors.NewProcessingError("not implemented")
+}
+
+// GetMedianTimePastForHeights returns the MTP for one or more block heights.
+// MTP values are read from pre-stored block metadata rather than recomputed on demand.
+func (c *LocalClient) GetMedianTimePastForHeights(ctx context.Context, heights []uint32) ([]uint32, error) {
+	if len(heights) == 0 {
+		return []uint32{}, nil
+	}
+
+	minHeight, maxHeight := heights[0], heights[0]
+	for _, h := range heights[1:] {
+		if h < minHeight {
+			minHeight = h
+		}
+		if h > maxHeight {
+			maxHeight = h
+		}
+	}
+
+	_, metas, err := c.store.GetBlockHeadersByHeight(ctx, minHeight, maxHeight)
+	if err != nil {
+		return nil, errors.NewProcessingError("[LocalClient][GetMedianTimePastForHeights] failed to get block headers from %d to %d", minHeight, maxHeight, err)
+	}
+
+	mtpByHeight := make(map[uint32]uint32, len(metas))
+	for _, meta := range metas {
+		mtpByHeight[meta.Height] = meta.MedianTimePast
+	}
+
+	mtps := make([]uint32, len(heights))
+	for i, height := range heights {
+		mtps[i] = mtpByHeight[height]
+	}
+
+	return mtps, nil
+}
+
+// GetMedianTimePastRange returns the MTP values for all blocks in [fromHeight, toHeight].
+// Returns a dense slice where result[i] = MTP for height (fromHeight + i).
+// Blocks missing from the canonical chain (e.g. heights below 11) are left as zero.
+func (c *LocalClient) GetMedianTimePastRange(ctx context.Context, fromHeight, toHeight uint32) ([]uint32, error) {
+	if toHeight < fromHeight {
+		return []uint32{}, nil
+	}
+
+	_, metas, err := c.store.GetBlockHeadersByHeight(ctx, fromHeight, toHeight)
+	if err != nil {
+		return nil, errors.NewProcessingError("[LocalClient][GetMedianTimePastRange] failed to get block headers from %d to %d", fromHeight, toHeight, err)
+	}
+
+	result := make([]uint32, toHeight-fromHeight+1)
+	for _, meta := range metas {
+		result[meta.Height-fromHeight] = meta.MedianTimePast
+	}
+
+	// If the top height is not in the database (block not yet persisted), compute its MTP
+	// on the fly from the block_time values of the preceding 11 blocks already in metas.
+	topMissing := len(metas) == 0 || metas[len(metas)-1].Height < toHeight
+	if topMissing && toHeight >= uint32(MedianTimeBlocks) {
+		computed, err := computeMTPForMissingHeight(metas, toHeight)
+		if err != nil {
+			return nil, err
+		}
+		result[toHeight-fromHeight] = computed
+	}
+
+	return result, nil
 }

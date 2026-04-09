@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
@@ -32,9 +32,11 @@ func Test_storeSubtreeData(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1_000)
 
 		subtreeDone, allDone, err := server.storeSubtreeData(t.Context(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 		require.NoError(t, err)
 
@@ -84,9 +86,11 @@ func Test_storeSubtreeData(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1_000)
 
 		subtreeDone, allDone, err := server.storeSubtreeData(t.Context(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 		require.NoError(t, err)
 
@@ -548,78 +552,6 @@ func TestSubmitMiningSolution_InvalidBlock_HandlesReset(t *testing.T) {
 	})
 }
 
-func TestRemoveSubtreesDAH_PartialFailures(t *testing.T) {
-	t.Run("removeSubtreesDAH handles partial DAH update failures gracefully", func(t *testing.T) {
-		server, subtreeStore := setupServer(t)
-
-		// Create a block with multiple subtrees
-		block := &model.Block{
-			Header: &model.BlockHeader{
-				Version:        1,
-				HashPrevBlock:  server.settings.ChainCfgParams.GenesisHash,
-				HashMerkleRoot: &chainhash.Hash{},
-				Timestamp:      uint32(time.Now().Unix()),
-				Bits:           model.NBit{},
-				Nonce:          1234,
-			},
-			CoinbaseTx: &bt.Tx{},
-			Subtrees:   []*chainhash.Hash{},
-		}
-
-		// store the block in the block store to simulate existing state
-		require.NoError(t, server.blockchainClient.AddBlock(t.Context(), block, "test"))
-
-		// Add some subtrees to the block
-		for i := 0; i < 3; i++ {
-			subtreeHash := chainhash.HashH([]byte(fmt.Sprintf("subtree%d", i)))
-			block.Subtrees = append(block.Subtrees, &subtreeHash)
-
-			// Store subtree in blob store with DAH > 0 to simulate existing state
-			subtreeBytes := make([]byte, 32)
-			require.NoError(t, subtreeStore.Set(t.Context(), subtreeHash[:], fileformat.FileTypeSubtree, subtreeBytes))
-			require.NoError(t, subtreeStore.SetDAH(t.Context(), subtreeHash[:], fileformat.FileTypeSubtree, 5))
-		}
-
-		// Call removeSubtreesDAH
-		err := server.removeSubtreesDAH(t.Context(), block)
-
-		// Should not return error even if some DAH updates fail
-		require.NoError(t, err)
-
-		// Verify that SetBlockSubtreesSet was not called when all DAH updates succeed
-		// (since we can't easily mock partial failures in memory store)
-	})
-
-	t.Run("removeSubtreesDAH handles store errors gracefully", func(t *testing.T) {
-		server, _ := setupServer(t)
-
-		// Use a mock store that fails
-		mockStore := &memory.Memory{}
-		server.subtreeStore = mockStore
-
-		subtreeHash1 := chainhash.HashH([]byte("subtree1"))
-		block := &model.Block{
-			Header: &model.BlockHeader{
-				Version:        1,
-				HashPrevBlock:  server.settings.ChainCfgParams.GenesisHash,
-				HashMerkleRoot: &chainhash.Hash{},
-				Timestamp:      uint32(time.Now().Unix()),
-				Bits:           model.NBit{},
-				Nonce:          1234,
-			},
-			CoinbaseTx: &bt.Tx{},
-			Subtrees:   []*chainhash.Hash{&subtreeHash1},
-		}
-
-		// store the block in the block store to simulate existing state
-		require.NoError(t, server.blockchainClient.AddBlock(t.Context(), block, "test"))
-
-		// This should not panic or return error even with store failures
-		err := server.removeSubtreesDAH(t.Context(), block)
-		require.NoError(t, err) // Should handle errors gracefully
-	})
-}
-
 // TestSubtreeCountCoverage tests the SubtreeCount function coverage
 func TestSubtreeCountCoverage(t *testing.T) {
 	server, _, _, _ := setup(t)
@@ -997,10 +929,12 @@ func TestStoreSubtreeDataIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		subtreeDone, allDone, err := server.storeSubtreeData(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:          subtree,
-			ParentTxMap:      txMap,
-			SkipNotification: true,
-			ErrChan:          nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			SkipNotification:  true,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 
 		assert.NoError(t, err)
@@ -1014,7 +948,7 @@ func TestStoreSubtreeDataIntensive(t *testing.T) {
 		assert.NotNil(t, subtreeBytes)
 	})
 
-	t.Run("storeSubtreeData with store already exists", func(t *testing.T) {
+	t.Run("storeSubtreeData already exists", func(t *testing.T) {
 		server, subtreeStore, subtree, txMap := setup(t)
 
 		// Pre-store the subtree to trigger "already exists" path
@@ -1026,9 +960,11 @@ func TestStoreSubtreeDataIntensive(t *testing.T) {
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		_, _, err = server.storeSubtreeData(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 
 		// Should return ErrBlobAlreadyExists
@@ -1042,9 +978,11 @@ func TestStoreSubtreeDataIntensive(t *testing.T) {
 
 		// Test with valid scenario - this just ensures the path is covered
 		subtreeDone, allDone, err := server.storeSubtreeData(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
+			Subtree:           subtree,
+			ParentTxMap:       txMap,
+			DeletedTxs:        nil,
+			ErrChan:           nil,
+			OnStorageComplete: nil,
 		}, subtreeRetryChan)
 
 		// Should succeed in most cases
@@ -1099,6 +1037,89 @@ func TestSendSubtreeNotification(t *testing.T) {
 		server.sendSubtreeNotification(context.Background(), *subtree.RootHash())
 
 		mockClient.AssertExpectations(t)
+	})
+}
+
+// TestStoreSubtree_RaceConditionFix tests that the deletedTxs backup map prevents
+// race condition errors when transactions are deleted during async subtree storage.
+// This test would FAIL without the fix (missing DeletedTxs fallback in Server.go).
+func TestStoreSubtree_RaceConditionFix(t *testing.T) {
+	t.Run("deletedTxs fallback prevents serialization errors", func(t *testing.T) {
+		server, subtreeStore, subtree, txMap := setup(t)
+		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
+
+		// Start with a full txMap (from setup) then simulate race condition
+		deletedTxsMap := txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+
+		// Simulate race: One transaction is deleted from ParentTxMap during async storage
+		// but saved to deletedTxsMap (this is what the fix does)
+		tx1Hash := subtree.Nodes[1].Hash // Use second node (first is coinbase)
+		tx1Inpoints, found := txMap.Get(tx1Hash)
+		require.True(t, found, "transaction should exist in txMap from setup")
+
+		// Move transaction from ParentTxMap to DeletedTxs (simulating deletion during storage)
+		deletedTxsMap.Set(tx1Hash, *tx1Inpoints)
+		txMap.Delete(tx1Hash)
+
+		// Now tx1 is NOT in ParentTxMap but IS in DeletedTxs
+		// Without the fix, this would fail serialization
+		// With the fix, Server falls back to DeletedTxs and succeeds
+
+		subtreeDone, allDone, err := server.storeSubtreeData(t.Context(), subtreeprocessor.NewSubtreeRequest{
+			Subtree:           subtree,
+			ParentTxMap:       txMap,         // Missing tx1!
+			DeletedTxs:        deletedTxsMap, // Has tx1 as backup
+			ErrChan:           nil,
+			OnStorageComplete: nil,
+		}, subtreeRetryChan)
+
+		// Should succeed because Server falls back to DeletedTxs
+		require.NoError(t, err)
+		storedOK := <-subtreeDone
+		require.True(t, storedOK)
+		<-allDone
+
+		// Verify subtree was stored
+		subtreeBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree)
+		require.NoError(t, err)
+		require.NotNil(t, subtreeBytes)
+
+		// Verify subtree meta was created successfully (using DeletedTxs fallback)
+		subtreeMetaBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta)
+		require.NoError(t, err)
+		require.NotNil(t, subtreeMetaBytes)
+	})
+
+	t.Run("without DeletedTxs fallback would fail", func(t *testing.T) {
+		server, subtreeStore, subtree, _ := setup(t)
+		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
+
+		// Create map without the deleted transaction
+		parentTxMap := subtreeprocessor.NewSplitTxInpointsMap(256)
+		// Don't add tx1 to parentTxMap - simulating it was deleted
+
+		subtreeDone, allDone, err := server.storeSubtreeData(t.Context(), subtreeprocessor.NewSubtreeRequest{
+			Subtree:           subtree,
+			ParentTxMap:       parentTxMap, // Missing tx1
+			DeletedTxs:        nil,         // No backup!
+			ErrChan:           nil,
+			OnStorageComplete: nil,
+		}, subtreeRetryChan)
+
+		// Should succeed but subtree meta won't be created (missing parent info)
+		require.NoError(t, err)
+		storedOK := <-subtreeDone
+		require.True(t, storedOK)
+		<-allDone
+
+		// Subtree data should still be stored
+		subtreeBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree)
+		require.NoError(t, err)
+		require.NotNil(t, subtreeBytes)
+
+		// But subtree meta should NOT exist (couldn't create without parent info)
+		_, err = subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta)
+		require.Error(t, err) // Expect error - meta wasn't created
 	})
 }
 
@@ -1841,7 +1862,7 @@ func TestRetryLogicIntensive(t *testing.T) {
 		select {
 		case <-subtreeRetryChan:
 			t.Fatal("Should not have queued retry when exhausted")
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(500 * time.Millisecond):
 			// Good, nothing was queued
 		}
 	})
@@ -2076,7 +2097,7 @@ func TestStoreRetryErrorPaths(t *testing.T) {
 		select {
 		case <-subtreeRetryChan:
 			t.Fatal("Should not have queued retry when exhausted")
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(500 * time.Millisecond):
 			// Good, nothing was queued
 		}
 	})
@@ -2245,7 +2266,7 @@ func TestAdditionalCoveragePaths(t *testing.T) {
 		server, _ := setupServer(t)
 
 		// Test with immediate timeout to cover timeout path
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
 
 		previousHash := chainhash.HashH([]byte("previous"))

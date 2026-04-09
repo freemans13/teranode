@@ -14,7 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/ordishs/go-utils"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // DifficultyAdjustmentWindow defines the number of blocks to consider for difficulty adjustment.
@@ -24,7 +24,7 @@ const DifficultyAdjustmentWindow = 144
 // The CalcWork function has been moved to the work package as CalcBlockWork
 
 // Difficulty handles the calculation and management of blockchain mining difficulty.
-// Implements the Bitcoin SV Difficulty Adjustment Algorithm (DAA) with caching for performance.
+// Implements the Bitcoin Difficulty Adjustment Algorithm (DAA) with caching for performance.
 //
 // Thread-safe: uses sync.RWMutex to protect cached values.
 type Difficulty struct {
@@ -117,7 +117,7 @@ func (d *Difficulty) CalcNextWorkRequired(ctx context.Context, blockHeader *mode
 		return nil, errors.NewProcessingError("[Difficulty] lastSuitableBlock is nil", nil)
 	}
 
-	d.logger.Debugf("[Difficulty] lastSuitableBlock.Hash: %s, lastSuitableBlock.Height: %d, lastSuitableBlock.Time: %d", utils.ReverseAndHexEncodeSlice(lastSuitableBlock.Hash), lastSuitableBlock.Height, lastSuitableBlock.Time)
+	d.logger.Debugf("[Difficulty] lastSuitableBlock.Hash: %s, lastSuitableBlock.Height: %d, lastSuitableBlock.Time: %d", util.ReverseAndHexEncodeSlice(lastSuitableBlock.Hash), lastSuitableBlock.Height, lastSuitableBlock.Time)
 
 	ancestorHash, err := d.store.GetHashOfAncestorBlock(ctx, blockHeader.Hash(), DifficultyAdjustmentWindow)
 	if err != nil {
@@ -144,7 +144,7 @@ func (d *Difficulty) CalcNextWorkRequired(ctx context.Context, blockHeader *mode
 		return d.powLimitnBits, nil
 	}
 
-	d.logger.Debugf("[Difficulty] firstSuitableBlock.Hash: %s, firstSuitableBlock.Height: %d, firstSuitableBlock.Time: %d", utils.ReverseAndHexEncodeSlice(firstSuitableBlock.Hash), firstSuitableBlock.Height, firstSuitableBlock.Time)
+	d.logger.Debugf("[Difficulty] firstSuitableBlock.Hash: %s, firstSuitableBlock.Height: %d, firstSuitableBlock.Time: %d", util.ReverseAndHexEncodeSlice(firstSuitableBlock.Hash), firstSuitableBlock.Height, firstSuitableBlock.Time)
 
 	nBits, err := d.computeTarget(firstSuitableBlock, lastSuitableBlock)
 	if err != nil {
@@ -188,10 +188,10 @@ func (d *Difficulty) computeTarget(suitableFirstBlock *model.SuitableBlock, suit
 
 	duration := int64(suitableLastBlock.Time - suitableFirstBlock.Time)
 	if duration > 288*int64(d.settings.ChainCfgParams.TargetTimePerBlock.Seconds()) {
-		d.logger.Debugf("duration %d is greater than 288 * target time per block %d - setting to 288 * target time per block", duration, d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
+		d.logger.Debugf("duration %d is greater than 288 * target time per block %.0f - setting to 288 * target time per block", duration, d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
 		duration = 288 * int64(d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
 	} else if duration < 72*int64(d.settings.ChainCfgParams.TargetTimePerBlock.Seconds()) {
-		d.logger.Debugf("duration %d is less than 72 * target time per block %d - setting to 72 * target time per block", duration, d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
+		d.logger.Debugf("duration %d is less than 72 * target time per block %.0f - setting to 72 * target time per block", duration, d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
 		duration = 72 * int64(d.settings.ChainCfgParams.TargetTimePerBlock.Seconds())
 	}
 

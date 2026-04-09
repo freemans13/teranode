@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -63,6 +62,10 @@ func (m *mockLogger) New(service string, options ...ulogger.Option) ulogger.Logg
 }
 
 func (m *mockLogger) Duplicate(options ...ulogger.Option) ulogger.Logger {
+	return m
+}
+
+func (m *mockLogger) WithTraceContext(_ context.Context) ulogger.Logger {
 	return m
 }
 
@@ -143,6 +146,11 @@ func (m *mockCache) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 func (m *mockCache) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	args := m.Called(ctx, tx)
+	return args.Error(0)
+}
+
+func (m *mockCache) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
+	args := m.Called(ctx, txs)
 	return args.Error(0)
 }
 
@@ -227,12 +235,8 @@ func createKafkaMessage(t *testing.T, delete bool, content []byte) *kafka.KafkaM
 		copy(data[offset:], content)
 	}
 
-	consumerMsg := sarama.ConsumerMessage{
-		Value: data,
-	}
-
 	return &kafka.KafkaMessage{
-		ConsumerMessage: consumerMsg,
+		Value: data,
 	}
 }
 
@@ -252,7 +256,7 @@ func TestServer_txmetaHandler(t *testing.T) {
 		{
 			name:       "message too short for entry count",
 			setupMocks: func(l *mockLogger, c *mockCache) {},
-			input:      &kafka.KafkaMessage{ConsumerMessage: sarama.ConsumerMessage{Value: make([]byte, 3)}},
+			input:      &kafka.KafkaMessage{Value: make([]byte, 3)},
 		},
 		{
 			name: "successful delete operation",

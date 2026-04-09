@@ -44,6 +44,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -79,6 +80,7 @@ type TestDaemon struct {
 	PropagationClient     *propagation.Client
 	Settings              *settings.Settings
 	SubtreeStore          blob.Store
+	BlockchainStore       blockchainstore.Store
 	UtxoStore             utxo.Store
 	P2PClient             p2p.ClientI
 	composeDependencies   tc.ComposeStack
@@ -360,7 +362,7 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 
 	// Override QuorumPath to ensure it uses the test-specific directory
 	// This prevents tests from sharing the same quorum directory
-	// appSettings.SubtreeValidation.QuorumPath = filepath.Join(path, "subtree_quorum")
+	appSettings.SubtreeValidation.QuorumPath = filepath.Join(path, "subtree_quorum")
 
 	absPath, err := filepath.Abs(path)
 	require.NoError(t, err)
@@ -399,6 +401,13 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	} else if opts.UTXOStoreType != "" {
 		containerManager, err = containers.NewContainerManager(containers.UTXOStoreType(opts.UTXOStoreType))
 		require.NoError(t, err, "Failed to create container manager")
+
+		// Set test-specific external storage path for Aerospike to avoid conflicts between parallel tests
+		// Use absolute path to ensure files are written to the correct location
+		externalStorePath := filepath.Join(appSettings.DataFolder, "externalStore")
+		absExternalStorePath, err := filepath.Abs(externalStorePath)
+		require.NoError(t, err, "Failed to get absolute path for external storage")
+		containerManager.SetExternalStorePath(absExternalStorePath)
 
 		utxoStoreURL, err := containerManager.Initialize(ctx)
 		require.NoError(t, err, "Failed to initialize container")
@@ -500,6 +509,14 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	ports := []int{getPortFromString(appSettings.HealthCheckHTTPListenAddress)}
 	require.NoError(t, WaitForHealthLiveness(ports, 10*time.Second))
 
+	// If using Aerospike, add a brief delay to allow it to stabilize after daemon services connect
+	// Aerospike may accept connections but still reject operations immediately after multiple
+	// services start connecting simultaneously. Combined with retry logic in tests, this ensures
+	// reliability across different environments (local development and resource-constrained CI).
+	if containerManager != nil && containerManager.GetStoreType() == containers.UTXOStoreAerospike {
+		time.Sleep(1 * time.Second)
+	}
+
 	var blockchainClient blockchain.ClientI
 
 	blockchainClient, err = blockchain.NewClient(ctx, logger, appSettings, "test")
@@ -530,6 +547,9 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	require.NoError(t, err)
 
 	subtreeStore, err := d.daemonStores.GetSubtreeStore(ctx, logger, appSettings)
+	require.NoError(t, err)
+
+	blockchainStore, err := d.daemonStores.GetBlockchainStore(ctx, logger, appSettings)
 	require.NoError(t, err)
 
 	var utxoStore utxo.Store
@@ -603,6 +623,7 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		PropagationClient:     propagationClient,
 		Settings:              appSettings,
 		SubtreeStore:          subtreeStore,
+		BlockchainStore:       blockchainStore,
 		UtxoStore:             utxoStore,
 		P2PClient:             p2pClient,
 		composeDependencies:   composeDependencies,
@@ -1109,6 +1130,39 @@ func (td *TestDaemon) WaitForBlobDeletion(timeout time.Duration) (height uint32,
 	return td.blobDeletionObserver.waitForBlobDeletion(timeout)
 }
 
+// WaitForBlockPersisted waits for a block to be marked as persisted in the blockchain database.
+// It polls GetBlocksNotPersisted until the specified block is no longer in the unpersisted list.
+func (td *TestDaemon) WaitForBlockPersisted(blockHash *chainhash.Hash, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	checkInterval := 500 * time.Millisecond
+
+	for time.Now().Before(deadline) {
+		// Check if this block is still in the unpersisted list
+		unpersistedBlocks, err := td.BlockchainClient.GetBlocksNotPersisted(td.Ctx, 100)
+		if err != nil {
+			time.Sleep(checkInterval)
+			continue
+		}
+
+		// If the block is not in the unpersisted list, it has been persisted
+		found := false
+		for _, b := range unpersistedBlocks {
+			if b.Hash().String() == blockHash.String() {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return nil // Block is no longer in unpersisted list, so it's persisted
+		}
+
+		time.Sleep(checkInterval)
+	}
+
+	return context.DeadlineExceeded
+}
+
 // CreateTransaction creates a new transaction with a single input from the parent transaction.
 func (td *TestDaemon) CreateTransaction(t *testing.T, parentTx *bt.Tx, useInput ...uint64) *bt.Tx {
 	tx := bt.NewTx()
@@ -1499,6 +1553,14 @@ finished:
 }
 
 func (td *TestDaemon) WaitForBlockStateChange(t *testing.T, expectedBlock *model.Block, timeout time.Duration) {
+	// Check if block assembly is already at the expected block before waiting
+	// This prevents missing state changes that occurred before the channel was registered
+	currentHeader, currentHeight := td.BlockAssembler.CurrentBlock()
+	if currentHeader != nil && currentHeader.Hash().IsEqual(expectedBlock.Header.Hash()) {
+		t.Logf("Block assembly already at expected block: Height=%d, Hash=%s", currentHeight, currentHeader.Hash().String())
+		return
+	}
+
 	stateChangeCh := make(chan blockassembly.BestBlockInfo)
 	td.BlockAssembler.SetStateChangeCh(stateChangeCh)
 
@@ -1703,6 +1765,12 @@ func (td *TestDaemon) GetContainerManager() *containers.ContainerManager {
 // This is useful for tests that need to verify block persistence.
 func (td *TestDaemon) GetBlockStore() (blob.Store, error) {
 	return td.d.daemonStores.GetBlockStore(td.Ctx, td.Logger, td.Settings)
+}
+
+// GetTxStore returns the transaction store used by this test daemon.
+// This is useful for tests that need to verify transaction storage and deletion scheduling.
+func (td *TestDaemon) GetTxStore() (blob.Store, error) {
+	return td.d.daemonStores.GetTxStore(td.Ctx, td.Logger, td.Settings)
 }
 
 // WaitForHealthLiveness waits for the health readiness endpoint of the given ports to respond within the specified timeout.
