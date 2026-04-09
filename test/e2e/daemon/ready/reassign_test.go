@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/test"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
@@ -14,15 +15,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	// Use smaller values for faster test execution
+	testCoinbaseMaturity             = 2
+	testReassignedUtxoSpendableAfter = 5
+)
+
 func TestShouldAllowReassign(t *testing.T) {
 	SharedTestLock.Lock()
 	defer SharedTestLock.Unlock()
 
-	// Initialize test daemon with required services
+	// Initialize test daemon with required services and reduced block heights for faster testing
 	td := daemon.NewTestDaemon(t, daemon.TestOptions{
-		EnableRPC:            true,
-		EnableValidator:      true,
-		SettingsOverrideFunc: test.SystemTestSettings(),
+		EnableRPC:       true,
+		EnableValidator: true,
+		SettingsOverrideFunc: test.ComposeSettings(
+			test.SystemTestSettings(),
+			func(s *settings.Settings) {
+				// Reduce coinbase maturity for faster test
+				s.ChainCfgParams.CoinbaseMaturity = testCoinbaseMaturity
+				// Reduce reassigned UTXO spendable blocks for faster test
+				s.UtxoStore.ReAssignedUtxoSpendableAfterBlocks = testReassignedUtxoSpendableAfter
+			},
+		),
 	})
 
 	defer td.Stop(t)
@@ -31,8 +46,8 @@ func TestShouldAllowReassign(t *testing.T) {
 	err := td.BlockchainClient.Run(td.Ctx, "test")
 	require.NoError(t, err)
 
-	// Generate initial blocks
-	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{2})
+	// Generate initial blocks (coinbase maturity + 1)
+	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{testCoinbaseMaturity + 1})
 	require.NoError(t, err)
 
 	// Generate private keys and addresses for Alice, Bob, and Charles
@@ -62,6 +77,9 @@ func TestShouldAllowReassign(t *testing.T) {
 	// Send Alice to Bob transaction
 	err = td.PropagationClient.ProcessTransaction(td.Ctx, aliceToBobTx)
 	require.NoError(t, err)
+
+	// Wait for the transaction to be processed by block assembly before mining
+	td.WaitForBlockAssemblyToProcessTx(t, aliceToBobTx.TxIDChainHash().String())
 
 	// Mine a block and wait for processing
 	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{1})
@@ -122,10 +140,10 @@ func TestShouldAllowReassign(t *testing.T) {
 	require.NoError(t, err)
 
 	err = td.PropagationClient.ProcessTransaction(td.Ctx, charlesSpendingTx)
-	require.Error(t, err, "Transaction should be rejected since UTXO is not spendable until block 1000")
+	require.Error(t, err, "Transaction should be rejected since UTXO is not spendable until reassignment height")
 
-	// Generate 1000 blocks to reach reassignment height
-	td.MineAndWait(t, 1000)
+	// Generate blocks to reach reassignment height
+	td.MineAndWait(t, testReassignedUtxoSpendableAfter)
 
 	// Now try spending the reassigned UTXO - should succeed
 	err = td.PropagationClient.ProcessTransaction(td.Ctx, charlesSpendingTx)

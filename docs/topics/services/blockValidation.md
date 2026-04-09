@@ -65,7 +65,11 @@ The block validator is a service that validates blocks. After validating them, i
 
 ![block_validation_p2p_block_found.svg](img/plantuml/blockvalidation/block_validation_p2p_block_found.svg)
 
-- The Legacy Service is responsible for receiving new blocks from the network. When a new block is found, it will notify the block validation service via the `BlockFound()` gRPC endpoint.
+Block validation receives new blocks through two distinct paths:
+
+1. **P2P-discovered blocks (primary)**: The P2P service publishes block announcements to a Kafka topic. Block validation consumes this topic via `consumerMessageHandler`, which calls `blockHandler()` to queue blocks for processing via `blockFoundCh`.
+2. **Legacy-synced blocks**: The Legacy service's netsync manager calls `blockValidation.ProcessBlock()` directly when it downloads a complete block from a legacy Bitcoin peer.
+
 - The block validation service will then check if the block is already known. If not, it will start the validation process.
 - The block is added to a channel for processing. The channel is used to ensure that the block validation process is asynchronous and non-blocking.
 
@@ -84,7 +88,7 @@ The block validator is a service that validates blocks. After validating them, i
     - The validator retrieves the last 100 block headers, which are used to validate the block data. We can see more about this specific step in the section 2.2.4.
     - The validator stores the coinbase Tx in the UTXO Store and the Tx Store.
     - The validator adds the block to the Blockchain.
-    - For each Subtree in the block, the validator updates the TTL (Time To Live) to zero for the subtree. This allows the Store to clear out data the services will no longer use.
+    - Subtrees retain their finite DAH (Delete-At-Height) from assembly/validation. The Block Persister will promote them to permanent (DAH=0) when the block is confirmed on the main chain.
     - For each Tx for each Subtree, we set the Tx as mined in the UTXO Store. This allows the UTXO Store to know which block(s) the Tx is in.
     - Should an error occur during the validation process, the block will be invalidated and removed from the blockchain.
 
@@ -126,7 +130,7 @@ The optimistic path is implemented in `ValidateBlock()` (services/blockvalidatio
 
 **Configuration:**
 
-- **Setting**: `blockvalidation_optimisticMining` (default: `false`)
+- **Setting**: `blockvalidation_optimistic_mining` (default: `true`)
 - **Runtime Override**: Can be disabled per-block via `ValidateBlockOptions.DisableOptimisticMining`
 - **Automatic Disable**: Always disabled during catchup mode for better reliability
 

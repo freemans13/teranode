@@ -100,6 +100,11 @@ func (m *MockStore) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return args.Get(0).(utxo.UnminedTxIterator), args.Error(1)
 }
 
+func (m *MockStore) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (utxo.UnminedTxIterator, error) {
+	args := m.Called(cutoffBlockHeight)
+	return args.Get(0).(utxo.UnminedTxIterator), args.Error(1)
+}
+
 func (m *MockStore) GetSpend(ctx context.Context, spendArg *utxo.Spend) (*utxo.SpendResponse, error) {
 	args := m.Called(ctx, spendArg)
 	return args.Get(0).(*utxo.SpendResponse), args.Error(1)
@@ -112,6 +117,11 @@ func (m *MockStore) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice [
 
 func (m *MockStore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	args := m.Called(ctx, tx)
+	return args.Error(0)
+}
+
+func (m *MockStore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
+	args := m.Called(ctx, txs)
 	return args.Error(0)
 }
 

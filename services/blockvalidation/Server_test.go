@@ -1,4 +1,4 @@
-// Package blockvalidation implements block validation for Bitcoin SV nodes in Teranode.
+// Package blockvalidation implements block validation for BSV Blockchain nodes in Teranode.
 //
 // This package provides the core functionality for validating Bitcoin blocks, managing block subtrees,
 // and processing transaction metadata. It is designed for high-performance operation at scale,
@@ -25,7 +25,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -45,12 +44,12 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jarcoal/httpmock"
 	"github.com/jellydator/ttlcache/v3"
-	"github.com/ordishs/go-utils/expiringmap"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -1023,7 +1022,7 @@ func Test_Start(t *testing.T) {
 	}
 
 	// Create a context with quick timeout since Start() blocks on GRPC server
-	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	readyCh := make(chan struct{})
@@ -1042,10 +1041,15 @@ func Test_Start_FSMTransitionError(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
+	// Clear the gRPC listen address to prevent port conflicts during testing
+	tSettings.BlockValidation.GRPCListenAddress = ""
 
 	// Create mock blockchain client that returns error
 	mockBlockchainClient := &blockchain.Mock{}
 	mockBlockchainClient.On("WaitUntilFSMTransitionFromIdleState", mock.Anything).Return(errors.New(errors.ERR_BLOCK_NOT_FOUND, "FSM not ready"))
+
+	// set the GRPC listen address to a random local port to avoid conflicts during testing
+	tSettings.BlockValidation.GRPCListenAddress = "localhost:0"
 
 	server := &Server{
 		logger:           logger,
@@ -1132,6 +1136,7 @@ func Test_BlockFound(t *testing.T) {
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 		}
+		defer bv.blockExistsCache.Stop()
 
 		// Mark block as existing
 		err := bv.SetBlockExists(&hash)
@@ -1164,6 +1169,7 @@ func Test_BlockFound(t *testing.T) {
 			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1206,6 +1212,7 @@ func Test_BlockFound(t *testing.T) {
 			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1246,6 +1253,7 @@ func Test_BlockFound(t *testing.T) {
 			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1327,6 +1335,7 @@ func Test_ProcessBlock(t *testing.T) {
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			stats:                         gocore.NewStat("test"),
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1370,6 +1379,7 @@ func Test_ProcessBlock(t *testing.T) {
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			stats:                         gocore.NewStat("test"),
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1471,6 +1481,7 @@ func Test_ValidateBlock(t *testing.T) {
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			stats:                         gocore.NewStat("test"),
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1541,6 +1552,7 @@ func Test_ValidateBlock(t *testing.T) {
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			stats:                         gocore.NewStat("test"),
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1596,6 +1608,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1616,9 +1629,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 		require.NoError(t, err)
 
 		msg := &kafka.KafkaMessage{
-			ConsumerMessage: sarama.ConsumerMessage{
-				Value: msgBytes,
-			},
+			Value: msgBytes,
 		}
 
 		handler := server.consumerMessageHandler(ctx)
@@ -1648,6 +1659,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1660,9 +1672,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 
 		// Invalid message that will cause a parsing error
 		msg := &kafka.KafkaMessage{
-			ConsumerMessage: sarama.ConsumerMessage{
-				Value: []byte("invalid protobuf"),
-			},
+			Value: []byte("invalid protobuf"),
 		}
 
 		handler := server.consumerMessageHandler(ctx)
@@ -1685,6 +1695,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,
 		}
+		defer bv.blockExistsCache.Stop()
 
 		server := &Server{
 			logger:              logger,
@@ -1707,9 +1718,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 		require.NoError(t, err)
 
 		msg := &kafka.KafkaMessage{
-			ConsumerMessage: sarama.ConsumerMessage{
-				Value: msgBytes,
-			},
+			Value: msgBytes,
 		}
 
 		handler := server.consumerMessageHandler(ctx)

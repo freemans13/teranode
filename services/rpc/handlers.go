@@ -55,14 +55,20 @@ import (
 	"github.com/bsv-blockchain/teranode/services/p2p"
 	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
-	"github.com/ordishs/go-utils"
-	cache "github.com/patrickmn/go-cache"
+	"github.com/jellydator/ttlcache/v3"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// live items expire after 10s, cleanup runs every minute
-var rpcCallCache = cache.New(10*time.Second, time.Minute)
+// live items expire after 10s
+var rpcCallCache = newRPCCache()
+
+func newRPCCache() *ttlcache.Cache[string, any] {
+	c := ttlcache.New[string, any](ttlcache.WithTTL[string, any](10 * time.Second))
+	go c.Start()
+	return c
+}
 
 // handleGetBlock implements the getblock command, which retrieves information about a block
 // from the blockchain based on its hash.
@@ -486,8 +492,8 @@ func handleGetBestBlockHash(ctx context.Context, s *RPCServer, _ interface{}, _ 
 	)
 	defer deferFn()
 
-	if cached, found := rpcCallCache.Get("getbestblockhash"); found {
-		return cached.(string), nil
+	if cached := rpcCallCache.Get("getbestblockhash"); cached != nil {
+		return cached.Value().(string), nil
 	}
 
 	bh, _, err := s.blockchainClient.GetBestBlockHeader(ctx)
@@ -498,7 +504,7 @@ func handleGetBestBlockHash(ctx context.Context, s *RPCServer, _ interface{}, _ 
 	hash := bh.Hash()
 
 	if s.settings.RPC.CacheEnabled {
-		rpcCallCache.Set("getbestblockhash", hash.String(), cache.DefaultExpiration)
+		rpcCallCache.Set("getbestblockhash", hash.String(), ttlcache.DefaultTTL)
 	}
 
 	return hash.String(), nil
@@ -581,19 +587,26 @@ func handleGetRawTransaction(ctx context.Context, s *RPCServer, cmd interface{},
 	inputs := make([]bsvjson.Vin, len(tx.Inputs))
 
 	for i, txIn := range tx.Inputs {
-		asm, err := txscript.DisasmString(txIn.UnlockingScript.Bytes())
-		if err != nil {
-			return nil, errors.NewServiceError("Error disassembling script", err)
-		}
+		if tx.IsCoinbase() {
+			inputs[i] = bsvjson.Vin{
+				Coinbase: txIn.UnlockingScript.String(),
+				Sequence: txIn.SequenceNumber,
+			}
+		} else {
+			asm, err := txscript.DisasmString(txIn.UnlockingScript.Bytes())
+			if err != nil {
+				return nil, errors.NewServiceError("Error disassembling script", err)
+			}
 
-		inputs[i] = bsvjson.Vin{
-			Txid: txIn.PreviousTxIDStr(),
-			Vout: txIn.PreviousTxOutIndex,
-			ScriptSig: &bsvjson.ScriptSig{
-				Asm: asm,
-				Hex: txIn.UnlockingScript.String(),
-			},
-			Sequence: txIn.SequenceNumber,
+			inputs[i] = bsvjson.Vin{
+				Txid: txIn.PreviousTxIDStr(),
+				Vout: txIn.PreviousTxOutIndex,
+				ScriptSig: &bsvjson.ScriptSig{
+					Asm: asm,
+					Hex: txIn.UnlockingScript.String(),
+				},
+				Sequence: txIn.SequenceNumber,
+			}
 		}
 	}
 
@@ -617,7 +630,7 @@ func handleGetRawTransaction(ctx context.Context, s *RPCServer, cmd interface{},
 		}
 
 		outputs[i] = bsvjson.Vout{
-			Value: float64(txOut.Satoshis),
+			Value: bsvjson.BTCValue(float64(txOut.Satoshis) / 1e8),
 			N:     uint32(i),
 			ScriptPubKey: bsvjson.ScriptPubKeyResult{
 				Addresses: addressStrings,
@@ -1050,11 +1063,11 @@ func handleGetMiningCandidate(ctx context.Context, s *RPCServer, cmd interface{}
 	merkleProofStrings := make([]string, len(mc.MerkleProof))
 
 	for i, hash := range mc.MerkleProof {
-		merkleProofStrings[i] = utils.ReverseAndHexEncodeSlice(hash)
+		merkleProofStrings[i] = util.ReverseAndHexEncodeSlice(hash)
 	}
 
 	jsonMap := map[string]interface{}{
-		"id":                  utils.ReverseAndHexEncodeSlice(mc.Id),
+		"id":                  util.ReverseAndHexEncodeSlice(mc.Id),
 		"prevhash":            ph.String(),
 		"coinbaseValue":       mc.CoinbaseValue,
 		"version":             mc.Version,
@@ -1079,7 +1092,7 @@ func handleGetMiningCandidate(ctx context.Context, s *RPCServer, cmd interface{}
 	if *c.Verbosity == uint32(1) {
 		subtreeHashes := make([]string, len(mc.SubtreeHashes))
 		for i, hash := range mc.SubtreeHashes {
-			subtreeHashes[i] = utils.ReverseAndHexEncodeSlice(hash)
+			subtreeHashes[i] = util.ReverseAndHexEncodeSlice(hash)
 		}
 
 		jsonMap["subtreeHashes"] = subtreeHashes
@@ -1125,8 +1138,8 @@ func handleGetpeerinfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-c
 	)
 	defer deferFn()
 
-	if cached, found := rpcCallCache.Get("getpeerinfo"); found {
-		return cached, nil
+	if cached := rpcCallCache.Get("getpeerinfo"); cached != nil {
+		return cached.Value(), nil
 	}
 
 	// use a goroutine with select to handle timeouts more reliably
@@ -1212,6 +1225,13 @@ func handleGetpeerinfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-c
 				// 	// We actually want microseconds.
 				// 	info.PingWait = wait / 1000
 				// }
+				for _, s := range p.Streams {
+					info.Streams = append(info.Streams, bsvjson.StreamInfoResult{
+						StreamType: s.StreamType,
+						BytesSent:  s.BytesSent,
+						BytesRecv:  s.BytesRecv,
+					})
+				}
 				infos = append(infos, info)
 			}
 		}
@@ -1380,8 +1400,8 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 	)
 	defer deferFn()
 
-	if cached, found := rpcCallCache.Get("getblockchaininfo"); found {
-		return cached.(map[string]interface{}), nil
+	if cached := rpcCallCache.Get("getblockchaininfo"); cached != nil {
+		return cached.Value().(map[string]interface{}), nil
 	}
 
 	bestBlockHeader, bestBlockMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
@@ -1395,7 +1415,7 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 		return map[string]interface{}{}, errors.NewProcessingError("error calculating median time: %v", err)
 	}
 
-	// Calculate verification progress based on Bitcoin SV's GuessVerificationProgress function
+	// Calculate verification progress based on SV Node's GuessVerificationProgress function
 	verificationProgress, err := calculateVerificationProgress(ctx, s.blockchainClient, bestBlockMeta.Height)
 	if err != nil {
 		// If we can't calculate verification progress, default to 1.0 (assume fully synced)
@@ -1413,7 +1433,7 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 		"blocks":               bestBlockMeta.Height,
 		"headers":              bestBlockMeta.Height,
 		"bestblockhash":        bestBlockHeader.Hash().String(),
-		"difficulty":           difficulty, // Return as float64 to match Bitcoin SV
+		"difficulty":           difficulty, // Return as float64 to match SV Node
 		"mediantime":           medianTime,
 		"verificationprogress": verificationProgress,
 		"chainwork":            chainWorkHex,
@@ -1428,8 +1448,8 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 	return jsonMap, nil
 }
 
-// calculateVerificationProgress follows the pattern of Bitcoin SV's GuessVerificationProgress function.
-// This is a translation of the Bitcoin SV code from validation.cpp:
+// calculateVerificationProgress follows the pattern of SV Node's GuessVerificationProgress function.
+// This is a translation of the SV Node code from validation.cpp:
 //
 //	double GuessVerificationProgress(const ChainTxData &data, const CBlockIndex *pindex) {
 //	    if (pindex == nullptr) return 0.0;
@@ -1443,7 +1463,7 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 //	    return pindex->GetChainTx() / fTxTotal;
 //	}
 //
-// Since we don't have hardcoded ChainTxData like Bitcoin SV, we'll use dynamic calculation
+// Since we don't have hardcoded ChainTxData like SV Node, we'll use dynamic calculation
 // based on our current blockchain statistics.
 func calculateVerificationProgress(ctx context.Context, blockchainClient blockchain.ClientI, currentHeight uint32) (float64, error) {
 	// Equivalent to: if (pindex == nullptr) return 0.0;
@@ -1465,7 +1485,7 @@ func calculateVerificationProgress(ctx context.Context, blockchainClient blockch
 	// Equivalent to: int64_t nNow = time(nullptr);
 	nNow := time.Now().Unix()
 
-	// Since we don't have hardcoded ChainTxData like Bitcoin SV, we'll use a different approach
+	// Since we don't have hardcoded ChainTxData like SV Node, we'll use a different approach
 	// We'll estimate sync progress based on how recent our last block is
 
 	// If our last block is very recent (within 10 minutes), assume we're synced
@@ -1531,6 +1551,25 @@ func calculateMedianTime(ctx context.Context, blockchainClient blockchain.Client
 	return medianTimestampUint32, nil
 }
 
+// isSubscriberActive checks whether a blockchain subscriber whose source
+// contains substr is currently registered. This lets RPC handlers skip
+// expensive calls to services that are not running.
+// isSubscriberActive checks whether source is present in the blockchain
+// subscriber list. This lets RPC handlers skip expensive calls to services
+// that are not running.
+func isSubscriberActive(ctx context.Context, s *RPCServer, source string) bool {
+	subs, err := s.blockchainClient.GetSubscribers(ctx)
+	if err != nil {
+		return false
+	}
+	for _, src := range subs {
+		if src == source {
+			return true
+		}
+	}
+	return false
+}
+
 // handleGetInfo returns a JSON object containing various state info.
 func handleGetInfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan struct{}) (interface{}, error) {
 	ctx, _, deferFn := tracing.Tracer("rpc").Start(ctx, "handleGetInfo",
@@ -1541,8 +1580,8 @@ func handleGetInfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan 
 	defer deferFn()
 
 	// use a cache that expires after 10 seconds
-	if cached, found := rpcCallCache.Get("getinfo"); found {
-		return cached.(map[string]interface{}), nil
+	if cached := rpcCallCache.Get("getinfo"); cached != nil {
+		return cached.Value().(map[string]interface{}), nil
 	}
 
 	bestBlockHeader, bestBlockMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
@@ -1587,12 +1626,10 @@ func handleGetInfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan 
 	}
 
 	var legacyConnections *peer_api.GetPeersResponse
-	if s.legacyP2PClient != nil {
-		// create a timeout context to prevent hanging if legacy peer service is not responding
+	if s.legacyP2PClient != nil && isSubscriberActive(ctx, s, blockchain.SubscriberLegacy) {
 		peerCtx, cancel := context.WithTimeout(ctx, s.settings.RPC.ClientCallTimeout)
 		defer cancel()
 
-		// use a goroutine with select to handle timeouts more reliably
 		type peerResult struct {
 			resp *peer_api.GetPeersResponse
 			err  error
@@ -1607,13 +1644,11 @@ func handleGetInfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan 
 		select {
 		case result := <-resultCh:
 			if result.err != nil {
-				// not critical - legacy service may not be running, so log as info
 				s.logger.Infof("error getting legacy peer info: %v", result.err)
 			} else {
 				legacyConnections = result.resp
 			}
 		case <-peerCtx.Done():
-			// timeout reached
 			s.logger.Infof("timeout getting legacy peer info from peer service")
 		}
 	}
@@ -1644,7 +1679,7 @@ func handleGetInfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan 
 	}
 
 	if s.settings.RPC.CacheEnabled {
-		rpcCallCache.Set("getinfo", jsonMap, cache.DefaultExpiration)
+		rpcCallCache.Set("getinfo", jsonMap, ttlcache.DefaultTTL)
 	}
 
 	return jsonMap, nil
@@ -1692,7 +1727,7 @@ func handleSubmitMiningSolution(ctx context.Context, s *RPCServer, cmd interface
 
 	s.logger.Debugf("in handleSubmitMiningSolution: cmd: %s", c.MiningSolution.String())
 
-	id, err := utils.DecodeAndReverseHexString(c.MiningSolution.ID)
+	id, err := util.DecodeAndReverseHexString(c.MiningSolution.ID)
 	if err != nil {
 		return nil, rpcDecodeHexError(c.MiningSolution.ID)
 	}
@@ -2013,15 +2048,9 @@ func handleIsBanned(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan
 		}
 	}
 
-	// validate ip or subnet
-	if !isIPOrSubnet(c.IPOrSubnet) {
-		return nil, &bsvjson.RPCError{
-			Code:    bsvjson.ErrRPCInvalidParameter,
-			Message: "Invalid IP or subnet",
-		}
-	}
+	isIP := isIPOrSubnet(c.IPOrSubnet)
 
-	// check if P2P service is available
+	// P2P service handles both IPs and PeerIDs (checks banList and banManager)
 	var p2pBanned bool
 
 	if s.p2pClient != nil {
@@ -2033,10 +2062,10 @@ func handleIsBanned(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan
 		}
 	}
 
-	// check if legacy peer service is available
+	// Legacy service only handles IPs
 	var peerBanned bool
 
-	if s.legacyP2PClient != nil {
+	if isIP && s.legacyP2PClient != nil {
 		isBannedLegacy, err := s.legacyP2PClient.IsBanned(ctx, &peer_api.IsBannedRequest{IpOrSubnet: c.IPOrSubnet})
 		if err != nil {
 			s.logger.Warnf("Failed to check if banned in legacy peer service: %v", err)
@@ -2674,19 +2703,19 @@ func calculateHashRate(difficulty float64, blockTime float64) float64 {
 // Returns:
 //   - bool: true if the string is a valid IP or subnet, false otherwise
 func isIPOrSubnet(ipOrSubnet string) bool {
+	if ipOrSubnet == "" {
+		return false
+	}
+
 	// no slash means ip
 	if !strings.Contains(ipOrSubnet, "/") {
 		_, err := net.ResolveIPAddr("ip", ipOrSubnet)
 		return err == nil
 	}
 
-	if strings.Contains(ipOrSubnet, ":") {
-		// remove port
-		ipOrSubnet = strings.Split(ipOrSubnet, ":")[0]
-	}
-
+	// CIDR notation never includes ports, so pass directly to ParseCIDR.
+	// The previous port-stripping logic broke IPv6 CIDR (e.g. "2001:db8::/32").
 	_, _, err := net.ParseCIDR(ipOrSubnet)
-
 	return err == nil
 }
 
@@ -2699,8 +2728,8 @@ func handleGetchaintips(ctx context.Context, s *RPCServer, cmd interface{}, _ <-
 	)
 	defer deferFn()
 
-	if cached, found := rpcCallCache.Get("getchaintips"); found {
-		return cached, nil
+	if cached := rpcCallCache.Get("getchaintips"); cached != nil {
+		return cached.Value(), nil
 	}
 
 	_, ok := cmd.(*bsvjson.GetChainTipsCmd)

@@ -108,6 +108,12 @@ func (m *MockUtxostore) GetUnminedTxIterator(bool) (UnminedTxIterator, error) {
 	return args.Get(0).(UnminedTxIterator), args.Error(1)
 }
 
+// GetPrunableUnminedTxIterator mocks the creation of a pruner-specific lightweight iterator.
+func (m *MockUtxostore) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (UnminedTxIterator, error) {
+	args := m.Called(cutoffBlockHeight)
+	return args.Get(0).(UnminedTxIterator), args.Error(1)
+}
+
 // BatchDecorate mocks the batch decoration of unresolved metadata with field data.
 // Returns the configured mock response for batch metadata decoration operations.
 func (m *MockUtxostore) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*UnresolvedMetaData, fields ...fields.FieldName) error {
@@ -119,6 +125,12 @@ func (m *MockUtxostore) BatchDecorate(ctx context.Context, unresolvedMetaDataSli
 // Returns the configured mock response for previous output decoration operations.
 func (m *MockUtxostore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	args := m.Called(ctx, tx)
+	return args.Error(0)
+}
+
+// BatchPreviousOutputsDecorate mocks batch decoration of transaction inputs with previous output data.
+func (m *MockUtxostore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
+	args := m.Called(ctx, txs)
 	return args.Error(0)
 }
 
