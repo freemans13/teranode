@@ -118,3 +118,24 @@ func TestBlockHeightRetentionAdjustments(t *testing.T) {
 		require.Equal(t, uint32(0), tSettings.GetSubtreeValidationBlockHeightRetention())
 	})
 }
+
+func TestBatchSQLOperationsDefault(t *testing.T) {
+	tSettings := NewSettings()
+
+	// Default value should be true
+	require.True(t, tSettings.UtxoStore.BatchSQLOperations)
+}
+
+func TestBatchSQLOperationsExplicitValues(t *testing.T) {
+	t.Run("ExplicitTrue", func(t *testing.T) {
+		tSettings := NewSettings()
+		tSettings.UtxoStore.BatchSQLOperations = true
+		require.True(t, tSettings.UtxoStore.BatchSQLOperations)
+	})
+
+	t.Run("ExplicitFalse", func(t *testing.T) {
+		tSettings := NewSettings()
+		tSettings.UtxoStore.BatchSQLOperations = false
+		require.False(t, tSettings.UtxoStore.BatchSQLOperations)
+	})
+}

@@ -434,7 +434,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DisableDAHCleaner:                  getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 			ReAssignedUtxoSpendableAfterBlocks: getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
 			QueryIdleTimeoutSeconds:            getInt("utxostore_queryIdleTimeoutSeconds", 60, alternativeContext...),
-			BatchSQLOperations:                 getBool("utxostore_batch_sql_operations", true, alternativeContext...),
+			BatchSQLOperations:                 getBool("utxostore_batchSQLOperations", true, alternativeContext...),
 		},
 		P2P: P2PSettings{
 			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),
