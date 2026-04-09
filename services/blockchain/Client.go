@@ -1268,13 +1268,13 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 
 			// Subscription established successfully - fetch current FSM state
 			c.logger.Infof("[Blockchain] Subscription established, fetching current FSM state for %s", source)
-			c.fetchAndRestoreFSMState(ctx, source)
-
-			// Signal that subscription is ready (first successful subscribe + FSM fetch)
-			c.subscriptionReadyOnce.Do(func() {
-				close(c.subscriptionReady)
-				c.logger.Infof("[Blockchain] Subscription ready for %s", source)
-			})
+			if c.fetchAndRestoreFSMState(ctx, source) {
+				// Signal readiness only after successful FSM state fetch
+				c.subscriptionReadyOnce.Do(func() {
+					close(c.subscriptionReady)
+					c.logger.Infof("[Blockchain] Subscription ready for %s", source)
+				})
+			}
 
 			// Don't initialize heartbeat here - let it remain 0 until first PING is received.
 			// This ensures staleness detection works correctly: if connection breaks before
@@ -1368,8 +1368,9 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 
 // fetchAndRestoreFSMState queries the blockchain service for the current FSM state
 // and updates the local cached state. This is called after successful reconnection
-// to ensure the client has the correct FSM state.
-func (c *Client) fetchAndRestoreFSMState(ctx context.Context, source string) {
+// to ensure the client has the correct FSM state. Returns true if the state was
+// successfully fetched, false if it fell back to IDLE due to an error.
+func (c *Client) fetchAndRestoreFSMState(ctx context.Context, source string) bool {
 	stateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -1378,12 +1379,13 @@ func (c *Client) fetchAndRestoreFSMState(ctx context.Context, source string) {
 		c.logger.Warnf("[Blockchain] Failed to fetch FSM state, setting to IDLE for safety: %v", err)
 		idleState := FSMStateIDLE
 		c.fmsState.Store(&idleState)
-		return
+		return false
 	}
 
 	newState := state.State
 	c.fmsState.Store(&newState)
 	c.logger.Infof("[Blockchain] FSM state restored to %s for %s", newState.String(), source)
+	return true
 }
 
 // GetState retrieves a value from the blockchain state storage by its key.
