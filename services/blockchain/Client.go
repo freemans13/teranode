@@ -167,7 +167,11 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 			select {
 			case <-ctx.Done():
 				return
-			case notification := <-subscriptionCh:
+			case notification, ok := <-subscriptionCh:
+				if !ok {
+					// Channel closed, exit the listener
+					return
+				}
 				if notification == nil {
 					continue
 				}
