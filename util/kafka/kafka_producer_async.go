@@ -67,6 +67,9 @@ type KafkaProducerConfig struct {
 
 	// Debug logging
 	EnableDebugLogging bool // Enable verbose debug logging
+
+	// Transfer rate monitoring
+	SlowTransfer SlowTransferConfig // Thresholds for slow-send detection (zero value uses defaults)
 }
 
 // MessageStatus represents the status of a produced message.
@@ -150,16 +153,25 @@ func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, ur
 	return producer, nil
 }
 
-// clampBatchMaxBytes clamps the given flush bytes value to the valid range for
-// franz-go's ProducerBatchMaxBytes (int32). The minimum is 512 bytes (Kafka
-// protocol minimum for a record batch).
+// defaultBatchMaxBytes is the default max batch size for franz-go, matching the
+// Kafka broker default for max.message.bytes (1 MiB). This must not be derived
+// from flush_bytes, which was a Sarama flush-trigger threshold, not a size limit.
+const defaultBatchMaxBytes int32 = 1_048_576
+
+// clampBatchMaxBytes returns a safe ProducerBatchMaxBytes value. The flush_bytes
+// config parameter controlled flush timing in Sarama, not max batch size. In
+// franz-go, ProducerBatchMaxBytes is a hard limit — setting it too low causes
+// Redpanda/Kafka to reject messages with MESSAGE_TOO_LARGE.
+//
+// When flush_bytes <= defaultBatchMaxBytes (which includes all legacy configs like
+// flush_bytes=64 or flush_bytes=1024), we use the 1 MiB default. Only when
+// flush_bytes explicitly exceeds 1 MiB do we respect it as a batch size override.
 func clampBatchMaxBytes(flushBytes int) int32 {
-	const minBatchMaxBytes = 512
-	if flushBytes < minBatchMaxBytes {
-		flushBytes = minBatchMaxBytes
+	if flushBytes <= int(defaultBatchMaxBytes) {
+		return defaultBatchMaxBytes
 	}
 	if flushBytes > math.MaxInt32 {
-		flushBytes = math.MaxInt32
+		return math.MaxInt32
 	}
 	return int32(flushBytes) //nolint:gosec // bounds checked above
 }
@@ -212,6 +224,14 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 	if cfg.EnableDebugLogging {
 		opts = append(opts, kgo.WithLogger(&franzLoggerAdapter{logger: logger}))
 	}
+
+	// Wire transfer-rate monitoring hooks
+	slowCfg := cfg.SlowTransfer
+	if slowCfg.ThresholdBps == 0 {
+		slowCfg = DefaultSlowTransferConfig()
+	}
+	hook := newProducerMetricsHook(logger, cfg.Topic, slowCfg)
+	opts = append(opts, kgo.WithHooks(hook))
 
 	// Create the franz-go client
 	client, err := kgo.NewClient(opts...)
@@ -417,8 +437,13 @@ func (c *KafkaAsyncProducer) Stop() error {
 }
 
 // BrokersURL returns the list of configured Kafka broker URLs.
+// Returns nil for in-memory producers since there are no real brokers.
 func (c *KafkaAsyncProducer) BrokersURL() []string {
 	if c == nil {
+		return nil
+	}
+
+	if c.inMemoryProducer != nil {
 		return nil
 	}
 

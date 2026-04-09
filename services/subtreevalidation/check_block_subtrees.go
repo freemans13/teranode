@@ -728,7 +728,11 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 		// Basic sanity check: ensure the transaction hash matches the expected hash from the subtree
 		if txIndex < subtree.Length() {
 			expectedHash := subtree.Nodes[txIndex].Hash
-			if !expectedHash.Equal(*tx.TxIDChainHash()) {
+			// The coinbase placeholder (all-F's) is only treated as valid at index 0 of this subtree when the
+			// corresponding transaction is coinbase. The actual coinbase tx hash may be unavailable when the
+			// subtree structure is built, so this special case is allowed only for that local position.
+			isCoinbasePlaceholder := txIndex == 0 && tx.IsCoinbase() && expectedHash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+			if !isCoinbasePlaceholder && !expectedHash.Equal(*tx.TxIDChainHash()) {
 				return txIndex, errors.NewProcessingError("[readTransactionsFromSubtreeDataStream] transaction hash mismatch at index %d: expected %s, got %s", txIndex, expectedHash.String(), tx.TxIDChainHash().String())
 			}
 		} else {
@@ -844,6 +848,12 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	// Pre-process validation options
 	processedValidatorOptions := validator.ProcessOptions(validatorOptions...)
+
+	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
+	// can read mtpStore[h] without locking and without making gRPC calls.
+	if err = u.validatorClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] failed to pre-load MTP store: %v", err)
+	}
 
 	// Track validation results
 	var (
