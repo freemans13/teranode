@@ -13,13 +13,12 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/services/blockassembly"
-	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
@@ -31,8 +30,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxometa "github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/bsv-blockchain/teranode/util"
-	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -972,6 +969,81 @@ func TestReadTransactionsFromSubtreeDataStream(t *testing.T) {
 
 		assert.Equal(t, 0, count)
 		assert.Len(t, allTransactions, 0)
+	})
+
+	t.Run("CoinbasePlaceholderAtIndex0", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		// Create a coinbase transaction (input from all-zero hash with 0xffffffff index)
+		coinbaseTx := bt.NewTx()
+		err := coinbaseTx.From(
+			"0000000000000000000000000000000000000000000000000000000000000000",
+			0xffffffff,
+			"03640000", // minimal coinbase script with block height
+			0,
+		)
+		require.NoError(t, err)
+		coinbaseTx.AddOutput(&bt.Output{
+			Satoshis: 5000000000,
+			LockingScript: func() *bscript.Script {
+				s, _ := bscript.NewFromHexString("76a914389ffce9cd9ae88dcc0631e88a821ffdbe9bfe2688ac")
+				return s
+			}(),
+		})
+		require.True(t, coinbaseTx.IsCoinbase(), "test tx must be coinbase")
+
+		// Create a regular transaction
+		tx1, err := createTestTransaction("tx1")
+		require.NoError(t, err)
+
+		// Build subtree with coinbase placeholder at index 0 (simulating the real scenario
+		// where the coinbase hash is not yet known when the subtree is built)
+		subtree, err := subtreepkg.NewTreeByLeafCount(4)
+		require.NoError(t, err)
+		require.NoError(t, subtree.AddCoinbaseNode()) // places CoinbasePlaceholderHashValue at index 0
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+
+		// Write coinbase + tx1 to the data stream
+		subtreeData := bytes.Buffer{}
+		subtreeData.Write(coinbaseTx.Bytes())
+		subtreeData.Write(tx1.Bytes())
+
+		var allTransactions []*bt.Tx
+		count, err := server.readTransactionsFromSubtreeDataStream(subtree, &subtreeData, &allTransactions)
+		require.NoError(t, err)
+
+		// Should succeed — the coinbase placeholder at index 0 is allowed when the tx is coinbase
+		require.Equal(t, 2, count)
+		require.Len(t, allTransactions, 2)
+	})
+
+	t.Run("PlaceholderAtNonZeroIndexFails", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		// Create two regular transactions
+		tx1, err := createTestTransaction("tx1")
+		require.NoError(t, err)
+		tx2, err := createTestTransaction("tx2")
+		require.NoError(t, err)
+
+		// Build subtree with placeholder hash at index 1 (not index 0) — this should fail
+		subtree, err := subtreepkg.NewTreeByLeafCount(4)
+		require.NoError(t, err)
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 0))
+		require.NoError(t, subtree.AddNode(*tx2.TxIDChainHash(), 1, 1))
+		// Manually overwrite node 1 to the placeholder hash to simulate an invalid subtree
+		subtree.Nodes[1] = subtreepkg.Node{Hash: subtreepkg.CoinbasePlaceholderHashValue}
+
+		subtreeData := bytes.Buffer{}
+		subtreeData.Write(tx1.Bytes())
+		subtreeData.Write(tx2.Bytes())
+
+		var allTransactions []*bt.Tx
+		_, err = server.readTransactionsFromSubtreeDataStream(subtree, &subtreeData, &allTransactions)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "transaction hash mismatch")
 	})
 }
 
@@ -2309,115 +2381,4 @@ func TestBuildParentMetadata(t *testing.T) {
 		assert.True(t, exists)
 		assert.Equal(t, uint32(100), meta.BlockHeight)
 	})
-}
-
-// TestCheckBlockSubtrees_SkipSubtreeDataFetchWhenLocalTxsAvailable verifies that when
-// block assembly has enough transactions locally, the expensive subtree_data fetch
-// from the peer's asset-cache is skipped.
-func TestCheckBlockSubtrees_SkipSubtreeDataFetchWhenLocalTxsAvailable(t *testing.T) {
-	testHeaders := testhelpers.CreateTestHeaders(t, 1)
-
-	server, cleanup := setupTestServer(t)
-	defer cleanup()
-
-	// Mock blockchain client
-	server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-		mock.Anything).
-		Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-
-	// Set up a mock block assembly client that reports high tx count
-	mockBA := blockassembly.NewMock()
-	mockBA.On("GetBlockAssemblyState", mock.Anything).
-		Return(&blockassembly_api.StateMessage{
-			TxCount: 1000000, // 1M txs available locally
-		}, nil)
-	server.blockAssemblyClient = mockBA
-
-	// Mock GetBlockHeaderIDs (called before subtree processing)
-	server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
-		mock.Anything, mock.Anything, mock.Anything).
-		Return([]uint32{1, 2, 3}, nil)
-
-	server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-		mock.Anything, blockchain.FSMStateRUNNING).
-		Return(true, nil)
-
-	// Build a valid subtree structure and store it so /subtree/ HTTP fetch is bypassed
-	tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-	require.NoError(t, err)
-
-	subtree, err := subtreepkg.NewTreeByLeafCount(2)
-	require.NoError(t, err)
-	require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
-
-	subtreeBytes, err := subtree.Serialize()
-	require.NoError(t, err)
-
-	subtreeHash := *subtree.RootHash()
-
-	// Store subtree structure (FileTypeSubtreeToCheck) — bypasses /subtree/ fetch
-	err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
-	require.NoError(t, err)
-
-	// Do NOT store FileTypeSubtreeData — forces the code into the subtree_data fetch path
-	// where localTxsAvailable should cause it to skip the expensive peer fetch
-
-	// Activate httpmock to track HTTP calls
-	httpmock.ActivateNonDefault(util.HTTPClient())
-	defer httpmock.DeactivateAndReset()
-
-	// Register a responder for subtree_data to prevent real HTTP calls
-	subtreeDataURL := fmt.Sprintf("=~.*/subtree_data/%s", subtreeHash.String())
-	httpmock.RegisterResponder("GET", subtreeDataURL,
-		httpmock.NewBytesResponder(200, []byte("dummy")))
-
-	// Create a block referencing the missing subtree with fewer txs than block assembly has
-	header := &model.BlockHeader{
-		Version:        1,
-		HashPrevBlock:  &chainhash.Hash{},
-		HashMerkleRoot: &chainhash.Hash{},
-		Timestamp:      uint32(time.Now().Unix()),
-		Bits:           model.NBit{},
-		Nonce:          0,
-	}
-
-	coinbaseTx := &bt.Tx{Version: 1}
-	block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 100, 400, 0, 0)
-	require.NoError(t, err)
-
-	blockBytes, err := block.Bytes()
-	require.NoError(t, err)
-
-	request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-		Block:   blockBytes,
-		BaseUrl: "http://test-peer.local",
-	}
-
-	// Disable ValidateSubtreeInternal's fallback subtree_data fetch so any
-	// /subtree_data/ request can only originate from CheckBlockSubtrees itself.
-	server.settings.SubtreeValidation.PercentageMissingGetFullData = 101
-
-	// Run CheckBlockSubtrees — will eventually fail during ValidateSubtreeInternal
-	// because we don't have the actual tx data, but the optimization path should be taken.
-	_, err = server.CheckBlockSubtrees(context.Background(), request)
-
-	// Verify block assembly state was queried — the optimization was triggered
-	mockBA.AssertCalled(t, "GetBlockAssemblyState", mock.Anything)
-
-	// If there's an error, it should NOT be "failed to get subtree data from" which
-	// comes from CheckBlockSubtrees' fetch path.
-	if err != nil {
-		assert.NotContains(t, err.Error(), "failed to get subtree data from",
-			"CheckBlockSubtrees should skip subtree_data fetch when local txs available")
-	}
-
-	// Assert no subtree_data fetch was performed — with ValidateSubtreeInternal's
-	// fallback disabled, any call here can only come from CheckBlockSubtrees.
-	callCounts := httpmock.GetCallCountInfo()
-	for k, v := range callCounts {
-		if v > 0 {
-			assert.NotContains(t, k, "subtree_data",
-				"subtree_data should NOT be fetched when local txs are available")
-		}
-	}
 }

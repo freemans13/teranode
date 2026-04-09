@@ -96,6 +96,9 @@ type Options struct {
 	// Used to coordinate cleanup with block persister progress (can be nil)
 	GetPersistedHeight func() uint32
 
+	// LuaPackage is the name of the registered Lua UDF module
+	LuaPackage string
+
 	// Observers is a list of observers to notify when pruning completes
 	Observers []pruner.Observer
 }
@@ -131,15 +134,17 @@ type Service struct {
 	skipParentUpdates              bool    // Skip parent update operations and input fetching
 	partitionWorkerFn              func(ctx context.Context, blockHeight uint32, partitionStart int, partitionCount int, prunedSet *PrunedTxSet) (int64, int64, error)
 
+	// Lua UDF module name
+	luaPackage string
+
 	// Cached field names (avoid repeated String() allocations in hot paths)
 	fieldTxID, fieldUtxos, fieldInputs, fieldDeletedChildren, fieldExternal        string
 	fieldDeleteAtHeight, fieldTotalExtraRecs, fieldUnminedSince, fieldBlockHeights string
 
 	// Internally reused variables
-	queryPolicy      *aerospike.QueryPolicy
-	writePolicy      *aerospike.WritePolicy
-	batchWritePolicy *aerospike.BatchWritePolicy
-	batchPolicy      *aerospike.BatchPolicy
+	queryPolicy *aerospike.QueryPolicy
+	writePolicy *aerospike.WritePolicy
+	batchPolicy *aerospike.BatchPolicy
 }
 
 // parentUpdateInfo holds accumulated parent update information for batching
@@ -240,10 +245,6 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 	// Use the configured write policy from settings
 	writePolicy := util.GetAerospikeWritePolicy(settings, 0)
 
-	// Use the configured batch policies from settings
-	batchWritePolicy := util.GetAerospikeBatchWritePolicy(settings)
-	batchWritePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
-
 	// Use the configured batch policy from settings (configured via aerospike_batchPolicy URL)
 	batchPolicy := util.GetAerospikeBatchPolicy(settings)
 
@@ -262,9 +263,9 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		ctx:                            opts.Ctx,
 		indexWaiter:                    opts.IndexWaiter,
 		notifier:                       notifier,
+		luaPackage:                     opts.LuaPackage,
 		queryPolicy:                    queryPolicy,
 		writePolicy:                    writePolicy,
-		batchWritePolicy:               batchWritePolicy,
 		batchPolicy:                    batchPolicy,
 		utxoBatchSize:                  settings.UtxoStore.UtxoBatchSize,
 		blockHeightRetention:           settings.GetUtxoStoreBlockHeightRetention(),
@@ -276,7 +277,6 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		partitionQueries:               settings.Pruner.UTXOPartitionQueries,
 		connectionPoolWarningThreshold: settings.Pruner.ConnectionPoolWarningThreshold,
 		utxoSetTTL:                     settings.Pruner.UTXOSetTTL,
-		skipParentUpdates:              settings.Pruner.SkipParentUpdates,
 		fieldTxID:                      fields.TxID.String(),
 		fieldUtxos:                     fields.Utxos.String(),
 		fieldInputs:                    fields.Inputs.String(),
@@ -465,12 +465,9 @@ func (s *Service) partitionWorker(
 		return 0, 0, err
 	}
 
-	// Fetch bins based on defensive mode and skipParentUpdates setting
+	// Fetch bins based on defensive mode
 	// Note: DeleteAtHeight is only used in query filter (server-side), not in processing logic
-	binNames := []string{s.fieldTxID, s.fieldExternal, s.fieldTotalExtraRecs}
-	if !s.skipParentUpdates {
-		binNames = append(binNames, s.fieldInputs)
-	}
+	binNames := []string{s.fieldTxID, s.fieldExternal, s.fieldTotalExtraRecs, s.fieldInputs}
 	if s.defensiveEnabled {
 		binNames = append(binNames, s.fieldUtxos, s.fieldDeletedChildren)
 	}
@@ -932,10 +929,7 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	}
 
 	// Step 3: Accumulate operations for entire chunk, then flush once (efficient batching)
-	var allParentUpdates map[string]*parentUpdateInfo
-	if !s.skipParentUpdates {
-		allParentUpdates = make(map[string]*parentUpdateInfo, 1000) // Accumulate all parent updates for chunk
-	}
+	allParentUpdates := make(map[string]*parentUpdateInfo, 1000)
 	allDeletions := make([]*aerospike.Key, 0, 1000)      // Accumulate all deletions for chunk
 	allExternalFiles := make([]*externalFileInfo, 0, 10) // Accumulate external files (<1%)
 	processedCount := 0
@@ -989,45 +983,38 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		}
 
 		// Safe to delete - get inputs for parent updates
-		var inputs []*bt.Input
-		if !s.skipParentUpdates {
-			var err error
-			inputs, err = s.getTxInputsFromBins(ctx, blockHeight, rec.Record.Bins, txHash)
-			if err != nil {
-				return 0, 0, err
+		inputs, err := s.getTxInputsFromBins(ctx, blockHeight, rec.Record.Bins, txHash)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		// Accumulate parent updates, skipping parents already pruned in this session
+		for _, input := range inputs {
+			// Check if parent TX was already pruned — if so, skip the update
+			parentTxID := input.PreviousTxIDChainHash()
+			if prunedSet != nil && prunedSet.CheckAndRemove(*parentTxID) {
+				prometheusUtxoParentsSkippedPruned.Inc()
+				continue
 			}
 
-			// Accumulate parent updates, skipping parents already pruned in this session
-			for _, input := range inputs {
-				// Check if parent TX was already pruned — if so, skip the update
-				parentTxID := input.PreviousTxIDChainHash()
-				if prunedSet != nil && prunedSet.CheckAndRemove(*parentTxID) {
-					prometheusUtxoParentsSkippedPruned.Inc()
-					continue
+			keySource := uaerospike.CalculateKeySource(parentTxID, input.PreviousTxOutIndex, s.utxoBatchSize)
+			parentKeyStr := string(keySource)
+
+			if existing, ok := allParentUpdates[parentKeyStr]; ok {
+				existing.childHashes = append(existing.childHashes, txHash)
+			} else {
+				parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
+				if err != nil {
+					return 0, 0, err
 				}
-
-				keySource := uaerospike.CalculateKeySource(parentTxID, input.PreviousTxOutIndex, s.utxoBatchSize)
-				parentKeyStr := string(keySource)
-
-				if existing, ok := allParentUpdates[parentKeyStr]; ok {
-					existing.childHashes = append(existing.childHashes, txHash)
-				} else {
-					parentKey, err := aerospike.NewKey(s.namespace, s.set, keySource)
-					if err != nil {
-						return 0, 0, err
-					}
-					allParentUpdates[parentKeyStr] = &parentUpdateInfo{
-						key:         parentKey,
-						childHashes: []*chainhash.Hash{txHash},
-					}
+				allParentUpdates[parentKeyStr] = &parentUpdateInfo{
+					key:         parentKey,
+					childHashes: []*chainhash.Hash{txHash},
 				}
 			}
 		}
 
 		// Accumulate external files
-		// NOTE: When skipParentUpdates=true, inputs are not fetched, so all external
-		// files are classified as FileTypeOutputs. This is acceptable because
-		// skipParentUpdates is only used when external file support is not needed.
 		external, isExternal := rec.Record.Bins[s.fieldExternal].(bool)
 		if isExternal && external {
 			fileType := fileformat.FileTypeOutputs
@@ -1416,12 +1403,11 @@ func (s *Service) getTxInputsFromBins(ctx context.Context, blockHeight uint32, b
 }
 
 // flushCleanupBatches flushes accumulated parent updates, external file deletions, and Aerospike deletions
-func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error { // Execute parent updates first
-	if !s.skipParentUpdates {
-		if len(parentUpdates) > 0 {
-			if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
-				return err
-			}
+func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error {
+	// Execute parent updates first
+	if len(parentUpdates) > 0 {
+		if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
+			return err
 		}
 	}
 
@@ -1467,8 +1453,12 @@ func (s *Service) extractInputs(ctx context.Context, blockHeight uint32, bins ae
 // executeBatchParentUpdates performs Phase 2a: updates parent records to mark that their
 // child transactions have been deleted (adds to deletedChildren map).
 //
+// Uses a Lua UDF (addDeletedChildren) instead of BatchWrite+MapPutItemsOp so that
+// missing parent records are handled server-side without generating KEY_NOT_FOUND errors
+// in Aerospike client metrics.
+//
 // IDEMPOTENCY: This operation is safely re-runnable:
-// - Missing parents (KEY_NOT_FOUND) are skipped - they were already deleted
+// - Missing parents are silently skipped by the Lua UDF (TX_NOT_FOUND)
 // - Duplicate updates are no-ops - deletedChildren map updates are idempotent
 // - Partial batch failures can be retried without side effects
 //
@@ -1478,23 +1468,34 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 		return nil
 	}
 
-	// Convert map to batch operations
-	// Track deleted children by adding child tx hashes to the DeletedChildren map
-	mapPolicy := aerospike.DefaultMapPolicy()
+	if s.luaPackage != "" {
+		return s.executeBatchParentUpdatesUDF(ctx, updates)
+	}
+
+	return s.executeBatchParentUpdatesBatchWrite(ctx, updates)
+}
+
+// executeBatchParentUpdatesUDF uses a Lua UDF (addDeletedChildren) so that missing parent
+// records are handled server-side without generating KEY_NOT_FOUND errors in Aerospike client metrics.
+func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[string]*parentUpdateInfo) error {
+	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates))
 
 	for _, info := range updates {
-		// Build a single map of all children to insert, avoiding multiple MapPutOps on the same record
-		items := make(map[interface{}]interface{}, len(info.childHashes))
+		childHashList := make([]interface{}, 0, len(info.childHashes))
 		for _, childHash := range info.childHashes {
-			items[childHash.String()] = true
+			childHashList = append(childHashList, childHash.String())
 		}
 
-		op := aerospike.MapPutItemsOp(mapPolicy, s.fieldDeletedChildren, items)
-		batchRecords = append(batchRecords, aerospike.NewBatchWrite(s.batchWritePolicy, info.key, op))
+		batchRecords = append(batchRecords, aerospike.NewBatchUDF(
+			batchUDFPolicy,
+			info.key,
+			s.luaPackage,
+			"addDeletedChildren",
+			aerospike.NewValue(childHashList),
+		))
 	}
 
-	// Check context before expensive operation
 	select {
 	case <-ctx.Done():
 		s.logger.Infof("Context cancelled, skipping parent update batch")
@@ -1502,13 +1503,94 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 	default:
 	}
 
-	// Execute batch
 	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
 		s.logger.Errorf("Batch parent update failed: %v", err)
 		return errors.NewStorageError("batch parent update failed", err)
 	}
 
-	// Check for errors
+	successCount := 0
+	notFoundCount := 0
+	errorCount := 0
+
+	for _, rec := range batchRecords {
+		batchRec := rec.BatchRec()
+		if batchRec.Err != nil {
+			s.logger.Errorf("Parent update error for key %v: %v", batchRec.Key, batchRec.Err)
+			errorCount++
+			continue
+		}
+
+		if batchRec.Record != nil && batchRec.Record.Bins != nil {
+			if resp, ok := batchRec.Record.Bins["SUCCESS"]; ok {
+				if respMap, ok := resp.(map[interface{}]interface{}); ok {
+					if status, ok := respMap["status"].(string); ok {
+						switch status {
+						case "OK":
+							successCount++
+						case "ERROR":
+							if errCode, ok := respMap["errorCode"].(string); ok && errCode == "TX_NOT_FOUND" {
+								notFoundCount++
+							} else {
+								s.logger.Errorf("Parent update Lua error for key %v: %v", batchRec.Key, respMap)
+								errorCount++
+							}
+						}
+						continue
+					}
+				}
+			}
+		}
+
+		successCount++
+	}
+
+	if errorCount > 0 {
+		return errors.NewStorageError("%d parent update operations failed", errorCount)
+	}
+
+	if successCount > 0 {
+		prometheusUtxoParentsUpdated.Add(float64(successCount))
+	}
+
+	if notFoundCount > 0 {
+		prometheusUtxoParentsUpdatedSkipped.Add(float64(notFoundCount))
+	}
+
+	return nil
+}
+
+// executeBatchParentUpdatesBatchWrite is the fallback when Lua UDF is not configured.
+// Uses BatchWrite+MapPutItemsOp with UPDATE_ONLY policy. Missing records generate
+// KEY_NOT_FOUND in Aerospike client metrics but are handled gracefully.
+func (s *Service) executeBatchParentUpdatesBatchWrite(ctx context.Context, updates map[string]*parentUpdateInfo) error {
+	batchWritePolicy := aerospike.NewBatchWritePolicy()
+	batchWritePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
+
+	mapPolicy := aerospike.DefaultMapPolicy()
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates))
+
+	for _, info := range updates {
+		items := make(map[interface{}]interface{}, len(info.childHashes))
+		for _, childHash := range info.childHashes {
+			items[childHash.String()] = true
+		}
+
+		op := aerospike.MapPutItemsOp(mapPolicy, s.fieldDeletedChildren, items)
+		batchRecords = append(batchRecords, aerospike.NewBatchWrite(batchWritePolicy, info.key, op))
+	}
+
+	select {
+	case <-ctx.Done():
+		s.logger.Infof("Context cancelled, skipping parent update batch")
+		return ctx.Err()
+	default:
+	}
+
+	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
+		s.logger.Errorf("Batch parent update failed: %v", err)
+		return errors.NewStorageError("batch parent update failed", err)
+	}
+
 	successCount := 0
 	notFoundCount := 0
 	errorCount := 0
@@ -1516,12 +1598,9 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 	for _, rec := range batchRecords {
 		if rec.BatchRec().Err != nil {
 			if rec.BatchRec().Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
-				// Idempotent: Parent may have been deleted by concurrent pruning or LocalDAH cleanup
-				// This is a success condition - parent is already gone so we don't need to update it
 				notFoundCount++
 				continue
 			}
-			// Log other errors
 			s.logger.Errorf("Parent update error for key %v: %v", rec.BatchRec().Key, rec.BatchRec().Err)
 			errorCount++
 		} else {
@@ -1529,12 +1608,10 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 		}
 	}
 
-	// Return error if any individual record operations failed
 	if errorCount > 0 {
 		return errors.NewStorageError("%d parent update operations failed", errorCount)
 	}
 
-	// Update metric with successful parent updates
 	if successCount > 0 {
 		prometheusUtxoParentsUpdated.Add(float64(successCount))
 	}

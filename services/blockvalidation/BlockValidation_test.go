@@ -1,4 +1,4 @@
-// Package blockvalidation implements block validation for Bitcoin SV nodes in Teranode.
+// Package blockvalidation implements block validation for BSV Blockchain nodes in Teranode.
 //
 // This package provides the core functionality for validating Bitcoin blocks, managing block subtrees,
 // and processing transaction metadata. It is designed for high-performance operation at scale,
@@ -292,7 +292,7 @@ func setup(t *testing.T) (utxostore.Store, subtreevalidation.Interface, blockcha
 
 	nilConsumer := &kafka.KafkaConsumerGroup{}
 
-	subtreeValidationServer, err := subtreevalidation.New(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil, nil)
+	subtreeValidationServer, err := subtreevalidation.New(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil)
 	if err != nil {
 		panic(err)
 	}
