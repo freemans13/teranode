@@ -1,4 +1,4 @@
-// Package blockvalidation implements block validation for Bitcoin SV nodes in Teranode.
+// Package blockvalidation implements block validation for BSV Blockchain nodes in Teranode.
 //
 // This package provides the core functionality for validating Bitcoin blocks, managing block subtrees,
 // and processing transaction metadata. It is designed for high-performance operation at scale,
@@ -1186,21 +1186,26 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			}
 
 			if block.SizeInBytes > excessiveBlockSizeUint64 {
-				u.storeInvalidBlock(ctx, block, baseURL, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
+				if !opts.IsRevalidation {
+					u.storeInvalidBlock(ctx, block, opts.PeerID, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
+				}
 
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block size %d exceeds excessiveblocksize %d", block.Header.Hash().String(), block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize)
 			}
 		}
 
 		if block.CoinbaseTx == nil || block.CoinbaseTx.Inputs == nil || len(block.CoinbaseTx.Inputs) == 0 {
-			u.storeInvalidBlock(ctx, block, baseURL, "coinbase tx is nil or empty")
-
-			return errors.NewBlockInvalidError("[ValidateBlock][%s] coinbase tx is nil or empty", block.Header.Hash().String())
+			// Use BlockIncomplete rather than BlockInvalid — a missing coinbase likely means the peer
+			// doesn't have full block data (e.g. seeded peer). Don't store as invalid so we can
+			// accept the valid version from another peer later.
+			return errors.NewBlockIncompleteError("[ValidateBlock][%s] coinbase tx is nil or empty", block.Header.Hash().String())
 		}
 
 		// check the coinbase length
 		if len(block.CoinbaseTx.Inputs[0].UnlockingScript.Bytes()) < 2 || len(block.CoinbaseTx.Inputs[0].UnlockingScript.Bytes()) > int(u.settings.ChainCfgParams.MaxCoinbaseScriptSigSize) {
-			u.storeInvalidBlock(ctx, block, baseURL, "bad coinbase length")
+			if !opts.IsRevalidation {
+				u.storeInvalidBlock(ctx, block, opts.PeerID, "bad coinbase length")
+			}
 
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] bad coinbase length", block.Header.Hash().String())
 		}
@@ -1224,8 +1229,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				ctxLogger.Warnf("[ValidateBlock][%s] failed to get parent block metadata: %v, continuing with validation", block.Hash().String(), err)
 				// Continue with validation - this is defensive programming
 			}
-			if err := u.checkParentInvalidAndStore(ctx, block, baseURL, parentMeta); err != nil {
-				return err
+			if u.checkParentInvalid(parentMeta) {
+				if !opts.IsRevalidation {
+					u.storeInvalidBlock(ctx, block, opts.PeerID, fmt.Sprintf("parent block %s is invalid", block.Header.HashPrevBlock.String()))
+				}
+				return errors.NewBlockInvalidError("[ValidateBlock][%s] parent block is invalid", block.Hash().String())
 			}
 		} else {
 			// Fetch headers from blockchain service
@@ -1252,8 +1260,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			if len(parentBlockHeadersMeta) > 0 {
 				parentMeta = parentBlockHeadersMeta[0]
 			}
-			if err := u.checkParentInvalidAndStore(ctx, block, baseURL, parentMeta); err != nil {
-				return err
+			if u.checkParentInvalid(parentMeta) {
+				if !opts.IsRevalidation {
+					u.storeInvalidBlock(ctx, block, opts.PeerID, fmt.Sprintf("parent block %s is invalid", block.Header.HashPrevBlock.String()))
+				}
+				return errors.NewBlockInvalidError("[ValidateBlock][%s] parent block is invalid", block.Hash().String())
 			}
 		}
 
@@ -1276,7 +1287,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			if errors.Is(err, errors.ErrTxInvalid) || errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
 				ctxLogger.Warnf("[ValidateBlock][%s] block contains invalid transactions, marking as invalid: %s", block.Hash().String(), err)
 				reason := fmt.Sprintf("block contains invalid transactions: %s", err.Error())
-				u.storeInvalidBlock(ctx, block, baseURL, reason)
+				if !opts.IsRevalidation {
+					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
+				}
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block contains invalid transactions: %s", block.Hash().String(), err)
 			}
 
@@ -1312,7 +1325,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// Compare the block's nBits with the expected nBits
 			if expectedNBits != nil && block.Header.Bits != *expectedNBits {
 				reason := fmt.Sprintf("incorrect difficulty bits: got %v, expected %v", block.Header.Bits, *expectedNBits)
-				u.storeInvalidBlock(ctx, block, baseURL, reason)
+				if !opts.IsRevalidation {
+					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
+				}
 
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block has incorrect difficulty bits: got %v, expected %v",
 					block.Header.Hash().String(), block.Header.Bits, expectedNBits)
@@ -1325,7 +1340,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				if err != nil {
 					reason = fmt.Sprintf("block does not meet target difficulty: %s", err.Error())
 				}
-				u.storeInvalidBlock(ctx, block, baseURL, reason)
+				if !opts.IsRevalidation {
+					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
+				}
 
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block does not meet target difficulty: %s", block.Header.Hash().String(), err)
 			}
@@ -1341,7 +1358,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 			ctxLogger.Infof("[ValidateBlock][%s] adding block optimistically to blockchain", block.Hash().String())
 
-			if err = u.blockchainClient.AddBlock(ctx, block, baseURL); err != nil {
+			if err = u.blockchainClient.AddBlock(ctx, block, opts.PeerID); err != nil {
 				return errors.NewServiceError("[ValidateBlock][%s] failed to store block", block.Hash().String(), err)
 			}
 
@@ -1465,15 +1482,17 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					return err
 				}
 
-				u.storeInvalidBlock(ctx, block, baseURL, reason)
+				if !opts.IsRevalidation {
+					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
+				}
 
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err)
 			}
 
 			if iterationError := u.checkOldBlockIDs(ctx, oldBlockIDsMap, block); iterationError != nil {
-				if errors.Is(iterationError, errors.ErrBlockInvalid) {
+				if errors.Is(iterationError, errors.ErrBlockInvalid) && !opts.IsRevalidation {
 					reason := iterationError.Error()
-					u.storeInvalidBlock(ctx, block, baseURL, reason)
+					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
 				}
 
 				return iterationError
@@ -1506,7 +1525,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				storeCtx, storeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer storeCancel()
 
-				if err = u.blockchainClient.AddBlock(storeCtx, block, baseURL); err != nil {
+				if err = u.blockchainClient.AddBlock(storeCtx, block, opts.PeerID); err != nil {
 					return errors.NewServiceError("[ValidateBlock][%s] failed to store block", block.Hash().String(), err)
 				}
 			}
@@ -1576,11 +1595,14 @@ func (u *BlockValidation) markBlockAsInvalid(ctx context.Context, block *model.B
 
 // storeInvalidBlock stores a block marked as invalid in the blockchain database.
 // This helper function centralizes the logic for persisting invalid blocks and updating caches.
-func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Block, baseURL string, reason string) {
+// NOTE: This must NOT be called during block revalidation, as the block already
+// exists in the database. Calling AddBlock (INSERT) for an existing block will
+// fail with a duplicate key constraint violation.
+func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Block, peerID string, reason string) {
 	u.logger.Warnf("[ValidateBlock][%s] storing block as invalid: %s", block.Hash().String(), reason)
 
 	// Store the block marked as invalid so we have a record of it
-	if storeErr := u.blockchainClient.AddBlock(ctx, block, baseURL, blockchainoptions.WithInvalid(true)); storeErr != nil {
+	if storeErr := u.blockchainClient.AddBlock(ctx, block, peerID, blockchainoptions.WithInvalid(true)); storeErr != nil {
 		u.logger.Errorf("[ValidateBlock][%s] failed to store invalid block: %v", block.Hash().String(), storeErr)
 	} else {
 		// Update cache to reflect that block exists
@@ -1592,26 +1614,15 @@ func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Bl
 	u.kafkaNotifyBlockInvalid(block, reason)
 }
 
-// checkParentInvalidAndStore checks if the parent block is invalid and stores
-// the child block as invalid if so. This is an optimization to skip expensive
-// validation when the parent is already invalid.
+// checkParentInvalid checks if the parent block is invalid. This is an optimization
+// to skip expensive validation when the parent is already invalid.
 //
 // Parameters:
-//   - ctx: Context for the operation
-//   - block: Child block being validated
-//   - baseURL: Source URL for the block
 //   - parentMeta: Metadata of the parent block (can be nil)
 //
-// Returns:
-//   - nil if parent is valid or metadata is nil
-//   - error if parent is invalid (child is stored as invalid)
-func (u *BlockValidation) checkParentInvalidAndStore(ctx context.Context, block *model.Block, baseURL string, parentMeta *model.BlockHeaderMeta) error {
-	if parentMeta != nil && parentMeta.Invalid {
-		reason := fmt.Sprintf("parent block %s is invalid", block.Header.HashPrevBlock.String())
-		u.storeInvalidBlock(ctx, block, baseURL, reason)
-		return errors.NewBlockInvalidError("[ValidateBlock][%s] parent block is invalid", block.Hash().String())
-	}
-	return nil
+// Returns true if the parent block is marked as invalid, false otherwise.
+func (*BlockValidation) checkParentInvalid(parentMeta *model.BlockHeaderMeta) bool {
+	return parentMeta != nil && parentMeta.Invalid
 }
 
 func (u *BlockValidation) kafkaNotifyBlockInvalid(block *model.Block, reason string) {
@@ -1857,7 +1868,18 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 	defer deferFn()
 
-	currentChainBlockIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Hash(), 10_000)
+	// Use the parent block hash to get the ancestor chain for validation.
+	// - Normal path: block not yet committed (AddBlock runs after checkOldBlockIDs)
+	// - Optimistic path: block already committed (AddBlock at line 1361)
+	// HashPrevBlock works correctly in both cases. The old code used block.Hash()
+	// which returned empty in the normal path, defeating the fast-path map and
+	// forcing every entry through individual CheckBlockIsInCurrentChain gRPC calls.
+	if block.Header == nil || block.Header.HashPrevBlock == nil {
+		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] block header or HashPrevBlock is nil", block.String())
+	}
+	lookupHash := block.Header.HashPrevBlock
+
+	currentChainBlockIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, lookupHash, 10_000)
 	if err != nil {
 		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] failed to get block header ids", block.String(), err)
 	}
@@ -1867,9 +1889,14 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 		currentChainBlockIDsMap[blockID] = struct{}{}
 	}
 
+	if u.logger != nil {
+		u.logger.Infof("[checkOldBlockIDs][%s] loaded %d chain block IDs for fast lookup, checking %d old block ID entries", block.Hash().String(), len(currentChainBlockIDs), oldBlockIDsMap.Length())
+	}
+
 	currentChainLookupCache := make(map[string]bool, len(currentChainBlockIDs))
 
 	var builder strings.Builder
+	var fastPathCount, slowPathCount, cacheHitCount int
 
 	// range over the oldBlockIDsMap to get txID - oldBlockID pairs
 	oldBlockIDsMap.Iterate(func(txID chainhash.Hash, blockIDs []uint32) bool {
@@ -1882,6 +1909,7 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 		for _, blockID := range blockIDs {
 			if _, ok := currentChainBlockIDsMap[blockID]; ok {
 				// all good, continue
+				fastPathCount++
 				return true
 			}
 		}
@@ -1902,6 +1930,7 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 		// check whether we already checked exactly the same blockIDs and can use a cache
 		if blocksPartOfCurrentChain, ok := currentChainLookupCache[blockIDsString]; ok {
+			cacheHitCount++
 			if !blocksPartOfCurrentChain {
 				iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain using cache", block.String(), txID, blockIDs)
 				return false
@@ -1911,6 +1940,7 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 		}
 
 		// Flag to check if the old blocks are part of the current chain
+		slowPathCount++
 		blocksPartOfCurrentChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, blockIDs)
 		// if err is not nil, log the error and continue iterating for the next transaction
 		if err != nil {
@@ -1929,6 +1959,10 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 		return true
 	})
+
+	if u.logger != nil {
+		u.logger.Infof("[checkOldBlockIDs][%s] done: fastPath=%d, slowPath=%d, cacheHit=%d", block.Hash().String(), fastPathCount, slowPathCount, cacheHitCount)
+	}
 
 	return
 }

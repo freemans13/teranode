@@ -138,6 +138,12 @@ func (u *Server) processMissingSubtreesStreaming(ctx context.Context, request *s
 
 	sp.validatorOptions = validator.ProcessOptions(validatorOptions...)
 
+	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
+	// can read mtpStore[h] without locking and without making gRPC calls.
+	if err = u.validatorClient.EnsureMTPLoaded(ctx, block.Height); err != nil {
+		return nil, errors.NewProcessingError("[processMissingSubtreesStreaming] failed to pre-load MTP store: %v", err)
+	}
+
 	dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
 
 	// Phase 1 & 2: Stream, filter, and process transactions in pipeline
@@ -852,7 +858,7 @@ func (sp *streamingProcessor) classifyAndProcessStreaming(
 	// Store total for processBuckets loop limit
 	sp.totalTransactions = txCount
 
-	sp.server.logger.Infof("[classifyAndProcessStreaming] Classified %d transactions: %d at level 0, %d with dependencies (maxDeps=%d). (Level 0 = no block parents, expected for coinbase spenders)",
+	sp.server.logger.Debugf("[classifyAndProcessStreaming] Classified %d transactions: %d at level 0, %d with dependencies (maxDeps=%d). (Level 0 = no block parents, expected for coinbase spenders)",
 		txCount, level0Count, len(sp.waitingOnParent), maxDeps)
 
 	// Now that ALL transactions are classified, process level 0
@@ -866,7 +872,7 @@ func (sp *streamingProcessor) classifyAndProcessStreaming(
 
 	// Process remaining dependency levels via cascade
 	if maxDeps > 0 {
-		sp.server.logger.Infof("[classifyAndProcessStreaming] Processing remaining %d dependency levels", maxDeps)
+		sp.server.logger.Debugf("[classifyAndProcessStreaming] Processing remaining %d dependency levels", maxDeps)
 		if err := sp.processBuckets(ctx, maxDeps); err != nil {
 			return err
 		}

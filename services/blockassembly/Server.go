@@ -531,7 +531,10 @@ func (ba *BlockAssembly) storeSubtreeMetaWithRetry(ctx context.Context, subtreeR
 
 	if err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree meta already exists", subtreeRetry.subtreeHash.String())
+			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree meta already exists, updating DeleteAtHeight", subtreeRetry.subtreeHash.String())
+			if dahErr := ba.subtreeStore.SetDAH(ctx, subtreeRetry.subtreeHash[:], fileformat.FileTypeSubtreeMeta, dah); dahErr != nil {
+				ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: could not update subtree meta DAH (meta may not exist): %s", subtreeRetry.subtreeHash.String(), dahErr)
+			}
 		} else {
 			ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to retry store subtree meta: %s", subtreeRetry.subtreeHash.String(), err)
 			ba.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "subtree meta")
@@ -552,7 +555,12 @@ func (ba *BlockAssembly) storeSubtreeDataWithRetry(ctx context.Context, subtreeR
 
 	if err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree already exists", subtreeRetry.subtreeHash.String())
+			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree already exists, updating DeleteAtHeight", subtreeRetry.subtreeHash.String())
+			if dahErr := ba.subtreeStore.SetDAH(ctx, subtreeRetry.subtreeHash[:], fileformat.FileTypeSubtree, dah); dahErr != nil {
+				ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to update subtree DAH: %s", subtreeRetry.subtreeHash.String(), dahErr)
+				ba.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "subtree DAH update")
+				return dahErr
+			}
 		} else {
 			ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to retry store subtree: %s", subtreeRetry.subtreeHash.String(), err)
 			ba.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "subtree")
@@ -633,7 +641,14 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 
 	// Check whether this subtree already exists in the store
 	if ok, _ := ba.subtreeStore.Exists(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree); ok {
-		ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] subtree already exists", subtree.RootHash().String())
+		ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] subtree already exists, updating DeleteAtHeight", subtree.RootHash().String())
+		dah := ba.blockAssembler.utxoStore.GetBlockHeight() + ba.settings.GlobalBlockHeightRetention
+		if err := ba.subtreeStore.SetDAH(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, dah); err != nil {
+			return nil, nil, errors.NewProcessingError("[BlockAssembly:storeSubtreeData][%s] failed to update subtree DAH", subtree.RootHash().String(), err)
+		}
+		if err := ba.subtreeStore.SetDAH(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta, dah); err != nil {
+			ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] could not update subtree meta DAH (meta may not exist): %s", subtree.RootHash().String(), err)
+		}
 		return nil, nil, errors.ErrBlobAlreadyExists
 	}
 
@@ -659,8 +674,16 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 			for idx, node := range subtreeRequest.Subtree.Nodes {
 				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 					txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
+					if !found && subtreeRequest.DeletedTxs != nil {
+						// Fallback: check if transaction was deleted during async storage
+						var deletedTxInpoints subtreepkg.TxInpoints
+						deletedTxInpoints, found = subtreeRequest.DeletedTxs.Get(node.Hash)
+						if found {
+							txInpoints = &deletedTxInpoints
+						}
+					}
 					if !found {
-						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap or DeletedTxs", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
 						return
 					}
 
@@ -733,6 +756,10 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 		defer close(allDoneCh)
 		<-subtreeStorageDone
 		<-metaDoneCh
+		// Trigger cleanup of soft-deleted transactions
+		if subtreeRequest.OnStorageComplete != nil {
+			subtreeRequest.OnStorageComplete()
+		}
 	}()
 
 	return subtreeDoneCh, allDoneCh, nil
@@ -1522,6 +1549,28 @@ func (ba *BlockAssembly) ResetBlockAssemblyFully(ctx context.Context, _ *blockas
 	}
 
 	ba.blockAssembler.Reset(true)
+
+	return &blockassembly_api.EmptyMessage{}, nil
+}
+
+// ResetBlockAssemblyValidateInputs performs a reset with UTXO input validation.
+// Uses index-based scan (not full scan) for performance — only iterates unmined txs.
+// For each unmined transaction, verifies that its inputs are still spent by this transaction.
+// If an input is spent by a different tx, marks the tx as conflicting and excludes it.
+// Use this to recover from corrupted UTXO state (e.g. after a double-spend incident).
+func (ba *BlockAssembly) ResetBlockAssemblyValidateInputs(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error) {
+	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "ResetBlockAssemblyValidateInputs",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithLogMessage(ba.logger, "[ResetBlockAssemblyValidateInputs] called"),
+	)
+	defer deferFn()
+
+	if ba.blockAssembler.unminedTransactionsLoading.Load() {
+		ba.logger.Warnf("[ResetBlockAssemblyValidateInputs] service not ready - unmined transactions are still being loaded")
+		return nil, errors.NewServiceError("service not ready - unmined transactions are still being loaded")
+	}
+
+	ba.blockAssembler.ResetWithInputValidation()
 
 	return &blockassembly_api.EmptyMessage{}, nil
 }

@@ -7,6 +7,7 @@ package blockchain
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ type Client struct {
 	subscribersMu         sync.Mutex                         // Mutex for subscribers list
 	lastBlockNotification *blockchain_api.Notification       // Last block notification received
 	lastHeartbeat         atomic.Int64                       // Unix nano timestamp of last heartbeat
+	createdAt             int64                              // Unix nano timestamp — used for startup grace period
 }
 
 // BestBlockHeader represents the best block header in the blockchain.
@@ -113,6 +115,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 		baConn, err = util.GetGRPCClient(ctx, address, &util.ConnectionOptions{
 			MaxRetries:   tSettings.GRPCMaxRetries,
 			RetryBackoff: tSettings.GRPCRetryBackoff,
+			CallerName:   "blockchain",
 		}, tSettings)
 		if err != nil {
 			return nil, errors.NewServiceError("failed to init blockchain service connection for '%s'", source, err)
@@ -149,12 +152,33 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 		running:     &running,
 		conn:        baConn,
 		subscribers: make([]clientSubscriber, 0),
+		createdAt:   time.Now().UnixNano(),
 	}
 
-	// start a subscription to the blockchain service
-	subscriptionCh, err := c.SubscribeToServer(ctx, source)
+	// start a subscription to the blockchain service and wait for it to be ready
+	subscriptionCh, ready, err := c.SubscribeToServer(ctx, source)
 	if err != nil {
 		return nil, err
+	}
+
+	// Wait for subscription to establish and FSM state to be fetched before
+	// returning the client. Without this, callers (e.g. RPC) may start serving
+	// requests before the blockchain subscription is ready, causing stale state
+	// (e.g. getinfo returning block height 0).
+	subscriptionTimeout := tSettings.BlockChain.SubscriptionTimeout
+	subscriptionTimer := time.NewTimer(subscriptionTimeout)
+	select {
+	case <-ready:
+		subscriptionTimer.Stop()
+		// Reset grace period so heartbeat timeout starts from subscription
+		// readiness, not client creation (avoids false 503 after slow subscribe).
+		c.createdAt = time.Now().UnixNano()
+		logger.Infof("[Blockchain] Subscription ready for %s", source)
+	case <-subscriptionTimer.C:
+		logger.Warnf("[Blockchain] Subscription not ready after %v for %s, proceeding anyway", subscriptionTimeout, source)
+	case <-ctx.Done():
+		subscriptionTimer.Stop()
+		return nil, ctx.Err()
 	}
 
 	// start a go routine to listen for notifications
@@ -217,11 +241,48 @@ func (c *Client) Health(ctx context.Context, checkLiveness bool) (int, string, e
 	// If all dependencies are ready, return http.StatusOK
 	// A failed dependency check does not imply the service needs restarting
 	resp, err := c.client.HealthGRPC(ctx, &emptypb.Empty{})
-	if err != nil || !resp.GetOk() {
-		return http.StatusFailedDependency, resp.GetDetails(), errors.UnwrapGRPC(err)
+	if err != nil {
+		return http.StatusFailedDependency, err.Error(), errors.UnwrapGRPC(err)
+	}
+	if !resp.GetOk() {
+		return http.StatusFailedDependency, resp.GetDetails(), nil
+	}
+
+	// Check subscription health via heartbeat recency
+	if code, msg := c.checkSubscriptionHealth(); code != http.StatusOK {
+		return code, msg, nil
 	}
 
 	return http.StatusOK, resp.GetDetails(), nil
+}
+
+// checkSubscriptionHealth verifies the blockchain subscription is active by
+// checking heartbeat recency. Returns 503 if the subscription appears stale.
+func (c *Client) checkSubscriptionHealth() (int, string) {
+	if c.createdAt == 0 {
+		// Client not created via constructor (e.g. test mock) — skip subscription check
+		return http.StatusOK, "subscription check skipped (no createdAt)"
+	}
+
+	lastHB := c.lastHeartbeat.Load()
+	heartbeatTimeout := 3 * c.settings.BlockChain.HeartbeatInterval
+
+	if lastHB == 0 {
+		// No heartbeat yet — check if still within startup grace period
+		if time.Since(time.Unix(0, c.createdAt)) > heartbeatTimeout {
+			return http.StatusServiceUnavailable,
+				fmt.Sprintf("subscription not established (no heartbeat received after %v)", heartbeatTimeout)
+		}
+		return http.StatusOK, "subscription: waiting for first heartbeat"
+	}
+
+	heartbeatAge := time.Since(time.Unix(0, lastHB))
+	if heartbeatAge > heartbeatTimeout {
+		return http.StatusServiceUnavailable,
+			fmt.Sprintf("subscription stale (last heartbeat %v ago, timeout %v)", heartbeatAge.Round(time.Second), heartbeatTimeout)
+	}
+
+	return http.StatusOK, fmt.Sprintf("subscription healthy (last heartbeat %v ago)", heartbeatAge.Round(time.Second))
 }
 
 // AddBlock sends a request to add a new block to the blockchain.
@@ -1197,10 +1258,15 @@ func (c *Client) GetSubscribers(ctx context.Context) ([]string, error) {
 //
 // Returns:
 //   - chan *blockchain_api.Notification: Channel for receiving blockchain notifications
+//   - <-chan struct{}: Ready channel that closes when subscription is established and FSM state fetched
 //   - error: Any error encountered during subscription establishment
-func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *blockchain_api.Notification, error) {
+func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *blockchain_api.Notification, <-chan struct{}, error) {
 	// Use a buffered channel to prevent blocking on sends
 	ch := make(chan *blockchain_api.Notification, 100)
+
+	// ready is signalled after the first successful subscription + FSM state fetch
+	ready := make(chan struct{})
+	var readyOnce sync.Once
 
 	// Heartbeat timeout: 3x the server's broadcast interval (allows 3 missed heartbeats)
 	heartbeatTimeout := 3 * c.settings.BlockChain.HeartbeatInterval
@@ -1255,6 +1321,9 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 			// Subscription established successfully - fetch current FSM state
 			c.logger.Infof("[Blockchain] Subscription established, fetching current FSM state for %s", source)
 			c.fetchAndRestoreFSMState(ctx, source)
+
+			// Signal readiness on first successful subscription
+			readyOnce.Do(func() { close(ready) })
 
 			// Don't initialize heartbeat here - let it remain 0 until first PING is received.
 			// This ensures staleness detection works correctly: if connection breaks before
@@ -1343,7 +1412,7 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 		}
 	}()
 
-	return ch, nil
+	return ch, ready, nil
 }
 
 // fetchAndRestoreFSMState queries the blockchain service for the current FSM state
@@ -1808,7 +1877,7 @@ func (c *Client) Run(ctx context.Context, source string) error {
 // - Recovering from network disconnections or service downtime
 // - Ensuring the local blockchain is synchronized with the network
 // - Handling blockchain reorganizations and chain updates
-// - Maintaining consensus with the Bitcoin SV network
+// - Maintaining consensus with the BSV Blockchain network
 // - Coordinating synchronization across distributed Teranode components
 //
 // The method first checks if the FSM is already in the CATCHING_BLOCKS state
@@ -1868,11 +1937,11 @@ func (c *Client) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, pe
 // LegacySync sends a legacy sync FSM event to the blockchain service.
 // This method initiates a legacy synchronization process by transitioning the
 // blockchain service's finite state machine to the LEGACY_SYNCING state, which
-// triggers compatibility mode synchronization with older Bitcoin SV network
+// triggers compatibility mode synchronization with older BSV Blockchain network
 // protocols and legacy blockchain implementations.
 //
 // The legacy sync mode is essential for:
-// - Maintaining compatibility with older Bitcoin SV network nodes
+// - Maintaining compatibility with older BSV Blockchain network nodes
 // - Synchronizing with legacy blockchain implementations
 // - Supporting migration scenarios from older Teranode versions
 // - Ensuring interoperability across diverse network topologies
@@ -1891,7 +1960,7 @@ func (c *Client) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, pe
 //
 // This operation is typically used during:
 // - Network upgrades and migration periods
-// - Integration with legacy Bitcoin SV infrastructure
+// - Integration with legacy BSV Blockchain infrastructure
 // - Debugging synchronization issues with older nodes
 // - Ensuring network-wide compatibility during protocol transitions
 //
@@ -1993,7 +2062,7 @@ func (c *Client) Idle(ctx context.Context) error {
 // which blocks they need to synchronize.
 //
 // This implementation follows the standard Bitcoin protocol for block locators,
-// ensuring compatibility with the broader Bitcoin SV network.
+// ensuring compatibility with the broader BSV Blockchain network.
 //
 // Parameters:
 //   - ctx: Context for the operation with timeout and cancellation support
@@ -2357,6 +2426,31 @@ func (c *Client) CompleteBlobDeletionBatch(ctx context.Context, batchToken strin
 
 // GetMedianTimePastForHeights returns the MTP for one or more block heights.
 func (c *Client) GetMedianTimePastForHeights(ctx context.Context, heights []uint32) ([]uint32, error) {
+	resp, err := c.client.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{
+		Heights: heights,
+	})
+	if err != nil {
+		return nil, errors.UnwrapGRPC(err)
+	}
+
+	return resp.MedianTimePast, nil
+}
+
+// GetMedianTimePastRange returns the MTP values for all blocks in [fromHeight, toHeight].
+// Returns a dense slice where result[i] = MTP for height (fromHeight + i).
+// Internally builds a full heights array to reuse the existing GetMedianTimePastByHeights RPC,
+// avoiding the need for a new proto endpoint.
+func (c *Client) GetMedianTimePastRange(ctx context.Context, fromHeight, toHeight uint32) ([]uint32, error) {
+	if toHeight < fromHeight {
+		return []uint32{}, nil
+	}
+
+	count := toHeight - fromHeight + 1
+	heights := make([]uint32, count)
+	for i := range heights {
+		heights[i] = fromHeight + uint32(i)
+	}
+
 	resp, err := c.client.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{
 		Heights: heights,
 	})

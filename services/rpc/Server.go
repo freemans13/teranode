@@ -3,7 +3,7 @@
 // The rpc package provides a full-featured and standards-compliant Bitcoin JSON-RPC server
 // implementation that enables external clients to interact with the Teranode node
 // using established protocols. The service implements both standard Bitcoin Core RPC methods
-// and Bitcoin SV specific extensions, supporting operations such as:
+// and BSV Blockchain specific extensions, supporting operations such as:
 //
 // - Blockchain data retrieval (blocks, transactions, chain state)
 // - Transaction submission and broadcast
@@ -610,7 +610,7 @@ func handleVersion(_ context.Context, s *RPCServer, cmd interface{}, closeChan <
 //
 // The server implements a two-tier authentication system that separates administrative
 // capabilities from limited-user operations, providing security through proper authorization.
-// It supports standard Bitcoin Core RPC methods and Bitcoin SV extensions for
+// It supports standard Bitcoin Core RPC methods and BSV Blockchain extensions for
 // compatibility with existing tools while enhancing functionality.
 //
 // The RPCServer is designed for concurrent operation, employing synchronization mechanisms
@@ -665,6 +665,9 @@ type RPCServer struct {
 	// rpcMaxClients is the maximum number of concurrent RPC clients allowed
 	// This setting helps prevent resource exhaustion from too many simultaneous connections
 	rpcMaxClients int
+
+	// rpcMaxRequestSize is the maximum allowed size in bytes for RPC request bodies
+	rpcMaxRequestSize int64
 
 	// rpcQuirks enables backwards-compatible quirks in the RPC server when true
 	// This improves compatibility with clients expecting legacy Bitcoin Core behavior
@@ -1099,6 +1102,11 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 		return
 	}
 
+	// Limit request body size to prevent memory exhaustion
+	if s.rpcMaxRequestSize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, s.rpcMaxRequestSize)
+	}
+
 	// Use context-aware logger for trace correlation
 	ctx := r.Context()
 	ctxLogger := s.logger.WithTraceContext(ctx)
@@ -1322,7 +1330,10 @@ func (s *RPCServer) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 		// Timeout connections which don't complete the initial
 		// handshake within the allowed timeframe.
-		ReadTimeout: time.Second * rpcAuthTimeoutSeconds,
+		ReadTimeout:       time.Second * rpcAuthTimeoutSeconds,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	rpcServeMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1483,6 +1494,7 @@ func NewServer(logger ulogger.Logger, tSettings *settings.Settings, blockchainCl
 	// rpc.cfg.Chain.Subscribe(rpc.handleBlockchainNotification)
 
 	rpc.rpcMaxClients = tSettings.RPC.RPCMaxClients
+	rpc.rpcMaxRequestSize = int64(tSettings.RPC.RPCMaxRequestSize)
 
 	rpc.rpcQuirks = tSettings.RPC.RPCQuirks
 
