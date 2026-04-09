@@ -1,4 +1,4 @@
-// Package blockvalidation implements block validation for Bitcoin SV nodes in Teranode.
+// Package blockvalidation implements block validation for BSV Blockchain nodes in Teranode.
 //
 // This package provides the core functionality for validating Bitcoin blocks, managing block subtrees,
 // and processing transaction metadata. It is designed for high-performance operation at scale,
@@ -25,7 +25,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -1630,9 +1629,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 		require.NoError(t, err)
 
 		msg := &kafka.KafkaMessage{
-			ConsumerMessage: sarama.ConsumerMessage{
-				Value: msgBytes,
-			},
+			Value: msgBytes,
 		}
 
 		handler := server.consumerMessageHandler(ctx)
@@ -1675,9 +1672,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 
 		// Invalid message that will cause a parsing error
 		msg := &kafka.KafkaMessage{
-			ConsumerMessage: sarama.ConsumerMessage{
-				Value: []byte("invalid protobuf"),
-			},
+			Value: []byte("invalid protobuf"),
 		}
 
 		handler := server.consumerMessageHandler(ctx)
@@ -1723,9 +1718,7 @@ func Test_consumerMessageHandler(t *testing.T) {
 		require.NoError(t, err)
 
 		msg := &kafka.KafkaMessage{
-			ConsumerMessage: sarama.ConsumerMessage{
-				Value: msgBytes,
-			},
+			Value: msgBytes,
 		}
 
 		handler := server.consumerMessageHandler(ctx)
