@@ -21,9 +21,11 @@ import (
 )
 
 // setupBlockAssemblyTestWithUtxoStore is the same as setupBlockAssemblyTest but passes
-// the UTXO store to the SubtreeProcessor. This is required for tests that exercise
+// the UTXO store to NewBlockAssembler. This is required for tests that exercise
 // reset() with moveForward blocks, because SubtreeProcessor.reset() calls
 // processCoinbaseUtxos() which needs a non-nil utxoStore.
+// NewBlockAssembler passes the utxoStore through to its internal SubtreeProcessor,
+// so no separate SubtreeProcessor construction is needed.
 func setupBlockAssemblyTestWithUtxoStore(t *testing.T) *baTestItems {
 	t.Helper()
 
@@ -66,21 +68,7 @@ func setupBlockAssemblyTestWithUtxoStore(t *testing.T) *baTestItems {
 		items.newSubtreeChan,
 	)
 	require.NoError(t, err)
-	require.NotNil(t, ba.settings)
-
-	// Create SubtreeProcessor WITH utxoStore (unlike setupBlockAssemblyTest which passes nil).
-	// This is needed because SubtreeProcessor.reset() calls processCoinbaseUtxos()
-	// which requires utxoStore.Create().
-	ba.subtreeProcessor, err = subtreeprocessor.NewSubtreeProcessor(
-		t.Context(),
-		ulogger.TestLogger{},
-		ba.settings,
-		nil, // blobStore
-		items.blockchainClient,
-		items.utxoStore, // NOT nil — this is the key difference
-		items.newSubtreeChan,
-	)
-	require.NoError(t, err)
+	require.NotNil(t, ba.subtreeProcessor)
 
 	t.Cleanup(func() {
 		if ba.subtreeProcessor != nil {

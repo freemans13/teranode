@@ -1151,10 +1151,18 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			return errors.NewProcessingError("[SubtreeProcessor][Reset] error processing coinbase utxos", err)
 		}
 
-		// Finalize each moveForward block sequentially to ensure SetBlockProcessedAt
-		// is called for all blocks, not just the last one.
-		for _, block := range moveForwardBlocks {
-			stp.finalizeBlockProcessing(ctx, block)
+		// Mark processed_at for all blocks. For intermediate blocks use a lightweight
+		// direct SetBlockProcessedAt call to avoid running adjustSubtreeSize and
+		// updatePrecomputedMiningData on stale stats repeatedly during fast-forward.
+		// Only the final block gets full finalizeBlockProcessing.
+		for i, block := range moveForwardBlocks {
+			if i < len(moveForwardBlocks)-1 {
+				if err := stp.blockchainClient.SetBlockProcessedAt(ctx, block.Header.Hash()); err != nil {
+					stp.logger.Warnf("[SubtreeProcessor][Reset] error setting block processed_at for %s: %v", block.String(), err)
+				}
+			} else {
+				stp.finalizeBlockProcessing(ctx, block)
+			}
 		}
 	} else {
 		for _, block := range moveForwardBlocks {
@@ -1191,11 +1199,20 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			if err = stp.processCoinbaseUtxos(context.Background(), block); err != nil {
 				return errors.NewProcessingError("[SubtreeProcessor][Reset] error processing coinbase utxos", err)
 			}
+		}
 
-			// Finalize each moveForward block individually to ensure SetBlockProcessedAt
-			// is called for all blocks, not just the last one. Without this, intermediate
-			// moveForward blocks would never get processed_at set.
-			stp.finalizeBlockProcessing(ctx, block)
+		// Mark processed_at for all blocks. For intermediate blocks use a lightweight
+		// direct SetBlockProcessedAt call to avoid running adjustSubtreeSize and
+		// updatePrecomputedMiningData on stale stats repeatedly during fast-forward.
+		// Only the final block gets full finalizeBlockProcessing.
+		for i, block := range moveForwardBlocks {
+			if i < len(moveForwardBlocks)-1 {
+				if err := stp.blockchainClient.SetBlockProcessedAt(ctx, block.Header.Hash()); err != nil {
+					stp.logger.Warnf("[SubtreeProcessor][Reset] error setting block processed_at for %s: %v", block.String(), err)
+				}
+			} else {
+				stp.finalizeBlockProcessing(ctx, block)
+			}
 		}
 	}
 
