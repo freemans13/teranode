@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/require"
 )
 
@@ -120,6 +121,10 @@ func TestBlockHeightRetentionAdjustments(t *testing.T) {
 }
 
 func TestBatchSQLOperationsDefault(t *testing.T) {
+	// Ensure the config key is unset so default applies
+	gocore.Config().Unset("utxostore_batchSQLOperations")
+	defer gocore.Config().Unset("utxostore_batchSQLOperations")
+
 	tSettings := NewSettings()
 
 	// Default value should be true
@@ -128,14 +133,18 @@ func TestBatchSQLOperationsDefault(t *testing.T) {
 
 func TestBatchSQLOperationsExplicitValues(t *testing.T) {
 	t.Run("ExplicitTrue", func(t *testing.T) {
+		gocore.Config().Set("utxostore_batchSQLOperations", "true")
+		defer gocore.Config().Unset("utxostore_batchSQLOperations")
+
 		tSettings := NewSettings()
-		tSettings.UtxoStore.BatchSQLOperations = true
 		require.True(t, tSettings.UtxoStore.BatchSQLOperations)
 	})
 
 	t.Run("ExplicitFalse", func(t *testing.T) {
+		gocore.Config().Set("utxostore_batchSQLOperations", "false")
+		defer gocore.Config().Unset("utxostore_batchSQLOperations")
+
 		tSettings := NewSettings()
-		tSettings.UtxoStore.BatchSQLOperations = false
 		require.False(t, tSettings.UtxoStore.BatchSQLOperations)
 	})
 }
