@@ -319,10 +319,11 @@ func TestBlobDeletionSchedulingViaBlobStore(t *testing.T) {
 
 // TestBlobDeletionSafetyWindow verifies that the BlobDeletionSafetyWindow setting
 // prevents premature deletion of blobs. With a safety window of 2, blob deletions
-// are only processed when blockHeight - safetyWindow >= deleteAtHeight.
+// are only processed when blockHeight > safetyWindow AND blockHeight - safetyWindow >= deleteAtHeight.
 //
 // The safety window logic in processBlobDeletionsAtHeight:
 //
+//	if blockHeight <= safetyWindow: skip all deletions (window not yet satisfied)
 //	safeHeight = blockHeight - safetyWindow
 //	Only blobs with delete_at_height <= safeHeight are eligible for deletion
 //	This ensures data is safely behind the chain tip before blob removal
