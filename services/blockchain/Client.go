@@ -51,7 +51,7 @@ type Client struct {
 	subscribersMu         sync.Mutex                         // Mutex for subscribers list
 	lastBlockNotification *blockchain_api.Notification       // Last block notification received
 	lastHeartbeat         atomic.Int64                       // Unix nano timestamp of last heartbeat
-	subscriptionReady     chan struct{}                       // Closed when first subscription + FSM state fetch completes
+	subscriptionReady     chan struct{}                      // Closed when first subscription + FSM state fetch completes
 	subscriptionReadyOnce sync.Once                          // Ensures subscriptionReady is closed exactly once
 }
 
@@ -146,11 +146,11 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 	running.Store(true)
 
 	c := &Client{
-		client:      blockchain_api.NewBlockchainAPIClient(baConn),
-		logger:      logger,
-		settings:    tSettings,
-		running:     &running,
-		conn:        baConn,
+		client:            blockchain_api.NewBlockchainAPIClient(baConn),
+		logger:            logger,
+		settings:          tSettings,
+		running:           &running,
+		conn:              baConn,
 		subscribers:       make([]clientSubscriber, 0),
 		subscriptionReady: make(chan struct{}),
 	}
