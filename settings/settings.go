@@ -68,7 +68,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 		PostgresCheckAddress:         getString("postgres_check_address", "localhost:5432", alternativeContext...),
 		Postgres: PostgresSettings{
 			MaxOpenConns:     getInt("postgres_maxOpenConns", 50, alternativeContext...),
-			MaxIdleConns:     getInt("postgres_maxIdleConns", 10, alternativeContext...),
+			MaxIdleConns:     getInt("postgres_maxIdleConns", 50, alternativeContext...),
 			ConnMaxLifetime:  getDuration("postgres_connMaxLifetime", 5*time.Minute, alternativeContext...),
 			ConnMaxIdleTime:  getDuration("postgres_connMaxIdleTime", 1*time.Minute, alternativeContext...),
 			RetryMaxAttempts: getInt("postgres_retryMaxAttempts", 3, alternativeContext...),

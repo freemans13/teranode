@@ -25,7 +25,7 @@ When using PostgreSQL as the blockchain store, these nested settings configure c
 | Setting | Type | Default | Environment Variable | Usage |
 |---------|------|---------|---------------------|-------|
 | MaxOpenConns | int | 50 | blockchain_postgres_pool_postgres_maxOpenConns | Maximum concurrent database connections |
-| MaxIdleConns | int | 10 | blockchain_postgres_pool_postgres_maxIdleConns | Maximum idle connections in pool |
+| MaxIdleConns | int | 50 | blockchain_postgres_pool_postgres_maxIdleConns | Maximum idle connections in pool |
 | ConnMaxLifetime | time.Duration | 5m | blockchain_postgres_pool_postgres_connMaxLifetime | Maximum connection reuse duration |
 | ConnMaxIdleTime | time.Duration | 1m | blockchain_postgres_pool_postgres_connMaxIdleTime | Maximum idle time before closing |
 | RetryEnabled | bool | false | blockchain_postgres_pool_postgres_retryEnabled | Enable retries for transient errors |
