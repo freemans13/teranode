@@ -541,7 +541,7 @@ RETURNING id
 //
 // Returns:
 //   - error: A domain-specific error with appropriate context, typically wrapped as
-//     a BlockAlreadyExistsError for duplicates or a more general StorageError for other issues
+//     a BlockExistsError via errors.NewBlockExistsError for duplicates or a more general StorageError for other issues
 func (*SQL) parseSQLError(err error, block *model.Block) error {
 	// check whether this is a pgx postgres exists constraint error
 	var pgxErr *pgconn.PgError
