@@ -1273,12 +1273,18 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 			// Subscription established successfully - fetch current FSM state
 			c.logger.Infof("[Blockchain] Subscription established, fetching current FSM state for %s", source)
 			if c.fetchAndRestoreFSMState(ctx, source) {
-				// Signal readiness only after successful FSM state fetch
-				c.subscriptionReadyOnce.Do(func() {
-					close(c.subscriptionReady)
-					c.logger.Infof("[Blockchain] Subscription ready for %s", source)
-				})
+				c.logger.Infof("[Blockchain] Initial FSM state restored for %s", source)
+			} else {
+				c.logger.Warnf("[Blockchain] Initial FSM state fetch failed for %s; continuing with subscription and fallback state", source)
 			}
+
+			// Signal readiness once the subscription is established and the initial FSM fetch attempt has completed.
+			c.subscriptionReadyOnce.Do(func() {
+				if c.subscriptionReady != nil {
+					close(c.subscriptionReady)
+				}
+				c.logger.Infof("[Blockchain] Subscription ready for %s", source)
+			})
 
 			// Don't initialize heartbeat here - let it remain 0 until first PING is received.
 			// This ensures staleness detection works correctly: if connection breaks before
