@@ -590,19 +590,26 @@ func handleGetRawTransaction(ctx context.Context, s *RPCServer, cmd interface{},
 	inputs := make([]bsvjson.Vin, len(tx.Inputs))
 
 	for i, txIn := range tx.Inputs {
-		asm, err := txscript.DisasmString(txIn.UnlockingScript.Bytes())
-		if err != nil {
-			return nil, errors.NewServiceError("Error disassembling script", err)
-		}
+		if tx.IsCoinbase() {
+			inputs[i] = bsvjson.Vin{
+				Coinbase: txIn.UnlockingScript.String(),
+				Sequence: txIn.SequenceNumber,
+			}
+		} else {
+			asm, err := txscript.DisasmString(txIn.UnlockingScript.Bytes())
+			if err != nil {
+				return nil, errors.NewServiceError("Error disassembling script", err)
+			}
 
-		inputs[i] = bsvjson.Vin{
-			Txid: txIn.PreviousTxIDStr(),
-			Vout: txIn.PreviousTxOutIndex,
-			ScriptSig: &bsvjson.ScriptSig{
-				Asm: asm,
-				Hex: txIn.UnlockingScript.String(),
-			},
-			Sequence: txIn.SequenceNumber,
+			inputs[i] = bsvjson.Vin{
+				Txid: txIn.PreviousTxIDStr(),
+				Vout: txIn.PreviousTxOutIndex,
+				ScriptSig: &bsvjson.ScriptSig{
+					Asm: asm,
+					Hex: txIn.UnlockingScript.String(),
+				},
+				Sequence: txIn.SequenceNumber,
+			}
 		}
 	}
 
@@ -626,7 +633,7 @@ func handleGetRawTransaction(ctx context.Context, s *RPCServer, cmd interface{},
 		}
 
 		outputs[i] = bsvjson.Vout{
-			Value: float64(txOut.Satoshis),
+			Value: bsvjson.BTCValue(float64(txOut.Satoshis) / 1e8),
 			N:     uint32(i),
 			ScriptPubKey: bsvjson.ScriptPubKeyResult{
 				Addresses: addressStrings,
@@ -1411,7 +1418,7 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 		return map[string]interface{}{}, errors.NewProcessingError("error calculating median time: %v", err)
 	}
 
-	// Calculate verification progress based on Bitcoin SV's GuessVerificationProgress function
+	// Calculate verification progress based on SV Node's GuessVerificationProgress function
 	verificationProgress, err := calculateVerificationProgress(ctx, s.blockchainClient, bestBlockMeta.Height)
 	if err != nil {
 		// If we can't calculate verification progress, default to 1.0 (assume fully synced)
@@ -1429,7 +1436,7 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 		"blocks":               bestBlockMeta.Height,
 		"headers":              bestBlockMeta.Height,
 		"bestblockhash":        bestBlockHeader.Hash().String(),
-		"difficulty":           difficulty, // Return as float64 to match Bitcoin SV
+		"difficulty":           difficulty, // Return as float64 to match SV Node
 		"mediantime":           medianTime,
 		"verificationprogress": verificationProgress,
 		"chainwork":            chainWorkHex,
@@ -1444,8 +1451,8 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 	return jsonMap, nil
 }
 
-// calculateVerificationProgress follows the pattern of Bitcoin SV's GuessVerificationProgress function.
-// This is a translation of the Bitcoin SV code from validation.cpp:
+// calculateVerificationProgress follows the pattern of SV Node's GuessVerificationProgress function.
+// This is a translation of the SV Node code from validation.cpp:
 //
 //	double GuessVerificationProgress(const ChainTxData &data, const CBlockIndex *pindex) {
 //	    if (pindex == nullptr) return 0.0;
@@ -1459,7 +1466,7 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 //	    return pindex->GetChainTx() / fTxTotal;
 //	}
 //
-// Since we don't have hardcoded ChainTxData like Bitcoin SV, we'll use dynamic calculation
+// Since we don't have hardcoded ChainTxData like SV Node, we'll use dynamic calculation
 // based on our current blockchain statistics.
 func calculateVerificationProgress(ctx context.Context, blockchainClient blockchain.ClientI, currentHeight uint32) (float64, error) {
 	// Equivalent to: if (pindex == nullptr) return 0.0;
@@ -1481,7 +1488,7 @@ func calculateVerificationProgress(ctx context.Context, blockchainClient blockch
 	// Equivalent to: int64_t nNow = time(nullptr);
 	nNow := time.Now().Unix()
 
-	// Since we don't have hardcoded ChainTxData like Bitcoin SV, we'll use a different approach
+	// Since we don't have hardcoded ChainTxData like SV Node, we'll use a different approach
 	// We'll estimate sync progress based on how recent our last block is
 
 	// If our last block is very recent (within 10 minutes), assume we're synced

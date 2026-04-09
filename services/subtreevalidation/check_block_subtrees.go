@@ -7,7 +7,6 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -117,20 +116,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	}
 
 	u.logger.Infof("[CheckBlockSubtrees] Found %d missing subtrees for block %s, proceeding with validation", len(missingSubtrees), block.Hash().String())
-
-	// Check if we likely have all transactions locally via block assembly.
-	// When true, we skip the expensive subtree_data fetch from the peer's asset-cache
-	// and let ValidateSubtreeInternal validate using local UTXO store lookups instead.
-	var localTxsAvailable bool
-	if u.blockAssemblyClient != nil {
-		baCtx, baCancel := context.WithTimeout(ctx, 2*time.Second)
-		state, baErr := u.blockAssemblyClient.GetBlockAssemblyState(baCtx)
-		baCancel()
-		if baErr == nil && state != nil && state.TxCount >= uint64(block.TransactionCount) {
-			localTxsAvailable = true
-			u.logger.Infof("[CheckBlockSubtrees] Block assembly has %d txs, block needs %d — skipping subtree_data fetch from peer", state.TxCount, block.TransactionCount)
-		}
-	}
 
 	// BATCHED SUBTREE LOADING: Get blockIds once before batching
 	blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Header.HashPrevBlock, uint64(u.settings.GetUtxoStoreBlockHeightRetention()*2))
@@ -274,54 +259,48 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 				}
 
+				// PHASE 2: Exact pre-allocation
+				subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
+
 				subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 				if err != nil {
 					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
 				}
 
 				if !subtreeDataExists {
-					if !localTxsAvailable {
-						// Pre-allocate only when we will populate the slice
-						subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
+					// get the subtree data from the peer and process it directly
+					url := fmt.Sprintf("%s/subtree_data/%s", request.BaseUrl, subtreeHash.String())
 
-						// get the subtree data from the peer and process it directly
-						url := fmt.Sprintf("%s/subtree_data/%s", request.BaseUrl, subtreeHash.String())
+					body, subtreeDataErr := util.DoHTTPRequestBodyReader(gCtx, url)
+					if subtreeDataErr != nil {
+						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
+					}
 
-						body, subtreeDataErr := util.DoHTTPRequestBodyReader(gCtx, url)
-						if subtreeDataErr != nil {
-							return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
-						}
+					// Wrap with counting reader to track bytes downloaded
+					var bytesRead uint64
+					countingBody := &countingReadCloser{
+						reader:    body,
+						bytesRead: &bytesRead,
+					}
 
-						// Wrap with counting reader to track bytes downloaded
-						var bytesRead uint64
-						countingBody := &countingReadCloser{
-							reader:    body,
-							bytesRead: &bytesRead,
-						}
+					// Process transactions directly from the stream while storing to disk
+					err = u.processSubtreeDataStream(gCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah)
+					_ = countingBody.Close()
 
-						// Process transactions directly from the stream while storing to disk
-						err = u.processSubtreeDataStream(gCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah)
-						_ = countingBody.Close()
-
-						// Track bytes downloaded from peer after stream is consumed
-						// Decouple the context to ensure tracking completes even if parent context is cancelled
-						if u.p2pClient != nil && peerID != "" {
-							trackCtx, _, deferFn := tracing.DecoupleTracingSpan(gCtx, "subtreevalidation", "recordBytesDownloaded")
-							defer deferFn()
-							if err := u.p2pClient.RecordBytesDownloaded(trackCtx, peerID, bytesRead); err != nil {
-								u.logger.Warnf("[CheckBlockSubtrees][%s] failed to record %d bytes downloaded from peer %s: %v", subtreeHash.String(), bytesRead, peerID, err)
-							}
-						}
-
-						if err != nil {
-							return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to process subtree data stream", subtreeHash.String(), err)
+					// Track bytes downloaded from peer after stream is consumed
+					// Decouple the context to ensure tracking completes even if parent context is cancelled
+					if u.p2pClient != nil && peerID != "" {
+						trackCtx, _, deferFn := tracing.DecoupleTracingSpan(gCtx, "subtreevalidation", "recordBytesDownloaded")
+						defer deferFn()
+						if err := u.p2pClient.RecordBytesDownloaded(trackCtx, peerID, bytesRead); err != nil {
+							u.logger.Warnf("[CheckBlockSubtrees][%s] failed to record %d bytes downloaded from peer %s: %v", subtreeHash.String(), bytesRead, peerID, err)
 						}
 					}
-					// When localTxsAvailable, skip fetch — ValidateSubtreeInternal will use local UTXO store
-				} else {
-					// Pre-allocate only when we will populate the slice
-					subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
 
+					if err != nil {
+						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to process subtree data stream", subtreeHash.String(), err)
+					}
+				} else {
 					// SubtreeData exists, extract transactions from stored file
 					err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx])
 					if err != nil {
@@ -608,7 +587,11 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 		// Basic sanity check: ensure the transaction hash matches the expected hash from the subtree
 		if txIndex < subtree.Length() {
 			expectedHash := subtree.Nodes[txIndex].Hash
-			if !expectedHash.Equal(*tx.TxIDChainHash()) {
+			// The coinbase placeholder (all-F's) is only treated as valid at index 0 of this subtree when the
+			// corresponding transaction is coinbase. The actual coinbase tx hash may be unavailable when the
+			// subtree structure is built, so this special case is allowed only for that local position.
+			isCoinbasePlaceholder := txIndex == 0 && tx.IsCoinbase() && expectedHash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+			if !isCoinbasePlaceholder && !expectedHash.Equal(*tx.TxIDChainHash()) {
 				return txIndex, errors.NewProcessingError("[readTransactionsFromSubtreeDataStream] transaction hash mismatch at index %d: expected %s, got %s", txIndex, expectedHash.String(), tx.TxIDChainHash().String())
 			}
 		} else {
@@ -724,6 +707,12 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	// Pre-process validation options
 	processedValidatorOptions := validator.ProcessOptions(validatorOptions...)
+
+	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
+	// can read mtpStore[h] without locking and without making gRPC calls.
+	if err = u.validatorClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] failed to pre-load MTP store: %v", err)
+	}
 
 	// Track validation results
 	var (

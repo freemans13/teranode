@@ -1,7 +1,7 @@
 /*
-Package validator implements Bitcoin SV transaction validation functionality.
+Package validator implements BSV Blockchain transaction validation functionality.
 
-This package provides comprehensive transaction validation for Bitcoin SV nodes,
+This package provides comprehensive transaction validation for BSV Blockchain nodes,
 including script verification, UTXO management, and policy enforcement. It supports
 multiple script interpreters (GoBT, GoSDK, GoBDK) and implements the full Bitcoin
 transaction validation ruleset.
@@ -263,30 +263,32 @@ func TestValidate_RejectedTransactionChannel(t *testing.T) {
 	tx, err := bt.NewTxFromString(txHex)
 	require.NoError(t, err)
 
-	// set previous sats to 0, which makes the tx invalid
-	tx.Inputs[0].PreviousTxSatoshis = 0
+	// Calculate actual input amount
+	inputAmount := tx.Inputs[0].PreviousTxSatoshis
 
-	ctx := context.Background()
-	logger := ulogger.NewErrorTestLogger(t)
+	// Make the transaction invalid by making output satoshis exceed input satoshis
+	// This will fail the basic sanity check: sum(outputs) must be <= sum(inputs)
+	for _, output := range tx.Outputs {
+		output.Satoshis = inputAmount * 2 // Make total outputs > inputs
+	}
 
-	tSettings := test.CreateBaseTestSettings(t)
-	tSettings.ChainCfgParams, _ = chaincfg.GetChainParams("mainnet")
-
-	utxoStoreURL, err := url.Parse("sqlitememory:///test")
-	require.NoError(t, err)
-
-	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
-	require.NoError(t, err)
+	utxoStore, _ := nullstore.NewNullStore()
+	_ = utxoStore.SetBlockHeight(257727)
+	//nolint:gosec
+	_ = utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))
 
 	initPrometheusMetrics()
+
+	tSettings := settings.NewSettings()
+	tSettings.ChainCfgParams = &chaincfg.MainNetParams
 
 	txmetaKafkaProducerClient := kafka.NewKafkaAsyncProducerMock()
 	rejectedTxKafkaProducerClient := kafka.NewKafkaAsyncProducerMock()
 
 	v := &Validator{
-		logger:                        logger,
+		logger:                        ulogger.TestLogger{},
 		settings:                      tSettings,
-		txValidator:                   NewTxValidator(logger, tSettings),
+		txValidator:                   NewTxValidator(ulogger.TestLogger{}, tSettings),
 		utxoStore:                     utxoStore,
 		blockAssembler:                nil,
 		stats:                         gocore.NewStat("validator"),
@@ -714,7 +716,7 @@ func (s *MockBlockAssemblyStore) RemoveTx(_ context.Context, hash *chainhash.Has
 }
 
 func Benchmark_validateInternal(b *testing.B) {
-	txF65eHex, err := os.ReadFile("./testdata/f65ec8dcc934c8118f3c65f86083c2b7c28dad0579becd0cfe87243e576d9ae9.bin")
+	txF65eHex, err := os.ReadFile("./testdata/f65ec8dcc934c8118f3c65f86083c2b7c28dad0579becd0cfe87243e576d9ae9")
 	require.NoError(b, err)
 	tx, err := bt.NewTxFromBytes(txF65eHex)
 	require.NoError(b, err)
@@ -726,11 +728,16 @@ func Benchmark_validateInternal(b *testing.B) {
 		txValidator: NewTxValidator(ulogger.TestLogger{}, tSettings),
 	}
 
+	utxoHeights := make([]uint32, len(tx.Inputs))
+	for i := range utxoHeights {
+		utxoHeights[i] = 740975
+	}
+
 	for i := 0; i < b.N; i++ {
 		err = v.validateTransaction(context.Background(), tx, 740975, nil, &Options{})
 		require.NoError(b, err)
 
-		err = v.validateTransactionScripts(context.Background(), tx, 740975, []uint32{740975}, &Options{SkipPolicyChecks: true})
+		err = v.validateTransactionScripts(context.Background(), tx, 740975, utxoHeights, &Options{SkipPolicyChecks: true})
 		require.NoError(b, err)
 	}
 }

@@ -72,7 +72,7 @@ services:
       - --pandaproxy-addr 0.0.0.0:9093
       - --advertise-pandaproxy-addr localhost:9093
     ports:
-      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:9096:8081"
       - "127.0.0.1:9092:9092"
       - "127.0.0.1:9093:9093"
 
@@ -91,7 +91,7 @@ services:
       - ../../../services/propagation/propagation_api/propagation_api.proto:/etc/protos/propagation_api.proto:ro
       - ../base/kafka-console-config.yml:/etc/console/config.yml:ro
     ports:
-      - "127.0.0.1:8082:8080"
+      - "127.0.0.1:9095:8080"
     depends_on:
       - kafka-shared
 

@@ -757,18 +757,18 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	headersFirst := sm.headersFirstMode.Load()
 	lastBlockSince := time.Since(sps.getLastBlockTime())
 
-	// Skip violation checks entirely during headers-first mode to avoid
-	// side effects (validNetworkSpeed increments violation counter).
-	var isNetworkSpeedViolation, isLastBlockTimeViolation bool
+	// During headers-first mode, only suppress network speed checks since
+	// downloading 80-byte headers makes the peer appear slow. Still check
+	// last-block-time so stalled peers get rotated even during headers-first.
+	var isNetworkSpeedViolation bool
 	if !headersFirst {
 		validNetworkSpeed := sps.validNetworkSpeed(sm.minSyncPeerNetworkSpeed)
 		isNetworkSpeedViolation = validNetworkSpeed >= maxNetworkViolations
-		isLastBlockTimeViolation = lastBlockSince > maxLastBlockTime
-
 		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check, network violations: %v (limit %v), time since last block: %v (limit %v)", sp.String(), validNetworkSpeed, maxNetworkViolations, lastBlockSince, maxLastBlockTime)
 	} else {
-		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check skipped (headers-first mode), time since last block: %v", sp.String(), lastBlockSince)
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check (headers-first mode, speed check skipped), time since last block: %v (limit %v)", sp.String(), lastBlockSince, maxLastBlockTime)
 	}
+	isLastBlockTimeViolation := lastBlockSince > maxLastBlockTime
 
 	// If no violations detected, the sync peer is healthy — nothing to do.
 	if !isNetworkSpeedViolation && !isLastBlockTimeViolation {
@@ -1263,9 +1263,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			}
 
 			return nil
-		} else if errors.Is(err, context.Canceled) {
-			return nil
 		} else {
+			if errors.Is(err, context.Canceled) || errors.IsContextError(err) {
+				return nil
+			}
+
 			serviceError := errors.Is(err, errors.ErrServiceError) || errors.Is(err, errors.ErrStorageError)
 			if !legacySyncMode && !catchingBlocks && !serviceError {
 				peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &bmsg.blockHash, false)
@@ -1273,8 +1275,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 
 			sm.logger.Errorf("Failed to process new block in service blockQueueMsg %v: %v", bmsg.blockHash, err)
 
-			// TODO TEMPORARY: we should not panic here, but return the error
-			panic(err)
+			// Never panic in sync processing goroutines; bubble error to caller.
+			return err
 		}
 	}
 
@@ -1658,8 +1660,15 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 	switch invVect.Type {
 	case wire.InvTypeBlock:
-		// check whether this block exists in the blockchain service
-		return sm.blockchainClient.GetBlockExists(sm.ctx, &invVect.Hash)
+		// single round-trip: GetBlockHeader tells us both existence and validity
+		_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &invVect.Hash)
+		if err != nil {
+			// block not found (or transient error) — trigger re-request
+			return false, nil
+		}
+
+		// block exists but was marked invalid — re-request so it can be reprocessed
+		return !meta.Invalid, nil
 
 	case wire.InvTypeTx:
 		// check whether this transaction exists in the utxo store
