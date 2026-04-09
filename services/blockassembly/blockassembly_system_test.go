@@ -822,9 +822,11 @@ func TestResetWithBlockchainAhead_Integration(t *testing.T) {
 	t.Logf("Initial block hash: %s", initialHeader.Hash())
 
 	// Build chain of 4 blocks
-	chainBits, _ := model.NewNBitFromString("207fffff")
+	chainBits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
 
-	coinbaseTx, _ := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff17030200002f6d312d65752f605f77009f74384816a31807ffffffff03ac505763000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88acaa505763000000001976a9143c22b6d9ba7b50b6d6e615c69d11ecb2ba3db14588acaa505763000000001976a914b7177c7deb43f3869eabc25cfd9f618215f34d5588ac00000000")
+	coinbaseTx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff17030200002f6d312d65752f605f77009f74384816a31807ffffffff03ac505763000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88acaa505763000000001976a9143c22b6d9ba7b50b6d6e615c69d11ecb2ba3db14588acaa505763000000001976a914b7177c7deb43f3869eabc25cfd9f618215f34d5588ac00000000")
+	require.NoError(t, err)
 
 	headers := make([]*model.BlockHeader, 4)
 	prevHash := initialHeader.Hash()
@@ -927,10 +929,12 @@ func TestHandleReorgWithInvalidBlock_Integration(t *testing.T) {
 	require.NoError(t, err)
 	t.Logf("Initial block height: %d, hash: %s", initialMetadata.Height, initialHeader.Hash())
 
-	coinbaseTx, _ := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff17030200002f6d312d65752f605f77009f74384816a31807ffffffff03ac505763000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88acaa505763000000001976a9143c22b6d9ba7b50b6d6e615c69d11ecb2ba3db14588acaa505763000000001976a914b7177c7deb43f3869eabc25cfd9f618215f34d5588ac00000000")
+	coinbaseTx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff17030200002f6d312d65752f605f77009f74384816a31807ffffffff03ac505763000000001976a914c362d5af234dd4e1f2a1bfbcab90036d38b0aa9f88acaa505763000000001976a9143c22b6d9ba7b50b6d6e615c69d11ecb2ba3db14588acaa505763000000001976a914b7177c7deb43f3869eabc25cfd9f618215f34d5588ac00000000")
+	require.NoError(t, err)
 
 	// Build chain A: genesis → A1 → A2 → A3 (lower difficulty)
-	chainABits, _ := model.NewNBitFromString("207fffff")
+	chainABits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
 
 	chainAHeaders := make([]*model.BlockHeader, 3)
 	prevHash := initialHeader.Hash()
@@ -976,7 +980,8 @@ func TestHandleReorgWithInvalidBlock_Integration(t *testing.T) {
 	require.NoError(t, err, "failed to invalidate chain A block 2")
 
 	// Build chain B: genesis → B1 → B2 → B3 (higher difficulty, from genesis)
-	chainBBits, _ := model.NewNBitFromString("1d00ffff")
+	chainBBits, err := model.NewNBitFromString("1d00ffff")
+	require.NoError(t, err)
 
 	chainBHeaders := make([]*model.BlockHeader, 3)
 	prevHash = initialHeader.Hash()

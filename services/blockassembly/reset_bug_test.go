@@ -13,7 +13,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
-	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
 	utxostoresql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/ordishs/gocore"
@@ -41,9 +40,9 @@ func setupBlockAssemblyTestWithUtxoStore(t *testing.T) *baTestItems {
 
 	tSettings := createTestSettings(t)
 
-	utxoStore, err := utxostoresql.New(ctx, logger, tSettings, utxoStoreURL)
+	utxo, err := utxostoresql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
-	items.utxoStore = utxoStore
+	items.utxoStore = utxo
 
 	storeURL, err := url.Parse("sqlitememory://")
 	require.NoError(t, err)
@@ -56,7 +55,7 @@ func setupBlockAssemblyTestWithUtxoStore(t *testing.T) *baTestItems {
 
 	stats := gocore.NewStat("test")
 
-	ba, _ := NewBlockAssembler(
+	ba, err := NewBlockAssembler(
 		t.Context(),
 		ulogger.TestLogger{},
 		tSettings,
@@ -66,7 +65,7 @@ func setupBlockAssemblyTestWithUtxoStore(t *testing.T) *baTestItems {
 		items.blockchainClient,
 		items.newSubtreeChan,
 	)
-
+	require.NoError(t, err)
 	require.NotNil(t, ba.settings)
 
 	// Create SubtreeProcessor WITH utxoStore (unlike setupBlockAssemblyTest which passes nil).
@@ -113,17 +112,16 @@ func addBlockWithMinedSet(ctx context.Context, t *testing.T, items *baTestItems,
 	require.NoError(t, err)
 }
 
-// TestResetWithBlockchainAhead_MissesIntermediateBlockProcessing proves that when
-// block assembly performs a reset and blockchain is ahead by N blocks, the intermediate
-// moveForward blocks are NOT properly processed.
+// TestResetWithBlockchainAhead_MissesIntermediateBlockProcessing covers a bug where,
+// during reset with blockchain ahead by N blocks, intermediate moveForward blocks were
+// not properly finalized.
 //
-// Specifically, SubtreeProcessor.reset() only calls finalizeBlockProcessing (and thus
-// SetBlockProcessedAt) for the LAST moveForward block. Intermediate blocks never get
-// processed_at set, meaning they are not recognized as fully processed.
+// Before the fix, SubtreeProcessor.reset() only called finalizeBlockProcessing (and
+// thus SetBlockProcessedAt) for the LAST moveForward block. Intermediate blocks never
+// got processed_at set, meaning they were not recognized as fully processed.
 //
-// This test FAILS with the current code (proving the bug exists).
-// After the fix (don't moveForward during reset), all blocks will be processed
-// via the normal moveForwardBlock path, which calls finalizeBlockProcessing per block.
+// This test would have failed before the fix. The fix ensures reset finalizes each
+// moveForward block so every intermediate block is marked processed.
 func TestResetWithBlockchainAhead_MissesIntermediateBlockProcessing(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -174,19 +172,19 @@ func TestResetWithBlockchainAhead_MissesIntermediateBlockProcessing(t *testing.T
 		"block4 (last moveForward) should have processed_at set")
 }
 
-// TestHandleReorg_FallbackReset_ReturnsNilInsteadOfResetError proves that when
-// handleReorg falls back to reset() (due to an invalid block or failed Reorg),
-// it returns nil instead of ErrBlockAssemblyReset.
+// TestHandleReorg_FallbackReset_ReturnsNilInsteadOfResetError covers a bug where
+// handleReorg fell back to reset() (due to an invalid block or failed Reorg) but
+// returned nil instead of ErrBlockAssemblyReset.
 //
-// This is a bug because processNewBlockAnnouncement (the caller) checks for
+// Before the fix, processNewBlockAnnouncement (the caller) checked for
 // ErrBlockAssemblyReset to decide whether to skip the subsequent setBestBlockHeader
-// call. When handleReorg returns nil, the caller proceeds to overwrite BA's best
-// block with a potentially stale value captured before the reset ran.
+// call. When handleReorg returned nil, the caller would overwrite BA's best block
+// with a potentially stale value captured before the reset ran.
 //
-// Compare with the large-reorg path (line 1158-1163) which correctly returns
-// ErrBlockAssemblyReset.
+// The large-reorg path correctly returned ErrBlockAssemblyReset. This fix aligns
+// the fallback-reset path with the same behavior.
 //
-// This test FAILS with the current code (proving the bug exists).
+// This test would have failed before the fix.
 func TestHandleReorg_FallbackReset_ReturnsNilInsteadOfResetError(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -228,8 +226,3 @@ func TestHandleReorg_FallbackReset_ReturnsNilInsteadOfResetError(t *testing.T) {
 	require.True(t, errors.Is(err, errors.ErrBlockAssemblyReset),
 		"handleReorg should return ErrBlockAssemblyReset after fallback reset, got: %v", err)
 }
-
-// Ensure unused imports are used
-var (
-	_ utxoStore.Store = nil
-)

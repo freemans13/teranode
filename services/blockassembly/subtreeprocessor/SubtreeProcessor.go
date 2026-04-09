@@ -1208,6 +1208,12 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			return errors.NewProcessingError("[SubtreeProcessor][Reset] error getting parent block of last block we moved back", err)
 		}
 		stp.finalizeBlockProcessing(ctx, block)
+	} else if len(moveForwardBlocks) == 0 && len(moveBackBlocks) == 0 {
+		// no-op reset: block assembly is already at the target block, but chainedSubtrees
+		// and currentSubtree were just cleared above. Refresh precomputedMiningData so it
+		// no longer references the old (now-closed) subtrees.
+		stp.currentBlockHeader.Store(blockHeader)
+		stp.updatePrecomputedMiningData()
 	}
 
 	if postProcess != nil {
