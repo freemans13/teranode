@@ -627,3 +627,35 @@ func (c *LocalClient) GetMedianTimePastForHeights(ctx context.Context, heights [
 
 	return mtps, nil
 }
+
+// GetMedianTimePastRange returns the MTP values for all blocks in [fromHeight, toHeight].
+// Returns a dense slice where result[i] = MTP for height (fromHeight + i).
+// Blocks missing from the canonical chain (e.g. heights below 11) are left as zero.
+func (c *LocalClient) GetMedianTimePastRange(ctx context.Context, fromHeight, toHeight uint32) ([]uint32, error) {
+	if toHeight < fromHeight {
+		return []uint32{}, nil
+	}
+
+	_, metas, err := c.store.GetBlockHeadersByHeight(ctx, fromHeight, toHeight)
+	if err != nil {
+		return nil, errors.NewProcessingError("[LocalClient][GetMedianTimePastRange] failed to get block headers from %d to %d", fromHeight, toHeight, err)
+	}
+
+	result := make([]uint32, toHeight-fromHeight+1)
+	for _, meta := range metas {
+		result[meta.Height-fromHeight] = meta.MedianTimePast
+	}
+
+	// If the top height is not in the database (block not yet persisted), compute its MTP
+	// on the fly from the block_time values of the preceding 11 blocks already in metas.
+	topMissing := len(metas) == 0 || metas[len(metas)-1].Height < toHeight
+	if topMissing && toHeight >= uint32(MedianTimeBlocks) {
+		computed, err := computeMTPForMissingHeight(metas, toHeight)
+		if err != nil {
+			return nil, err
+		}
+		result[toHeight-fromHeight] = computed
+	}
+
+	return result, nil
+}

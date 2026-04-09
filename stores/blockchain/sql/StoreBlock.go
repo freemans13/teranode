@@ -104,13 +104,59 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		opt(&storeBlockOptions)
 	}
 
+	var preBestHash *chainhash.Hash
+	if s.useInMemoryChainCheck {
+		// Capture the current best block hash before insert for reorg detection.
+		// getBestBlockID is cached, so this is essentially free.
+		var preBestErr error
+		_, preBestHash, preBestErr = s.getBestBlockID(ctx)
+		if preBestErr != nil {
+			s.logger.Warnf("StoreBlock: failed to get pre-insert best block ID: %v", preBestErr)
+		}
+	}
+
 	newBlockID, height, _, _, err := s.storeBlock(ctx, block, peerID, storeBlockOptions)
 	if err != nil {
 		return 0, height, err
 	}
 
-	// Reset response cache to invalidate cached block headers and best block
+	// Reset response cache to invalidate cached best block ID and headers
 	s.ResetResponseCache()
+
+	if s.useInMemoryChainCheck {
+		// Track the highest block ID for the maxBlockID upper-bound check.
+		s.updateMaxBlockID(newBlockID)
+
+		// Detect forks and reorgs by comparing the newly inserted block against
+		// the post-insert best block.
+		postBestCtx, postBestCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+		defer postBestCancel()
+		postBestID, _, bestErr := s.getBestBlockID(postBestCtx)
+		if bestErr != nil {
+			s.logger.Errorf("StoreBlock: failed to get best block ID: %v", bestErr)
+		} else if uint64(postBestID) != newBlockID {
+			s.blockTimestampCache.Clear()
+			rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+			defer rebuildCancel()
+			if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+				s.logger.Errorf("StoreBlock: %v", rebuildErr)
+			} else {
+				s.lastSuccessfulRebuild.Store(time.Now().Unix())
+			}
+		} else if preBestHash == nil || *block.Header.HashPrevBlock != *preBestHash {
+			// Case 2: new block is the best but doesn't extend the old best (reorg),
+			// or preBestHash was unavailable — take the conservative path and rebuild.
+			s.blockTimestampCache.Clear()
+			s.resetChainWalkCache()
+			rebuildCtx, rebuildCancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+			defer rebuildCancel()
+			if rebuildErr := s.triggerRebuildOffChainSet(rebuildCtx); rebuildErr != nil {
+				s.logger.Errorf("StoreBlock: %v", rebuildErr)
+			} else {
+				s.lastSuccessfulRebuild.Store(time.Now().Unix())
+			}
+		}
+	}
 
 	return newBlockID, height, nil
 }
@@ -364,7 +410,7 @@ RETURNING id
 	}
 
 	// Calculate Median Time Past (MTP) for this block
-	medianTimePast, err := s.calculateMedianTimePastForHeight(ctx, height)
+	medianTimePast, err := s.calculateMedianTimePastForHeight(ctx, height, previousBlockID)
 	if err != nil {
 		s.logger.Errorf("[StoreBlock] Failed to calculate MTP for height %d (CSVHeight=%d): %v", height, s.chainParams.CSVHeight, err)
 		return 0, 0, nil, false, err
@@ -462,6 +508,12 @@ RETURNING id
 	var newBlockID uint64
 	if err = rows.Scan(&newBlockID); err != nil {
 		return 0, 0, nil, false, errors.NewStorageError("failed to scan new block id", err)
+	}
+
+	// Update MTP cache with this block's timestamp for future MTP calculations.
+	// Only cache valid blocks — invalid blocks are excluded from MTP queries.
+	if !storeAsInvalid {
+		s.blockTimestampCache.Add(height, block.Header.Timestamp)
 	}
 
 	return newBlockID, height, cumulativeChainWorkBytes, storeAsInvalid, nil
@@ -728,11 +780,12 @@ func (s *SQL) validateCoinbaseHeight(block *model.Block, currentHeight uint32) e
 // Parameters:
 //   - ctx: Context for the database operation
 //   - height: The block height to calculate MTP for
+//   - parentBlockID: The database ID of the parent block, used to walk the correct chain
 //
 // Returns:
 //   - uint32: The MTP value as Unix timestamp, or 0 if height < CSVHeight or height < 11
 //   - error: Error if block timestamps cannot be retrieved
-func (s *SQL) calculateMedianTimePastForHeight(ctx context.Context, height uint32) (uint32, error) {
+func (s *SQL) calculateMedianTimePastForHeight(ctx context.Context, height uint32, parentBlockID uint64) (uint32, error) {
 	// BIP113 is only active from CSVHeight onwards
 	// Before CSVHeight, MTP was not used
 	if height < s.chainParams.CSVHeight {
@@ -751,51 +804,78 @@ func (s *SQL) calculateMedianTimePastForHeight(ctx context.Context, height uint3
 	startHeight := height - medianTimeBlocks
 	endHeight := height - 1
 
-	// Fetch block timestamps for the range
-	q := `
-		SELECT block_time
-		FROM blocks
-		WHERE height >= $1 AND height <= $2
-		ORDER BY height ASC
-	`
-	rows, err := s.db.QueryContext(ctx, q, startHeight, endHeight)
+	// Fast path: check in-memory cache before hitting the database.
+	if cached := s.blockTimestampCache.GetRange(startHeight, endHeight); cached != nil {
+		return calculateMTPFromTimestamps(cached)
+	}
+
+	// Slow path: walk back through the parent chain from the parent block.
+	// This ensures we only get timestamps from the actual chain being extended,
+	// not from fork blocks that happen to share the same height range.
+	timestamps, err := s.fetchBlockTimestampsByParentChain(ctx, parentBlockID, medianTimeBlocks)
 	if err != nil {
-		return 0, errors.NewStorageError("failed to fetch block timestamps from %d to %d", startHeight, endHeight, err)
+		return 0, err
+	}
+
+	return calculateMTPFromTimestamps(timestamps)
+}
+
+// fetchBlockTimestampsByParentChain retrieves block timestamps by walking back through
+// the parent_id chain starting from the given block. This correctly handles forks by
+// only following the chain that the current block is being built on, rather than
+// querying by height range which can return timestamps from competing fork blocks.
+func (s *SQL) fetchBlockTimestampsByParentChain(ctx context.Context, startBlockID uint64, count int) ([]uint32, error) {
+	q := `
+		WITH RECURSIVE chain AS (
+			SELECT block_time, parent_id, 1 AS depth
+			FROM blocks WHERE id = $1
+			UNION ALL
+			SELECT b.block_time, b.parent_id, c.depth + 1
+			FROM blocks b
+			JOIN chain c ON b.id = c.parent_id
+			WHERE c.depth < $2
+		)
+		SELECT block_time FROM chain ORDER BY depth DESC
+	`
+	rows, err := s.db.QueryContext(ctx, q, startBlockID, count)
+	if err != nil {
+		return nil, errors.NewStorageError("failed to walk parent chain from block ID %d for %d blocks", startBlockID, count, err)
 	}
 	defer rows.Close()
 
-	// Collect timestamps
-	timestamps := make([]uint32, 0, medianTimeBlocks)
+	timestamps := make([]uint32, 0, count)
 	for rows.Next() {
 		var blockTime uint32
 		if err := rows.Scan(&blockTime); err != nil {
-			return 0, errors.NewStorageError("failed to scan block timestamp", err)
+			return nil, errors.NewStorageError("failed to scan block timestamp", err)
 		}
 		timestamps = append(timestamps, blockTime)
 	}
 
 	if err := rows.Err(); err != nil {
-		return 0, errors.NewStorageError("error iterating block timestamps", err)
+		return nil, errors.NewStorageError("error iterating block timestamps", err)
 	}
 
-	// Verify we got exactly 11 timestamps
-	if len(timestamps) != medianTimeBlocks {
-		return 0, errors.NewStorageError("expected %d timestamps, got %d", medianTimeBlocks, len(timestamps))
+	if len(timestamps) != count {
+		return nil, errors.NewStorageError("expected %d timestamps walking parent chain from block ID %d, got %d", count, startBlockID, len(timestamps))
 	}
 
-	// Convert to time.Time for median calculation
-	times := make([]time.Time, medianTimeBlocks)
+	return timestamps, nil
+}
+
+// calculateMTPFromTimestamps computes the Median Time Past from a slice of
+// block timestamps (expected to be in ascending height order).
+func calculateMTPFromTimestamps(timestamps []uint32) (uint32, error) {
+	times := make([]time.Time, len(timestamps))
 	for i, ts := range timestamps {
 		times[i] = time.Unix(int64(ts), 0)
 	}
 
-	// Calculate median using existing function
 	medianTime, err := model.CalculateMedianTimestamp(times)
 	if err != nil {
 		return 0, errors.NewStorageError("failed to calculate median timestamp", err)
 	}
 
-	// Convert back to uint32
 	return uint32(medianTime.Unix()), nil
 }
 

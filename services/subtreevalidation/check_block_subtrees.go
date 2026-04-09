@@ -76,16 +76,35 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}()
 
-	// Check which subtrees are missing first to avoid unnecessary pause logic
+	// Check which subtrees are missing, waiting for any in-flight validations to complete.
+	// When a subtree notification and block notification arrive simultaneously, the subtree
+	// handler may still be processing. Without waiting, we'd immediately mark it as missing
+	// and fetch subtree_data from the peer's asset-cache (expensive Aerospike reconstruction),
+	// which can fail under load and cascade into CATCHINGBLOCKS mode.
 	missingSubtrees := make([]chainhash.Hash, 0, len(block.Subtrees))
 	for _, subtreeHash := range block.Subtrees {
-		subtreeExists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
-		if err != nil {
-			return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to check if subtree exists in store", err)
-		}
-
-		if !subtreeExists {
-			missingSubtrees = append(missingSubtrees, *subtreeHash)
+		if u.quorum != nil {
+			locked, exists, release, err := u.quorum.TryLockIfNotExistsWithTimeout(ctx, subtreeHash, fileformat.FileTypeSubtree)
+			if err != nil {
+				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to acquire quorum lock or determine subtree existence", err)
+			}
+			if locked {
+				// File doesn't exist and no one else is working on it — release lock and mark missing
+				release()
+				missingSubtrees = append(missingSubtrees, *subtreeHash)
+			} else if !exists {
+				// Timed out waiting for in-flight handler — still treat as missing
+				missingSubtrees = append(missingSubtrees, *subtreeHash)
+			}
+			// exists==true: subtree was completed by in-flight handler — no action needed
+		} else {
+			subtreeExists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+			if err != nil {
+				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to check if subtree exists in store", err)
+			}
+			if !subtreeExists {
+				missingSubtrees = append(missingSubtrees, *subtreeHash)
+			}
 		}
 	}
 
@@ -124,9 +143,13 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	} else if block.TransactionCount > 0 && len(block.Subtrees) > 0 {
 		// Calculate exact txs per subtree using block metadata
 		txsPerSubtree := int(block.TransactionCount / uint64(len(block.Subtrees)))
-		subtreesBatchSize = txBatchSize / txsPerSubtree
-		if subtreesBatchSize == 0 {
-			subtreesBatchSize = 1 // Minimum 1 subtree per batch
+		if txsPerSubtree == 0 {
+			subtreesBatchSize = 1
+		} else {
+			subtreesBatchSize = txBatchSize / txsPerSubtree
+			if subtreesBatchSize == 0 {
+				subtreesBatchSize = 1 // Minimum 1 subtree per batch
+			}
 		}
 	} else {
 		// Fallback if metadata not available (shouldn't happen)
@@ -145,7 +168,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 		batchNum := (batchStart / subtreesBatchSize) + 1
 		batchSubtrees := missingSubtrees[batchStart:batchEnd]
-		u.logger.Infof("[CheckBlockSubtrees] Processing subtree batch %d/%d with %d subtrees for block %s", batchNum, (totalSubtrees+subtreesBatchSize-1)/subtreesBatchSize, len(batchSubtrees), block.Hash().String())
+		u.logger.Debugf("[CheckBlockSubtrees] Processing subtree batch %d/%d with %d subtrees for block %s", batchNum, (totalSubtrees+subtreesBatchSize-1)/subtreesBatchSize, len(batchSubtrees), block.Hash().String())
 
 		// Load transactions for this batch of subtrees in parallel
 		subtreeTxs := make([][]*bt.Tx, len(batchSubtrees))
@@ -312,7 +335,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 		batchTxCount := len(allTransactions)
 		totalBatches := (totalSubtrees + subtreesBatchSize - 1) / subtreesBatchSize
-		u.logger.Infof("[CheckBlockSubtrees] Batch %d/%d loaded %d transactions for block %s, now processing", batchNum, totalBatches, batchTxCount, block.Hash().String())
+		u.logger.Debugf("[CheckBlockSubtrees] Batch %d/%d loaded %d transactions for block %s, now processing", batchNum, totalBatches, batchTxCount, block.Hash().String())
 
 		// Process transactions for this batch
 		if batchTxCount > 0 {
@@ -327,7 +350,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 
 		batchSubtrees = nil //nolint:ineffassign // Intentional early GC hint for batch slice view
-		u.logger.Infof("[CheckBlockSubtrees] Batch %d/%d complete for block %s (%d txs processed, %d total), memory reclaimed", batchNum, totalBatches, block.Hash().String(), batchTxCount, totalProcessedTxs)
+		u.logger.Debugf("[CheckBlockSubtrees] Batch %d/%d complete for block %s (%d txs processed, %d total), memory reclaimed", batchNum, totalBatches, block.Hash().String(), batchTxCount, totalProcessedTxs)
 	}
 
 	u.logger.Infof("[CheckBlockSubtrees] Completed processing %d transactions across %d subtree batches", totalProcessedTxs, (totalSubtrees+subtreesBatchSize-1)/subtreesBatchSize)
@@ -564,7 +587,11 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 		// Basic sanity check: ensure the transaction hash matches the expected hash from the subtree
 		if txIndex < subtree.Length() {
 			expectedHash := subtree.Nodes[txIndex].Hash
-			if !expectedHash.Equal(*tx.TxIDChainHash()) {
+			// The coinbase placeholder (all-F's) is only treated as valid at index 0 of this subtree when the
+			// corresponding transaction is coinbase. The actual coinbase tx hash may be unavailable when the
+			// subtree structure is built, so this special case is allowed only for that local position.
+			isCoinbasePlaceholder := txIndex == 0 && tx.IsCoinbase() && expectedHash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+			if !isCoinbasePlaceholder && !expectedHash.Equal(*tx.TxIDChainHash()) {
 				return txIndex, errors.NewProcessingError("[readTransactionsFromSubtreeDataStream] transaction hash mismatch at index %d: expected %s, got %s", txIndex, expectedHash.String(), tx.TxIDChainHash().String())
 			}
 		} else {
@@ -610,7 +637,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	if missed > 0 {
-		u.logger.Infof("[processTransactionsInLevels] Pre-check: %d/%d transactions missed in cache, checking UTXO store", missed, len(txHashes))
+		u.logger.Debugf("[processTransactionsInLevels] Pre-check: %d/%d transactions missed in cache, checking UTXO store", missed, len(txHashes))
 
 		batched := u.settings.SubtreeValidation.BatchMissingTransactions
 		missed, err = u.processTxMetaUsingStore(ctx, txHashes, txMetaSlice, blockIds, batched, false)
@@ -622,10 +649,10 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	alreadyValidated := len(txHashes) - missed
 
 	if missed == 0 {
-		u.logger.Infof("[processTransactionsInLevels] All transactions already validated, skipping processing")
+		u.logger.Debugf("[processTransactionsInLevels] All transactions already validated, skipping processing")
 		return nil
 	} else if alreadyValidated > 0 {
-		u.logger.Infof("[processTransactionsInLevels] Pre-check: %d/%d transactions already validated, %d need validation", alreadyValidated, len(txHashes), missed)
+		u.logger.Debugf("[processTransactionsInLevels] Pre-check: %d/%d transactions already validated, %d need validation", alreadyValidated, len(txHashes), missed)
 	}
 
 	// Convert transactions to missingTx format for prepareTxsPerLevel
@@ -643,7 +670,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		}
 	}
 
-	u.logger.Infof("[processTransactionsInLevels] Organizing %d transactions into dependency levels", len(allTransactions))
+	u.logger.Debugf("[processTransactionsInLevels] Organizing %d transactions into dependency levels", len(allTransactions))
 
 	// Use the existing prepareTxsPerLevel logic to organize transactions by dependency levels
 	maxLevel, txsPerLevel, err := u.selectPrepareTxsPerLevel(ctx, missingTxs)
@@ -660,7 +687,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	allTransactions = nil //nolint:ineffassign // Intentional early GC hint
 	missingTxs = nil      //nolint:ineffassign // Intentional early GC hint
 
-	u.logger.Infof("[processTransactionsInLevels] Processing transactions across %d levels", maxLevel+1)
+	u.logger.Debugf("[processTransactionsInLevels] Processing transactions across %d levels", maxLevel+1)
 
 	validatorOptions := []validator.Option{
 		validator.WithSkipPolicyChecks(true),
@@ -680,6 +707,12 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	// Pre-process validation options
 	processedValidatorOptions := validator.ProcessOptions(validatorOptions...)
+
+	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
+	// can read mtpStore[h] without locking and without making gRPC calls.
+	if err = u.validatorClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] failed to pre-load MTP store: %v", err)
+	}
 
 	// Track validation results
 	var (
@@ -835,7 +868,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
 	}
 
-	u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions", totalTxCount)
+	u.logger.Debugf("[processTransactionsInLevels] Successfully processed all %d transactions", totalTxCount)
 
 	txMetaSlice = nil //nolint:ineffassign // Intentional early GC hint
 

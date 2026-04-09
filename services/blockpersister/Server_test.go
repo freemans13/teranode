@@ -744,6 +744,13 @@ func (m *MockBlockchainClient) GetMedianTimePastForHeights(ctx context.Context, 
 	// All zeros - sufficient for tests that don't check MTP values
 	return mtps, nil
 }
+
+func (m *MockBlockchainClient) GetMedianTimePastRange(_ context.Context, fromHeight, toHeight uint32) ([]uint32, error) {
+	if toHeight < fromHeight {
+		return []uint32{}, nil
+	}
+	return make([]uint32, toHeight-fromHeight+1), nil
+}
 func (m *MockBlockchainClient) SetState(ctx context.Context, key string, data []byte) error {
 	return nil
 }
@@ -1000,6 +1007,9 @@ func (m *MockUTXOStore) BatchDecorate(ctx context.Context, unresolvedMetaDataSli
 	return nil
 }
 func (m *MockUTXOStore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error { return nil }
+func (m *MockUTXOStore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
+	return nil
+}
 func (m *MockUTXOStore) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, tSettings *settings.Settings) error {
 	return nil
 }

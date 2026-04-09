@@ -369,13 +369,11 @@ func (u *Server) blessMissingTransaction(ctx context.Context, blockHash chainhas
 	// validate the transaction in the validation service
 	// this should spend utxos, create the tx meta and create new utxos
 	txMeta, err = u.validatorClient.ValidateWithOptions(ctx, tx, blockHeight, validationOptions)
+	if err != nil && !errors.Is(err, errors.ErrTxConflicting) {
+		return nil, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to validate transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
+	}
 	if err != nil {
-		if errors.Is(err, errors.ErrTxConflicting) {
-			// conflicting transaction, which has been saved, but not spent
-			u.logger.Warnf("[blessMissingTransaction][%s/%s][%s] transaction is conflicting", blockHash.String(), subtreeHash.String(), tx.TxID())
-		} else {
-			return nil, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to validate transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
-		}
+		u.logger.Warnf("[blessMissingTransaction][%s/%s][%s] transaction is conflicting", blockHash.String(), subtreeHash.String(), tx.TxID())
 	}
 
 	// Not recoverable, returning processing error
@@ -1050,6 +1048,12 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		firstErrorOnce   sync.Once
 	)
 
+	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
+	// can read mtpStore[h] without locking and without making gRPC calls.
+	if err = u.validatorClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
+		return errors.NewProcessingError("[processMissingTransactions][%s] failed to pre-load MTP store: %v", subtreeHash.String(), err)
+	}
+
 	for level := uint32(0); level <= maxLevel; level++ {
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
@@ -1088,14 +1092,12 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 								u.logger.Warnf("[validateSubtree][%s] Failed to add transaction %s to orphanage - orphanage is full", subtreeHash.String(), tx.TxIDChainHash().String())
 							}
 						}
-					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
-						// Report invalid subtree - contains truly invalid transaction
+					} else if (errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy)) ||
+						errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrUtxoError) {
+						// Report invalid subtree - contains truly invalid transaction or double-spend
 						u.publishInvalidSubtree(gCtx, subtreeHash.String(), baseURL, "contains_invalid_transaction")
 
-						// return the error, so that the caller can handle it
-						if errors.Is(err, errors.ErrTxInvalid) {
-							return err
-						}
+						return err
 					} else {
 						// If the error is not a policy error, we log it as a processing error
 						u.logger.Errorf("[validateSubtree][%s] failed to bless missing transaction: %s: %v", subtreeHash.String(), tx.TxIDChainHash().String(), err)

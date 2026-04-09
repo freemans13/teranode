@@ -695,29 +695,7 @@ func (b *Blockchain) startSubscriptions() {
 
 			// Send initial notification to let the subscriber know the subscription is ready
 			// and provide the current blockchain state
-			go func(sub subscriber) {
-				chainTip, _, err := b.store.GetBestBlockHeader(context.Background())
-				var initialNotification *blockchain_api.Notification
-				if err != nil {
-					// If no best block exists yet (e.g., empty blockchain), send notification with genesis hash
-					b.logger.Warnf("[Blockchain][startSubscriptions] No best block header available for initial notification to %s: %v", sub.source, err)
-					initialNotification = &blockchain_api.Notification{
-						Type: model.NotificationType_Block,
-						Hash: b.settings.ChainCfgParams.GenesisHash.CloneBytes(),
-					}
-				} else {
-					initialNotification = &blockchain_api.Notification{
-						Type: model.NotificationType_Block,
-						Hash: chainTip.Hash().CloneBytes(),
-					}
-				}
-
-				b.logger.Infof("[Blockchain][startSubscriptions] Sending initial notification to %s", sub.source)
-				if err := sub.subscription.Send(initialNotification); err != nil {
-					b.logger.Errorf("[Blockchain][startSubscriptions] Failed to send initial notification to %s: %v", sub.source, err)
-					b.deadSubscriptions <- sub
-				}
-			}(s)
+			go b.sendInitialNotification(s)
 
 		case s := <-b.deadSubscriptions:
 			b.subscribersMu.Lock()
@@ -727,6 +705,30 @@ func (b *Blockchain) startSubscriptions() {
 			safeClose(s.done)
 			b.logger.Infof("[Blockchain][startSubscriptions] Subscription removed (Total=%d).", remaining)
 		}
+	}
+}
+
+// sendInitialNotification sends the current chain tip (or genesis) to a new subscriber.
+func (b *Blockchain) sendInitialNotification(sub subscriber) {
+	chainTip, _, err := b.store.GetBestBlockHeader(context.Background())
+	var initialNotification *blockchain_api.Notification
+	if err != nil {
+		b.logger.Warnf("[Blockchain][startSubscriptions] No best block header available for initial notification to %s: %v", sub.source, err)
+		initialNotification = &blockchain_api.Notification{
+			Type: model.NotificationType_Block,
+			Hash: b.settings.ChainCfgParams.GenesisHash.CloneBytes(),
+		}
+	} else {
+		initialNotification = &blockchain_api.Notification{
+			Type: model.NotificationType_Block,
+			Hash: chainTip.Hash().CloneBytes(),
+		}
+	}
+
+	b.logger.Infof("[Blockchain][startSubscriptions] Sending initial notification to %s", sub.source)
+	if err := sub.subscription.Send(initialNotification); err != nil {
+		b.logger.Errorf("[Blockchain][startSubscriptions] Failed to send initial notification to %s: %v", sub.source, err)
+		b.deadSubscriptions <- sub
 	}
 }
 
@@ -2546,7 +2548,12 @@ func (b *Blockchain) SendFSMEvent(ctx context.Context, eventReq *blockchain_api.
 	err := b.finiteStateMachine.Event(ctx, eventReq.Event.String())
 	if err != nil {
 		b.logger.Debugf("[Blockchain Server] Error sending event to FSM, state has not changed.")
-		return nil, err
+		switch err.(type) {
+		case fsm.InvalidEventError, fsm.NoTransitionError:
+			return nil, errors.WrapGRPC(errors.NewStateError("[Blockchain Server] FSM event %s rejected in state %s", eventReq.Event.String(), priorState, err))
+		default:
+			return nil, errors.WrapGRPC(err)
+		}
 	}
 
 	state := b.finiteStateMachine.Current()
