@@ -13,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -334,6 +335,20 @@ func TestParseSQLError_PostgreSQLConstraint(t *testing.T) {
 	}
 
 	result := s.parseSQLError(pqErr, block1)
+	assert.Error(t, result)
+	assert.Contains(t, result.Error(), "block already exists")
+	assert.Contains(t, result.Error(), block1.Hash().String())
+}
+
+func TestParseSQLError_PgxConstraint(t *testing.T) {
+	s := &SQL{}
+
+	// Create a pgx PgError constraint violation error
+	pgxErr := &pgconn.PgError{
+		Code: "23505", // Unique constraint violation
+	}
+
+	result := s.parseSQLError(pgxErr, block1)
 	assert.Error(t, result)
 	assert.Contains(t, result.Error(), "block already exists")
 	assert.Contains(t, result.Error(), block1.Hash().String())

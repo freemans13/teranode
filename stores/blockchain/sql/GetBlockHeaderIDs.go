@@ -160,7 +160,9 @@ func (s *SQL) GetBlockHeaderIDs(ctx context.Context, blockHashFrom *chainhash.Ha
 		ids = append(ids, id)
 	}
 
-	cacheOp.Set(ids, cacheTTL)
+	if len(ids) > 0 {
+		cacheOp.Set(ids, cacheTTL)
+	}
 
 	return ids, nil
 }
