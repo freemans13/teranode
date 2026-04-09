@@ -5,7 +5,7 @@ import (
 	"math/big"
 
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/ordishs/go-utils"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 type NBit [4]byte // nBits is 4 bytes array held internal in little endian format
@@ -23,7 +23,7 @@ func NewNBitFromSlice(nBits []byte) (*NBit, error) {
 }
 
 func NewNBitFromString(nBitStr string) (*NBit, error) {
-	nBits, err := utils.DecodeAndReverseHexString(nBitStr)
+	nBits, err := util.DecodeAndReverseHexString(nBitStr)
 	if err != nil {
 		return nil, errors.NewInvalidArgumentError("error decoding nBitStr ", err)
 	}
@@ -32,7 +32,7 @@ func NewNBitFromString(nBitStr string) (*NBit, error) {
 }
 
 func (b NBit) String() string {
-	return utils.ReverseAndHexEncodeSlice(b[:])
+	return util.ReverseAndHexEncodeSlice(b[:])
 }
 
 func (b NBit) MarshalJSON() ([]byte, error) {
@@ -40,7 +40,7 @@ func (b NBit) MarshalJSON() ([]byte, error) {
 }
 
 func (b NBit) UnmarshalJSON(data []byte) error {
-	nBits, err := utils.DecodeAndReverseHexString(string(data))
+	nBits, err := util.DecodeAndReverseHexString(string(data))
 	if err != nil {
 		return err
 	}
@@ -76,7 +76,7 @@ func (b NBit) CalculateTarget() *big.Int {
 // CalculateDifficulty from nBits using the standard Bitcoin algorithm
 func (b NBit) CalculateDifficulty() *big.Float {
 	// This implementation follows the standard Bitcoin difficulty calculation
-	// as used in both Bitcoin Core and Bitcoin SV:
+	// as used in both Bitcoin Core and SV Node:
 	// https://github.com/bitcoin/bitcoin/blob/master/src/rpc/blockchain.cpp
 	// https://github.com/bitcoin-sv/bitcoin-sv/blob/master/src/rpc/blockchain.cpp
 	//

@@ -110,6 +110,15 @@ func (m *NullStore) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error 
 	return nil
 }
 
+func (m *NullStore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
+	for _, tx := range txs {
+		if err := m.PreviousOutputsDecorate(ctx, tx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *NullStore) Create(_ context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
 	options := &utxo.CreateOptions{}
 	for _, opt := range opts {
@@ -153,6 +162,10 @@ func (m *NullStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 }
 
 func (m *NullStore) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
+	return nil, nil
+}
+
+func (m *NullStore) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (utxo.UnminedTxIterator, error) {
 	return nil, nil
 }
 

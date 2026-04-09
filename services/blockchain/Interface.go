@@ -12,7 +12,23 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+)
+
+// Subscriber source identifiers passed to Subscribe(). Services use these
+// constants so that callers of GetSubscribers() can reliably detect which
+// services are currently connected.
+const (
+	SubscriberLegacy            = "legacy/manager"
+	SubscriberP2P               = "p2pServer"
+	SubscriberUTXOStore         = "UTXOStore"
+	SubscriberBlockAssembler    = "BlockAssembler"
+	SubscriberBlockValidation   = "blockvalidation"
+	SubscriberSubtreeValidation = "subtreevalidation"
+	SubscriberPruner            = "Pruner"
+	SubscriberAssetService      = "AssetService"
+	SubscriberUTXOPersister     = "utxo-persister"
 )
 
 // ClientI defines the interface for blockchain client operations.
@@ -538,6 +554,9 @@ type ClientI interface {
 	// - Error if the subscription creation fails
 	Subscribe(ctx context.Context, source string) (chan *blockchain_api.Notification, error)
 
+	// GetSubscribers returns the list of currently active subscriber source strings.
+	GetSubscribers(ctx context.Context) ([]string, error)
+
 	// GetState retrieves state data by key.
 	//
 	// This method fetches arbitrary state data stored under the specified key in the
@@ -631,7 +650,7 @@ type ClientI interface {
 	//
 	// This method updates the blockchain database to indicate that the subtree hash structure
 	// for a specific block has been properly set. Subtree hashes are important for efficient
-	// validation and transaction lookup in the Bitcoin SV blockchain architecture.
+	// validation and transaction lookup in the BSV Blockchain architecture.
 	//
 	// Parameters:
 	// - ctx: Context for the operation with timeout and cancellation support
@@ -985,7 +1004,37 @@ type ClientI interface {
 	// Returns:
 	// - Deletion ID and success status
 	// - Error if scheduling fails
-	ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error)
+	ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType, deleteAtHeight uint32) (int64, bool, error)
+
+	// CancelBlobDeletion cancels a previously scheduled blob deletion.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - blobKey: The key of the blob
+	// - fileType: The file type of the blob
+	// - storeType: The type of blob store
+	//
+	// Returns:
+	// - cancelled: True if the deletion was found and cancelled
+	// - Error if cancellation fails
+	CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType) (bool, error)
+
+	// ListScheduledDeletions lists scheduled blob deletions with optional filtering.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - minHeight: Minimum delete-at height (0 = no minimum)
+	// - maxHeight: Maximum delete-at height (0 = no maximum)
+	// - storeType: Filter by store type (only applied if filterByStore is true)
+	// - filterByStore: Whether to filter by store type
+	// - limit: Maximum number of results (0 = default)
+	// - offset: Number of results to skip
+	//
+	// Returns:
+	// - Array of scheduled deletions
+	// - Total count of matching deletions
+	// - Error if query fails
+	ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType storetypes.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error)
 
 	// GetPendingBlobDeletions retrieves blob deletions ready for processing at a specific height.
 	//
@@ -1076,6 +1125,43 @@ type ClientI interface {
 	// Returns:
 	// - Error if completion fails or token is invalid
 	CompleteBlobDeletionBatch(ctx context.Context, batchToken string, completedIDs []int64, failedIDs []int64, maxRetries int) error
+
+	// GetMedianTimePastForHeights returns the Median Time Past (MTP) for one or more block heights.
+	// MTP is defined as the median of the timestamps of the previous 11 blocks (BIP113).
+	//
+	// BIP113 (Median Time Past) was activated as part of the CSV softfork at a specific block height
+	// on each network (mainnet: 419328, testnet3: 770112, etc.). Before this activation height,
+	// MTP was not used and this function returns 0 for those heights.
+	//
+	// Parameters:
+	// - ctx: Context for the operation
+	// - heights: Array of block heights to get MTP for
+	//
+	// Returns:
+	// - []uint32: Array of MTP values corresponding to input heights (0 for height < CSVHeight or height < 11)
+	// - error: Error if block headers cannot be retrieved or MTP cannot be calculated
+	//
+	// Note: MTP of block N is the median of timestamps from blocks [N-11, N-1] (previous 11 blocks).
+	GetMedianTimePastForHeights(ctx context.Context, heights []uint32) ([]uint32, error)
+
+	// GetMedianTimePastRange returns the MTP values for all blocks in [fromHeight, toHeight].
+	// Returns a dense slice where result[i] = MTP for height (fromHeight + i),
+	// so len(result) == toHeight - fromHeight + 1.
+	//
+	// This is more efficient than GetMedianTimePastForHeights for contiguous ranges
+	// because it avoids constructing and transmitting a full heights array.
+	// Used for bulk pre-loading the in-memory MTP store at validator startup and
+	// for extending it when new block heights are encountered.
+	//
+	// Parameters:
+	// - ctx: Context for the operation
+	// - fromHeight: Start of the height range (inclusive)
+	// - toHeight: End of the height range (inclusive); must be >= fromHeight
+	//
+	// Returns:
+	// - []uint32: Dense slice of MTP values indexed from fromHeight
+	// - error: Error if block headers cannot be retrieved
+	GetMedianTimePastRange(ctx context.Context, fromHeight, toHeight uint32) ([]uint32, error)
 }
 
 const notImplemented = "not implemented"

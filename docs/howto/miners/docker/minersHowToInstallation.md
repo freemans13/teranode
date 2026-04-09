@@ -54,13 +54,18 @@ This guide does not cover:
 
 ## Hardware Requirements
 
-The Teranode team will provide you with current hardware recommendations. These recommendations will be:
+For detailed hardware specifications including CPU, RAM, and storage requirements, see the [System Requirements](../systemRequirements.md) document.
 
-1. Tailored to your specific configuration settings
-2. Designed to handle the expected production transaction volume
-3. Updated regularly to reflect the latest performance requirements
+**Quick reference for Docker Compose mainnet:**
 
-This ensures your system is appropriately equipped to manage the projected workload efficiently.
+| Resource     | Minimum   | Recommended   |
+| ------------ | --------- | ------------- |
+| CPU          | 8 cores   | 16 cores      |
+| RAM          | 128 GB    | 256 GB        |
+| Storage      | 1 TB      | 2 TB          |
+| Storage Type | NVMe SSD  | NVMe SSD      |
+
+These specifications assume a seeded, pruned node with default retention settings.
 
 ## Software Requirements
 
@@ -260,11 +265,11 @@ docker compose up -d
 
 Force the node to transition to Run mode:
 
-**Option 1: Using Admin Dashboard (Easiest)**
+#### Option 1: Using Admin Dashboard (Easiest)
 
 Access the dashboard at <http://localhost:8090/admin> and use the FSM State controls to transition to **RUNNING** or **LEGACYSYNCING**.
 
-**Option 2: Using teranode-cli**
+#### Option 2: Using teranode-cli
 
 ```bash
 # Transition to Run mode
@@ -294,22 +299,22 @@ docker compose ps
 
 Example output:
 
-| NAME | IMAGE | COMMAND | SERVICE | CREATED | STATUS | PORTS                                                                                                                                                                                                                                                                                                                                                                       |
-|------|-------|---------|----------|---------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| aerospike | aerospike:ce-7.1.0.6 | `/usr/bin/as-tini-st…` | aerospike | 2 minutes ago | Up 2 minutes | 0.0.0.0:3000->3000/tcp, :::3000->3000/tcp, 3001-3002/tcp                                                                                                                                                                                                                                                                                                                    |
-| aerospike-exporter | aerospike/aerospike-prometheus-exporter:latest | `/docker-entrypoint.…` | aerospike-exporter | 2 minutes ago | Up 2 minutes | 9145/tcp                                                                                                                                                                                                                                                                                                                                                                    |
-| asset | ghcr.io/bsv-blockchain/teranode:v0.5.50 | `/app/entrypoint.sh …` | asset | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:8090->8090/tcp, :::8090->8090/tcp, 0.0.0.0:32796->4040/tcp, [::]:32796->4040/tcp, 0.0.0.0:32797->8000/tcp, [::]:32797->8000/tcp, 0.0.0.0:32798->8091/tcp, [::]:32798->8091/tcp, 0.0.0.0:32799->9091/tcp, [::]:32799->9091/tcp                                                                                                  |
-| blockassembly | ghcr.io/bsv-blockchain/teranode:v0.5.50 | `/app/entrypoint.sh …` | blockassembly | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32768->4040/tcp, [::]:32768->4040/tcp, 0.0.0.0:32772->8000/tcp, [::]:32772->8000/tcp, 0.0.0.0:32774->8085/tcp, [::]:32774->8085/tcp, 0.0.0.0:32777->8285/tcp, [::]:32777->8285/tcp, 0.0.0.0:32779->9091/tcp, [::]:32779->9091/tcp                                                                                              |
-| blockchain | ghcr.io/bsv-blockchain/teranode:v0.5.50 | `/app/entrypoint.sh …` | blockchain | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32769->4040/tcp, [::]:32769->4040/tcp, 0.0.0.0:32771->8000/tcp, [::]:32771->8000/tcp, 0.0.0.0:32775->8082/tcp, [::]:32775->8082/tcp, 0.0.0.0:32776->8087/tcp, [::]:32776->8087/tcp, 0.0.0.0:32778->9091/tcp, [::]:32778->9091/tcp                                                                                              |
-| blockvalidation | ghcr.io/bsv-blockchain/teranode:v0.5.50 | `/app/entrypoint.sh …` | blockvalidation | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32781->4040/tcp, [::]:32781->4040/tcp, 0.0.0.0:32787->8000/tcp, [::]:32787->8000/tcp, 0.0.0.0:32788->8088/tcp, [::]:32788->8088/tcp, 0.0.0.0:32790->8188/tcp, [::]:32790->8188/tcp, 0.0.0.0:32792->9091/tcp, [::]:32792->9091/tcp                                                                                              |
-| grafana | grafana/grafana:latest | `/run.sh` | grafana | 2 minutes ago | Up 2 minutes | 0.0.0.0:3005->3000/tcp, [::]:3005->3000/tcp                                                                                                                                                                                                                                                                                                                                 |
-| kafka-console-shared | docker.redpanda.com/redpandadata/console:latest | `/bin/sh -c 'echo \"$…'` | kafka-console-shared | 2 minutes ago | Up 2 minutes | 0.0.0.0:8080->8080/tcp, :::8080->8080/tcp                                                                                                                                                                                                                                                                                                                                   |
-| kafka-shared | vectorized/redpanda:latest | `/entrypoint.sh 'red…'` | kafka-shared | 2 minutes ago | Up 2 minutes | 8082/tcp, 9644/tcp, 0.0.0.0:9092-9093->9092-9093/tcp, :::9092-9093->9092-9093/tcp, 0.0.0.0:32794->8081/tcp, [::]:32794->8081/tcp                                                                                                                                                                                                                                            |
-| legacy | ghcr.io/bsv-blockchain/teranode:v0.5.50 | `/app/entrypoint.sh …` | legacy | 2 minutes ago | Up 2 minutes | 0/tcp, 3005/tcp, 0.0.0.0:8333->8333/tcp, :::8333->8333/tcp, 9292/tcp, 0.0.0.0:18333->18333/tcp, :::18333->18333/tcp, 0.0.0.0:32782->4040/tcp, [::]:32782->4040/tcp, 0.0.0.0:32783->8000/tcp, [::]:32783->8000/tcp, 0.0.0.0:32784->8098/tcp, [::]:32784->8098/tcp, 0.0.0.0:32785->8099/tcp, [::]:32785->8099/tcp, 0.0.0.0:32786->9091/tcp, [::]:32786->9091/tcp              |
-| postgres | postgres:latest | `docker-entrypoint.s…` | postgres | 2 minutes ago | Up 2 minutes (healthy) | 0.0.0.0:5432->5432/tcp, :::5432->5432/tcp                                                                                                                                                                                                                                                                                                                                   |
-| prometheus | prom/prometheus:v2.44.0 | `/bin/prometheus --c…` | prometheus | 2 minutes ago | Up 2 minutes | 0.0.0.0:9090->9090/tcp, :::9090->9090/tcp                                                                                                                                                                                                                                                                                                                                   |
-| rpc | ghcr.io/bsv-blockchain/teranode:v0.5.50 | `/app/entrypoint.sh …` | rpc | 2 minutes ago | Up 2 minutes | 0/tcp, 3005/tcp, 8098/tcp, 0.0.0.0:9292->9292/tcp, :::9292->9292/tcp, 0.0.0.0:32770->4040/tcp, [::]:32770->4040/tcp, 0.0.0.0:32773->8000/tcp, [::]:32773->8000/tcp, 0.0.0.0:32780->9091/tcp, [::]:32780->9091/tcp                                                                                                                                                           |
-| subtreevalidation | ghcr.io/bsv-blockchain/teranode:v0.5.50 | `/app/entrypoint.sh …` | subtreevalidation | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32789->4040/tcp, [::]:32789->4040/tcp, 0.0.0.0:32791->8000/tcp, [::]:32791->8000/tcp, 0.0.0.0:32793->8086/tcp, [::]:32793->8086/tcp, 0.0.0.0:32795->9091/tcp, [::]:32795->9091/tcp                                                                                                                                             |
+| NAME                 | IMAGE                                           | COMMAND                  | SERVICE              | CREATED       | STATUS                 | PORTS                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------- | ----------------------------------------------- | ------------------------ | -------------------- | ------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| aerospike            | aerospike:ce-7.1.0.6                            | `/usr/bin/as-tini-st…`   | aerospike            | 2 minutes ago | Up 2 minutes           | 0.0.0.0:3000->3000/tcp, :::3000->3000/tcp, 3001-3002/tcp                                                                                                                                                                                                                                                                                                                      |
+| aerospike-exporter   | aerospike/aerospike-prometheus-exporter:latest  | `/docker-entrypoint.…`   | aerospike-exporter   | 2 minutes ago | Up 2 minutes           | 9145/tcp                                                                                                                                                                                                                                                                                                                                                                      |
+| asset                | ghcr.io/bsv-blockchain/teranode:v0.5.50         | `/app/entrypoint.sh …`   | asset                | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:8090->8090/tcp, :::8090->8090/tcp, 0.0.0.0:32796->4040/tcp, [::]:32796->4040/tcp, 0.0.0.0:32797->8000/tcp, [::]:32797->8000/tcp, 0.0.0.0:32798->8091/tcp, [::]:32798->8091/tcp, 0.0.0.0:32799->9091/tcp, [::]:32799->9091/tcp                                                                                                    |
+| blockassembly        | ghcr.io/bsv-blockchain/teranode:v0.5.50         | `/app/entrypoint.sh …`   | blockassembly        | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32768->4040/tcp, [::]:32768->4040/tcp, 0.0.0.0:32772->8000/tcp, [::]:32772->8000/tcp, 0.0.0.0:32774->8085/tcp, [::]:32774->8085/tcp, 0.0.0.0:32777->8285/tcp, [::]:32777->8285/tcp, 0.0.0.0:32779->9091/tcp, [::]:32779->9091/tcp                                                                                                |
+| blockchain           | ghcr.io/bsv-blockchain/teranode:v0.5.50         | `/app/entrypoint.sh …`   | blockchain           | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32769->4040/tcp, [::]:32769->4040/tcp, 0.0.0.0:32771->8000/tcp, [::]:32771->8000/tcp, 0.0.0.0:32775->8082/tcp, [::]:32775->8082/tcp, 0.0.0.0:32776->8087/tcp, [::]:32776->8087/tcp, 0.0.0.0:32778->9091/tcp, [::]:32778->9091/tcp                                                                                                |
+| blockvalidation      | ghcr.io/bsv-blockchain/teranode:v0.5.50         | `/app/entrypoint.sh …`   | blockvalidation      | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32781->4040/tcp, [::]:32781->4040/tcp, 0.0.0.0:32787->8000/tcp, [::]:32787->8000/tcp, 0.0.0.0:32788->8088/tcp, [::]:32788->8088/tcp, 0.0.0.0:32790->8188/tcp, [::]:32790->8188/tcp, 0.0.0.0:32792->9091/tcp, [::]:32792->9091/tcp                                                                                                |
+| grafana              | grafana/grafana:latest                          | `/run.sh`                | grafana              | 2 minutes ago | Up 2 minutes           | 0.0.0.0:3005->3000/tcp, [::]:3005->3000/tcp                                                                                                                                                                                                                                                                                                                                   |
+| kafka-console-shared | docker.redpanda.com/redpandadata/console:latest | `/bin/sh -c 'echo \"$…'` | kafka-console-shared | 2 minutes ago | Up 2 minutes           | 0.0.0.0:9095->8080/tcp, :::9095->8080/tcp                                                                                                                                                                                                                                                                                                                                     |
+| kafka-shared         | vectorized/redpanda:latest                      | `/entrypoint.sh 'red…'`  | kafka-shared         | 2 minutes ago | Up 2 minutes           | 8082/tcp, 9644/tcp, 0.0.0.0:9092-9093->9092-9093/tcp, :::9092-9093->9092-9093/tcp, 0.0.0.0:9096->8081/tcp, [::]:9096->8081/tcp                                                                                                                                                                                                                                                |
+| legacy               | ghcr.io/bsv-blockchain/teranode:v0.5.50         | `/app/entrypoint.sh …`   | legacy               | 2 minutes ago | Up 2 minutes           | 0/tcp, 3005/tcp, 0.0.0.0:8333->8333/tcp, :::8333->8333/tcp, 9292/tcp, 0.0.0.0:18333->18333/tcp, :::18333->18333/tcp, 0.0.0.0:32782->4040/tcp, [::]:32782->4040/tcp, 0.0.0.0:32783->8000/tcp, [::]:32783->8000/tcp, 0.0.0.0:32784->8098/tcp, [::]:32784->8098/tcp, 0.0.0.0:32785->8099/tcp, [::]:32785->8099/tcp, 0.0.0.0:32786->9091/tcp, [::]:32786->9091/tcp                |
+| postgres             | postgres:latest                                 | `docker-entrypoint.s…`   | postgres             | 2 minutes ago | Up 2 minutes (healthy) | 0.0.0.0:5432->5432/tcp, :::5432->5432/tcp                                                                                                                                                                                                                                                                                                                                     |
+| prometheus           | prom/prometheus:v2.44.0                         | `/bin/prometheus --c…`   | prometheus           | 2 minutes ago | Up 2 minutes           | 0.0.0.0:9090->9090/tcp, :::9090->9090/tcp                                                                                                                                                                                                                                                                                                                                     |
+| rpc                  | ghcr.io/bsv-blockchain/teranode:v0.5.50         | `/app/entrypoint.sh …`   | rpc                  | 2 minutes ago | Up 2 minutes           | 0/tcp, 3005/tcp, 8098/tcp, 0.0.0.0:9292->9292/tcp, :::9292->9292/tcp, 0.0.0.0:32770->4040/tcp, [::]:32770->4040/tcp, 0.0.0.0:32773->8000/tcp, [::]:32773->8000/tcp, 0.0.0.0:32780->9091/tcp, [::]:32780->9091/tcp                                                                                                                                                             |
+| subtreevalidation    | ghcr.io/bsv-blockchain/teranode:v0.5.50         | `/app/entrypoint.sh …`   | subtreevalidation    | 2 minutes ago | Up 2 minutes (healthy) | 0/tcp, 3005/tcp, 8098/tcp, 9292/tcp, 0.0.0.0:32789->4040/tcp, [::]:32789->4040/tcp, 0.0.0.0:32791->8000/tcp, [::]:32791->8000/tcp, 0.0.0.0:32793->8086/tcp, [::]:32793->8086/tcp, 0.0.0.0:32795->9091/tcp, [::]:32795->9091/tcp                                                                                                                                               |
 
 ##### Verify Service Health
 
@@ -322,7 +327,7 @@ Ensure all services show a status of "Up" or "Healthy".
     - Navigate to the "Teranode - Service Overview" dashboard for key metrics
     - Explore other dashboards for detailed service metrics. For example, you can check the Legacy sync metrics in the "Teranode - Legacy Service" dashboard.
 
-2. **Kafka Console**: Available internally on port 8080
+2. **Kafka Console**: Available at `http://localhost:9095`
 
 3. **Prometheus**: Available internally on port 9090
 
@@ -462,7 +467,7 @@ Teranode offers two network connectivity options:
 ### SVNode P2P Network (Default for Docker Compose)
 
 - **Description**: All data transmitted over P2P connections (via `legacy` service)
-- **Use Case**: Traditional Bitcoin SV network connectivity
+- **Use Case**: Traditional BSV Blockchain network connectivity
 - **Characteristics**: Compatible with existing SV Node infrastructure
 - **Status**: Enabled by default in Docker Compose for initial blockchain synchronization
 
@@ -610,8 +615,6 @@ sudo rm -rf ./data/*
 docker compose up -d
 ```
 
-For detailed procedures, troubleshooting, or selective cleanup, consult the [reset guide](minersHowToResetTeranode.md).
-
 ## Teranode Seeding
 
 If you have access to an SV Node, you can speed up the Initial Block Download (IBD) by seeding the Teranode with an export from SV Node. Only run this on a gracefully shut down SV Node instance (e.g., after using the RPC `stop` method).
@@ -648,38 +651,9 @@ docker run -it \
 
 ### Step 3: Complete Seeding Process
 
-For Docker Compose setup, use the following instructions:
+For complete seeding instructions including Docker Compose setup, database preparation, and FSM state transitions, refer to the dedicated sync guide:
 
-```bash
-# Stop all services
-docker compose down
-
-# Clear out the postgres, aerospike and external data
-sudo rm -rf ~/teranode-public/docker/testnet/data/*
-
-# Bring up the dependent services
-# Blockchain service will insert the correct genesis block for your selected network
-docker compose up -d aerospike postgres kafka-shared
-
-# Wait to make sure genesis block gets inserted
-# You will see it in the blockchain logs as `genesis block inserted`
-docker compose logs -f -n 100 blockchain
-
-# Run the seeder (see command above)
-docker run -it ...
-
-# Bring down blockchain to reset the internal caches
-docker compose down blockchain
-
-# Bring all other services back online
-docker compose up -d
-
-# Transition Teranode to LEGACYSYNCING
-# Option 1: Via teranode-cli
-docker exec -it blockchain teranode-cli setfsmstate --fsmstate LEGACYSYNCING
-
-# Option 2: Via Admin Dashboard at http://localhost:8090/admin
-```
+- **[Syncing the Blockchain Guide](./minersHowToSyncTheNode.md)** - Comprehensive instructions for all synchronization methods
 
 ## CPU Mining
 

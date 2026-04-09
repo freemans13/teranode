@@ -35,10 +35,11 @@ var bufioReaderPool = sync.Pool{
 // but the actual I/O can be deferred to a background worker pool.
 type SubtreeWriteJob struct {
 	SubtreeHash   chainhash.Hash
-	SubtreeBytes  []byte
-	BlockHash     string // For logging
-	SubtreeIdx    int    // For logging
-	AlreadyExists bool   // Skip write if already exists
+	Subtree       *subtreepkg.Subtree // Serialized lazily by write worker to avoid holding bytes in channel
+	BlockHash     string              // For logging
+	BlockHeight   uint32              // For DAH calculation
+	SubtreeIdx    int                 // For logging
+	AlreadyExists bool                // Skip write if already exists
 }
 
 // subtreeWriteWorker processes subtree write jobs from a channel.
@@ -56,20 +57,25 @@ func (u *BlockValidation) subtreeWriteWorker(ctx context.Context, writeJobsChan 
 			}
 
 			if job.AlreadyExists {
-				// Just need to unset DAH, file already exists
-				if err := u.subtreeStore.SetDAH(ctx, job.SubtreeHash[:], fileformat.FileTypeSubtree, 0); err != nil {
-					return errors.NewProcessingError("[subtreeWriteWorker][%s] failed to unset DAH for subtree %d (%s)", job.BlockHash, job.SubtreeIdx, job.SubtreeHash.String(), err)
-				}
+				// Subtree already exists with assembly's finite DAH — no change needed.
+				// The block persister will promote to permanent when the block is confirmed.
 				continue
 			}
 
-			// Write the subtree file
+			// Serialize lazily at write time to avoid holding bytes in the channel buffer
+			subtreeBytes, err := job.Subtree.Serialize()
+			if err != nil {
+				return errors.NewProcessingError("[subtreeWriteWorker][%s] failed to serialize subtree %d (%s)", job.BlockHash, job.SubtreeIdx, job.SubtreeHash.String(), err)
+			}
+
+			// Write the subtree file with finite DAH (temporary until block persister confirms)
+			dah := job.BlockHeight + u.subtreeBlockHeightRetention
 			if err := u.subtreeStore.Set(ctx,
 				job.SubtreeHash[:],
 				fileformat.FileTypeSubtree,
-				job.SubtreeBytes,
+				subtreeBytes,
 				bloboptions.WithAllowOverwrite(true),
-				bloboptions.WithDeleteAt(0),
+				bloboptions.WithDeleteAt(dah),
 			); err != nil {
 				return errors.NewProcessingError("[subtreeWriteWorker][%s] failed to store subtree %d (%s)", job.BlockHash, job.SubtreeIdx, job.SubtreeHash.String(), err)
 			}
@@ -101,7 +107,7 @@ func (u *BlockValidation) buildSubtreeAndQueueWrite(ctx context.Context, block *
 			return nil, errors.NewProcessingError("[buildSubtreeAndQueueWrite][%s] failed to get existing full subtree %s", block.Hash().String(), subtreeHash.String(), err)
 		}
 
-		fullSubtree, err := subtreepkg.NewSubtreeFromBytes(fullSubtreeBytes)
+		fullSubtree, err := u.newSubtreeFromBytes(fullSubtreeBytes)
 		if err != nil {
 			return nil, errors.NewProcessingError("[buildSubtreeAndQueueWrite][%s] failed to deserialize full subtree %s", block.Hash().String(), subtreeHash.String(), err)
 		}
@@ -111,6 +117,7 @@ func (u *BlockValidation) buildSubtreeAndQueueWrite(ctx context.Context, block *
 		return &SubtreeWriteJob{
 			SubtreeHash:   subtreeHash,
 			BlockHash:     block.Hash().String(),
+			BlockHeight:   block.Height,
 			SubtreeIdx:    subtreeIdx,
 			AlreadyExists: true,
 		}, nil
@@ -145,16 +152,11 @@ func (u *BlockValidation) buildSubtreeAndQueueWrite(ctx context.Context, block *
 	// Set on block for merkle validation (synchronous)
 	block.SubtreeSlices[subtreeIdx] = fullSubtree
 
-	// Serialize for async write
-	subtreeBytes, err := fullSubtree.Serialize()
-	if err != nil {
-		return nil, errors.NewProcessingError("[buildSubtreeAndQueueWrite][%s] failed to serialize full subtree %s", block.Hash().String(), subtreeHash.String(), err)
-	}
-
 	return &SubtreeWriteJob{
 		SubtreeHash:   subtreeHash,
-		SubtreeBytes:  subtreeBytes,
+		Subtree:       fullSubtree,
 		BlockHash:     block.Hash().String(),
+		BlockHeight:   block.Height,
 		SubtreeIdx:    subtreeIdx,
 		AlreadyExists: false,
 	}, nil
@@ -172,12 +174,17 @@ func (u *BlockValidation) buildSubtreeAndQueueWrite(ctx context.Context, block *
 //
 // Returns:
 //   - error: If validation fails
-func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.Block, baseURL string) error {
+func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.Block, peerID, baseURL string) error {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "quickValidateBlock",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[quickValidateBlock][%s] performing quick validation for checkpointed block at height %d", block.Hash().String(), block.Height),
 	)
 	defer deferFn()
+
+	// Reject blocks without a valid coinbase (e.g. from seeded peers that don't have full block data)
+	if block.CoinbaseTx == nil || len(block.CoinbaseTx.Inputs) == 0 {
+		return errors.NewBlockIncompleteError("[quickValidateBlock][%s] coinbase tx is nil or has no inputs, peer may not have full block data", block.Hash().String())
+	}
 
 	var (
 		err error
@@ -208,7 +215,7 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 	// add block directly to blockchain
 	if err = u.blockchainClient.AddBlock(ctx,
 		block,
-		baseURL,
+		peerID,
 		options.WithSubtreesSet(true),
 		options.WithMinedSet(true),
 		options.WithID(uint64(block.ID)),
@@ -253,12 +260,17 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 //
 // Returns:
 //   - error: If validation fails or context is cancelled
-func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *model.Block, baseURL string, writeJobsChan chan<- *SubtreeWriteJob) error {
+func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *model.Block, peerID, baseURL string, writeJobsChan chan<- *SubtreeWriteJob) error {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "quickValidateBlockAsync",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[quickValidateBlockAsync][%s] performing async quick validation for checkpointed block at height %d", block.Hash().String(), block.Height),
 	)
 	defer deferFn()
+
+	// Reject blocks without a valid coinbase (e.g. from seeded peers that don't have full block data)
+	if block.CoinbaseTx == nil || len(block.CoinbaseTx.Inputs) == 0 {
+		return errors.NewBlockIncompleteError("[quickValidateBlockAsync][%s] coinbase tx is nil or has no inputs, peer may not have full block data", block.Hash().String())
+	}
 
 	var (
 		err error
@@ -289,7 +301,7 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 	// add block directly to blockchain
 	if err = u.blockchainClient.AddBlock(ctx,
 		block,
-		baseURL,
+		peerID,
 		options.WithSubtreesSet(true),
 		options.WithMinedSet(true),
 		options.WithID(uint64(block.ID)),
@@ -404,8 +416,12 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 
 		// Phase 7: Write subtree files (shared with normal validation)
 		if err := u.writeSubtreeFilesForBatch(ctx, block, batch); err != nil {
+			batch.Close()
 			return 0, err
 		}
+
+		// Release mmap resources for completed batch
+		batch.Close()
 	}
 
 	return u.validateSubtrees(ctx, block, existingBlockID)
@@ -664,9 +680,13 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 				return err
 			})
 			if err := batchG.Wait(); err != nil {
+				batch.Close()
 				return err
 			}
 			u.logger.Infof("[pipeline:process:async][%s] batch %d-%d processed in %v (utxo=%v, build+queue=%v)", block.Hash().String(), batch.batchStart, batch.batchEnd, time.Since(start), utxoDuration, buildDuration)
+
+			// Release mmap resources for completed batch
+			batch.Close()
 		}
 		return nil
 	})
@@ -716,7 +736,18 @@ func (u *BlockValidation) readSubtree(ctx context.Context, block *model.Block, s
 	}()
 
 	// subtree only contains the tx hashes (nodes) of the subtree
-	subtree, err := subtreepkg.NewSubtreeFromReader(bufferedReader)
+	var subtree *subtreepkg.Subtree
+	if u.mmapDir != "" {
+		subtree, err = subtreepkg.NewSubtreeFromReaderMmap(bufferedReader, u.mmapDir)
+		if err != nil {
+			// Fallback to heap on mmap failure — reset reader and retry
+			u.logger.Warnf("[getBlockTransactions][%s] mmap deserialization failed for subtree %s, falling back to heap: %v", block.Hash().String(), subtreeHash.String(), err)
+			bufferedReader.Reset(subtreeReader)
+			subtree, err = subtreepkg.NewSubtreeFromReader(bufferedReader)
+		}
+	} else {
+		subtree, err = subtreepkg.NewSubtreeFromReader(bufferedReader)
+	}
 	if err != nil {
 		return subtreeResult{err: errors.NewProcessingError("[getBlockTransactions][%s] failed to deserialize subtree %s", block.Hash().String(), subtreeHash.String(), err)}
 	}
@@ -810,12 +841,14 @@ func (u *BlockValidation) writeSubtreeFilesFromTxs(ctx context.Context, block *m
 			return errors.NewProcessingError("[writeSubtreeFilesFromTxs][%s] failed to serialize full subtree %s", block.Hash().String(), subtreeHash.String(), err)
 		}
 
+		// Write with finite DAH — block persister will promote to permanent when block is confirmed
+		dah := block.Height + u.subtreeBlockHeightRetention
 		if err = u.subtreeStore.Set(ctx,
 			subtreeHash[:],
 			fileformat.FileTypeSubtree,
 			fullSubtreeBytes,
 			bloboptions.WithAllowOverwrite(true),
-			bloboptions.WithDeleteAt(0),
+			bloboptions.WithDeleteAt(dah),
 		); err != nil {
 			return errors.NewProcessingError("[writeSubtreeFilesFromTxs][%s] failed to store full subtree %s", block.Hash().String(), subtreeHash.String(), err)
 		}
@@ -825,16 +858,15 @@ func (u *BlockValidation) writeSubtreeFilesFromTxs(ctx context.Context, block *m
 			return errors.NewNotFoundError("[writeSubtreeFilesFromTxs][%s] failed to get full subtree %s", block.Hash().String(), subtreeHash.String(), err)
 		}
 
-		fullSubtree, err := subtreepkg.NewSubtreeFromBytes(fullSubtreeBytes)
+		fullSubtree, err := u.newSubtreeFromBytes(fullSubtreeBytes)
 		if err != nil {
 			return errors.NewProcessingError("[writeSubtreeFilesFromTxs][%s] failed to deserialize full subtree %s", block.Hash().String(), subtreeHash.String(), err)
 		}
 
 		block.SubtreeSlices[subtreeIdx] = fullSubtree
 
-		if err = u.subtreeStore.SetDAH(ctx, subtreeHash[:], fileformat.FileTypeSubtree, 0); err != nil {
-			return errors.NewProcessingError("[writeSubtreeFilesFromTxs][%s] failed to unset DAH for full subtree %s", block.Hash().String(), subtreeHash.String(), err)
-		}
+		// Subtree already exists with assembly's finite DAH — no change needed.
+		// The block persister will promote to permanent when the block is confirmed.
 	}
 
 	// Note: Subtree meta file (.subtreemeta) writing is intentionally skipped during quick validation
@@ -916,6 +948,15 @@ type SubtreeProcessingBatch struct {
 
 	// batchEnd is the global ending index (exclusive) in block.Subtrees
 	batchEnd int
+}
+
+// Close releases mmap-backed subtree resources in this batch.
+func (b *SubtreeProcessingBatch) Close() {
+	for _, st := range b.subtrees {
+		if st != nil {
+			st.Close()
+		}
+	}
 }
 
 // processSubtreeBatch reads and extends a batch of subtrees.
@@ -1035,34 +1076,11 @@ func (u *BlockValidation) processSubtreeBatch(
 		batch.txRanges[i] = [2]int{startIdx, len(batch.batchTxs)}
 	}
 
-	// Phase 3: Extend remaining transactions in parallel using UTXO store
+	// Phase 3: Extend remaining transactions using bulk UTXO store lookup
 	if len(txsNeedingExtension) > 0 {
-		extendG, extendCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(extendG, 256)
-
-		for _, tx := range txsNeedingExtension {
-			tx := tx
-			extendG.Go(func() error {
-				return u.utxoStore.PreviousOutputsDecorate(extendCtx, tx)
-			})
-		}
-
-		if err := extendG.Wait(); err != nil {
+		if err := u.utxoStore.BatchPreviousOutputsDecorate(ctx, txsNeedingExtension); err != nil {
 			cancelReaders()
 			return nil, errors.NewProcessingError("[processSubtreeBatch][%s] failed to extend transactions: %v", block.Hash().String(), err)
-		}
-
-		// Verify all inputs are now extended
-		for _, tx := range txsNeedingExtension {
-			for j, input := range tx.Inputs {
-				if input.PreviousTxSatoshis == 0 && input.PreviousTxScript == nil {
-					parentHash := input.PreviousTxIDChainHash()
-					cancelReaders()
-					return nil, errors.NewProcessingError(
-						"[processSubtreeBatch][%s] parent tx %s not found for input %d of tx %s",
-						block.Hash().String(), parentHash.String(), j, tx.TxIDChainHash().String())
-				}
-			}
 		}
 	}
 
@@ -1396,32 +1414,10 @@ func (u *BlockValidation) extendBatch(
 		batch.txRanges[i] = [2]int{startIdx, len(batch.batchTxs)}
 	}
 
-	// Extend remaining transactions in parallel using UTXO store
+	// Extend remaining transactions using bulk UTXO store lookup
 	if len(txsNeedingExtension) > 0 {
-		extendG, extendCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(extendG, 256)
-
-		for _, tx := range txsNeedingExtension {
-			tx := tx
-			extendG.Go(func() error {
-				return u.utxoStore.PreviousOutputsDecorate(extendCtx, tx)
-			})
-		}
-
-		if err := extendG.Wait(); err != nil {
+		if err := u.utxoStore.BatchPreviousOutputsDecorate(ctx, txsNeedingExtension); err != nil {
 			return errors.NewProcessingError("[extendBatch][%s] failed to extend transactions: %v", block.Hash().String(), err)
-		}
-
-		// Verify all inputs are now extended
-		for _, tx := range txsNeedingExtension {
-			for j, input := range tx.Inputs {
-				if input.PreviousTxSatoshis == 0 && input.PreviousTxScript == nil {
-					parentHash := input.PreviousTxIDChainHash()
-					return errors.NewProcessingError(
-						"[extendBatch][%s] parent tx %s not found for input %d of tx %s",
-						block.Hash().String(), parentHash.String(), j, tx.TxIDChainHash().String())
-				}
-			}
 		}
 	}
 

@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/internal/banlist"
 	"github.com/bsv-blockchain/teranode/internal/profiling"
 	"github.com/bsv-blockchain/teranode/services/alert"
 	"github.com/bsv-blockchain/teranode/services/asset"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
-	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/blockpersister"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/legacy"
@@ -28,7 +28,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
-	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
@@ -223,16 +222,8 @@ func startProfilerAndMetrics(logger ulogger.Logger, appSettings *settings.Settin
 // startBlockchainService initializes and starts the Blockchain service.
 func (d *Daemon) startBlockchainService(ctx context.Context, appSettings *settings.Settings,
 	args []string, createLogger func(string) ulogger.Logger) error {
-	// Create the blockchain store url from the app settings
-	blockchainStoreURL := appSettings.BlockChain.StoreURL
-	if blockchainStoreURL == nil {
-		return errors.NewStorageError("blockchain store url not found")
-	}
 
-	// Create the blockchain store
-	blockchainStore, err := blockchainstore.NewStore(
-		createLogger(loggerBlockchainSQL), blockchainStoreURL, appSettings,
-	)
+	blockchainStore, err := d.daemonStores.GetBlockchainStore(ctx, createLogger(loggerBlockchainSQL), appSettings)
 	if err != nil {
 		return err
 	}
@@ -419,6 +410,9 @@ func (d *Daemon) startAssetService(ctx context.Context, appSettings *settings.Se
 		return err
 	}
 
+	// Create ban list for the Asset service
+	banList := createBanList(ctx, createLogger("asset_banlist"), appSettings)
+
 	// Initialize the Asset service with the necessary parts
 	return d.ServiceManager.AddService(serviceAssetFormal, asset.NewServer(
 		createLogger(serviceAsset),
@@ -430,6 +424,7 @@ func (d *Daemon) startAssetService(ctx context.Context, appSettings *settings.Se
 		blockchainClient,
 		blockvalidationClient,
 		p2pClient,
+		banList,
 	))
 }
 
@@ -1001,6 +996,9 @@ func (d *Daemon) startPropagationService(
 		return err
 	}
 
+	// Create ban list for the Propagation service
+	propBanList := createBanList(ctx, createLogger("propagation_banlist"), appSettings)
+
 	// Add the Propagation service to the ServiceManager
 	return d.ServiceManager.AddService(servicePropagationFormal, propagation.New(
 		createLogger(loggerPropagation),
@@ -1009,6 +1007,7 @@ func (d *Daemon) startPropagationService(
 		validatorClient,
 		blockchainClient,
 		validatorKafkaProducerClient,
+		propBanList,
 	))
 }
 
@@ -1128,29 +1127,6 @@ func (d *Daemon) startPrunerService(ctx context.Context, appSettings *settings.S
 		return err
 	}
 
-	// Create blob stores map for pruner - uses enum keys
-	// Stores are created lazily when first deletion is encountered
-	// This allows pruner to run on a separate server with different mount points to same shared storage
-	blobStores := make(map[blockchain_api.BlobStoreType]blob.Store)
-
-	logger.Infof("Pruner will create blob stores on-demand from settings when deletions are processed")
-
-	// Get blockchain store for database connection
-	blockchainStoreURL := appSettings.BlockChain.StoreURL
-	if blockchainStoreURL == nil {
-		return errors.NewStorageError("blockchain store url not found")
-	}
-
-	blockchainStore, err := blockchainstore.NewStore(
-		createLogger(loggerBlockchainSQL), blockchainStoreURL, appSettings,
-	)
-	if err != nil {
-		return err
-	}
-
-	// Get postgres database connection
-	db := blockchainStore.GetDB().DB
-
 	// Add the Pruner service to the ServiceManager
 	return d.ServiceManager.AddService(servicePrunerFormal, pruner.New(
 		ctx,
@@ -1159,7 +1135,23 @@ func (d *Daemon) startPrunerService(ctx context.Context, appSettings *settings.S
 		utxoStore,
 		blockchainClient,
 		blockAssemblyClient,
-		blobStores,
-		db,
 	))
+}
+
+// createBanList creates, initializes, and starts periodic reload for a ban list.
+// Returns nil if creation or initialization fails (service continues without bans).
+func createBanList(ctx context.Context, logger ulogger.Logger, appSettings *settings.Settings) banlist.Interface {
+	bl, err := banlist.NewFromSettings(logger, appSettings)
+	if err != nil {
+		logger.Warnf("failed to create ban list: %v", err)
+		return nil
+	}
+
+	if err := bl.Init(ctx); err != nil {
+		logger.Warnf("failed to init ban list: %v", err)
+		return nil
+	}
+
+	bl.StartPeriodicReload(ctx, 30*time.Second)
+	return bl
 }

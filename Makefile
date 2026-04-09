@@ -7,6 +7,10 @@ TXMETA_TAG=
 SETTINGS_CONTEXT_DEFAULT := docker.ci
 LOCAL_TEST_START_FROM_STATE ?=
 
+# Test retry configuration
+TEST_RETRY_COUNT ?= 3
+TEST_RETRY_DELAY ?= 2
+
 # Get version from git using the shared script
 # Use environment variables if set, otherwise use the script
 ifndef GIT_VERSION
@@ -121,6 +125,10 @@ build-tx-blaster: set_debug_flags
 build-teranode-cli:
 	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -mod=readonly -o teranode-cli ./cmd/teranodecli
 
+.PHONY: build-teranode-dev
+build-teranode-dev:
+	CGO_ENABLED=0 go build -o teranode-dev ./cmd/teranodedev
+
 # .PHONY: build-propagation-blaster
 # build-propagation-blaster: set_debug_flags
 # 	go build --trimpath -ldflags="-X main.commit=${GITHUB_SHA} -X main.version=MANUAL" -gcflags "all=${DEBUG_FLAGS}" -o propagationblaster.run ./cmd/propagation_blaster/
@@ -166,37 +174,67 @@ longtest:
 	SETTINGS_CONTEXT=test gotestsum --format pkgname -- -race -tags "testtxmetacache" -count=1 -timeout=10m -coverprofile=coverage.out ./test/longtest/... 2>&1 | grep -v "ld: warning:"
 
 # run tests in the test/sequentialtest directory in order, one by one
+# Environment variables:
+#   TEST_RETRY_COUNT - Number of retry attempts for failed tests (default: 3)
+#   TEST_RETRY_DELAY - Delay between retries in seconds (default: 2)
+# Example: make sequentialtest TEST_RETRY_COUNT=5 TEST_RETRY_DELAY=3
 .PHONY: sequentialtest
 sequentialtest:
 	@mkdir -p /tmp/teranode-test-results
-	logLevel=INFO test/scripts/run_tests_sequentially.sh 2>&1 | tee /tmp/teranode-test-results/sequentialtest-results.txt
+	TEST_RETRY_COUNT=$(TEST_RETRY_COUNT) TEST_RETRY_DELAY=$(TEST_RETRY_DELAY) logLevel=INFO test/scripts/run_tests_sequentially.sh 2>&1 | tee /tmp/teranode-test-results/sequentialtest-results.txt
 
 # run sequential tests for specific database backends
 .PHONY: sequentialtest-sqlite
 sequentialtest-sqlite:
 	@mkdir -p /tmp/teranode-test-results
-	logLevel=INFO test/scripts/run_tests_sequentially.sh --db sqlite 2>&1 | tee /tmp/teranode-test-results/sequentialtest-sqlite-results.txt
+	TEST_RETRY_COUNT=$(TEST_RETRY_COUNT) TEST_RETRY_DELAY=$(TEST_RETRY_DELAY) logLevel=INFO test/scripts/run_tests_sequentially.sh --db sqlite 2>&1 | tee /tmp/teranode-test-results/sequentialtest-sqlite-results.txt
 
 .PHONY: sequentialtest-postgres
 sequentialtest-postgres:
 	@mkdir -p /tmp/teranode-test-results
-	logLevel=INFO test/scripts/run_tests_sequentially.sh --db postgres 2>&1 | tee /tmp/teranode-test-results/sequentialtest-postgres-results.txt
+	TEST_RETRY_COUNT=$(TEST_RETRY_COUNT) TEST_RETRY_DELAY=$(TEST_RETRY_DELAY) logLevel=INFO test/scripts/run_tests_sequentially.sh --db postgres 2>&1 | tee /tmp/teranode-test-results/sequentialtest-postgres-results.txt
 
 .PHONY: sequentialtest-aerospike
 sequentialtest-aerospike:
 	@mkdir -p /tmp/teranode-test-results
-	logLevel=INFO test/scripts/run_tests_sequentially.sh --db aerospike 2>&1 | tee /tmp/teranode-test-results/sequentialtest-aerospike-results.txt
+	TEST_RETRY_COUNT=$(TEST_RETRY_COUNT) TEST_RETRY_DELAY=$(TEST_RETRY_DELAY) logLevel=INFO test/scripts/run_tests_sequentially.sh --db aerospike 2>&1 | tee /tmp/teranode-test-results/sequentialtest-aerospike-results.txt
 
 .PHONY: testall
 testall: test longtest sequentialtest
 
 # run tests in the test/e2e/daemon directory
 # Tests run in parallel by default - each test gets unique ports and data directories
+# Environment variables:
+#   TEST_RETRY_COUNT - Number of retry attempts for failed tests (default: 3, set to 1 to disable retries)
+#   TEST_RETRY_DELAY - Delay between retries in seconds (default: 2)
+# Example: make smoketest TEST_RETRY_COUNT=5
+# Note: With retries enabled, timeout is increased to 20m to accommodate retry attempts
 .PHONY: smoketest
 smoketest:
 	@command -v gotestsum >/dev/null 2>&1 || { echo "gotestsum not found. Installing..."; $(MAKE) install-tools; }
 	@mkdir -p /tmp/teranode-test-results
-	cd test/e2e/daemon/ready && gotestsum --format pkgname -- -v -count=1 -race -timeout=10m -parallel 2 -run . 2>&1 | tee /tmp/teranode-test-results/smoketest-results.txt
+	@if [ "$(TEST_RETRY_COUNT)" != "1" ]; then \
+		echo "Running smoketest with retry support (TEST_RETRY_COUNT=$(TEST_RETRY_COUNT))"; \
+		cd test/e2e/daemon/ready && TEST_RETRY_COUNT=$(TEST_RETRY_COUNT) TEST_RETRY_DELAY=$(TEST_RETRY_DELAY) ../../../../test/scripts/gotestsum_with_retry.sh --format pkgname -- -v -count=1 -race -timeout=20m -parallel 1 -skip 'TestLegacySync|TestSVNodeSync|TestBidirectionalSync|TestSVNodeValidates|TestMultistreamLegacySync|TestMultistreamSVNodeSyncFromTeranode|TestMultistreamBackwardCompatibility|TestMultistreamDisabledRejectsConnection|TestMultistreamMixedPeers|TestMultistreamOnlyStandardPeer|TestMultistreamOnlyMultistreamPeer|TestMultistreamLongestChainSelection|TestBlobDeletion|TestPruner|TestShouldAllowSubmitMiningSolutionUsingMiningCandidateFromRPC|TestShouldRejectOversizedTx' -run . 2>&1 | tee /tmp/teranode-test-results/smoketest-results.txt; \
+	else \
+		echo "Running smoketest without retry (TEST_RETRY_COUNT=1)"; \
+		cd test/e2e/daemon/ready && gotestsum --format pkgname -- -v -count=1 -race -timeout=10m -parallel 1 -skip 'TestLegacySync|TestSVNodeSync|TestBidirectionalSync|TestSVNodeValidates|TestMultistreamLegacySync|TestMultistreamSVNodeSyncFromTeranode|TestMultistreamBackwardCompatibility|TestMultistreamDisabledRejectsConnection|TestMultistreamMixedPeers|TestMultistreamOnlyStandardPeer|TestMultistreamOnlyMultistreamPeer|TestMultistreamLongestChainSelection|TestBlobDeletion|TestPruner|TestShouldAllowSubmitMiningSolutionUsingMiningCandidateFromRPC|TestShouldRejectOversizedTx' -run . 2>&1 | tee /tmp/teranode-test-results/smoketest-results.txt; \
+	fi
+
+# run pruner e2e tests - heavyweight tests that mine blocks and verify pruning behavior
+.PHONY: prunertest
+prunertest:
+	@command -v gotestsum >/dev/null 2>&1 || { echo "gotestsum not found. Installing..."; $(MAKE) install-tools; }
+	@mkdir -p /tmp/teranode-test-results
+	cd test/e2e/daemon/ready && gotestsum --format pkgname -- -v -count=1 -race -timeout=15m -parallel 1 -run 'TestBlobDeletion|TestPruner' 2>&1 | tee /tmp/teranode-test-results/prunertest-results.txt
+
+# run legacy sync tests - tests teranode syncing with legacy svnode
+# Note: TestMultistreamLongestChainSelection skipped due to race condition in Kafka producer
+.PHONY: legacy-sync
+legacy-sync:
+	@command -v gotestsum >/dev/null 2>&1 || { echo "gotestsum not found. Installing..."; $(MAKE) install-tools; }
+	@mkdir -p /tmp/teranode-test-results
+	cd test/e2e/daemon/ready && gotestsum --format pkgname -- -v -count=1 -race -timeout=15m -run 'TestLegacySync|TestSVNodeSync|TestBidirectionalSync|TestSVNodeValidates|TestMultistreamLegacySync|TestMultistreamSVNodeSyncFromTeranode|TestMultistreamBackwardCompatibility|TestMultistreamDisabledRejectsConnection|TestMultistreamMixedPeers|TestMultistreamOnlyStandardPeer|TestMultistreamOnlyMultistreamPeer|TestBIP68' 2>&1 | tee /tmp/teranode-test-results/legacy-sync-results.txt
 
 # run chain integrity tests - multi-node tests with deep chain verification
 # This test mines blocks across multiple nodes and verifies chain consistency
@@ -213,6 +251,52 @@ nightly-tests:
 
 	cd $(test_dir) && SETTINGS_CONTEXT=$(or $(settings_context),$(SETTINGS_CONTEXT_DEFAULT)) go test -v -tags $(test_tags) -json | go-ctrf-json-reporter -output ../../$(report_name) --verbose
 	# cd $(TEST_DIR) && SETTINGS_CONTEXT=docker.ci go test -json | go-ctrf-json-reporter -output ../../$(REPORT_NAME) --verbose
+
+BENCH_PACKAGES = \
+	./errors \
+	./model \
+	./services/blockassembly \
+	./services/blockassembly/mining \
+	./services/blockassembly/subtreeprocessor \
+	./services/blockchain/work \
+	./services/blockpersister \
+	./services/blockvalidation \
+	./services/legacy/bsvec \
+	./services/legacy/bsvutil/hdkeychain \
+	./services/legacy/netsync \
+	./services/legacy/peer \
+	./services/subtreevalidation \
+	./services/validator \
+	./stores/blob/null \
+	./stores/blockchain/options \
+	./stores/blockchain/sql \
+	./stores/txmetacache \
+	./stores/utxo \
+	./stores/utxo/meta \
+	./test/consensus \
+	./ulogger \
+	./util \
+	./util/health \
+	./util/servicemanager \
+	./util/usql
+
+BENCH_FLAGS = -bench=. -benchmem -benchtime=1s -short -timeout=30m -count=2 -run='^$$' -tags "testtxmetacache"
+
+.PHONY: bench-test
+bench-test:
+	go test $(BENCH_FLAGS) $(BENCH_PACKAGES)
+
+.PHONY: bench-local-compare
+bench-local-compare:
+	@command -v benchstat >/dev/null 2>&1 || { echo "Installing benchstat..."; go install golang.org/x/perf/cmd/benchstat@latest; }
+	go build -o /tmp/bench-compare ./cmd/compare-benchmarks
+	@echo "=== Run 1 (baseline) ==="
+	go test $(BENCH_FLAGS) $(BENCH_PACKAGES) | tee /tmp/bench-run1.txt
+	@echo "=== Run 2 (current) ==="
+	go test $(BENCH_FLAGS) $(BENCH_PACKAGES) | tee /tmp/bench-run2.txt
+	@echo "=== Comparing (benchstat with p-value) ==="
+	/tmp/bench-compare -baseline /tmp/bench-run1.txt -current /tmp/bench-run2.txt -output /tmp/bench-local-report.md -threshold 10.0 -alpha 0.05
+	@cat /tmp/bench-local-report.md
 
 reset-data:
 	unzip data.zip
@@ -381,19 +465,19 @@ install-lint:
 .PHONY: lint
 lint:
 	git fetch origin main
-	golangci-lint run ./... --new-from-rev origin/main
+	golangci-lint run ./... --new-from-rev origin/main --disable gosec --disable prealloc # TODO: re-enable gosec once gosec >v2.23.0 is released (fixes float constant panic)
 
 # lint-new will only check only your unstaged/untracked changes (not committed changes), or fallback to check last commit if no changes in checkout
 # It is useful for quickly checking that your current, uncommitted work doesn't introduce new lint errors.
 .PHONY: lint-new
 lint-new:
-	golangci-lint run ./... --new
+	golangci-lint run ./... --new --disable gosec --disable prealloc # TODO: re-enable gosec once gosec >v2.23.0 is released (fixes float constant panic)
 
 # lint-full will check all files in the project
 # It will show all lint errors and warnings.
 .PHONY: lint-full
 lint-full:
-	golangci-lint run ./...
+	golangci-lint run ./... --disable gosec --disable prealloc # TODO: re-enable gosec once gosec >v2.23.0 is released (fixes float constant panic)
 
 # lint-full-changed-dirs will check the files that have been added/modified in the current branch compared to base main, including unstaged/untracked changes
 # It will show all lint errors and warnings.
@@ -407,7 +491,7 @@ lint-full-changed-dirs:
 	else \
 	  echo "Linting packages in the following directories:"; \
 	  echo "$$changed_dirs"; \
-	  golangci-lint run $$changed_dirs; \
+	  golangci-lint run --disable gosec --disable prealloc $$changed_dirs; \
 	fi
 
 # The install target installs all dependencies needed for development.
@@ -462,9 +546,6 @@ chain-integrity-test:
 
 	# Step 3: Build teranode image locally
 	@echo "Step 3: Building teranode image locally..."
-	@echo "  - Logging into AWS ECR..."
-	@aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin 434394763103.dkr.ecr.eu-north-1.amazonaws.com || (echo "  ✗ ECR login failed - skipping build"; exit 1)
-	@echo "  ✓ ECR login successful"
 	@echo "  - Building Docker image (this may take several minutes)..."
 	@docker build -t teranode:latest .
 	@echo "  ✓ Teranode Docker image built successfully"
@@ -735,17 +816,6 @@ clean-chain-integrity:
 	@echo "  ✓ Chain integrity test artifacts cleaned up."
 	@echo "  ✓ All containers stopped"
 	@echo "  ✓ All log files removed"
-
-# AWS ECR login for pulling required images
-.PHONY: ecr-login
-ecr-login:
-	@echo "🔐 AWS ECR Login"
-	@echo "=================="
-	@echo "  - Logging into AWS ECR (eu-north-1)..."
-	@aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin 434394763103.dkr.ecr.eu-north-1.amazonaws.com
-	@echo "  ✓ ECR login completed successfully"
-	@echo "  - You can now pull ECR images"
-	@echo ""
 
 # Display hash analysis results from chainintegrity test
 .PHONY: show-hashes

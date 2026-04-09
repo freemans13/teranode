@@ -1,5 +1,5 @@
 /*
-Package validator implements Bitcoin SV transaction validation functionality.
+Package validator implements BSV Blockchain transaction validation functionality.
 
 This file implements the Go-BDK script verification functionality, providing
 script validation using the Bitcoin Development Kit (BDK) implementation.
@@ -194,7 +194,7 @@ func (v *scriptVerifierGoBDK) VerifyScript(tx *bt.Tx, blockHeight uint32, consen
 		utxoInfoStr := strings.Join(utxoHeighstStr, "|")
 		errorLogMsg := fmt.Sprintf("%v \n\n TxID : %v\n\nBlock Height : %v\n\nUTXO Heights : %v\n\nerror:\n%v\n\n", errMsgInvalidTx, tx.TxID(), blockHeight, utxoInfoStr, errVerify)
 
-		v.logger.Warnf(errorLogMsg)
+		v.logger.Warnf("%s", errorLogMsg)
 
 		errCode := errVerify.Code()
 		policyRelatedError := (errCode == bdkscript.SCRIPT_ERR_OP_COUNT ||

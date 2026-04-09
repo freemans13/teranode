@@ -81,6 +81,10 @@ service BlockchainAPI {
   // GetBlockHeadersByHeight retrieves block headers between two specified heights.
   rpc GetBlockHeadersByHeight(GetBlockHeadersByHeightRequest) returns (GetBlockHeadersByHeightResponse) {}
 
+  // GetMedianTimePastByHeights retrieves Median Time Past (MTP) values for specified block heights.
+  // This is used for BIP68 relative locktime verification.
+  rpc GetMedianTimePastByHeights(GetMedianTimePastByHeightsRequest) returns (GetMedianTimePastByHeightsResponse) {}
+
   // GetBlocksByHeight retrieves full blocks between two specified heights.
   rpc GetBlocksByHeight(GetBlocksByHeightRequest) returns (GetBlocksByHeightResponse) {}
 
@@ -117,6 +121,9 @@ service BlockchainAPI {
 
   // SendNotification broadcasts a notification to subscribers.
   rpc SendNotification(Notification) returns (google.protobuf.Empty) {}
+
+  // GetSubscribers returns the list of currently active subscriber source strings.
+  rpc GetSubscribers(google.protobuf.Empty) returns (GetSubscribersResponse) {}
 
   // GetState retrieves state data by key.
   rpc GetState(GetStateRequest) returns (StateResponse) {}
@@ -372,6 +379,16 @@ message GetBlockHeadersByHeightResponse {
   repeated bytes metas = 2;         // List of serialized metadata
 }
 
+// GetMedianTimePastByHeightsRequest requests MTP values for specified block heights.
+message GetMedianTimePastByHeightsRequest {
+  repeated uint32 heights = 1;  // List of block heights to get MTP for
+}
+
+// GetMedianTimePastByHeightsResponse contains MTP values for the requested heights.
+message GetMedianTimePastByHeightsResponse {
+  repeated uint32 median_time_past = 1;  // MTP values corresponding to requested heights (0 if height < 11)
+}
+
 // GetBlocksByHeightRequest requests full blocks between two heights.
 message GetBlocksByHeightRequest {
   uint32 startHeight = 1;  // Starting height
@@ -445,6 +462,7 @@ message GetBlockHeaderResponse {
   bool subtrees_set = 12;     // Subtrees status
   bool invalid = 13;          // Validity status
   google.protobuf.Timestamp processed_at = 14; // Timestamp when block was processed
+  uint32 median_time_past = 15; // Median Time Past (MTP) - median of last 11 block timestamps (BIP113)
 }
 
 // CheckBlockIsCurrentChainResponse indicates if blocks are in the main chain.
@@ -479,6 +497,11 @@ message Notification {
 // NotificationMetadata contains additional notification information.
 message NotificationMetadata {
   map<string, string> metadata = 1;  // Key-value pairs of metadata
+}
+
+// GetSubscribersResponse contains the list of active subscriber sources.
+message GetSubscribersResponse {
+  repeated string sources = 1;  // Source identifiers of active subscribers
 }
 
 // GetStateRequest requests state data by key.
@@ -697,19 +720,13 @@ message GetBlocksNotPersistedResponse {
 }
 
 // Blob deletion scheduling messages
-
-enum BlobStoreType {
-  TXSTORE = 0;
-  SUBTREESTORE = 1;
-  BLOCKSTORE = 2;
-  TEMPSTORE = 3;
-  BLOCKPERSISTERSTORE = 4;
-}
+// Note: store_type values map to storetypes.BlobStoreType:
+// 0=TXSTORE, 1=SUBTREESTORE, 2=BLOCKSTORE, 3=TEMPSTORE, 4=BLOCKPERSISTERSTORE
 
 message ScheduleBlobDeletionRequest {
   bytes blob_key = 1;
   string file_type = 2;
-  BlobStoreType store_type = 3;
+  int32 store_type = 3;
   uint32 delete_at_height = 4;
 }
 
@@ -722,7 +739,7 @@ message ScheduleBlobDeletionResponse {
 message CancelBlobDeletionRequest {
   bytes blob_key = 1;
   string file_type = 2;
-  BlobStoreType store_type = 3;
+  int32 store_type = 3;
   string cancel_reason = 4;
 }
 
@@ -734,7 +751,7 @@ message CancelBlobDeletionResponse {
 message ListScheduledDeletionsRequest {
   uint32 min_height = 1;
   uint32 max_height = 2;
-  BlobStoreType store_type = 3;
+  int32 store_type = 3;
   int32 limit = 4;
   int32 offset = 5;
   bool filter_by_store = 6;
@@ -744,7 +761,7 @@ message ScheduledDeletion {
   int64 id = 1;
   bytes blob_key = 2;
   string file_type = 3;
-  BlobStoreType store_type = 4;
+  int32 store_type = 4;
   uint32 delete_at_height = 5;
   uint32 retry_count = 6;
 }

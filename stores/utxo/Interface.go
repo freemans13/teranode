@@ -1,4 +1,4 @@
-// Package utxo provides UTXO (Unspent Transaction Output) management for the Bitcoin SV Teranode implementation.
+// Package utxo provides UTXO (Unspent Transaction Output) management for the BSV Blockchain Teranode implementation.
 //
 // The package implements a UTXO store interface that handles:
 //   - UTXO creation, retrieval, and deletion
@@ -262,6 +262,13 @@ type Store interface {
 	// GetUnminedTxIterator returns an iterator for all unmined transactions in the store.
 	GetUnminedTxIterator(fullScan bool) (UnminedTxIterator, error)
 
+	// GetPrunableUnminedTxIterator returns a lightweight iterator optimized for the pruner's needs.
+	// Unlike GetUnminedTxIterator, this iterator:
+	// - Filters server-side for only unmined transactions with unminedSince <= cutoffBlockHeight
+	// - Fetches only the bins needed by the pruner (txID, unminedSince, external, inputs)
+	// This reduces bandwidth by 90-99%+ compared to the full iterator when the mempool is large.
+	GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (UnminedTxIterator, error)
+
 	// QueryOldUnminedTransactions returns transaction hashes for unmined transactions older than the cutoff height.
 	// This method is used by the store-agnostic cleanup implementation.
 	QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error)
@@ -284,6 +291,12 @@ type Store interface {
 
 	// PreviousOutputsDecorate fetches information about transaction inputs' previous outputs.
 	PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error
+
+	// BatchPreviousOutputsDecorate fetches previous output information for inputs across
+	// multiple transactions in bulk. This is more efficient than calling PreviousOutputsDecorate
+	// per-transaction because it reduces database round-trips.
+	// Inputs that are already decorated (PreviousTxScript != nil) are skipped.
+	BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error
 
 	// functions related to Alert System
 
