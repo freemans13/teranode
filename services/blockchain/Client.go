@@ -51,6 +51,8 @@ type Client struct {
 	subscribersMu         sync.Mutex                         // Mutex for subscribers list
 	lastBlockNotification *blockchain_api.Notification       // Last block notification received
 	lastHeartbeat         atomic.Int64                       // Unix nano timestamp of last heartbeat
+	subscriptionReady     chan struct{}                       // Closed when first subscription + FSM state fetch completes
+	subscriptionReadyOnce sync.Once                          // Ensures subscriptionReady is closed exactly once
 }
 
 // BestBlockHeader represents the best block header in the blockchain.
@@ -149,7 +151,8 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 		settings:    tSettings,
 		running:     &running,
 		conn:        baConn,
-		subscribers: make([]clientSubscriber, 0),
+		subscribers:       make([]clientSubscriber, 0),
+		subscriptionReady: make(chan struct{}),
 	}
 
 	// start a subscription to the blockchain service
@@ -213,10 +216,17 @@ func (c *Client) Health(ctx context.Context, checkLiveness bool) (int, string, e
 		return http.StatusOK, "OK", nil
 	}
 
-	// Add readiness checks here. Include dependency checks.
-	// If any dependency is not ready, return http.StatusServiceUnavailable
-	// If all dependencies are ready, return http.StatusOK
-	// A failed dependency check does not imply the service needs restarting
+	// Check subscription readiness — prevents serving stale state before
+	// the first subscription + FSM state fetch completes.
+	if c.subscriptionReady != nil {
+		select {
+		case <-c.subscriptionReady:
+			// ready
+		default:
+			return http.StatusServiceUnavailable, "subscription not yet established", nil
+		}
+	}
+
 	resp, err := c.client.HealthGRPC(ctx, &emptypb.Empty{})
 	if err != nil {
 		return http.StatusFailedDependency, err.Error(), errors.UnwrapGRPC(err)
@@ -1259,6 +1269,12 @@ func (c *Client) SubscribeToServer(ctx context.Context, source string) (chan *bl
 			// Subscription established successfully - fetch current FSM state
 			c.logger.Infof("[Blockchain] Subscription established, fetching current FSM state for %s", source)
 			c.fetchAndRestoreFSMState(ctx, source)
+
+			// Signal that subscription is ready (first successful subscribe + FSM fetch)
+			c.subscriptionReadyOnce.Do(func() {
+				close(c.subscriptionReady)
+				c.logger.Infof("[Blockchain] Subscription ready for %s", source)
+			})
 
 			// Don't initialize heartbeat here - let it remain 0 until first PING is received.
 			// This ensures staleness detection works correctly: if connection breaks before
