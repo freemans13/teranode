@@ -63,6 +63,13 @@ func (s *Server) processBlobDeletionsAtHeight(blockHeight uint32, blockHash chai
 		return
 	}
 
+	// Apply safety window: only delete blobs that are safetyWindow blocks behind the current height
+	safeHeight := blockHeight
+	safetyWindow := s.settings.Pruner.BlobDeletionSafetyWindow
+	if safetyWindow > 0 && blockHeight > safetyWindow {
+		safeHeight = blockHeight - safetyWindow
+	}
+
 	batchSize := s.settings.Pruner.BlobDeletionBatchSize
 	lockTimeout := 300 // 5 minutes - should be plenty for processing
 	maxRetries := s.settings.Pruner.BlobDeletionMaxRetries
@@ -77,7 +84,7 @@ func (s *Server) processBlobDeletionsAtHeight(blockHeight uint32, blockHash chai
 		batchNum++
 
 		// Acquire batch with locking from blockchain service (uses SELECT...FOR UPDATE SKIP LOCKED)
-		batchToken, deletions, err := s.blockchainClient.AcquireBlobDeletionBatch(ctx, blockHeight, int(batchSize), lockTimeout)
+		batchToken, deletions, err := s.blockchainClient.AcquireBlobDeletionBatch(ctx, safeHeight, int(batchSize), lockTimeout)
 		if err != nil {
 			s.logger.Errorf("[pruner][%s:%d] blob deletion: failed to acquire batch %d: %v", blockHashStr, blockHeight, batchNum, err)
 			blobDeletionErrorsTotal.WithLabelValues("acquisition").Inc()

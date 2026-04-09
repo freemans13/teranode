@@ -221,6 +221,18 @@ When enabled, sets Aerospike record TTL to 1 second instead of hard deleting. Th
 
 When enabled, skips scheduled deletion of blob store data (transactions and subtrees) based on Delete-At-Height values.
 
+### pruner_blobDeletionSafetyWindow
+
+**Type**: uint32
+
+**Default**: `10`
+
+**Environment Variable**: `pruner_blobDeletionSafetyWindow`
+
+**Description**: Number of blocks behind the current block height before deleting blobs
+
+Provides a safety margin by only deleting blobs whose delete-at-height is at least this many blocks behind the triggering block height. Prevents deletion of data that might be needed during reorg scenarios.
+
 ### pruner_blobDeletionBatchSize
 
 **Type**: Integer
@@ -862,12 +874,6 @@ pruner_jobTimeout = 20m  # or higher
     ```
 
 3. Verify Block Assembly in RUNNING state
-
-## Removed Settings
-
-### pruner_blobDeletionSafetyWindow (removed)
-
-This setting was removed because the persisted-height safety check it controlled was redundant in both trigger modes. In `OnBlockPersisted` mode the block height already reflects the persisted height, and in `OnBlockMined` mode no block persister is running so the check used stale state from a previous run, causing all blob deletions to be silently skipped. To delay blob deletions, adjust the Delete-At-Height values or the global block height retention setting instead.
 
 ## Related Documentation
 
