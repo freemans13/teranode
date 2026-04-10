@@ -3,6 +3,7 @@ package queue
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -61,6 +62,10 @@ WHERE o.tx_hash = $1 AND o.idx = $2
 // It uses a validation CTE + INSERT for each input and falls back to
 // a diagnostic query when the INSERT returns 0 rows.
 func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	if prometheusDirectSpend != nil {
+		prometheusDirectSpend.Inc()
+	}
+
 	if blockHeight == 0 {
 		return nil, errors.NewProcessingError("blockHeight must be greater than zero")
 	}
@@ -85,6 +90,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		}
 
 		spendingDataBytes := spend.SpendingData.Bytes()
+		inputStart := time.Now()
 
 		// Try the atomic INSERT with validation CTE.
 		var inserted int
@@ -97,6 +103,10 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			useIgnoreLocked,      // $6 ignoreLocked
 			useIgnoreConflicting, // $7 ignoreConflicting
 		).Scan(&inserted)
+
+		if prometheusDirectSpendDuration != nil {
+			prometheusDirectSpendDuration.Observe(time.Since(inputStart).Seconds())
+		}
 
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			// Unexpected DB error
@@ -124,6 +134,9 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		var errSpent *errors.UtxoSpentErrData
 		if errors.AsData(diagErr, &errSpent) {
 			spends[idx].ConflictingTxID = errSpent.SpendingData.TxID
+			if prometheusDirectConflicts != nil {
+				prometheusDirectConflicts.Inc()
+			}
 		}
 	}
 

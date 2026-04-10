@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -17,6 +18,13 @@ const minedChunkSize = 500
 // UnsetMined path (reorg): DELETE from block_ids for the given blockID.
 // Returns a map of each hash to its list of block_ids.
 func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	startTime := time.Now()
+	defer func() {
+		if prometheusDirectMinedDuration != nil {
+			prometheusDirectMinedDuration.Observe(time.Since(startTime).Seconds())
+		}
+	}()
+
 	if len(hashes) == 0 {
 		return make(map[chainhash.Hash][]uint32), nil
 	}

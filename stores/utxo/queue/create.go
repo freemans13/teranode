@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -22,6 +23,16 @@ const megaTxThreshold = 100
 // Create stores a new transaction's outputs as UTXOs using direct INSERTs
 // into the v4 snapshot tables within a single pgx transaction.
 func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+	startTime := time.Now()
+	defer func() {
+		if prometheusDirectCreate != nil {
+			prometheusDirectCreate.Inc()
+		}
+		if prometheusDirectCreateDuration != nil {
+			prometheusDirectCreateDuration.Observe(time.Since(startTime).Seconds())
+		}
+	}()
+
 	options := &utxo.CreateOptions{}
 	for _, opt := range opts {
 		opt(options)

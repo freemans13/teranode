@@ -59,6 +59,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, err
 	}
 
+	initPrometheusMetrics()
+
 	s := &Store{
 		logger:   logger,
 		settings: tSettings,

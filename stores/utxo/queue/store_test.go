@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -1181,6 +1182,275 @@ func TestSetMinedMultiEmpty(t *testing.T) {
 	result, err := store.SetMinedMulti(context.Background(), nil, utxo.MinedBlockInfo{})
 	require.NoError(t, err)
 	require.Empty(t, result)
+}
+
+// ---------------------------------------------------------------------------
+// Task 9 tests: Iterators
+// ---------------------------------------------------------------------------
+
+func TestGetUnminedTxIterator(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// Create an unmined transaction.
+	tx := testExtendedTx(t)
+	blockHeight := uint32(50)
+	_, err := store.Create(ctx, tx, blockHeight)
+	require.NoError(t, err)
+
+	// Get the iterator.
+	iter, err := store.GetUnminedTxIterator(false)
+	require.NoError(t, err)
+	require.NotNil(t, iter)
+	defer iter.Close()
+
+	batch, err := iter.Next(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, batch, "should find at least one unmined tx")
+
+	found := false
+	txHash := tx.TxIDChainHash()
+	for _, unmined := range batch {
+		if unmined.Skip {
+			continue
+		}
+		if unmined.Node != nil && unmined.Node.Hash == *txHash {
+			found = true
+			require.Equal(t, int(blockHeight), unmined.UnminedSince)
+			require.False(t, unmined.Locked)
+			require.NotNil(t, unmined.TxInpoints)
+		}
+	}
+	require.True(t, found, "should find the created unmined tx in iterator")
+
+	// Next batch should be empty.
+	batch2, err := iter.Next(ctx)
+	require.NoError(t, err)
+	require.Nil(t, batch2, "no more unmined txs expected")
+}
+
+func TestGetPrunableUnminedTxIterator(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// Create an unmined transaction at height 10.
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 10)
+	require.NoError(t, err)
+
+	// Cutoff 5 -- too low, should not find the tx.
+	iter, err := store.GetPrunableUnminedTxIterator(5)
+	require.NoError(t, err)
+	defer iter.Close()
+	batch, err := iter.Next(ctx)
+	require.NoError(t, err)
+	require.Nil(t, batch, "should not find tx with cutoff < unmined_since")
+
+	// Cutoff 10 -- should find the tx.
+	iter2, err := store.GetPrunableUnminedTxIterator(10)
+	require.NoError(t, err)
+	defer iter2.Close()
+	batch2, err := iter2.Next(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, batch2, "should find tx with cutoff >= unmined_since")
+}
+
+func TestQueryOldUnminedTransactions(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// Create an unmined transaction at height 20.
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 20)
+	require.NoError(t, err)
+
+	// Query with cutoff 19 -- should not find.
+	hashes, err := store.QueryOldUnminedTransactions(ctx, 19)
+	require.NoError(t, err)
+	require.Empty(t, hashes)
+
+	// Query with cutoff 20 -- should find.
+	hashes, err = store.QueryOldUnminedTransactions(ctx, 20)
+	require.NoError(t, err)
+	require.Len(t, hashes, 1)
+	require.Equal(t, *tx.TxIDChainHash(), hashes[0])
+}
+
+// ---------------------------------------------------------------------------
+// Task 10 tests: Alert System
+// ---------------------------------------------------------------------------
+
+func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// Create an unmined transaction.
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	// Build a spend for the first output.
+	utxoHash, err := util.UTXOHashFromOutput(txHash, tx.Outputs[0], 0)
+	require.NoError(t, err)
+
+	spends := []*utxo.Spend{
+		{TxID: txHash, Vout: 0, UTXOHash: utxoHash},
+	}
+
+	// Freeze.
+	err = store.FreezeUTXOs(ctx, spends, nil)
+	require.NoError(t, err)
+
+	// Verify frozen.
+	var frozen bool
+	err = store.pool.QueryRow(ctx, `SELECT frozen FROM outputs WHERE tx_hash = $1 AND idx = 0`, txHash[:]).Scan(&frozen)
+	require.NoError(t, err)
+	require.True(t, frozen)
+
+	// Double-freeze should error.
+	err = store.FreezeUTXOs(ctx, spends, nil)
+	require.Error(t, err)
+
+	// Unfreeze.
+	err = store.UnFreezeUTXOs(ctx, spends, nil)
+	require.NoError(t, err)
+
+	// Verify unfrozen.
+	err = store.pool.QueryRow(ctx, `SELECT frozen FROM outputs WHERE tx_hash = $1 AND idx = 0`, txHash[:]).Scan(&frozen)
+	require.NoError(t, err)
+	require.False(t, frozen)
+
+	// Double-unfreeze should error.
+	err = store.UnFreezeUTXOs(ctx, spends, nil)
+	require.Error(t, err)
+}
+
+func TestReAssignUTXO(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// Create an unmined transaction.
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	require.NoError(t, store.SetBlockHeight(200))
+
+	txHash := tx.TxIDChainHash()
+
+	utxoHash, err := util.UTXOHashFromOutput(txHash, tx.Outputs[0], 0)
+	require.NoError(t, err)
+
+	sourceSpend := &utxo.Spend{TxID: txHash, Vout: 0, UTXOHash: utxoHash}
+
+	// Must freeze first.
+	err = store.FreezeUTXOs(ctx, []*utxo.Spend{sourceSpend}, nil)
+	require.NoError(t, err)
+
+	// Reassign.
+	newHash := chainhash.HashH([]byte("new-utxo-hash"))
+	newSpend := &utxo.Spend{UTXOHash: &newHash}
+	err = store.ReAssignUTXO(ctx, sourceSpend, newSpend, nil)
+	require.NoError(t, err)
+
+	// Verify: frozen should be false, utxo_hash should be updated.
+	var outputFrozen bool
+	var storedUtxoHash []byte
+	err = store.pool.QueryRow(ctx,
+		`SELECT frozen, utxo_hash FROM outputs WHERE tx_hash = $1 AND idx = 0`,
+		txHash[:]).Scan(&outputFrozen, &storedUtxoHash)
+	require.NoError(t, err)
+	require.False(t, outputFrozen, "should be unfrozen after reassign")
+	require.Equal(t, newHash[:], storedUtxoHash)
+}
+
+// ---------------------------------------------------------------------------
+// Task 11 tests: Preservation + Pruner
+// ---------------------------------------------------------------------------
+
+func TestPreserveTransactions(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	txHash := *tx.TxIDChainHash()
+
+	// Preserve until height 500.
+	err = store.PreserveTransactions(ctx, []chainhash.Hash{txHash}, 500)
+	require.NoError(t, err)
+
+	// Verify.
+	var preserveUntil *int64
+	var dah *int64
+	err = store.pool.QueryRow(ctx,
+		`SELECT preserve_until, delete_at_height FROM tx_state WHERE tx_hash = $1`,
+		txHash[:]).Scan(&preserveUntil, &dah)
+	require.NoError(t, err)
+	require.NotNil(t, preserveUntil)
+	require.Equal(t, int64(500), *preserveUntil)
+	require.Nil(t, dah, "delete_at_height should be cleared")
+}
+
+func TestProcessExpiredPreservations(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	txHash := *tx.TxIDChainHash()
+
+	// Preserve until height 50.
+	err = store.PreserveTransactions(ctx, []chainhash.Hash{txHash}, 50)
+	require.NoError(t, err)
+
+	// Process at height 100 -- should expire the preservation.
+	err = store.ProcessExpiredPreservations(ctx, 100)
+	require.NoError(t, err)
+
+	// Verify: preserve_until should be nil, delete_at_height should be set.
+	var preserveUntil *int64
+	var dah *int64
+	err = store.pool.QueryRow(ctx,
+		`SELECT preserve_until, delete_at_height FROM tx_state WHERE tx_hash = $1`,
+		txHash[:]).Scan(&preserveUntil, &dah)
+	require.NoError(t, err)
+	require.Nil(t, preserveUntil, "preserve_until should be cleared")
+	require.NotNil(t, dah, "delete_at_height should be set")
+}
+
+func TestPrunerService(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// Create a tx and set delete_at_height.
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	// Set delete_at_height = 50.
+	_, err = store.pool.Exec(ctx,
+		`UPDATE tx_state SET delete_at_height = 50 WHERE tx_hash = $1`,
+		txHash[:])
+	require.NoError(t, err)
+
+	// Get pruner service.
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+	require.NotNil(t, svc)
+
+	svc.Start(ctx)
+
+	// Prune at height 50 should delete the tx.
+	count, err := svc.Prune(ctx, 50, "test-hash")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+
+	// Verify the tx is gone.
+	var txCount int
+	err = store.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM transactions WHERE hash = $1`, txHash[:]).Scan(&txCount)
+	require.NoError(t, err)
+	require.Equal(t, 0, txCount, "transaction should be deleted by pruner")
 }
 
 // Ensure unused imports are used.
