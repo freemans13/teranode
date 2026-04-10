@@ -2,11 +2,13 @@ package queue
 
 import (
 	"context"
+	"math/rand"
 	"net/url"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -437,3 +439,386 @@ func TestGetWithUtxos(t *testing.T) {
 		require.Nil(t, sd, "output %d should be unspent (nil spending data)", i)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Test helpers for Spend + Conflicting tests
+// ---------------------------------------------------------------------------
+
+// getSpendingTx creates a transaction that spends the given output indices from parentTx.
+// Each input gets a dummy unlocking script so the tx can be stored via Create.
+func getSpendingTx(t *testing.T, parentTx *bt.Tx, vOut ...uint32) *bt.Tx {
+	t.Helper()
+	newTx := bt.NewTx()
+
+	for _, outIdx := range vOut {
+		err := newTx.From(
+			parentTx.TxIDChainHash().String(),
+			outIdx,
+			parentTx.Outputs[outIdx].LockingScript.String(),
+			parentTx.Outputs[outIdx].Satoshis,
+		)
+		require.NoError(t, err)
+	}
+
+	//nolint:gosec
+	_ = newTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", rand.Uint64()%1000+1)
+	//nolint:gosec
+	_ = newTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", rand.Uint64()%1000+1)
+	_ = newTx.ChangeToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", &bt.FeeQuote{})
+
+	// Ensure each input has a non-nil unlocking script for the NOT NULL constraint.
+	for _, input := range newTx.Inputs {
+		if input.UnlockingScript == nil || len(*input.UnlockingScript) == 0 {
+			input.UnlockingScript = bscript.NewFromBytes([]byte{0x30, 0x44})
+		}
+	}
+
+	return newTx
+}
+
+// ---------------------------------------------------------------------------
+// Task 5 + 6 tests
+// ---------------------------------------------------------------------------
+
+func TestSpendOutput(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create the parent transaction.
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	// Build a spending transaction that spends output 0 of the parent.
+	spendTx := getSpendingTx(t, parentTx, 0)
+
+	// Spend should succeed.
+	spends, err := store.Spend(ctx, spendTx, blockHeight+1)
+	require.NoError(t, err)
+	require.Len(t, spends, 1, "spending tx has 1 input, so 1 spend")
+
+	// Verify the output is now spent via Get with Utxos field.
+	parentHash := parentTx.TxIDChainHash()
+	got, err := store.Get(ctx, parentHash, fields.Utxos, fields.Tx)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NotNil(t, got.SpendingDatas, "should have SpendingDatas slice")
+
+	// Output 0 should be spent.
+	require.NotNil(t, got.SpendingDatas[0], "output 0 should be spent")
+	require.Equal(t, spendTx.TxIDChainHash().String(), got.SpendingDatas[0].TxID.String())
+	require.Equal(t, 0, got.SpendingDatas[0].Vin)
+
+	// Other outputs should still be unspent.
+	for i := 1; i < len(got.SpendingDatas); i++ {
+		require.Nil(t, got.SpendingDatas[i], "output %d should still be unspent", i)
+	}
+}
+
+func TestDoubleSpend(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create the parent transaction.
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	// Build two competing spending transactions, both spending output 0.
+	spendTxA := getSpendingTx(t, parentTx, 0)
+	spendTxB := getSpendingTx(t, parentTx, 0)
+
+	// First spend should succeed.
+	_, err = store.Spend(ctx, spendTxA, blockHeight+1)
+	require.NoError(t, err)
+
+	// Second spend should fail with ErrSpent.
+	spends, err := store.Spend(ctx, spendTxB, blockHeight+1)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrSpent), "should return ErrSpent, got: %v", err)
+	require.NotEmpty(t, spends)
+	require.NotNil(t, spends[0].ConflictingTxID, "should have ConflictingTxID set")
+	require.Equal(t, spendTxA.TxIDChainHash().String(), spends[0].ConflictingTxID.String(),
+		"ConflictingTxID should be the first spending tx")
+}
+
+func TestSpendIdempotent(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	spendTx := getSpendingTx(t, parentTx, 0)
+
+	// First spend.
+	_, err = store.Spend(ctx, spendTx, blockHeight+1)
+	require.NoError(t, err)
+
+	// Same spend again should be idempotent (no error, same spending data).
+	_, err = store.Spend(ctx, spendTx, blockHeight+1)
+	require.NoError(t, err)
+}
+
+func TestSpendNotFound(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	blockHeight := uint32(100)
+
+	err := store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	// Build a spending tx that references a non-existent parent.
+	fakeTx := bt.NewTx()
+	fakeHash, err := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000099")
+	require.NoError(t, err)
+	_ = fakeTx.From(fakeHash.String(), 0, "76a91488ac", 5000)
+	_ = fakeTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+
+	_, err = store.Spend(ctx, fakeTx, blockHeight+1)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "should return ErrTxNotFound, got: %v", err)
+}
+
+func TestSpendFrozenTx(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, parentTx, blockHeight, utxo.WithFrozen(true))
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	spendTx := getSpendingTx(t, parentTx, 0)
+
+	_, err = store.Spend(ctx, spendTx, blockHeight+1)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrFrozen), "should return ErrFrozen, got: %v", err)
+}
+
+func TestSpendLockedTx(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, parentTx, blockHeight, utxo.WithLocked(true))
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	spendTx := getSpendingTx(t, parentTx, 0)
+
+	// Without ignore flag: should fail with ErrLocked.
+	_, err = store.Spend(ctx, spendTx, blockHeight+1)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxLocked), "should return ErrLocked, got: %v", err)
+
+	// With IgnoreLocked: should succeed.
+	_, err = store.Spend(ctx, spendTx, blockHeight+1, utxo.IgnoreFlags{IgnoreLocked: true})
+	require.NoError(t, err)
+}
+
+func TestSpendConflictingTx(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, parentTx, blockHeight, utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	spendTx := getSpendingTx(t, parentTx, 0)
+
+	// Without ignore flag: should fail with ErrTxConflicting.
+	_, err = store.Spend(ctx, spendTx, blockHeight+1)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxConflicting), "should return ErrTxConflicting, got: %v", err)
+
+	// With IgnoreConflicting: should succeed.
+	_, err = store.Spend(ctx, spendTx, blockHeight+1, utxo.IgnoreFlags{IgnoreConflicting: true})
+	require.NoError(t, err)
+}
+
+func TestSetLocked(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create with locked=true.
+	_, err := store.Create(ctx, parentTx, blockHeight, utxo.WithLocked(true))
+	require.NoError(t, err)
+
+	txHash := parentTx.TxIDChainHash()
+
+	// Verify locked=true.
+	got, err := store.Get(ctx, txHash, fields.Locked)
+	require.NoError(t, err)
+	require.True(t, got.Locked, "should be locked")
+
+	// SetLocked(false).
+	err = store.SetLocked(ctx, []chainhash.Hash{*txHash}, false)
+	require.NoError(t, err)
+
+	// Verify locked=false.
+	got, err = store.Get(ctx, txHash, fields.Locked)
+	require.NoError(t, err)
+	require.False(t, got.Locked, "should be unlocked after SetLocked(false)")
+
+	// SetLocked(true) again.
+	err = store.SetLocked(ctx, []chainhash.Hash{*txHash}, true)
+	require.NoError(t, err)
+
+	got, err = store.Get(ctx, txHash, fields.Locked)
+	require.NoError(t, err)
+	require.True(t, got.Locked, "should be locked again")
+}
+
+func TestSetConflicting(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := parentTx.TxIDChainHash()
+
+	// Initially not conflicting.
+	got, err := store.Get(ctx, txHash, fields.Conflicting)
+	require.NoError(t, err)
+	require.False(t, got.Conflicting, "should not be conflicting initially")
+
+	// Set conflicting=true.
+	affectedSpends, childTxHashes, err := store.SetConflicting(ctx, []chainhash.Hash{*txHash}, true)
+	require.NoError(t, err)
+	// Parent spends = inputs of the conflicting tx (1 input).
+	require.Len(t, affectedSpends, 1, "should have 1 affected parent spend")
+	// No child spends since outputs are unspent.
+	require.Empty(t, childTxHashes, "no spending children expected")
+
+	// Verify conflicting=true.
+	got, err = store.Get(ctx, txHash, fields.Conflicting)
+	require.NoError(t, err)
+	require.True(t, got.Conflicting, "should be conflicting after SetConflicting(true)")
+
+	// Set conflicting=false.
+	_, _, err = store.SetConflicting(ctx, []chainhash.Hash{*txHash}, false)
+	require.NoError(t, err)
+
+	got, err = store.Get(ctx, txHash, fields.Conflicting)
+	require.NoError(t, err)
+	require.False(t, got.Conflicting, "should not be conflicting after SetConflicting(false)")
+}
+
+func TestMarkTransactionsOnLongestChain(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create as unmined.
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := parentTx.TxIDChainHash()
+
+	// Verify unmined_since is set.
+	got, err := store.Get(ctx, txHash)
+	require.NoError(t, err)
+	require.Equal(t, blockHeight, got.UnminedSince, "should be unmined")
+
+	// Mark on longest chain (mined).
+	err = store.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*txHash}, true)
+	require.NoError(t, err)
+
+	got, err = store.Get(ctx, txHash)
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), got.UnminedSince, "should be mined (unmined_since=0)")
+
+	// Mark off longest chain (unmined again).
+	err = store.SetBlockHeight(200)
+	require.NoError(t, err)
+	err = store.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*txHash}, false)
+	require.NoError(t, err)
+
+	got, err = store.Get(ctx, txHash)
+	require.NoError(t, err)
+	require.Equal(t, uint32(200), got.UnminedSince, "should be unmined again at current block height")
+}
+
+func TestSetConflictingWithSpendingChildren(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create parent tx.
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	// Create and execute a spending tx that spends output 0.
+	spendTx := getSpendingTx(t, parentTx, 0)
+	_, err = store.Create(ctx, spendTx, blockHeight)
+	require.NoError(t, err)
+	_, err = store.Spend(ctx, spendTx, blockHeight+1)
+	require.NoError(t, err)
+
+	txHash := parentTx.TxIDChainHash()
+
+	// Set parent as conflicting -- should return the spending child.
+	_, childTxHashes, err := store.SetConflicting(ctx, []chainhash.Hash{*txHash}, true)
+	require.NoError(t, err)
+	require.Len(t, childTxHashes, 1, "should have 1 spending child tx")
+	require.Equal(t, spendTx.TxIDChainHash().String(), childTxHashes[0].String())
+}
+
+func TestUnspend(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	spendTx := getSpendingTx(t, parentTx, 0)
+
+	spends, err := store.Spend(ctx, spendTx, blockHeight+1)
+	require.NoError(t, err)
+
+	// Verify spent.
+	parentHash := parentTx.TxIDChainHash()
+	got, err := store.Get(ctx, parentHash, fields.Utxos)
+	require.NoError(t, err)
+	require.NotNil(t, got.SpendingDatas[0], "output 0 should be spent")
+
+	// Unspend.
+	err = store.Unspend(ctx, spends)
+	require.NoError(t, err)
+
+	// Verify unspent.
+	got, err = store.Get(ctx, parentHash, fields.Utxos)
+	require.NoError(t, err)
+	require.Nil(t, got.SpendingDatas[0], "output 0 should be unspent after Unspend")
+}
+
+// Ensure unused imports are used.
+var _ = meta.Data{}
+var _ = rand.Uint64

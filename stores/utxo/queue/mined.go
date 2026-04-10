@@ -14,8 +14,4 @@ func (s *Store) SetMinedMulti(_ context.Context, _ []*chainhash.Hash, _ utxo.Min
 	return nil, errors.NewProcessingError("not implemented")
 }
 
-// MarkTransactionsOnLongestChain updates unmined_since for transactions based on chain status.
-// TODO: implement in Task 7.
-func (s *Store) MarkTransactionsOnLongestChain(_ context.Context, _ []chainhash.Hash, _ bool) error {
-	return errors.NewProcessingError("not implemented")
-}
+// MarkTransactionsOnLongestChain is implemented in conflicting.go.
