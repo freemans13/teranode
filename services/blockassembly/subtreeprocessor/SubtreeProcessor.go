@@ -1119,6 +1119,21 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		}
 	}
 
+	// Clear processed_at for all moveBack blocks concurrently — these blocks are
+	// being "un-processed" during the reset so their timestamps must be removed.
+	if len(moveBackBlocks) > 0 {
+		g, gCtx := errgroup.WithContext(ctx)
+		for _, block := range moveBackBlocks {
+			g.Go(func() error {
+				if err := stp.blockchainClient.SetBlockProcessedAt(gCtx, block.Header.Hash(), true); err != nil {
+					stp.logger.Warnf("[SubtreeProcessor][Reset] error clearing block processed_at for %s: %v", block.String(), err)
+				}
+				return nil // non-critical, don't fail reset
+			})
+		}
+		_ = g.Wait()
+	}
+
 	// optimized version for legacy sync
 	if isLegacySync {
 		coinbaseTxsAdded := sync.Map{}
