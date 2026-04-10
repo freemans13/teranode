@@ -154,6 +154,8 @@ const blockIDsDDL = `
 CREATE TABLE IF NOT EXISTS block_ids (
     tx_hash      BYTEA  NOT NULL,
     block_id     BIGINT NOT NULL,
+    block_height BIGINT NOT NULL,
+    subtree_idx  BIGINT NOT NULL,
     PRIMARY KEY (tx_hash, block_id)
 ) PARTITION BY HASH (tx_hash);`
 
