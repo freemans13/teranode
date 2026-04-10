@@ -819,6 +819,370 @@ func TestUnspend(t *testing.T) {
 	require.Nil(t, got.SpendingDatas[0], "output 0 should be unspent after Unspend")
 }
 
+// ---------------------------------------------------------------------------
+// Task 7 + 8 tests
+// ---------------------------------------------------------------------------
+
+func TestSetMinedMulti(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create as unmined.
+	_, err := store.Create(ctx, tx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	// Verify unmined_since is set (not mined).
+	got, err := store.Get(ctx, txHash)
+	require.NoError(t, err)
+	require.Equal(t, blockHeight, got.UnminedSince, "should be unmined initially")
+	require.Empty(t, got.BlockIDs, "should have no block_ids initially")
+
+	// SetMinedMulti: mine the tx into block 42 on longest chain.
+	info := utxo.MinedBlockInfo{
+		BlockID:        42,
+		BlockHeight:    100,
+		SubtreeIdx:     7,
+		OnLongestChain: true,
+	}
+	result, err := store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info)
+	require.NoError(t, err)
+	require.Contains(t, result, *txHash)
+	require.Equal(t, []uint32{42}, result[*txHash])
+
+	// Verify locked=false and unmined_since=0 after mining.
+	got, err = store.Get(ctx, txHash, fields.Locked, fields.BlockIDs)
+	require.NoError(t, err)
+	require.False(t, got.Locked, "should be unlocked after mining")
+	require.Equal(t, uint32(0), got.UnminedSince, "should be mined (unmined_since=0)")
+	require.Equal(t, []uint32{42}, got.BlockIDs)
+}
+
+func TestSetMinedMultiIdempotent(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, tx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	info := utxo.MinedBlockInfo{
+		BlockID:        42,
+		BlockHeight:    100,
+		SubtreeIdx:     7,
+		OnLongestChain: true,
+	}
+
+	// First call.
+	result1, err := store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, result1[*txHash])
+
+	// Second call (idempotent).
+	result2, err := store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, result2[*txHash])
+}
+
+func TestSetMinedMultiMultipleBlocks(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, tx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	// Mine into block 42.
+	info1 := utxo.MinedBlockInfo{
+		BlockID:        42,
+		BlockHeight:    100,
+		SubtreeIdx:     7,
+		OnLongestChain: true,
+	}
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info1)
+	require.NoError(t, err)
+
+	// Mine into block 43 (competing block).
+	info2 := utxo.MinedBlockInfo{
+		BlockID:        43,
+		BlockHeight:    100,
+		SubtreeIdx:     3,
+		OnLongestChain: false,
+	}
+	result, err := store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info2)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42, 43}, result[*txHash], "should have both block IDs sorted")
+}
+
+func TestSetMinedMultiNotOnLongestChain(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, tx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	// Mine not on longest chain: should NOT clear unmined_since.
+	info := utxo.MinedBlockInfo{
+		BlockID:        42,
+		BlockHeight:    100,
+		SubtreeIdx:     7,
+		OnLongestChain: false,
+	}
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info)
+	require.NoError(t, err)
+
+	got, err := store.Get(ctx, txHash)
+	require.NoError(t, err)
+	require.False(t, got.Locked, "should be unlocked")
+	require.Equal(t, blockHeight, got.UnminedSince, "unmined_since should NOT be cleared when not on longest chain")
+}
+
+func TestUnsetMined(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create and mine tx.
+	_, err := store.Create(ctx, tx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	info := utxo.MinedBlockInfo{
+		BlockID:        42,
+		BlockHeight:    100,
+		SubtreeIdx:     7,
+		OnLongestChain: true,
+	}
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info)
+	require.NoError(t, err)
+
+	// Verify mined.
+	got, err := store.Get(ctx, txHash, fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, got.BlockIDs)
+	require.Equal(t, uint32(0), got.UnminedSince)
+
+	// Unset mined (reorg).
+	err = store.SetBlockHeight(150)
+	require.NoError(t, err)
+
+	unsetInfo := utxo.MinedBlockInfo{
+		BlockID:    42,
+		UnsetMined: true,
+	}
+	result, err := store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, unsetInfo)
+	require.NoError(t, err)
+	require.Empty(t, result[*txHash], "should have no block_ids after unset")
+
+	// Verify unmined_since is set after all block_ids removed.
+	got, err = store.Get(ctx, txHash)
+	require.NoError(t, err)
+	require.Equal(t, uint32(150), got.UnminedSince, "should be unmined at current block height")
+}
+
+func TestUnsetMinedPartial(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	_, err := store.Create(ctx, tx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	// Mine into two blocks.
+	info1 := utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 100, SubtreeIdx: 7, OnLongestChain: true}
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info1)
+	require.NoError(t, err)
+
+	info2 := utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 100, SubtreeIdx: 3, OnLongestChain: true}
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info2)
+	require.NoError(t, err)
+
+	// Unset only block 42 -- should still have block 43.
+	unsetInfo := utxo.MinedBlockInfo{BlockID: 42, UnsetMined: true}
+	result, err := store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, unsetInfo)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{43}, result[*txHash], "should have only block 43")
+
+	// unmined_since should NOT be set because block_ids remain.
+	got, err := store.Get(ctx, txHash)
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), got.UnminedSince, "should still be mined since block_ids remain")
+}
+
+func TestDelete(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create tx.
+	_, err := store.Create(ctx, tx, blockHeight)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	// Verify it exists.
+	got, err := store.Get(ctx, txHash)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	// Delete it.
+	err = store.Delete(ctx, txHash)
+	require.NoError(t, err)
+
+	// Verify Get returns ErrTxNotFound.
+	got, err = store.Get(ctx, txHash)
+	require.Error(t, err)
+	require.Nil(t, got)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "should return ErrTxNotFound, got: %v", err)
+}
+
+func TestDeleteWithBlockIDs(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create as mined.
+	blockInfo := utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 100, SubtreeIdx: 7}
+	_, err := store.Create(ctx, tx, blockHeight, utxo.WithMinedBlockInfo(blockInfo))
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	// Delete.
+	err = store.Delete(ctx, txHash)
+	require.NoError(t, err)
+
+	// Verify deleted.
+	_, err = store.Get(ctx, txHash)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+
+	// Verify block_ids are also cleaned up.
+	var count int
+	err = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM block_ids WHERE tx_hash = $1`, txHash[:]).Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 0, count, "block_ids should be deleted")
+}
+
+func TestDeleteWithSpends(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Create parent and spend output 0.
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	spendTx := getSpendingTx(t, parentTx, 0)
+	_, err = store.Spend(ctx, spendTx, blockHeight+1)
+	require.NoError(t, err)
+
+	parentHash := parentTx.TxIDChainHash()
+
+	// Delete the parent: should also remove its spends.
+	err = store.Delete(ctx, parentHash)
+	require.NoError(t, err)
+
+	_, err = store.Get(ctx, parentHash)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+
+	// Verify spends are cleaned up.
+	var count int
+	err = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM spends WHERE prev_tx_hash = $1`, parentHash[:]).Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 0, count, "spends should be deleted")
+}
+
+func TestDeleteNonExistent(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	fakeHash, err := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
+	require.NoError(t, err)
+
+	// Deleting a non-existent tx should not error (no rows affected).
+	err = store.Delete(ctx, fakeHash)
+	require.NoError(t, err)
+}
+
+func TestSetDAH(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	parentTx := testExtendedTx(t)
+	blockHeight := uint32(100)
+
+	// Set retention so DAH logic is active.
+	store.settings.GlobalBlockHeightRetention = 10
+
+	// Create as mined on longest chain.
+	blockInfo := utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 100, SubtreeIdx: 7, OnLongestChain: true}
+	_, err := store.Create(ctx, parentTx, blockHeight, utxo.WithMinedBlockInfo(blockInfo))
+	require.NoError(t, err)
+
+	err = store.SetBlockHeight(blockHeight)
+	require.NoError(t, err)
+
+	txHash := parentTx.TxIDChainHash()
+
+	// Mark as mined on longest chain via SetMinedMulti.
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, blockInfo)
+	require.NoError(t, err)
+
+	// Outputs are unspent, so DAH should NOT be set.
+	err = store.setDAH(ctx, txHash)
+	require.NoError(t, err)
+
+	var dah *int64
+	err = store.pool.QueryRow(ctx, `SELECT delete_at_height FROM tx_state WHERE tx_hash = $1`, txHash[:]).Scan(&dah)
+	require.NoError(t, err)
+	require.Nil(t, dah, "DAH should not be set while outputs are unspent")
+
+	// Spend all non-nil outputs.
+	for i, output := range parentTx.Outputs {
+		if output == nil {
+			continue
+		}
+		spendTx := getSpendingTx(t, parentTx, uint32(i))
+		_, err = store.Create(ctx, spendTx, blockHeight)
+		require.NoError(t, err)
+		_, err = store.Spend(ctx, spendTx, blockHeight+1)
+		require.NoError(t, err)
+	}
+
+	// Now setDAH: all outputs are spent, has block_ids, on longest chain.
+	err = store.setDAH(ctx, txHash)
+	require.NoError(t, err)
+
+	err = store.pool.QueryRow(ctx, `SELECT delete_at_height FROM tx_state WHERE tx_hash = $1`, txHash[:]).Scan(&dah)
+	require.NoError(t, err)
+	require.NotNil(t, dah, "DAH should be set when all outputs are spent")
+	expectedDAH := int64(blockHeight + 1 + 10) // blockHeight + 1 + retention
+	require.Equal(t, expectedDAH, *dah, "DAH should be blockHeight+1+retention")
+}
+
+func TestSetMinedMultiEmpty(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	// Empty hashes should return empty map.
+	result, err := store.SetMinedMulti(context.Background(), nil, utxo.MinedBlockInfo{})
+	require.NoError(t, err)
+	require.Empty(t, result)
+}
+
 // Ensure unused imports are used.
 var _ = meta.Data{}
 var _ = rand.Uint64
