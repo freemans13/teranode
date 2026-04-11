@@ -24,8 +24,8 @@ func (s *Store) GetConflictingChildren(ctx context.Context, hash chainhash.Hash)
 }
 
 // SetConflicting marks transactions as conflicting or not conflicting.
-// It updates utxos.conflicting and utxos.delete_at_height, appends to the
-// conflicting_children array on parent utxos, and returns affected parent spends
+// It updates txs.conflicting and txs.delete_at_height, appends to the
+// conflicting_children array on parent txs, and returns affected parent spends
 // and spending child tx hashes.
 func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, setValue bool) ([]*utxo.Spend, []chainhash.Hash, error) {
 	if len(txHashes) == 0 {
@@ -51,11 +51,11 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			return nil, nil, err
 		}
 
-		// Update utxos: set conflicting flag + delete_at_height.
+		// Update txs: set conflicting flag + delete_at_height.
 		if setValue {
 			// When setting conflicting=true: set DAH only if not already set.
 			_, err = s.pool.Exec(ctx, `
-				UPDATE utxos SET
+				UPDATE txs SET
 				  conflicting = $2,
 				  delete_at_height = COALESCE(delete_at_height, $3)
 				WHERE hash = $1`,
@@ -64,7 +64,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		} else {
 			// When clearing conflicting: clear DAH.
 			_, err = s.pool.Exec(ctx, `
-				UPDATE utxos SET
+				UPDATE txs SET
 				  conflicting = $2,
 				  delete_at_height = $3
 				WHERE hash = $1`,
@@ -75,7 +75,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", txHash, err)
 		}
 
-		// Append this tx as a conflicting child of each parent (array on utxos).
+		// Append this tx as a conflicting child of each parent (array on txs).
 		if txMeta.Tx != nil {
 			seen := make(map[chainhash.Hash]struct{}, len(txMeta.Tx.Inputs))
 			for _, input := range txMeta.Tx.Inputs {
@@ -86,7 +86,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 				seen[parentHash] = struct{}{}
 
 				_, insertErr := s.pool.Exec(ctx, `
-					UPDATE utxos SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
+					UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
 					WHERE hash = $1`,
 					parentHash[:], [][]byte{txHash[:]},
 				)
@@ -113,24 +113,38 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			}
 		}
 
-		// Find spending child transactions by scanning the spending_data array.
+		// Find spending child transactions by querying the spends table directly.
 		if txMeta.Tx != nil {
-			var spendingDataArr [][]byte
-			scanErr := s.pool.QueryRow(ctx, `SELECT spending_data FROM utxos WHERE hash = $1`, txHash[:]).Scan(&spendingDataArr)
-			if scanErr != nil {
-				return nil, nil, scanErr
+			rows, queryErr := s.pool.Query(ctx, `
+				SELECT sp.spending_data
+				FROM spends sp
+				WHERE sp.prev_tx_hash = $1`,
+				txHash[:],
+			)
+			if queryErr != nil {
+				return nil, nil, queryErr
 			}
 
-			for _, sdBytes := range spendingDataArr {
-				if len(sdBytes) >= 32 {
-					sd, parseErr := spendpkg.NewSpendingDataFromBytes(sdBytes)
+			for rows.Next() {
+				var spendingDataBytes []byte
+				if scanErr := rows.Scan(&spendingDataBytes); scanErr != nil {
+					rows.Close()
+					return nil, nil, scanErr
+				}
+				if len(spendingDataBytes) >= 32 {
+					sd, parseErr := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
 					if parseErr != nil {
+						rows.Close()
 						return nil, nil, parseErr
 					}
 					if sd.TxID != nil {
 						spendingTxHashes = append(spendingTxHashes, *sd.TxID)
 					}
 				}
+			}
+			rows.Close()
+			if rowsErr := rows.Err(); rowsErr != nil {
+				return nil, nil, rowsErr
 			}
 		}
 	}
@@ -166,13 +180,13 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 
 		if setValue {
 			inClause, args := buildINClauseLocal(hashBytes, 1)
-			q := fmt.Sprintf(`UPDATE utxos SET locked = true, delete_at_height = NULL WHERE hash IN %s`, inClause)
+			q := fmt.Sprintf(`UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s`, inClause)
 			if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 				return errors.NewStorageError("failed to set locked flag", err)
 			}
 		} else {
 			inClause, args := buildINClauseLocal(hashBytes, 1)
-			q := fmt.Sprintf(`UPDATE utxos SET locked = false WHERE hash IN %s`, inClause)
+			q := fmt.Sprintf(`UPDATE txs SET locked = false WHERE hash IN %s`, inClause)
 			if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 				return errors.NewStorageError("failed to clear locked flag", err)
 			}
@@ -220,11 +234,11 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 		if onLongestChain {
 			inClause, inArgs := buildINClauseLocal(chunk, 1)
-			q = fmt.Sprintf(`UPDATE utxos SET unmined_since = NULL WHERE hash IN %s`, inClause)
+			q = fmt.Sprintf(`UPDATE txs SET unmined_since = NULL WHERE hash IN %s`, inClause)
 			args = inArgs
 		} else {
 			inClause, inArgs := buildINClauseLocal(chunk, 2)
-			q = fmt.Sprintf(`UPDATE utxos SET unmined_since = $1 WHERE hash IN %s`, inClause)
+			q = fmt.Sprintf(`UPDATE txs SET unmined_since = $1 WHERE hash IN %s`, inClause)
 			args = append([]interface{}{int64(currentBlockHeight)}, inArgs...)
 		}
 
@@ -249,7 +263,7 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 	if totalUpdated < attempted {
 		missing := attempted - totalUpdated
-		s.logger.Errorf("[MarkTransactionsOnLongestChain] FATAL: %d/%d transactions not found in utxos", missing, attempted)
+		s.logger.Errorf("[MarkTransactionsOnLongestChain] FATAL: %d/%d transactions not found in txs", missing, attempted)
 	}
 
 	return nil

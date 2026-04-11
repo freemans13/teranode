@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -49,7 +50,7 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
 	data := &meta.Data{}
 
-	// Single SELECT from utxos — all metadata, state, arrays.
+	// Single SELECT from txs — all metadata, state, raw_tx, and arrays.
 	var (
 		version             int64
 		lockTime            int64
@@ -59,23 +60,17 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		blockHeights        []int32
 		subtreeIdxs         []int32
 		conflictingChildren [][]byte
-		lockingScripts      [][]byte
-		satoshisArr         []int64
-		spendingDataArr     [][]byte
-		frozenOutputsArr    []bool
 	)
 
 	err := s.pool.QueryRow(ctx, `
 		SELECT version, lock_time, fee, size_in_bytes, coinbase,
 		       locked, conflicting, frozen, unmined_since, raw_tx,
-		       block_ids, block_heights, subtree_idxs, conflicting_children,
-		       locking_scripts, satoshis, spending_data, frozen_outputs
-		FROM utxos WHERE hash = $1`,
+		       block_ids, block_heights, subtree_idxs, conflicting_children
+		FROM txs WHERE hash = $1`,
 		hash[:],
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
 		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince, &rawTx,
-		&blockIDs, &blockHeights, &subtreeIdxs, &conflictingChildren,
-		&lockingScripts, &satoshisArr, &spendingDataArr, &frozenOutputsArr)
+		&blockIDs, &blockHeights, &subtreeIdxs, &conflictingChildren)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxNotFoundError("transaction %s not found", hash, err)
@@ -102,19 +97,32 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		}
 	}
 
-	// Build outputs from arrays.
+	// Fetch outputs for Tx reconstruction (locking_script, satoshis).
 	if contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos) {
-		tx.Outputs = make([]*bt.Output, len(lockingScripts))
-		for i := range lockingScripts {
+		rows, err := s.pool.Query(ctx, `
+			SELECT idx, locking_script, satoshis
+			FROM outputs
+			WHERE tx_hash = $1
+			ORDER BY idx`,
+			hash[:],
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		// Replace the outputs from raw_tx with the authoritative outputs table data.
+		tx.Outputs = nil
+		for rows.Next() {
+			var idx int64
 			output := &bt.Output{}
-			if lockingScripts[i] != nil {
-				ls := bscript.Script(lockingScripts[i])
-				output.LockingScript = &ls
+			if err := rows.Scan(&idx, &output.LockingScript, &output.Satoshis); err != nil {
+				return nil, err
 			}
-			if i < len(satoshisArr) {
-				output.Satoshis = uint64(satoshisArr[i])
-			}
-			tx.Outputs[i] = output
+			tx.Outputs = append(tx.Outputs, output)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -144,21 +152,44 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		}
 	}
 
-	// Build UTXOs with spend status from spending_data array.
+	// Fetch UTXOs with spend status from spends table.
 	if contains(bins, fields.Utxos) {
-		numOutputs := len(lockingScripts)
-		data.SpendingDatas = make([]*spendpkg.SpendingData, numOutputs)
-		for i := 0; i < numOutputs; i++ {
-			frozen := data.Frozen || (i < len(frozenOutputsArr) && frozenOutputsArr[i])
-			if frozen {
-				data.SpendingDatas[i] = spendpkg.NewSpendingData(&subtree.FrozenBytesTxHash, i)
-			} else if i < len(spendingDataArr) && spendingDataArr[i] != nil {
-				sd, sdErr := spendpkg.NewSpendingDataFromBytes(spendingDataArr[i])
-				if sdErr != nil {
-					return nil, errors.NewProcessingError("failed to parse spending data", sdErr)
-				}
-				data.SpendingDatas[i] = sd
+		rows, err := s.pool.Query(ctx, `
+			SELECT o.idx, sp.spending_data, o.frozen
+			FROM outputs o
+			LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+			WHERE o.tx_hash = $1
+			ORDER BY o.idx`,
+			hash[:],
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		data.SpendingDatas = make([]*spendpkg.SpendingData, len(tx.Outputs))
+		for rows.Next() {
+			var (
+				idx               int
+				spendingDataBytes []byte
+				frozen            bool
+			)
+			if err := rows.Scan(&idx, &spendingDataBytes, &frozen); err != nil {
+				return nil, err
 			}
+
+			if data.Frozen || frozen {
+				data.SpendingDatas[idx] = spendpkg.NewSpendingData(&subtree.FrozenBytesTxHash, idx)
+			} else if spendingDataBytes != nil {
+				sd, err := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
+				if err != nil {
+					return nil, errors.NewProcessingError("failed to parse spending data", err)
+				}
+				data.SpendingDatas[idx] = sd
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -169,10 +200,10 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 
 	// Build TxInpoints from inputs.
 	if contains(bins, fields.TxInpoints) {
-		var inpErr error
-		data.TxInpoints, inpErr = subtree.NewTxInpointsFromInputs(tx.Inputs)
-		if inpErr != nil {
-			return nil, errors.NewProcessingError("failed to create tx inpoints from inputs", inpErr)
+		var err error
+		data.TxInpoints, err = subtree.NewTxInpointsFromInputs(tx.Inputs)
+		if err != nil {
+			return nil, errors.NewProcessingError("failed to create tx inpoints from inputs", err)
 		}
 	}
 
@@ -180,25 +211,27 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 }
 
 // GetSpend retrieves the spend status for a specific UTXO.
+// It validates UTXO state by JOINing outputs + txs + spends.
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
 	var (
-		utxoHashBytes    []byte
-		coinbaseHeight   int64
-		spendingDataByte []byte
-		frozen           bool
-		spendableIn      *int32
-		conflicting      bool
-		locked           bool
+		utxoHashBytes          []byte
+		coinbaseSpendingHeight uint32
+		spendingDataBytes      []byte
+		frozen                 bool
+		spendableIn            *uint32
+		conflicting            bool
+		locked                 bool
 	)
 
-	// Read from the single utxos table using array indexing (1-based).
-	idx := int(spend.Vout) + 1
 	err := s.pool.QueryRow(ctx, `
-		SELECT utxo_hashes[$2], coinbase_heights[$2], spending_data[$2],
-		       frozen OR COALESCE(frozen_outputs[$2], false), spendable_in[$2], conflicting, locked
-		FROM utxos WHERE hash = $1`,
-		spend.TxID[:], idx,
-	).Scan(&utxoHashBytes, &coinbaseHeight, &spendingDataByte, &frozen, &spendableIn, &conflicting, &locked)
+		SELECT o.utxo_hash, o.coinbase_spending_height, sp.spending_data,
+		       o.frozen OR t.frozen, o.spendable_in, t.conflicting, t.locked
+		FROM outputs o
+		JOIN txs t ON t.hash = o.tx_hash
+		LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+		WHERE o.tx_hash = $1 AND o.idx = $2`,
+		spend.TxID[:], spend.Vout,
+	).Scan(&utxoHashBytes, &coinbaseSpendingHeight, &spendingDataBytes, &frozen, &spendableIn, &conflicting, &locked)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &utxo.SpendResponse{
@@ -208,36 +241,20 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		return nil, err
 	}
 
-	// If utxo_hashes element is nil, the output doesn't exist at that index.
-	if utxoHashBytes == nil {
-		return &utxo.SpendResponse{
-			Status: int(utxo.Status_NOT_FOUND),
-		}, nil
-	}
-
 	// Validate UTXO hash matches.
-	if spend.UTXOHash != nil && len(utxoHashBytes) > 0 {
-		utxoMatch := true
-		for i, b := range spend.UTXOHash[:] {
-			if i >= len(utxoHashBytes) || b != utxoHashBytes[i] {
-				utxoMatch = false
-				break
-			}
-		}
-		if !utxoMatch {
-			return nil, errors.NewUtxoHashMismatchError("utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
-		}
+	if !bytes.Equal(utxoHashBytes, spend.UTXOHash[:]) {
+		return nil, errors.NewUtxoHashMismatchError("utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 
 	var spendingData *spendpkg.SpendingData
-	if len(spendingDataByte) > 0 {
-		spendingData, err = spendpkg.NewSpendingDataFromBytes(spendingDataByte)
+	if len(spendingDataBytes) > 0 {
+		spendingData, err = spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	utxoStatus := utxo.CalculateUtxoStatus(spendingData, uint32(coinbaseHeight), s.blockHeight.Load())
+	utxoStatus := utxo.CalculateUtxoStatus(spendingData, coinbaseSpendingHeight, s.blockHeight.Load())
 
 	if frozen {
 		utxoStatus = utxo.Status_FROZEN
@@ -249,14 +266,14 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 	if locked {
 		utxoStatus = utxo.Status_LOCKED
 	}
-	if spendableIn != nil && s.GetBlockHeight() < uint32(*spendableIn) {
+	if spendableIn != nil && s.GetBlockHeight() < *spendableIn {
 		utxoStatus = utxo.Status_IMMATURE
 	}
 
 	return &utxo.SpendResponse{
 		Status:       int(utxoStatus),
 		SpendingData: spendingData,
-		LockTime:     uint32(coinbaseHeight),
+		LockTime:     coinbaseSpendingHeight,
 	}, nil
 }
 
@@ -309,14 +326,13 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		hashToItems[item.Hash] = append(hashToItems[item.Hash], item)
 	}
 
-	// Bulk fetch from utxos (single table).
+	// Query 1: Bulk fetch from txs (single table, no JOIN).
 	inClause, inArgs := buildINClauseLocal(hashes, 1)
 
 	q := `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
 	             locked, conflicting, frozen, unmined_since, raw_tx,
-	             block_ids, block_heights, subtree_idxs,
-	             locking_scripts, satoshis
-	      FROM utxos
+	             block_ids, block_heights, subtree_idxs
+	      FROM txs
 	      WHERE hash IN ` + inClause
 
 	rows, err := s.pool.Query(ctx, q, inArgs...)
@@ -328,41 +344,36 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 
 	for rows.Next() {
 		var (
-			hashBytes      []byte
-			unminedSince   *int64
-			version        int64
-			lockTime       int64
-			rawTx          []byte
-			bIDs           []int32
-			blkHeights     []int32
-			subIdxs        []int32
-			lockingScripts [][]byte
-			satoshisArr    []int64
+			hashBytes    []byte
+			unminedSince *int64
+			version      int64
+			lockTime     int64
+			rawTx        []byte
+			blockIDs     []int32
+			blkHeights   []int32
+			subIdxs      []int32
 		)
 		row := &txRow{data: &meta.Data{}}
 		if err := rows.Scan(&hashBytes, &version, &lockTime, &row.data.Fee, &row.data.SizeInBytes, &row.data.IsCoinbase,
 			&row.data.Locked, &row.data.Conflicting, &row.data.Frozen, &unminedSince, &rawTx,
-			&bIDs, &blkHeights, &subIdxs,
-			&lockingScripts, &satoshisArr); err != nil {
+			&blockIDs, &blkHeights, &subIdxs); err != nil {
 			rows.Close()
 			return err
 		}
 		row.version = uint32(version)
 		row.lockTime = uint32(lockTime)
 		row.rawTx = rawTx
-		row.lockingScripts = lockingScripts
-		row.satoshisArr = satoshisArr
 		copy(row.hash[:], hashBytes)
 		if unminedSince != nil {
 			row.data.UnminedSince = uint32(*unminedSince)
 		}
 		// Store block_ids on the data object.
-		if len(bIDs) > 0 {
-			row.data.BlockIDs = make([]uint32, len(bIDs))
+		if len(blockIDs) > 0 {
+			row.data.BlockIDs = make([]uint32, len(blockIDs))
 			row.data.BlockHeights = make([]uint32, len(blkHeights))
 			row.data.SubtreeIdxs = make([]int, len(subIdxs))
-			for i := range bIDs {
-				row.data.BlockIDs[i] = uint32(bIDs[i])
+			for i := range blockIDs {
+				row.data.BlockIDs[i] = uint32(blockIDs[i])
 				if i < len(blkHeights) {
 					row.data.BlockHeights[i] = uint32(blkHeights[i])
 				}
@@ -386,10 +397,17 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		return nil
 	}
 
+	// Collect tx hashes for subsequent queries.
+	txHashes := make([][]byte, 0, len(hashToTx))
+	for h := range hashToTx {
+		hCopy := h
+		txHashes = append(txHashes, hCopy[:])
+	}
+
 	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
 	needOutputs := contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos)
 
-	// Deserialize raw_tx for inputs.
+	// Query 2: Deserialize raw_tx for inputs.
 	if needInputs {
 		for _, row := range hashToTx {
 			if row.rawTx != nil {
@@ -404,24 +422,10 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		}
 	}
 
-	// Build outputs from arrays (no extra query needed).
+	// Query 3: Bulk fetch outputs.
 	if needOutputs {
-		for _, row := range hashToTx {
-			if row.data.Tx == nil {
-				row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
-			}
-			row.data.Tx.Outputs = make([]*bt.Output, len(row.lockingScripts))
-			for i := range row.lockingScripts {
-				output := &bt.Output{}
-				if row.lockingScripts[i] != nil {
-					ls := bscript.Script(row.lockingScripts[i])
-					output.LockingScript = &ls
-				}
-				if i < len(row.satoshisArr) {
-					output.Satoshis = uint64(row.satoshisArr[i])
-				}
-				row.data.Tx.Outputs[i] = output
-			}
+		if err := s.batchDecorateOutputs(ctx, txHashes, hashToTx); err != nil {
+			return err
 		}
 	}
 
@@ -462,6 +466,40 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	}
 
 	return nil
+}
+
+// batchDecorateOutputs bulk-fetches outputs for multiple transactions keyed by tx_hash.
+func (s *Store) batchDecorateOutputs(ctx context.Context, txHashes [][]byte, hashToTx map[chainhash.Hash]*txRow) error {
+	inClause, args := buildINClauseLocal(txHashes, 1)
+
+	q := `SELECT tx_hash, locking_script, satoshis
+	      FROM outputs WHERE tx_hash IN ` + inClause + ` ORDER BY tx_hash, idx`
+
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var txHashBytes []byte
+		output := &bt.Output{}
+		if err := rows.Scan(&txHashBytes, &output.LockingScript, &output.Satoshis); err != nil {
+			return err
+		}
+
+		var h chainhash.Hash
+		copy(h[:], txHashBytes)
+		row := hashToTx[h]
+		if row == nil {
+			continue
+		}
+		if row.data.Tx == nil {
+			row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
+		}
+		row.data.Tx.Outputs = append(row.data.Tx.Outputs, output)
+	}
+	return rows.Err()
 }
 
 // PreviousOutputsDecorate fetches output information for transaction inputs.
@@ -537,7 +575,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		chunk := parentHashes[chunkStart:chunkEnd]
 
 		inClause, args := buildINClauseLocal(chunk, 1)
-		q := `SELECT hash, locking_scripts, satoshis FROM utxos WHERE hash IN ` + inClause
+		q := `SELECT tx_hash, idx, locking_script, satoshis FROM outputs WHERE tx_hash IN ` + inClause
 
 		rows, err := s.pool.Query(ctx, q, args...)
 		if err != nil {
@@ -546,25 +584,18 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 
 		for rows.Next() {
 			var hashBytes []byte
-			var lockingScripts [][]byte
-			var satoshisArr []int64
-			if err := rows.Scan(&hashBytes, &lockingScripts, &satoshisArr); err != nil {
+			var idx uint32
+			var lockingScript []byte
+			var satoshis uint64
+			if err := rows.Scan(&hashBytes, &idx, &lockingScript, &satoshis); err != nil {
 				rows.Close()
 				return err
 			}
 			var h chainhash.Hash
 			copy(h[:], hashBytes)
-			// Map each output to results.
-			for i := range lockingScripts {
-				results[outputKey{hash: h, idx: uint32(i)}] = &outputInfo{
-					lockingScript: lockingScripts[i],
-					satoshis: func() uint64 {
-						if i < len(satoshisArr) {
-							return uint64(satoshisArr[i])
-						}
-						return 0
-					}(),
-				}
+			results[outputKey{hash: h, idx: idx}] = &outputInfo{
+				lockingScript: lockingScript,
+				satoshis:      satoshis,
 			}
 		}
 		rows.Close()
@@ -608,11 +639,9 @@ func contains(slice []fields.FieldName, item fields.FieldName) bool {
 
 // txRow holds intermediate results for a single transaction during bulk fetch.
 type txRow struct {
-	data           *meta.Data
-	version        uint32
-	lockTime       uint32
-	hash           chainhash.Hash
-	rawTx          []byte
-	lockingScripts [][]byte
-	satoshisArr    []int64
+	data     *meta.Data
+	version  uint32
+	lockTime uint32
+	hash     chainhash.Hash
+	rawTx    []byte
 }

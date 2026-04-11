@@ -37,7 +37,7 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 	return prunerServiceInstance, nil
 }
 
-// queuePrunerService implements pruner.Service for the v6 queue store.
+// queuePrunerService implements pruner.Service for the v5 queue store.
 type queuePrunerService struct {
 	store     *Store
 	logger    interface{ Infof(string, ...interface{}) }
@@ -104,11 +104,11 @@ func (s *queuePrunerService) Prune(ctx context.Context, blockHeight uint32, bloc
 }
 
 // deleteTombstoned finds transactions with delete_at_height <= blockHeight and
-// deletes them from the utxos table.
+// cascade-deletes them from all 3 tables.
 func (s *queuePrunerService) deleteTombstoned(ctx context.Context, blockHeight uint32) (int64, error) {
 	// Find tombstoned tx hashes.
 	rows, err := s.store.pool.Query(ctx, `
-		SELECT hash FROM utxos
+		SELECT hash FROM txs
 		WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
 	`, int64(blockHeight))
 	if err != nil {
@@ -133,7 +133,7 @@ func (s *queuePrunerService) deleteTombstoned(ctx context.Context, blockHeight u
 		return 0, nil
 	}
 
-	// Delete in batches of 500. One table, one DELETE per hash.
+	// Delete in batches of 500 within a single transaction per batch.
 	const batchSize = 500
 	var totalDeleted int64
 
@@ -150,12 +150,30 @@ func (s *queuePrunerService) deleteTombstoned(ctx context.Context, blockHeight u
 		default:
 		}
 
+		pgxTx, err := s.store.pool.Begin(ctx)
+		if err != nil {
+			return totalDeleted, errors.NewStorageError("[pruner] begin: %v", err)
+		}
+
 		for _, hashBytes := range batch {
-			_, err := s.store.pool.Exec(ctx, `DELETE FROM utxos WHERE hash = $1`, hashBytes)
-			if err != nil {
-				return totalDeleted, errors.NewStorageError("[pruner] delete failed: %v", err)
+			deleteStatements := []string{
+				`DELETE FROM spends WHERE prev_tx_hash = $1`,
+				`DELETE FROM outputs WHERE tx_hash = $1`,
+				`DELETE FROM txs WHERE hash = $1`,
 			}
+
+			for _, stmt := range deleteStatements {
+				if _, err := pgxTx.Exec(ctx, stmt, hashBytes); err != nil {
+					pgxTx.Rollback(ctx) //nolint:errcheck
+					return totalDeleted, errors.NewStorageError("[pruner] delete failed: %v", err)
+				}
+			}
+
 			totalDeleted++
+		}
+
+		if err := pgxTx.Commit(ctx); err != nil {
+			return totalDeleted, errors.NewStorageError("[pruner] commit: %v", err)
 		}
 	}
 

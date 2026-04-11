@@ -30,7 +30,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		}
 
 		inClause, args := buildINClauseLocal(chunk, 2)
-		q := fmt.Sprintf(`UPDATE utxos SET preserve_until = $1, delete_at_height = NULL WHERE hash IN %s`, inClause)
+		q := fmt.Sprintf(`UPDATE txs SET preserve_until = $1, delete_at_height = NULL WHERE hash IN %s`, inClause)
 
 		allArgs := append([]interface{}{int64(preserveUntilHeight)}, args...)
 		result, err := s.pool.Exec(ctx, q, allArgs...)
@@ -52,7 +52,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	deleteAtHeight := currentHeight + s.settings.GetUtxoStoreBlockHeightRetention()
 
 	result, err := s.pool.Exec(ctx, `
-		UPDATE utxos SET delete_at_height = $1, preserve_until = NULL
+		UPDATE txs SET delete_at_height = $1, preserve_until = NULL
 		WHERE preserve_until IS NOT NULL AND preserve_until <= $2
 	`, int64(deleteAtHeight), int64(currentHeight))
 	if err != nil {
