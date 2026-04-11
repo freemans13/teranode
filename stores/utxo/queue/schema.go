@@ -8,9 +8,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// createSchema creates the v7 UTXO tables in the connected PostgreSQL
-// database. 2 UNLOGGED tables (txs, spends) with 16 partitions each.
-// Outputs are embedded in txs as parallel arrays.
+// createSchema creates the v5 turbo UTXO tables in the connected PostgreSQL
+// database. 3 UNLOGGED tables (txs, outputs, spends) with 16 partitions each.
 func (s *Store) createSchema(ctx context.Context) error {
 	return createSchemaWithPool(ctx, s.pool)
 }
@@ -28,6 +27,7 @@ const numPartitions = 16
 func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	ddlStatements := []string{
 		txsDDL,
+		outputsDDL,
 		spendsDDL,
 	}
 
@@ -39,8 +39,9 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 
 	// Create 16 hash partitions for each table with appropriate fillfactor.
 	tables := []partitionSpec{
-		{"txs", 70},     // HOT updates — reserve 30% for in-place updates
-		{"spends", 100}, // append-only
+		{"txs", 70},      // HOT updates — reserve 30% for in-place updates
+		{"outputs", 100}, // immutable
+		{"spends", 100},  // append-only
 	}
 	for _, spec := range tables {
 		for i := 0; i < numPartitions; i++ {
@@ -74,11 +75,11 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 }
 
 // ---------------------------------------------------------------------------
-// Table DDL — 2 UNLOGGED tables (v7: outputs embedded in txs as arrays)
+// Table DDL — 3 UNLOGGED tables
 // ---------------------------------------------------------------------------
 
 // txs: consolidated transaction metadata + state + inputs (raw_tx) + block_ids
-// (arrays) + conflicting_children (array) + output arrays. UNLOGGED for performance.
+// (arrays) + conflicting_children (array). UNLOGGED for performance.
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
     hash                 BYTEA PRIMARY KEY,
@@ -98,20 +99,27 @@ CREATE TABLE IF NOT EXISTS txs (
     block_heights        INT[],
     subtree_idxs         INT[],
     conflicting_children BYTEA[],
-    inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    -- output arrays (v7 — replaces outputs table)
-    utxo_hashes          BYTEA[],
-    locking_scripts      BYTEA[],
-    satoshis_arr         BIGINT[],
-    coinbase_heights     BIGINT[],
-    frozen_outputs       BOOLEAN[],
-    spendable_in_arr     INT[]
+    inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) PARTITION BY HASH (hash);`
 
 // Partial indexes on txs.
 const txsIndexesDDL = `
 CREATE INDEX IF NOT EXISTS px_unmined_since ON txs (unmined_since) WHERE unmined_since IS NOT NULL;
 CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE delete_at_height IS NOT NULL;`
+
+// outputs: immutable transaction outputs. UNLOGGED for performance.
+const outputsDDL = `
+CREATE TABLE IF NOT EXISTS outputs (
+    tx_hash                 BYTEA   NOT NULL,
+    idx                     BIGINT  NOT NULL,
+    locking_script          BYTEA   NOT NULL,
+    satoshis                BIGINT  NOT NULL,
+    utxo_hash               BYTEA   NOT NULL,
+    coinbase_spending_height BIGINT NOT NULL DEFAULT 0,
+    frozen                  BOOLEAN DEFAULT FALSE,
+    spendable_in            INT,
+    PRIMARY KEY (tx_hash, idx)
+) PARTITION BY HASH (tx_hash);`
 
 // spends: append-only spend records. UNLOGGED for performance.
 const spendsDDL = `
@@ -126,4 +134,5 @@ CREATE TABLE IF NOT EXISTS spends (
 // tables exist for the COPY-based create batcher.
 const createStagingTablesSQL = `
 CREATE TEMP TABLE IF NOT EXISTS staging_txs (LIKE txs EXCLUDING ALL) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS staging_outputs (LIKE outputs EXCLUDING ALL) ON COMMIT DELETE ROWS;
 `

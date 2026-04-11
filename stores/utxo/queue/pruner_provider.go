@@ -104,7 +104,7 @@ func (s *queuePrunerService) Prune(ctx context.Context, blockHeight uint32, bloc
 }
 
 // deleteTombstoned finds transactions with delete_at_height <= blockHeight and
-// cascade-deletes them from txs + spends (v7: no outputs table).
+// cascade-deletes them from all 3 tables.
 func (s *queuePrunerService) deleteTombstoned(ctx context.Context, blockHeight uint32) (int64, error) {
 	// Find tombstoned tx hashes.
 	rows, err := s.store.pool.Query(ctx, `
@@ -158,6 +158,7 @@ func (s *queuePrunerService) deleteTombstoned(ctx context.Context, blockHeight u
 		for _, hashBytes := range batch {
 			deleteStatements := []string{
 				`DELETE FROM spends WHERE prev_tx_hash = $1`,
+				`DELETE FROM outputs WHERE tx_hash = $1`,
 				`DELETE FROM txs WHERE hash = $1`,
 			}
 
