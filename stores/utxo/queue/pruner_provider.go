@@ -37,7 +37,7 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 	return prunerServiceInstance, nil
 }
 
-// queuePrunerService implements pruner.Service for the v4 queue store.
+// queuePrunerService implements pruner.Service for the v5 queue store.
 type queuePrunerService struct {
 	store     *Store
 	logger    interface{ Infof(string, ...interface{}) }
@@ -60,7 +60,6 @@ func (s *queuePrunerService) AddObserver(observer pruner.Observer) {
 }
 
 // Prune removes transactions marked for deletion at or before the specified height.
-// Returns the number of records processed and any error encountered.
 func (s *queuePrunerService) Prune(ctx context.Context, blockHeight uint32, blockHashStr string) (int64, error) {
 	if blockHeight == 0 {
 		return 0, errors.NewProcessingError("cannot prune at block height 0")
@@ -105,11 +104,11 @@ func (s *queuePrunerService) Prune(ctx context.Context, blockHeight uint32, bloc
 }
 
 // deleteTombstoned finds transactions with delete_at_height <= blockHeight and
-// cascade-deletes them from all tables.
+// cascade-deletes them from all 3 tables.
 func (s *queuePrunerService) deleteTombstoned(ctx context.Context, blockHeight uint32) (int64, error) {
 	// Find tombstoned tx hashes.
 	rows, err := s.store.pool.Query(ctx, `
-		SELECT tx_hash FROM tx_state
+		SELECT hash FROM txs
 		WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
 	`, int64(blockHeight))
 	if err != nil {
@@ -159,12 +158,8 @@ func (s *queuePrunerService) deleteTombstoned(ctx context.Context, blockHeight u
 		for _, hashBytes := range batch {
 			deleteStatements := []string{
 				`DELETE FROM spends WHERE prev_tx_hash = $1`,
-				`DELETE FROM block_ids WHERE tx_hash = $1`,
 				`DELETE FROM outputs WHERE tx_hash = $1`,
-				`DELETE FROM inputs WHERE tx_hash = $1`,
-				`DELETE FROM conflicting_children WHERE tx_hash = $1 OR child_tx_hash = $1`,
-				`DELETE FROM tx_state WHERE tx_hash = $1`,
-				`DELETE FROM transactions WHERE hash = $1`,
+				`DELETE FROM txs WHERE hash = $1`,
 			}
 
 			for _, stmt := range deleteStatements {

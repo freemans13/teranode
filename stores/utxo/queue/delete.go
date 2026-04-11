@@ -7,7 +7,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// Delete removes a transaction and all its associated data from all tables
+// Delete removes a transaction and all its associated data from all 3 tables
 // in a single pgx transaction.
 func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	pgxTx, err := s.pool.Begin(ctx)
@@ -16,16 +16,11 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
-	// Delete in dependency order: children tables first, then parent tables.
+	// Delete in dependency order: children tables first, then parent table.
 	deleteStatements := []string{
 		`DELETE FROM spends WHERE prev_tx_hash = $1`,
-		`DELETE FROM block_ids WHERE tx_hash = $1`,
 		`DELETE FROM outputs WHERE tx_hash = $1`,
-		`DELETE FROM inputs WHERE tx_hash = $1`,
-		`DELETE FROM conflicting_children WHERE tx_hash = $1`,
-		`DELETE FROM conflicting_children WHERE child_tx_hash = $1`,
-		`DELETE FROM tx_state WHERE tx_hash = $1`,
-		`DELETE FROM transactions WHERE hash = $1`,
+		`DELETE FROM txs WHERE hash = $1`,
 	}
 
 	for _, stmt := range deleteStatements {
@@ -34,18 +29,15 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 		}
 	}
 
+	// Evict from cache.
+	s.cache.Remove(*hash)
+
 	return pgxTx.Commit(ctx)
 }
 
-// setDAH sets or clears the delete_at_height field in tx_state based on
+// setDAH sets or clears the delete_at_height field in txs based on
 // whether all outputs are spent, the transaction has block_ids, and is on the
 // longest chain (unmined_since IS NULL).
-//
-// This mirrors the aerospike Lua setDeleteAtHeight logic:
-//   - If preserve_until is set: don't touch delete_at_height
-//   - If all outputs are spent AND has block_ids AND on longest chain:
-//     set delete_at_height = blockHeight + retention (bump forward if smaller)
-//   - Otherwise: clear delete_at_height
 func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	retention := s.settings.GetUtxoStoreBlockHeightRetention()
 	if retention == 0 {
@@ -55,7 +47,7 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	// Check preserve_until first: if set, don't touch DAH.
 	var preserveUntil *int64
 	err := s.pool.QueryRow(ctx,
-		`SELECT preserve_until FROM tx_state WHERE tx_hash = $1`,
+		`SELECT preserve_until FROM txs WHERE hash = $1`,
 		hash[:],
 	).Scan(&preserveUntil)
 	if err != nil {
@@ -79,36 +71,29 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 		return errors.NewStorageError("[setDAH] check all_spent for %s: %v", hash, err)
 	}
 
-	// Check if has block_ids and is on longest chain.
-	var hasBlockIDs bool
+	// Check if has block_ids and is on longest chain — read from txs arrays.
+	var blockIDs []int32
+	var onLongestChain bool
 	err = s.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM block_ids WHERE tx_hash = $1)`,
+		`SELECT block_ids, (unmined_since IS NULL) FROM txs WHERE hash = $1`,
 		hash[:],
-	).Scan(&hasBlockIDs)
+	).Scan(&blockIDs, &onLongestChain)
 	if err != nil {
 		return errors.NewStorageError("[setDAH] check block_ids for %s: %v", hash, err)
 	}
 
-	var onLongestChain bool
-	err = s.pool.QueryRow(ctx,
-		`SELECT unmined_since IS NULL FROM tx_state WHERE tx_hash = $1`,
-		hash[:],
-	).Scan(&onLongestChain)
-	if err != nil {
-		return errors.NewStorageError("[setDAH] check unmined_since for %s: %v", hash, err)
-	}
-
+	hasBlockIDs := len(blockIDs) > 0
 	newDAH := int64(s.blockHeight.Load() + 1 + retention)
 
 	if allSpent && hasBlockIDs && onLongestChain {
 		// Set delete_at_height, but only bump forward (never decrease).
 		_, err = s.pool.Exec(ctx, `
-			UPDATE tx_state
+			UPDATE txs
 			SET delete_at_height = CASE
 				WHEN delete_at_height IS NULL OR delete_at_height < $2 THEN $2
 				ELSE delete_at_height
 			END
-			WHERE tx_hash = $1`,
+			WHERE hash = $1`,
 			hash[:], newDAH,
 		)
 		if err != nil {
@@ -117,7 +102,7 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	} else {
 		// Clear delete_at_height since conditions are not met.
 		_, err = s.pool.Exec(ctx, `
-			UPDATE tx_state SET delete_at_height = NULL WHERE tx_hash = $1`,
+			UPDATE txs SET delete_at_height = NULL WHERE hash = $1`,
 			hash[:],
 		)
 		if err != nil {

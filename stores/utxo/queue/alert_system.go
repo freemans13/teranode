@@ -50,12 +50,12 @@ func (s *Store) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *settin
 			return errors.NewStorageError("[FreezeUTXOs] failed to freeze output %s:%d", spend.TxID, spend.Vout, err)
 		}
 
-		// Set frozen on tx_state.
+		// Set frozen on txs.
 		_, err = s.pool.Exec(ctx, `
-			UPDATE tx_state SET frozen = true WHERE tx_hash = $1
+			UPDATE txs SET frozen = true WHERE hash = $1
 		`, spend.TxID[:])
 		if err != nil {
-			return errors.NewStorageError("[FreezeUTXOs] failed to freeze tx_state for %s", spend.TxID, err)
+			return errors.NewStorageError("[FreezeUTXOs] failed to freeze txs for %s", spend.TxID, err)
 		}
 	}
 
@@ -88,7 +88,7 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 			return errors.NewStorageError("[UnFreezeUTXOs] failed to unfreeze output %s:%d", spend.TxID, spend.Vout, err)
 		}
 
-		// Only clear tx_state.frozen if no other frozen outputs remain.
+		// Only clear txs.frozen if no other frozen outputs remain.
 		var remainingFrozen int
 		err = s.pool.QueryRow(ctx, `
 			SELECT COUNT(*) FROM outputs WHERE tx_hash = $1 AND frozen = true
@@ -99,10 +99,10 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 
 		if remainingFrozen == 0 {
 			_, err = s.pool.Exec(ctx, `
-				UPDATE tx_state SET frozen = false WHERE tx_hash = $1
+				UPDATE txs SET frozen = false WHERE hash = $1
 			`, spend.TxID[:])
 			if err != nil {
-				return errors.NewStorageError("[UnFreezeUTXOs] failed to unfreeze tx_state for %s", spend.TxID, err)
+				return errors.NewStorageError("[UnFreezeUTXOs] failed to unfreeze txs for %s", spend.TxID, err)
 			}
 		}
 	}
@@ -112,7 +112,6 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 
 // ReAssignUTXO reassigns a frozen UTXO to a new transaction output.
 // The UTXO must be frozen before it can be reassigned.
-// The reassigned UTXO becomes spendable after ReAssignedUtxoSpendableAfterBlocks blocks.
 func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo *utxo.Spend, tSettings *settings.Settings) error {
 	// Verify source UTXO is frozen.
 	var outputFrozen bool

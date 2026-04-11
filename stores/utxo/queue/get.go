@@ -19,7 +19,7 @@ import (
 )
 
 // maxINClauseSize limits the number of hashes per IN clause to avoid exceeding
-// Postgres parameter limits. v3 uses 400; we match that.
+// Postgres parameter limits.
 const maxINClauseSize = 400
 
 // Get retrieves UTXO metadata for a given transaction hash.
@@ -49,22 +49,27 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
 	data := &meta.Data{}
 
-	// Always fetch transaction metadata + tx_state in one JOIN query.
+	// Single SELECT from txs — all metadata, state, raw_tx, and arrays.
 	var (
-		version      int64
-		lockTime     int64
-		unminedSince *int64
+		version             int64
+		lockTime            int64
+		unminedSince        *int64
+		rawTx               []byte
+		blockIDs            []int32
+		blockHeights        []int32
+		subtreeIdxs         []int32
+		conflictingChildren [][]byte
 	)
 
 	err := s.pool.QueryRow(ctx, `
-		SELECT t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
-		       ts.locked, ts.conflicting, ts.frozen, ts.unmined_since
-		FROM transactions t
-		JOIN tx_state ts ON ts.tx_hash = t.hash
-		WHERE t.hash = $1`,
+		SELECT version, lock_time, fee, size_in_bytes, coinbase,
+		       locked, conflicting, frozen, unmined_since, raw_tx,
+		       block_ids, block_heights, subtree_idxs, conflicting_children
+		FROM txs WHERE hash = $1`,
 		hash[:],
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
-		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince)
+		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince, &rawTx,
+		&blockIDs, &blockHeights, &subtreeIdxs, &conflictingChildren)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxNotFoundError("transaction %s not found", hash, err)
@@ -76,49 +81,18 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		data.UnminedSince = uint32(*unminedSince)
 	}
 
-	tx := bt.Tx{
-		Version:  uint32(version),
-		LockTime: uint32(lockTime),
-	}
-
-	// Fetch inputs if needed (for Tx, Inputs, TxInpoints, or Utxos fields).
-	if contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos) {
-		rows, err := s.pool.Query(ctx, `
-			SELECT previous_transaction_hash, previous_tx_idx, previous_tx_satoshis,
-			       previous_tx_script, unlocking_script, sequence_number
-			FROM inputs
-			WHERE tx_hash = $1
-			ORDER BY idx`,
-			hash[:],
-		)
+	// Deserialize raw_tx for Tx/Inputs/TxInpoints fields.
+	var tx *bt.Tx
+	if rawTx != nil && (contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)) {
+		tx, err = bt.NewTxFromBytes(rawTx)
 		if err != nil {
-			return nil, err
+			return nil, errors.NewProcessingError("failed to deserialize raw_tx", err)
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			input := &bt.Input{}
-			var prevTxHashBytes []byte
-			var prevIdx int64
-
-			if err := rows.Scan(&prevTxHashBytes, &prevIdx, &input.PreviousTxSatoshis,
-				&input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
-				return nil, err
-			}
-			input.PreviousTxOutIndex = uint32(prevIdx)
-
-			prevHash, err := chainhash.NewHash(prevTxHashBytes)
-			if err != nil {
-				return nil, err
-			}
-			if err := input.PreviousTxIDAdd(prevHash); err != nil {
-				return nil, err
-			}
-
-			tx.Inputs = append(tx.Inputs, input)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
+	} else {
+		// Create a minimal Tx with version/locktime for output assembly.
+		tx = &bt.Tx{
+			Version:  uint32(version),
+			LockTime: uint32(lockTime),
 		}
 	}
 
@@ -136,6 +110,8 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		}
 		defer rows.Close()
 
+		// Replace the outputs from raw_tx with the authoritative outputs table data.
+		tx.Outputs = nil
 		for rows.Next() {
 			var idx int64
 			output := &bt.Output{}
@@ -149,61 +125,29 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		}
 	}
 
-	// Fetch block_ids.
-	if contains(bins, fields.BlockIDs) {
-		rows, err := s.pool.Query(ctx, `
-			SELECT block_id, block_height, subtree_idx
-			FROM block_ids
-			WHERE tx_hash = $1
-			ORDER BY block_id`,
-			hash[:],
-		)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var (
-				blockID     uint32
-				blockHeight uint32
-				subtreeIdx  int
-			)
-			if err := rows.Scan(&blockID, &blockHeight, &subtreeIdx); err != nil {
-				return nil, err
+	// Fetch block_ids from arrays.
+	if contains(bins, fields.BlockIDs) && len(blockIDs) > 0 {
+		data.BlockIDs = make([]uint32, len(blockIDs))
+		data.BlockHeights = make([]uint32, len(blockHeights))
+		data.SubtreeIdxs = make([]int, len(subtreeIdxs))
+		for i := range blockIDs {
+			data.BlockIDs[i] = uint32(blockIDs[i])
+			if i < len(blockHeights) {
+				data.BlockHeights[i] = uint32(blockHeights[i])
 			}
-			data.BlockIDs = append(data.BlockIDs, blockID)
-			data.BlockHeights = append(data.BlockHeights, blockHeight)
-			data.SubtreeIdxs = append(data.SubtreeIdxs, subtreeIdx)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
+			if i < len(subtreeIdxs) {
+				data.SubtreeIdxs[i] = int(subtreeIdxs[i])
+			}
 		}
 	}
 
-	// Fetch conflicting children.
-	if contains(bins, fields.ConflictingChildren) {
-		rows, err := s.pool.Query(ctx, `
-			SELECT child_tx_hash
-			FROM conflicting_children
-			WHERE tx_hash = $1`,
-			hash[:],
-		)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-
-		data.ConflictingChildren = make([]chainhash.Hash, 0, 16)
-		for rows.Next() {
-			var childHashBytes []byte
-			if err := rows.Scan(&childHashBytes); err != nil {
-				return nil, err
+	// Fetch conflicting children from array.
+	if contains(bins, fields.ConflictingChildren) && len(conflictingChildren) > 0 {
+		data.ConflictingChildren = make([]chainhash.Hash, 0, len(conflictingChildren))
+		for _, childBytes := range conflictingChildren {
+			if len(childBytes) == chainhash.HashSize {
+				data.ConflictingChildren = append(data.ConflictingChildren, chainhash.Hash(childBytes))
 			}
-			data.ConflictingChildren = append(data.ConflictingChildren, chainhash.Hash(childHashBytes))
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
 		}
 	}
 
@@ -250,7 +194,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 
 	// Attach Tx to meta if requested.
 	if contains(bins, fields.Tx) {
-		data.Tx = &tx
+		data.Tx = tx
 	}
 
 	// Build TxInpoints from inputs.
@@ -266,7 +210,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 }
 
 // GetSpend retrieves the spend status for a specific UTXO.
-// It validates UTXO state by JOINing outputs + tx_state + spends.
+// It validates UTXO state by JOINing outputs + txs + spends.
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
 	var (
 		utxoHashBytes          []byte
@@ -280,9 +224,9 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 
 	err := s.pool.QueryRow(ctx, `
 		SELECT o.utxo_hash, o.coinbase_spending_height, sp.spending_data,
-		       o.frozen OR ts.frozen, o.spendable_in, ts.conflicting, ts.locked
+		       o.frozen OR t.frozen, o.spendable_in, t.conflicting, t.locked
 		FROM outputs o
-		JOIN tx_state ts ON ts.tx_hash = o.tx_hash
+		JOIN txs t ON t.hash = o.tx_hash
 		LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
 		WHERE o.tx_hash = $1 AND o.idx = $2`,
 		spend.TxID[:], spend.Vout,
@@ -333,14 +277,13 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 }
 
 // BatchDecorate efficiently fetches metadata for multiple transactions.
-// Delegates to Get for each item (could be optimized with bulk queries later).
 func (s *Store) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*utxo.UnresolvedMetaData, requestedFields ...fields.FieldName) error {
 	bins := utxo.MetaFieldsWithTx
 	if len(requestedFields) > 0 {
 		bins = requestedFields
 	}
 
-	// Filter out nil entries
+	// Filter out nil entries.
 	items := make([]*utxo.UnresolvedMetaData, 0, len(unresolvedMetaDataSlice))
 	for _, item := range unresolvedMetaDataSlice {
 		if item != nil {
@@ -382,14 +325,14 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		hashToItems[item.Hash] = append(hashToItems[item.Hash], item)
 	}
 
-	// Query 1: Bulk fetch transactions + tx_state
+	// Query 1: Bulk fetch from txs (single table, no JOIN).
 	inClause, inArgs := buildINClauseLocal(hashes, 1)
 
-	q := `SELECT t.hash, t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
-	             ts.locked, ts.conflicting, ts.frozen, ts.unmined_since
-	      FROM transactions t
-	      JOIN tx_state ts ON ts.tx_hash = t.hash
-	      WHERE t.hash IN ` + inClause
+	q := `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
+	             locked, conflicting, frozen, unmined_since, raw_tx,
+	             block_ids, block_heights, subtree_idxs
+	      FROM txs
+	      WHERE hash IN ` + inClause
 
 	rows, err := s.pool.Query(ctx, q, inArgs...)
 	if err != nil {
@@ -404,18 +347,39 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 			unminedSince *int64
 			version      int64
 			lockTime     int64
+			rawTx        []byte
+			blockIDs     []int32
+			blkHeights   []int32
+			subIdxs      []int32
 		)
 		row := &txRow{data: &meta.Data{}}
 		if err := rows.Scan(&hashBytes, &version, &lockTime, &row.data.Fee, &row.data.SizeInBytes, &row.data.IsCoinbase,
-			&row.data.Locked, &row.data.Conflicting, &row.data.Frozen, &unminedSince); err != nil {
+			&row.data.Locked, &row.data.Conflicting, &row.data.Frozen, &unminedSince, &rawTx,
+			&blockIDs, &blkHeights, &subIdxs); err != nil {
 			rows.Close()
 			return err
 		}
 		row.version = uint32(version)
 		row.lockTime = uint32(lockTime)
+		row.rawTx = rawTx
 		copy(row.hash[:], hashBytes)
 		if unminedSince != nil {
 			row.data.UnminedSince = uint32(*unminedSince)
+		}
+		// Store block_ids on the data object.
+		if len(blockIDs) > 0 {
+			row.data.BlockIDs = make([]uint32, len(blockIDs))
+			row.data.BlockHeights = make([]uint32, len(blkHeights))
+			row.data.SubtreeIdxs = make([]int, len(subIdxs))
+			for i := range blockIDs {
+				row.data.BlockIDs[i] = uint32(blockIDs[i])
+				if i < len(blkHeights) {
+					row.data.BlockHeights[i] = uint32(blkHeights[i])
+				}
+				if i < len(subIdxs) {
+					row.data.SubtreeIdxs[i] = int(subIdxs[i])
+				}
+			}
 		}
 		hashToTx[row.hash] = row
 	}
@@ -441,25 +405,25 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 
 	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
 	needOutputs := contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos)
-	needBlockIDs := contains(bins, fields.BlockIDs)
 
-	// Query 2: Bulk fetch inputs
+	// Query 2: Deserialize raw_tx for inputs.
 	if needInputs {
-		if err := s.batchDecorateInputs(ctx, txHashes, hashToTx); err != nil {
-			return err
+		for _, row := range hashToTx {
+			if row.rawTx != nil {
+				parsedTx, parseErr := bt.NewTxFromBytes(row.rawTx)
+				if parseErr == nil {
+					if row.data.Tx == nil {
+						row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
+					}
+					row.data.Tx.Inputs = parsedTx.Inputs
+				}
+			}
 		}
 	}
 
-	// Query 3: Bulk fetch outputs
+	// Query 3: Bulk fetch outputs.
 	if needOutputs {
 		if err := s.batchDecorateOutputs(ctx, txHashes, hashToTx); err != nil {
-			return err
-		}
-	}
-
-	// Query 4: Bulk fetch block_ids
-	if needBlockIDs {
-		if err := s.batchDecorateBlockIDs(ctx, txHashes, hashToTx); err != nil {
 			return err
 		}
 	}
@@ -503,55 +467,6 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	return nil
 }
 
-// batchDecorateInputs bulk-fetches inputs for multiple transactions keyed by tx_hash.
-func (s *Store) batchDecorateInputs(ctx context.Context, txHashes [][]byte, hashToTx map[chainhash.Hash]*txRow) error {
-	inClause, args := buildINClauseLocal(txHashes, 1)
-
-	q := `SELECT tx_hash, previous_transaction_hash, previous_tx_idx, previous_tx_satoshis,
-	             previous_tx_script, unlocking_script, sequence_number
-	      FROM inputs WHERE tx_hash IN ` + inClause + ` ORDER BY tx_hash, idx`
-
-	rows, err := s.pool.Query(ctx, q, args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			txHashBytes     []byte
-			prevTxHashBytes []byte
-			prevIdx         int64
-		)
-		input := &bt.Input{}
-		if err := rows.Scan(&txHashBytes, &prevTxHashBytes, &prevIdx, &input.PreviousTxSatoshis,
-			&input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
-			return err
-		}
-		input.PreviousTxOutIndex = uint32(prevIdx)
-
-		prevHash, err := chainhash.NewHash(prevTxHashBytes)
-		if err != nil {
-			return err
-		}
-		if err := input.PreviousTxIDAdd(prevHash); err != nil {
-			return err
-		}
-
-		var h chainhash.Hash
-		copy(h[:], txHashBytes)
-		row := hashToTx[h]
-		if row == nil {
-			continue
-		}
-		if row.data.Tx == nil {
-			row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
-		}
-		row.data.Tx.Inputs = append(row.data.Tx.Inputs, input)
-	}
-	return rows.Err()
-}
-
 // batchDecorateOutputs bulk-fetches outputs for multiple transactions keyed by tx_hash.
 func (s *Store) batchDecorateOutputs(ctx context.Context, txHashes [][]byte, hashToTx map[chainhash.Hash]*txRow) error {
 	inClause, args := buildINClauseLocal(txHashes, 1)
@@ -586,51 +501,13 @@ func (s *Store) batchDecorateOutputs(ctx context.Context, txHashes [][]byte, has
 	return rows.Err()
 }
 
-// batchDecorateBlockIDs bulk-fetches block_ids for multiple transactions keyed by tx_hash.
-func (s *Store) batchDecorateBlockIDs(ctx context.Context, txHashes [][]byte, hashToTx map[chainhash.Hash]*txRow) error {
-	inClause, args := buildINClauseLocal(txHashes, 1)
-
-	q := `SELECT tx_hash, block_id, block_height, subtree_idx
-	      FROM block_ids WHERE tx_hash IN ` + inClause + ` ORDER BY tx_hash, block_id`
-
-	rows, err := s.pool.Query(ctx, q, args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			txHashBytes []byte
-			blockID     uint32
-			blockHeight uint32
-			subtreeIdx  int
-		)
-		if err := rows.Scan(&txHashBytes, &blockID, &blockHeight, &subtreeIdx); err != nil {
-			return err
-		}
-
-		var h chainhash.Hash
-		copy(h[:], txHashBytes)
-		row := hashToTx[h]
-		if row == nil {
-			continue
-		}
-		row.data.BlockIDs = append(row.data.BlockIDs, blockID)
-		row.data.BlockHeights = append(row.data.BlockHeights, blockHeight)
-		row.data.SubtreeIdxs = append(row.data.SubtreeIdxs, subtreeIdx)
-	}
-	return rows.Err()
-}
-
 // PreviousOutputsDecorate fetches output information for transaction inputs.
 func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	return s.BatchPreviousOutputsDecorate(ctx, []*bt.Tx{tx})
 }
 
 // BatchPreviousOutputsDecorate fetches previous output information for inputs
-// across multiple transactions in bulk. Chunks parent hashes into IN clauses
-// (max 400 per query). Reads only from the outputs table.
+// across multiple transactions in bulk.
 func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
 	if len(txs) == 0 {
 		return nil
@@ -760,10 +637,10 @@ func contains(slice []fields.FieldName, item fields.FieldName) bool {
 }
 
 // txRow holds intermediate results for a single transaction during bulk fetch.
-// Used by batchDecorateChunk and its helper methods.
 type txRow struct {
 	data     *meta.Data
 	version  uint32
 	lockTime uint32
 	hash     chainhash.Hash
+	rawTx    []byte
 }

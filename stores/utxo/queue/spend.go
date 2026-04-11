@@ -34,18 +34,15 @@ type batchSpendItem struct {
 
 // spendValidationSQL is the CTE used to validate a spend attempt and insert
 // into the append-only spends table in a single round-trip.
-//
-// Parameters: $1=prev_tx_hash, $2=prev_output_idx, $3=spending_data,
-// $4=expected_utxo_hash, $5=blockHeight, $6=ignoreLocked, $7=ignoreConflicting
 const spendValidationSQL = `
 WITH validation AS (
     SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
            o.coinbase_spending_height,
-           ts.locked AS tx_locked, ts.conflicting AS tx_conflicting,
-           ts.frozen AS tx_frozen,
+           t.locked AS tx_locked, t.conflicting AS tx_conflicting,
+           t.frozen AS tx_frozen,
            sp.spending_data AS existing_spend
     FROM outputs o
-    JOIN tx_state ts ON ts.tx_hash = o.tx_hash
+    JOIN txs t ON t.hash = o.tx_hash
     LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
     WHERE o.tx_hash = $1 AND o.idx = $2
 )
@@ -68,11 +65,11 @@ RETURNING 1
 const spendDiagnosticSQL = `
 SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
        o.coinbase_spending_height,
-       ts.locked AS tx_locked, ts.conflicting AS tx_conflicting,
-       ts.frozen AS tx_frozen,
+       t.locked AS tx_locked, t.conflicting AS tx_conflicting,
+       t.frozen AS tx_frozen,
        sp.spending_data AS existing_spend
 FROM outputs o
-JOIN tx_state ts ON ts.tx_hash = o.tx_hash
+JOIN txs t ON t.hash = o.tx_hash
 LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
 WHERE o.tx_hash = $1 AND o.idx = $2
 `
@@ -82,8 +79,6 @@ WHERE o.tx_hash = $1 AND o.idx = $2
 // ---------------------------------------------------------------------------
 
 // Spend marks UTXOs consumed by the given transaction as spent.
-// When a spendBatcher is active (after Start()), each input is enqueued for
-// bulk processing. Otherwise, the per-input validation CTE is used directly.
 func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	if prometheusDirectSpend != nil {
 		prometheusDirectSpend.Inc()
@@ -323,7 +318,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	var sb strings.Builder
 	sb.WriteString(`
 		SELECT v.batch_idx, o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
-		       o.coinbase_spending_height, ts.locked, ts.conflicting, ts.frozen AS tx_frozen,
+		       o.coinbase_spending_height, t.locked, t.conflicting, t.frozen AS tx_frozen,
 		       sp.spending_data AS existing_spend
 		FROM (VALUES `)
 	args := make([]interface{}, 0, len(batch)*3)
@@ -338,7 +333,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	}
 	sb.WriteString(`) AS v(hash, idx, batch_idx)
 		JOIN outputs o ON o.tx_hash = v.hash AND o.idx = v.idx
-		JOIN tx_state ts ON ts.tx_hash = v.hash
+		JOIN txs t ON t.hash = v.hash
 		LEFT JOIN spends sp ON sp.prev_tx_hash = v.hash AND sp.prev_output_idx = v.idx`)
 
 	rows, err := pgxTx.Query(ctx, sb.String(), args...)
@@ -405,7 +400,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			continue
 		}
 
-		// Check if already spent
+		// Check if already spent.
 		if len(r.existingSpendBytes) > 0 {
 			spendingDataBytes := spend.SpendingData.Bytes()
 			if !bytes.Equal(r.existingSpendBytes, spendingDataBytes) {
@@ -459,32 +454,10 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	if len(dedupedInsert) > 0 {
 		var ib strings.Builder
 		ib.WriteString(`
-			INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
-			SELECT * FROM (VALUES `)
-		insertArgs := make([]interface{}, 0, len(dedupedInsert)*4)
-		pidx := 1
-		for j, u := range dedupedInsert {
-			if j > 0 {
-				ib.WriteByte(',')
-			}
-			ib.WriteString(fmt.Sprintf("($%d::bytea, $%d::bigint, $%d::bytea, $%d::int)", pidx, pidx+1, pidx+2, pidx+3))
-			insertArgs = append(insertArgs, u.prevTxHash, u.prevOutputIdx, u.spendingData, u.batchIdx)
-			pidx += 4
-		}
-		ib.WriteString(`) AS v(prev_tx_hash, prev_output_idx, spending_data, batch_idx)
-			ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
-			RETURNING (SELECT v.batch_idx FROM (VALUES `) // need subquery to get batch_idx back
-
-		// Actually, RETURNING can only reference columns from the inserted row.
-		// We need a different approach. Let me use a CTE approach instead.
-		// Rewrite:
-
-		ib.Reset()
-		ib.WriteString(`
 			WITH to_insert AS (
 				SELECT * FROM (VALUES `)
-		insertArgs = insertArgs[:0]
-		pidx = 1
+		insertArgs := make([]interface{}, 0, len(dedupedInsert)*4)
+		pidx := 1
 		for j, u := range dedupedInsert {
 			if j > 0 {
 				ib.WriteByte(',')
@@ -588,8 +561,8 @@ func isDeadlock(err error) bool {
 	return strings.Contains(err.Error(), "40P01") || strings.Contains(err.Error(), "deadlock")
 }
 
-// diagnoseSpendFailure queries the output + tx_state + spends to determine
-// why a spend INSERT failed. Returns the appropriate typed error.
+// diagnoseSpendFailure queries the output + txs + spends to determine
+// why a spend INSERT failed.
 func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spendingDataBytes []byte,
 	blockHeight uint32, ignoreLocked, ignoreConflicting bool) error {
 
@@ -617,7 +590,7 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 		return errors.NewStorageError("[Spend] diagnostic query failed for %s:%d", spend.TxID, spend.Vout, err)
 	}
 
-	// Check existing spend (double-spend or idempotent)
+	// Check existing spend (double-spend or idempotent).
 	if existingSpendBytes != nil {
 		if bytes.Equal(existingSpendBytes, spendingDataBytes) {
 			// Idempotent: same spending data already recorded.
@@ -631,33 +604,33 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 		return errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSD)
 	}
 
-	// Check frozen
+	// Check frozen.
 	if outputFrozen || txFrozen {
 		return errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
 	}
 
-	// Check locked (when not ignored)
+	// Check locked (when not ignored).
 	if txLocked && !ignoreLocked {
 		return errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
 	}
 
-	// Check conflicting (when not ignored)
+	// Check conflicting (when not ignored).
 	if txConflicting && !ignoreConflicting {
 		return errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
 	}
 
-	// Check UTXO hash mismatch
+	// Check UTXO hash mismatch.
 	if !bytes.Equal(utxoHashBytes, spend.UTXOHash[:]) {
 		return errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 
-	// Check coinbase maturity
+	// Check coinbase maturity.
 	if coinbaseSpendingHeight > 0 && coinbaseSpendingHeight > int64(blockHeight) {
 		return errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d",
 			spend.TxID, spend.Vout, coinbaseSpendingHeight, blockHeight)
 	}
 
-	// Check spendable_in
+	// Check spendable_in.
 	if spendableIn != nil && *spendableIn > 0 && blockHeight < uint32(*spendableIn) {
 		return errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
 	}
@@ -684,7 +657,6 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 }
 
 // Unspend reverses a previous spend operation by deleting from the spends table.
-// TODO: implement fully in Task 8.
 func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) error {
 	if len(spends) == 0 {
 		return nil

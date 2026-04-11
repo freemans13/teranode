@@ -4,18 +4,63 @@ import (
 	"context"
 	"database/sql"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-batcher"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // register pgx stdlib driver
 )
 
 var _ utxo.Store = (*Store)(nil)
+
+const txCacheMaxSize = 100_000
+
+// txCache is a simple bounded in-process cache for recently created transactions.
+type txCache struct {
+	mu      sync.RWMutex
+	entries map[chainhash.Hash]*meta.Data
+	maxSize int
+}
+
+func newTxCache(maxSize int) *txCache {
+	return &txCache{
+		entries: make(map[chainhash.Hash]*meta.Data, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+func (c *txCache) Get(hash chainhash.Hash) *meta.Data {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.entries[hash]
+}
+
+func (c *txCache) Add(hash chainhash.Hash, data *meta.Data) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Evict randomly when full (simple strategy — LRU not needed for this use case).
+	if len(c.entries) >= c.maxSize {
+		for k := range c.entries {
+			delete(c.entries, k)
+			break
+		}
+	}
+	c.entries[hash] = data
+}
+
+func (c *txCache) Remove(hash chainhash.Hash) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, hash)
+}
 
 // Store implements the utxo.Store interface using direct writes to
 // append-only PostgreSQL tables with optional batching for throughput.
@@ -37,6 +82,9 @@ type Store struct {
 	// batchers — nil until Start() is called.
 	createBatcher *batcher.Batcher[batchCreateItem]
 	spendBatcher  *batcher.Batcher[batchSpendItem]
+
+	// in-process cache for recently created transactions.
+	cache *txCache
 }
 
 // New creates a new direct-write UTXO store.
@@ -50,7 +98,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
-	pgxConfig.MaxConns = 20
+	pgxConfig.MaxConns = 100
+
+	// Set synchronous_commit = off on each connection for write performance.
+	pgxConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, "SET synchronous_commit = off")
+		return err
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, pgxConfig)
 	if err != nil {
@@ -72,6 +126,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		storeURL: storeURL,
 		pool:     pool,
 		db:       db,
+		cache:    newTxCache(txCacheMaxSize),
 	}
 
 	if err := s.createSchema(ctx); err != nil {
@@ -86,7 +141,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 // Start initializes the create and spend batchers for throughput optimization.
 // Without calling Start(), Create() and Spend() work in direct (unbatched) mode.
 func (s *Store) Start(_ context.Context) {
-	// Create batcher — pipelines N CTE creates in 1 pgx.SendBatch flush.
+	// Create batcher — pipelines N creates via COPY to staging + INSERT...SELECT.
 	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
 	if storeBatchSize <= 0 {
 		storeBatchSize = 100
