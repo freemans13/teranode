@@ -236,8 +236,8 @@ func newSQLStoreForBench(t *testing.T) utxo.Store {
 	storeURL, _ := url.Parse(throughputDSN)
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
-	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 1
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 1
 	tSettings.UtxoStore.GetBatcherSize = 100
 	tSettings.Postgres.MaxOpenConns = 40
 	logger := ulogger.TestLogger{}
@@ -256,8 +256,8 @@ func newQueueStoreForBench(t *testing.T) utxo.Store {
 	storeURL.Scheme = "postgresqueue"
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
-	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 1
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 1
 	logger := ulogger.TestLogger{}
 	s, err := queue.New(ctx, logger, tSettings, storeURL)
 	if err != nil {
@@ -284,12 +284,14 @@ func terminateOtherConnections(t *testing.T) {
 func TestThroughput_SQLStore(t *testing.T) {
 	s := newSQLStoreForBench(t)
 	workerOffset := 0
-	for _, workers := range []int{1, 10, 100, 500, 1000, 10000} {
-		opsPerWorker := 20
+	for _, workers := range []int{1, 10, 100, 500, 1000, 5000, 10000, 15000} {
+		opsPerWorker := 10
 		if workers <= 10 {
 			opsPerWorker = 100
 		} else if workers <= 100 {
 			opsPerWorker = 50
+		} else if workers <= 1000 {
+			opsPerWorker = 20
 		}
 		offset := workerOffset
 		workerOffset += workers
@@ -305,10 +307,12 @@ func TestThroughput_QueueStore(t *testing.T) {
 	terminateOtherConnections(t)
 	s := newQueueStoreForBench(t)
 	workerOffset := 0
-	for _, workers := range []int{1, 10, 100, 500, 1000, 10000} {
-		opsPerWorker := 20
+	for _, workers := range []int{1, 10, 100, 500, 1000, 5000, 10000, 15000} {
+		opsPerWorker := 10
 		if workers <= 10 {
 			opsPerWorker = 50
+		} else if workers <= 1000 {
+			opsPerWorker = 20
 		}
 		offset := workerOffset
 		workerOffset += workers

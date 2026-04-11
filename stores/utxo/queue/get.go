@@ -23,11 +23,18 @@ import (
 const maxINClauseSize = 400
 
 // Get retrieves UTXO metadata for a given transaction hash.
+// Checks in-process cache first (populated by Create).
 // The requested fields control which additional queries are executed.
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields ...fields.FieldName) (*meta.Data, error) {
 	bins := utxo.MetaFieldsWithTx
 	if len(requestedFields) > 0 {
 		bins = requestedFields
+	}
+
+	// Cache hit path — returns immediately without DB round-trip.
+	// Cache entries are created by Create() and invalidated by Delete()/SetConflicting().
+	if cached := s.cache.Get(*hash); cached != nil {
+		return cached, nil
 	}
 
 	return s.getInternal(ctx, hash, bins)
