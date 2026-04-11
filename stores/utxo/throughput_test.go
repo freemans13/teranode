@@ -284,10 +284,12 @@ func terminateOtherConnections(t *testing.T) {
 func TestThroughput_SQLStore(t *testing.T) {
 	s := newSQLStoreForBench(t)
 	workerOffset := 0
-	for _, workers := range []int{1, 10, 100, 500} {
-		opsPerWorker := 50
+	for _, workers := range []int{1, 10, 100, 500, 1000, 10000} {
+		opsPerWorker := 20
 		if workers <= 10 {
 			opsPerWorker = 100
+		} else if workers <= 100 {
+			opsPerWorker = 50
 		}
 		offset := workerOffset
 		workerOffset += workers
@@ -303,7 +305,7 @@ func TestThroughput_QueueStore(t *testing.T) {
 	terminateOtherConnections(t)
 	s := newQueueStoreForBench(t)
 	workerOffset := 0
-	for _, workers := range []int{1, 10, 100, 500, 1000} {
+	for _, workers := range []int{1, 10, 100, 500, 1000, 10000} {
 		opsPerWorker := 20
 		if workers <= 10 {
 			opsPerWorker = 50
