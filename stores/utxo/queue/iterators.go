@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// unminedTxIterator implements utxo.UnminedTxIterator for the v5 queue store.
+// unminedTxIterator implements utxo.UnminedTxIterator for the v6 queue store.
 type unminedTxIterator struct {
 	store *Store
 	rows  pgx.Rows
@@ -26,7 +26,7 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 	q := `
 		SELECT hash, fee, size_in_bytes, inserted_at, coinbase,
 		       locked, unmined_since, raw_tx, block_ids
-		FROM txs
+		FROM utxos
 		WHERE unmined_since IS NOT NULL AND conflicting = false
 		ORDER BY hash
 	`
@@ -43,7 +43,7 @@ func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unmi
 	q := `
 		SELECT hash, fee, size_in_bytes, inserted_at, coinbase,
 		       locked, unmined_since, raw_tx, block_ids
-		FROM txs
+		FROM utxos
 		WHERE unmined_since IS NOT NULL
 		  AND unmined_since <= $1
 		  AND conflicting = false
@@ -198,7 +198,7 @@ func (s *Store) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (utxo.Unm
 // older than the cutoff height.
 func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT hash FROM txs
+		SELECT hash FROM utxos
 		WHERE unmined_since IS NOT NULL AND unmined_since <= $1
 		ORDER BY unmined_since LIMIT 1000
 	`, int64(cutoffBlockHeight))

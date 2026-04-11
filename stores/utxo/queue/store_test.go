@@ -28,7 +28,7 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 
 	ctx := context.Background()
 
-	// Clean slate -- drop all tables (including old v3 + v4 tables if present)
+	// Clean slate -- drop all tables (including old v3/v4/v5 tables if present)
 	pool, err := pgxpool.New(ctx, testDSN)
 	if err != nil {
 		t.Skipf("Skipping: cannot connect to postgres: %v", err)
@@ -38,10 +38,11 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 		t.Skipf("Skipping: cannot connect to postgres: %v", err)
 	}
 	_, _ = pool.Exec(ctx, `
+		DROP FUNCTION IF EXISTS spend_utxo(BYTEA, INT, BYTEA, BYTEA, BIGINT, BOOLEAN, BOOLEAN) CASCADE;
 		DROP FUNCTION IF EXISTS process_batch(BIGINT) CASCADE;
 		DROP FUNCTION IF EXISTS process_delete_at_height(BIGINT) CASCADE;
 		DROP PROCEDURE IF EXISTS materialize_loop() CASCADE;
-		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
+		DROP TABLE IF EXISTS utxos, conflicting_children, block_ids, spends, outputs, inputs,
 			tx_state, transactions, txs,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
 			batch_notifications CASCADE;
@@ -84,36 +85,39 @@ func testExtendedTx(t *testing.T) *bt.Tx {
 func TestSchemaCreation(t *testing.T) {
 	store, ctx := setupTestStore(t)
 
-	// Verify all 3 tables exist by querying them.
-	tables := []string{"txs", "outputs", "spends"}
-	for _, table := range tables {
-		var count int
-		err := store.pool.QueryRow(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count)
-		require.NoError(t, err, "table %s should exist", table)
-	}
+	// Verify the utxos table exists.
+	var count int
+	err := store.pool.QueryRow(ctx, "SELECT COUNT(*) FROM utxos").Scan(&count)
+	require.NoError(t, err, "utxos table should exist")
 
-	// Verify partitions exist (16 per table = 48 total).
-	for _, table := range tables {
-		var partCount int
-		err := store.pool.QueryRow(ctx, `
-			SELECT COUNT(*)
-			FROM pg_inherits
-			JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
-			WHERE parent.relname = $1
-		`, table).Scan(&partCount)
-		require.NoError(t, err, "should be able to count partitions for %s", table)
-		require.Equal(t, 16, partCount, "table %s should have 16 partitions", table)
-	}
+	// Verify partitions exist (16).
+	var partCount int
+	err = store.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_inherits
+		JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+		WHERE parent.relname = 'utxos'
+	`).Scan(&partCount)
+	require.NoError(t, err, "should be able to count partitions for utxos")
+	require.Equal(t, 16, partCount, "utxos should have 16 partitions")
 
-	// Verify txs partial indexes exist.
+	// Verify partial indexes exist.
 	var idxCount int
-	err := store.pool.QueryRow(ctx, `
+	err = store.pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM pg_indexes
 		WHERE indexname IN ('px_unmined_since', 'px_delete_at_height')
 	`).Scan(&idxCount)
 	require.NoError(t, err)
-	require.Equal(t, 2, idxCount, "txs should have 2 partial indexes")
+	require.Equal(t, 2, idxCount, "utxos should have 2 partial indexes")
+
+	// Verify spend_utxo function exists.
+	var funcExists bool
+	err = store.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'spend_utxo')
+	`).Scan(&funcExists)
+	require.NoError(t, err)
+	require.True(t, funcExists, "spend_utxo function should exist")
 }
 
 func TestHealth(t *testing.T) {
@@ -1070,11 +1074,11 @@ func TestDeleteWithBlockIDs(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 
-	// Verify txs row (including embedded block_ids) is gone.
+	// Verify utxos row is gone.
 	var count int
-	err = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM txs WHERE hash = $1`, txHash[:]).Scan(&count)
+	err = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM utxos WHERE hash = $1`, txHash[:]).Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, 0, count, "txs row should be deleted")
+	require.Equal(t, 0, count, "utxos row should be deleted")
 }
 
 func TestDeleteWithSpends(t *testing.T) {
@@ -1095,7 +1099,7 @@ func TestDeleteWithSpends(t *testing.T) {
 
 	parentHash := parentTx.TxIDChainHash()
 
-	// Delete the parent: should also remove its spends.
+	// Delete the parent: one table, one DELETE.
 	err = store.Delete(ctx, parentHash)
 	require.NoError(t, err)
 
@@ -1103,11 +1107,11 @@ func TestDeleteWithSpends(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 
-	// Verify spends are cleaned up.
+	// Verify the utxos row is gone (spends are in the same row).
 	var count int
-	err = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM spends WHERE prev_tx_hash = $1`, parentHash[:]).Scan(&count)
+	err = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM utxos WHERE hash = $1`, parentHash[:]).Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, 0, count, "spends should be deleted")
+	require.Equal(t, 0, count, "utxos row should be deleted")
 }
 
 func TestDeleteNonExistent(t *testing.T) {
@@ -1148,7 +1152,7 @@ func TestSetDAH(t *testing.T) {
 	require.NoError(t, err)
 
 	var dah *int64
-	err = store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash = $1`, txHash[:]).Scan(&dah)
+	err = store.pool.QueryRow(ctx, `SELECT delete_at_height FROM utxos WHERE hash = $1`, txHash[:]).Scan(&dah)
 	require.NoError(t, err)
 	require.Nil(t, dah, "DAH should not be set while outputs are unspent")
 
@@ -1168,7 +1172,7 @@ func TestSetDAH(t *testing.T) {
 	err = store.setDAH(ctx, txHash)
 	require.NoError(t, err)
 
-	err = store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash = $1`, txHash[:]).Scan(&dah)
+	err = store.pool.QueryRow(ctx, `SELECT delete_at_height FROM utxos WHERE hash = $1`, txHash[:]).Scan(&dah)
 	require.NoError(t, err)
 	require.NotNil(t, dah, "DAH should be set when all outputs are spent")
 	expectedDAH := int64(blockHeight + 1 + 10) // blockHeight + 1 + retention
@@ -1299,11 +1303,11 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	err = store.FreezeUTXOs(ctx, spends, nil)
 	require.NoError(t, err)
 
-	// Verify frozen.
-	var frozen bool
-	err = store.pool.QueryRow(ctx, `SELECT frozen FROM outputs WHERE tx_hash = $1 AND idx = 0`, txHash[:]).Scan(&frozen)
+	// Verify frozen via array.
+	var frozenOutputs []bool
+	err = store.pool.QueryRow(ctx, `SELECT frozen_outputs FROM utxos WHERE hash = $1`, txHash[:]).Scan(&frozenOutputs)
 	require.NoError(t, err)
-	require.True(t, frozen)
+	require.True(t, len(frozenOutputs) > 0 && frozenOutputs[0], "output 0 should be frozen")
 
 	// Double-freeze should error.
 	err = store.FreezeUTXOs(ctx, spends, nil)
@@ -1314,9 +1318,9 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify unfrozen.
-	err = store.pool.QueryRow(ctx, `SELECT frozen FROM outputs WHERE tx_hash = $1 AND idx = 0`, txHash[:]).Scan(&frozen)
+	err = store.pool.QueryRow(ctx, `SELECT frozen_outputs FROM utxos WHERE hash = $1`, txHash[:]).Scan(&frozenOutputs)
 	require.NoError(t, err)
-	require.False(t, frozen)
+	require.True(t, len(frozenOutputs) > 0 && !frozenOutputs[0], "output 0 should be unfrozen")
 
 	// Double-unfreeze should error.
 	err = store.UnFreezeUTXOs(ctx, spends, nil)
@@ -1350,14 +1354,14 @@ func TestReAssignUTXO(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify: frozen should be false, utxo_hash should be updated.
-	var outputFrozen bool
-	var storedUtxoHash []byte
+	var frozenOutputs []bool
+	var storedUtxoHashes [][]byte
 	err = store.pool.QueryRow(ctx,
-		`SELECT frozen, utxo_hash FROM outputs WHERE tx_hash = $1 AND idx = 0`,
-		txHash[:]).Scan(&outputFrozen, &storedUtxoHash)
+		`SELECT frozen_outputs, utxo_hashes FROM utxos WHERE hash = $1`,
+		txHash[:]).Scan(&frozenOutputs, &storedUtxoHashes)
 	require.NoError(t, err)
-	require.False(t, outputFrozen, "should be unfrozen after reassign")
-	require.Equal(t, newHash[:], storedUtxoHash)
+	require.False(t, frozenOutputs[0], "should be unfrozen after reassign")
+	require.Equal(t, newHash[:], storedUtxoHashes[0])
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,7 +1385,7 @@ func TestPreserveTransactions(t *testing.T) {
 	var preserveUntil *int64
 	var dah *int64
 	err = store.pool.QueryRow(ctx,
-		`SELECT preserve_until, delete_at_height FROM txs WHERE hash = $1`,
+		`SELECT preserve_until, delete_at_height FROM utxos WHERE hash = $1`,
 		txHash[:]).Scan(&preserveUntil, &dah)
 	require.NoError(t, err)
 	require.NotNil(t, preserveUntil)
@@ -1410,7 +1414,7 @@ func TestProcessExpiredPreservations(t *testing.T) {
 	var preserveUntil *int64
 	var dah *int64
 	err = store.pool.QueryRow(ctx,
-		`SELECT preserve_until, delete_at_height FROM txs WHERE hash = $1`,
+		`SELECT preserve_until, delete_at_height FROM utxos WHERE hash = $1`,
 		txHash[:]).Scan(&preserveUntil, &dah)
 	require.NoError(t, err)
 	require.Nil(t, preserveUntil, "preserve_until should be cleared")
@@ -1429,7 +1433,7 @@ func TestPrunerService(t *testing.T) {
 
 	// Set delete_at_height = 50.
 	_, err = store.pool.Exec(ctx,
-		`UPDATE txs SET delete_at_height = 50 WHERE hash = $1`,
+		`UPDATE utxos SET delete_at_height = 50 WHERE hash = $1`,
 		txHash[:])
 	require.NoError(t, err)
 
@@ -1448,7 +1452,7 @@ func TestPrunerService(t *testing.T) {
 	// Verify the tx is gone.
 	var txCount int
 	err = store.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM txs WHERE hash = $1`, txHash[:]).Scan(&txCount)
+		`SELECT COUNT(*) FROM utxos WHERE hash = $1`, txHash[:]).Scan(&txCount)
 	require.NoError(t, err)
 	require.Equal(t, 0, txCount, "transaction should be deleted by pruner")
 }

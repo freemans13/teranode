@@ -62,8 +62,10 @@ func (c *txCache) Remove(hash chainhash.Hash) {
 	delete(c.entries, hash)
 }
 
-// Store implements the utxo.Store interface using direct writes to
-// append-only PostgreSQL tables with optional batching for throughput.
+// Store implements the utxo.Store interface using a single-table document model
+// (v6). One row per transaction in the utxos table, with all output data stored
+// as parallel arrays and a spend_utxo() stored function for atomic server-side
+// spend validation.
 type Store struct {
 	logger   ulogger.Logger
 	settings *settings.Settings
@@ -87,7 +89,7 @@ type Store struct {
 	cache *txCache
 }
 
-// New creates a new direct-write UTXO store.
+// New creates a new v6 document-model UTXO store.
 // The storeURL scheme should be "postgresqueue"; it is rewritten to "postgres"
 // for the underlying connections.
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, storeURL *url.URL) (*Store, error) {
@@ -141,7 +143,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 // Start initializes the create and spend batchers for throughput optimization.
 // Without calling Start(), Create() and Spend() work in direct (unbatched) mode.
 func (s *Store) Start(_ context.Context) {
-	// Create batcher — pipelines N creates via COPY to staging + INSERT...SELECT.
+	// Create batcher — pipelines N INSERTs via SendBatch.
 	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
 	if storeBatchSize <= 0 {
 		storeBatchSize = 100
@@ -152,7 +154,7 @@ func (s *Store) Start(_ context.Context) {
 	}
 	s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
 
-	// Spend batcher — bulk SELECT + bulk INSERT for N spends.
+	// Spend batcher — pipelines N spend_utxo() function calls via SendBatch.
 	// background=false to prevent PostgreSQL deadlocks from concurrent
 	// transactions locking overlapping rows in different orders.
 	spendBatchSize := s.settings.UtxoStore.SpendBatcherSize
