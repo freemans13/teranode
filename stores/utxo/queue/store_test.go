@@ -84,15 +84,15 @@ func testExtendedTx(t *testing.T) *bt.Tx {
 func TestSchemaCreation(t *testing.T) {
 	store, ctx := setupTestStore(t)
 
-	// Verify all 3 tables exist by querying them.
-	tables := []string{"txs", "outputs", "spends"}
+	// Verify all 2 tables exist by querying them (v7: no outputs table).
+	tables := []string{"txs", "spends"}
 	for _, table := range tables {
 		var count int
 		err := store.pool.QueryRow(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count)
 		require.NoError(t, err, "table %s should exist", table)
 	}
 
-	// Verify partitions exist (16 per table = 48 total).
+	// Verify partitions exist (16 per table = 32 total).
 	for _, table := range tables {
 		var partCount int
 		err := store.pool.QueryRow(ctx, `
@@ -1299,11 +1299,11 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	err = store.FreezeUTXOs(ctx, spends, nil)
 	require.NoError(t, err)
 
-	// Verify frozen.
-	var frozen bool
-	err = store.pool.QueryRow(ctx, `SELECT frozen FROM outputs WHERE tx_hash = $1 AND idx = 0`, txHash[:]).Scan(&frozen)
+	// Verify frozen (v7: frozen_outputs array on txs).
+	var frozenOutputs []bool
+	err = store.pool.QueryRow(ctx, `SELECT frozen_outputs FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozenOutputs)
 	require.NoError(t, err)
-	require.True(t, frozen)
+	require.True(t, len(frozenOutputs) > 0 && frozenOutputs[0])
 
 	// Double-freeze should error.
 	err = store.FreezeUTXOs(ctx, spends, nil)
@@ -1314,9 +1314,9 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify unfrozen.
-	err = store.pool.QueryRow(ctx, `SELECT frozen FROM outputs WHERE tx_hash = $1 AND idx = 0`, txHash[:]).Scan(&frozen)
+	err = store.pool.QueryRow(ctx, `SELECT frozen_outputs FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozenOutputs)
 	require.NoError(t, err)
-	require.False(t, frozen)
+	require.True(t, len(frozenOutputs) > 0 && !frozenOutputs[0])
 
 	// Double-unfreeze should error.
 	err = store.UnFreezeUTXOs(ctx, spends, nil)
@@ -1349,15 +1349,17 @@ func TestReAssignUTXO(t *testing.T) {
 	err = store.ReAssignUTXO(ctx, sourceSpend, newSpend, nil)
 	require.NoError(t, err)
 
-	// Verify: frozen should be false, utxo_hash should be updated.
-	var outputFrozen bool
-	var storedUtxoHash []byte
+	// Verify: frozen_outputs[1] should be false, utxo_hashes[1] should be updated.
+	var frozenOutputs []bool
+	var storedUtxoHashes [][]byte
 	err = store.pool.QueryRow(ctx,
-		`SELECT frozen, utxo_hash FROM outputs WHERE tx_hash = $1 AND idx = 0`,
-		txHash[:]).Scan(&outputFrozen, &storedUtxoHash)
+		`SELECT frozen_outputs, utxo_hashes FROM txs WHERE hash = $1`,
+		txHash[:]).Scan(&frozenOutputs, &storedUtxoHashes)
 	require.NoError(t, err)
-	require.False(t, outputFrozen, "should be unfrozen after reassign")
-	require.Equal(t, newHash[:], storedUtxoHash)
+	require.True(t, len(frozenOutputs) > 0)
+	require.False(t, frozenOutputs[0], "should be unfrozen after reassign")
+	require.True(t, len(storedUtxoHashes) > 0)
+	require.Equal(t, newHash[:], storedUtxoHashes[0])
 }
 
 // ---------------------------------------------------------------------------

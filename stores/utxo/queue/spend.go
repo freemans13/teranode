@@ -34,17 +34,19 @@ type batchSpendItem struct {
 
 // spendValidationSQL is the CTE used to validate a spend attempt and insert
 // into the append-only spends table in a single round-trip.
+// v7: reads output data from txs arrays (index is $2+1 for 1-based PG arrays).
 const spendValidationSQL = `
 WITH validation AS (
-    SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
-           o.coinbase_spending_height,
+    SELECT t.utxo_hashes[$2+1] AS utxo_hash,
+           t.frozen OR COALESCE(t.frozen_outputs[$2+1], false) AS output_frozen,
+           t.spendable_in_arr[$2+1] AS spendable_in,
+           COALESCE(t.coinbase_heights[$2+1], 0) AS coinbase_spending_height,
            t.locked AS tx_locked, t.conflicting AS tx_conflicting,
            t.frozen AS tx_frozen,
            sp.spending_data AS existing_spend
-    FROM outputs o
-    JOIN txs t ON t.hash = o.tx_hash
-    LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
-    WHERE o.tx_hash = $1 AND o.idx = $2
+    FROM txs t
+    LEFT JOIN spends sp ON sp.prev_tx_hash = t.hash AND sp.prev_output_idx = $2
+    WHERE t.hash = $1 AND t.utxo_hashes[$2+1] IS NOT NULL
 )
 INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
 SELECT $1, $2, $3
@@ -60,18 +62,20 @@ ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
 RETURNING 1
 `
 
-// spendDiagnosticSQL re-queries the validation CTE when the INSERT returned
-// 0 rows, so we can determine the exact reason the spend failed.
+// spendDiagnosticSQL re-queries validation when the INSERT returned 0 rows,
+// so we can determine the exact reason the spend failed.
+// v7: reads from txs arrays instead of outputs table.
 const spendDiagnosticSQL = `
-SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
-       o.coinbase_spending_height,
+SELECT t.utxo_hashes[$2+1] AS utxo_hash,
+       t.frozen OR COALESCE(t.frozen_outputs[$2+1], false) AS output_frozen,
+       t.spendable_in_arr[$2+1] AS spendable_in,
+       COALESCE(t.coinbase_heights[$2+1], 0) AS coinbase_spending_height,
        t.locked AS tx_locked, t.conflicting AS tx_conflicting,
        t.frozen AS tx_frozen,
        sp.spending_data AS existing_spend
-FROM outputs o
-JOIN txs t ON t.hash = o.tx_hash
-LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
-WHERE o.tx_hash = $1 AND o.idx = $2
+FROM txs t
+LEFT JOIN spends sp ON sp.prev_tx_hash = t.hash AND sp.prev_output_idx = $2
+WHERE t.hash = $1 AND t.utxo_hashes[$2+1] IS NOT NULL
 `
 
 // ---------------------------------------------------------------------------
@@ -315,10 +319,14 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
 	// Phase 1: Bulk SELECT — fetch all output states in one query.
+	// v7: read output data from txs arrays (idx+1 for 1-based PG arrays).
 	var sb strings.Builder
 	sb.WriteString(`
-		SELECT v.batch_idx, o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
-		       o.coinbase_spending_height, t.locked, t.conflicting, t.frozen AS tx_frozen,
+		SELECT v.batch_idx, t.utxo_hashes[v.idx+1] AS utxo_hash,
+		       t.frozen OR COALESCE(t.frozen_outputs[v.idx+1], false) AS output_frozen,
+		       t.spendable_in_arr[v.idx+1] AS spendable_in,
+		       COALESCE(t.coinbase_heights[v.idx+1], 0) AS coinbase_spending_height,
+		       t.locked, t.conflicting, t.frozen AS tx_frozen,
 		       sp.spending_data AS existing_spend
 		FROM (VALUES `)
 	args := make([]interface{}, 0, len(batch)*3)
@@ -332,8 +340,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		paramIdx += 3
 	}
 	sb.WriteString(`) AS v(hash, idx, batch_idx)
-		JOIN outputs o ON o.tx_hash = v.hash AND o.idx = v.idx
-		JOIN txs t ON t.hash = v.hash
+		JOIN txs t ON t.hash = v.hash AND t.utxo_hashes[v.idx+1] IS NOT NULL
 		LEFT JOIN spends sp ON sp.prev_tx_hash = v.hash AND sp.prev_output_idx = v.idx`)
 
 	rows, err := pgxTx.Query(ctx, sb.String(), args...)

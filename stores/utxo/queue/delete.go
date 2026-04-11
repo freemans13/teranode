@@ -7,8 +7,8 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// Delete removes a transaction and all its associated data from all 3 tables
-// in a single pgx transaction.
+// Delete removes a transaction and all its associated data from txs + spends
+// in a single pgx transaction. v7: no separate outputs table.
 func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	pgxTx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -16,10 +16,9 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
-	// Delete in dependency order: children tables first, then parent table.
+	// Delete in dependency order: spends first, then txs.
 	deleteStatements := []string{
 		`DELETE FROM spends WHERE prev_tx_hash = $1`,
-		`DELETE FROM outputs WHERE tx_hash = $1`,
 		`DELETE FROM txs WHERE hash = $1`,
 	}
 
@@ -58,13 +57,12 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	}
 
 	// Check if all outputs are spent.
+	// v7: output count comes from array_length on utxo_hashes; spend count from spends table.
 	var allSpent bool
 	err = s.pool.QueryRow(ctx, `
-		SELECT NOT EXISTS(
-			SELECT 1 FROM outputs o
-			WHERE o.tx_hash = $1
-			AND NOT EXISTS (SELECT 1 FROM spends sp WHERE sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx)
-		) AS all_spent`,
+		SELECT COALESCE(array_length(t.utxo_hashes, 1), 0) =
+		       (SELECT COUNT(*) FROM spends sp WHERE sp.prev_tx_hash = t.hash)
+		FROM txs t WHERE t.hash = $1`,
 		hash[:],
 	).Scan(&allSpent)
 	if err != nil {
