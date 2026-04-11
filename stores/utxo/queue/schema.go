@@ -60,6 +60,17 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		return errors.NewStorageError("index creation failed: %v", err)
 	}
 
+	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
+	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`)
+
+	// Playbook §9: aggressive autovacuum on hot-update table.
+	_, _ = pool.Exec(ctx, `ALTER TABLE txs SET (
+		autovacuum_vacuum_scale_factor = 0.01,
+		autovacuum_analyze_scale_factor = 0.005,
+		autovacuum_vacuum_cost_delay = 2,
+		autovacuum_vacuum_insert_threshold = 1000
+	)`)
+
 	return nil
 }
 
