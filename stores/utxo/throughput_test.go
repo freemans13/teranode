@@ -236,8 +236,8 @@ func newSQLStoreForBench(t *testing.T) utxo.Store {
 	storeURL, _ := url.Parse(throughputDSN)
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 1
-	tSettings.UtxoStore.StoreBatcherDurationMillis = 1
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
 	tSettings.UtxoStore.GetBatcherSize = 100
 	tSettings.Postgres.MaxOpenConns = 40
 	logger := ulogger.TestLogger{}
@@ -256,8 +256,8 @@ func newQueueStoreForBench(t *testing.T) utxo.Store {
 	storeURL.Scheme = "postgresqueue"
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 1
-	tSettings.UtxoStore.StoreBatcherDurationMillis = 1
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
 	logger := ulogger.TestLogger{}
 	s, err := queue.New(ctx, logger, tSettings, storeURL)
 	if err != nil {

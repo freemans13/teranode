@@ -29,6 +29,8 @@ const (
 	UTXOStorePostgres UTXOStoreType = "postgres"
 	// UTXOStoreSQLite uses SQLite as the UTXO store backend (no container needed)
 	UTXOStoreSQLite UTXOStoreType = "sqlite"
+	// UTXOStorePostgresQueue uses the queue-based PostgreSQL UTXO store backend
+	UTXOStorePostgresQueue UTXOStoreType = "postgresqueue"
 )
 
 // ContainerManager manages test container lifecycle for various store backends
@@ -71,6 +73,8 @@ func (cm *ContainerManager) Initialize(ctx context.Context) (*url.URL, error) {
 		return cm.initializePostgres(ctx)
 	case UTXOStoreSQLite:
 		return cm.initializeSQLite()
+	case UTXOStorePostgresQueue:
+		return cm.initializePostgresQueue(ctx)
 	default:
 		return nil, errors.NewInvalidArgumentError("unsupported UTXO store type: %s", cm.storeType)
 	}
@@ -202,6 +206,21 @@ func (cm *ContainerManager) initializePostgres(ctx context.Context) (*url.URL, e
 	if err != nil {
 		return nil, errors.NewExternalError("failed to parse PostgreSQL URL: %v", err)
 	}
+
+	return parsedURL, nil
+}
+
+// initializePostgresQueue starts a PostgreSQL container and returns a postgresqueue:// URL
+// for the queue-based UTXO store. Reuses the same container setup as initializePostgres.
+func (cm *ContainerManager) initializePostgresQueue(ctx context.Context) (*url.URL, error) {
+	parsedURL, err := cm.initializePostgres(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Rewrite scheme from postgres to postgresqueue
+	parsedURL.Scheme = "postgresqueue"
+	cm.containerURL = parsedURL.String()
 
 	return parsedURL, nil
 }

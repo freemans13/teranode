@@ -31,12 +31,6 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 		bins = requestedFields
 	}
 
-	// Cache hit path — returns immediately without DB round-trip.
-	// Cache entries are created by Create() and invalidated by Delete()/SetConflicting().
-	if cached := s.cache.Get(*hash); cached != nil {
-		return cached, nil
-	}
-
 	return s.getInternal(ctx, hash, bins)
 }
 
