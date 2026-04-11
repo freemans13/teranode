@@ -70,7 +70,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 // txs: consolidated transaction metadata + state + inputs (raw_tx) + block_ids
 // (arrays) + conflicting_children (array). UNLOGGED for performance.
 const txsDDL = `
-CREATE UNLOGGED TABLE IF NOT EXISTS txs (
+CREATE TABLE IF NOT EXISTS txs (
     hash                 BYTEA PRIMARY KEY,
     version              BIGINT NOT NULL,
     lock_time            BIGINT NOT NULL,
@@ -98,7 +98,7 @@ CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE d
 
 // outputs: immutable transaction outputs. UNLOGGED for performance.
 const outputsDDL = `
-CREATE UNLOGGED TABLE IF NOT EXISTS outputs (
+CREATE TABLE IF NOT EXISTS outputs (
     tx_hash                 BYTEA   NOT NULL,
     idx                     BIGINT  NOT NULL,
     locking_script          BYTEA   NOT NULL,
@@ -112,7 +112,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS outputs (
 
 // spends: append-only spend records. UNLOGGED for performance.
 const spendsDDL = `
-CREATE UNLOGGED TABLE IF NOT EXISTS spends (
+CREATE TABLE IF NOT EXISTS spends (
     prev_tx_hash    BYTEA  NOT NULL,
     prev_output_idx BIGINT NOT NULL,
     spending_data   BYTEA  NOT NULL,
