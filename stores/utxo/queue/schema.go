@@ -122,6 +122,6 @@ CREATE UNLOGGED TABLE IF NOT EXISTS spends (
 // createStagingTablesSQL is executed per-connection to ensure temp staging
 // tables exist for the COPY-based create batcher.
 const createStagingTablesSQL = `
-CREATE TEMP TABLE IF NOT EXISTS staging_txs (LIKE txs INCLUDING NOTHING) ON COMMIT DELETE ROWS;
-CREATE TEMP TABLE IF NOT EXISTS staging_outputs (LIKE outputs INCLUDING NOTHING) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS staging_txs (LIKE txs EXCLUDING ALL) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS staging_outputs (LIKE outputs EXCLUDING ALL) ON COMMIT DELETE ROWS;
 `

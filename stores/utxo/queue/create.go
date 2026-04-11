@@ -396,7 +396,19 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 		})
 	}
 
-	_, err = conn.Conn().CopyFrom(ctx, pgx.Identifier{"staging_txs"}, txCols, txSource)
+	// BEGIN transaction first — all COPY + INSERT...SELECT in one transaction.
+	// This prevents ON COMMIT DELETE ROWS from clearing staging data between COPY and INSERT.
+	pgxTx, err := conn.Begin(ctx)
+	if err != nil {
+		for _, idx := range validIndices {
+			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to begin transaction", err)}
+		}
+		return
+	}
+	defer pgxTx.Rollback(ctx) //nolint:errcheck
+
+	// COPY tx rows into staging_txs within the transaction.
+	_, err = pgxTx.Conn().CopyFrom(ctx, pgx.Identifier{"staging_txs"}, txCols, txSource)
 	if err != nil {
 		for _, idx := range validIndices {
 			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to COPY txs to staging", err)}
@@ -404,7 +416,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 		return
 	}
 
-	// COPY output rows into staging_outputs.
+	// COPY output rows into staging_outputs within the transaction.
 	outCols := []string{
 		"tx_hash", "idx", "locking_script", "satoshis", "utxo_hash",
 		"coinbase_spending_height", "frozen", "spendable_in",
@@ -425,7 +437,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 	}
 
 	if len(outSource.rows) > 0 {
-		_, err = conn.Conn().CopyFrom(ctx, pgx.Identifier{"staging_outputs"}, outCols, outSource)
+		_, err = pgxTx.Conn().CopyFrom(ctx, pgx.Identifier{"staging_outputs"}, outCols, outSource)
 		if err != nil {
 			for _, idx := range validIndices {
 				batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to COPY outputs to staging", err)}
@@ -434,17 +446,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 		}
 	}
 
-	// BEGIN; INSERT...SELECT from staging into final tables; COMMIT.
-	pgxTx, err := conn.Begin(ctx)
-	if err != nil {
-		for _, idx := range validIndices {
-			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to begin transaction", err)}
-		}
-		return
-	}
-	defer pgxTx.Rollback(ctx) //nolint:errcheck
-
-	// INSERT txs and get back which were new.
+	// INSERT from staging into final tables and get back which were new.
 	rows, err := pgxTx.Query(ctx, `
 		INSERT INTO txs SELECT * FROM staging_txs ON CONFLICT (hash) DO NOTHING RETURNING hash
 	`)
