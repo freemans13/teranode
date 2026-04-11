@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"net/url"
 	"sync/atomic"
+	"time"
 
+	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -16,8 +18,7 @@ import (
 var _ utxo.Store = (*Store)(nil)
 
 // Store implements the utxo.Store interface using direct writes to
-// append-only PostgreSQL tables. There is no batcher, no materializer,
-// no queue tables, and no background goroutines.
+// append-only PostgreSQL tables with optional batching for throughput.
 type Store struct {
 	logger   ulogger.Logger
 	settings *settings.Settings
@@ -32,6 +33,10 @@ type Store struct {
 	// block state
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
+
+	// batchers — nil until Start() is called.
+	createBatcher *batcher.Batcher[batchCreateItem]
+	spendBatcher  *batcher.Batcher[batchSpendItem]
 }
 
 // New creates a new direct-write UTXO store.
@@ -78,13 +83,44 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	return s, nil
 }
 
-// Start is a no-op -- v4 has no background goroutines.
+// Start initializes the create and spend batchers for throughput optimization.
+// Without calling Start(), Create() and Spend() work in direct (unbatched) mode.
 func (s *Store) Start(_ context.Context) {
-	// intentionally empty
+	// Create batcher — pipelines N CTE creates in 1 pgx.SendBatch flush.
+	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
+	if storeBatchSize <= 0 {
+		storeBatchSize = 100
+	}
+	storeBatchDuration := time.Duration(s.settings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
+	if storeBatchDuration <= 0 {
+		storeBatchDuration = 10 * time.Millisecond
+	}
+	s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
+
+	// Spend batcher — bulk SELECT + bulk INSERT for N spends.
+	// background=false to prevent PostgreSQL deadlocks from concurrent
+	// transactions locking overlapping rows in different orders.
+	spendBatchSize := s.settings.UtxoStore.SpendBatcherSize
+	if spendBatchSize <= 0 {
+		spendBatchSize = 100
+	}
+	spendBatchDuration := time.Duration(s.settings.UtxoStore.SpendBatcherDurationMillis) * time.Millisecond
+	if spendBatchDuration <= 0 {
+		spendBatchDuration = 10 * time.Millisecond
+	}
+	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, false)
 }
 
-// Stop closes database connections.
+// Stop closes batchers and database connections.
 func (s *Store) Stop() {
+	if s.createBatcher != nil {
+		s.createBatcher.Close()
+		s.createBatcher = nil
+	}
+	if s.spendBatcher != nil {
+		s.spendBatcher.Close()
+		s.spendBatcher = nil
+	}
 	if s.pool != nil {
 		s.pool.Close()
 	}

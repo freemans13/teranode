@@ -36,7 +36,8 @@ func cleanDB(t *testing.T) {
 		DROP PROCEDURE IF EXISTS materialize_loop() CASCADE;
 		DROP FUNCTION IF EXISTS process_batch(BIGINT) CASCADE;
 		DROP FUNCTION IF EXISTS process_delete_at_height(BIGINT) CASCADE;
-		DROP TABLE IF EXISTS batch_notifications, conflicting_children, block_ids, outputs, inputs, transactions,
+		DROP TABLE IF EXISTS batch_notifications, conflicting_children, block_ids, spends, outputs, inputs,
+			tx_state, transactions,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue CASCADE;
 	`)
 }
@@ -255,6 +256,8 @@ func newQueueStoreForBench(t *testing.T) utxo.Store {
 	storeURL.Scheme = "postgresqueue"
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
 	logger := ulogger.TestLogger{}
 	s, err := queue.New(ctx, logger, tSettings, storeURL)
 	if err != nil {
