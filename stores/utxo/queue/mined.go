@@ -52,13 +52,29 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		}
 	}
 
-	// Fetch block_ids for all hashes after the update.
-	for _, hash := range hashes {
-		blockIDs, err := s.fetchBlockIDs(ctx, hash)
-		if err != nil {
-			return nil, err
+	// Bulk fetch block_ids for all hashes in one query.
+	hashBytes := make([][]byte, len(hashes))
+	for i, h := range hashes {
+		hashBytes[i] = h[:]
+	}
+	rows, err := s.pool.Query(ctx, `SELECT hash, block_ids FROM txs WHERE hash = ANY($1)`, hashBytes)
+	if err != nil {
+		return nil, errors.NewStorageError("[SetMinedMulti] bulk fetch block_ids: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var h []byte
+		var bids []int32
+		if err := rows.Scan(&h, &bids); err != nil {
+			return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids: %v", err)
 		}
-		resultMap[*hash] = blockIDs
+		var ch chainhash.Hash
+		copy(ch[:], h)
+		result := make([]uint32, len(bids))
+		for i, bid := range bids {
+			result[i] = uint32(bid)
+		}
+		resultMap[ch] = result
 	}
 
 	return resultMap, nil
