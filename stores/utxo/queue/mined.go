@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/jackc/pgx/v5"
 )
 
 // minedChunkSize is the maximum number of hashes per bulk UPDATE.
@@ -34,38 +35,84 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 
 	resultMap := make(map[chainhash.Hash][]uint32, len(hashes))
 
-	// Process in chunks.
+	// Pipeline all UPDATE chunks + fetch queries via SendBatch.
+	// This eliminates per-chunk round-trip latency.
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, errors.NewStorageError("[SetMinedMulti] acquire connection: %v", err)
+	}
+	defer conn.Release()
+
+	batch := &pgx.Batch{}
+
+	// Queue UPDATE chunks.
+	var updateSQL string
+	if minedBlockInfo.OnLongestChain {
+		updateSQL = `UPDATE txs SET
+			block_ids = COALESCE(block_ids, '{}') || $2::int[],
+			block_heights = COALESCE(block_heights, '{}') || $3::int[],
+			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+			locked = false, unmined_since = NULL
+		WHERE hash = ANY($1)`
+	} else {
+		updateSQL = `UPDATE txs SET
+			block_ids = COALESCE(block_ids, '{}') || $2::int[],
+			block_heights = COALESCE(block_heights, '{}') || $3::int[],
+			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+			locked = false
+		WHERE hash = ANY($1)`
+	}
+
+	numUpdateChunks := 0
 	for i := 0; i < len(hashes); i += minedChunkSize {
 		end := i + minedChunkSize
 		if end > len(hashes) {
 			end = len(hashes)
 		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		chunk := hashes[i:end]
+		hashBytes := make([][]byte, len(chunk))
+		for j, h := range chunk {
+			hashBytes[j] = h[:]
 		}
-
-		if err := s.setMinedChunk(ctx, hashes[i:end], minedBlockInfo); err != nil {
-			return nil, errors.NewStorageError("[SetMinedMulti] chunk %d-%d: %v", i, end-1, err)
-		}
+		batch.Queue(updateSQL,
+			hashBytes,
+			[]int32{int32(minedBlockInfo.BlockID)},
+			[]int32{int32(minedBlockInfo.BlockHeight)},
+			[]int32{int32(minedBlockInfo.SubtreeIdx)},
+		)
+		numUpdateChunks++
 	}
 
-	// Bulk fetch block_ids for all hashes in one query.
-	hashBytes := make([][]byte, len(hashes))
+	// Queue fetch query (one query for all hashes).
+	allHashBytes := make([][]byte, len(hashes))
 	for i, h := range hashes {
-		hashBytes[i] = h[:]
+		allHashBytes[i] = h[:]
 	}
-	rows, err := s.pool.Query(ctx, `SELECT hash, block_ids FROM txs WHERE hash = ANY($1)`, hashBytes)
+	batch.Queue(`SELECT hash, block_ids FROM txs WHERE hash = ANY($1)`, allHashBytes)
+
+	// Send entire batch in one network flush.
+	br := conn.SendBatch(ctx, batch)
+
+	// Drain UPDATE results.
+	for i := 0; i < numUpdateChunks; i++ {
+		if _, err := br.Exec(); err != nil {
+			br.Close()
+			return nil, errors.NewStorageError("[SetMinedMulti] UPDATE chunk %d: %v", i, err)
+		}
+	}
+
+	// Read fetch results.
+	rows, err := br.Query()
 	if err != nil {
+		br.Close()
 		return nil, errors.NewStorageError("[SetMinedMulti] bulk fetch block_ids: %v", err)
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var h []byte
 		var bids []int32
 		if err := rows.Scan(&h, &bids); err != nil {
+			rows.Close()
+			br.Close()
 			return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids: %v", err)
 		}
 		var ch chainhash.Hash
@@ -76,6 +123,8 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		}
 		resultMap[ch] = result
 	}
+	rows.Close()
+	br.Close()
 
 	return resultMap, nil
 }
