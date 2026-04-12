@@ -3,7 +3,6 @@ package queue
 import (
 	"bytes"
 	"context"
-	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -264,32 +263,8 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 // sendSpendBatch — batch callback for the go-batcher
 // ---------------------------------------------------------------------------
 
-// spendSelectResult holds the result of a bulk SELECT for a single spend item.
-type spendSelectResult struct {
-	batchIdx               int
-	utxoHash               []byte
-	outputFrozen           bool
-	spendableIn            *int32
-	coinbaseSpendingHeight int64
-	txLocked               bool
-	txConflicting          bool
-	txFrozen               bool
-	existingSpendBytes     []byte
-}
-
 func (s *Store) sendSpendBatch(batch []*batchSpendItem) {
-	const maxRetries = 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		retryable := s.trySendSpendBatch(batch)
-		if !retryable {
-			return
-		}
-		s.logger.Warnf("[Spend] deadlock detected (attempt %d/%d), retrying batch of %d items", attempt+1, maxRetries, len(batch))
-		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
-	}
-	for _, item := range batch {
-		item.errCh <- errors.NewStorageError("[Spend] deadlock persisted after %d retries", maxRetries)
-	}
+	s.trySendSpendBatch(batch)
 }
 
 func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
@@ -466,14 +441,6 @@ FROM validated v
 LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
 ORDER BY v.batch_idx
 `
-
-// isDeadlock checks if an error is a PostgreSQL deadlock (40P01).
-func isDeadlock(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "40P01") || strings.Contains(err.Error(), "deadlock")
-}
 
 // diagnoseSpendFailure queries the output + txs + spends to determine
 // why a spend INSERT failed.

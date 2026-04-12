@@ -159,60 +159,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	return resultMap, nil
 }
 
-// setMinedChunk processes a single chunk of hashes with a single UPDATE on txs
-// using array concatenation.
-func (s *Store) setMinedChunk(ctx context.Context, hashes []*chainhash.Hash, info utxo.MinedBlockInfo) error {
-	hashBytes := make([][]byte, len(hashes))
-	for i, h := range hashes {
-		hashBytes[i] = h[:]
-	}
-
-	// Idempotent UPDATE: only append if block_id not already present.
-	var q string
-	var args []interface{}
-	if info.OnLongestChain {
-		q = `UPDATE txs SET
-			block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
-				ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-			block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
-				ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-			subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
-				ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
-			locked = false,
-			unmined_since = NULL
-		WHERE hash = ANY($1)`
-		args = []interface{}{
-			hashBytes,
-			[]int32{int32(info.BlockID)},
-			[]int32{int32(info.BlockHeight)},
-			[]int32{int32(info.SubtreeIdx)},
-		}
-	} else {
-		q = `UPDATE txs SET
-			block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
-				ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-			block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
-				ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-			subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
-				ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
-			locked = false
-		WHERE hash = ANY($1)`
-		args = []interface{}{
-			hashBytes,
-			[]int32{int32(info.BlockID)},
-			[]int32{int32(info.BlockHeight)},
-			[]int32{int32(info.SubtreeIdx)},
-		}
-	}
-
-	_, err := s.pool.Exec(ctx, q, args...)
-	if err != nil {
-		return errors.NewStorageError("[SetMinedMulti] UPDATE txs: %v", err)
-	}
-
-	return nil
-}
-
 // unsetMinedMulti handles the reorg path: remove a block_id from the arrays.
 // If no block_ids remain after removal, sets unmined_since to current block height.
 func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, blockID uint32) (map[chainhash.Hash][]uint32, error) {

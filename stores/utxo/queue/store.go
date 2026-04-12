@@ -163,13 +163,14 @@ func (s *Store) Start(_ context.Context) {
 	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, true)
 
 	// Get batcher — pipelines N SELECTs via SendBatch.
+	// Duration matches spend/create batcher (configured via settings).
 	getBatchSize := 500
-	getBatchDuration := 5 * time.Millisecond
+	getBatchDuration := storeBatchDuration
 	s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, true)
 
 	// Unlock batcher — pipelines N UPDATEs via SendBatch.
 	unlockBatchSize := 500
-	unlockBatchDuration := 5 * time.Millisecond
+	unlockBatchDuration := storeBatchDuration
 	s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
 }
 
