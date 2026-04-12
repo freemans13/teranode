@@ -82,6 +82,8 @@ type Store struct {
 	// batchers — nil until Start() is called.
 	createBatcher *batcher.Batcher[batchCreateItem]
 	spendBatcher  *batcher.Batcher[batchSpendItem]
+	getBatcher    *batcher.Batcher[batchGetItem]
+	unlockBatcher *batcher.Batcher[batchUnlockItem]
 
 	// in-process cache for recently created transactions.
 	cache *txCache
@@ -163,6 +165,16 @@ func (s *Store) Start(_ context.Context) {
 		spendBatchDuration = 10 * time.Millisecond
 	}
 	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, true)
+
+	// Get batcher — pipelines N SELECTs via SendBatch.
+	getBatchSize := 500
+	getBatchDuration := 5 * time.Millisecond
+	s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, true)
+
+	// Unlock batcher — pipelines N UPDATEs via SendBatch.
+	unlockBatchSize := 500
+	unlockBatchDuration := 5 * time.Millisecond
+	s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
 }
 
 // Stop closes batchers and database connections.
@@ -174,6 +186,14 @@ func (s *Store) Stop() {
 	if s.spendBatcher != nil {
 		s.spendBatcher.Close()
 		s.spendBatcher = nil
+	}
+	if s.getBatcher != nil {
+		s.getBatcher.Close()
+		s.getBatcher = nil
+	}
+	if s.unlockBatcher != nil {
+		s.unlockBatcher.Close()
+		s.unlockBatcher = nil
 	}
 	if s.pool != nil {
 		s.pool.Close()

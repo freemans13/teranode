@@ -122,6 +122,7 @@ func doRunValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, 
 
 	var totalOps atomic.Int64
 	var errCount atomic.Int64
+	var totalGetNs, totalSpendNs, totalCreateNs, totalUnlockNs atomic.Int64
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 
@@ -142,7 +143,9 @@ func doRunValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, 
 				parentHash := parent.TxIDChainHash()
 
 				// 1. GET parent tx — verify it exists (same fields as validator)
+				t0 := time.Now()
 				_, err := store.Get(ctx, parentHash, fields.BlockIDs, fields.BlockHeights)
+				totalGetNs.Add(time.Since(t0).Nanoseconds())
 				if err != nil {
 					if errCount.Add(1) <= 5 {
 						t.Logf("worker %d iter %d (of %d): GET: %v (parent=%s)", w, i, opsPerWorker, err, parentHash)
@@ -151,7 +154,9 @@ func doRunValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, 
 				}
 
 				// 2. SPEND parent outputs via child tx
+				t1 := time.Now()
 				spends, err := store.Spend(ctx, child, blockHeight)
+				totalSpendNs.Add(time.Since(t1).Nanoseconds())
 				if err != nil {
 					if errCount.Add(1) <= 5 {
 						spendDetail := ""
@@ -167,7 +172,9 @@ func doRunValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, 
 				}
 
 				// 3. CREATE child tx (locked)
+				t2 := time.Now()
 				_, err = store.Create(ctx, child, blockHeight, utxo.WithLocked(true))
+				totalCreateNs.Add(time.Since(t2).Nanoseconds())
 				if err != nil {
 					if errCount.Add(1) <= 3 {
 						t.Logf("worker %d iter %d: CREATE: %v", w, i, err)
@@ -176,7 +183,9 @@ func doRunValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, 
 				}
 
 				// 4. UNLOCK child tx
+				t3 := time.Now()
 				err = store.SetLocked(ctx, []chainhash.Hash{*child.TxIDChainHash()}, false)
+				totalUnlockNs.Add(time.Since(t3).Nanoseconds())
 				if err != nil {
 					if errCount.Add(1) <= 3 {
 						t.Logf("worker %d iter %d: UNLOCK: %v", w, i, err)
@@ -198,6 +207,16 @@ func doRunValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, 
 	ops := totalOps.Load()
 	errs := errCount.Load()
 	validatorTPS := float64(ops) / validatorElapsed.Seconds()
+
+	// Per-op average latency.
+	if ops > 0 {
+		avgGet := time.Duration(totalGetNs.Load() / ops)
+		avgSpend := time.Duration(totalSpendNs.Load() / ops)
+		avgCreate := time.Duration(totalCreateNs.Load() / ops)
+		avgUnlock := time.Duration(totalUnlockNs.Load() / ops)
+		t.Logf("  Avg latency: Get=%v  Spend=%v  Create=%v  Unlock=%v  Total=%v",
+			avgGet, avgSpend, avgCreate, avgUnlock, avgGet+avgSpend+avgCreate+avgUnlock)
+	}
 
 	if errs > 0 {
 		t.Logf("  (%d workers errored out)", errs)
@@ -238,10 +257,13 @@ func newSQLStoreForBench(t *testing.T) utxo.Store {
 	storeURL, _ := url.Parse(throughputDSN)
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
-	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
-	tSettings.UtxoStore.GetBatcherSize = 100
-	tSettings.Postgres.MaxOpenConns = 500
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 5
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5
+	tSettings.UtxoStore.SpendBatcherSize = 500
+	tSettings.UtxoStore.StoreBatcherSize = 500
+	tSettings.UtxoStore.GetBatcherSize = 500
+	tSettings.UtxoStore.GetBatcherDurationMillis = 5
+	tSettings.Postgres.MaxOpenConns = 100
 	logger := ulogger.TestLogger{}
 	s, err := sqlstore.New(ctx, logger, tSettings, storeURL)
 	if err != nil {

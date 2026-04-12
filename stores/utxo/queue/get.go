@@ -22,16 +22,108 @@ import (
 // Postgres parameter limits.
 const maxINClauseSize = 400
 
+// batchGetItem represents a single Get request queued into the batcher.
+type batchGetItem struct {
+	hash *chainhash.Hash
+	bins []fields.FieldName
+	done chan batchGetResult
+}
+
+type batchGetResult struct {
+	Data *meta.Data
+	Err  error
+}
+
 // Get retrieves UTXO metadata for a given transaction hash.
-// Checks in-process cache first (populated by Create).
-// The requested fields control which additional queries are executed.
+// When getBatcher is active, simple gets are batched for throughput.
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields ...fields.FieldName) (*meta.Data, error) {
 	bins := utxo.MetaFieldsWithTx
 	if len(requestedFields) > 0 {
 		bins = requestedFields
 	}
 
+	// Use batcher for simple metadata-only gets (BlockIDs, BlockHeights — no Tx body).
+	if s.getBatcher != nil && !contains(bins, fields.Tx) && !contains(bins, fields.Outputs) &&
+		!contains(bins, fields.Utxos) && !contains(bins, fields.TxInpoints) && !contains(bins, fields.Inputs) {
+		done := make(chan batchGetResult, 1)
+		s.getBatcher.Put(&batchGetItem{hash: hash, bins: bins, done: done})
+		select {
+		case result := <-done:
+			return result.Data, result.Err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	return s.getInternal(ctx, hash, bins)
+}
+
+// sendGetBatch pipelines N SELECT queries via SendBatch.
+func (s *Store) sendGetBatch(batch []*batchGetItem) {
+	ctx := context.Background()
+
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		for _, item := range batch {
+			item.done <- batchGetResult{Err: errors.NewStorageError("[Get] acquire: %v", err)}
+		}
+		return
+	}
+	defer conn.Release()
+
+	pgxBatch := &pgx.Batch{}
+	for _, item := range batch {
+		pgxBatch.Queue(`
+			SELECT version, lock_time, fee, size_in_bytes, coinbase,
+			       locked, conflicting, frozen, unmined_since,
+			       block_ids, block_heights, subtree_idxs
+			FROM txs WHERE hash = $1`,
+			item.hash[:],
+		)
+	}
+
+	br := conn.SendBatch(ctx, pgxBatch)
+
+	for _, item := range batch {
+		data := &meta.Data{}
+		var version, lockTime int64
+		var unminedSince *int64
+		var blockIDs, blockHeights, subtreeIdxs []int32
+
+		err := br.QueryRow().Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes,
+			&data.IsCoinbase, &data.Locked, &data.Conflicting, &data.Frozen,
+			&unminedSince, &blockIDs, &blockHeights, &subtreeIdxs)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				item.done <- batchGetResult{Err: errors.NewTxNotFoundError("transaction %s not found", item.hash)}
+			} else {
+				item.done <- batchGetResult{Err: err}
+			}
+			continue
+		}
+
+		if unminedSince != nil {
+			data.UnminedSince = uint32(*unminedSince)
+		}
+		if len(blockIDs) > 0 {
+			data.BlockIDs = make([]uint32, len(blockIDs))
+			data.BlockHeights = make([]uint32, len(blockHeights))
+			data.SubtreeIdxs = make([]int, len(subtreeIdxs))
+			for i := range blockIDs {
+				data.BlockIDs[i] = uint32(blockIDs[i])
+				if i < len(blockHeights) {
+					data.BlockHeights[i] = uint32(blockHeights[i])
+				}
+				if i < len(subtreeIdxs) {
+					data.SubtreeIdxs[i] = int(subtreeIdxs[i])
+				}
+			}
+		}
+
+		item.done <- batchGetResult{Data: data}
+	}
+
+	br.Close()
 }
 
 // GetMeta retrieves only the metadata for a transaction (no Tx body).
