@@ -14,7 +14,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // register pgx stdlib driver
 )
@@ -102,11 +101,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 	pgxConfig.MaxConns = 100
 
-	// Set synchronous_commit = off on each connection for write performance.
-	pgxConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, "SET synchronous_commit = off")
-		return err
-	}
+	// Full durability — financial data requires synchronous_commit = on (the default).
+	// Group commit (commit_delay + commit_siblings) is the safe way to get throughput.
 
 	pool, err := pgxpool.NewWithConfig(ctx, pgxConfig)
 	if err != nil {
