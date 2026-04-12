@@ -152,9 +152,8 @@ func (s *Store) Start(_ context.Context) {
 	}
 	s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
 
-	// Spend batcher — bulk SELECT + bulk INSERT for N spends.
-	// background=false to prevent PostgreSQL deadlocks from concurrent
-	// transactions locking overlapping rows in different orders.
+	// Spend batcher — pipelines N validation CTEs via SendBatch (no transaction needed).
+	// background=true is safe because pipelined CTEs don't hold row locks across batches.
 	spendBatchSize := s.settings.UtxoStore.SpendBatcherSize
 	if spendBatchSize <= 0 {
 		spendBatchSize = 100
@@ -163,7 +162,7 @@ func (s *Store) Start(_ context.Context) {
 	if spendBatchDuration <= 0 {
 		spendBatchDuration = 10 * time.Millisecond
 	}
-	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, false)
+	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, true)
 }
 
 // Stop closes batchers and database connections.

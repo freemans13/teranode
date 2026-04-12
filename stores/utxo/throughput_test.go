@@ -12,7 +12,9 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	aerostore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/queue"
 	sqlstore "github.com/bsv-blockchain/teranode/stores/utxo/sql"
@@ -239,7 +241,7 @@ func newSQLStoreForBench(t *testing.T) utxo.Store {
 	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
 	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
 	tSettings.UtxoStore.GetBatcherSize = 100
-	tSettings.Postgres.MaxOpenConns = 40
+	tSettings.Postgres.MaxOpenConns = 500
 	logger := ulogger.TestLogger{}
 	s, err := sqlstore.New(ctx, logger, tSettings, storeURL)
 	if err != nil {
@@ -256,15 +258,16 @@ func newQueueStoreForBench(t *testing.T) utxo.Store {
 	storeURL.Scheme = "postgresqueue"
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
-	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 5
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5
+	tSettings.UtxoStore.SpendBatcherSize = 500
+	tSettings.UtxoStore.StoreBatcherSize = 500
 	logger := ulogger.TestLogger{}
 	s, err := queue.New(ctx, logger, tSettings, storeURL)
 	if err != nil {
 		t.Fatalf("queue store: %v", err)
 	}
 	s.Start(ctx)
-	// Materializer runs via pg_cron (scheduled during schema creation).
 	t.Cleanup(func() { s.Stop() })
 	return s
 }
@@ -319,6 +322,65 @@ func TestThroughput_QueueStore(t *testing.T) {
 		t.Run(fmt.Sprintf("workers_%d", workers), func(t *testing.T) {
 			opsPerSec := runValidatorThroughputOffset(t, s, opsPerWorker, workers, offset)
 			t.Logf("Queue Store: %d workers × %d ops = %.0f TPS (Get+Spend+Create+Unlock per tx)",
+				workers, opsPerWorker, opsPerSec)
+		})
+	}
+}
+
+func newAerospikeStoreForBench(t *testing.T) utxo.Store {
+	t.Helper()
+	ctx := context.Background()
+	storeURL, _ := url.Parse("aerospike://localhost:3000/utxo-store?set=throughput_test&block_retention=1&externalStore=file://./data/externalStore")
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 60 * time.Second
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
+	logger := ulogger.TestLogger{}
+	s, err := aerostore.New(ctx, logger, tSettings, storeURL)
+	if err != nil {
+		t.Skipf("aerospike not available: %v", err)
+	}
+	s.SetExternalStore(memory.New())
+	return s
+}
+
+func TestThroughput_AerospikeStore(t *testing.T) {
+	s := newAerospikeStoreForBench(t)
+	workerOffset := 0
+	for _, workers := range []int{1, 10, 100, 500, 1000, 5000, 10000, 15000} {
+		opsPerWorker := 10
+		if workers <= 10 {
+			opsPerWorker = 100
+		} else if workers <= 100 {
+			opsPerWorker = 50
+		} else if workers <= 1000 {
+			opsPerWorker = 20
+		}
+		offset := workerOffset
+		workerOffset += workers
+		t.Run(fmt.Sprintf("workers_%d", workers), func(t *testing.T) {
+			opsPerSec := runValidatorThroughputOffset(t, s, opsPerWorker, workers, offset)
+			t.Logf("Aerospike Store: %d workers × %d ops = %.0f TPS (Get+Spend+Create+Unlock per tx)",
+				workers, opsPerWorker, opsPerSec)
+		})
+	}
+}
+
+// TestThroughput_QueueExperiment is a fast experiment harness testing 1K and 10K workers.
+func TestThroughput_QueueExperiment(t *testing.T) {
+	terminateOtherConnections(t)
+	s := newQueueStoreForBench(t)
+	workerOffset := 0
+	for _, workers := range []int{1000, 10000} {
+		opsPerWorker := 20
+		if workers > 5000 {
+			opsPerWorker = 10
+		}
+		offset := workerOffset
+		workerOffset += workers
+		t.Run(fmt.Sprintf("workers_%d", workers), func(t *testing.T) {
+			opsPerSec := runValidatorThroughputOffset(t, s, opsPerWorker, workers, offset)
+			t.Logf("EXPERIMENT: %d workers × %d ops = %.0f TPS",
 				workers, opsPerWorker, opsPerSec)
 		})
 	}
