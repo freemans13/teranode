@@ -304,51 +304,168 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	}
 	defer conn.Release()
 
-	// Pipeline N validation CTEs via SendBatch — each CTE does validate+insert
-	// in a single query, all sent in one network flush. No transaction needed.
-	pgxBatch := &pgx.Batch{}
-	for _, item := range batch {
-		pgxBatch.Queue(spendValidationSQL,
-			item.spend.TxID[:],
-			item.spend.Vout,
-			item.spend.SpendingData.Bytes(),
-			item.spend.UTXOHash[:],
-			int64(item.blockHeight),
-			item.ignoreLocked,
-			item.ignoreConflicting,
-		)
+	// Single bulk query: UNNEST parallel arrays → 3-table JOIN validation →
+	// INSERT valid spends → return per-item results with diagnostic flags.
+	// One parse/plan/execute for the entire batch (§6.1 multi-row INSERT).
+	prevTxHashes := make([][]byte, len(batch))
+	prevIdxs := make([]int64, len(batch))
+	spendingDatas := make([][]byte, len(batch))
+	utxoHashes := make([][]byte, len(batch))
+	blockHeights := make([]int64, len(batch))
+	ignLockeds := make([]bool, len(batch))
+	ignConflictings := make([]bool, len(batch))
+	batchIdxs := make([]int32, len(batch))
+
+	for i, item := range batch {
+		prevTxHashes[i] = item.spend.TxID[:]
+		prevIdxs[i] = int64(item.spend.Vout)
+		spendingDatas[i] = item.spend.SpendingData.Bytes()
+		utxoHashes[i] = item.spend.UTXOHash[:]
+		blockHeights[i] = int64(item.blockHeight)
+		ignLockeds[i] = item.ignoreLocked
+		ignConflictings[i] = item.ignoreConflicting
+		batchIdxs[i] = int32(i)
 	}
 
-	br := conn.SendBatch(ctx, pgxBatch)
+	rows, err := conn.Query(ctx, bulkSpendSQL,
+		prevTxHashes, prevIdxs, spendingDatas, utxoHashes,
+		blockHeights, ignLockeds, ignConflictings, batchIdxs,
+	)
+	if err != nil {
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] bulk query failed: %v", err)
+		}
+		return false
+	}
 
-	for _, item := range batch {
-		var inserted int
-		err := br.QueryRow().Scan(&inserted)
+	type bulkResult struct {
+		inserted       bool
+		found          bool
+		existingSpend  []byte
+		outputFrozen   bool
+		txFrozen       bool
+		txLocked       bool
+		txConflicting  bool
+		utxoHashMatch  bool
+		coinbaseBlock  bool
+		spendableBlock bool
+	}
+	resultMap := make(map[int]*bulkResult, len(batch))
+	for rows.Next() {
+		var bIdx int32
+		r := &bulkResult{}
+		if err := rows.Scan(&bIdx, &r.inserted, &r.existingSpend,
+			&r.outputFrozen, &r.txFrozen, &r.txLocked, &r.txConflicting,
+			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock); err != nil {
+			rows.Close()
+			for _, item := range batch {
+				item.errCh <- errors.NewStorageError("[Spend] scan: %v", err)
+			}
+			return false
+		}
+		r.found = true
+		resultMap[int(bIdx)] = r
+	}
+	rows.Close()
 
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			item.errCh <- errors.NewStorageError("[Spend] pipeline query failed for %s:%d: %v", item.spend.TxID, item.spend.Vout, err)
+	for i, item := range batch {
+		spend := item.spend
+		r, found := resultMap[i]
+
+		if !found {
+			item.errCh <- errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
 			continue
 		}
-
-		if err == nil {
-			// Validation CTE succeeded — spend inserted.
+		if r.inserted {
 			item.errCh <- nil
 			continue
 		}
-
-		// INSERT returned 0 rows — run diagnostic to determine exact failure reason.
-		diagErr := s.diagnoseSpendFailure(ctx, item.spend, item.spend.SpendingData.Bytes(),
-			item.blockHeight, item.ignoreLocked, item.ignoreConflicting)
-		if diagErr == nil {
-			item.errCh <- nil
+		if len(r.existingSpend) > 0 {
+			spendingDataBytes := spend.SpendingData.Bytes()
+			if bytes.Equal(r.existingSpend, spendingDataBytes) {
+				item.errCh <- nil
+				continue
+			}
+			existingSD, parseErr := spendpkg.NewSpendingDataFromBytes(r.existingSpend)
+			if parseErr != nil {
+				item.errCh <- errors.NewProcessingError("failed to parse existing spending data", parseErr)
+				continue
+			}
+			item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSD)
+			continue
+		}
+		if r.outputFrozen || r.txFrozen {
+			item.errCh <- errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
+		} else if r.txLocked && !item.ignoreLocked {
+			item.errCh <- errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
+		} else if r.txConflicting && !item.ignoreConflicting {
+			item.errCh <- errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
+		} else if !r.utxoHashMatch {
+			item.errCh <- errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
+		} else if r.coinbaseBlock {
+			item.errCh <- errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready for %s:%d", spend.TxID, spend.Vout)
+		} else if r.spendableBlock {
+			item.errCh <- errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable yet", spend.TxID, spend.Vout)
 		} else {
-			item.errCh <- diagErr
+			item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
 		}
 	}
 
-	br.Close()
 	return false
 }
+
+// bulkSpendSQL processes an entire batch in ONE query: UNNEST → validate → INSERT → results.
+const bulkSpendSQL = `
+WITH items AS (
+    SELECT unnest($1::bytea[])   AS prev_tx_hash,
+           unnest($2::bigint[])  AS prev_idx,
+           unnest($3::bytea[])   AS spending_data,
+           unnest($4::bytea[])   AS expected_utxo_hash,
+           unnest($5::bigint[])  AS block_height,
+           unnest($6::boolean[]) AS ign_locked,
+           unnest($7::boolean[]) AS ign_conflicting,
+           unnest($8::int[])     AS batch_idx
+),
+validated AS (
+    SELECT i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data,
+           i.expected_utxo_hash, i.block_height, i.ign_locked, i.ign_conflicting,
+           o.utxo_hash, o.frozen AS out_frozen, o.spendable_in,
+           o.coinbase_spending_height,
+           t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
+           sp.spending_data AS existing_spend
+    FROM items i
+    JOIN outputs o ON o.tx_hash = i.prev_tx_hash AND o.idx = i.prev_idx
+    JOIN txs t ON t.hash = i.prev_tx_hash
+    LEFT JOIN spends sp ON sp.prev_tx_hash = i.prev_tx_hash AND sp.prev_output_idx = i.prev_idx
+),
+to_insert AS (
+    SELECT prev_tx_hash, prev_idx, spending_data, batch_idx
+    FROM validated
+    WHERE existing_spend IS NULL
+      AND utxo_hash = expected_utxo_hash
+      AND NOT out_frozen AND NOT tx_frozen
+      AND (ign_locked OR NOT tx_locked)
+      AND (ign_conflicting OR NOT tx_conflicting)
+      AND NOT (coinbase_spending_height > 0 AND coinbase_spending_height > block_height)
+      AND NOT (COALESCE(spendable_in, 0) > 0 AND block_height < COALESCE(spendable_in, 0))
+),
+inserted AS (
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
+    SELECT prev_tx_hash, prev_idx, spending_data FROM to_insert
+    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
+    RETURNING prev_tx_hash, prev_output_idx
+)
+SELECT v.batch_idx,
+       (i.prev_tx_hash IS NOT NULL) AS inserted,
+       v.existing_spend,
+       v.out_frozen, v.tx_frozen, v.tx_locked, v.tx_conflicting,
+       (v.utxo_hash = v.expected_utxo_hash) AS utxo_match,
+       (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > v.block_height) AS coinbase_block,
+       (COALESCE(v.spendable_in, 0) > 0 AND v.block_height < COALESCE(v.spendable_in, 0)) AS spendable_block
+FROM validated v
+LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
+ORDER BY v.batch_idx
+`
 
 // isDeadlock checks if an error is a PostgreSQL deadlock (40P01).
 func isDeadlock(err error) bool {
