@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -46,19 +47,48 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	batch := &pgx.Batch{}
 
 	// Queue UPDATE chunks.
+	// Use array_append only if the block_id is NOT already present (idempotent).
+	// Also handle delete_at_height for pruning (mirrors SQL store logic).
 	var updateSQL string
 	if minedBlockInfo.OnLongestChain {
-		updateSQL = `UPDATE txs SET
-			block_ids = COALESCE(block_ids, '{}') || $2::int[],
-			block_heights = COALESCE(block_heights, '{}') || $3::int[],
-			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
-			locked = false, unmined_since = NULL
-		WHERE hash = ANY($1)`
+		retention := uint32(0)
+		if s.settings != nil {
+			retention = s.settings.GetUtxoStoreBlockHeightRetention()
+		}
+		if retention > 0 {
+			newDAH := int64(s.blockHeight.Load() + 1 + retention)
+			updateSQL = fmt.Sprintf(`UPDATE txs SET
+				block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
+					ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+				block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
+					ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+				subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
+					ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+				locked = false, unmined_since = NULL,
+				delete_at_height = CASE
+					WHEN preserve_until IS NOT NULL THEN delete_at_height
+					WHEN delete_at_height IS NOT NULL AND delete_at_height < %d THEN %d
+					ELSE delete_at_height END
+			WHERE hash = ANY($1)`, newDAH, newDAH)
+		} else {
+			updateSQL = `UPDATE txs SET
+				block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
+					ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+				block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
+					ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+				subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
+					ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+				locked = false, unmined_since = NULL
+			WHERE hash = ANY($1)`
+		}
 	} else {
 		updateSQL = `UPDATE txs SET
-			block_ids = COALESCE(block_ids, '{}') || $2::int[],
-			block_heights = COALESCE(block_heights, '{}') || $3::int[],
-			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+			block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
+				ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+			block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
+				ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+			subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
+				ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
 			locked = false
 		WHERE hash = ANY($1)`
 	}
@@ -137,14 +167,17 @@ func (s *Store) setMinedChunk(ctx context.Context, hashes []*chainhash.Hash, inf
 		hashBytes[i] = h[:]
 	}
 
-	// Single UPDATE with array append.
+	// Idempotent UPDATE: only append if block_id not already present.
 	var q string
 	var args []interface{}
 	if info.OnLongestChain {
 		q = `UPDATE txs SET
-			block_ids = COALESCE(block_ids, '{}') || $2::int[],
-			block_heights = COALESCE(block_heights, '{}') || $3::int[],
-			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+			block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
+				ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+			block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
+				ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+			subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
+				ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
 			locked = false,
 			unmined_since = NULL
 		WHERE hash = ANY($1)`
@@ -156,9 +189,12 @@ func (s *Store) setMinedChunk(ctx context.Context, hashes []*chainhash.Hash, inf
 		}
 	} else {
 		q = `UPDATE txs SET
-			block_ids = COALESCE(block_ids, '{}') || $2::int[],
-			block_heights = COALESCE(block_heights, '{}') || $3::int[],
-			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+			block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
+				ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+			block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
+				ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+			subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
+				ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
 			locked = false
 		WHERE hash = ANY($1)`
 		args = []interface{}{
