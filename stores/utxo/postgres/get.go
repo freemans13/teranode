@@ -69,44 +69,44 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 		return
 	}
 
-	conn, err := s.pool.Acquire(ctx)
+	// Bulk SELECT: one query for all items using hash = ANY($1).
+	hashBytes := make([][]byte, len(batch))
+	hashToIdx := make(map[chainhash.Hash][]int, len(batch))
+	for i, item := range batch {
+		hashBytes[i] = item.hash[:]
+		hashToIdx[*item.hash] = append(hashToIdx[*item.hash], i)
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
+		       locked, conflicting, frozen, unmined_since,
+		       block_ids, block_heights, subtree_idxs
+		FROM txs WHERE hash = ANY($1)`,
+		hashBytes,
+	)
 	if err != nil {
 		for _, item := range batch {
-			item.done <- batchGetResult{Err: errors.NewStorageError("[Get] acquire: %v", err)}
+			item.done <- batchGetResult{Err: errors.NewStorageError("[Get] bulk query: %v", err)}
 		}
 		return
 	}
-	defer conn.Release()
 
-	pgxBatch := &pgx.Batch{}
-	for _, item := range batch {
-		pgxBatch.Queue(`
-			SELECT version, lock_time, fee, size_in_bytes, coinbase,
-			       locked, conflicting, frozen, unmined_since,
-			       block_ids, block_heights, subtree_idxs
-			FROM txs WHERE hash = $1`,
-			item.hash[:],
-		)
-	}
-
-	br := conn.SendBatch(ctx, pgxBatch)
-
-	for _, item := range batch {
+	found := make(map[chainhash.Hash]*meta.Data, len(batch))
+	for rows.Next() {
 		data := &meta.Data{}
+		var hashB []byte
 		var version, lockTime int64
 		var unminedSince *int64
 		var blockIDs, blockHeights, subtreeIdxs []int32
 
-		err := br.QueryRow().Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes,
+		if err := rows.Scan(&hashB, &version, &lockTime, &data.Fee, &data.SizeInBytes,
 			&data.IsCoinbase, &data.Locked, &data.Conflicting, &data.Frozen,
-			&unminedSince, &blockIDs, &blockHeights, &subtreeIdxs)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				item.done <- batchGetResult{Err: errors.NewTxNotFoundError("transaction %s not found", item.hash)}
-			} else {
+			&unminedSince, &blockIDs, &blockHeights, &subtreeIdxs); err != nil {
+			rows.Close()
+			for _, item := range batch {
 				item.done <- batchGetResult{Err: err}
 			}
-			continue
+			return
 		}
 
 		if unminedSince != nil {
@@ -127,10 +127,20 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 			}
 		}
 
-		item.done <- batchGetResult{Data: data}
+		var h chainhash.Hash
+		copy(h[:], hashB)
+		found[h] = data
 	}
+	rows.Close()
 
-	br.Close()
+	for i, item := range batch {
+		_ = i
+		if data, ok := found[*item.hash]; ok {
+			item.done <- batchGetResult{Data: data}
+		} else {
+			item.done <- batchGetResult{Err: errors.NewTxNotFoundError("transaction %s not found", item.hash)}
+		}
+	}
 }
 
 // GetMeta retrieves only the metadata for a transaction (no Tx body).
