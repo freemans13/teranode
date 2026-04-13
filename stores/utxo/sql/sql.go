@@ -227,9 +227,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	// Initialize unlock batcher for Postgres — batches SetLocked(false) calls.
-	if storeURL.Scheme == "postgres" {
-		unlockBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
-		s.unlockBatcher = batcher.New(500, unlockBatchDuration, s.sendUnlockBatch, true)
+	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.LockedBatcherSize > 1 {
+		unlockBatchSize := tSettings.UtxoStore.LockedBatcherSize
+		unlockBatchDuration := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
+		s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
+		if tSettings.BatcherDrainMode {
+			s.unlockBatcher.SetDrainMode(true)
+		}
 	}
 
 	return s, nil
@@ -3633,6 +3637,9 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 
 	// Postgres: single-hash unlock → use batcher.
 	if s.unlockBatcher != nil && len(txHashes) == 1 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		done := make(chan error, 1)
 		s.unlockBatcher.Put(&batchUnlockItem{hash: txHashes[0], done: done})
 		select {
@@ -4630,7 +4637,7 @@ func isLockError(err error) bool {
 
 // sendUnlockBatch processes a batch of SetLocked(false) calls with a single bulk UPDATE.
 func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
-	ctx := context.Background()
+	ctx := s.ctx
 
 	if len(batch) == 1 {
 		hashes := []chainhash.Hash{batch[0].hash}
