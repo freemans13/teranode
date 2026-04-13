@@ -1048,8 +1048,9 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 			batch[r.idx].done <- r.result
 		}
 
-		// Propagate close error so the connection is not returned to the pool
-		// and Phase 3 (conflicting children) does not run on an uncertain state.
+		// Propagate close error so the Raw callback signals failure.
+		// This prevents Phase 3 (conflicting children) from running on
+		// an uncertain connection state.
 		return closeErr
 	})
 	if connErr != nil {
@@ -4611,7 +4612,8 @@ func isLockError(err error) bool {
 		strings.Contains(errStr, "lock timeout")
 }
 
-// sendUnlockBatch processes a batch of SetLocked(false) calls with a single bulk UPDATE.
+// sendUnlockBatch processes a batch of SetLocked(false) calls via setUnlockedBulk,
+// which chunks large batches into multiple UPDATE statements (maxINClauseSize=400).
 func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 	ctx := s.ctx
 
