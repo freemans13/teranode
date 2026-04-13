@@ -296,7 +296,7 @@ func TestDuplicateAcrossSubtreeBoundarySqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgresqueue", func(t *testing.T) {
+	t.Run("postgres", func(t *testing.T) {
 		testDuplicateAcrossSubtreeBoundary(t, pg.ConnectionString())
 	})
 }
@@ -308,7 +308,7 @@ func TestDuplicateInLastIncompleteSubtreeSqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgresqueue", func(t *testing.T) {
+	t.Run("postgres", func(t *testing.T) {
 		testDuplicateInLastIncompleteSubtree(t, pg.ConnectionString())
 	})
 }

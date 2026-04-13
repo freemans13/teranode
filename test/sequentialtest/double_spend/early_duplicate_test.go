@@ -197,7 +197,7 @@ func TestEarlyDuplicatePartiallySpentAndPrunedSqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgresqueue", func(t *testing.T) {
+	t.Run("postgres", func(t *testing.T) {
 		testEarlyDuplicatePartiallySpentAndPruned(t, pg.ConnectionString())
 	})
 }
@@ -209,7 +209,7 @@ func TestEarlyDuplicateNotSpentSqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgresqueue", func(t *testing.T) {
+	t.Run("postgres", func(t *testing.T) {
 		testEarlyDuplicateNotSpent(t, pg.ConnectionString())
 	})
 }

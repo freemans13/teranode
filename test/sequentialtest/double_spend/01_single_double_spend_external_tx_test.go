@@ -123,6 +123,6 @@ func testSingleDoubleSpendExternalTx(t *testing.T, utxoStore string) {
 
 func TestSingleDoubleSpendExternalTxSqlQueue(t *testing.T) {
 	t.Run("single_external_tx_with_one_conflicting_transaction", func(t *testing.T) {
-		testSingleDoubleSpendExternalTx(t, "postgresqueue")
+		testSingleDoubleSpendExternalTx(t, "postgres")
 	})
 }

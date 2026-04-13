@@ -106,6 +106,6 @@ func testMarkAsConflictingMultipleExternalTx(t *testing.T, utxoStore string) {
 
 func TestMarkAsConflictingMultipleExternalTxSqlQueue(t *testing.T) {
 	t.Run("multiple_conflicting_external_txs_in_different_blocks", func(t *testing.T) {
-		testMarkAsConflictingMultipleExternalTx(t, "postgresqueue")
+		testMarkAsConflictingMultipleExternalTx(t, "postgres")
 	})
 }

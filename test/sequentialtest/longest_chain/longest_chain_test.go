@@ -217,15 +217,15 @@ func testLongestChainInvalidateBlockWithOldTx(t *testing.T, utxoStore string) {
 
 func TestLongestChainSqlQueue(t *testing.T) {
 	t.Run("simple", func(t *testing.T) {
-		testLongestChainSimple(t, "postgresqueue")
+		testLongestChainSimple(t, "postgres")
 	})
 
 	t.Run("invalid block", func(t *testing.T) {
-		testLongestChainInvalidateBlock(t, "postgresqueue")
+		testLongestChainInvalidateBlock(t, "postgres")
 	})
 
 	t.Run("invalid block with old tx", func(t *testing.T) {
 		t.Skip()
-		testLongestChainInvalidateBlockWithOldTx(t, "postgresqueue")
+		testLongestChainInvalidateBlockWithOldTx(t, "postgres")
 	})
 }

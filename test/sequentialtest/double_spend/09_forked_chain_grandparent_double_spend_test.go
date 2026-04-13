@@ -256,6 +256,6 @@ func testComplexForkGrandparentConflict(t *testing.T, utxoStore string) {
 
 func TestComplexForkGrandparentConflictSqlQueue(t *testing.T) {
 	t.Run("complex_fork_grandparent_conflict", func(t *testing.T) {
-		testComplexForkGrandparentConflict(t, "postgresqueue")
+		testComplexForkGrandparentConflict(t, "postgres")
 	})
 }

@@ -170,6 +170,6 @@ func testDoubleSpendForkExternalTx(t *testing.T, utxoStore string) {
 
 func TestDoubleSpendForkExternalTxSqlQueue(t *testing.T) {
 	t.Run("double_spend_fork_external_tx", func(t *testing.T) {
-		testDoubleSpendForkExternalTx(t, "postgresqueue")
+		testDoubleSpendForkExternalTx(t, "postgres")
 	})
 }
