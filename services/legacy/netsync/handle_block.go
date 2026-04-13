@@ -204,11 +204,9 @@ func (sm *SyncManager) waitForPreviousBlockMined(ctx context.Context, prevBlockH
 	_, err := retry.Retry(ctx, sm.logger, func() (bool, error) {
 		isMined, err := sm.blockchainClient.GetBlockIsMined(ctx, prevBlockHash)
 		if err != nil {
-			if errors.Is(err, errors.ErrBlockNotFound) {
-				// Parent not in blockchain store yet — expected for genesis or very early blocks
-				return true, nil
-			}
-			return false, err
+			return false, errors.NewServiceError(
+				"[waitForPreviousBlockMined][height:%d] parent %s mined status not available yet",
+				blockHeight, prevBlockHash.String(), err)
 		}
 		if !isMined {
 			return false, errors.NewBlockParentNotMinedError(
@@ -220,6 +218,7 @@ func (sm *SyncManager) waitForPreviousBlockMined(ctx context.Context, prevBlockH
 		retry.WithBackoffDurationType(sm.settings.BlockValidation.IsParentMinedRetryBackoffDuration),
 		retry.WithBackoffMultiplier(sm.settings.BlockValidation.IsParentMinedRetryBackoffMultiplier),
 		retry.WithRetryCount(sm.settings.BlockValidation.IsParentMinedRetryMaxRetry),
+		retry.WithMessage("waitForPreviousBlockMined: legacy sync waiting for parent mined_set"),
 	)
 	return err
 }
