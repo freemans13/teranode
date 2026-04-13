@@ -455,10 +455,11 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool, validateInput
 		moveBackTxs := make([]chainhash.Hash, 0, len(moveBackBlocksWithMeta)*100)
 
 		for _, blockWithMeta := range moveBackBlocksWithMeta {
-			// Note: we do NOT skip invalid blocks here. BlockValidation's unsetMined=true
-			// may not have set unmined_since if subtrees were unavailable. To be safe,
-			// we always collect transactions from moveBack blocks (including invalid ones)
-			// so MarkTransactionsOnLongestChain can set unmined_since as a fallback.
+			if blockWithMeta.meta.Invalid {
+				// Skip invalid blocks - BlockValidation already handled them via unsetMined=true
+				continue
+			}
+
 			block := blockWithMeta.block
 			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
 			if err != nil {
