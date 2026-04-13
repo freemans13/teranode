@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/jackc/pgx/v5"
 )
 
 // GetCounterConflicting delegates to the store-agnostic implementation which
@@ -173,22 +174,29 @@ func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 		return
 	}
 
-	// Bulk UPDATE: one query for all items.
-	hashBytes := make([][]byte, len(batch))
-	for i, item := range batch {
-		hashBytes[i] = item.hash[:]
-	}
-
-	_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = ANY($1)`, hashBytes)
+	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		for _, item := range batch {
-			item.done <- errors.NewStorageError("[Unlock] bulk update: %v", err)
+			item.done <- errors.NewStorageError("[Unlock] acquire: %v", err)
 		}
 		return
 	}
+	defer conn.Release()
+
+	pgxBatch := &pgx.Batch{}
 	for _, item := range batch {
-		item.done <- nil
+		pgxBatch.Queue(`UPDATE txs SET locked = false WHERE hash = $1`, item.hash[:])
 	}
+
+	br := conn.SendBatch(ctx, pgxBatch)
+	for _, item := range batch {
+		if _, err := br.Exec(); err != nil {
+			item.done <- errors.NewStorageError("[Unlock] update: %v", err)
+		} else {
+			item.done <- nil
+		}
+	}
+	br.Close()
 }
 
 // SetLocked marks transactions as locked or unlocked.
