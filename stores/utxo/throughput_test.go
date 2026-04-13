@@ -355,8 +355,12 @@ func newAerospikeStoreForBench(t *testing.T) utxo.Store {
 	storeURL, _ := url.Parse("aerospike://localhost:3000/utxo-store?set=throughput_test&block_retention=1&externalStore=file://./data/externalStore")
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
-	tSettings.UtxoStore.SpendBatcherDurationMillis = 10
-	tSettings.UtxoStore.StoreBatcherDurationMillis = 10
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 5
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5
+	tSettings.UtxoStore.SpendBatcherSize = 500
+	tSettings.UtxoStore.StoreBatcherSize = 500
+	tSettings.UtxoStore.GetBatcherSize = 500
+	tSettings.UtxoStore.GetBatcherDurationMillis = 5
 	logger := ulogger.TestLogger{}
 	s, err := aerostore.New(ctx, logger, tSettings, storeURL)
 	if err != nil {
