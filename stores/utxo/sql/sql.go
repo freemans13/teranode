@@ -101,6 +101,13 @@ type Store struct {
 	spendBatcher    *batcher.Batcher[batchSpend]
 	getBatcher      *batcher.Batcher[batchGetItem]
 	createBatcher   *batcher.Batcher[batchCreateItem]
+	unlockBatcher   *batcher.Batcher[batchUnlockItem]
+}
+
+// batchUnlockItem represents a single SetLocked(false) request.
+type batchUnlockItem struct {
+	hash chainhash.Hash
+	done chan error
 }
 
 // batchGetItemData holds the result of a batch get operation.
@@ -217,6 +224,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		if tSettings.BatcherDrainMode {
 			s.createBatcher.SetDrainMode(true)
 		}
+	}
+
+	// Initialize unlock batcher for Postgres — batches SetLocked(false) calls.
+	if storeURL.Scheme == "postgres" {
+		unlockBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
+		s.unlockBatcher = batcher.New(500, unlockBatchDuration, s.sendUnlockBatch, true)
 	}
 
 	return s, nil
@@ -3583,6 +3596,18 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		return nil
 	}
 
+	// Postgres: single-hash unlock → use batcher.
+	if s.unlockBatcher != nil && len(txHashes) == 1 {
+		done := make(chan error, 1)
+		s.unlockBatcher.Put(&batchUnlockItem{hash: txHashes[0], done: done})
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	// Postgres: bulk unlock + DAH in chunked UPDATE statements
 	if s.engine == "postgres" {
 		return s.setUnlockedBulk(ctx, txHashes)
@@ -4566,4 +4591,25 @@ func isLockError(err error) bool {
 	return strings.Contains(errStr, "database is locked") ||
 		strings.Contains(errStr, "deadlock") ||
 		strings.Contains(errStr, "lock timeout")
+}
+
+// sendUnlockBatch processes a batch of SetLocked(false) calls with a single bulk UPDATE.
+func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
+	ctx := context.Background()
+
+	if len(batch) == 1 {
+		hashes := []chainhash.Hash{batch[0].hash}
+		batch[0].done <- s.setUnlockedBulk(ctx, hashes)
+		return
+	}
+
+	hashes := make([]chainhash.Hash, len(batch))
+	for i, item := range batch {
+		hashes[i] = item.hash
+	}
+
+	err := s.setUnlockedBulk(ctx, hashes)
+	for _, item := range batch {
+		item.done <- err
+	}
 }
