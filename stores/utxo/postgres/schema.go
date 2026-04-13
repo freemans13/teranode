@@ -21,7 +21,7 @@ type partitionSpec struct {
 }
 
 // numPartitions is the number of hash partitions per table.
-const numPartitions = 16
+const numPartitions = 8
 
 // createSchemaWithPool executes all DDL statements using the provided pool.
 func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
