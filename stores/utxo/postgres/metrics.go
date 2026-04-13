@@ -25,7 +25,7 @@ func initPrometheusMetrics() {
 func doInitPrometheusMetrics() {
 	prometheusDirectCreateDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "teranode",
-		Subsystem: "queue_utxo",
+		Subsystem: "postgres_utxo",
 		Name:      "create_duration_seconds",
 		Help:      "Duration of Create() calls in seconds",
 		Buckets:   prometheus.DefBuckets,
@@ -33,7 +33,7 @@ func doInitPrometheusMetrics() {
 
 	prometheusDirectSpendDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "teranode",
-		Subsystem: "queue_utxo",
+		Subsystem: "postgres_utxo",
 		Name:      "spend_duration_seconds",
 		Help:      "Duration of Spend() per-input calls in seconds",
 		Buckets:   prometheus.DefBuckets,
@@ -41,7 +41,7 @@ func doInitPrometheusMetrics() {
 
 	prometheusDirectMinedDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "teranode",
-		Subsystem: "queue_utxo",
+		Subsystem: "postgres_utxo",
 		Name:      "mined_duration_seconds",
 		Help:      "Duration of SetMinedMulti() calls in seconds",
 		Buckets:   prometheus.DefBuckets,
@@ -49,21 +49,21 @@ func doInitPrometheusMetrics() {
 
 	prometheusDirectConflicts = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "teranode",
-		Subsystem: "queue_utxo",
+		Subsystem: "postgres_utxo",
 		Name:      "spend_conflicts_total",
 		Help:      "Total number of spend conflicts detected",
 	})
 
 	prometheusDirectCreate = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "teranode",
-		Subsystem: "queue_utxo",
+		Subsystem: "postgres_utxo",
 		Name:      "create_total",
 		Help:      "Total number of Create calls",
 	})
 
 	prometheusDirectSpend = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "teranode",
-		Subsystem: "queue_utxo",
+		Subsystem: "postgres_utxo",
 		Name:      "spend_total",
 		Help:      "Total number of Spend calls",
 	})

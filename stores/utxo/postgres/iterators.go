@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// unminedTxIterator implements utxo.UnminedTxIterator for the v5 queue store.
+// unminedTxIterator implements utxo.UnminedTxIterator for the postgres store.
 type unminedTxIterator struct {
 	store *Store
 	rows  pgx.Rows

@@ -204,9 +204,9 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	var num int
 	err := s.pool.QueryRow(ctx, "SELECT 1").Scan(&num)
 	if err != nil {
-		return 503, "Queue UTXO Store", err
+		return 503, "Postgres UTXO Store", err
 	}
-	return 200, "Queue UTXO Store", nil
+	return 200, "Postgres UTXO Store", nil
 }
 
 func (s *Store) SetBlockHeight(blockHeight uint32) error {

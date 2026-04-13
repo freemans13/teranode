@@ -19,7 +19,7 @@ var (
 	prunerServiceMutex    sync.Mutex
 )
 
-// GetPrunerService returns a pruner service for the queue store.
+// GetPrunerService returns a pruner service for the postgres store.
 func (s *Store) GetPrunerService() (pruner.Service, error) {
 	prunerServiceMutex.Lock()
 	defer prunerServiceMutex.Unlock()
@@ -28,7 +28,7 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 		return prunerServiceInstance, nil
 	}
 
-	svc := &queuePrunerService{
+	svc := &postgresPrunerService{
 		store:  s,
 		logger: s.logger,
 	}
@@ -37,30 +37,30 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 	return prunerServiceInstance, nil
 }
 
-// queuePrunerService implements pruner.Service for the v5 queue store.
-type queuePrunerService struct {
+// postgresPrunerService implements pruner.Service for the postgres store.
+type postgresPrunerService struct {
 	store     *Store
 	logger    interface{ Infof(string, ...interface{}) }
 	observers []pruner.Observer
 	mu        sync.Mutex
 }
 
-var _ pruner.Service = (*queuePrunerService)(nil)
+var _ pruner.Service = (*postgresPrunerService)(nil)
 
 // Start starts the pruner service. No background goroutines needed.
-func (s *queuePrunerService) Start(_ context.Context) {
-	s.logger.Infof("[QueuePrunerService] service ready")
+func (s *postgresPrunerService) Start(_ context.Context) {
+	s.logger.Infof("[PostgresPrunerService] service ready")
 }
 
 // AddObserver adds an observer to be notified when pruning completes.
-func (s *queuePrunerService) AddObserver(observer pruner.Observer) {
+func (s *postgresPrunerService) AddObserver(observer pruner.Observer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observers = append(s.observers, observer)
 }
 
 // Prune removes transactions marked for deletion at or before the specified height.
-func (s *queuePrunerService) Prune(ctx context.Context, blockHeight uint32, blockHashStr string) (int64, error) {
+func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, blockHashStr string) (int64, error) {
 	if blockHeight == 0 {
 		return 0, errors.NewProcessingError("cannot prune at block height 0")
 	}
@@ -105,7 +105,7 @@ func (s *queuePrunerService) Prune(ctx context.Context, blockHeight uint32, bloc
 
 // deleteTombstoned finds transactions with delete_at_height <= blockHeight and
 // cascade-deletes them from all 3 tables.
-func (s *queuePrunerService) deleteTombstoned(ctx context.Context, blockHeight uint32) (int64, error) {
+func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeight uint32) (int64, error) {
 	// Find tombstoned tx hashes.
 	rows, err := s.store.pool.Query(ctx, `
 		SELECT hash FROM txs

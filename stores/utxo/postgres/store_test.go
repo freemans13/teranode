@@ -122,7 +122,7 @@ func TestHealth(t *testing.T) {
 	code, name, err := store.Health(ctx, true)
 	require.NoError(t, err)
 	require.Equal(t, 200, code)
-	require.Equal(t, "Queue UTXO Store", name)
+	require.Equal(t, "Postgres UTXO Store", name)
 }
 
 func TestBlockState(t *testing.T) {

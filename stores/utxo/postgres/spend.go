@@ -157,7 +157,7 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 	if len(spends) != len(spentSpends) {
 		if needsSpendRollback(spends) {
 			if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
-				s.logger.Errorf("error in queue unspend (rollback): %v", unspendErr)
+				s.logger.Errorf("error in postgres unspend (rollback): %v", unspendErr)
 			}
 		}
 
@@ -171,7 +171,7 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 				}
 			}
 		}
-		return spends, errors.NewUtxoError("error in queue spend - errors", spendErrors)
+		return spends, errors.NewUtxoError("error in postgres spend - errors", spendErrors)
 	}
 
 	return spends, nil
@@ -239,7 +239,7 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 	if len(spends) != len(spentSpends) {
 		if needsSpendRollback(spends) {
 			if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
-				s.logger.Errorf("error in queue unspend (rollback): %v", unspendErr)
+				s.logger.Errorf("error in postgres unspend (rollback): %v", unspendErr)
 			}
 		}
 
@@ -253,7 +253,7 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 				}
 			}
 		}
-		return spends, errors.NewUtxoError("error in queue spend - errors", spendErrors)
+		return spends, errors.NewUtxoError("error in postgres spend - errors", spendErrors)
 	}
 
 	return spends, nil
