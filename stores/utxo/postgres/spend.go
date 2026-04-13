@@ -270,6 +270,33 @@ func (s *Store) sendSpendBatch(batch []*batchSpendItem) {
 func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	ctx := context.Background()
 
+	// Single-item fast path: use the direct validation CTE instead of bulk UNNEST.
+	if len(batch) == 1 {
+		item := batch[0]
+		var inserted int
+		err := s.pool.QueryRow(ctx, spendValidationSQL,
+			item.spend.TxID[:], item.spend.Vout,
+			item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
+			int64(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
+		).Scan(&inserted)
+		if err == nil {
+			item.errCh <- nil
+			return false
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			item.errCh <- errors.NewStorageError("[Spend] query failed for %s:%d: %v", item.spend.TxID, item.spend.Vout, err)
+			return false
+		}
+		diagErr := s.diagnoseSpendFailure(ctx, item.spend, item.spend.SpendingData.Bytes(),
+			item.blockHeight, item.ignoreLocked, item.ignoreConflicting)
+		if diagErr == nil {
+			item.errCh <- nil
+		} else {
+			item.errCh <- diagErr
+		}
+		return false
+	}
+
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		for _, item := range batch {

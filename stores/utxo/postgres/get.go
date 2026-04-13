@@ -62,6 +62,13 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 func (s *Store) sendGetBatch(batch []*batchGetItem) {
 	ctx := context.Background()
 
+	// Single-item fast path: direct query, no SendBatch overhead.
+	if len(batch) == 1 {
+		result, err := s.getInternal(ctx, batch[0].hash, batch[0].bins)
+		batch[0].done <- batchGetResult{Data: result, Err: err}
+		return
+	}
+
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		for _, item := range batch {

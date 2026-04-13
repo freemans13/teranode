@@ -272,6 +272,14 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 // ---------------------------------------------------------------------------
 
 func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
+	// Single-item fast path: bypass COPY+staging overhead, use direct INSERT.
+	if len(batch) == 1 {
+		item := batch[0]
+		result, err := s.createDirect(context.Background(), item.tx, item.blockHeight, item.options)
+		item.done <- batchCreateResult{Data: result, Err: err}
+		return
+	}
+
 	ctx := context.Background()
 
 	// Phase 1: Pre-compute all parameters (CPU only, no DB).

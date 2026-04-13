@@ -163,6 +163,17 @@ type batchUnlockItem struct {
 func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 	ctx := context.Background()
 
+	// Single-item fast path: direct query.
+	if len(batch) == 1 {
+		_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = $1`, batch[0].hash[:])
+		if err != nil {
+			batch[0].done <- errors.NewStorageError("[Unlock] update: %v", err)
+		} else {
+			batch[0].done <- nil
+		}
+		return
+	}
+
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		for _, item := range batch {
