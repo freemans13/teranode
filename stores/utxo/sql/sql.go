@@ -1011,12 +1011,20 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 
 		// Close the batch reader — ensures all pipelined commits are finalized
 		// and visible to other connections before callers proceed.
-		if closeErr := br.Close(); closeErr != nil {
-			s.logger.Warnf("[sendCreateBatch] error closing batch results: %v", closeErr)
+		closeErr := br.Close()
+		if closeErr != nil {
+			s.logger.Errorf("[sendCreateBatch] error closing batch results: %v", closeErr)
 		}
 
-		// Now signal callers
+		// Now signal callers — if Close() failed, override successes with errors
+		// since the connection may be in an error state and data visibility is uncertain.
 		for _, r := range results {
+			if closeErr != nil && r.result.Err == nil {
+				batch[r.idx].done <- batchCreateResult{
+					Err: errors.NewStorageError("batch close failed, results may not be visible", closeErr),
+				}
+				continue
+			}
 			if r.logError {
 				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", prepared[r.idx].txHash[:], r.result.Err)
 			}
