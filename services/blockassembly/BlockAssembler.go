@@ -455,10 +455,12 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool, validateInput
 		moveBackTxs := make([]chainhash.Hash, 0, len(moveBackBlocksWithMeta)*100)
 
 		for _, blockWithMeta := range moveBackBlocksWithMeta {
-			if blockWithMeta.meta.Invalid {
-				// Skip invalid blocks - BlockValidation already handled them via unsetMined=true
-				continue
-			}
+			// Do NOT skip invalid blocks here. BlockValidation handles them via
+			// setTxMinedStatus(unsetMined=true), but that runs asynchronously via
+			// a BlockMinedUnset notification and may not have completed yet. If we
+			// skip, loadUnminedTransactions() won't find these txs (unmined_since
+			// still NULL) and they'll be silently lost from block assembly.
+			// MarkTransactionsOnLongestChain is idempotent, so double-marking is safe.
 
 			block := blockWithMeta.block
 			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
