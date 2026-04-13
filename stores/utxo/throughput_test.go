@@ -16,7 +16,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	aerostore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
-	"github.com/bsv-blockchain/teranode/stores/utxo/queue"
+	pgstore "github.com/bsv-blockchain/teranode/stores/utxo/postgres"
 	sqlstore "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -277,7 +277,7 @@ func newQueueStoreForBench(t *testing.T) utxo.Store {
 	cleanDB(t)
 	ctx := context.Background()
 	storeURL, _ := url.Parse(throughputDSN)
-	storeURL.Scheme = "postgresqueue"
+	storeURL.Scheme = "postgres"
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 60 * time.Second
 	tSettings.UtxoStore.SpendBatcherDurationMillis = 5
@@ -285,7 +285,7 @@ func newQueueStoreForBench(t *testing.T) utxo.Store {
 	tSettings.UtxoStore.SpendBatcherSize = 500
 	tSettings.UtxoStore.StoreBatcherSize = 500
 	logger := ulogger.TestLogger{}
-	s, err := queue.New(ctx, logger, tSettings, storeURL)
+	s, err := pgstore.New(ctx, logger, tSettings, storeURL)
 	if err != nil {
 		t.Fatalf("queue store: %v", err)
 	}

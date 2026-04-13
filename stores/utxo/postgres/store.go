@@ -1,4 +1,4 @@
-package queue
+package postgres
 
 import (
 	"context"
@@ -89,8 +89,7 @@ type Store struct {
 }
 
 // New creates a new direct-write UTXO store.
-// The storeURL scheme should be "postgresqueue"; it is rewritten to "postgres"
-// for the underlying connections.
+// The storeURL scheme should be "postgres".
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, storeURL *url.URL) (*Store, error) {
 	pgxURL := *storeURL
 	pgxURL.Scheme = "postgres"

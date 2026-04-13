@@ -1,4 +1,4 @@
-package queue
+package postgres
 
 import (
 	"context"
@@ -50,7 +50,7 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 
 	storeURL, err := url.Parse(testDSN)
 	require.NoError(t, err)
-	storeURL.Scheme = "postgresqueue"
+	storeURL.Scheme = "postgres"
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
