@@ -2716,39 +2716,15 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 		}
 	} else {
 		// Not on longest chain: clear delete_at_height, set locked = false
-		if minedBlockInfo.UnsetMined {
-			// UnsetMined path (block invalidation): set unmined_since for transactions
-			// that no longer have any block_ids after the deletion above.
-			// This mirrors the aerospike Lua which sets unmined_since = currentBlockHeight
-			// when #blocks == 0 after removing the block_id.
-			inClause3, inArgs3 := buildINClause(existingHashBytes, 2)
-			qUpdate := fmt.Sprintf(`
-				UPDATE transactions
-				SET locked = false
-				   ,delete_at_height = NULL
-				   ,unmined_since = CASE
-				        WHEN NOT EXISTS (
-				            SELECT 1 FROM block_ids bi WHERE bi.transaction_id = transactions.id
-				        ) THEN $1
-				        ELSE unmined_since
-				    END
-				WHERE hash IN %s
-			`, inClause3)
-			args := append([]interface{}{minedBlockInfo.BlockHeight}, inArgs3...)
-			if _, err = txn.ExecContext(ctx, qUpdate, args...); err != nil {
-				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
-			}
-		} else {
-			// Normal not-on-longest-chain path: MarkTransactionsOnLongestChain handles unmined_since
-			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
-			qUpdate := fmt.Sprintf(`
-				UPDATE transactions
-				SET locked = false, delete_at_height = NULL
-				WHERE hash IN %s
-			`, inClause3)
-			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
-				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
-			}
+		// Do NOT set unmined_since here — that's MarkTransactionsOnLongestChain's job
+		inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
+		qUpdate := fmt.Sprintf(`
+			UPDATE transactions
+			SET locked = false, delete_at_height = NULL
+			WHERE hash IN %s
+		`, inClause3)
+		if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
+			return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
 		}
 	}
 
