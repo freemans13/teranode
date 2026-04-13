@@ -12,7 +12,8 @@ import (
 )
 
 // minedChunkSize is the maximum number of hashes per bulk UPDATE.
-const minedChunkSize = 500
+// Larger chunks = fewer round trips. Simple array append keeps per-row cost constant.
+const minedChunkSize = 2000
 
 // SetMinedMulti updates the block ID for multiple transactions that have been mined.
 // Normal path: single UPDATE on txs with array append.
@@ -47,8 +48,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	batch := &pgx.Batch{}
 
 	// Queue UPDATE chunks.
-	// Use array_append only if the block_id is NOT already present (idempotent).
-	// Also handle delete_at_height for pruning (mirrors SQL store logic).
+	// Simple array append — no idempotency check. Duplicates only occur on crash
+	// recovery (same block re-processed). UnsetMined removes all matching entries
+	// so duplicates are harmless.
 	var updateSQL string
 	if minedBlockInfo.OnLongestChain {
 		retention := uint32(0)
@@ -58,12 +60,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		if retention > 0 {
 			newDAH := int64(s.blockHeight.Load() + 1 + retention)
 			updateSQL = fmt.Sprintf(`UPDATE txs SET
-				block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
-					ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-				block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
-					ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-				subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
-					ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+				block_ids = COALESCE(block_ids, '{}') || $2::int[],
+				block_heights = COALESCE(block_heights, '{}') || $3::int[],
+				subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
 				locked = false, unmined_since = NULL,
 				delete_at_height = CASE
 					WHEN preserve_until IS NOT NULL THEN delete_at_height
@@ -72,23 +71,17 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			WHERE hash = ANY($1)`, newDAH, newDAH)
 		} else {
 			updateSQL = `UPDATE txs SET
-				block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
-					ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-				block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
-					ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-				subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
-					ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+				block_ids = COALESCE(block_ids, '{}') || $2::int[],
+				block_heights = COALESCE(block_heights, '{}') || $3::int[],
+				subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
 				locked = false, unmined_since = NULL
 			WHERE hash = ANY($1)`
 		}
 	} else {
 		updateSQL = `UPDATE txs SET
-			block_ids = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_ids
-				ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-			block_heights = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN block_heights
-				ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-			subtree_idxs = CASE WHEN $2::int[] && COALESCE(block_ids, '{}'::int[]) THEN subtree_idxs
-				ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+			block_ids = COALESCE(block_ids, '{}') || $2::int[],
+			block_heights = COALESCE(block_heights, '{}') || $3::int[],
+			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
 			locked = false
 		WHERE hash = ANY($1)`
 	}
