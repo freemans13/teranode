@@ -1015,7 +1015,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 			} else if !inserted {
 				// ON CONFLICT (hash) DO NOTHING — new_tx returned 0 rows, tx already exists
 				results = append(results, batchResult{idx: idx, result: batchCreateResult{
-					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", p.isCoinbase),
+					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v)", p.isCoinbase),
 				}})
 			} else {
 				results = append(results, batchResult{idx: idx, result: batchCreateResult{Data: p.txMeta}})
@@ -1024,18 +1024,29 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 
 		// Close the batch reader — ensures all pipelined commits are finalized
 		// and visible to other connections before callers proceed.
-		if closeErr := br.Close(); closeErr != nil {
-			s.logger.Warnf("[sendCreateBatch] error closing batch results: %v", closeErr)
+		closeErr := br.Close()
+		if closeErr != nil {
+			s.logger.Errorf("[sendCreateBatch] error closing batch results: %v", closeErr)
 		}
 
-		// Now signal callers
+		// Now signal callers — if Close() failed, override successes with errors
+		// since the connection may be in an error state and data visibility is uncertain.
 		for _, r := range results {
+			if closeErr != nil && r.result.Err == nil {
+				batch[r.idx].done <- batchCreateResult{
+					Err: errors.NewStorageError("batch close failed, results may not be visible", closeErr),
+				}
+				continue
+			}
 			if r.logError {
 				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", prepared[r.idx].txHash[:], r.result.Err)
 			}
 			batch[r.idx].done <- r.result
 		}
-		return nil
+
+		// Propagate close error so the connection is not returned to the pool
+		// and Phase 3 (conflicting children) does not run on an uncertain state.
+		return closeErr
 	})
 	if connErr != nil {
 		// Raw callback error — send to any items that haven't received a result yet
@@ -2701,15 +2712,39 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 		}
 	} else {
 		// Not on longest chain: clear delete_at_height, set locked = false
-		// Do NOT set unmined_since here — that's MarkTransactionsOnLongestChain's job
-		inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
-		qUpdate := fmt.Sprintf(`
-			UPDATE transactions
-			SET locked = false, delete_at_height = NULL
-			WHERE hash IN %s
-		`, inClause3)
-		if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
-			return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+		if minedBlockInfo.UnsetMined {
+			// UnsetMined path (block invalidation): set unmined_since for transactions
+			// that no longer have any block_ids after the deletion above.
+			// This mirrors the aerospike Lua which sets unmined_since = currentBlockHeight
+			// when #blocks == 0 after removing the block_id.
+			inClause3, inArgs3 := buildINClause(existingHashBytes, 2)
+			qUpdate := fmt.Sprintf(`
+				UPDATE transactions
+				SET locked = false
+				   ,delete_at_height = NULL
+				   ,unmined_since = CASE
+				        WHEN NOT EXISTS (
+				            SELECT 1 FROM block_ids bi WHERE bi.transaction_id = transactions.id
+				        ) THEN $1
+				        ELSE unmined_since
+				    END
+				WHERE hash IN %s
+			`, inClause3)
+			args := append([]interface{}{minedBlockInfo.BlockHeight}, inArgs3...)
+			if _, err = txn.ExecContext(ctx, qUpdate, args...); err != nil {
+				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+			}
+		} else {
+			// Normal not-on-longest-chain path: MarkTransactionsOnLongestChain handles unmined_since
+			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
+			qUpdate := fmt.Sprintf(`
+				UPDATE transactions
+				SET locked = false, delete_at_height = NULL
+				WHERE hash IN %s
+			`, inClause3)
+			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
+				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+			}
 		}
 	}
 
