@@ -226,7 +226,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 	}
 
-	// Initialize unlock batcher for Postgres — batches SetLocked(false) calls.
+	// Initialize unlock batcher for Postgres — batches single-hash SetLocked(false) calls.
 	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.LockedBatcherSize > 1 {
 		unlockBatchSize := tSettings.UtxoStore.LockedBatcherSize
 		unlockBatchDuration := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
