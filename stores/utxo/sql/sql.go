@@ -1030,7 +1030,10 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 			}
 			batch[r.idx].done <- r.result
 		}
-		return nil
+
+		// Propagate close error so the connection is not returned to the pool
+		// and Phase 3 (conflicting children) does not run on an uncertain state.
+		return closeErr
 	})
 	if connErr != nil {
 		// Raw callback error — send to any items that haven't received a result yet
