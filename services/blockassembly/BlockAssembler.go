@@ -1497,6 +1497,15 @@ func (b *BlockAssembler) validateParentChain(
 			filteringStatus := "disabled"
 			if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
 				filteringStatus = "enabled"
+
+				// Run a final validation pass so transactions with still-unresolved parents
+				// are not leaked into the result.
+				finalValidTxs, _, finalSkippedCount, err := b.validateParentChainPass(ctx, validTxs, bestBlockHeaderIDsMap)
+				if err != nil {
+					return nil, err
+				}
+				validTxs = finalValidTxs
+				skippedCount = finalSkippedCount
 			}
 			if skippedCount > 0 {
 				b.logger.Warnf("[BlockAssembler][validateParentChain] Skipped %d transactions due to invalid/missing parent chains (filtering: %s)", skippedCount, filteringStatus)
@@ -1724,7 +1733,9 @@ func (b *BlockAssembler) validateParentChainPass(
 			if allParentsValid {
 				validTxs = append(validTxs, tx)
 			} else if hasMissingParent {
-				validTxs = append(validTxs, tx)
+				// Do not add to validTxs — parent chain is unresolved.
+				// The tx remains in unminedTxs for re-validation after reconciliation.
+				skippedCount++
 			} else {
 				if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
 					skippedCount++
@@ -1764,7 +1775,7 @@ func (b *BlockAssembler) reconcileMissingParents(
 	}
 
 	fetchFields := []fields.FieldName{
-		fields.Fee, fields.SizeInBytes, fields.CreatedAt,
+		fields.Fee, fields.SizeInBytes,
 		fields.BlockIDs, fields.UnminedSince, fields.Locked,
 	}
 	if b.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {

@@ -40,17 +40,16 @@ validateParentChain(unminedTxs, bestBlockHeaderIDsMap)
   │   └─ Parent data inconsistency → invalid
   │
   ├─ If reconciliation candidates exist:
-  │   ├─ BatchDecorate reconciliation candidates with full field set
-  │   │   (fee, size, createdAt, blockIDs, locked, txInpoints)
+  │   ├─ BatchDecorate reconciliation candidates with the available field set
+  │   │   (fee, size, blockIDs, unminedSince, locked, txInpoints)
   │   ├─ Filter out invalid candidates:
   │   │   ├─ Skip if block_ids on best chain (data inconsistency, not truly unmined)
-  │   │   ├─ Skip if no createdAt (split record, not a real unmined tx)
+  │   │   ├─ Skip if unminedSince == 0 (no longer unmined, race resolved)
   │   │   └─ Skip if BatchDecorate returns error (record doesn't exist)
-  │   ├─ Build UnminedTransaction structs from valid candidates
-  │   ├─ Append to validTxs
-  │   ├─ Re-sort validTxs by createdAt
-  │   ├─ Rebuild parentIndexMap
-  │   └─ Pass 2: Validate ONLY reconciled txs and their direct children
+  │   ├─ Build UnminedTransaction structs from valid candidates (CreatedAt=0)
+  │   ├─ Prepend to unminedTxs (not validTxs) to preserve ordering
+  │   ├─ Re-sort unminedTxs by createdAt (stable sort)
+  │   └─ Pass 2: Re-validate the full unminedTxs list (now including reconciled parents)
   │       └─ Repeat up to 3 passes max
   │
   └─ Return validTxs (complete with reconciled parents)
@@ -58,9 +57,9 @@ validateParentChain(unminedTxs, bestBlockHeaderIDsMap)
 
 ### Key Details
 
-**Fetching missing parents**: Use `BatchDecorate` with the full field set (same bins the iterator requests: fee, sizeInBytes, createdAt, blockIDs, locked, unminedSince, txInpoints). No new store method needed.
+**Fetching missing parents**: Use `BatchDecorate` with the available field set (fee, sizeInBytes, blockIDs, locked, unminedSince, plus txInpoints if `StoreTxInpointsForSubtreeMeta` is enabled). Note: `createdAt` is not available from `meta.Data`, so reconciled txs use `CreatedAt=0`. No new store method needed.
 
-**Subsequent passes are scoped**: Only validate newly reconciled parents (their own parents might be missing) and children of reconciled parents that were previously marked invalid. This keeps cost proportional to reconciled count, not total list size.
+**Subsequent passes re-validate the full list**: Each pass re-validates the complete `unminedTxs` slice (now including any newly reconciled parents). This is simpler than scoping to only affected txs and the cost is acceptable because the reconciliation set is typically small (10-100 txs) compared to the total list. The O(N) per-pass cost is dominated by the initial BatchDecorate calls that already happen.
 
 **Max passes cap**: 3 passes maximum. If missing parents remain after 3 passes, fall back to current behavior — warn and skip/keep based on `OnRestartRemoveInvalidParentChainTxs` setting.
 
@@ -69,7 +68,7 @@ validateParentChain(unminedTxs, bestBlockHeaderIDsMap)
 | Scenario | Handling |
 |----------|----------|
 | Reconciled parent has block_ids on best chain + unmined_since > 0 | Data inconsistency — do not add to unmined list. Already handled by `MarkTransactionsOnLongestChain`. |
-| Reconciled parent has no createdAt | Split record — skip, not a real unmined tx. |
+| Reconciled parent has CreatedAt=0 | Expected — `createdAt` is not available from `meta.Data`. Stable sort preserves insertion order for reconciled txs. |
 | Concurrent write during reconciliation | Acceptable — same class of problem. 3-pass cap + normal tx ingestion picks it up. |
 | Deep ancestor chains (parent → grandparent → great-grandparent all missed) | Handled by multi-pass. Each pass discovers the next level. Capped at 3. |
 | More than 1000 parents reconciled | Log WARN — indicates systemic issue, not normal scan race. |
@@ -89,7 +88,7 @@ The expensive work (SI scan + BatchDecorate for all parents) already happens tod
 
 - One BatchDecorate call for the missing parents (typically 10-100 txs, negligible vs the millions already fetched)
 - A re-sort of the full list (already O(N log N), adding a handful of items doesn't change this)
-- At most 2 additional scoped validation passes
+- At most 2 additional full validation passes (re-validates the complete list each time)
 
 Net impact: unmeasurable in practice.
 

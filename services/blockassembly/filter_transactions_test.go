@@ -118,7 +118,7 @@ func TestValidateParentChain_BatchingAndOrdering(t *testing.T) {
 
 		// Setup mock responses for BatchDecorate
 		// The mock needs to respond to BatchDecorate calls for each batch
-		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).
 			Run(func(args mock.Arguments) {
 				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
 				for _, unresolved := range unresolvedParents {
@@ -247,7 +247,7 @@ func TestValidateParentChain_BatchingAndOrdering(t *testing.T) {
 		unminedTxs := []*utxo.UnminedTransaction{childTx, parentTx}
 
 		// Setup mock responses
-		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).
 			Run(func(args mock.Arguments) {
 				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
 				for _, unresolved := range unresolvedParents {
@@ -338,7 +338,7 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 
 		// First BatchDecorate call (validation pass): returns parent as unmined
 		// Second BatchDecorate call (reconciliation fetch): returns full parent data
-		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).
 			Run(func(args mock.Arguments) {
 				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
 				for _, unresolved := range unresolvedParents {
@@ -422,7 +422,7 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 
 		unminedTxs := []*utxo.UnminedTransaction{childTx}
 
-		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).
 			Run(func(args mock.Arguments) {
 				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
 				for _, unresolved := range unresolvedParents {
@@ -507,7 +507,7 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 
 		unminedTxs := []*utxo.UnminedTransaction{childTx}
 
-		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).
 			Run(func(args mock.Arguments) {
 				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
 				for _, unresolved := range unresolvedParents {
@@ -528,8 +528,11 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 		validTxs, err := blockAssembler.validateParentChain(ctx, unminedTxs, bestBlockHeaderIDsMap)
 		require.NoError(t, err)
 
-		// The parent should NOT be reconciled (data inconsistency).
-		// The key: parent should NOT appear in validTxs
+		// The parent should NOT be reconciled (data inconsistency), and because the
+		// child depends on that skipped parent it must not remain in validTxs either.
+		require.Len(t, validTxs, 0, "Orphan child should be excluded when parent reconciliation is skipped")
+
+		// The key: parent should NOT appear in validTxs.
 		for _, tx := range validTxs {
 			require.False(t, tx.Hash.IsEqual(&parentHash), "Parent with block_ids on best chain should not be reconciled into list")
 		}
@@ -575,7 +578,7 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 
 		unminedTxs := []*utxo.UnminedTransaction{childTx}
 
-		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).
 			Run(func(args mock.Arguments) {
 				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
 				for _, unresolved := range unresolvedParents {
