@@ -28,6 +28,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/gocore"
 )
@@ -404,6 +405,23 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool, validateInput
 		return errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
 	}
 
+	// Wait for BlockValidation to finish processing any invalid moveBack blocks.
+	// InvalidateBlock sets mined_set=false and sends a BlockMinedUnset notification.
+	// BlockValidation's setTxMinedStatus(unsetMined=true) processes that notification
+	// asynchronously — it unsets the mined status for the block's transactions (sets
+	// unmined_since) and then sets mined_set=true. We must wait for that to complete
+	// before loadUnminedTransactions, otherwise those txs still have unmined_since=NULL
+	// and won't be recovered into block assembly.
+	for _, blockWithMeta := range moveBackBlocksWithMeta {
+		if blockWithMeta.meta.Invalid {
+			blockHash := blockWithMeta.block.Hash()
+			b.logger.Infof("[BlockAssembler][Reset] waiting for invalid block %s to be processed by BlockValidation", blockHash.String())
+			if waitErr := b.waitForBlockMinedSet(ctx, blockHash); waitErr != nil {
+				b.logger.Warnf("[BlockAssembler][Reset] timeout waiting for invalid block %s mined_set: %v (proceeding anyway)", blockHash.String(), waitErr)
+			}
+		}
+	}
+
 	// Mark moveBack transactions as unmined (set unmined_since)
 	//
 	// Division of Responsibility During Reorg:
@@ -455,12 +473,11 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool, validateInput
 		moveBackTxs := make([]chainhash.Hash, 0, len(moveBackBlocksWithMeta)*100)
 
 		for _, blockWithMeta := range moveBackBlocksWithMeta {
-			// Do NOT skip invalid blocks here. BlockValidation handles them via
-			// setTxMinedStatus(unsetMined=true), but that runs asynchronously via
-			// a BlockMinedUnset notification and may not have completed yet. If we
-			// skip, loadUnminedTransactions() won't find these txs (unmined_since
-			// still NULL) and they'll be silently lost from block assembly.
-			// MarkTransactionsOnLongestChain is idempotent, so double-marking is safe.
+			if blockWithMeta.meta.Invalid {
+				// Skip invalid blocks — BlockValidation has already handled them via
+				// setTxMinedStatus(unsetMined=true) which we waited for above.
+				continue
+			}
 
 			block := blockWithMeta.block
 			blockSubtrees, err := block.GetSubtrees(ctx, b.logger, b.subtreeStore, b.settings.Block.GetAndValidateSubtreesConcurrency)
@@ -533,6 +550,27 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool, validateInput
 	b.logger.Warnf("[BlockAssembler][Reset] resetting block assembler DONE")
 
 	return nil
+}
+
+// waitForBlockMinedSet polls until the given block has mined_set=true, indicating
+// that BlockValidation's setTxMinedStatus has completed for it.
+func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash) error {
+	_, err := retry.Retry(ctx, b.logger, func() (bool, error) {
+		isMined, err := b.blockchainClient.GetBlockIsMined(ctx, blockHash)
+		if err != nil {
+			return false, err
+		}
+		if !isMined {
+			return false, errors.NewBlockParentNotMinedError(
+				"[waitForBlockMinedSet] block %s mined_set not yet true", blockHash.String())
+		}
+		return true, nil
+	},
+		retry.WithBackoffDurationType(b.settings.BlockValidation.IsParentMinedRetryBackoffDuration),
+		retry.WithBackoffMultiplier(b.settings.BlockValidation.IsParentMinedRetryBackoffMultiplier),
+		retry.WithRetryCount(b.settings.BlockValidation.IsParentMinedRetryMaxRetry),
+	)
+	return err
 }
 
 // processNewBlockAnnouncement updates the best block information.
