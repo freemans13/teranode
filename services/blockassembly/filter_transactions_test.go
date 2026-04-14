@@ -379,4 +379,250 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 
 		mockStore.AssertExpectations(t)
 	})
+
+	t.Run("Reconciles deep chain - grandparent also missed", func(t *testing.T) {
+		mockStore := new(utxo.MockUtxostore)
+		logger := ulogger.TestLogger{}
+
+		testSettings := &settings.Settings{}
+		testSettings.BlockAssembly.ParentValidationBatchSize = 100
+		testSettings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs = true
+		testSettings.BlockAssembly.StoreTxInpointsForSubtreeMeta = true
+
+		blockAssembler := &BlockAssembler{
+			utxoStore: mockStore,
+			settings:  testSettings,
+			logger:    logger,
+		}
+
+		// Grandparent — NOT in unmined list (missed by SI scan)
+		grandparentHash := chainhash.Hash{}
+		grandparentHash[0] = 0x10
+
+		// Parent — NOT in unmined list (missed by SI scan)
+		parentHash := chainhash.Hash{}
+		parentHash[0] = 0x20
+
+		// Child — IS in unmined list
+		childHash := chainhash.Hash{}
+		childHash[0] = 0x30
+
+		childTx := &utxo.UnminedTransaction{
+			Node: &subtree.Node{
+				Hash:        childHash,
+				Fee:         1000,
+				SizeInBytes: 250,
+			},
+			TxInpoints: &subtree.TxInpoints{
+				ParentTxHashes: []chainhash.Hash{parentHash},
+				Idxs:           [][]uint32{{0}},
+			},
+			CreatedAt: 300,
+		}
+
+		unminedTxs := []*utxo.UnminedTransaction{childTx}
+
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
+				for _, unresolved := range unresolvedParents {
+					if unresolved.Hash.IsEqual(&grandparentHash) {
+						unresolved.Data = &meta.Data{
+							BlockIDs:     []uint32{},
+							UnminedSince: 100,
+							Fee:          200,
+							SizeInBytes:  150,
+							TxInpoints: subtree.TxInpoints{
+								ParentTxHashes: []chainhash.Hash{{}}, // grandparent's parent is mined
+								Idxs:           [][]uint32{{0}},
+							},
+						}
+					} else if unresolved.Hash.IsEqual(&parentHash) {
+						unresolved.Data = &meta.Data{
+							BlockIDs:     []uint32{},
+							UnminedSince: 100,
+							Fee:          500,
+							SizeInBytes:  200,
+							TxInpoints: subtree.TxInpoints{
+								ParentTxHashes: []chainhash.Hash{grandparentHash},
+								Idxs:           [][]uint32{{0}},
+							},
+						}
+					} else {
+						// Empty/mined parent
+						unresolved.Data = &meta.Data{
+							BlockIDs:     []uint32{1},
+							UnminedSince: 0,
+						}
+					}
+				}
+			}).
+			Return(nil)
+
+		bestBlockHeaderIDsMap := map[uint32]bool{1: true}
+
+		validTxs, err := blockAssembler.validateParentChain(ctx, unminedTxs, bestBlockHeaderIDsMap)
+		require.NoError(t, err)
+
+		// All three should be present: grandparent, parent, child
+		require.Equal(t, 3, len(validTxs), "Grandparent, parent, and child should all be valid")
+
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("Skip reconciliation if parent has block_ids on best chain", func(t *testing.T) {
+		mockStore := new(utxo.MockUtxostore)
+		logger := ulogger.TestLogger{}
+
+		testSettings := &settings.Settings{}
+		testSettings.BlockAssembly.ParentValidationBatchSize = 100
+		testSettings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs = true
+
+		blockAssembler := &BlockAssembler{
+			utxoStore: mockStore,
+			settings:  testSettings,
+			logger:    logger,
+		}
+
+		// Parent — not in list, but BatchDecorate says unmined_since>0 AND block_ids on best chain
+		// This is a data inconsistency — the parent should NOT be reconciled
+		parentHash := chainhash.Hash{}
+		parentHash[0] = 0x01
+
+		childHash := chainhash.Hash{}
+		childHash[0] = 0x02
+
+		childTx := &utxo.UnminedTransaction{
+			Node: &subtree.Node{
+				Hash:        childHash,
+				Fee:         1000,
+				SizeInBytes: 250,
+			},
+			TxInpoints: &subtree.TxInpoints{
+				ParentTxHashes: []chainhash.Hash{parentHash},
+				Idxs:           [][]uint32{{0}},
+			},
+			CreatedAt: 100,
+		}
+
+		unminedTxs := []*utxo.UnminedTransaction{childTx}
+
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
+				for _, unresolved := range unresolvedParents {
+					if unresolved.Hash.IsEqual(&parentHash) {
+						unresolved.Data = &meta.Data{
+							BlockIDs:     []uint32{1}, // ON best chain
+							UnminedSince: 100,         // But also marked unmined (inconsistency)
+							Fee:          500,
+							SizeInBytes:  200,
+						}
+					}
+				}
+			}).
+			Return(nil)
+
+		bestBlockHeaderIDsMap := map[uint32]bool{1: true}
+
+		validTxs, err := blockAssembler.validateParentChain(ctx, unminedTxs, bestBlockHeaderIDsMap)
+		require.NoError(t, err)
+
+		// The parent should NOT be reconciled (data inconsistency).
+		// The key: parent should NOT appear in validTxs
+		for _, tx := range validTxs {
+			require.False(t, tx.Hash.IsEqual(&parentHash), "Parent with block_ids on best chain should not be reconciled into list")
+		}
+
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("Max passes exceeded - falls back gracefully", func(t *testing.T) {
+		mockStore := new(utxo.MockUtxostore)
+		logger := ulogger.TestLogger{}
+
+		testSettings := &settings.Settings{}
+		testSettings.BlockAssembly.ParentValidationBatchSize = 100
+		testSettings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs = true
+
+		blockAssembler := &BlockAssembler{
+			utxoStore: mockStore,
+			settings:  testSettings,
+			logger:    logger,
+		}
+
+		// Create a chain of 5 levels deep (exceeds max 3 reconciliation passes)
+		// level0 (mined) <- level1 (missed) <- level2 (missed) <- level3 (missed) <- level4 (missed) <- child (in list)
+		hashes := make([]chainhash.Hash, 6)
+		for i := range hashes {
+			hashes[i] = chainhash.Hash{}
+			hashes[i][0] = byte(i + 1)
+		}
+
+		// Only the child (hashes[5]) is in the unmined list
+		childTx := &utxo.UnminedTransaction{
+			Node: &subtree.Node{
+				Hash:        hashes[5],
+				Fee:         1000,
+				SizeInBytes: 250,
+			},
+			TxInpoints: &subtree.TxInpoints{
+				ParentTxHashes: []chainhash.Hash{hashes[4]},
+				Idxs:           [][]uint32{{0}},
+			},
+			CreatedAt: 500,
+		}
+
+		unminedTxs := []*utxo.UnminedTransaction{childTx}
+
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
+				for _, unresolved := range unresolvedParents {
+					// hashes[0] is mined
+					if unresolved.Hash.IsEqual(&hashes[0]) {
+						unresolved.Data = &meta.Data{
+							BlockIDs:     []uint32{1},
+							UnminedSince: 0,
+						}
+					} else {
+						// Find which level this is
+						for level := 1; level <= 4; level++ {
+							if unresolved.Hash.IsEqual(&hashes[level]) {
+								unresolved.Data = &meta.Data{
+									BlockIDs:     []uint32{},
+									UnminedSince: 100,
+									Fee:          uint64(level * 100),
+									SizeInBytes:  uint64(level * 50),
+									TxInpoints: subtree.TxInpoints{
+										ParentTxHashes: []chainhash.Hash{hashes[level-1]},
+										Idxs:           [][]uint32{{0}},
+									},
+								}
+								break
+							}
+						}
+						// Empty hash (mined)
+						if unresolved.Data == nil {
+							unresolved.Data = &meta.Data{
+								BlockIDs:     []uint32{1},
+								UnminedSince: 0,
+							}
+						}
+					}
+				}
+			}).
+			Return(nil)
+
+		bestBlockHeaderIDsMap := map[uint32]bool{1: true}
+
+		validTxs, err := blockAssembler.validateParentChain(ctx, unminedTxs, bestBlockHeaderIDsMap)
+		require.NoError(t, err)
+
+		// With max 3 passes, we can reconcile levels 4, 3, 2 (3 passes).
+		// Level 1 would need a 4th pass. The key assertion: it doesn't panic or error out
+		require.NotNil(t, validTxs)
+
+		mockStore.AssertExpectations(t)
+	})
 }
