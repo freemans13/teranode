@@ -405,19 +405,23 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool, validateInput
 		return errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
 	}
 
-	// Wait for BlockValidation to finish processing any invalid moveBack blocks.
+	// Best-effort wait for BlockValidation to finish processing any invalid moveBack blocks.
 	// InvalidateBlock sets mined_set=false and sends a BlockMinedUnset notification.
 	// BlockValidation's setTxMinedStatus(unsetMined=true) processes that notification
 	// asynchronously — it unsets the mined status for the block's transactions (sets
-	// unmined_since) and then sets mined_set=true. We must wait for that to complete
-	// before loadUnminedTransactions, otherwise those txs still have unmined_since=NULL
-	// and won't be recovered into block assembly.
+	// unmined_since) and then sets mined_set=true. We wait for that to complete before
+	// loadUnminedTransactions so those txs have unmined_since set and can be recovered.
+	// On failure (except context cancellation), we proceed anyway — some txs may not
+	// be recovered in this reset cycle but will be picked up on subsequent resets.
 	for _, blockWithMeta := range moveBackBlocksWithMeta {
 		if blockWithMeta.meta.Invalid {
 			blockHash := blockWithMeta.block.Hash()
 			b.logger.Infof("[BlockAssembler][Reset] waiting for invalid block %s to be processed by BlockValidation", blockHash.String())
 			if waitErr := b.waitForBlockMinedSet(ctx, blockHash); waitErr != nil {
-				b.logger.Warnf("[BlockAssembler][Reset] timeout waiting for invalid block %s mined_set: %v (proceeding anyway)", blockHash.String(), waitErr)
+				if ctx.Err() != nil {
+					return errors.NewProcessingError("[Reset] context cancelled while waiting for invalid block mined_set", waitErr)
+				}
+				b.logger.Warnf("[BlockAssembler][Reset] gave up waiting for invalid block %s mined_set: %v (proceeding anyway — txs may be recovered on next reset)", blockHash.String(), waitErr)
 			}
 		}
 	}
@@ -566,9 +570,12 @@ func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *ch
 		}
 		return true, nil
 	},
+		retry.WithMessage("[BlockAssembler][Reset] waitForBlockMinedSet "+blockHash.String()),
 		retry.WithBackoffDurationType(b.settings.BlockValidation.IsParentMinedRetryBackoffDuration),
-		retry.WithBackoffMultiplier(b.settings.BlockValidation.IsParentMinedRetryBackoffMultiplier),
 		retry.WithRetryCount(b.settings.BlockValidation.IsParentMinedRetryMaxRetry),
+		retry.WithExponentialBackoff(),
+		retry.WithBackoffFactor(2.0),
+		retry.WithMaxBackoff(2*time.Second),
 	)
 	return err
 }
