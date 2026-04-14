@@ -1579,6 +1579,7 @@ func (b *BlockAssembler) validateParentChainPass(
 
 	validTxs := make([]*utxo.UnminedTransaction, 0, len(unminedTxs))
 	missingParentSet := make(map[chainhash.Hash]bool)
+	missingParentOrder := make([]chainhash.Hash, 0) // preserves discovery order for deterministic reconciliation
 	skippedCount := 0
 	batchSize := b.settings.BlockAssembly.ParentValidationBatchSize
 	if batchSize <= 0 {
@@ -1681,7 +1682,10 @@ func (b *BlockAssembler) validateParentChainPass(
 					} else {
 						allParentsValid = false
 						hasMissingParent = true
-						missingParentSet[parentTxID] = true
+						if !missingParentSet[parentTxID] {
+							missingParentSet[parentTxID] = true
+							missingParentOrder = append(missingParentOrder, parentTxID)
+						}
 						b.logger.Debugf("[BlockAssembler][validateParentChainPass] Transaction %s has missing parent %s (unmined, not in list) — will attempt reconciliation", tx.Hash.String(), parentTxID.String())
 						continue
 					}
@@ -1739,9 +1743,13 @@ func (b *BlockAssembler) validateParentChainPass(
 			if allParentsValid {
 				validTxs = append(validTxs, tx)
 			} else if hasMissingParent {
-				// Do not add to validTxs — parent chain is unresolved.
-				// The tx remains in unminedTxs for re-validation after reconciliation.
-				skippedCount++
+				// Parent chain is unresolved. Honor the configured keep/skip behavior
+				// so max-pass fallback remains consistent with other invalid-parent cases.
+				if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
+					skippedCount++
+				} else {
+					validTxs = append(validTxs, tx)
+				}
 			} else {
 				if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
 					skippedCount++
@@ -1752,10 +1760,8 @@ func (b *BlockAssembler) validateParentChainPass(
 		}
 	}
 
-	missingParentHashes := make([]chainhash.Hash, 0, len(missingParentSet))
-	for hash := range missingParentSet {
-		missingParentHashes = append(missingParentHashes, hash)
-	}
+	// Use discovery-ordered slice (not map iteration) for deterministic reconciliation order
+	missingParentHashes := missingParentOrder
 
 	return validTxs, missingParentHashes, skippedCount, nil
 }
