@@ -558,10 +558,24 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool, validateInput
 
 // waitForBlockMinedSet polls until the given block has mined_set=true, indicating
 // that BlockValidation's setTxMinedStatus has completed for it.
+// Non-retriable errors (e.g., block not found) cause an immediate return rather
+// than burning the full retry budget.
 func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash) error {
-	_, err := retry.Retry(ctx, b.logger, func() (bool, error) {
-		isMined, err := b.blockchainClient.GetBlockIsMined(ctx, blockHash)
+	retryCtx, retryCancel := context.WithCancel(ctx)
+	defer retryCancel()
+
+	var nonRetriableErr error
+
+	_, err := retry.Retry(retryCtx, b.logger, func() (bool, error) {
+		isMined, err := b.blockchainClient.GetBlockIsMined(retryCtx, blockHash)
 		if err != nil {
+			// Short-circuit on non-retriable errors (block doesn't exist in DB)
+			if errors.Is(err, errors.ErrBlockNotFound) {
+				nonRetriableErr = errors.NewProcessingError(
+					"[waitForBlockMinedSet] block %s not found — cannot wait for mined_set", blockHash.String())
+				retryCancel()
+				return false, nonRetriableErr
+			}
 			return false, err
 		}
 		if !isMined {
@@ -577,6 +591,10 @@ func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *ch
 		retry.WithBackoffFactor(2.0),
 		retry.WithMaxBackoff(2*time.Second),
 	)
+
+	if nonRetriableErr != nil {
+		return nonRetriableErr
+	}
 	return err
 }
 
