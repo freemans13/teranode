@@ -572,7 +572,7 @@ func (b *BlockAssembler) waitForBlockMinedSet(ctx context.Context, blockHash *ch
 			// Short-circuit on non-retriable errors (block doesn't exist in DB)
 			if errors.Is(err, errors.ErrBlockNotFound) {
 				nonRetriableErr = errors.NewProcessingError(
-					"[waitForBlockMinedSet] block %s not found — cannot wait for mined_set", blockHash.String())
+					"[waitForBlockMinedSet] block %s not found — cannot wait for mined_set", blockHash.String(), err)
 				retryCancel()
 				return false, nonRetriableErr
 			}
