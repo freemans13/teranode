@@ -1512,8 +1512,10 @@ func (b *BlockAssembler) validateParentChain(
 			b.logger.Warnf("[BlockAssembler][validateParentChain] Reconciliation found unusually high count (%d) — possible systemic issue", totalReconciled)
 		}
 
-		unminedTxs = append(unminedTxs, reconciledTxs...)
-		sort.Slice(unminedTxs, func(i, j int) bool {
+		// Prepend reconciled ancestors so that when stable-sorted, they remain before the
+		// children that depend on them (both have CreatedAt=0, stable sort preserves insertion order).
+		unminedTxs = append(reconciledTxs, unminedTxs...)
+		sort.SliceStable(unminedTxs, func(i, j int) bool {
 			return unminedTxs[i].CreatedAt < unminedTxs[j].CreatedAt
 		})
 
