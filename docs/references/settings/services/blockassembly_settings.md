@@ -34,7 +34,7 @@
 | BlockchainSubscriptionTimeout        | time.Duration | 5m               | blockassembly_blockchainSubscriptionTimeout        | Blockchain event subscription timeout                                                |
 | OnRestartValidateParentChain         | bool          | true             | blockassembly_onRestartValidateParentChain         | Enables parent chain validation on restart                                           |
 | ParentValidationBatchSize            | int           | 1000             | blockassembly_parentValidationBatchSize            | Parent validation batch size                                                         |
-| OnRestartRemoveInvalidParentChainTxs | bool          | true             | blockassembly_onRestartRemoveInvalidParentChainTxs | Filters transactions with invalid parent chains                                      |
+
 | SubtreeStorageWorkers                | int           | 4                | blockassembly_subtreeStorageWorkers                | Workers for subtree storage operations                                               |
 | SubtreeAnnouncementInterval          | time.Duration | 10s              | blockassembly_subtreeAnnouncementInterval          | Subtree announcement frequency                                                       |
 | UseColumnarBatch                     | bool          | false            | blockassembly_useColumnarBatch                     | Use columnar batch format for data layout                                            |
@@ -89,8 +89,6 @@
 
 - `OnRestartValidateParentChain = true`: Validates transaction parent chains after service restart
 - `ParentValidationBatchSize`: Controls batch processing size (default: 1000)
-- `OnRestartRemoveInvalidParentChainTxs = true` (default): Filters out transactions with invalid parent chains
-- `OnRestartRemoveInvalidParentChainTxs = false`: Keeps transactions despite invalid parents
 
 ## Service Dependencies
 

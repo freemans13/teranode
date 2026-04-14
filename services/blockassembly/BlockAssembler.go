@@ -1448,7 +1448,7 @@ func (b *BlockAssembler) getNextNbits(baBestBlockHeader *model.BlockHeader, next
 //   - bestBlockHeaderIDsMap: Map of block IDs on the best chain
 //
 // Returns:
-//   - []*utxo.UnminedTransaction: List of transactions (filtered if OnRestartRemoveInvalidParentChainTxs is enabled)
+//   - []*utxo.UnminedTransaction: List of validated transactions (all kept, invalid parents logged)
 //   - error: Context cancellation error if cancelled, nil otherwise
 func (b *BlockAssembler) validateParentChain(
 	ctx context.Context,
@@ -1570,13 +1570,9 @@ func (b *BlockAssembler) validateParentChain(
 				if onBestChain {
 					// Transaction is already on the best chain
 					// (though it shouldn't be in unmined list - this is a data inconsistency)
+					// Log but don't filter — loadUnminedTransactions already handles this
+					// via MarkTransactionsOnLongestChain.
 					b.logger.Warnf("[BlockAssembler][validateParentChain] Transaction %s is already on best chain but marked as unmined", tx.Hash.String())
-					if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
-						// Filtering enabled - skip this transaction
-						skippedCount++
-						continue
-					}
-					// Filtering disabled - keep transaction despite being on best chain
 				}
 				// Transaction has BlockIDs but not on best chain - it's on an orphaned chain
 				// Continue to validate its parents to decide if it can be re-included
@@ -1697,29 +1693,18 @@ func (b *BlockAssembler) validateParentChain(
 			if allParentsValid {
 				validTxs = append(validTxs, tx)
 			} else {
-				// Transaction has invalid parent chain - use setting to decide whether to exclude
-				if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
-					// Filtering enabled - skip this transaction
-					skippedCount++
-				} else {
-					// Filtering disabled (default) - keep transaction despite invalid parents
-					validTxs = append(validTxs, tx)
-				}
+				// Transaction has invalid parent chain — keep it anyway.
+				// Removing txs here is flawed: the tx validator runs concurrently and
+				// can create children of removed txs before any lock takes effect,
+				// re-creating the invalid candidate problem. Better to keep all txs
+				// and let the reconciliation (PR #701) handle the fixable cases.
+				validTxs = append(validTxs, tx)
 			}
 		}
 	}
 
-	filteringStatus := "disabled"
-	if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
-		filteringStatus = "enabled"
-	}
-
-	if skippedCount > 0 {
-		b.logger.Warnf("[BlockAssembler][validateParentChain] Skipped %d transactions due to invalid/missing parent chains (filtering: %s)", skippedCount, filteringStatus)
-	}
-
-	b.logger.Infof("[BlockAssembler][validateParentChain] Parent chain validation complete: %d valid, %d skipped (filtering: %s)",
-		len(validTxs), skippedCount, filteringStatus)
+	b.logger.Infof("[BlockAssembler][validateParentChain] Parent chain validation complete: %d valid, %d with invalid parents (kept)",
+		len(validTxs), skippedCount)
 
 	return validTxs, nil
 }
