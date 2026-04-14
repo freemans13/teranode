@@ -294,3 +294,89 @@ func TestValidateParentChain_BatchingAndOrdering(t *testing.T) {
 		mockStore.AssertExpectations(t)
 	})
 }
+
+func TestValidateParentChain_Reconciliation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Reconciles one missing parent from UTXO store", func(t *testing.T) {
+		mockStore := new(utxo.MockUtxostore)
+		logger := ulogger.TestLogger{}
+
+		testSettings := &settings.Settings{}
+		testSettings.BlockAssembly.ParentValidationBatchSize = 100
+		testSettings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs = true
+
+		blockAssembler := &BlockAssembler{
+			utxoStore: mockStore,
+			settings:  testSettings,
+			logger:    logger,
+		}
+
+		// Parent tx hash — NOT in the unmined list (simulates SI scan miss)
+		parentHash := chainhash.Hash{}
+		parentHash[0] = 0x01
+
+		// Child tx hash — IS in the unmined list
+		childHash := chainhash.Hash{}
+		childHash[0] = 0x02
+
+		childTx := &utxo.UnminedTransaction{
+			Node: &subtree.Node{
+				Hash:        childHash,
+				Fee:         1000,
+				SizeInBytes: 250,
+			},
+			TxInpoints: &subtree.TxInpoints{
+				ParentTxHashes: []chainhash.Hash{parentHash},
+				Idxs:           [][]uint32{{0}},
+			},
+			CreatedAt: 100,
+		}
+
+		// Only the child is in the unmined list (parent was missed by SI scan)
+		unminedTxs := []*utxo.UnminedTransaction{childTx}
+
+		// First BatchDecorate call (validation pass): returns parent as unmined
+		// Second BatchDecorate call (reconciliation fetch): returns full parent data
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				unresolvedParents := args.Get(1).([]*utxo.UnresolvedMetaData)
+				for _, unresolved := range unresolvedParents {
+					if unresolved.Hash.IsEqual(&parentHash) {
+						unresolved.Data = &meta.Data{
+							BlockIDs:     []uint32{},
+							UnminedSince: 100,
+							Locked:       false,
+							Fee:          500,
+							SizeInBytes:  200,
+							TxInpoints: subtree.TxInpoints{
+								ParentTxHashes: []chainhash.Hash{{}}, // parent's parent is mined (empty hash)
+								Idxs:           [][]uint32{{0}},
+							},
+						}
+					} else {
+						// Empty hash (mined grandparent)
+						unresolved.Data = &meta.Data{
+							BlockIDs:     []uint32{1},
+							UnminedSince: 0,
+						}
+					}
+				}
+			}).
+			Return(nil)
+
+		bestBlockHeaderIDsMap := map[uint32]bool{1: true}
+
+		validTxs, err := blockAssembler.validateParentChain(ctx, unminedTxs, bestBlockHeaderIDsMap)
+		require.NoError(t, err)
+
+		// Both parent and child should be in the result
+		require.Equal(t, 2, len(validTxs), "Both reconciled parent and child should be valid")
+
+		// Parent should come before child (lower index)
+		require.Equal(t, parentHash.String(), validTxs[0].Hash.String(), "Parent should be first")
+		require.Equal(t, childHash.String(), validTxs[1].Hash.String(), "Child should be second")
+
+		mockStore.AssertExpectations(t)
+	})
+}
