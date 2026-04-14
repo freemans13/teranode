@@ -547,6 +547,7 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 		testSettings := &settings.Settings{}
 		testSettings.BlockAssembly.ParentValidationBatchSize = 100
 		testSettings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs = true
+		testSettings.BlockAssembly.StoreTxInpointsForSubtreeMeta = true
 
 		blockAssembler := &BlockAssembler{
 			utxoStore: mockStore,

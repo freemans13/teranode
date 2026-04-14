@@ -1581,6 +1581,12 @@ func (b *BlockAssembler) validateParentChainPass(
 	missingParentSet := make(map[chainhash.Hash]bool)
 	skippedCount := 0
 	batchSize := b.settings.BlockAssembly.ParentValidationBatchSize
+	if batchSize <= 0 {
+		batchSize = len(unminedTxs)
+		if batchSize == 0 {
+			batchSize = 1
+		}
+	}
 
 	for i := 0; i < len(unminedTxs); i += batchSize {
 		select {
@@ -1677,7 +1683,7 @@ func (b *BlockAssembler) validateParentChainPass(
 						hasMissingParent = true
 						missingParentSet[parentTxID] = true
 						b.logger.Debugf("[BlockAssembler][validateParentChainPass] Transaction %s has missing parent %s (unmined, not in list) — will attempt reconciliation", tx.Hash.String(), parentTxID.String())
-						break
+						continue
 					}
 				} else if len(parentMeta.BlockIDs) > 0 {
 					onBestChain := false
