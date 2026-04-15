@@ -1454,87 +1454,54 @@ func (b *BlockAssembler) validateParentChain(
 
 	b.logger.Infof("[BlockAssembler][validateParentChain] Starting parent chain validation for %d unmined transactions", len(unminedTxs))
 
-	const maxReconciliationPasses = 3
-	totalReconciled := 0
-
-	for pass := 1; pass <= maxReconciliationPasses; pass++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		validTxs, missingParentHashes, skippedCount, err := b.validateParentChainPass(ctx, unminedTxs, bestBlockHeaderIDsMap)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(missingParentHashes) == 0 {
-			filteringStatus := "disabled"
-			if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
-				filteringStatus = "enabled"
-			}
-			if skippedCount > 0 {
-				b.logger.Warnf("[BlockAssembler][validateParentChain] Skipped %d transactions due to invalid/missing parent chains (filtering: %s)", skippedCount, filteringStatus)
-			}
-			if totalReconciled > 0 {
-				b.logger.Infof("[BlockAssembler][validateParentChain] Reconciliation complete: recovered %d missing parent(s) across %d pass(es)", totalReconciled, pass-1)
-			}
-			b.logger.Infof("[BlockAssembler][validateParentChain] Parent chain validation complete: %d valid, %d skipped (filtering: %s)",
-				len(validTxs), skippedCount, filteringStatus)
-			return validTxs, nil
-		}
-
-		b.logger.Infof("[BlockAssembler][validateParentChain] Pass %d: found %d missing parent(s), attempting reconciliation from UTXO store", pass, len(missingParentHashes))
-
-		reconciledTxs, err := b.reconcileMissingParents(ctx, missingParentHashes, bestBlockHeaderIDsMap)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(reconciledTxs) == 0 {
-			b.logger.Warnf("[BlockAssembler][validateParentChain] Pass %d: could not reconcile any of %d missing parent(s)", pass, len(missingParentHashes))
-			filteringStatus := "disabled"
-			if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
-				filteringStatus = "enabled"
-
-				// Run a final validation pass so transactions with still-unresolved parents
-				// are not leaked into the result.
-				finalValidTxs, _, finalSkippedCount, err := b.validateParentChainPass(ctx, validTxs, bestBlockHeaderIDsMap)
-				if err != nil {
-					return nil, err
-				}
-				validTxs = finalValidTxs
-				skippedCount = finalSkippedCount
-			}
-			if skippedCount > 0 {
-				b.logger.Warnf("[BlockAssembler][validateParentChain] Skipped %d transactions due to invalid/missing parent chains (filtering: %s)", skippedCount, filteringStatus)
-			}
-			b.logger.Infof("[BlockAssembler][validateParentChain] Parent chain validation complete: %d valid, %d skipped (filtering: %s)",
-				len(validTxs), skippedCount, filteringStatus)
-			return validTxs, nil
-		}
-
-		totalReconciled += len(reconciledTxs)
-
-		if totalReconciled > 1000 {
-			b.logger.Warnf("[BlockAssembler][validateParentChain] Reconciliation found unusually high count (%d) — possible systemic issue", totalReconciled)
-		}
-
-		// Prepend reconciled ancestors so that when stable-sorted, they remain before the
-		// children that depend on them (both have CreatedAt=0, stable sort preserves insertion order).
-		unminedTxs = append(reconciledTxs, unminedTxs...)
-		sort.SliceStable(unminedTxs, func(i, j int) bool {
-			return unminedTxs[i].CreatedAt < unminedTxs[j].CreatedAt
-		})
-
-		b.logger.Infof("[BlockAssembler][validateParentChain] Pass %d: reconciled %d missing parent(s) from UTXO store, re-validating", pass, len(reconciledTxs))
-	}
-
-	b.logger.Warnf("[BlockAssembler][validateParentChain] Max reconciliation passes (%d) exceeded with %d total reconciled — falling back", maxReconciliationPasses, totalReconciled)
-	validTxs, _, skippedCount, err := b.validateParentChainPass(ctx, unminedTxs, bestBlockHeaderIDsMap)
+	// First pass: identify missing parents
+	validTxs, missingParentHashes, skippedCount, err := b.validateParentChainPass(ctx, unminedTxs, bestBlockHeaderIDsMap)
 	if err != nil {
 		return nil, err
+	}
+
+	// If missing parents found, reconcile them (recursively resolves full ancestor chain)
+	if len(missingParentHashes) > 0 {
+		b.logger.Infof("[BlockAssembler][validateParentChain] Found %d missing parent(s), reconciling from UTXO store", len(missingParentHashes))
+
+		// Build set of hashes already in the unmined list for the recursive resolver
+		existingHashes := make(map[chainhash.Hash]bool, len(unminedTxs))
+		for _, tx := range unminedTxs {
+			existingHashes[tx.Node.Hash] = true
+		}
+
+		reconciledTxs, err := b.reconcileMissingParents(ctx, missingParentHashes, bestBlockHeaderIDsMap, existingHashes)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(reconciledTxs) > 0 {
+			if len(reconciledTxs) > 1000 {
+				b.logger.Warnf("[BlockAssembler][validateParentChain] Reconciliation found unusually high count (%d) — possible systemic issue", len(reconciledTxs))
+			}
+
+			b.logger.Infof("[BlockAssembler][validateParentChain] Reconciled %d missing ancestor(s) from UTXO store", len(reconciledTxs))
+
+			// Reverse reconciled list so deepest ancestors come first (the recursive
+			// resolver discovers them depth-first: child's parent before grandparent)
+			for i, j := 0, len(reconciledTxs)-1; i < j; i, j = i+1, j-1 {
+				reconciledTxs[i], reconciledTxs[j] = reconciledTxs[j], reconciledTxs[i]
+			}
+
+			// Prepend reconciled ancestors and stable-sort so parents come before children
+			unminedTxs = append(reconciledTxs, unminedTxs...)
+			sort.SliceStable(unminedTxs, func(i, j int) bool {
+				return unminedTxs[i].CreatedAt < unminedTxs[j].CreatedAt
+			})
+
+			// Final validation pass with the complete set
+			validTxs, _, skippedCount, err = b.validateParentChainPass(ctx, unminedTxs, bestBlockHeaderIDsMap)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			b.logger.Warnf("[BlockAssembler][validateParentChain] Could not reconcile any of %d missing parent(s)", len(missingParentHashes))
+		}
 	}
 
 	filteringStatus := "disabled"
@@ -1743,8 +1710,7 @@ func (b *BlockAssembler) validateParentChainPass(
 			if allParentsValid {
 				validTxs = append(validTxs, tx)
 			} else if hasMissingParent {
-				// Parent chain is unresolved. Honor the configured keep/skip behavior
-				// so max-pass fallback remains consistent with other invalid-parent cases.
+				// Parent chain is unresolved — reconciliation will attempt to fetch.
 				if b.settings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs {
 					skippedCount++
 				} else {
@@ -1767,24 +1733,25 @@ func (b *BlockAssembler) validateParentChainPass(
 }
 
 // reconcileMissingParents fetches full transaction records for parents that were missed
-// by the SI scan but confirmed as unmined by BatchDecorate. Returns UnminedTransaction
-// structs ready to be inserted into the unmined list.
+// by the SI scan but confirmed as unmined by BatchDecorate. Recursively resolves the
+// full ancestor chain — if a fetched parent also has missing parents, those are fetched
+// too, until all ancestors are either mined or resolved.
+//
+// Parameters:
+//   - missingHashes: initial set of missing parent hashes
+//   - bestBlockHeaderIDsMap: block IDs on the best chain
+//   - existingHashes: hashes already in the unmined list (to avoid re-fetching)
 func (b *BlockAssembler) reconcileMissingParents(
 	ctx context.Context,
 	missingHashes []chainhash.Hash,
 	bestBlockHeaderIDsMap map[uint32]bool,
+	existingHashes map[chainhash.Hash]bool,
 ) ([]*utxo.UnminedTransaction, error) {
 	if len(missingHashes) == 0 {
 		return nil, nil
 	}
 
-	unresolvedParents := make([]*utxo.UnresolvedMetaData, 0, len(missingHashes))
-	for idx, hash := range missingHashes {
-		unresolvedParents = append(unresolvedParents, &utxo.UnresolvedMetaData{
-			Hash: hash,
-			Idx:  idx,
-		})
-	}
+	const maxDepth = 100 // prevent infinite loops on circular references
 
 	fetchFields := []fields.FieldName{
 		fields.Fee, fields.SizeInBytes,
@@ -1794,61 +1761,102 @@ func (b *BlockAssembler) reconcileMissingParents(
 		fetchFields = append(fetchFields, fields.Inputs, fields.External)
 	}
 
-	err := b.utxoStore.BatchDecorate(ctx, unresolvedParents, fetchFields...)
-	if err != nil {
-		b.logger.Warnf("[BlockAssembler][reconcileMissingParents] BatchDecorate error (will check individual results): %v", err)
-	}
-
 	reconciled := make([]*utxo.UnminedTransaction, 0, len(missingHashes))
+	reconciledSet := make(map[chainhash.Hash]bool) // track what we've already reconciled
+	toFetch := missingHashes
 
-	for _, unresolved := range unresolvedParents {
-		if unresolved.Err != nil {
-			b.logger.Warnf("[BlockAssembler][reconcileMissingParents] Could not fetch parent tx %s: %v", unresolved.Hash.String(), unresolved.Err)
-			continue
-		}
-		if unresolved.Data == nil {
-			b.logger.Warnf("[BlockAssembler][reconcileMissingParents] Parent tx %s returned nil data", unresolved.Hash.String())
-			continue
-		}
-
-		data := unresolved.Data
-
-		if data.UnminedSince == 0 {
-			b.logger.Debugf("[BlockAssembler][reconcileMissingParents] Parent tx %s no longer unmined (race resolved), skipping", unresolved.Hash.String())
-			continue
+	for depth := 0; depth < maxDepth && len(toFetch) > 0; depth++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
 		}
 
-		if len(data.BlockIDs) > 0 {
-			onBestChain := false
-			for _, blockID := range data.BlockIDs {
-				if bestBlockHeaderIDsMap[blockID] {
-					onBestChain = true
-					break
-				}
-			}
-			if onBestChain {
-				b.logger.Debugf("[BlockAssembler][reconcileMissingParents] Parent tx %s has block_ids on best chain despite unmined_since>0, skipping (MarkTransactionsOnLongestChain will fix)", unresolved.Hash.String())
+		// Batch fetch all missing hashes at this level
+		unresolvedParents := make([]*utxo.UnresolvedMetaData, 0, len(toFetch))
+		for idx, hash := range toFetch {
+			unresolvedParents = append(unresolvedParents, &utxo.UnresolvedMetaData{
+				Hash: hash,
+				Idx:  idx,
+			})
+		}
+
+		err := b.utxoStore.BatchDecorate(ctx, unresolvedParents, fetchFields...)
+		if err != nil {
+			b.logger.Warnf("[BlockAssembler][reconcileMissingParents] BatchDecorate error (will check individual results): %v", err)
+		}
+
+		// Process results and collect next level of missing ancestors
+		var nextLevel []chainhash.Hash
+
+		for _, unresolved := range unresolvedParents {
+			if unresolved.Err != nil {
+				b.logger.Warnf("[BlockAssembler][reconcileMissingParents] Could not fetch parent tx %s: %v", unresolved.Hash.String(), unresolved.Err)
 				continue
 			}
+			if unresolved.Data == nil {
+				b.logger.Warnf("[BlockAssembler][reconcileMissingParents] Parent tx %s returned nil data", unresolved.Hash.String())
+				continue
+			}
+
+			data := unresolved.Data
+
+			if data.UnminedSince == 0 {
+				b.logger.Debugf("[BlockAssembler][reconcileMissingParents] Parent tx %s no longer unmined (race resolved), skipping", unresolved.Hash.String())
+				continue
+			}
+
+			if len(data.BlockIDs) > 0 {
+				onBestChain := false
+				for _, blockID := range data.BlockIDs {
+					if bestBlockHeaderIDsMap[blockID] {
+						onBestChain = true
+						break
+					}
+				}
+				if onBestChain {
+					b.logger.Debugf("[BlockAssembler][reconcileMissingParents] Parent tx %s has block_ids on best chain despite unmined_since>0, skipping", unresolved.Hash.String())
+					continue
+				}
+			}
+
+			var txInpoints subtree.TxInpoints
+			if b.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+				txInpoints = data.TxInpoints
+			}
+
+			reconciledTx := &utxo.UnminedTransaction{
+				Node: &subtree.Node{
+					Hash:        unresolved.Hash,
+					Fee:         data.Fee,
+					SizeInBytes: data.SizeInBytes,
+				},
+				TxInpoints:   &txInpoints,
+				CreatedAt:    0, // Not available from meta.Data; 0 sorts to front (before children)
+				Locked:       data.Locked,
+				BlockIDs:     data.BlockIDs,
+				UnminedSince: int(data.UnminedSince),
+			}
+
+			reconciled = append(reconciled, reconciledTx)
+			reconciledSet[unresolved.Hash] = true
+
+			// Check this parent's own parents — if any are unmined and not in the
+			// existing list or already reconciled, add them to the next fetch level
+			if b.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+				for _, ancestorHash := range txInpoints.GetParentTxHashes() {
+					if !existingHashes[ancestorHash] && !reconciledSet[ancestorHash] {
+						nextLevel = append(nextLevel, ancestorHash)
+					}
+				}
+			}
 		}
 
-		var txInpoints subtree.TxInpoints
-		if b.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
-			txInpoints = data.TxInpoints
-		}
+		toFetch = nextLevel
 
-		reconciled = append(reconciled, &utxo.UnminedTransaction{
-			Node: &subtree.Node{
-				Hash:        unresolved.Hash,
-				Fee:         data.Fee,
-				SizeInBytes: data.SizeInBytes,
-			},
-			TxInpoints:   &txInpoints,
-			CreatedAt:    0, // Not available from meta.Data; 0 sorts to front (before children)
-			Locked:       data.Locked,
-			BlockIDs:     data.BlockIDs,
-			UnminedSince: int(data.UnminedSince),
-		})
+		if depth > 0 {
+			b.logger.Infof("[BlockAssembler][reconcileMissingParents] Resolved ancestor level %d: %d more ancestor(s) to fetch", depth+1, len(toFetch))
+		}
 	}
 
 	return reconciled, nil

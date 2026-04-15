@@ -386,7 +386,7 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 
 		testSettings := &settings.Settings{}
 		testSettings.BlockAssembly.ParentValidationBatchSize = 100
-		testSettings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs = true
+
 		testSettings.BlockAssembly.StoreTxInpointsForSubtreeMeta = true
 
 		blockAssembler := &BlockAssembler{
@@ -528,14 +528,12 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 		validTxs, err := blockAssembler.validateParentChain(ctx, unminedTxs, bestBlockHeaderIDsMap)
 		require.NoError(t, err)
 
-		// The parent should NOT be reconciled (data inconsistency), and because the
-		// child depends on that skipped parent it must not remain in validTxs either.
-		require.Len(t, validTxs, 0, "Orphan child should be excluded when parent reconciliation is skipped")
-
-		// The key: parent should NOT appear in validTxs.
+		// The parent should NOT be reconciled (data inconsistency — block_ids on best chain).
+		// With filtering enabled, the child is skipped because its parent couldn't be reconciled.
 		for _, tx := range validTxs {
 			require.False(t, tx.Hash.IsEqual(&parentHash), "Parent with block_ids on best chain should not be reconciled into list")
 		}
+		require.Len(t, validTxs, 0, "Child should be skipped when parent reconciliation fails and filtering is enabled")
 
 		mockStore.AssertExpectations(t)
 	})
@@ -546,7 +544,7 @@ func TestValidateParentChain_Reconciliation(t *testing.T) {
 
 		testSettings := &settings.Settings{}
 		testSettings.BlockAssembly.ParentValidationBatchSize = 100
-		testSettings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs = true
+
 		testSettings.BlockAssembly.StoreTxInpointsForSubtreeMeta = true
 
 		blockAssembler := &BlockAssembler{
