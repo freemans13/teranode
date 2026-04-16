@@ -37,6 +37,7 @@ import (
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/bump"
 	"github.com/bsv-blockchain/teranode/util/health"
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -1384,6 +1385,14 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to create merkle tree", jobID, err)
 	}
 
+	// Compute coinbase BUMP (merkle proof in BRC-74 format) while subtree data is in memory.
+	// This is a best-effort operation — failure does not block block submission.
+	_, currentHeight := ba.blockAssembler.CurrentBlock()
+	var coinbaseBUMP []byte
+	if len(subtreesInJob) > 0 {
+		coinbaseBUMP = ba.computeCoinbaseBUMP(jobID, subtreesInJob, subtreeHashes, currentHeight+1)
+	}
+
 	// sizeInBytes from the subtrees, 80 byte header and varint bytes for txcount
 	blockSize := sizeInBytes + 80 + util.VarintSize(transactionCount)
 	// add the size of the coinbase tx to the blocksize
@@ -1418,6 +1427,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		SizeInBytes:      blockSize,
 		Subtrees:         jobSubtreeHashes, // we need to store the hashes of the subtrees in the block, without the coinbase
 		SubtreeSlices:    job.Subtrees,
+		CoinbaseBUMP:     coinbaseBUMP,
 	}
 
 	// check fully valid, including whether difficulty in header is low enough
@@ -1499,6 +1509,25 @@ func (ba *BlockAssembly) createMerkleTreeFromSubtrees(jobID string, subtreesInJo
 	}
 
 	return hashMerkleRoot, nil
+}
+
+// computeCoinbaseBUMP computes the coinbase transaction's merkle proof in BUMP format (BRC-74).
+// It builds the proof from the coinbase (at subtree index 0, tx index 0) to the block merkle root.
+// Returns nil if any step fails — callers should treat nil as "proof not available".
+func (ba *BlockAssembly) computeCoinbaseBUMP(jobID string, subtreesInJob []*subtreepkg.Subtree, subtreeHashes []chainhash.Hash, blockHeight uint32) []byte {
+	// Convert subtree hashes to pointer slice to match bump.ComputeCoinbaseBUMP signature
+	subtreeHashPtrs := make([]*chainhash.Hash, len(subtreeHashes))
+	for i := range subtreeHashes {
+		subtreeHashPtrs[i] = &subtreeHashes[i]
+	}
+
+	bumpBytes, err := bump.ComputeCoinbaseBUMP(subtreesInJob[0], subtreeHashPtrs, blockHeight)
+	if err != nil {
+		ba.logger.Warnf("[computeCoinbaseBUMP][%s] failed to compute coinbase BUMP: %v", jobID, err)
+		return nil
+	}
+
+	return bumpBytes
 }
 
 // GetCandidateBlock retrieves the block metadata for an existing mining candidate.
