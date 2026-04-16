@@ -22,6 +22,8 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/util/usql"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
 	"modernc.org/sqlite"
 )
@@ -311,7 +313,8 @@ INSERT INTO blocks (
 	,mined_set
 	,subtrees_set
 	,persisted_at
-) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22)
+	,coinbase_bump
+) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 RETURNING id
 			`
 		} else {
@@ -339,7 +342,8 @@ INSERT INTO blocks (
 	,mined_set
 	,subtrees_set
 	,persisted_at
-) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21)
+	,coinbase_bump
+) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22)
 RETURNING id
 			`
 		}
@@ -370,7 +374,8 @@ INSERT INTO blocks (
 	,mined_set
 	,subtrees_set
 	,persisted_at
-) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22)
+	,coinbase_bump
+) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 RETURNING id
 			`
 		} else {
@@ -398,7 +403,8 @@ INSERT INTO blocks (
 	,mined_set
 	,subtrees_set
 	,persisted_at
-) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21)
+	,coinbase_bump
+) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22)
 RETURNING id
 			`
 		}
@@ -421,7 +427,7 @@ RETURNING id
 		return 0, 0, nil, false, errors.NewStorageError("failed to get subtree bytes", err)
 	}
 
-	var coinbaseBytes []byte
+	coinbaseBytes := []byte{}
 	if block.CoinbaseTx != nil {
 		coinbaseBytes = block.CoinbaseTx.Bytes()
 	}
@@ -439,6 +445,12 @@ RETURNING id
 			// SQLite stores timestamps as TEXT - format as "YYYY-MM-DD HH:MM:SS"
 			persistedAt = now.UTC().Format("2006-01-02 15:04:05")
 		}
+	}
+
+	// coinbaseBump is nil for blocks without a proof (e.g., peer-received or pre-migration)
+	var coinbaseBump []byte
+	if len(block.CoinbaseBUMP) > 0 {
+		coinbaseBump = block.CoinbaseBUMP
 	}
 
 	if useCustomID {
@@ -466,6 +478,7 @@ RETURNING id
 			storeBlockOptions.MinedSet,
 			storeBlockOptions.SubtreesSet,
 			persistedAt,
+			coinbaseBump,
 		)
 	} else {
 		// When using auto-increment, no ID parameter is needed
@@ -491,6 +504,7 @@ RETURNING id
 			storeBlockOptions.MinedSet,
 			storeBlockOptions.SubtreesSet,
 			persistedAt,
+			coinbaseBump,
 		)
 	}
 
@@ -542,9 +556,15 @@ RETURNING id
 //   - error: A domain-specific error with appropriate context, typically wrapped as
 //     a BlockAlreadyExistsError for duplicates or a more general StorageError for other issues
 func (*SQL) parseSQLError(err error, block *model.Block) error {
-	// check whether this is a postgres exists constraint error
+	// check whether this is a postgres exists constraint error (pgx driver)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == usql.PgErrUniqueViolation {
+		return errors.NewBlockExistsError("block already exists in the database: %s", block.Hash().String(), err)
+	}
+
+	// check whether this is a postgres exists constraint error (lib/pq fallback)
 	var pqErr *pq.Error
-	if errors.As(err, &pqErr) && pqErr.Code == "23505" { // Duplicate constraint violation
+	if errors.As(err, &pqErr) && pqErr.Code == usql.PgErrUniqueViolation {
 		return errors.NewBlockExistsError("block already exists in the database: %s", block.Hash().String(), err)
 	}
 
