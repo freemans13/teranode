@@ -1104,7 +1104,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 		if len(assemblyTxHashes) > 0 {
 			stp.logger.Infof("[SubtreeProcessor][reset] marking %d assembly txs as not on longest chain before clearing state", len(assemblyTxHashes))
-			if err := stp.markNotOnLongestChain(ctx, assemblyTxHashes); err != nil {
+			if err := stp.markNotOnLongestChain(ctx, nil, nil, assemblyTxHashes); err != nil {
 				return errors.NewProcessingError("[SubtreeProcessor][reset] error marking assembly txs as not on longest chain before reset", err)
 			}
 		}
