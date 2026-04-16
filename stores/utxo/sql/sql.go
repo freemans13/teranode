@@ -3592,6 +3592,7 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		case err := <-done:
 			return err
 		case <-ctx.Done():
+			s.logger.Warnf("[setLockedBatched] context cancelled while waiting for batcher result — unlock may or may not be applied")
 			return ctx.Err()
 		}
 	}
