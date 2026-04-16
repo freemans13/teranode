@@ -315,6 +315,17 @@ func (s *Server) triggerInitialPruning(ctx context.Context) {
 	switch blockTrigger {
 	case settings.PrunerBlockTriggerOnBlockPersisted:
 		currentHeight = s.lastPersistedHeight.Load()
+		// Look up the actual block hash for the persisted height. GetBlockByHeight
+		// walks the main chain (highest chainwork), so this is fork-safe — it will
+		// always return the main-chain block even if competing blocks exist at this height.
+		if currentHeight > 0 {
+			block, err := s.blockchainClient.GetBlockByHeight(ctx, currentHeight)
+			if err != nil || block == nil {
+				s.logger.Warnf("[pruner] failed to get block at persisted height %d for initial pruning: %v", currentHeight, err)
+				return
+			}
+			blockHash = *block.Hash()
+		}
 	case settings.PrunerBlockTriggerOnBlockMined:
 		tipHeader, tipMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
 		if err != nil || tipHeader == nil || tipMeta == nil {
