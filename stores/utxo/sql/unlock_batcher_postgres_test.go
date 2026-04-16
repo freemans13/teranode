@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -37,7 +38,7 @@ func setupPostgresStore(t *testing.T) (*Store, context.Context) {
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		require.NoError(t, pgContainer.Terminate(ctx))
+		assert.NoError(t, pgContainer.Terminate(ctx))
 	})
 
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
@@ -100,7 +101,8 @@ func TestUnlockBatcher_Postgres_SingleHash(t *testing.T) {
 }
 
 // TestUnlockBatcher_Postgres_DAH verifies that the batched unlock path
-// correctly recalculates delete_at_height (DAH) for spent transactions.
+// correctly recalculates delete_at_height (DAH) for a fully-spent, mined,
+// on-longest-chain transaction.
 func TestUnlockBatcher_Postgres_DAH(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Postgres integration test in short mode")
@@ -116,16 +118,34 @@ func TestUnlockBatcher_Postgres_DAH(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = store.Delete(ctx, tests.ParentTx.TxIDChainHash()) }()
 
-	// Create the child tx unlocked so we can spend its outputs.
-	_, err = store.Create(ctx, tests.Tx, 1000)
+	// Create the child tx as mined on the longest chain (block_ids exist,
+	// unmined_since is NULL) so the DAH branch in setUnlockedBulk triggers.
+	_, err = store.Create(ctx, tests.Tx, 1000,
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+			BlockID:        100,
+			BlockHeight:    1000,
+			SubtreeIdx:     0,
+			OnLongestChain: true,
+		}),
+	)
 	require.NoError(t, err)
 	defer func() { _ = store.Delete(ctx, tests.Tx.TxIDChainHash()) }()
+
+	txHash := *tests.Tx.TxIDChainHash()
+
+	// Verify delete_at_height is NULL before spending.
+	var dahBefore *int64
+	err = store.db.QueryRowContext(ctx,
+		"SELECT delete_at_height FROM transactions WHERE hash = $1",
+		txHash[:]).Scan(&dahBefore)
+	require.NoError(t, err)
+	require.Nil(t, dahBefore, "delete_at_height should be NULL before spending")
 
 	// Spend all outputs to make the tx fully spent.
 	for i, out := range tests.Tx.Outputs {
 		spendTx := bt.NewTx()
 		require.NoError(t, spendTx.From(
-			tests.Tx.TxIDChainHash().String(), uint32(i),
+			txHash.String(), uint32(i),
 			out.LockingScript.String(),
 			out.Satoshis,
 		))
@@ -136,7 +156,6 @@ func TestUnlockBatcher_Postgres_DAH(t *testing.T) {
 	}
 
 	// Lock the now-spent tx, then unlock via the batcher path.
-	txHash := *tests.Tx.TxIDChainHash()
 	err = store.SetLocked(ctx, []chainhash.Hash{txHash}, true)
 	require.NoError(t, err)
 
@@ -152,10 +171,22 @@ func TestUnlockBatcher_Postgres_DAH(t *testing.T) {
 	m, err = store.Get(ctx, &txHash)
 	require.NoError(t, err)
 	require.False(t, m.Locked, "tx should be unlocked after batcher unlock")
+
+	// Verify that delete_at_height was set by the DAH recalculation.
+	// For a fully-spent, mined, on-longest-chain tx: DAH = blockHeight + 1 + retention.
+	// blockHeight=1000, retention=GlobalBlockHeightRetention(10), so DAH = 1011.
+	var dahAfter *int64
+	err = store.db.QueryRowContext(ctx,
+		"SELECT delete_at_height FROM transactions WHERE hash = $1",
+		txHash[:]).Scan(&dahAfter)
+	require.NoError(t, err)
+	require.NotNil(t, dahAfter, "delete_at_height should be set after unlock of fully-spent mined tx")
+	require.Equal(t, int64(1011), *dahAfter, "delete_at_height should be blockHeight+1+retention")
 }
 
 // TestUnlockBatcher_Postgres_MultipleConcurrent verifies that multiple
-// concurrent single-hash unlock calls are correctly batched together.
+// concurrent single-hash unlock calls complete correctly with the unlock
+// batcher-enabled path.
 func TestUnlockBatcher_Postgres_MultipleConcurrent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Postgres integration test in short mode")
