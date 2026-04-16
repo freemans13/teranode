@@ -608,7 +608,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 					if errors.Is(utxoMapErr, errors.ErrTxExists) {
 						txMetaData = &meta.Data{}
 						if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err != nil {
-							err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, utxoMapErr)
+							err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, err)
 							span.RecordError(err)
 
 							return nil, err
@@ -1169,10 +1169,12 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 		return nil
 	}
 
-	// The highest MTP index we ever need is blockHeight:
-	//   - utxoHeights are always < blockHeight (a UTXO must exist before the spending block)
+	// The highest MTP index we guarantee is blockHeight:
 	//   - blockMTPHeight = blockHeight: GetMedianTimePastRange computes stored_mtp(N)
 	//     on the fly for the not-yet-persisted block N from block_time values [N-11, N-1].
+	//   - utxoHeights *may* exceed blockHeight when the chain tip advances during
+	//     validation (unconfirmed parents get blockState.Height+1); validateTransaction
+	//     clamps those lookups to blockMTPHeight.
 	needed := blockHeight
 
 	// Fast path: store already covers the needed height.
@@ -1286,9 +1288,14 @@ func (v *Validator) validateTransaction(ctx context.Context, tx *bt.Tx, blockHei
 		return err
 	}
 
+	storeLen := uint32(len(v.mtpStore))
 	utxoMTPs := make([]uint32, len(utxoHeights))
 	for i, h := range utxoHeights {
-		utxoMTPs[i] = v.mtpStore[h]
+		if h >= storeLen {
+			utxoMTPs[i] = v.mtpStore[blockMTPHeight]
+		} else {
+			utxoMTPs[i] = v.mtpStore[h]
+		}
 	}
 	blockMTP := v.mtpStore[blockMTPHeight]
 
