@@ -478,10 +478,11 @@ func TestSetMinedMulti(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		// Verify tx has both block_ids
+		// Verify tx has both block_ids and capture unmined_since before the unset
 		txMeta, err := utxoStore.Get(ctx, tx.TxIDChainHash(), append(utxo.MetaFields, fields.UnminedSince)...)
 		require.NoError(t, err)
 		require.Len(t, txMeta.BlockIDs, 2)
+		unminedSinceBefore := txMeta.UnminedSince
 
 		// Unset one block_id (invalidate block 10)
 		_, err = utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{
@@ -493,15 +494,14 @@ func TestSetMinedMulti(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		// Verify: tx still has one block_id and unmined_since should NOT be updated
+		// Verify: tx still has one block_id and unmined_since is unchanged
 		txMeta, err = utxoStore.Get(ctx, tx.TxIDChainHash(), append(utxo.MetaFields, fields.UnminedSince)...)
 		require.NoError(t, err)
 		assert.Len(t, txMeta.BlockIDs, 1, "tx should have one block_id remaining")
 		assert.Equal(t, uint32(20), txMeta.BlockIDs[0], "remaining block_id should be 20")
-		// unmined_since should retain whatever value it had before (not set to current height)
-		// because the tx still has a block_id
-		assert.NotEqual(t, uint32(501), txMeta.UnminedSince,
-			"unmined_since should NOT be set to current block height when tx still has block_ids")
+		// unmined_since should be unchanged because the tx still has a remaining block_id
+		assert.Equal(t, unminedSinceBefore, txMeta.UnminedSince,
+			"unmined_since should be unchanged when tx still has block_ids")
 	})
 }
 
