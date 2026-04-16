@@ -973,7 +973,17 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 
 		br := pgxConn.SendBatch(s.ctx, pgxBatch)
 
-		// Read results and route to callers
+		// Read results — collect but don't send to callers yet.
+		// We must call br.Close() before signalling callers, because
+		// pipelined auto-committed statements may not be fully visible
+		// to other connections until the batch reader is closed.
+		type batchResult struct {
+			idx      int
+			result   batchCreateResult
+			logError bool
+		}
+		results := make([]batchResult, 0, len(validIndices))
+
 		for _, idx := range validIndices {
 			p := &prepared[idx]
 			rows, queryErr := br.Query()
@@ -986,24 +996,44 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 				rows.Close()
 			}
 			if queryErr != nil {
-				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", p.txHash[:], queryErr)
-				batch[idx].done <- batchCreateResult{
+				results = append(results, batchResult{idx: idx, result: batchCreateResult{
 					Err: errors.NewStorageError("Failed to create UTXO", queryErr),
-				}
+				}, logError: true})
 			} else if !inserted {
 				// ON CONFLICT (hash) DO NOTHING — new_tx returned 0 rows, tx already exists
-				batch[idx].done <- batchCreateResult{
-					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", p.isCoinbase),
-				}
+				results = append(results, batchResult{idx: idx, result: batchCreateResult{
+					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v)", p.isCoinbase),
+				}})
 			} else {
-				batch[idx].done <- batchCreateResult{Data: p.txMeta}
+				results = append(results, batchResult{idx: idx, result: batchCreateResult{Data: p.txMeta}})
 			}
 		}
 
-		if closeErr := br.Close(); closeErr != nil {
-			s.logger.Warnf("[sendCreateBatch] error closing batch results: %v", closeErr)
+		// Close the batch reader — ensures all pipelined commits are finalized
+		// and visible to other connections before callers proceed.
+		closeErr := br.Close()
+		if closeErr != nil {
+			s.logger.Errorf("[sendCreateBatch] error closing batch results: %v", closeErr)
 		}
-		return nil
+
+		// Now signal callers — if Close() failed, override successes with errors
+		// since the connection may be in an error state and data visibility is uncertain.
+		for _, r := range results {
+			if closeErr != nil && r.result.Err == nil {
+				batch[r.idx].done <- batchCreateResult{
+					Err: errors.NewStorageError("batch close failed, results may not be visible", closeErr),
+				}
+				continue
+			}
+			if r.logError {
+				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", prepared[r.idx].txHash[:], r.result.Err)
+			}
+			batch[r.idx].done <- r.result
+		}
+
+		// Propagate close error so the connection is not returned to the pool
+		// and Phase 3 (conflicting children) does not run on an uncertain state.
+		return closeErr
 	})
 	if connErr != nil {
 		// Raw callback error — send to any items that haven't received a result yet
