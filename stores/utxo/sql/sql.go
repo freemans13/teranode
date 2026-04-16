@@ -2674,6 +2674,9 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 			// that no longer have any block_ids after the deletion above.
 			// This mirrors the aerospike Lua which sets unmined_since = currentBlockHeight
 			// when #blocks == 0 after removing the block_id.
+			// Use the store's current block height (not the invalidated block's height)
+			// to match Aerospike's setMined UDF behavior.
+			currentBlockHeight := s.blockHeight.Load() + 1
 			inClause3, inArgs3 := buildINClause(existingHashBytes, 2)
 			qUpdate := fmt.Sprintf(`
 				UPDATE transactions
@@ -2687,7 +2690,7 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 				    END
 				WHERE hash IN %s
 			`, inClause3)
-			args := append([]interface{}{minedBlockInfo.BlockHeight}, inArgs3...)
+			args := append([]interface{}{currentBlockHeight}, inArgs3...)
 			if _, err = txn.ExecContext(ctx, qUpdate, args...); err != nil {
 				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
 			}
