@@ -116,8 +116,8 @@ func TestUnlockBatcher_Postgres_DAH(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = store.Delete(ctx, tests.ParentTx.TxIDChainHash()) }()
 
-	// Create the child tx as locked.
-	_, err = store.Create(ctx, tests.Tx, 1000, utxo.WithLocked(true))
+	// Create the child tx unlocked so we can spend its outputs.
+	_, err = store.Create(ctx, tests.Tx, 1000)
 	require.NoError(t, err)
 	defer func() { _ = store.Delete(ctx, tests.Tx.TxIDChainHash()) }()
 
@@ -135,15 +135,23 @@ func TestUnlockBatcher_Postgres_DAH(t *testing.T) {
 		require.NoError(t, spendErr)
 	}
 
-	// Unlock via single-hash batcher path.
+	// Lock the now-spent tx, then unlock via the batcher path.
 	txHash := *tests.Tx.TxIDChainHash()
+	err = store.SetLocked(ctx, []chainhash.Hash{txHash}, true)
+	require.NoError(t, err)
+
+	m, err := store.Get(ctx, &txHash)
+	require.NoError(t, err)
+	require.True(t, m.Locked, "tx should be locked before batcher unlock")
+
+	// Unlock via single-hash batcher path — this exercises DAH recalculation.
 	err = store.SetLocked(ctx, []chainhash.Hash{txHash}, false)
 	require.NoError(t, err)
 
 	// Verify unlock.
-	m, err := store.Get(ctx, &txHash)
+	m, err = store.Get(ctx, &txHash)
 	require.NoError(t, err)
-	require.False(t, m.Locked, "tx should be unlocked")
+	require.False(t, m.Locked, "tx should be unlocked after batcher unlock")
 }
 
 // TestUnlockBatcher_Postgres_MultipleConcurrent verifies that multiple
