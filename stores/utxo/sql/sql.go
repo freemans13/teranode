@@ -44,6 +44,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -1002,7 +1003,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 			} else if !inserted {
 				// ON CONFLICT (hash) DO NOTHING — new_tx returned 0 rows, tx already exists
 				results = append(results, batchResult{idx: idx, result: batchCreateResult{
-					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v)", p.isCoinbase),
+					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", p.isCoinbase),
 				}})
 			} else {
 				results = append(results, batchResult{idx: idx, result: batchCreateResult{Data: p.txMeta}})
@@ -1026,14 +1027,19 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 				continue
 			}
 			if r.logError {
-				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", prepared[r.idx].txHash[:], r.result.Err)
+				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %+v", prepared[r.idx].txHash[:], r.result.Err)
 			}
 			batch[r.idx].done <- r.result
 		}
 
-		// Propagate close error so the connection is not returned to the pool
-		// and Phase 3 (conflicting children) does not run on an uncertain state.
-		return closeErr
+		// Return driver.ErrBadConn so database/sql discards the connection
+		// from the pool rather than reusing it, and Phase 3 (conflicting
+		// children) does not run on an uncertain state. The actual closeErr
+		// is already logged above.
+		if closeErr != nil {
+			return driver.ErrBadConn
+		}
+		return nil
 	})
 	if connErr != nil {
 		// Raw callback error — send to any items that haven't received a result yet
