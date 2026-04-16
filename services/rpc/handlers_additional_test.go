@@ -5815,6 +5815,10 @@ func (m *mockBlockAssemblyClient) ResetBlockAssemblyValidateInputs(ctx context.C
 	return nil
 }
 
+func (m *mockBlockAssemblyClient) CheckBlockAssemblyValidateInputs(ctx context.Context) error {
+	return nil
+}
+
 func (m *mockBlockAssemblyClient) GetBlockAssemblyState(ctx context.Context) (*blockassembly_api.StateMessage, error) {
 	return nil, nil
 }
@@ -5825,6 +5829,9 @@ func (m *mockBlockAssemblyClient) GetTransactionHashes(ctx context.Context) ([]s
 	if m.getTransactionHashesFunc != nil {
 		return m.getTransactionHashesFunc(ctx)
 	}
+	return nil, nil
+}
+func (m *mockBlockAssemblyClient) GetCandidateBlock(ctx context.Context, candidateID []byte) (*blockassembly_api.GetCandidateBlockResponse, error) {
 	return nil, nil
 }
 

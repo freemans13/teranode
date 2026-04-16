@@ -198,8 +198,12 @@ func (s *BridgeStore) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsL
 	return s.inner.Unspend(ctx, spends, flagAsLocked...)
 }
 
-func (s *BridgeStore) GetUnminedTxIterator(fullScan bool) (utxo.UnminedTxIterator, error) {
-	return s.inner.GetUnminedTxIterator(fullScan)
+func (s *BridgeStore) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+	return s.inner.GetUnminedTxIterator()
+}
+
+func (s *BridgeStore) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
+	return s.inner.ScanInconsistentUnminedTxs()
 }
 
 func (s *BridgeStore) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (utxo.UnminedTxIterator, error) {
