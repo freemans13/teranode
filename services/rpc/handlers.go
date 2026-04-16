@@ -39,20 +39,22 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
-	"github.com/bitcoin-sv/teranode/services/legacy/peer_api"
-	"github.com/bitcoin-sv/teranode/services/legacy/txscript"
-	"github.com/bitcoin-sv/teranode/services/p2p/p2p_api"
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer_api"
+	"github.com/bsv-blockchain/teranode/services/legacy/txscript"
+	"github.com/bsv-blockchain/teranode/services/p2p/p2p_api"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/go-utils"
 	cache "github.com/patrickmn/go-cache"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -102,7 +104,36 @@ func handleGetBlock(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan
 		return nil, err
 	}
 
-	return s.blockToJSON(ctx, b, *c.Verbosity)
+	result, err := s.blockToJSON(ctx, b, *c.Verbosity)
+	if err != nil {
+		return nil, err
+	}
+
+	// If verbosity > 0, check if block is on main chain and adjust confirmations
+	if *c.Verbosity > 0 {
+		// Check if this block is on the main chain
+		isOnMainChain, err := s.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{b.ID})
+		if err != nil {
+			return nil, err
+		}
+
+		if !isOnMainChain {
+			// Type switch to modify confirmations field for orphaned blocks
+			switch v := result.(type) {
+			case *bsvjson.GetBlockVerboseTxResult:
+				v.GetBlockBaseVerboseResult.Confirmations = -1
+				return v, nil
+			case *bsvjson.GetBlockVerboseResult:
+				v.GetBlockBaseVerboseResult.Confirmations = -1
+				return v, nil
+			default:
+				// Should not happen with current implementation, but be defensive
+				return result, nil
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // handleGetBlockByHeight implements the getblockbyheight command, which retrieves information
@@ -247,9 +278,26 @@ func handleGetBlockHeader(ctx context.Context, s *RPCServer, cmd interface{}, _ 
 			Bits:         b.Bits.String(),
 			Difficulty:   diffFloat,
 			MerkleRoot:   b.HashMerkleRoot.String(),
-			// Confirmations: int64(1 + bestBlockMeta.Height - meta.Height),
-			Height: heightInt32,
+			Height:       heightInt32,
 		}
+
+		// Check if this block is on the main chain
+		isOnMainChain, err := s.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{meta.ID})
+		if err != nil {
+			return nil, err
+		}
+
+		if !isOnMainChain {
+			headerReply.Confirmations = -1
+			return headerReply, nil
+		}
+
+		// Block is on the main chain, calculate confirmations
+		_, bestBlockMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
+		if err != nil {
+			return nil, err
+		}
+		headerReply.Confirmations = 1 + int64(bestBlockMeta.Height) - int64(meta.Height)
 
 		return headerReply, nil
 	}
@@ -257,6 +305,7 @@ func handleGetBlockHeader(ctx context.Context, s *RPCServer, cmd interface{}, _ 
 	return fmt.Sprintf("%x", b.Bytes()), nil
 }
 
+// blockToJSON converts a block to JSON format based on verbosity level.
 func (s *RPCServer) blockToJSON(ctx context.Context, b *model.Block, verbosity uint32) (interface{}, error) {
 	if b == nil {
 		return nil, &bsvjson.RPCError{
@@ -320,7 +369,7 @@ func (s *RPCServer) blockToJSON(ctx context.Context, b *model.Block, verbosity u
 		PreviousHash:  b.Header.HashPrevBlock.String(),
 		Nonce:         b.Header.Nonce,
 		Time:          int64(b.Header.Timestamp),
-		Confirmations: int64(1 + bestBlockMeta.Height - b.Height),
+		Confirmations: 1 + int64(bestBlockMeta.Height) - int64(b.Height),
 		Height:        int64(b.Height),
 		Size:          blkBytesInt32,
 		Bits:          b.Header.Bits.String(),
@@ -357,7 +406,7 @@ func (s *RPCServer) blockToJSON(ctx context.Context, b *model.Block, verbosity u
 		// 		}
 		// 		rawTxns[i] = *rawTxn
 		// 	}
-		blockReply = bsvjson.GetBlockVerboseTxResult{
+		blockReply = &bsvjson.GetBlockVerboseTxResult{
 			GetBlockBaseVerboseResult: baseBlockReply,
 
 			// Tx: rawTxns,
@@ -1188,6 +1237,8 @@ func handleGetpeerinfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-c
 	return infos, nil
 }
 
+// handleGetRawMempool implements the getrawmempool command.
+// Returns transaction IDs currently in the memory pool.
 func handleGetRawMempool(ctx context.Context, s *RPCServer, cmd interface{}, _ <-chan struct{}) (interface{}, error) {
 	ctx, _, deferFn := tracing.Tracer("rpc").Start(ctx, "handleGetRawMempool",
 		tracing.WithParentStat(RPCStat),
@@ -1314,12 +1365,25 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 
 	bestBlockHeader, bestBlockMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
-		s.logger.Errorf("error getting best block header: %v", err)
+		return map[string]interface{}{}, errors.NewProcessingError("error getting best block header: %v", err)
+	}
+
+	// Calculate median time from the last 11 blocks
+	medianTime, err := calculateMedianTime(ctx, s.blockchainClient, bestBlockHeader.Hash())
+	if err != nil {
+		return map[string]interface{}{}, errors.NewProcessingError("error calculating median time: %v", err)
+	}
+
+	// Calculate verification progress based on blockchain statistics
+	verificationProgress, err := calculateVerificationProgress(ctx, s.blockchainClient, bestBlockMeta.Height)
+	if err != nil {
+		// If we can't calculate verification progress, default to 1.0 (assume fully synced)
+		verificationProgress = 1.0
 	}
 
 	chainWorkHash, err := chainhash.NewHash(bestBlockMeta.ChainWork)
 	if err != nil {
-		s.logger.Errorf("error creating chain work hash: %v", err)
+		return map[string]interface{}{}, errors.NewProcessingError("error creating chain work hash: %v", err)
 	}
 
 	difficultyBigFloat := bestBlockHeader.Bits.CalculateDifficulty()
@@ -1328,11 +1392,11 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 	jsonMap := map[string]interface{}{
 		"chain":                s.settings.ChainCfgParams.Name,
 		"blocks":               bestBlockMeta.Height,
-		"headers":              863341,
+		"headers":              bestBlockMeta.Height,
 		"bestblockhash":        bestBlockHeader.Hash().String(),
 		"difficulty":           difficulty, // Return as float64 to match Bitcoin SV
-		"mediantime":           0,
-		"verificationprogress": 0,
+		"mediantime":           medianTime,
+		"verificationprogress": verificationProgress,
 		"chainwork":            chainWorkHash.String(),
 		"pruned":               false, // the minimum relay fee for non-free transactions in BSV/KB
 		"softforks":            []interface{}{},
@@ -1343,6 +1407,109 @@ func handleGetblockchaininfo(ctx context.Context, s *RPCServer, cmd interface{},
 	}
 
 	return jsonMap, nil
+}
+
+// calculateVerificationProgress implements Bitcoin SV's GuessVerificationProgress function.
+// This is a direct translation of the Bitcoin SV code from validation.cpp:
+//
+//	double GuessVerificationProgress(const ChainTxData &data, const CBlockIndex *pindex) {
+//	    if (pindex == nullptr) return 0.0;
+//	    int64_t nNow = time(nullptr);
+//	    double fTxTotal;
+//	    if (pindex->GetChainTx() <= data.nTxCount) {
+//	        fTxTotal = data.nTxCount + (nNow - data.nTime) * data.dTxRate;
+//	    } else {
+//	        fTxTotal = pindex->GetChainTx() + (nNow - pindex->GetBlockTime()) * data.dTxRate;
+//	    }
+//	    return pindex->GetChainTx() / fTxTotal;
+//	}
+//
+// Since we don't have hardcoded ChainTxData like Bitcoin SV, we'll use dynamic calculation
+// based on our current blockchain statistics.
+func calculateVerificationProgress(ctx context.Context, blockchainClient blockchain.ClientI, currentHeight uint32) (float64, error) {
+	// Equivalent to: if (pindex == nullptr) return 0.0;
+	if currentHeight == 0 {
+		return 0.0, nil
+	}
+
+	// Get current block stats to get pindex->GetChainTx() equivalent
+	blockStats, err := blockchainClient.GetBlockStats(ctx)
+	if err != nil {
+		return 0.0, err
+	}
+
+	// Equivalent to: if (pindex == nullptr) return 0.0;
+	if blockStats.TxCount == 0 {
+		return 0.0, nil
+	}
+
+	// Equivalent to: int64_t nNow = time(nullptr);
+	nNow := time.Now().Unix()
+
+	// Since we don't have hardcoded ChainTxData like Bitcoin SV, we'll use a different approach
+	// We'll estimate sync progress based on how recent our last block is
+
+	// If our last block is very recent (within 10 minutes), assume we're synced
+	timeSinceLastBlock := nNow - int64(blockStats.LastBlockTime)
+	if timeSinceLastBlock <= 600 { // 10 minutes
+		return 1.0, nil
+	}
+
+	// If our last block is very old (more than 24 hours), we're definitely not synced
+	if timeSinceLastBlock >= 86400 { // 24 hours
+		return 0.1, nil // Very behind
+	}
+
+	// For blocks between 10 minutes and 24 hours old, calculate progress
+	// Progress decreases as time since last block increases
+	maxTimeBehind := int64(86400) // 24 hours
+	minTimeBehind := int64(600)   // 10 minutes
+
+	// Linear interpolation between 1.0 (recent) and 0.1 (old)
+	progress := 1.0 - 0.9*float64(timeSinceLastBlock-minTimeBehind)/float64(maxTimeBehind-minTimeBehind)
+
+	if progress < 0.1 {
+		progress = 0.1
+	}
+	if progress > 1.0 {
+		progress = 1.0
+	}
+
+	return progress, nil
+}
+
+// calculateMedianTime calculates the median time from the last 11 blocks.
+// This follows the Bitcoin consensus rules for calculating median time.
+func calculateMedianTime(ctx context.Context, blockchainClient blockchain.ClientI, bestBlockHash *chainhash.Hash) (uint32, error) {
+	// Get the last 11 block headers starting from the best block
+	headers, _, err := blockchainClient.GetBlockHeaders(ctx, bestBlockHash, 11)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(headers) == 0 {
+		return 0, errors.NewProcessingError("no block headers found")
+	}
+
+	// Extract timestamps from headers
+	timestamps := make([]time.Time, len(headers))
+	for i, header := range headers {
+		timestamps[i] = time.Unix(int64(header.Timestamp), 0)
+	}
+
+	// Calculate median timestamp using the existing model function
+	medianTimestamp, err := model.CalculateMedianTimestamp(timestamps)
+	if err != nil {
+		return 0, err
+	}
+
+	// Convert back to uint32 timestamp
+	medianTimestampUint32, err := safeconversion.TimeToUint32(*medianTimestamp)
+	if err != nil {
+		return 0, err
+	}
+
+	return medianTimestampUint32, nil
 }
 
 // handleGetInfo returns a JSON object containing various state info.
@@ -1522,6 +1689,11 @@ func handleSubmitMiningSolution(ctx context.Context, s *RPCServer, cmd interface
 	s.logger.Debugf("in handleSubmitMiningSolution: ms: %s", ms.Stringify(true))
 
 	if err = s.blockAssemblyClient.SubmitMiningSolution(ctx, ms); err != nil {
+		// Handle "job not found" as an expected condition - miners often submit stale solutions
+		if terr, ok := err.(*errors.Error); ok && terr.Code() == errors.ERR_NOT_FOUND {
+			s.logger.Infof("Mining solution rejected: %s (job expired or block already found)", err.Error())
+			return nil, bsvjson.NewRPCError(bsvjson.ErrRPCMisc, err.Error())
+		}
 		return nil, err
 	}
 
@@ -1630,11 +1802,44 @@ func handleReconsiderBlock(ctx context.Context, s *RPCServer, cmd interface{}, _
 		return nil, rpcDecodeHexError(c.BlockHash)
 	}
 
-	// Load the raw block bytes from the database.
-	err = s.blockchainClient.RevalidateBlock(ctx, ch)
+	// Get the block data from blockchain store to revalidate it
+	block, err := s.blockchainClient.GetBlock(ctx, ch)
 	if err != nil {
-		return nil, err
+		s.logger.Errorf("[handleReconsiderBlock] failed to get block %s: %v", ch, err)
+		return nil, &bsvjson.RPCError{
+			Code:    bsvjson.ErrRPCBlockNotFound,
+			Message: "Block not found",
+		}
 	}
+
+	// Submit the block to block validation service for full revalidation
+	// This will ensure all consensus rules are checked, including difficulty
+	s.logger.Infof("[handleReconsiderBlock] submitting block %s for revalidation", ch)
+
+	if s.blockValidationClient == nil {
+		s.logger.Errorf("[handleReconsiderBlock] block validation client not available")
+		return nil, &bsvjson.RPCError{
+			Code:    bsvjson.ErrRPCInternal.Code,
+			Message: "Block validation service not available",
+		}
+	}
+
+	// ValidateBlock will check if the block is marked as invalid and proceed with full validation
+	// If validation succeeds, it will call blockchain.RevalidateBlock to clear the invalid flag
+	// Pass IsRevalidation flag to indicate this is a reconsideration of an invalid block
+	options := &blockvalidation.ValidateBlockOptions{
+		IsRevalidation: true,
+	}
+	err = s.blockValidationClient.ValidateBlock(ctx, block, options)
+	if err != nil {
+		s.logger.Errorf("[handleReconsiderBlock] block validation failed for %s: %v", ch, err)
+		return nil, &bsvjson.RPCError{
+			Code:    bsvjson.ErrRPCVerify,
+			Message: "Block failed validation: " + err.Error(),
+		}
+	}
+
+	s.logger.Infof("[handleReconsiderBlock] block %s successfully reconsidered and validated", ch)
 
 	return nil, nil
 }

@@ -4,8 +4,8 @@ package utxo
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/stretchr/testify/assert"
 )
 

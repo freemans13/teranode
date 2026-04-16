@@ -5,14 +5,14 @@ package blockpersister
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/utxopersister"
-	"github.com/bitcoin-sv/teranode/services/utxopersister/filestorer"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -50,7 +50,7 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 	)
 	defer deferFn()
 
-	block, err := model.NewBlockFromBytes(blockBytes, u.settings)
+	block, err := model.NewBlockFromBytes(blockBytes)
 	if err != nil {
 		return errors.NewProcessingError("error creating block from bytes", err)
 	}
@@ -58,6 +58,16 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 	u.logger.Infof("[BlockPersister] Processing block %s (%d subtrees)...", block.Header.Hash().String(), len(block.Subtrees))
 
 	concurrency := u.settings.Block.BlockPersisterConcurrency
+
+	// In all-in-one mode, reduce concurrency to avoid resource starvation across multiple services
+	if u.settings.IsAllInOneMode {
+		concurrency = concurrency / 2
+		if concurrency < 1 {
+			concurrency = 1 // Ensure at least 1
+		}
+		u.logger.Infof("[BlockPersister] All-in-one mode detected: reducing concurrency to %d", concurrency)
+	}
+
 	u.logger.Infof("[BlockPersister] Processing subtrees with concurrency %d", concurrency)
 
 	// Create a new UTXO diff
@@ -65,6 +75,12 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 	if err != nil {
 		return errors.NewProcessingError("error creating utxo diff", err)
 	}
+
+	defer func() {
+		if closeErr := utxoDiff.Close(); closeErr != nil {
+			u.logger.Warnf("[persistBlock] error closing utxoDiff during error cleanup: %v", closeErr)
+		}
+	}()
 
 	if len(block.Subtrees) == 0 {
 		// No subtrees to process, just write the coinbase UTXO to the diff and continue
@@ -82,7 +98,7 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 			g.Go(func() error {
 				u.logger.Infof("[BlockPersister] processing subtree %d / %d [%s]", i+1, len(block.Subtrees), subtreeHash.String())
 
-				return u.ProcessSubtree(gCtx, *subtreeHash, block.CoinbaseTx)
+				return u.ProcessSubtree(gCtx, *subtreeHash, block.CoinbaseTx, utxoDiff)
 			})
 		}
 
@@ -94,11 +110,6 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 		}
 	}
 
-	// At this point, we have a complete UTXODiff for this block.
-	if err = utxoDiff.Close(); err != nil {
-		return errors.NewStorageError("error closing utxo diff", err)
-	}
-
 	// Now, write the block file
 	u.logger.Infof("[BlockPersister] Writing block %s to disk", block.Header.Hash().String())
 
@@ -107,12 +118,14 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 		return errors.NewStorageError("error creating block file", err)
 	}
 
+	defer func() {
+		if closeErr := storer.Close(ctx); closeErr != nil {
+			u.logger.Warnf("[persistBlock] error closing storer: %v", closeErr)
+		}
+	}()
+
 	if _, err = storer.Write(blockBytes); err != nil {
 		return errors.NewStorageError("error writing block to disk", err)
-	}
-
-	if err = storer.Close(ctx); err != nil {
-		return errors.NewStorageError("error closing block file", err)
 	}
 
 	return nil

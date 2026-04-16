@@ -4,19 +4,19 @@ import (
 	"testing"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	teranode_aerospike "github.com/bitcoin-sv/teranode/stores/utxo/aerospike"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
-	utxo2 "github.com/bitcoin-sv/teranode/test/longtest/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/test"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	teranode_aerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	utxo2 "github.com/bsv-blockchain/teranode/test/longtest/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,7 +42,7 @@ func TestAlertSystem(t *testing.T) {
 		}
 
 		// Create a key for the UTXO
-		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/uint32(store.GetUtxoBatchSize())) //nolint:gosec
+		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, store.GetUtxoBatchSize()) //nolint:gosec
 		key, aErr := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, aErr)
 
@@ -95,7 +95,7 @@ func TestAlertSystem(t *testing.T) {
 		}
 
 		// Create a key for the UTXO
-		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/uint32(store.GetUtxoBatchSize())) //nolint:gosec
+		keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, store.GetUtxoBatchSize())
 		key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, err)
 
@@ -185,7 +185,7 @@ func TestAlertSystem(t *testing.T) {
 		}
 
 		// Create a key for the UTXO
-		keySource := uaerospike.CalculateKeySource(utxoRec.TxID, utxoRec.Vout/uint32(store.GetUtxoBatchSize())) //nolint:gosec
+		keySource := uaerospike.CalculateKeySource(utxoRec.TxID, utxoRec.Vout, store.GetUtxoBatchSize())
 		key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, err)
 

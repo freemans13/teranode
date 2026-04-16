@@ -4,16 +4,16 @@ import (
 	"testing"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	teranode_aerospike "github.com/bitcoin-sv/teranode/stores/utxo/aerospike"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/test"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	teranode_aerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -96,7 +96,7 @@ func TestStore_SpendMultiRecord(t *testing.T) {
 			require.NoError(t, err)
 
 			//nolint:gosec
-			keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(vOut/store.GetUtxoBatchSize()))
+			keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(vOut), store.GetUtxoBatchSize())
 			key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 			require.NoError(t, err)
 
@@ -134,7 +134,7 @@ func TestStore_SpendMultiRecord(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, uint32(0), dah)
 
-		keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(0))
+		keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(0), 1)
 		mainRecordKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, err)
 

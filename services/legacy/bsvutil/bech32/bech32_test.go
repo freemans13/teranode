@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil/bech32"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil/bech32"
 )
 
 func TestBech32(t *testing.T) {

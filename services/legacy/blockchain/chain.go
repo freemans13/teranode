@@ -3,6 +3,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Package blockchain provides blockchain utilities and data structures for the legacy Bitcoin SV service.
 package blockchain
 
 import (
@@ -26,6 +27,7 @@ import (
 // [17a 16a 15 14 13 12 11 10 9 8 7 6 4 genesis]
 type BlockLocator []*chainhash.Hash
 
+// BlockChain represents a blockchain data structure for the legacy Bitcoin SV protocol implementation.
 type BlockChain struct {
 }
 

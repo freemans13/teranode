@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 )
 
 // MockIndexWaiter is a mock implementation of the IndexWaiter interface for testing

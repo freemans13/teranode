@@ -19,13 +19,13 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // Store wraps a utxo.Store implementation with logging capabilities.
@@ -216,8 +216,8 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	return blockIDsMap, err
 }
 
-func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
-	return s.store.GetUnminedTxIterator()
+func (s *Store) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
+	return s.store.GetUnminedTxIterator(false)
 }
 
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
@@ -286,6 +286,13 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
 	err := s.store.SetLocked(ctx, txHashes, setValue)
 	s.logger.Debugf("[UTXOStore][logger][SetLocked] txHashes %v setValue %v err %v : %s", txHashes, setValue, err, caller())
+
+	return err
+}
+
+func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	err := s.store.MarkTransactionsOnLongestChain(ctx, txHashes, onLongestChain)
+	s.logger.Debugf("[UTXOStore][logger][MarkTransactionsOnLongestChain] txHashes %v onLongestChain %v err %v : %s", txHashes, onLongestChain, err, caller())
 
 	return err
 }

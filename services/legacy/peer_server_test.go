@@ -4,11 +4,11 @@ import (
 	"net"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/addrmgr"
-	"github.com/bitcoin-sv/teranode/services/legacy/netsync"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/addrmgr"
+	"github.com/bsv-blockchain/teranode/services/legacy/netsync"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )

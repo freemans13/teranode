@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/assert"
 )
 

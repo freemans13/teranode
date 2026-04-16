@@ -19,9 +19,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // FetchFSMState retrieves and prints the current state of the FSM (Finite State Machine) from the blockchain service.

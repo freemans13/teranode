@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -80,11 +80,13 @@ func TestNewKafkaConsumer(t *testing.T) {
 		return nil
 	}
 
-	consumer := NewKafkaConsumer(cfg, consumerFn)
+	watchdog := &consumeWatchdog{}
+	consumer := NewKafkaConsumer(cfg, consumerFn, watchdog)
 
 	assert.NotNil(t, consumer)
 	assert.Equal(t, cfg, consumer.cfg)
 	assert.NotNil(t, consumer.consumerClosure)
+	assert.NotNil(t, consumer.watchdog)
 }
 
 func TestNewKafkaConsumerNilConsumerFunction(t *testing.T) {
@@ -96,7 +98,8 @@ func TestNewKafkaConsumerNilConsumerFunction(t *testing.T) {
 		AutoCommitEnabled: false,
 	}
 
-	consumer := NewKafkaConsumer(cfg, nil)
+	watchdog := &consumeWatchdog{}
+	consumer := NewKafkaConsumer(cfg, nil, watchdog)
 
 	assert.NotNil(t, consumer)
 	assert.Equal(t, cfg, consumer.cfg)
@@ -118,6 +121,7 @@ func TestKafkaConsumerSetup(t *testing.T) {
 func TestKafkaConsumerCleanupAutoCommitEnabled(t *testing.T) {
 	consumer := &KafkaConsumer{
 		cfg: KafkaConsumerConfig{
+			Logger:            &mockLogger{},
 			Topic:             "test-topic",
 			AutoCommitEnabled: true,
 		},
@@ -133,6 +137,7 @@ func TestKafkaConsumerCleanupAutoCommitEnabled(t *testing.T) {
 func TestKafkaConsumerCleanupManualCommit(t *testing.T) {
 	consumer := &KafkaConsumer{
 		cfg: KafkaConsumerConfig{
+			Logger:            &mockLogger{},
 			Topic:             "test-topic",
 			AutoCommitEnabled: false,
 		},
@@ -148,7 +153,7 @@ func TestKafkaConsumerCleanupManualCommit(t *testing.T) {
 func TestNewKafkaConsumerGroupFromURLInvalidURL(t *testing.T) {
 	logger := &mockLogger{}
 
-	consumer, err := NewKafkaConsumerGroupFromURL(logger, nil, "test-group", true)
+	consumer, err := NewKafkaConsumerGroupFromURL(logger, nil, "test-group", true, nil)
 
 	assert.Error(t, err)
 	assert.Nil(t, consumer)
@@ -157,68 +162,18 @@ func TestNewKafkaConsumerGroupFromURLInvalidURL(t *testing.T) {
 
 func TestNewKafkaConsumerGroupFromURLMemoryScheme(t *testing.T) {
 	logger := &mockLogger{}
-	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=4&consumer_ratio=2&replay=1")
+	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=4&replay=1")
 	require.NoError(t, err)
 
-	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", true)
+	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", true, nil)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, consumer)
 	assert.Equal(t, "test-topic", consumer.Config.Topic)
 	assert.Equal(t, "test-group", consumer.Config.ConsumerGroupID)
 	assert.Equal(t, 4, consumer.Config.Partitions)
-	assert.Equal(t, 2, consumer.Config.ConsumerRatio)
-	assert.Equal(t, 1, consumer.Config.ConsumerCount) // Memory scheme forces consumer count to 1
 	assert.True(t, consumer.Config.AutoCommitEnabled)
 	assert.True(t, consumer.Config.Replay)
-}
-
-func TestNewKafkaConsumerGroupFromURLConsumerRatioValidation(t *testing.T) {
-	tests := []struct {
-		name             string
-		urlParams        string
-		expectedRatio    int
-		expectedCount    int
-		expectedWarnings int
-	}{
-		{
-			name:             "Valid consumer ratio",
-			urlParams:        "partitions=6&consumer_ratio=2",
-			expectedRatio:    2,
-			expectedCount:    1, // Memory scheme forces consumer count to 1
-			expectedWarnings: 0,
-		},
-		{
-			name:             "Consumer ratio less than 1",
-			urlParams:        "partitions=4&consumer_ratio=0",
-			expectedRatio:    1, // Should be corrected to 1
-			expectedCount:    1, // Memory scheme forces consumer count to 1
-			expectedWarnings: 1,
-		},
-		{
-			name:             "Consumer count less than 1",
-			urlParams:        "partitions=1&consumer_ratio=2",
-			expectedRatio:    2,
-			expectedCount:    1, // Should be corrected to 1
-			expectedWarnings: 1,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logger := &mockLogger{}
-			kafkaURL, err := url.Parse("memory://localhost/test-topic?" + tt.urlParams)
-			require.NoError(t, err)
-
-			consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", true)
-
-			assert.NoError(t, err)
-			assert.NotNil(t, consumer)
-			assert.Equal(t, tt.expectedRatio, consumer.Config.ConsumerRatio)
-			assert.Equal(t, tt.expectedCount, consumer.Config.ConsumerCount)
-			assert.Equal(t, tt.expectedWarnings, logger.warnCount)
-		})
-	}
 }
 
 func TestNewKafkaConsumerGroupFromURLDefaultValues(t *testing.T) {
@@ -226,13 +181,11 @@ func TestNewKafkaConsumerGroupFromURLDefaultValues(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic")
 	require.NoError(t, err)
 
-	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", false)
+	consumer, err := NewKafkaConsumerGroupFromURL(logger, kafkaURL, "test-group", false, nil)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, consumer)
-	assert.Equal(t, 1, consumer.Config.Partitions)    // default partitions
-	assert.Equal(t, 1, consumer.Config.ConsumerRatio) // default consumer_ratio
-	assert.Equal(t, 1, consumer.Config.ConsumerCount) // 1/1 = 1
+	assert.Equal(t, 1, consumer.Config.Partitions) // default partitions
 	assert.False(t, consumer.Config.AutoCommitEnabled)
 	assert.True(t, consumer.Config.Replay) // default replay=1
 }
@@ -281,26 +234,14 @@ func TestNewKafkaConsumerGroupValidationErrors(t *testing.T) {
 			name: "Missing URL",
 			config: KafkaConsumerConfig{
 				Logger:          logger,
-				ConsumerCount:   1,
 				ConsumerGroupID: "test-group",
 			},
 			errMsg: "kafka URL is not set",
 		},
 		{
-			name: "Invalid consumer count",
-			config: KafkaConsumerConfig{
-				URL:             &url.URL{Scheme: "memory"},
-				Logger:          logger,
-				ConsumerCount:   0,
-				ConsumerGroupID: "test-group",
-			},
-			errMsg: "consumer count must be greater than 0",
-		},
-		{
 			name: "Missing logger",
 			config: KafkaConsumerConfig{
 				URL:             &url.URL{Scheme: "memory"},
-				ConsumerCount:   1,
 				ConsumerGroupID: "test-group",
 			},
 			errMsg: "logger is not set",
@@ -308,9 +249,8 @@ func TestNewKafkaConsumerGroupValidationErrors(t *testing.T) {
 		{
 			name: "Missing group ID",
 			config: KafkaConsumerConfig{
-				URL:           &url.URL{Scheme: "memory"},
-				Logger:        logger,
-				ConsumerCount: 1,
+				URL:    &url.URL{Scheme: "memory"},
+				Logger: logger,
 			},
 			errMsg: "group ID is not set",
 		},
@@ -396,3 +336,234 @@ func (m *mockSaramaConsumerGroup) PauseAll() {}
 
 // ResumeAll implements sarama.ConsumerGroup interface
 func (m *mockSaramaConsumerGroup) ResumeAll() {}
+
+// Watchdog tests
+
+func TestConsumeWatchdogMarkConsumeStarted(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	watchdog.markConsumeStarted()
+
+	// Verify that the watchdog is attempting to consume
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// Verify that consume start time was set
+	startTime, ok := watchdog.consumeStartTime.Load().(time.Time)
+	assert.True(t, ok)
+	assert.False(t, startTime.IsZero())
+
+	// Verify that setup called time was reset
+	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
+	assert.True(t, ok)
+	assert.True(t, setupTime.IsZero())
+}
+
+func TestConsumeWatchdogMarkSetupCalled(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// First mark consume started
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// Then mark setup called
+	watchdog.markSetupCalled()
+
+	// Verify that the watchdog is no longer attempting to consume
+	assert.False(t, watchdog.isAttemptingConsume.Load())
+
+	// Verify that setup called time was set
+	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
+	assert.True(t, ok)
+	assert.False(t, setupTime.IsZero())
+}
+
+func TestConsumeWatchdogMarkConsumeEnded(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// First mark consume started
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// Then mark consume ended
+	watchdog.markConsumeEnded()
+
+	// Verify that the watchdog is no longer attempting to consume
+	assert.False(t, watchdog.isAttemptingConsume.Load())
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_NotAttempting(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Don't mark consume started - should not be stuck
+	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Second)
+
+	assert.False(t, stuck)
+	assert.Equal(t, time.Duration(0), duration)
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_SetupCalled(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Mark consume started
+	watchdog.markConsumeStarted()
+
+	// Wait a bit then mark setup called
+	time.Sleep(10 * time.Millisecond)
+	watchdog.markSetupCalled()
+
+	// Should not be stuck because setup was called
+	stuck, duration := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
+
+	assert.False(t, stuck)
+	assert.Equal(t, time.Duration(0), duration)
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_BelowThreshold(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Mark consume started
+	watchdog.markConsumeStarted()
+
+	// Wait less than threshold
+	time.Sleep(10 * time.Millisecond)
+
+	// Should not be stuck because duration is below threshold
+	stuck, duration := watchdog.isStuckInRefreshMetadata(100 * time.Millisecond)
+
+	assert.False(t, stuck)
+	assert.Greater(t, duration, time.Duration(0))
+	assert.Less(t, duration, 100*time.Millisecond)
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_AboveThreshold(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Mark consume started
+	watchdog.markConsumeStarted()
+
+	// Wait more than threshold
+	time.Sleep(50 * time.Millisecond)
+
+	// Should be stuck because duration exceeds threshold and setup was not called
+	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
+
+	assert.True(t, stuck)
+	assert.Greater(t, duration, 10*time.Millisecond)
+}
+
+func TestConsumeWatchdogIsStuckInRefreshMetadata_ZeroStartTime(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// Set isAttemptingConsume to true but don't set start time
+	watchdog.isAttemptingConsume.Store(true)
+
+	// Should not be stuck because start time is not set
+	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
+
+	assert.False(t, stuck)
+	assert.Equal(t, time.Duration(0), duration)
+}
+
+func TestConsumeWatchdogSequence_NormalFlow(t *testing.T) {
+	watchdog := &consumeWatchdog{}
+
+	// 1. Consume starts
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// 2. Some time passes (simulating RefreshMetadata)
+	time.Sleep(10 * time.Millisecond)
+
+	// 3. Setup is called successfully
+	watchdog.markSetupCalled()
+	assert.False(t, watchdog.isAttemptingConsume.Load())
+
+	// 4. Should not be stuck
+	stuck, _ := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
+	assert.False(t, stuck)
+}
+
+func TestForceRecovery_ClosesOldConsumer(t *testing.T) {
+	logger := &mockLogger{}
+	mockConsumerGroup := &mockSaramaConsumerGroup{}
+
+	cfg := sarama.NewConfig()
+	cfg.Consumer.Return.Errors = true
+
+	consumer := &KafkaConsumerGroup{
+		Config: KafkaConsumerConfig{
+			Logger:          logger,
+			Topic:           "test-topic",
+			ConsumerGroupID: "test-group",
+			BrokersURL:      []string{"localhost:9092"},
+		},
+		ConsumerGroup: mockConsumerGroup,
+		saramaConfig:  cfg,
+		watchdog:      &consumeWatchdog{},
+	}
+
+	// Force recovery should close the old consumer
+	_ = consumer.forceRecovery()
+
+	// The important thing is that Close() was called on the mock consumer
+	// (New consumer creation will fail with invalid brokers, but that's expected and logged)
+	assert.True(t, mockConsumerGroup.closed, "forceRecovery should close the old consumer group")
+}
+
+func TestForceRecovery_WatchdogIntegration(t *testing.T) {
+	// Create a watchdog that appears stuck
+	watchdog := &consumeWatchdog{}
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// After simulated recovery, watchdog should be reset
+	watchdog.markConsumeEnded()
+	assert.False(t, watchdog.isAttemptingConsume.Load())
+
+	// Verify watchdog correctly detects stuck state
+	watchdog.markConsumeStarted()
+	time.Sleep(10 * time.Millisecond)
+	stuck, duration := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
+	assert.True(t, stuck)
+	assert.Greater(t, duration, 5*time.Millisecond)
+}
+
+func TestForceRecovery_MutexProtectsConcurrentCalls(t *testing.T) {
+	logger := &mockLogger{}
+	mockConsumerGroup := &mockSaramaConsumerGroup{}
+
+	cfg := sarama.NewConfig()
+	cfg.Consumer.Return.Errors = true
+
+	consumer := &KafkaConsumerGroup{
+		Config: KafkaConsumerConfig{
+			Logger:          logger,
+			Topic:           "test-topic",
+			ConsumerGroupID: "test-group",
+			BrokersURL:      []string{"localhost:9092"},
+		},
+		ConsumerGroup: mockConsumerGroup,
+		saramaConfig:  cfg,
+		watchdog:      &consumeWatchdog{},
+	}
+
+	// Launch multiple concurrent force recovery calls
+	// The mutex should ensure they don't interfere with each other
+	const numConcurrent = 5
+	done := make(chan bool, numConcurrent)
+
+	for i := 0; i < numConcurrent; i++ {
+		go func() {
+			_ = consumer.forceRecovery()
+			done <- true
+		}()
+	}
+
+	// Wait for all goroutines to complete
+	for i := 0; i < numConcurrent; i++ {
+		<-done
+	}
+
+	// Should have closed the consumer (at least once)
+	assert.True(t, mockConsumerGroup.closed)
+}

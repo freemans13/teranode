@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/servicemanager"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/servicemanager"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -350,10 +350,6 @@ func TestDaemon_Start_AllServices(t *testing.T) {
 	appSettings.Coinbase.GRPCListenAddress = fmt.Sprintf(":%d", coinbaseGRPCPort)
 	appSettings.Coinbase.GRPCAddress = fmt.Sprintf("localhost:%d", coinbaseGRPCPort)
 
-	// Disable both NAT services to avoid libp2p "multiple NATManagers" error
-	appSettings.P2P.EnableNATService = false
-	appSettings.P2P.EnableNATPortMap = false
-
 	// Manually set BlockChain and UTXO StoreURL to SQLite memory
 	appSettings.BlockChain.StoreURL = sqlStoreURL
 	appSettings.UtxoStore.UtxoStore = sqlStoreURL
@@ -411,7 +407,12 @@ func TestDaemon_Start_AllServices(t *testing.T) {
 	d := New(loggerFactory, WithContext(ctx))
 	require.NotNil(t, d, "New daemon instance should not be nil")
 
-	ctxStart, cancelStart := context.WithTimeout(context.Background(), 60*time.Second)
+	// Use longer timeout for CI environments where services take longer to start
+	startupTimeout := 60 * time.Second
+	if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
+		startupTimeout = 180 * time.Second // 3 minutes for CI
+	}
+	ctxStart, cancelStart := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancelStart()
 
 	readyCh := make(chan struct{})
@@ -436,12 +437,13 @@ func TestDaemon_Start_AllServices(t *testing.T) {
 	}()
 
 	// Wait for services to be ready or timeout
+	t.Logf("Waiting for daemon startup with timeout: %v", startupTimeout)
 	select {
 	case <-readyCh:
 		t.Logf("Daemon and its services reported ready.")
 	case <-ctxStart.Done():
-		logger.Errorf("Timeout waiting for daemon and its services to be ready: %v", ctxStart.Err())
-		t.Fatal("Timeout waiting for daemon and its services to be ready")
+		logger.Errorf("Timeout waiting for daemon and its services to be ready after %v: %v", startupTimeout, ctxStart.Err())
+		t.Fatalf("Timeout waiting for daemon and its services to be ready after %v", startupTimeout)
 	}
 
 	// additional sleep for alert service

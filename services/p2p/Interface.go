@@ -4,7 +4,7 @@ package p2p
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/services/p2p/p2p_api"
+	"github.com/bsv-blockchain/teranode/services/p2p/p2p_api"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 

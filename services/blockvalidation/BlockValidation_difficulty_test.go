@@ -6,15 +6,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -106,23 +106,25 @@ func TestValidateBlock_IncorrectDifficultyBits(t *testing.T) {
 		TransactionCount: uint64(subtree.Length()),
 		SizeInBytes:      123123,
 	}
-	block.SetSettings(tSettings)
 
 	// Mock blockchain client
 	mockBlockchain := new(blockchain.Mock)
 	mockBlockchain.On("GetBlockExists", mock.Anything, blockHeader.Hash()).Return(false, nil).Once()
 	mockBlockchain.On("GetBlockHeaders", mock.Anything, prevBlockHeader.Hash(), mock.Anything).
 		Return([]*model.BlockHeader{prevBlockHeader}, []*model.BlockHeaderMeta{{ID: 0, Height: 0}}, nil).Once()
-	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
+	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil).Maybe()
+	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil).Maybe()
 
 	// Mock Subscribe for blockchain notifications
 	notificationChan := make(chan *blockchain_api.Notification, 1)
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil)
+	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil).Maybe()
 
 	// Mock GetNextWorkRequired to return the expected difficulty
 	mockBlockchain.On("GetNextWorkRequired", mock.Anything, prevBlockHeader.Hash(), mock.Anything).
 		Return(expectedNBits, nil).Once()
+
+	// Mock AddBlock to store invalid block when difficulty check fails
+	mockBlockchain.On("AddBlock", mock.Anything, block, "test", mock.Anything).Return(nil).Once()
 
 	// Mock GetBlock for bloom filter creation
 	prevBlock := &model.Block{
@@ -131,7 +133,6 @@ func TestValidateBlock_IncorrectDifficultyBits(t *testing.T) {
 		Subtrees:   []*chainhash.Hash{},
 		Height:     0,
 	}
-	prevBlock.SetSettings(tSettings)
 	mockBlockchain.On("GetBlock", mock.Anything, prevBlockHeader.Hash()).Return(prevBlock, nil).Maybe()
 
 	// Mock GetBestBlockHeader for bloom filter pruning
@@ -236,23 +237,25 @@ func TestValidateBlock_DoesNotMeetTargetDifficulty(t *testing.T) {
 		TransactionCount: uint64(subtree.Length()),
 		SizeInBytes:      123123,
 	}
-	block.SetSettings(tSettings)
 
 	// Mock blockchain client
 	mockBlockchain := new(blockchain.Mock)
 	mockBlockchain.On("GetBlockExists", mock.Anything, blockHeader.Hash()).Return(false, nil).Once()
 	mockBlockchain.On("GetBlockHeaders", mock.Anything, prevBlockHeader.Hash(), mock.Anything).
 		Return([]*model.BlockHeader{prevBlockHeader}, []*model.BlockHeaderMeta{{ID: 0, Height: 0}}, nil).Once()
-	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
+	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil).Maybe()
+	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil).Maybe()
 
 	// Mock Subscribe for blockchain notifications
 	notificationChan := make(chan *blockchain_api.Notification, 1)
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil)
+	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil).Maybe()
 
 	// Mock GetNextWorkRequired to return the expected difficulty
 	mockBlockchain.On("GetNextWorkRequired", mock.Anything, prevBlockHeader.Hash(), mock.Anything).
 		Return(expectedNBits, nil).Once()
+
+	// Mock AddBlock to store invalid block when difficulty target is not met
+	mockBlockchain.On("AddBlock", mock.Anything, block, "test", mock.Anything).Return(nil).Once()
 
 	// Mock GetBlock for bloom filter creation
 	prevBlock := &model.Block{
@@ -261,7 +264,6 @@ func TestValidateBlock_DoesNotMeetTargetDifficulty(t *testing.T) {
 		Subtrees:   []*chainhash.Hash{},
 		Height:     0,
 	}
-	prevBlock.SetSettings(tSettings)
 	mockBlockchain.On("GetBlock", mock.Anything, prevBlockHeader.Hash()).Return(prevBlock, nil).Maybe()
 
 	// Mock GetBestBlockHeader for bloom filter pruning
@@ -378,7 +380,6 @@ func TestValidateBlock_ValidDifficulty(t *testing.T) {
 		TransactionCount: 1, // Just the coinbase
 		SizeInBytes:      uint64(coinbaseTx.Size()),
 	}
-	block.SetSettings(tSettings)
 
 	// Mock blockchain client
 	mockBlockchain := new(blockchain.Mock)
@@ -403,7 +404,6 @@ func TestValidateBlock_ValidDifficulty(t *testing.T) {
 		Subtrees:   []*chainhash.Hash{},
 		Height:     0,
 	}
-	prevBlock.SetSettings(tSettings)
 	mockBlockchain.On("GetBlock", mock.Anything, prevBlockHeader.Hash()).Return(prevBlock, nil).Maybe()
 
 	// Mock GetBestBlockHeader for bloom filter pruning

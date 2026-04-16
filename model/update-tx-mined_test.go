@@ -3,21 +3,20 @@ package model
 import (
 	"context"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -45,7 +44,7 @@ func TestUpdateTxMinedStatus(t *testing.T) {
 		tSettings.UtxoStore = settings.UtxoStoreSettings{
 			UpdateTxMinedStatus: true,
 			MaxMinedBatchSize:   1024,
-			MaxMinedRoutines:    128,
+			MaxMinedRoutines:    1,                // SQLite only supports one writer at a time
 			DBTimeout:           30 * time.Second, // Increase timeout for SQLite in-memory operations
 		}
 		setWorkerSettings(tSettings)
@@ -56,21 +55,21 @@ func TestUpdateTxMinedStatus(t *testing.T) {
 		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 		require.NoError(t, err)
 
-		_, err = utxoStore.Create(context.Background(), tx0, 0)
+		_, err = utxoStore.Create(context.Background(), tx0, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx1, 0)
+		_, err = utxoStore.Create(context.Background(), tx1, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx2, 0)
+		_, err = utxoStore.Create(context.Background(), tx2, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx3, 0)
+		_, err = utxoStore.Create(context.Background(), tx3, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx4, 0)
+		_, err = utxoStore.Create(context.Background(), tx4, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx5, 0)
+		_, err = utxoStore.Create(context.Background(), tx5, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx6, 0)
+		_, err = utxoStore.Create(context.Background(), tx6, 1)
 		require.NoError(t, err)
-		_, err = utxoStore.Create(context.Background(), tx7, 0)
+		_, err = utxoStore.Create(context.Background(), tx7, 1)
 		require.NoError(t, err)
 
 		block := &Block{}
@@ -122,6 +121,7 @@ func TestUpdateTxMinedStatus(t *testing.T) {
 			block,
 			1,
 			[]uint32{0},
+			true,
 			false,
 		)
 		require.NoError(t, err)
@@ -167,6 +167,7 @@ func TestUpdateTxMinedStatus(t *testing.T) {
 			block,
 			1,
 			[]uint32{0},
+			false,
 			true,
 		)
 		require.NoError(t, err)
@@ -262,7 +263,7 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 		// Chain contains block IDs 5 and 10
 		chainBlockIDs := []uint32{5, 10}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs)
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs, true)
 
 		// Should get BlockInvalidError because transaction was already mined in block 5 (on current chain)
 		require.Error(t, err)
@@ -286,7 +287,7 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 		// Chain contains different block IDs
 		chainBlockIDs := []uint32{5, 10, 15}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs)
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs, true)
 
 		// Should succeed because transactions are not on current chain
 		require.NoError(t, err)
@@ -307,7 +308,7 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 
 		chainBlockIDs := []uint32{5, 10, 15}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs)
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs, true)
 
 		// Should succeed because it's the same block being mined
 		require.NoError(t, err)
@@ -328,74 +329,9 @@ func TestUpdateTxMinedStatus_BlockIDCollisionDetection(t *testing.T) {
 		// Empty chain block IDs - should skip validation
 		chainBlockIDs := []uint32{}
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs)
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDs, true)
 
 		require.NoError(t, err)
-
-		mockStore.AssertExpectations(t)
-	})
-}
-
-// TestUpdateTxMinedStatus_RetryLogic tests the retry mechanism for failed SetMinedMulti calls
-func TestUpdateTxMinedStatus_RetryLogic(t *testing.T) {
-	ctx := context.Background()
-	logger := ulogger.NewErrorTestLogger(t)
-	tSettings := test.CreateBaseTestSettings(t)
-
-	tSettings.UtxoStore = settings.UtxoStoreSettings{
-		UpdateTxMinedStatus: true,
-		MaxMinedBatchSize:   10,
-		MaxMinedRoutines:    1,
-	}
-	setWorkerSettings(tSettings)
-
-	mockStore := &utxo.MockUtxostore{}
-
-	testTx := newTx(100)
-	block := &Block{}
-	block.Height = 100
-	block.Subtrees = []*chainhash.Hash{testTx.TxIDChainHash()}
-	block.SubtreeSlices = []*subtree.Subtree{
-		{
-			Nodes: []subtree.SubtreeNode{
-				{Hash: *testTx.TxIDChainHash()},
-			},
-		},
-	}
-
-	t.Run("should retry on failure and eventually succeed", func(t *testing.T) {
-		// First call fails
-		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
-		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Once()
-
-		// Second call succeeds
-		expectedBlockIDsMap := map[chainhash.Hash][]uint32{
-			*testTx.TxIDChainHash(): {15},
-		}
-		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Return(expectedBlockIDsMap, nil).Once()
-
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
-
-		require.NoError(t, err)
-		mockStore.AssertExpectations(t)
-	})
-
-	t.Run("should fail after max retries exceeded", func(t *testing.T) {
-		mockStore = &utxo.MockUtxostore{} // Reset mock
-
-		// Mock failure for all retry attempts (maxRetries = 10)
-		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
-		for i := 0; i <= 10; i++ {
-			mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-				Return(emptyBlockIDsMap, errors.NewStorageError("persistent storage error")).Once()
-		}
-
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "error setting remainder batch mined tx")
 
 		mockStore.AssertExpectations(t)
 	})
@@ -437,26 +373,12 @@ func TestUpdateTxMinedStatus_ContextCancellation(t *testing.T) {
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Maybe()
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "context canceled")
 	})
 
-	t.Run("should handle context cancellation during retry backoff", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-
-		// First call fails, triggering retry with backoff
-		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
-		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Maybe()
-
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "context canceled")
-	})
 }
 
 // TestUpdateTxMinedStatus_ConfigurationDisabled tests disabled configuration scenario
@@ -486,7 +408,7 @@ func TestUpdateTxMinedStatus_ConfigurationDisabled(t *testing.T) {
 	setWorkerSettings(tSettings)
 
 	// Should not call SetMinedMulti when disabled
-	err := UpdateTxMinedStatus(ctx, logger, tSettings, freshMockStore, block, 15, []uint32{})
+	err := UpdateTxMinedStatus(ctx, logger, tSettings, freshMockStore, block, 15, []uint32{}, true)
 
 	require.NoError(t, err)
 	// Allow some time for any async processing to complete
@@ -535,7 +457,7 @@ func TestUpdateTxMinedStatus_DifferentBatchSizes(t *testing.T) {
 	freshMockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 		Return(expectedBlockIDsMap, nil).Times(2) // 2 calls: first with 2 hashes, second with 1 hash
 
-	err := UpdateTxMinedStatus(ctx, logger, tSettings, freshMockStore, multiTxBlock, 15, []uint32{})
+	err := UpdateTxMinedStatus(ctx, logger, tSettings, freshMockStore, multiTxBlock, 15, []uint32{}, true)
 
 	require.NoError(t, err)
 	// Allow some time for any async processing to complete
@@ -586,7 +508,7 @@ func TestUpdateTxMinedStatus_CoinbasePlaceholderHandling(t *testing.T) {
 			}).
 			Return(expectedBlockIDsMap, nil).Once()
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -615,7 +537,7 @@ func TestUpdateTxMinedStatus_CoinbasePlaceholderHandling(t *testing.T) {
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(expectedBlockIDsMap, nil).Once()
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, wrongPosBlock, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, wrongPosBlock, 15, []uint32{}, true)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -672,7 +594,7 @@ func TestUpdateTxMinedStatus_ConcurrentProcessing(t *testing.T) {
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
 			Return(expectedBlockIDsMap, nil).Times(3)
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -700,7 +622,7 @@ func TestUpdateTxMinedStatus_MissingSubtree(t *testing.T) {
 		block.Subtrees = []*chainhash.Hash{newTx(1).TxIDChainHash()}
 		block.SubtreeSlices = []*subtree.Subtree{nil} // Missing subtree
 
-		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{})
+		err := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "missing subtree")
@@ -758,7 +680,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -790,46 +712,10 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 		// Chain contains block IDs that conflict
 		chainBlockIDsMap := map[uint32]bool{5: true, 10: true, 15: true}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "block contains a transaction already on our chain")
-
-		mockStore.AssertExpectations(t)
-	})
-
-	t.Run("should handle context cancellation in retry loop", func(t *testing.T) {
-		mockStore := &utxo.MockUtxostore{}
-
-		testTx := newTx(100)
-		block := &Block{}
-		block.Height = 100
-		block.Subtrees = []*chainhash.Hash{testTx.TxIDChainHash()}
-		block.SubtreeSlices = []*subtree.Subtree{
-			{
-				Nodes: []subtree.SubtreeNode{
-					{Hash: *testTx.TxIDChainHash()},
-				},
-			},
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-
-		// Mock first call to fail, which will trigger retry
-		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
-		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Run(func(args mock.Arguments) {
-				// Cancel context during the first call
-				cancel()
-			}).
-			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Once()
-
-		chainBlockIDsMap := map[uint32]bool{}
-
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "context canceled")
 
 		mockStore.AssertExpectations(t)
 	})
@@ -856,7 +742,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, disabledSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, disabledSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.NoError(t, err)
 		mockStore.AssertNotCalled(t, "SetMinedMulti")
@@ -896,7 +782,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 		// Chain contains block ID 5 and 15
 		chainBlockIDsMap := map[uint32]bool{5: true, 15: true}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		// Should fail because tx1 conflicts (block ID 5 is on current chain)
 		require.Error(t, err)
@@ -929,7 +815,7 @@ func Test_updateTxMinedStatus_Internal(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{5: true, 10: true}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		// Should succeed because no existing block IDs to conflict with
 		require.NoError(t, err)
@@ -966,7 +852,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		// Should succeed without calling SetMinedMulti (no nodes to process)
 		require.NoError(t, err)
@@ -992,7 +878,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		// Should succeed without calling SetMinedMulti (all placeholders skipped)
 		require.NoError(t, err)
@@ -1034,7 +920,7 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, largeBatchSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, largeBatchSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
@@ -1077,13 +963,55 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, boundarySettings, mockStore, block, 15, chainBlockIDsMap, false)
+		err := updateTxMinedStatus(ctx, logger, boundarySettings, mockStore, block, 15, chainBlockIDsMap, true, false)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)
 	})
 
-	t.Run("should handle retry with context deadline exceeded", func(t *testing.T) {
+	t.Run("should continue processing all transactions even when SetMinedMulti errors occur", func(t *testing.T) {
+		mockStore := &utxo.MockUtxostore{}
+
+		// Create block with multiple transactions
+		tx1 := newTx(1)
+		tx2 := newTx(2)
+		tx3 := newTx(3)
+
+		block := &Block{}
+		block.Height = 100
+		block.Subtrees = []*chainhash.Hash{tx1.TxIDChainHash()}
+		block.SubtreeSlices = []*subtree.Subtree{
+			{
+				Nodes: []subtree.SubtreeNode{
+					{Hash: *tx1.TxIDChainHash()},
+					{Hash: *tx2.TxIDChainHash()},
+					{Hash: *tx3.TxIDChainHash()},
+				},
+			},
+		}
+
+		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
+
+		// Mock SetMinedMulti to return an error - simulating a timeout or storage error
+		// The new behavior should log this error but continue processing
+		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
+			Return(emptyBlockIDsMap, errors.NewNetworkTimeoutError("timeout error")).Once()
+
+		chainBlockIDsMap := map[uint32]bool{}
+
+		// Call with unsetMined=false (valid block) - errors should be returned
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, false)
+
+		// Should return error for valid blocks when SetMinedMulti fails
+		require.Error(t, err)
+		// Error message should be generic, not containing the original "timeout error" string
+		assert.Contains(t, err.Error(), "failed to set mined status for")
+		assert.Contains(t, err.Error(), "1 batches") // 1 batch failed
+
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("should not return error for invalid blocks when SetMinedMulti errors occur", func(t *testing.T) {
 		mockStore := &utxo.MockUtxostore{}
 
 		testTx := newTx(100)
@@ -1098,24 +1026,20 @@ func Test_updateTxMinedStatus_EdgeCases(t *testing.T) {
 			},
 		}
 
-		// Create context with very short timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		defer cancel()
-
-		// Mock SetMinedMulti to fail multiple times
 		emptyBlockIDsMap := map[chainhash.Hash][]uint32{}
+
+		// Mock SetMinedMulti to return an error
 		mockStore.On("SetMinedMulti", mock.Anything, mock.Anything, mock.Anything).
-			Return(emptyBlockIDsMap, errors.NewNetworkTimeoutError("timeout error")).Maybe()
+			Return(emptyBlockIDsMap, errors.NewStorageError("storage error")).Once()
 
 		chainBlockIDsMap := map[uint32]bool{}
 
-		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, false)
+		// Call with unsetMined=true (invalid block) - errors should be logged but not returned
+		err := updateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, chainBlockIDsMap, true, true)
 
-		require.Error(t, err)
-		assert.True(t,
-			strings.Contains(err.Error(), "context canceled") ||
-				strings.Contains(err.Error(), "context deadline exceeded") ||
-				strings.Contains(err.Error(), "timeout error"),
-			"Should handle context timeout appropriately")
+		// Should NOT return error for invalid blocks - errors are logged only
+		require.NoError(t, err)
+
+		mockStore.AssertExpectations(t)
 	})
 }

@@ -9,20 +9,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/subtreevalidation/subtreevalidation_api"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/blob/memory"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
-	"github.com/bitcoin-sv/teranode/util/test"
-	"github.com/bitcoin-sv/teranode/util/testutil"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/testutil"
 	"github.com/ordishs/go-utils/expiringmap"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/mock"
@@ -40,7 +40,6 @@ func setupMemoryKafkaConsumer(t *testing.T, topic string) kafka.KafkaConsumerGro
 		BrokersURL:      []string{"localhost:9092"},
 		Topic:           topic,
 		ConsumerGroupID: "test-group",
-		ConsumerCount:   1,
 		Logger:          ulogger.TestLogger{},
 	}
 
@@ -65,7 +64,7 @@ func setupMemoryKafkaProducer(t *testing.T, topic string) kafka.KafkaAsyncProduc
 		Logger:         ulogger.TestLogger{},
 	}
 
-	producer, err := kafka.NewKafkaAsyncProducer(ulogger.TestLogger{}, cfg, nil)
+	producer, err := kafka.NewKafkaAsyncProducer(ulogger.TestLogger{}, cfg)
 	require.NoError(t, err)
 
 	return producer

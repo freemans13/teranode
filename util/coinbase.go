@@ -5,9 +5,9 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 const (

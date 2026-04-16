@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/daemon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -95,13 +95,13 @@ func TestShouldHandleFreeze(t *testing.T) {
 	block102, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 102)
 	require.NoError(t, err)
 
-	err = block102.GetAndValidateSubtrees(td.Ctx, td.Logger, td.SubtreeStore)
+	err = block102.GetAndValidateSubtrees(td.Ctx, td.Logger, td.SubtreeStore, td.Settings.Block.GetAndValidateSubtreesConcurrency)
 	require.NoError(t, err)
 
 	err = block102.CheckMerkleRoot(td.Ctx)
 	require.NoError(t, err)
 
-	subtree, err := block102.GetSubtrees(td.Ctx, td.Logger, td.SubtreeStore)
+	subtree, err := block102.GetSubtrees(td.Ctx, td.Logger, td.SubtreeStore, td.Settings.Block.GetAndValidateSubtreesConcurrency)
 	require.NoError(t, err)
 
 	blFound := false

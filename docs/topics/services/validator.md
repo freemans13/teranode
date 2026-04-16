@@ -8,6 +8,7 @@
     - [2.2. Receiving Transaction Validation Requests](#22-receiving-transaction-validation-requests)
     - [2.3. Validating the Transaction](#23-validating-the-transaction)
     - [2.3.1. Consensus Rules vs Policy Checks](#231-consensus-rules-vs-policy-checks)
+    - [2.3.2. Transaction Format Extension](#232-transaction-format-extension)
     - [2.4. Script Verification](#24-script-verification)
     - [2.5. Error Handling and Transaction Rejection](#25-error-handling-and-transaction-rejection)
     - [2.6. Concurrent Processing](#26-concurrent-processing)
@@ -18,7 +19,7 @@
 5. [Technology](#5-technology)
 6. [Directory Structure and Main Files](#6-directory-structure-and-main-files)
 7. [How to run](#7-how-to-run)
-8. [Configuration options (settings flags)](#8-configuration-options-settings-flags)
+8. [Configuration](#8-configuration)
 9. [Other Resources](#9-other-resources)
 
 ## 1. Description
@@ -30,9 +31,9 @@ The `Validator` (also called `Transaction Validator` or `Tx Validator`) is a go 
 3. Persisting the data into the utxo store,
 4. Propagating the transactions to other services based on validation results:
 
-   - **Block Assembly service**: Direct gRPC calls for validated transactions (if the Tx is passed)
-   - **Subtree Validation service**: Kafka topic for transaction metadata (if the Tx is passed)
-   - **P2P service**: Kafka topic for rejected transaction notifications (if the tx is rejected)
+    - **Block Assembly service**: Direct gRPC calls for validated transactions (if the Tx is passed)
+    - **Subtree Validation service**: Kafka topic for transaction metadata (if the Tx is passed)
+    - **P2P service**: Kafka topic for rejected transaction notifications (if the tx is rejected)
 
 ### 1.1 Deployment Models
 
@@ -67,6 +68,12 @@ The Validator receives notifications about new Txs.
 Also, the `Validator` will accept subscriptions from the P2P Service, where rejected tx notifications are pushed to.
 
 ![Tx_Validator_Component_Diagram.png](img/Tx_Validator_Component_Diagram.png)
+
+### Detailed Component Diagram
+
+The detailed component diagram below shows the internal architecture of the Validator Service:
+
+![Validator_Component](img/plantuml/validator/Validator_Component.svg)
 
 The Validator notifies the Block Assembly service of new transactions through gRPC calls via the Block Assembly client interface.
 
@@ -103,11 +110,13 @@ The Kafka integration provides resilience, allowing the system to handle tempora
 The Validator uses different communication patterns depending on the target service and use case:
 
 **Outbound Communications (Validator → Other Services):**
+
 - **Block Assembly**: gRPC calls via `blockassembly.ClientI` interface - used for real-time transaction forwarding to mining candidates
 - **Subtree Validation**: Kafka producer via `txmetaKafkaProducerClient` - used for transaction metadata publishing
 - **P2P Service**: Kafka producer via `rejectedTxKafkaProducerClient` - used for rejected transaction notifications
 
 **Inbound Communications (Other Services → Validator):**
+
 - **Propagation Service**: Direct method calls (local validator) or gRPC calls (remote validator)
 - **Subtree Validation Service**: Direct method calls (local validator) or gRPC calls (remote validator)
 - **Kafka Consumers**: Kafka messages via `consumerClient` - used for asynchronous validation requests
@@ -284,7 +293,7 @@ The above represents an implementation of the core Teranode validation rules:
 
     - <500000000 and smaller than block height, or >=500000000 and SMALLER THAN TIMESTAMP
 
-    - Note: This means that Teranode will deem non-final transactions invalid and REJECT these transactions. It is up to the user to create proper non-final transactions to ensure that Teranode is aware of them. For clarity, if a transaction has a locktime in the future, the Tx Validator will reject it.
+        - Note: This means that Teranode will deem non-final transactions invalid and REJECT these transactions. It is up to the user to create proper non-final transactions to ensure that Teranode is aware of them. For clarity, if a transaction has a locktime in the future, the Tx Validator will reject it.
 
     - No output must be Pay-to-Script-Hash (P2SH)
 
@@ -296,7 +305,7 @@ The above represents an implementation of the core Teranode validation rules:
 
     - A node must not be able to spend a confiscated (re-assigned) transaction until 1,000 blocks after the transaction was re-assigned (confiscation maturity). The difference between block height and height at which the transaction was re-assigned must not be less than one thousand.
 
-#### 2.3.1. Consensus Rules vs Policy Checks
+### 2.3.1. Consensus Rules vs Policy Checks
 
 In Bitcoin transaction validation, there are two distinct types of rules:
 
@@ -316,7 +325,7 @@ In Bitcoin transaction validation, there are two distinct types of rules:
 
 The TX Validator implements both types of rules, but provides the ability to skip policy checks when appropriate through the `SkipPolicyChecks` option.
 
-##### Skip Policy Checks Feature
+#### Skip Policy Checks Feature
 
 The `SkipPolicyChecks` feature allows Teranode to validate transactions while bypassing certain policy-based validations. When enabled, the validator will:
 
@@ -342,13 +351,95 @@ if !validationOptions.SkipPolicyChecks {
 
 When validating transactions from blocks mined by other nodes, policy checks should be skipped because these blocks are already valid due to proof-of-work, and the transactions must be accepted to maintain consensus, even if they don't meet local policy preferences.
 
-##### Skip Policy Checks - Usage
+#### Skip Policy Checks - Usage
 
 To use this feature:
 
 - When directly calling the validator: Use the `WithSkipPolicyChecks(true)` option
 - When using the gRPC API endpoint: Set the `skip_policy_checks` field to `true` in the `ValidateTransactionRequest` message
 - In services like Subtree Validation: The option is applied automatically when validating block transactions
+
+### 2.3.2. Transaction Format Extension
+
+The Validator Service automatically handles transaction format conversion during the validation pipeline, enabling support for both standard Bitcoin format and Extended Format (BIP-239) transactions.
+
+#### Extension Process
+
+When a transaction arrives in standard Bitcoin format (non-extended), the validator automatically extends it before validation:
+
+1. **Detection**: The validator checks `tx.IsExtended()` before validation begins
+2. **Parent Lookup**: Queries the UTXO store for all parent transactions referenced by the transaction's inputs
+3. **Input Decoration**: For each input, the system retrieves and adds:
+
+   ```go
+   tx.Inputs[idx].PreviousTxSatoshis = parentTx.Outputs[vout].Satoshis
+   tx.Inputs[idx].PreviousTxScript = parentTx.Outputs[vout].LockingScript
+   ```
+
+4. **In-Memory Extension**: Transaction is marked as extended (not persisted to storage)
+5. **Validation**: Proceeds with full validation using the extended data
+
+This extension process occurs transparently at multiple checkpoints in the validation pipeline:
+
+- `Validator.Validate()` in `services/validator/Validator.go` - Initial format check before validation
+- `Validator.validateConsensusRules()` in `services/validator/Validator.go` - Before consensus rule checks
+- `Validator.validateScripts()` in `services/validator/Validator.go` - Before script validation
+
+#### Implementation Details
+
+**Key Functions:**
+
+- `getTransactionInputBlockHeightsAndExtendTx()` - Orchestrates the extension process, fetching parent data and decorating inputs
+- `getUtxoBlockHeightsAndExtendTx()` - Retrieves block heights and extends transactions in parallel
+- `PreviousOutputsDecorate()` - UTXO store method that decorates transaction inputs with previous output data
+- `extendTransaction()` - Wrapper function for the extension logic
+
+**Performance Optimization:**
+
+- **Parallel batch queries**: Parent transactions are looked up concurrently using Go's errgroup pattern
+- **Configurable batching**: UTXO store queries are batched based on `UtxoStore.GetBatcherSize` setting
+- **Idempotent operation**: Already-decorated inputs are skipped automatically
+- **In-memory only**: Extension happens entirely in memory with no disk I/O overhead
+- **Sub-millisecond lookups**: Highly optimized UTXO store (Aerospike/SQL) combined with txmeta cache provides extremely fast parent transaction retrieval
+
+**Code Example:**
+
+```go
+// From Validator.Validate() method
+if !tx.IsExtended() {
+    // Get block heights and extend the transaction
+    if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID); err != nil {
+        return nil, errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
+    }
+}
+```
+
+#### Error Handling
+
+If parent transactions cannot be found during the extension process:
+
+- Returns `ErrTxMissingParent` error to the client
+- Transaction validation fails gracefully
+- Provides clear error message indicating which parent transaction is missing
+- Client can retry after ensuring parent transactions are validated/confirmed
+
+**Common scenarios requiring parent transactions:**
+
+- **Child-pays-for-parent (CPFP)**: Transaction chains where child hasn't been validated yet
+- **Concurrent submissions**: Parent and child transactions submitted simultaneously
+- **Block validation**: Transactions referencing outputs from the same block being processed
+
+#### Format Flexibility Benefits
+
+This automatic extension mechanism provides several advantages:
+
+1. **Backward Compatibility**: Existing Bitcoin wallets work without modification
+2. **No Client Changes Required**: Wallets can continue using standard Bitcoin transaction format
+3. **Optimized When Available**: Extended format transactions skip the lookup step for faster processing
+4. **Transparent Operation**: Format handling is invisible to the client
+5. **Storage Efficiency**: All transactions stored in non-extended format regardless of ingress format
+
+For more details on transaction format handling across the system, see the [Transaction Data Model documentation](../datamodel/transaction_data_model.md).
 
 ### 2.4. Script Verification
 
@@ -544,9 +635,9 @@ The Validator, when run as a service, uses gRPC for communication between nodes.
 
 ## 4. Data Model
 
-The Validation Service deals with the extended transaction format, as seen below:
+The Validation Service processes transactions in multiple formats:
 
-- [Extended Transaction Data Model](../datamodel/transaction_data_model.md): Include additional metadata to facilitate processing.
+- [Transaction Data Model](../datamodel/transaction_data_model.md): Comprehensive documentation covering both standard Bitcoin format and Extended Format (BIP-239), including automatic format conversion and storage strategies.
 
 ## 5. Technology
 
@@ -604,171 +695,9 @@ SETTINGS_CONTEXT=dev.[YOUR_USERNAME] go run -Validator=1
 
 Please refer to the [Locally Running Services Documentation](../../howto/locallyRunningServices.md) document for more information on running the Validator locally.
 
-## 8. Configuration options (settings flags)
+## 8. Configuration
 
-The TX Validator service relies on a set of configuration settings that control its behavior, performance, and integration with other services. This section provides a comprehensive overview of these settings, organized by functional category, along with their impacts, dependencies, and recommended configurations for different deployment scenarios.
-
-### 8.1 Configuration Categories
-
-TX Validator service settings can be organized into the following functional categories:
-
-1. **Deployment Architecture**: Settings that determine how the validator is deployed and integrated
-2. **Network & Communication**: Settings that control network binding and API endpoints
-3. **Performance & Throughput**: Settings that affect transaction processing performance
-4. **Kafka Integration**: Settings for message-based communication
-5. **Validation Rules**: Settings that control transaction validation policies
-6. **Monitoring & Debugging**: Settings for observability and troubleshooting
-
-### 8.2 Deployment Architecture Settings
-
-These settings fundamentally change how the validator operates within the system architecture.
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `useLocalValidator` | bool | `false` | Controls whether validation is performed locally or via remote service | Significantly affects system architecture, latency, and deployment model |
-
-#### Deployment Architecture Interactions and Dependencies
-
-The `useLocalValidator` setting has profound implications for system architecture:
-
-- When `true`, the validator is instantiated directly within other services (Propagation, Subtree Validation, Legacy), eliminating network overhead but requiring these services to be compiled with the validator
-- When `false`, the validator runs as an independent service with a gRPC interface that other services connect to remotely
-
-This choice creates two distinct deployment architectures:
-
-**Local Validator Architecture:**
-
-- Services contain embedded validator instances
-- No network calls between services and validator
-- Lower latency and higher throughput
-- All services must be redeployed when validator code changes
-- Limited deployment flexibility
-
-**Remote Validator Architecture:**
-
-- Validator runs as a standalone service
-- Network calls between services and validator
-- Higher latency but more flexible deployment
-- Validator can be scaled independently
-- Supports independent deployment and updates
-
-### 8.3 Network & Communication Settings
-
-These settings control how the validator communicates over the network.
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `validator_grpcAddress` | string | `"localhost:8081"` | Address for connecting to the validator gRPC service | Determines how other services connect to the validator |
-| `validator_grpcListenAddress` | string | `":8081"` | Address on which the validator gRPC server listens | Controls network binding for incoming validation requests |
-| `validator_httpListenAddress` | string | `""` | Address on which the HTTP API server listens | Enables HTTP-based validation requests when set |
-| `validator_httpAddress` | *url.URL | `nil` | URL for connecting to the validator HTTP API | Determines how other services connect to the HTTP interface |
-| `validator_httpRateLimit` | int | `1024` | Maximum number of HTTP requests per second | Prevents resource exhaustion from excessive requests |
-| `grpc_resolver` | string | `""` | Determines the gRPC resolver to use | Enables service discovery in Kubernetes environments |
-
-#### Network & Communication Interactions and Dependencies
-
-The validator offers two API interfaces for transaction validation:
-
-**gRPC Interface**:
-
-- Primary interface for high-performance validation requests
-- Used by Propagation and Subtree Validation services
-- Always enabled when running in remote validator mode
-- Configured through `validator_grpcAddress` and `validator_grpcListenAddress`
-
-**HTTP Interface**:
-
-- Optional secondary interface for REST-based validation requests
-- Only enabled when `validator_httpListenAddress` is set
-- Provides a simpler interface for testing and third-party integrations
-- Protected by rate limiting through `validator_httpRateLimit`
-
-In Kubernetes environments, the `grpc_resolver` setting enables service discovery to locate validator instances dynamically.
-
-### 8.4 Performance & Throughput Settings
-
-These settings control how efficiently transactions are processed.
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `validator_sendBatchSize` | int | `100` | Number of transactions to accumulate before batch processing | Balances throughput against latency for transaction processing |
-| `validator_sendBatchTimeout` | int | `2` | Maximum time (seconds) to wait before processing a partial batch | Ensures timely processing of transactions even when volume is low |
-| `validator_sendBatchWorkers` | int | `10` | Number of worker goroutines for batch send operations | Controls parallelism for outbound transaction processing |
-| `validator_blockvalidation_delay` | int | `0` | Artificial delay (milliseconds) introduced before block validation | Can be used for testing or throttling validation operations |
-| `validator_blockvalidation_maxRetries` | int | `5` | Maximum number of retries for failed block validations | Affects resilience against transient failures |
-| `validator_blockvalidation_retrySleep` | string | `"2s"` | Time to wait between block validation retry attempts | Controls backoff strategy for failed validations |
-
-#### Performance & Throughput Interactions and Dependencies
-
-The batch processing settings work together to optimize transaction throughput:
-
-- Batching improves performance by amortizing overhead across multiple transactions
-- The validator accumulates up to `validator_sendBatchSize` transactions before processing them as a batch
-- If fewer transactions arrive, a partial batch is processed after `validator_sendBatchTimeout` seconds
-- Multiple worker goroutines (`validator_sendBatchWorkers`) process batches in parallel
-
-This creates a balance between throughput (larger batches) and latency (timely processing).
-
-The block validation retry settings (`validator_blockvalidation_maxRetries` and `validator_blockvalidation_retrySleep`) control resilience by determining how aggressively the system retries failed operations.
-
-### 8.5 Kafka Integration Settings
-
-These settings control message-based communication via Kafka.
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `validator_kafkaWorkers` | int | `0` | Number of worker goroutines for Kafka message processing | Affects concurrency and throughput for Kafka-based transaction handling |
-| `kafka_validatortxsConfig` | URL | `""` | URL for the Kafka configuration for validator transactions | Configures how transactions are published to Kafka |
-| `kafka_txmetaConfig` | URL | `""` | URL for the Kafka configuration for transaction metadata | Configures how transaction metadata is published to Kafka |
-| `kafka_rejectedTxConfig` | URL | `""` | URL for the Kafka configuration for rejected transactions | Configures how rejected transaction information is published to Kafka |
-| `validator_kafka_maxMessageBytes` | int | `1048576` | Maximum size of Kafka messages in bytes | Limits the size of transactions that can be processed via Kafka |
-
-#### Kafka Integration Interactions and Dependencies
-
-Kafka integration provides asynchronous communication between the validator and other services:
-
-- Successful validations produce messages to `kafka_txmetaConfig` for Block Assembly
-- Rejected transactions produce messages to `kafka_rejectedTxConfig` for P2P notification
-- `validator_kafka_maxMessageBytes` must be coordinated with Kafka broker's `message.max.bytes`
-- When `validator_kafkaWorkers` is 0, the system auto-calculates based on available CPUs
-
-These Kafka channels complement the synchronous gRPC and HTTP APIs, providing an event-driven architecture for transaction propagation.
-
-### 8.6 Validation Rules Settings
-
-These settings control the rules and policies applied during transaction validation.
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `maxtxsizepolicy` | int | Varies | Maximum allowed transaction size in bytes | Restricts oversized transactions from entering the mempool |
-| `minminingtxfee` | int64 | Varies | Minimum fee required for transaction acceptance | Sets economic barrier for transaction inclusion |
-| `validator_scriptVerificationLibrary` | string | `"VerificatorGoBT"` | Library used for Bitcoin script verification | Determines script validation implementation |
-
-#### Validation Rules Interactions and Dependencies
-
-Validation rules determine which transactions are accepted:
-
-- The `maxtxsizepolicy` setting rejects transactions exceeding the size limit
-- The `minminingtxfee` setting enforces minimum fee requirements
-- The script verification library (`validator_scriptVerificationLibrary`) determines how transaction scripts are validated
-
-These settings directly impact consensus and policy enforcement, ensuring that only valid transactions are propagated and included in blocks.
-
-### 8.7 Monitoring & Debugging Settings
-
-These settings control observability and diagnostics.
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `validator_verbose_debug` | bool | `false` | Enables detailed debug logging for validator operations | Provides additional diagnostic information at the cost of log verbosity |
-| `fsm_state_restore` | bool | `false` | Controls whether the service restores from a previously saved state | Affects recovery behavior after restarts or failures |
-
-#### Monitoring & Debugging Interactions and Dependencies
-
-These settings help with troubleshooting and observability:
-
-- `validator_verbose_debug` increases log verbosity, useful for diagnosing issues but increases log volume
-- `fsm_state_restore` enables recovering from previous state after restart, important for maintaining continuity
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [Validator Settings Reference](../../references/settings/services/validator_settings.md).
 
 ## 9. Other Resources
 

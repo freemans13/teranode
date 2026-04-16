@@ -22,15 +22,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 )
@@ -576,7 +576,7 @@ func (t *TxMetaCache) SetMinedMultiParallel(ctx context.Context, hashes []*chain
 	return nil
 }
 
-func (t *TxMetaCache) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+func (t *TxMetaCache) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return nil, errors.NewProcessingError("not implemented")
 }
 
@@ -876,6 +876,8 @@ func (t *TxMetaCache) ReAssignUTXO(ctx context.Context, utxo *utxo.Spend, newUtx
 	return t.Delete(ctx, utxo.TxID)
 }
 
+// GetCounterConflicting retrieves a list of transactions that are in conflict with the specified transaction.
+// This method delegates directly to the underlying UTXO store without caching.
 func (t *TxMetaCache) GetCounterConflicting(ctx context.Context, txHash chainhash.Hash) ([]chainhash.Hash, error) {
 	return t.utxoStore.GetCounterConflicting(ctx, txHash)
 }
@@ -921,6 +923,20 @@ func (t *TxMetaCache) SetConflicting(ctx context.Context, txHashes []chainhash.H
 // Returns:
 // - Error if the operation fails (currently always returns nil)
 func (t *TxMetaCache) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
+	return nil
+}
+
+// MarkTransactionsOnLongestChain marks transactions as being on the longest chain or not.
+// This is a stub implementation that currently does nothing.
+//
+// Parameters:
+// - ctx: Context for the operation
+// - txHashes: Array of transaction hashes to mark as on/not on longest chain
+// - onLongestChain: Whether transactions are on the longest chain
+//
+// Returns:
+// - Error if the operation fails (currently always returns nil)
+func (t *TxMetaCache) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	return nil
 }
 

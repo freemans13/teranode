@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,14 +22,14 @@ func TestReportInvalidBlock(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create a mock P2P node with the test peer ID
-	mockNode := &MockServerP2PNode{peerID: testPeerID}
+	mockNode := &MockServerP2PClient{peerID: testPeerID}
 
 	// Create test server with minimal required fields
 	server := &Server{
 		blockPeerMap:   sync.Map{},
 		logger:         ulogger.TestLogger{},
 		notificationCh: make(chan *notificationMsg, 10),
-		P2PNode:        mockNode,
+		P2PClient:      mockNode,
 	}
 
 	// Initialize ban manager with test handler

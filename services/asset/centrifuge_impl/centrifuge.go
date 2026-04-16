@@ -1,6 +1,4 @@
-// Package centrifuge_impl provides a Centrifuge server implementation for broadcasting
-// real-time blockchain events. It handles WebSocket connections, P2P communication,
-// and manages subscriptions for blockchain data updates.
+// Package centrifuge_impl provides real-time blockchain event broadcasting via WebSocket connections.
 package centrifuge_impl
 
 import (
@@ -13,16 +11,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/asset/asset_api"
-	"github.com/bitcoin-sv/teranode/services/asset/httpimpl"
-	"github.com/bitcoin-sv/teranode/services/asset/repository"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/asset/asset_api"
+	"github.com/bsv-blockchain/teranode/services/asset/httpimpl"
+	"github.com/bsv-blockchain/teranode/services/asset/repository"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/centrifugal/centrifuge"
 	"github.com/gorilla/websocket"
 )
@@ -33,8 +31,7 @@ const (
 	AccessControlAllowCredentials = "Access-Control-Allow-Credentials"
 )
 
-// Centrifuge represents a Centrifuge server instance that manages real-time
-// blockchain data broadcasting and client connections.
+// Centrifuge manages real-time blockchain data broadcasting to WebSocket clients.
 type Centrifuge struct {
 	logger                  ulogger.Logger
 	settings                *settings.Settings

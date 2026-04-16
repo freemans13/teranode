@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 func TestNewTestLogger(t *testing.T) {

@@ -41,6 +41,13 @@ The Block Persister files are optionally post-processed by the UTXO Persister, w
 
 - The Blockchain client is directly accessed to wait for the node State Management to change to `RUNNING` state before beginning block processing operations. For more information on this, please refer to the [State Management](../architecture/stateManagement.md) documentation.
 
+### Detailed Component View
+
+The following diagram provides a deeper level of detail into the Block Persister Service's internal components and their interactions:
+
+![block_persister_detailed_component.svg](img/plantuml/blockpersister/block_persister_detailed_component.svg)
+
+
 ## 2. Functionality
 
 ### 2.1 Service Initialization
@@ -225,147 +232,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 
 ## 7. Configuration options (settings flags)
 
-The Block Persister service configuration is organized into several categories that control different aspects of the service's behavior. All settings can be provided via environment variables or configuration files.
-
-### Storage Configuration
-
-#### State Management
-
-- **State File (`blockpersister_stateFile`)**
-    - Type: `string`
-    - Default Value: `"file://./data/blockpersister_state.txt"`
-    - Purpose: Maintains the persister's processing state (last persisted block height and hash)
-    - Format: Supports both local file paths (`file://./path`) and remote storage URLs
-    - Impact: Critical for recovery after service restart and maintaining processing continuity
-    - Recovery Implications: If this file is lost, the service will need to reprocess blocks from the beginning
-
-#### Block Storage
-
-- **Block Store URL (`blockstore`)**
-    - Type: `*url.URL`
-    - Default Value: `"file://./data/blockstore"`
-    - Purpose: Defines where block data files are stored
-    - Supported Formats:
-
-        - S3: `s3://bucket-name/prefix`
-        - Local filesystem: `file://./path/to/dir`
-
-    - Impact: Determines the persistence mechanism and reliability characteristics
-
-- **HTTP Listen Address (`blockPersister_httpListenAddress`)**
-    - Type: `string`
-    - Default Value: `":8083"`
-    - Purpose: Controls the network interface and port for the HTTP server that serves block data
-    - Usage: If empty, no HTTP server is started; when configured, enables external access to blob store
-    - Security Consideration: In production environments, should be configured based on network security requirements
-
-### Processing Configuration
-
-#### Block Selection and Timing
-
-- **Persist Age (`blockpersister_persistAge`)**
-    - Type: `uint32`
-    - Default Value: `100`
-    - Purpose: Determines how many blocks behind the tip the persister stays
-    - Impact: Critical for avoiding reorgs by ensuring blocks are sufficiently confirmed
-    - Example: If set to 100, only blocks that are at least 100 blocks deep are processed
-    - Tuning Advice:
-
-        - Lower values: More immediate processing but higher risk of reprocessing due to reorgs
-        - Higher values: More conservative approach with minimal reorg risk
-
-- **Persist Sleep (`blockPersister_persistSleep`)**
-    - Type: `time.Duration`
-    - Default Value: `1 minute`
-    - Purpose: Sleep duration between polling attempts when no blocks are available to process
-    - Impact: Controls polling frequency and system load during idle periods
-    - Tuning Advice:
-
-        - Shorter durations: More responsive but higher CPU usage
-        - Longer durations: More resource-efficient but less responsive
-
-#### Performance Tuning
-
-- **Processing Concurrency (`blockpersister_concurrency`)**
-    - Type: `int`
-    - Default Value: `8`
-    - Purpose: Controls the number of concurrent goroutines for processing subtrees
-    - Impact: Directly affects CPU utilization, memory usage, and throughput
-    - Tuning Advice:
-
-        - Optimal value typically depends on available CPU cores
-        - For systems with 8+ cores, the default value is usually appropriate
-        - For high-performance systems, consider increasing to match available cores
-
-- **Batch Missing Transactions (`blockpersister_batchMissingTransactions`)**
-    - Type: `bool`
-    - Default Value: `true`
-    - Purpose: Controls whether transactions are fetched in batches from the store
-    - Impact: Can significantly improve performance by reducing the number of individual queries
-    - Tuning Advice: Generally should be kept enabled unless encountering specific issues
-
-- **Process TxMeta Using Store Batch Size (`blockvalidation_processTxMetaUsingStore_BatchSize`)**
-    - Type: `int`
-    - Default Value: `1024`
-    - Purpose: Controls the batch size when processing transaction metadata from the store
-    - Impact: Affects performance and memory usage when fetching transaction data
-    - Tuning Advice: Higher values improve throughput at the cost of increased memory usage
-
-#### UTXO Management
-
-- **Skip UTXO Delete (`blockpersister_skipUTXODelete`)**
-    - Type: `bool`
-    - Default Value: `false`
-    - Purpose: Controls whether UTXO deletions are skipped during processing
-    - Impact: When enabled, improves performance but affects UTXO set completeness
-    - Usage Scenarios:
-
-        - Enable during initial sync or recovery to improve performance
-        - Disable for normal operation to maintain complete UTXO tracking
-
-- **UTXO Store URL (`txmeta_store`)**
-    - Type: `*url.URL`
-    - Default Value: `""` (empty)
-    - Purpose: UTXO store URL for transaction metadata access
-    - Impact: Provides transaction metadata storage for UTXO processing operations
-    - Usage: Required when UTXO processing features are enabled
-
-- **UTXO Persister Buffer Size (`utxoPersister_buffer_size`)**
-    - Type: `string`
-    - Default Value: `"4KB"`
-    - Purpose: Buffer size for UTXO persister operations
-    - Impact: Controls memory allocation for UTXO processing operations
-    - Supported Formats: Standard size units (KB, MB, GB)
-
-- **UTXO Persister Direct Mode (`direct`)**
-    - Type: `bool`
-    - Default Value: `true`
-    - Purpose: Enable direct UTXO persister mode (bypasses intermediate buffering)
-    - Impact: Controls UTXO processing mode for performance optimization
-    - Tuning Advice:
-
-        - Direct mode: Better performance for most scenarios
-        - Buffered mode: May be useful for specific memory-constrained environments
-
-### Configuration Interactions and Dependencies
-
-#### Block Processing Pipeline
-
-The Block Persister's processing behavior is controlled by multiple interacting settings:
-
-1. **Block Discovery and Selection**
-    - `BlockPersisterPersistAge` determines which blocks are eligible for processing
-    - The service checks the blockchain tip and calculates which blocks to process based on this setting
-
-2. **Processing Performance**
-    - `BlockPersisterConcurrency` controls parallelism during subtree processing
-    - `BatchMissingTransactions` and `ProcessTxMetaUsingStoreBatchSize` affect how transaction data is fetched
-    - Together, these settings determine overall throughput and resource utilization
-
-3. **Wait Behavior**
-    - `BlockPersisterPersistSleep` controls polling frequency when no blocks are available
-    - On errors, the service applies a fixed 1-minute backoff regardless of this setting
-
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Persister Settings Reference](../../references/settings/services/blockpersister_settings.md).
 ## 8. Other Resources
 
 [Block Persister Reference](../../references/services/blockpersister_reference.md)

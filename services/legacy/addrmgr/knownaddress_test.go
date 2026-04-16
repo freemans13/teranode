@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/addrmgr"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/addrmgr"
 )
 
 func TestChance(t *testing.T) {

@@ -4,11 +4,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -57,9 +57,6 @@ func TestTryQuickValidation(t *testing.T) {
 		defer suite.Cleanup()
 
 		ctx := context.Background()
-
-		// Mock GetNextBlockID to trigger quickValidateBlock but make it fail
-		suite.MockBlockchain.On("GetNextBlockID", mock.Anything).Return(uint64(1), nil).Once()
 
 		// Create a test block with subtrees
 		subtreeHash1, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
@@ -129,9 +126,6 @@ func TestTryQuickValidation(t *testing.T) {
 		defer suite.Cleanup()
 
 		ctx := context.Background()
-
-		// Mock GetNextBlockID to trigger quickValidateBlock but make it fail
-		suite.MockBlockchain.On("GetNextBlockID", mock.Anything).Return(uint64(1), nil).Once()
 
 		// Create a test block with subtrees that don't exist in store
 		subtreeHash, _ := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")

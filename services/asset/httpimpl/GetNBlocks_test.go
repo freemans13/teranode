@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -95,7 +95,7 @@ func TestGetNBlocks(t *testing.T) {
 		assert.Len(t, responseBytes, 229)
 
 		// read the response bytes into a block
-		block, err := model.NewBlockFromBytes(responseBytes, nil)
+		block, err := model.NewBlockFromBytes(responseBytes)
 		require.NoError(t, err)
 
 		// Check response fields
@@ -138,7 +138,7 @@ func TestGetNBlocks(t *testing.T) {
 		responseBytes, err := hex.DecodeString(responseHex)
 		require.NoError(t, err)
 
-		block, err := model.NewBlockFromBytes(responseBytes, nil)
+		block, err := model.NewBlockFromBytes(responseBytes)
 		require.NoError(t, err)
 
 		// Check response fields
@@ -186,7 +186,7 @@ func TestGetNBlocks(t *testing.T) {
 
 		for i := 0; i < 3; i++ {
 			// read the blocks sequentially from the reader
-			block, err := model.NewBlockFromReader(reader, nil)
+			block, err := model.NewBlockFromReader(reader)
 			require.NoError(t, err)
 
 			// Check response fields

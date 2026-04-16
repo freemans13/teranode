@@ -18,11 +18,11 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetBlocksSubtreesNotSet retrieves blocks whose subtrees have not been properly processed.
@@ -175,6 +175,7 @@ func (s *SQL) getBlocksWithQuery(ctx context.Context, q string) ([]*model.Block,
 
 		block.TransactionCount = transactionCount
 		block.SizeInBytes = sizeInBytes
+		block.Height = height
 
 		if len(coinbaseTx) > 0 {
 			block.CoinbaseTx, err = bt.NewTxFromBytes(coinbaseTx)

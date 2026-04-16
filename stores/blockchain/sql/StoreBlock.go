@@ -14,15 +14,15 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/work"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/work"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/lib/pq"
 	"modernc.org/sqlite"
 )
@@ -145,10 +145,13 @@ func (s *SQL) StoreBlock(ctx context.Context, block *model.Block, peerID string,
 		Invalid:     invalid,
 	}
 
-	ok := s.blocksCache.AddBlockHeader(block.Header, meta)
-	if !ok {
-		if err := s.ResetBlocksCache(ctx); err != nil {
-			s.logger.Errorf("error clearing caches: %v", err)
+	// do not add invalid blocks to the cache
+	if !invalid {
+		ok := s.blocksCache.AddBlockHeader(block.Header, meta)
+		if !ok {
+			if err := s.ResetBlocksCache(ctx); err != nil {
+				s.logger.Errorf("error clearing caches: %v", err)
+			}
 		}
 	}
 

@@ -1,0 +1,149 @@
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam component {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam database {
+  BackgroundColor #f2f2f2
+  BorderColor #999999
+  FontColor black
+  RoundCorner 10
+}
+skinparam shadowing false
+skinparam ArrowColor #666666
+
+@startuml UTXO_Persister_Component
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title UTXO Persister Service - Component Diagram
+
+Container_Boundary(utxo_persister, "UTXO Persister Service") {
+
+Component(notification_handler, "Notification Handler", "Go", "Handles blockchain notifications and triggers")
+
+Component(block_monitor, "Block Monitor", "Go", "Monitors for new block files from Block Persister")
+
+Component(utxo_processor, "UTXO Processor", "Go", "Processes UTXO additions and deletions")
+
+Component(consolidator, "Consolidator", "Go", "Consolidates block ranges for efficient processing")
+
+Component(utxo_set_generator, "UTXO Set Generator", "Go", "Generates complete UTXO set files")
+
+
+
+Component(blockchain_client, "Blockchain Client", "Go gRPC", "Interface to Blockchain service")
+
+Component(blockchain_store_client, "Blockchain Store Client", "Go", "Direct blockchain store access (optional)")
+
+Component(block_store_client, "Block Store Client", "Go", "Interface to shared block storage")
+
+
+
+Component(state_manager, "State Manager", "Go", "Manages processing state persistence")
+
+Component(file_storer, "File Storer", "Go", "Optimized UTXO file storage mechanism")
+
+
+
+Component(metrics_collector, "Metrics Collector", "Prometheus", "Collects UTXO processing metrics")
+
+Component(health_monitor, "Health Monitor", "Go", "Monitors service and dependency health")
+
+}
+
+Container_Boundary(external_services, "External Services") {
+
+Container(blockchain, "Blockchain Service", "Go", "Blockchain state management")
+
+ContainerDb(block_store, "Final Block Store", "Blob Storage (S3)", "Shared blob storage")
+
+ContainerDb(blockchain_store, "Blockchain Store", "Database", "Blockchain data storage")
+
+Container(state_file, "State File", "Filesystem", "Local processing state")
+
+}
+
+Person(admin, "Administrator", "Node operator")
+
+System_Ext(block_persister, "Block Persister Service", "Produces enriched block data")
+
+' Notification and trigger flow
+
+Rel(blockchain, notification_handler, "Block notifications", "gRPC")
+
+Rel(notification_handler, block_monitor, "Trigger processing")
+
+Rel(block_monitor, utxo_processor, "Process new blocks")
+
+' UTXO processing flow
+
+Rel(utxo_processor, consolidator, "Consolidate block ranges")
+
+Rel(consolidator, utxo_set_generator, "Generate UTXO sets")
+
+Rel(utxo_set_generator, file_storer, "Store UTXO set files")
+
+' Data access
+
+Rel(notification_handler, blockchain_client, "Subscribe to notifications")
+
+Rel(consolidator, blockchain_store_client, "Get block headers (optional)")
+
+Rel(consolidator, blockchain_client, "Get block headers")
+
+Rel(block_monitor, block_store_client, "Read block files")
+
+Rel(utxo_processor, block_store_client, "Read UTXO additions/deletions")
+
+Rel(file_storer, block_store_client, "Store UTXO set files")
+
+' State management
+
+Rel(block_monitor, state_manager, "Update processing state")
+
+Rel(state_manager, state_file, "Persist state", "Filesystem")
+
+' External service connections
+
+Rel(blockchain_client, blockchain, "gRPC calls", "gRPC")
+
+Rel(blockchain_store_client, blockchain_store, "Direct access", "Direct")
+
+Rel(block_store_client, block_store, "Blob operations", "Direct")
+
+' Data flow from Block Persister
+
+Rel(block_persister, block_store, "Produces enriched block files", "Direct")
+
+' Administrative monitoring
+
+Rel(admin, metrics_collector, "Monitor UTXO processing metrics", "HTTP")
+
+' Health and monitoring
+
+Rel(health_monitor, blockchain_client, "Health checks")
+
+Rel(health_monitor, block_store_client, "Health checks")
+
+' Metrics collection
+
+Rel(notification_handler, metrics_collector, "Notification metrics")
+
+Rel(utxo_processor, metrics_collector, "Processing metrics")
+
+Rel(consolidator, metrics_collector, "Consolidation metrics")
+
+Rel(utxo_set_generator, metrics_collector, "Generation metrics")
+
+SHOW_LEGEND()
+
+@enduml

@@ -138,15 +138,15 @@ Pull and load the required Teranode images into Minikube:
 
 You can find the latest available version published on GitHub Container Registry:
 
-- <https://github.com/bitcoin-sv/teranode/pkgs/container/teranode>
-- <https://github.com/bitcoin-sv/teranode-operator/pkgs/container/teranode-operator>
+- <https://github.com/bsv-blockchain/teranode/pkgs/container/teranode>
+- <https://github.com/bsv-blockchain/teranode-operator/pkgs/container/teranode-operator>
 
 #### Set Image Versions
 
 ```bash
 # Set image versions (please derive the right TERANODE_VERSION from the results of the previous command)
 export OPERATOR_VERSION=v0.5.5
-export TERANODE_VERSION=v0.9.76
+export TERANODE_VERSION=v0.11.13
 export ECR_REGISTRY=ghcr.io/bsv-blockchain
 ```
 

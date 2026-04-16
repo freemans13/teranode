@@ -33,30 +33,30 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob/memory"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
-	teranode_aerospike "github.com/bitcoin-sv/teranode/stores/utxo/aerospike"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/stores/utxo/nullstore"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/stores/utxo/tests"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
-	"github.com/bitcoin-sv/teranode/util/test"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	aeroTest "github.com/bitcoin-sv/testcontainers-aerospike-go"
 	bt "github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	teranode_aerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -663,6 +663,7 @@ func TestIsFinalb633531280f980108329e3e0b9335b2290892d120916f9e17a9e3033bde1260b
 	require.NoError(t, err)
 }
 
+// txFeeSize represents transaction metadata for block assembly testing.
 type txFeeSize struct {
 	txHash     *chainhash.Hash
 	fee        uint64
@@ -670,6 +671,7 @@ type txFeeSize struct {
 	txInpoints subtree.TxInpoints
 }
 
+// MockBlockAssemblyStore provides a test double for block assembly storage operations.
 type MockBlockAssemblyStore struct {
 	returnError error
 	storedTxs   []txFeeSize
@@ -1053,6 +1055,7 @@ func TestValidator_TwoPhaseCommitTransaction_AlreadySpendable(t *testing.T) {
 	assert.False(t, meta.Locked, "TX should remain spendable after 2-phase commit")
 }
 
+// FailingUtxoStore provides a test double that simulates UTXO store failures.
 type FailingUtxoStore struct {
 	*sql.Store
 }

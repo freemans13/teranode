@@ -22,8 +22,8 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // InvalidateBlock marks a block and all its descendants as invalid in the blockchain.
@@ -58,10 +58,8 @@ import (
 //   - BlockNotFoundError if the specified block doesn't exist in the database
 //   - StorageError for database errors, transaction failures, or if no rows were affected
 //   - ProcessingError for internal processing failures
-func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) ([]chainhash.Hash, error) {
+func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) (invalidatedHashes []chainhash.Hash, err error) {
 	s.logger.Debugf("InvalidateBlock %s", blockHash.String())
-
-	s.blocksCache.RebuildBlockchain(nil, nil) // reset cache so that GetBlockExists goes to the DB
 
 	exists, err := s.GetBlockExists(ctx, blockHash)
 	if err != nil {
@@ -69,7 +67,10 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) ([
 	}
 
 	if !exists {
-		return nil, errors.NewStorageError("block %s does not exist", blockHash.String(), errors.ErrNotFound)
+		// Block doesn't exist - this is not an error, just log it and return success
+		// This makes InvalidateBlock idempotent
+		s.logger.Warnf("InvalidateBlock: block %s does not exist, nothing to invalidate", blockHash.String())
+		return []chainhash.Hash{}, nil
 	}
 
 	// recursively update all children blocks to invalid in 1 query
@@ -82,8 +83,8 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) ([
 			WHERE hash = $1
 			UNION
 			SELECT b.id, b.hash, b.previous_hash
-			FROM blocks b	
-			INNER JOIN children c ON c.hash = b.previous_hash	
+			FROM blocks b
+			INNER JOIN children c ON c.hash = b.previous_hash
 		)
 		UPDATE blocks
 		SET invalid = true, mined_set = false
@@ -92,17 +93,25 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) ([
 	`
 
 	var (
-		rows              *sql.Rows
-		hashBytes         []byte
-		hash              *chainhash.Hash
-		invalidatedHashes []chainhash.Hash
+		rows      *sql.Rows
+		hashBytes []byte
+		hash      *chainhash.Hash
 	)
 
 	if rows, err = s.db.QueryContext(ctx, q, blockHash.CloneBytes()); err != nil {
 		return nil, errors.NewStorageError("error querying blocks to invalidate", err)
 	}
 
-	defer rows.Close()
+	defer func() {
+		err = errors.Join(err, rows.Close())
+
+		s.ResetResponseCache()
+
+		if err = s.ResetBlocksCache(ctx); err != nil {
+			err = errors.Join(err, errors.NewStorageError("error clearing caches", err))
+			return
+		}
+	}()
 
 	for rows.Next() {
 		if err = rows.Scan(&hashBytes); err != nil {
@@ -119,12 +128,6 @@ func (s *SQL) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) ([
 	if len(invalidatedHashes) == 0 {
 		return nil, errors.NewStorageError("no blocks were invalidated", errors.ErrProcessing)
 	}
-
-	if err = s.ResetBlocksCache(ctx); err != nil {
-		return nil, errors.NewStorageError("error clearing caches", err)
-	}
-
-	s.ResetResponseCache()
 
 	return invalidatedHashes, nil
 }

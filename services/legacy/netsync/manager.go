@@ -5,12 +5,10 @@
 package netsync
 
 import (
-	"bufio"
 	"bytes"
 	"container/list"
 	"context"
 	"fmt"
-	"io"
 	"math/rand/v2"
 	"net"
 	"net/url"
@@ -18,27 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	teranodeblockchain "github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation"
-	"github.com/bitcoin-sv/teranode/services/legacy/blockchain"
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
-	peerpkg "github.com/bitcoin-sv/teranode/services/legacy/peer"
-	"github.com/bitcoin-sv/teranode/services/subtreevalidation"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -47,6 +24,26 @@ import (
 	"github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	teranodeblockchain "github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/services/legacy/blockchain"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/go-utils/expiringmap"
 	"google.golang.org/protobuf/proto"
 )
@@ -275,7 +272,6 @@ type SyncManager struct {
 	validationClient  validator.Interface
 	utxoStore         utxostore.Store
 	subtreeStore      blob.Store
-	tempStore         blob.Store
 	subtreeValidation subtreevalidation.Interface
 	blockValidation   blockvalidation.Interface
 	blockAssembly     blockassembly.ClientI
@@ -1731,7 +1727,6 @@ func (sm *SyncManager) blockHandler() {
 
 	// create a block queue to handle block messages in a separate goroutine, in order
 	blockQueue := make(chan *blockQueueMsg, maxBlockQueue)
-	blockDiskWriter := make(chan struct{}, 1) // buffer size 1, allows only one block to be written to disk at a time
 
 	// start the block queue handler
 	go func() {
@@ -1792,68 +1787,15 @@ out:
 				}(msg)
 
 			case *blockMsg:
-				// we process the block message in the background, so we do not block the main loop
-				go func(msg *blockMsg) {
-					// block the disk writer until we are done with the previous block
-					// we must make sure the block is written to disk before continuing
-					blockDiskWriter <- struct{}{}
+				sm.logger.Debugf("[blockHandler][%s] queueing block for validation", msg.block.Hash())
 
-					ctx, _, _ := tracing.Tracer("SyncManager").Start(sm.ctx, "blockHandler",
-						tracing.WithLogMessage(sm.logger, "[blockHandler][%s] processing block message", msg.block.Hash()),
-					)
-
-					var msgBlock *wire.MsgBlock
-					if sm.settings.Legacy.WriteMsgBlocksToDisk {
-						// write the block directly to disk and queue for validation in a reader pipe
-						reader, writer := io.Pipe()
-
-						bufferSize := 4 * 1024 * 1024
-						bufferedReader := io.NopCloser(bufio.NewReaderSize(reader, bufferSize))
-
-						// start writing to the pipe in the background
-						go func() {
-							if err := msg.block.MsgBlock().Serialize(writer); err != nil {
-								sm.logger.Errorf("failed to serialize block: %v", err)
-							}
-
-							// close the writer to signal the end of the block
-							if err := writer.Close(); err != nil {
-								sm.logger.Errorf("failed to close writer: %v", err)
-							}
-						}()
-
-						sm.logger.Debugf("[blockHandler][%s] writing block to disk", msg.block.Hash())
-						if err := sm.tempStore.SetFromReader(ctx,
-							msg.block.Hash().CloneBytes(),
-							fileformat.FileTypeMsgBlock,
-							bufferedReader,
-							options.WithDeleteAt(10),
-							options.WithSubDirectory("blocks"),
-							options.WithAllowOverwrite(true),
-						); err != nil {
-							sm.logger.Errorf("failed to write block to disk: %v", err)
-						}
-
-						// close the reader to signal the end of the block
-						if err := reader.Close(); err != nil {
-							sm.logger.Errorf("failed to close reader: %v", err)
-						}
-					} else {
-						msgBlock = msg.block.MsgBlock()
-					}
-
-					sm.logger.Debugf("[blockHandler][%s] queueing block for validation", msg.block.Hash())
-					blockQueue <- &blockQueueMsg{
-						block:       msgBlock,
-						blockHash:   *msg.block.Hash(),
-						blockHeight: msg.block.Height(),
-						peer:        msg.peer,
-						reply:       msg.reply,
-					}
-
-					// unblock the disk writer
-					<-blockDiskWriter
-				}(msg)
+				blockQueue <- &blockQueueMsg{
+					block:       msg.block.MsgBlock(),
+					blockHash:   *msg.block.Hash(),
+					blockHeight: msg.block.Height(),
+					peer:        msg.peer,
+					reply:       msg.reply,
+				}
 
 			case *invMsg:
 				go sm.handleInvMsg(msg)
@@ -2067,7 +2009,7 @@ func (sm *SyncManager) Pause() chan<- struct{} {
 // New constructs a new SyncManager. Use Start to begin processing asynchronous
 // block, tx, and inv updates.
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient teranodeblockchain.ClientI,
-	validationClient validator.Interface, utxoStore utxostore.Store, subtreeStore blob.Store, tempStore blob.Store,
+	validationClient validator.Interface, utxoStore utxostore.Store, subtreeStore blob.Store,
 	subtreeValidation subtreevalidation.Interface, blockValidation blockvalidation.Interface,
 	blockAssembly blockassembly.ClientI, config *Config) (*SyncManager, error) {
 	initPrometheusMetrics()
@@ -2096,7 +2038,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		validationClient:  validationClient,
 		utxoStore:         utxoStore,
 		subtreeStore:      subtreeStore,
-		tempStore:         tempStore,
 		subtreeValidation: subtreeValidation,
 		blockValidation:   blockValidation,
 		blockAssembly:     blockAssembly,
@@ -2167,34 +2108,44 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 }
 
 func (sm *SyncManager) startKafkaListeners(ctx context.Context, _ error) {
-	kafkaControlChan := make(chan bool) // true = start, false = stop
+	blockControlChan := make(chan bool, 1) // control channel for block-related listeners (buffered to prevent blocking)
+	txControlChan := make(chan bool, 1)    // control channel for transaction-related listeners (buffered to prevent blocking)
 
-	// start a go routine to control the kafka listener, using the FSM state of the node
+	// start a go routine to control the kafka listeners based on FSM state
+	// Block-related listeners (INV, blocks final): enabled when NOT in LEGACYSYNCING state
+	// Transaction-related listeners (txmeta): enabled only when in RUNNING state
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
-				// get the FSM state, only turn on the listener if we are in RUN mode
-				// TODO it would be better to be able to listen somehow to state changes in the FSM
-				isState, _ := sm.blockchainClient.IsFSMCurrentState(sm.ctx, teranodeblockchain.FSMStateRUNNING)
+			case <-time.After(1 * time.Second):
+				// Block-related listeners: enable when NOT in LEGACYSYNCING
+				isLegacySyncing, _ := sm.blockchainClient.IsFSMCurrentState(sm.ctx, teranodeblockchain.FSMStateLEGACYSYNCING)
+				blockEnabled := !isLegacySyncing
 
-				if isState {
-					kafkaControlChan <- true // start or continue the listener
-				} else {
-					kafkaControlChan <- false // stop the listener
+				// Non-blocking send to avoid deadlock if no one is reading
+				select {
+				case blockControlChan <- blockEnabled:
+				default:
 				}
 
-				// wait 1 second before checking again
-				time.Sleep(1 * time.Second)
+				// Transaction-related listeners: enable only when RUNNING
+				isRunning, _ := sm.blockchainClient.IsFSMCurrentState(sm.ctx, teranodeblockchain.FSMStateRUNNING)
+
+				// Non-blocking send to avoid deadlock if no one is reading
+				select {
+				case txControlChan <- isRunning:
+				default:
+				}
 			}
 		}
 	}()
 
-	var kafkaControlListenersCh []chan bool
+	var blockListenersCh []chan bool // channels for block-related listeners
+	var txListenersCh []chan bool    // channels for tx-related listeners
 
-	// Kafka for INV messages
+	// Kafka for INV messages (responds to requests from other nodes)
 	legacyInvConfigURL := sm.settings.Kafka.LegacyInvConfig
 	if legacyInvConfigURL != nil {
 		sm.legacyKafkaInvCh = make(chan *kafka.Message, 10_000)
@@ -2210,25 +2161,29 @@ func (sm *SyncManager) startKafkaListeners(ctx context.Context, _ error) {
 			producer.Start(sm.ctx, sm.legacyKafkaInvCh)
 		}()
 
+		// INV listener receives inventory messages from other nodes
+		// Disabled during LEGACYSYNCING to reduce processing load during catch-up
 		controlCh := make(chan bool)
-		kafkaControlListenersCh = append(kafkaControlListenersCh, controlCh)
+		blockListenersCh = append(blockListenersCh, controlCh)
 
 		go kafka.StartKafkaControlledListener(ctx, sm.logger, "inv.legacy"+"."+sm.settings.ClientName, controlCh, legacyInvConfigURL, sm.kafkaINVListener)
 	}
 
+	// Kafka for blocks final messages (announces blocks to peers)
 	blocksFinalConfigURL := sm.settings.Kafka.BlocksFinalConfig
 	if blocksFinalConfigURL != nil {
 		controlCh := make(chan bool)
-		kafkaControlListenersCh = append(kafkaControlListenersCh, controlCh)
+		blockListenersCh = append(blockListenersCh, controlCh)
 
 		go kafka.StartKafkaControlledListener(ctx, sm.logger, "blocksfinal.legacy"+"."+sm.settings.ClientName, controlCh, blocksFinalConfigURL, sm.kafkaBlocksFinalListener)
 	}
 
+	// Kafka for txmeta messages (announces transactions to peers)
 	txmetaKafkaURL := sm.settings.Kafka.TxMetaConfig
 
 	if txmetaKafkaURL != nil {
 		controlCh := make(chan bool)
-		kafkaControlListenersCh = append(kafkaControlListenersCh, controlCh)
+		txListenersCh = append(txListenersCh, controlCh)
 
 		// disable replay for txmeta in the legacy service, we do not have to replay anything, ever
 		values := txmetaKafkaURL.Query()
@@ -2239,6 +2194,7 @@ func (sm *SyncManager) startKafkaListeners(ctx context.Context, _ error) {
 		go kafka.StartKafkaControlledListener(ctx, sm.logger, "txmeta.legacy"+"."+sm.settings.ClientName, controlCh, txmetaKafkaURL, sm.kafkaTXmetaListener)
 	}
 
+	// Listen to blockchain notifications for subtree announcements
 	go func() {
 		// will never return an error
 		blockchainSubscription, _ := sm.blockchainClient.Subscribe(ctx, "legacy/manager")
@@ -2284,14 +2240,28 @@ func (sm *SyncManager) startKafkaListeners(ctx context.Context, _ error) {
 		}
 	}()
 
+	// Control block listeners based on blockControlChan
 	go func() {
-		// listen to the control channel and send the control signal to all listeners
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case control := <-kafkaControlChan:
-				for _, ch := range kafkaControlListenersCh {
+			case control := <-blockControlChan:
+				for _, ch := range blockListenersCh {
+					ch <- control
+				}
+			}
+		}
+	}()
+
+	// Control transaction listeners based on txControlChan
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case control := <-txControlChan:
+				for _, ch := range txListenersCh {
 					ch <- control
 				}
 			}
@@ -2321,7 +2291,7 @@ func (sm *SyncManager) kafkaINVListener(ctx context.Context, kafkaURL *url.URL, 
 		go sm.handleInvMsg(invMsg)
 
 		return nil
-	})
+	}, &sm.settings.Kafka)
 }
 
 func (sm *SyncManager) kafkaBlocksFinalListener(ctx context.Context, kafkaURL *url.URL, groupID string) {
@@ -2360,7 +2330,7 @@ func (sm *SyncManager) kafkaBlocksFinalListener(ctx context.Context, kafkaURL *u
 		sm.peerNotifier.RelayInventory(wire.NewInvVect(wire.InvTypeBlock, hash), wireBlockHeader)
 
 		return nil
-	})
+	}, &sm.settings.Kafka)
 }
 
 func (sm *SyncManager) kafkaTXmetaListener(ctx context.Context, kafkaURL *url.URL, groupID string) {
@@ -2395,5 +2365,5 @@ func (sm *SyncManager) kafkaTXmetaListener(ctx context.Context, kafkaURL *url.UR
 		}
 
 		return nil
-	})
+	}, &sm.settings.Kafka)
 }

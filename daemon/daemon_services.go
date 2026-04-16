@@ -8,29 +8,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/alert"
-	"github.com/bitcoin-sv/teranode/services/asset"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockpersister"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation"
-	"github.com/bitcoin-sv/teranode/services/legacy"
-	"github.com/bitcoin-sv/teranode/services/legacy/peer"
-	"github.com/bitcoin-sv/teranode/services/p2p"
-	"github.com/bitcoin-sv/teranode/services/propagation"
-	"github.com/bitcoin-sv/teranode/services/rpc"
-	"github.com/bitcoin-sv/teranode/services/subtreevalidation"
-	"github.com/bitcoin-sv/teranode/services/utxopersister"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	blockchainstore "github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	"github.com/bitcoin-sv/teranode/util/servicemanager"
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/alert"
+	"github.com/bsv-blockchain/teranode/services/asset"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockpersister"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/services/legacy"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/p2p"
+	"github.com/bsv-blockchain/teranode/services/propagation"
+	"github.com/bsv-blockchain/teranode/services/rpc"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	"github.com/bsv-blockchain/teranode/util/servicemanager"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/felixge/fgprof"
 	"github.com/ordishs/gocore"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -72,6 +72,9 @@ func (d *Daemon) startServices(ctx context.Context, logger ulogger.Logger, appSe
 	// Create the application count based on the services that are going to be started
 	d.appCount += len(d.externalServices)
 
+	// Set all-in-one mode flag: true if running multiple services in one container
+	appSettings.IsAllInOneMode = d.appCount > 1
+
 	// If no services are started, print usage and exit
 	if help || d.appCount == 0 {
 		printUsage()
@@ -94,6 +97,9 @@ func (d *Daemon) startServices(ctx context.Context, logger ulogger.Logger, appSe
 		if err != nil {
 			logger.Warnf("failed to initialize tracer: %v", err)
 		}
+	} else {
+		// Explicitly disable tracing to ensure all tracing operations become no-ops
+		tracing.SetTracingEnabled(false)
 	}
 
 	// Create a slice of service starters
@@ -172,6 +178,7 @@ func startProfilerAndMetrics(logger ulogger.Logger, appSettings *settings.Settin
 			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 			// fgprof support
+
 			mux.Handle("/debug/fgprof", fgprof.Handler())
 
 			if appSettings.StatsPrefix != "" {
@@ -431,10 +438,18 @@ func (d *Daemon) startRPCService(ctx context.Context, appSettings *settings.Sett
 		return err
 	}
 
+	// Create block validation client for RPC service
+	var blockValidationClient blockvalidation.Interface
+
+	blockValidationClient, err = d.daemonStores.GetBlockValidationClient(ctx, createLogger("blockvalidation"), appSettings)
+	if err != nil {
+		return err
+	}
+
 	// Create the RPC server with the necessary parts
 	var rpcServer *rpc.RPCServer
 
-	rpcServer, err = rpc.NewServer(createLogger(loggerRPC), appSettings, blockchainClient, utxoStore, blockAssemblyClient, peerClient, p2pClient)
+	rpcServer, err = rpc.NewServer(createLogger(loggerRPC), appSettings, blockchainClient, blockValidationClient, utxoStore, blockAssemblyClient, peerClient, p2pClient)
 	if err != nil {
 		return err
 	}

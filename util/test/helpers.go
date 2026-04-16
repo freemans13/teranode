@@ -3,8 +3,8 @@ package test
 import (
 	"net/url"
 
-	"github.com/bitcoin-sv/teranode/settings"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/settings"
 )
 
 type TestingT interface {

@@ -20,26 +20,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/mining"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/subtreeprocessor"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/health"
-	"github.com/bitcoin-sv/teranode/util/retry"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/mining"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/health"
+	"github.com/bsv-blockchain/teranode/util/retry"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
@@ -277,6 +277,11 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 	return nil
 }
 
+// GetBlockAssembler returns the BlockAssembler instance.
+func (ba *BlockAssembly) GetBlockAssembler() *BlockAssembler {
+	return ba.blockAssembler
+}
+
 // runSubtreeRetryProcessor handles retry logic for failed subtree storage operations.
 // It processes subtrees that failed to be stored and retries them with exponential backoff.
 func (ba *BlockAssembly) runSubtreeRetryProcessor(ctx context.Context, subtreeRetryChan chan *subtreeRetrySend) {
@@ -478,6 +483,13 @@ func (ba *BlockAssembly) sendSubtreeNotification(ctx context.Context, subtreeHas
 func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtreeprocessor.NewSubtreeRequest, subtreeRetryChan chan *subtreeRetrySend) (err error) {
 	subtree := subtreeRequest.Subtree
 
+	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "storeSubtree",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithCounter(prometheusBlockAssemblerSubtreeCreated),
+		tracing.WithLogMessage(ba.logger, "[BlockAssembly:Init][%s] new subtree notification from assembly: len %d", subtree.RootHash().String(), subtree.Length()),
+	)
+	defer deferFn()
+
 	// start1, stat1, _ := util.NewStatFromContext(ctx, "newSubtreeChan", channelStats)
 	// check whether this subtree already exists in the store, which would mean it has already been announced
 	if ok, _ := ba.subtreeStore.Exists(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree); ok {
@@ -486,13 +498,10 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 		return
 	}
 
-	prometheusBlockAssemblerSubtreeCreated.Inc()
-	ba.logger.Infof("[BlockAssembly:Init][%s] new subtree notification from assembly: len %d", subtree.RootHash().String(), subtree.Length())
-
 	var subtreeBytes []byte
 
 	if subtreeBytes, err = subtree.Serialize(); err != nil {
-		return errors.NewProcessingError("[BlockAssembly:Init][%s] failed to serialize subtree", subtree.RootHash().String(), err)
+		return errors.NewProcessingError("[BlockAssembly:storeSubtree][%s] failed to serialize subtree", subtree.RootHash().String(), err)
 	}
 
 	dah := ba.blockAssembler.utxoStore.GetBlockHeight() + ba.settings.GlobalBlockHeightRetention
@@ -506,7 +515,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 				txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
 				if !found {
-					ba.logger.Errorf("[BlockAssembly:Init][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
 
 					subtreeMetaMissingTxs = true
 
@@ -514,7 +523,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 				}
 
 				if err = subtreeMeta.SetTxInpoints(idx, txInpoints); err != nil {
-					ba.logger.Errorf("[BlockAssembly:Init][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
+					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
 
 					subtreeMetaMissingTxs = true
 
@@ -526,19 +535,19 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 		if !subtreeMetaMissingTxs {
 			subtreeMetaBytes, err := subtreeMeta.Serialize()
 			if err != nil {
-				return errors.NewStorageError("[writeSubtree][%s] failed to serialize subtree data", subtree.RootHash().String(), err)
+				return errors.NewStorageError("[BlockAssembly:storeSubtree][%s] failed to serialize subtree data", subtree.RootHash().String(), err)
 			}
 
 			if err = ba.subtreeStore.Set(ctx,
 				subtree.RootHash()[:],
 				fileformat.FileTypeSubtreeMeta,
 				subtreeMetaBytes,
-				options.WithDeleteAt(dah), // this sets the DAH for the subtree, it must be updated when a block is mined
+				options.WithDeleteAt(dah),
 			); err != nil {
 				if errors.Is(err, errors.ErrBlobAlreadyExists) {
-					ba.logger.Debugf("[BlockAssembly:Init][%s] subtree meta already exists", subtree.RootHash().String())
+					ba.logger.Debugf("[BlockAssembly:storeSubtree][%s] subtree meta already exists", subtree.RootHash().String())
 				} else {
-					ba.logger.Errorf("[BlockAssembly:Init][%s] failed to store subtree meta: %s", subtree.RootHash().String(), err)
+					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to store subtree meta: %s", subtree.RootHash().String(), err)
 
 					// add to retry saving the subtree
 					subtreeRetryChan <- &subtreeRetrySend{
@@ -559,9 +568,9 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 		options.WithDeleteAt(dah), // this sets the DAH for the subtree, it must be updated when a block is mined
 	); err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			ba.logger.Debugf("[BlockAssembly:Init][%s] subtree already exists", subtree.RootHash().String())
+			ba.logger.Debugf("[BlockAssembly:storeSubtree][%s] subtree already exists", subtree.RootHash().String())
 		} else {
-			ba.logger.Errorf("[BlockAssembly:Init][%s] failed to store subtree: %s", subtree.RootHash().String(), err)
+			ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to store subtree: %s", subtree.RootHash().String(), err)
 
 			// add to retry saving the subtree
 			// no need to retry the subtree meta, we have already stored that
@@ -581,7 +590,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 
 	isRunning, err := ba.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
 	if err != nil {
-		return errors.NewProcessingError("[SubtreeProcessor] failed to get current state: %s", err)
+		return errors.NewProcessingError("[BlockAssembly:storeSubtree][%s] failed to get current state", subtree.RootHash().String(), err)
 	}
 
 	// only send notification if the FSM is in the running state
@@ -599,7 +608,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 				Metadata: nil,
 			},
 		}); err != nil {
-			return errors.NewServiceError("[BlockAssembly:Init][%s] failed to send subtree notification", subtree.RootHash().String(), err)
+			return errors.NewServiceError("[BlockAssembly:storeSubtree][%s] failed to send subtree notification", subtree.RootHash().String(), err)
 		}
 	}
 
@@ -628,11 +637,6 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 		// from multiple close attempts during concurrent startup scenarios
 		closeOnce sync.Once
 
-		// grpcClosed channel receives the result of gRPC server operation
-		// This allows the main goroutine to wait for either successful startup
-		// or server termination, enabling proper error handling and cleanup
-		grpcClosed = make(chan error)
-
 		// grpcReady channel signals when the gRPC server is ready to accept requests
 		grpcReady = make(chan struct{})
 	)
@@ -641,12 +645,14 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 	// This prevents callers from waiting indefinitely for service readiness
 	defer closeOnce.Do(func() { close(readyCh) })
 
-	// Start gRPC server in a separate goroutine to avoid blocking the main thread
-	// This allows the service to handle both gRPC requests and internal operations concurrently
-	go func() {
+	// Create errgroup for coordinating goroutines
+	g, gCtx := errgroup.WithContext(ctx)
+
+	// Start gRPC server in errgroup to properly handle shutdown
+	g.Go(func() error {
 		// StartGRPCServer blocks until the server shuts down or encounters an error
 		// The server setup includes registering the BlockAssemblyAPI service
-		grpcClosed <- util.StartGRPCServer(ctx, ba.logger, ba.settings, "blockassembly", ba.settings.BlockAssembly.GRPCListenAddress, func(server *grpc.Server) {
+		return util.StartGRPCServer(gCtx, ba.logger, ba.settings, "blockassembly", ba.settings.BlockAssembly.GRPCListenAddress, func(server *grpc.Server) {
 			// Register the BlockAssembly service with the gRPC server
 			// This makes all BlockAssembly API methods available to clients
 			blockassembly_api.RegisterBlockAssemblyAPIServer(server, ba)
@@ -655,17 +661,17 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 			// This is called once the gRPC server is successfully listening
 			grpcReady <- struct{}{}
 		}, nil)
-	}()
+	})
 
-	// Start the block assembler component which handles the core block creation logic
+	<-grpcReady
+
 	// This must succeed for the service to be functional
 	if err = ba.blockAssembler.Start(ctx); err != nil {
 		return errors.NewServiceError("failed to start block assembler", err)
 	}
 
-	<-grpcReady
 	// Signal that the service is ready to accept requests
-	closeOnce.Do(func() { close(readyCh) })
+	closeOnce.Do(func() { close(readyCh) }) // Start the block assembler component which handles the core block creation logic
 
 	// Wait for gRPC server completion or error
 	// This blocks until either:
@@ -677,7 +683,7 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 	// - nil if server shut down gracefully
 	// - context cancellation error if shutdown was requested
 	// - network or configuration errors if startup failed
-	return <-grpcClosed
+	return g.Wait()
 }
 
 // Stop gracefully shuts down the BlockAssembly service.
@@ -905,28 +911,6 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 		MiningCandidate: miningCandidate,
 	}, jobTTL) // create a new job with a TTL, will be cleaned up automatically
 
-	go func() {
-		// decouple the tracing context to not cancel the context when the subtree DAH is being saved in the background
-		decoupledCtx, _, endSpan := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleMiningOn")
-		defer endSpan()
-
-		previousHash, err := chainhash.NewHash(miningCandidate.PreviousHash)
-		if err != nil {
-			ba.logger.Errorf("failed to convert previous hash: %s", err)
-		}
-
-		if err = ba.blockchainClient.SendNotification(decoupledCtx, &blockchain.Notification{
-			Type:     model.NotificationType_MiningOn,
-			Hash:     previousHash[:],
-			Base_URL: "",
-			Metadata: &blockchain.NotificationMetadata{
-				Metadata: nil,
-			},
-		}); err != nil {
-			ba.logger.Errorf("failed to send mining on notification: %s", err)
-		}
-	}()
-
 	if includeSubtreeHashes {
 		miningCandidate.SubtreeHashes = make([][]byte, len(subtrees))
 		for i, subtree := range subtrees {
@@ -1023,7 +1007,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 
 	jobItem := ba.jobStore.Get(*storeID)
 	if jobItem == nil {
-		return nil, errors.NewProcessingError("[BlockAssembly][%s] job not found", jobID)
+		return nil, errors.NewNotFoundError("[BlockAssembly][%s] job not found", jobID)
 	}
 
 	job := jobItem.Value()
@@ -1033,7 +1017,8 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to convert hashPrevBlock", jobID, err)
 	}
 
-	if ba.blockAssembler.bestBlockHeader.Load().HashPrevBlock.IsEqual(hashPrevBlock) {
+	bestBlockHeader, _ := ba.blockAssembler.CurrentBlock()
+	if bestBlockHeader.HashPrevBlock.IsEqual(hashPrevBlock) {
 		return nil, errors.NewProcessingError("[BlockAssembly][%s] already mining on top of the same block that is submitted", jobID)
 	}
 
@@ -1043,6 +1028,11 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		coinbaseTx, err = bt.NewTxFromBytes(req.CoinbaseTx)
 		if err != nil {
 			return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to convert coinbaseTx", jobID, err)
+		}
+
+		// Validate coinbase has exactly one input before accessing Inputs[0]
+		if len(coinbaseTx.Inputs) != 1 {
+			return nil, errors.NewProcessingError("[BlockAssembly][%s] coinbase transaction must have exactly one input, got %d", jobID, len(coinbaseTx.Inputs))
 		}
 
 		if len(coinbaseTx.Inputs[0].UnlockingScript.Bytes()) < 2 || len(coinbaseTx.Inputs[0].UnlockingScript.Bytes()) > int(ba.blockAssembler.settings.ChainCfgParams.MaxCoinbaseScriptSigSize) {
@@ -1067,6 +1057,11 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		if req.Nonce != 0 {
 			coinbaseTx.Inputs[0].SequenceNumber = req.Nonce
 		}
+	}
+
+	// Final validation: ensure coinbase is valid (defense-in-depth)
+	if len(coinbaseTx.Inputs) != 1 {
+		return nil, errors.NewProcessingError("[BlockAssembly][%s] coinbase transaction must have exactly one input after processing, got %d", jobID, len(coinbaseTx.Inputs))
 	}
 
 	coinbaseTxIDHash := coinbaseTx.TxIDChainHash()
@@ -1145,16 +1140,13 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		SubtreeSlices:    job.Subtrees,
 	}
 
-	// set the settings on the block for validation
-	block.SetSettings(ba.settings)
-
 	// check fully valid, including whether difficulty in header is low enough
 	// TODO add more checks to the Valid function, like whether the parent/child relationships are OK
-	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, nil, nil); !ok {
+	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, nil, nil, ba.settings); !ok {
 		ba.logger.Errorf("[BlockAssembly][%s][%s] invalid block: %v - %v", jobID, block.Hash().String(), block.Header, err)
 
 		// the subtreeprocessor created an invalid block, we must reset
-		ba.blockAssembler.Reset()
+		ba.blockAssembler.Reset(false)
 
 		// remove the job, we cannot use it anymore
 		ba.jobStore.Delete(*storeID)
@@ -1175,7 +1167,8 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 
 	ba.logger.Debugf("[BlockAssembly][%s][%s] add block to blockchain", jobID, block.Header.Hash())
 	ba.logger.Debugf("[BlockAssembly][%s][%s] block difficulty: %s", jobID, block.Header.Hash(), block.Header.Bits.CalculateDifficulty().String())
-	ba.logger.Debugf("[BlockAssembly][%s][%s] time since previous block: %s", jobID, block.Header.Hash(), time.Since(time.Unix(int64(ba.blockAssembler.bestBlockHeader.Load().Timestamp), 0)).String())
+	bestBlockHeader, _ = ba.blockAssembler.CurrentBlock()
+	ba.logger.Debugf("[BlockAssembly][%s][%s] time since previous block: %s", jobID, block.Header.Hash(), time.Since(time.Unix(int64(bestBlockHeader.Timestamp), 0)).String())
 
 	// add the new block to the blockchain
 	if err = ba.blockchainClient.AddBlock(callerCtx, block, ""); err != nil {
@@ -1330,7 +1323,25 @@ func (ba *BlockAssembly) ResetBlockAssembly(ctx context.Context, _ *blockassembl
 		return nil, errors.NewServiceError("service not ready - unmined transactions are still being loaded")
 	}
 
-	ba.blockAssembler.Reset()
+	ba.blockAssembler.Reset(false)
+
+	return &blockassembly_api.EmptyMessage{}, nil
+}
+
+func (ba *BlockAssembly) ResetBlockAssemblyFully(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error) {
+	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "ResetBlockAssemblyFully",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithLogMessage(ba.logger, "[ResetBlockAssemblyFully] called"),
+	)
+	defer deferFn()
+
+	// Check if unmined transactions are still being loaded
+	if ba.blockAssembler.unminedTransactionsLoading.Load() {
+		ba.logger.Warnf("[ResetBlockAssemblyFully] service not ready - unmined transactions are still being loaded")
+		return nil, errors.NewServiceError("service not ready - unmined transactions are still being loaded")
+	}
+
+	ba.blockAssembler.Reset(true)
 
 	return &blockassembly_api.EmptyMessage{}, nil
 }
@@ -1363,16 +1374,6 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 	)
 	defer deferFn()
 
-	resetWaitCountUint32, err := safeconversion.Int32ToUint32(ba.blockAssembler.resetWaitCount.Load())
-	if err != nil {
-		return nil, errors.NewProcessingError("error converting reset wait count", err)
-	}
-
-	resetWaitTimeUint32, err := safeconversion.Int32ToUint32(ba.blockAssembler.resetWaitDuration.Load())
-	if err != nil {
-		return nil, errors.NewProcessingError("error converting reset wait time", err)
-	}
-
 	subtreeCountUint32, err := safeconversion.IntToUint32(ba.blockAssembler.SubtreeCount())
 	if err != nil {
 		return nil, errors.NewProcessingError("error converting subtree count", err)
@@ -1390,16 +1391,16 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 		return nil, errors.NewProcessingError("error converting remove map length", err)
 	}
 
+	currentHeader, currentHeight := ba.blockAssembler.CurrentBlock()
+
 	return &blockassembly_api.StateMessage{
 		BlockAssemblyState:    StateStrings[ba.blockAssembler.GetCurrentRunningState()],
 		SubtreeProcessorState: subtreeprocessor.StateStrings[ba.blockAssembler.subtreeProcessor.GetCurrentRunningState()],
-		ResetWaitCount:        resetWaitCountUint32,
-		ResetWaitTime:         resetWaitTimeUint32,
 		SubtreeCount:          subtreeCountUint32,
 		TxCount:               ba.blockAssembler.TxCount(),
 		QueueCount:            ba.blockAssembler.QueueLength(),
-		CurrentHeight:         ba.blockAssembler.bestBlockHeight.Load(),
-		CurrentHash:           ba.blockAssembler.bestBlockHeader.Load().Hash().String(),
+		CurrentHeight:         currentHeight,
+		CurrentHash:           currentHeader.Hash().String(),
 		RemoveMapCount:        removeMapLen32,
 		Subtrees:              subtreeHashesStrings,
 	}, nil
@@ -1649,7 +1650,8 @@ func (ba *BlockAssembly) generateBlock(ctx context.Context, address *string) err
 	}
 
 	// Store the current best block hash before submission
-	previousBestHash := ba.blockAssembler.bestBlockHeader.Load().Hash()
+	previousBestHeader, _ := ba.blockAssembler.CurrentBlock()
+	previousBestHash := previousBestHeader.Hash()
 
 	resp, err := ba.submitMiningSolution(ctx, req)
 	if err != nil {
@@ -1681,7 +1683,8 @@ func (ba *BlockAssembly) waitForBestBlockHeaderUpdate(ctx context.Context, previ
 			// Continue anyway - the block was submitted successfully
 			return nil
 		case <-ticker.C:
-			currentBestHash := ba.blockAssembler.bestBlockHeader.Load().Hash()
+			currentBestHeader, _ := ba.blockAssembler.CurrentBlock()
+			currentBestHash := currentBestHeader.Hash()
 			if !currentBestHash.IsEqual(previousBestHash) {
 				// Best block has been updated
 				return nil

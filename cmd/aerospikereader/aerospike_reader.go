@@ -24,15 +24,15 @@ import (
 	"time"
 
 	aero "github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 )
 
 // ReadAerospike handles the Aerospike reader command logic.
@@ -68,7 +68,7 @@ func ReadAerospike(logger ulogger.Logger, settings *settings.Settings, txIDStrin
 	fmt.Printf("Reading record from %s.%s\n", namespace, setName)
 
 	// Create the Aerospike key for the given transaction ID
-	keySource := uaerospike.CalculateKeySource(hash, 0)
+	keySource := uaerospike.CalculateKeySourceInternal(hash, 0)
 
 	var key *aero.Key
 	key, err = aero.NewKey(namespace, setName, keySource)
@@ -125,7 +125,7 @@ func ReadAerospike(logger ulogger.Logger, settings *settings.Settings, txIDStrin
 
 			for i := uint32(1); i <= nrRecordsUint32; i++ {
 				// Calculate the key source for the additional records
-				keySource = uaerospike.CalculateKeySource(hash, i)
+				keySource = uaerospike.CalculateKeySourceInternal(hash, i)
 
 				// Create a new key for the additional record
 				key, err = aero.NewKey(namespace, setName, keySource)

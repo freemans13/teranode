@@ -12,21 +12,21 @@ import (
 	"os"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	blockchainstore "github.com/bitcoin-sv/teranode/stores/blockchain"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
-	utxostorefactory "github.com/bitcoin-sv/teranode/stores/utxo/factory"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	utxostorefactory "github.com/bsv-blockchain/teranode/stores/utxo/factory"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 var (
@@ -268,16 +268,12 @@ func fetchBlockHeaders(nodeContext string, debug bool, logfile string) ([]*model
 
 	ctx := context.Background()
 
-	var bestBlockHeader *model.BlockHeader
-
-	bestBlockHeader, _, err = blockchainDB.GetBestBlockHeader(ctx)
+	blockAtTestHeight, err := blockchainDB.GetBlockByHeight(ctx, 120)
 	if err != nil {
 		return nil, err
 	}
 
-	var blockHeaders []*model.BlockHeader
-
-	blockHeaders, _, err = blockchainDB.GetBlockHeaders(ctx, bestBlockHeader.Hash(), 100000)
+	blockHeaders, _, err := blockchainDB.GetBlockHeaders(ctx, blockAtTestHeight.Hash(), 100000)
 	if err != nil {
 		return nil, err
 	}

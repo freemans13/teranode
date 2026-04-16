@@ -7,12 +7,13 @@
   import Typo from '$internal/components/typo/index.svelte'
   import Icon from '$lib/components/icon/index.svelte'
   import { Button } from '$lib/components'
-  import { miningNodes, sock, currentNodePeerID } from '$internal/stores/p2pStore'
+  import { miningNodes, sock, currentNodePeerID, blockHashToMiner } from '$internal/stores/p2pStore'
   import { calculateChainworkScores } from '$internal/components/page/network/connected-nodes-card/data'
   import i18n from '$internal/i18n'
   import RenderSpan from '$lib/components/table/renderers/render-span/index.svelte'
   import RenderSpanWithTooltip from '$lib/components/table/renderers/render-span-with-tooltip/index.svelte'
   import RenderHashWithMiner from '$lib/components/table/renderers/render-hash-with-miner/index.svelte'
+  import { get } from 'svelte/store'
   
   $: t = $i18n.t
   
@@ -44,8 +45,7 @@
     // Calculate chainwork scores if we have data
     if (nodes.length > 0) {
       const chainworkScores = calculateChainworkScores(nodes)
-      const maxScore = Math.max(...Array.from(chainworkScores.values()))
-      
+
       // Get current node peer ID
       const currentPeerID = $currentNodePeerID
 
@@ -53,7 +53,6 @@
       nodes.forEach((node) => {
         const key = node.peer_id
         node.chainwork_score = chainworkScores.get(key) || 0
-        node.maxChainworkScore = maxScore
         node.isCurrentNode = node.peer_id === currentPeerID
         
         // For current node, immediately populate with its best hash
@@ -367,7 +366,7 @@
       },
       {
         id: 'chainwork_score',
-        name: 'Chainwork',
+        name: 'Chain Rank',
         type: 'number',
         props: {
           width: '10%',
@@ -429,7 +428,14 @@
     best_block_hash: (idField, item, colId) => {
       const value = item[colId]
       const shortHash = value ? (value.length > 16 ? `${value.slice(0, 8)}...${value.slice(-8)}` : value) : ''
-      const miner = item.miner_name || ''
+      let miner = item.miner_name || ''
+      
+      // Fallback to miner cache if not available
+      if (!miner && value) {
+        const minerCache = get(blockHashToMiner)
+        miner = minerCache.get(value) || ''
+      }
+      
       return {
         component: value ? RenderHashWithMiner : null,
         props: {
@@ -446,18 +452,17 @@
     },
     chainwork_score: (idField, item, colId) => {
       const score = item[colId] || 0
-      const maxScore = item.maxChainworkScore || 0
-      const isTopScore = score > 0 && score === maxScore
-      
+      const isTopScore = score === 1 // Score 1 is now the highest chainwork
+
       let displayValue = '-'
       let className = 'num'
-      
+
       if (score > 0) {
         displayValue = score.toString()
         // Use same CSS classes as network tab for coloring
         className = isTopScore ? 'chainwork-score-top num' : 'chainwork-score-other num'
       }
-      
+
       return {
         component: RenderSpan,
         props: {
@@ -484,7 +489,14 @@
       
       // Handle normal hash display
       const shortHash = value ? (value.length > 16 ? `${value.slice(0, 8)}...${value.slice(-8)}` : value) : ''
-      const miner = item.common_block_miner || ''
+      let miner = item.common_block_miner || ''
+      
+      // Fallback to miner cache if not available
+      if (!miner && value) {
+        const minerCache = get(blockHashToMiner)
+        miner = minerCache.get(value) || ''
+      }
+      
       return {
         component: value ? RenderHashWithMiner : null,
         props: {

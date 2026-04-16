@@ -1,20 +1,49 @@
 services:
   postgres:
     container_name: postgres
-    image: postgres:latest
+    image: postgres:17
     networks:
       - teranode-network
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: really_strong_password_change_me
       POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data
     ports:
-      - 5432:5432
-    expose:
-      - 5432
+      - "127.0.0.1:5432:5432"
     volumes:
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
       - ${DATA_PATH}/postgres:/var/lib/postgresql/data
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: |
+      "
+      cat > /docker-entrypoint-initdb.d/init.sql <<'EOF'
+      CREATE ROLE teranode LOGIN
+        PASSWORD 'teranode'
+        SUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION;
+      GRANT teranode TO postgres;
+      CREATE DATABASE teranode
+        WITH OWNER = teranode
+        ENCODING = 'UTF8'
+        CONNECTION LIMIT = -1;
+      EOF
+      cat > /refresh-collation.sh <<'EOF'
+      #!/bin/bash
+      set -e
+      # Wait for postgres to be ready
+      until pg_isready -U postgres > /dev/null 2>&1; do
+        sleep 1
+      done
+      # Refresh collation version to prevent warnings/errors after postgres image updates
+      # When postgres updates to a newer glibc version, the collation version changes
+      # and existing databases need to be refreshed to avoid index corruption
+      psql -U postgres -d postgres -c 'ALTER DATABASE postgres REFRESH COLLATION VERSION;' 2>/dev/null || true
+      psql -U postgres -d teranode -c 'ALTER DATABASE teranode REFRESH COLLATION VERSION;' 2>/dev/null || true
+      EOF
+      chmod +x /refresh-collation.sh
+      # Run collation refresh in background after postgres starts
+      /refresh-collation.sh &
+      exec /usr/local/bin/docker-entrypoint.sh postgres
+      "
     restart: on-failure
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres" ]
@@ -39,9 +68,9 @@ services:
       - --pandaproxy-addr 0.0.0.0:9093
       - --advertise-pandaproxy-addr localhost:9093
     ports:
-      - 8081
-      - 9092:9092
-      - 9093:9093
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:9092:9092"
+      - "127.0.0.1:9093:9093"
 
   kafka-console-shared:
     container_name: kafka-console-shared
@@ -60,7 +89,7 @@ services:
             enabled: true
             urls: ["http://kafka-shared:8081"]
     ports:
-      - 8080:8080
+      - "127.0.0.1:8080:8080"
     depends_on:
       - kafka-shared
 
@@ -72,15 +101,12 @@ services:
     networks:
       - teranode-network
     ports:
-      - 3000:3000
-    expose:
-      - 3000
-      - 3001
-      - 3002
+      - "127.0.0.1:3000:3000"
     restart: on-failure
     volumes:
       - ./aerospike.conf:/etc/aerospike.conf
       - ${DATA_PATH}/aerospike/data:/opt/aerospike/data
+      - ${DATA_PATH}/aerospike/smd:/opt/aerospike/smd
     privileged: true  # Allow the container to access raw devices
     hostname: aerospike
 
@@ -92,15 +118,12 @@ services:
     networks:
       - teranode-network
     ports:
-      - 3010:3000  # Map to different host port to avoid conflicts
-    expose:
-      - 3000
-      - 3001
-      - 3002
+      - "127.0.0.1:3010:3000" # Map to different host port to avoid conflicts
     restart: on-failure
     volumes:
       - ./aerospike.conf:/etc/aerospike.conf
       - ${DATA_PATH}/aerospike-2/data:/opt/aerospike/data
+      - ${DATA_PATH}/aerospike-2/smd:/opt/aerospike/smd
     privileged: true
     hostname: aerospike-2
 
@@ -112,19 +135,35 @@ services:
     networks:
       - teranode-network
     ports:
-      - 3020:3000  # Map to different host port to avoid conflicts
-    expose:
-      - 3000
-      - 3001
-      - 3002
+      - "127.0.0.1:3020:3000" # Map to different host port to avoid conflicts
     restart: on-failure
     volumes:
       - ./aerospike.conf:/etc/aerospike.conf
       - ${DATA_PATH}/aerospike-3/data:/opt/aerospike/data
+      - ${DATA_PATH}/aerospike-3/smd:/opt/aerospike/smd
     privileged: true
     hostname: aerospike-3
 
-  # Aerospike exporter for the primary node
+  # Aerospike Enterprise Edition, single node in evaluation mode
+  aerospike-ee:
+    container_name: aerospike
+    image: aerospike/aerospike-server-enterprise:8.1
+    networks:
+      - teranode-network
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    stop_grace_period: 600s # to allow ASMT to backup the indexes for warm restarts
+    volumes:
+      - ./aerospike-ee.conf:/etc/aerospike.conf
+      - ./aerospike-asmt-wrapper.sh:/aerospike-asmt-wrapper.sh:ro
+      - ${DATA_PATH}/aerospike/data:/opt/aerospike/data
+      - ${DATA_PATH}/aerospike/smd:/opt/aerospike/smd
+      - ${DATA_PATH}/aerospike/asmt:/backup/indexes
+    entrypoint: ["/bin/bash", "/aerospike-asmt-wrapper.sh"]
+    privileged: true  # Allow the container to access raw devices
+    hostname: aerospike
+
   aerospike-exporter:
     image: aerospike/aerospike-prometheus-exporter:latest
     container_name: aerospike-exporter
@@ -136,23 +175,11 @@ services:
     networks:
       - teranode-network
 
-  # Optional exporter for the second node
-  aerospike-exporter-2:
-    image: aerospike/aerospike-prometheus-exporter:latest
-    container_name: aerospike-exporter-2
-    environment:
-      AS_HOST: aerospike-2
-      AS_PORT: 3000
-      AGENT_BIND_PORT: 10146
-      METRIC_LABELS: "type='development',source='aerospike-2',node='2'"
-    networks:
-      - teranode-network
-
   prometheus:
     container_name: prometheus
     image: prom/prometheus:v2.44.0
     ports:
-      - 9090:9090
+      - "127.0.0.1:9090:9090"
     networks:
       - teranode-network
     user: "0:0"
@@ -164,7 +191,7 @@ services:
     container_name: grafana
     image: grafana/grafana:latest
     ports:
-      - 3005:3000
+      - "127.0.0.1:3005:3000"
     networks:
       - teranode-network
     user: "0:0"
@@ -182,7 +209,7 @@ services:
     networks:
       - teranode-network
     ports:
-      - 8000:8000
+      - "127.0.0.1:8000:8000"
     depends_on:
       - asset
     volumes:

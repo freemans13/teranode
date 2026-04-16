@@ -7,11 +7,11 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -51,7 +51,7 @@ func TestSQLLocateBlockHeaders(t *testing.T) {
 	var buf bytes.Buffer
 	err = chaincfg.RegressionNetParams.GenesisBlock.Serialize(&buf)
 	require.NoError(t, err)
-	genesisBlock, err := model.NewBlockFromBytes(buf.Bytes(), tSettings)
+	genesisBlock, err := model.NewBlockFromBytes(buf.Bytes())
 	require.NoError(t, err)
 	require.NotNil(t, genesisBlock)
 

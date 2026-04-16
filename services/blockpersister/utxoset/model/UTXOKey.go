@@ -5,15 +5,23 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// UTXOKey represents a bitcoin transaction output identifier, consisting of a transaction ID and output index.
+// UTXOKey represents a unique identifier for a Bitcoin transaction output.
+//
+// A UTXOKey uniquely identifies any transaction output by combining the transaction
+// hash with the output index within that transaction. This follows Bitcoin's standard
+// outpoint representation.
+//
+// Serialization format: 36 bytes total - 32 bytes for transaction hash (little-endian)
+// followed by 4 bytes for output index (little-endian).
 type UTXOKey struct {
-	// TxID is the transaction identifier
+	// TxID is the hash of the transaction that created this output
 	TxID chainhash.Hash
-	// Index is the output index in the transaction
+
+	// Index specifies which output within the transaction (zero-indexed)
 	Index uint32
 }
 

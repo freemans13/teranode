@@ -19,24 +19,24 @@ import (
 	"time"
 
 	"github.com/bitcoin-sv/go-sdk/script"
-	"github.com/bitcoin-sv/teranode/errors"
-	blockmodel "github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	ba "github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/mining"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	blockmodel "github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	ba "github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/mining"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/ordishs/go-utils"
 )
 
@@ -174,7 +174,7 @@ func GetBlockHeight(url string) (uint32, error) {
 
 // isTxInBlock checks if a transaction with the specified txid exists in the block represented by the provided reader.
 func isTxInBlock(ctx context.Context, l ulogger.Logger, storeSubtree blob.Store, blockReader io.Reader, queryTxId chainhash.Hash) (bool, error) {
-	block, err := blockmodel.NewBlockFromReader(blockReader, nil)
+	block, err := blockmodel.NewBlockFromReader(blockReader)
 	if err != nil {
 		return false, errors.NewProcessingError("error reading block", err)
 	}
@@ -245,7 +245,7 @@ func GetBlockSubtreeHashes(ctx context.Context, _ ulogger.Logger, blockHash []by
 		return nil, errors.NewProcessingError("error getting block reader", err)
 	}
 
-	block, err := blockmodel.NewBlockFromReader(blockReader, nil)
+	block, err := blockmodel.NewBlockFromReader(blockReader)
 	if err != nil {
 		return nil, errors.NewProcessingError("error reading block", err)
 	}
@@ -275,7 +275,7 @@ func GetSubtreeTxHashes(ctx context.Context, logger ulogger.Logger, subtreeHash 
 
 	txHashes := make([]chainhash.Hash, 0, tSettings.BlockAssembly.InitialMerkleItemsPerSubtree)
 	buffer := make([]byte, chainhash.HashSize)
-	bufferedReader := bufio.NewReaderSize(body, 1024*1024*4) // 4MB buffer
+	bufferedReader := bufio.NewReaderSize(body, 1024*64)
 
 	logger.Debugf("[getSubtreeTxHashes][%s] processing subtree response into tx hashes", subtreeHash.String())
 

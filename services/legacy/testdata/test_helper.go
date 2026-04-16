@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 type binReader struct {
@@ -37,7 +37,7 @@ func ReadBlockFromFile(filePath string) (*bsvutil.Block, error) {
 	}
 
 	// buffer the reader
-	bufferedReader := bufio.NewReaderSize(reader, 1024*1024*4) // 4MB buffer
+	bufferedReader := bufio.NewReaderSize(reader, 1024*64)
 
 	block, err := bsvutil.NewBlockFromReader(bufferedReader)
 	if err != nil {

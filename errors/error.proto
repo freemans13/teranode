@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-option go_package = "github.com/bitcoin-sv/teranode/errors";
+option go_package = "github.com/bsv-blockchain/teranode/errors";
 
 package errors;
 

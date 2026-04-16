@@ -18,8 +18,8 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // Interface defines the contract for block validation functionality in Teranode.
@@ -36,11 +36,12 @@ type Interface interface {
 	BlockFound(ctx context.Context, blockHash *chainhash.Hash, baseURL string, waitToComplete bool) error
 
 	// ProcessBlock validates and processes a complete block at the specified height.
-	ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32) error
+	ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, baseURL string, peerID string) error
 
 	// ValidateBlock validates a block using the provided request, but does not update any state or database tables.
 	// This is useful for validating blocks without committing them to the database.
-	ValidateBlock(ctx context.Context, block *model.Block) error
+	// The options parameter allows control over validation behavior, including revalidation of invalid blocks.
+	ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error
 }
 
 var _ Interface = &MockBlockValidation{}
@@ -55,10 +56,10 @@ func (mv *MockBlockValidation) BlockFound(ctx context.Context, blockHash *chainh
 	return nil
 }
 
-func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32) error {
+func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, baseURL string, peerID string) error {
 	return nil
 }
 
-func (mv *MockBlockValidation) ValidateBlock(ctx context.Context, block *model.Block) error {
+func (mv *MockBlockValidation) ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error {
 	return nil
 }

@@ -5,18 +5,19 @@ import (
 	"math"
 
 	as "github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 )
 
 // unminedTxIterator implements utxo.UnminedTxIterator for Aerospike
 // It scans all records in the set and yields those that are not mined (i.e., unmined/mempool)
 type unminedTxIterator struct {
 	store     *Store
+	fullScan  bool
 	err       error
 	done      bool
 	recordset *as.Recordset
@@ -29,19 +30,23 @@ type unminedTxIterator struct {
 //
 // Parameters:
 //   - store: The Aerospike store instance to iterate over
+//   - fullScan: If true, performs a full scan of all records; if false, applies a filter to limit results
 //
 // Returns:
 //   - *unminedTxIterator: A new iterator instance ready for use
 //   - error: Any error encountered during iterator initialization
-func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
+func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, error) {
 	it := &unminedTxIterator{
-		store: store,
+		store:    store,
+		fullScan: fullScan,
 	}
 
 	stmt := as.NewStatement(store.namespace, store.setName)
 
-	if err := stmt.SetFilter(as.NewRangeFilter(fields.UnminedSince.String(), 1, int64(math.MaxUint32))); err != nil {
-		return nil, err
+	if !fullScan {
+		if err := stmt.SetFilter(as.NewRangeFilter(fields.UnminedSince.String(), 1, int64(math.MaxUint32))); err != nil {
+			return nil, err
+		}
 	}
 
 	// Set the bins to retrieve only the necessary fields for unmined transactions
@@ -54,16 +59,22 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 		fields.CreatedAt.String(),
 		fields.Conflicting.String(),
 		fields.Locked.String(),
+		fields.BlockIDs.String(),
+		fields.UnminedSince.String(),
+		fields.IsCoinbase.String(),
 	}
 
 	policy := as.NewQueryPolicy()
 	policy.MaxRetries = 1
 	policy.IncludeBinData = true
 
+	store.logger.Infof("[newUnminedTxIterator] Starting Aerospike query for unmined transactions (fullScan=%t)", fullScan)
 	recordset, err := store.client.Query(policy, stmt)
 	if err != nil {
+		store.logger.Errorf("[newUnminedTxIterator] Aerospike query failed: %v", err)
 		return nil, err
 	}
+	store.logger.Infof("[newUnminedTxIterator] Aerospike query completed successfully")
 
 	it.recordset = recordset
 	it.result = recordset.Results()
@@ -122,50 +133,78 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 		break
 	}
 
+	coinbaseBool, ok := rec.Record.Bins[fields.IsCoinbase.String()].(bool)
+	if ok && coinbaseBool {
+		// Skip coinbase transactions as they are not unmined
+		return &utxo.UnminedTransaction{
+			Skip: true,
+		}, nil
+	}
+
 	// Extract transaction data from the record
 	txData, err := it.extractTransactionData(rec.Record.Bins)
 	if err != nil {
 		it.closeWithLogging()
 		it.err = err
-		return nil, it.err
+		return nil, errors.NewProcessingError("invalid transaction data", err)
+	}
+
+	blockIDs, err := processBlockIDs(rec.Record.Bins)
+	if err != nil {
+		it.closeWithLogging()
+		return nil, errors.NewProcessingError("invalid block IDs for %s", txData.hash.String(), err)
 	}
 
 	// Process external transaction if needed
 	txInpoints, err := it.processTransactionInpoints(ctx, txData, rec.Record.Bins)
 	if err != nil {
+		if it.fullScan {
+			// In full scan mode, if we encounter an error processing inpoints and the transaction
+			// has block IDs, it has already been mined. We can skip it.
+			return &utxo.UnminedTransaction{
+				Hash: txData.hash,
+				Fee:  txData.fee,
+				Size: txData.size,
+				Skip: true,
+			}, nil
+		}
+
 		it.closeWithLogging()
 		it.err = err
-		return nil, it.err
+		return nil, errors.NewProcessingError("failed to process transaction inpoints for %s", txData.hash.String(), err)
 	}
 
 	// Extract created_at timestamp
 	createdAt, err := it.extractCreatedAt(rec.Record.Bins)
 	if err != nil {
 		it.closeWithLogging()
-		return nil, err
+		return nil, errors.NewProcessingError("invalid created_at for %s", txData.hash.String(), err)
 	}
 
 	locked, err := it.extractLocked(rec.Record.Bins)
 	if err != nil {
 		it.closeWithLogging()
-		return nil, err
+		return nil, errors.NewProcessingError("invalid locked status for %s", txData.hash.String(), err)
 	}
 
 	return &utxo.UnminedTransaction{
-		Hash:       txData.hash,
-		Fee:        txData.fee,
-		Size:       txData.size,
-		TxInpoints: txInpoints,
-		CreatedAt:  createdAt,
-		Locked:     locked,
+		Hash:         txData.hash,
+		Fee:          txData.fee,
+		Size:         txData.size,
+		UnminedSince: txData.unminedSince,
+		TxInpoints:   txInpoints,
+		CreatedAt:    createdAt,
+		Locked:       locked,
+		BlockIDs:     blockIDs,
 	}, nil
 }
 
 // transactionData holds the basic transaction data extracted from a record
 type transactionData struct {
-	hash *chainhash.Hash
-	fee  uint64
-	size uint64
+	hash         *chainhash.Hash
+	fee          uint64
+	size         uint64
+	unminedSince int
 }
 
 // closeWithLogging closes the iterator with error logging
@@ -212,10 +251,13 @@ func (it *unminedTxIterator) extractTransactionData(bins map[string]interface{})
 
 	size, _ := toUint64(sizeVal)
 
+	unminedSince, _ := bins[fields.UnminedSince.String()].(int)
+
 	return &transactionData{
-		hash: hash,
-		fee:  fee,
-		size: size,
+		hash:         hash,
+		fee:          fee,
+		size:         size,
+		unminedSince: unminedSince,
 	}, nil
 }
 
@@ -339,10 +381,10 @@ func toUint64(val interface{}) (uint64, error) {
 }
 
 // GetUnminedTxIterator implements utxo.Store for Aerospike
-func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+func (s *Store) GetUnminedTxIterator(fullScan bool) (utxo.UnminedTxIterator, error) {
 	if s.client == nil {
 		return nil, errors.NewProcessingError("aerospike client not initialized")
 	}
 
-	return newUnminedTxIterator(s)
+	return newUnminedTxIterator(s, fullScan)
 }

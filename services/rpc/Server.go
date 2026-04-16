@@ -58,17 +58,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/legacy/peer"
-	"github.com/bitcoin-sv/teranode/services/p2p"
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/health"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/p2p"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/health"
 	"github.com/ordishs/gocore"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
@@ -107,6 +108,7 @@ const (
 	// maxProtocolVersion = wire.FeeFilterVersion
 )
 
+// RPCStat provides performance statistics collection for the RPC service.
 var RPCStat = gocore.NewStat("RPC")
 
 var (
@@ -655,6 +657,10 @@ type RPCServer struct {
 	// blockchainClient provides access to blockchain data and operations
 	// Used for retrieving block information, chain state, and blockchain operations
 	blockchainClient blockchain.ClientI
+
+	// blockValidationClient provides access to block validation services
+	// Used for validating blocks and triggering revalidation of invalid blocks
+	blockValidationClient blockvalidation.Interface
 
 	// blockAssemblyClient provides access to block assembly and mining services
 	// Used for mining-related RPC commands like getminingcandidate and generate
@@ -1366,7 +1372,7 @@ func (s *RPCServer) Start(ctx context.Context, readyCh chan<- struct{}) error {
 // Returns:
 //   - *RPCServer: Configured server instance ready for initialization
 //   - error: Any error encountered during configuration
-func NewServer(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, utxoStore utxo.Store, blockAssemblyClient blockassembly.ClientI, peerClient peer.ClientI, p2pClient p2p.ClientI) (*RPCServer, error) {
+func NewServer(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, blockValidationClient blockvalidation.Interface, utxoStore utxo.Store, blockAssemblyClient blockassembly.ClientI, peerClient peer.ClientI, p2pClient p2p.ClientI) (*RPCServer, error) {
 	initPrometheusMetrics()
 
 	assetHTTPAddress := tSettings.Asset.HTTPAddress
@@ -1386,6 +1392,7 @@ func NewServer(logger ulogger.Logger, tSettings *settings.Settings, blockchainCl
 		settings:               tSettings,
 		quit:                   make(chan int),
 		blockchainClient:       blockchainClient,
+		blockValidationClient:  blockValidationClient,
 		assetHTTPURL:           parsedURL,
 		helpCacher:             newHelpCacher(),
 		utxoStore:              utxoStore,

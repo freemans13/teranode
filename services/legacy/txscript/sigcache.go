@@ -7,8 +7,8 @@ package txscript
 import (
 	"sync"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvec"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvec"
 )
 
 // sigCacheEntry represents an entry in the SigCache. Entries within the

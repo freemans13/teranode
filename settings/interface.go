@@ -17,6 +17,7 @@ type Settings struct {
 	Commit                       string
 	Version                      string
 	Context                      string
+	IsAllInOneMode               bool // Runtime-computed: true if daemon is running multiple services in a single process
 	ServiceName                  string
 	TracingEnabled               bool
 	TracingSampleRate            float64
@@ -128,6 +129,8 @@ type KafkaSettings struct {
 	TLSCAFile     string
 	TLSCertFile   string
 	TLSKeyFile    string
+	// Debug logging
+	EnableDebugLogging bool
 }
 
 type AerospikeSettings struct {
@@ -193,6 +196,8 @@ type BlockSettings struct {
 	BlockPersisterPersistAge              uint32
 	BlockPersisterPersistSleep            time.Duration
 	UtxoStore                             *url.URL
+	FileStoreReadConcurrency              int
+	FileStoreWriteConcurrency             int
 }
 
 type BlockChainSettings struct {
@@ -234,9 +239,8 @@ type BlockAssemblySettings struct {
 	MinerWalletPrivateKeys              []string
 	DifficultyCache                     bool
 	UseDynamicSubtreeSize               bool
-	ResetWaitCount                      int32
-	ResetWaitDuration                   time.Duration
 	MiningCandidateCacheTimeout         time.Duration
+	BlockchainSubscriptionTimeout       time.Duration
 }
 
 type BlockValidationSettings struct {
@@ -295,6 +299,10 @@ type BlockValidationSettings struct {
 	ExtendTransactionTimeout time.Duration // Timeout for extending transactions (default: 120s)
 	// Concurrency limits
 	GetBlockTransactionsConcurrency int // Concurrency limit for getBlockTransactions (default: 64)
+	// Priority queue and fork processing settings
+	NearForkThreshold int // Heights within this range are considered "near" forks (default: coinbase maturity / 2)
+	MaxParallelForks  int // Maximum number of forks to process in parallel (default: 4)
+	MaxTrackedForks   int // Maximum total number of forks to track (default: 1000)
 }
 
 type ValidatorSettings struct {
@@ -325,37 +333,39 @@ type AdvertisingSettings struct {
 }
 
 type UtxoStoreSettings struct {
-	UtxoStore                      *url.URL
-	BlockHeightRetention           uint32
-	UnminedTxRetention             uint32
-	ParentPreservationBlocks       uint32
-	OutpointBatcherSize            int
-	OutpointBatcherDurationMillis  int
-	SpendBatcherDurationMillis     int
-	SpendBatcherSize               int
-	SpendBatcherConcurrency        int
-	StoreBatcherDurationMillis     int
-	StoreBatcherSize               int
-	UtxoBatchSize                  int
-	IncrementBatcherSize           int
-	IncrementBatcherDurationMillis int
-	SetDAHBatcherSize              int
-	SetDAHBatcherDurationMillis    int
-	LockedBatcherSize              int
-	LockedBatcherDurationMillis    int
-	GetBatcherSize                 int
-	GetBatcherDurationMillis       int
-	DBTimeout                      time.Duration
-	UseExternalTxCache             bool
-	ExternalizeAllTransactions     bool
-	PostgresMaxIdleConns           int
-	PostgresMaxOpenConns           int
-	VerboseDebug                   bool
-	UpdateTxMinedStatus            bool
-	MaxMinedRoutines               int
-	MaxMinedBatchSize              int
-	BlockHeightRetentionAdjustment int32 // Adjustment to GlobalBlockHeightRetention (can be positive or negative)
-	DisableDAHCleaner              bool  // Disable the DAH cleaner process completely
+	UtxoStore                         *url.URL
+	BlockHeightRetention              uint32
+	UnminedTxRetention                uint32
+	ParentPreservationBlocks          uint32
+	OutpointBatcherSize               int
+	OutpointBatcherDurationMillis     int
+	SpendBatcherDurationMillis        int
+	SpendBatcherSize                  int
+	SpendBatcherConcurrency           int
+	StoreBatcherDurationMillis        int
+	StoreBatcherSize                  int
+	UtxoBatchSize                     int
+	IncrementBatcherSize              int
+	IncrementBatcherDurationMillis    int
+	SetDAHBatcherSize                 int
+	SetDAHBatcherDurationMillis       int
+	LockedBatcherSize                 int
+	LockedBatcherDurationMillis       int
+	LongestChainBatcherSize           int
+	LongestChainBatcherDurationMillis int
+	GetBatcherSize                    int
+	GetBatcherDurationMillis          int
+	DBTimeout                         time.Duration
+	UseExternalTxCache                bool
+	ExternalizeAllTransactions        bool
+	PostgresMaxIdleConns              int
+	PostgresMaxOpenConns              int
+	VerboseDebug                      bool
+	UpdateTxMinedStatus               bool
+	MaxMinedRoutines                  int
+	MaxMinedBatchSize                 int
+	BlockHeightRetentionAdjustment    int32 // Adjustment to GlobalBlockHeightRetention (can be positive or negative)
+	DisableDAHCleaner                 bool  // Disable the DAH cleaner process completely
 	// Cleanup-specific settings
 	CleanupParentUpdateBatcherSize           int // Batch size for parent record updates during cleanup
 	CleanupParentUpdateBatcherDurationMillis int // Batch duration for parent record updates during cleanup (ms)
@@ -365,10 +375,7 @@ type UtxoStoreSettings struct {
 }
 
 type P2PSettings struct {
-	BestBlockTopic      string
-	BlockTopic          string
-	BootstrapAddresses  []string
-	BootstrapPersistent bool
+	BootstrapAddresses []string
 
 	GRPCAddress       string
 	GRPCListenAddress string
@@ -379,59 +386,28 @@ type P2PSettings struct {
 	ListenAddresses    []string
 	AdvertiseAddresses []string
 	ListenMode         string // "full" (default) or "listen_only"
-	MiningOnTopic      string
 
 	PeerID string
 	Port   int
 
-	PrivateKey      string
+	PrivateKey string //nolint:gosec // G117 - field name matches secret pattern but is not a hardcoded credential
+
+	BlockTopic      string
+	NodeStatusTopic string // pubsub topic for node status messages
 	RejectedTxTopic string
+	SubtreeTopic    string
 
-	SharedKey   string
 	StaticPeers []string
-
-	SubtreeTopic          string
-	HandshakeTopic        string // new pubsub topic for version/verack handshake
-	HandshakeTopicSize    int
-	HandshakeTopicTimeout time.Duration
-	NodeStatusTopic       string // pubsub topic for node status messages
-
-	DHTProtocolID   string
-	DHTUsePrivate   bool
-	OptimiseRetries bool
-
-	// libp2p feature toggles
-	EnableNATService   bool
-	EnableHolePunching bool
-	EnableRelay        bool
-	EnableNATPortMap   bool
-
-	// Enhanced NAT traversal features (from go-p2p improvements)
-	EnableAutoNATv2    bool   // Enable AutoNAT v2 for better address discovery
-	ForceReachability  string // Force reachability: "public", "private", or "" (auto-detect)
-	EnableRelayService bool   // Whether to act as a relay for other nodes
-
-	// Connection management (from go-p2p improvements)
-	EnableConnManager bool          // Enable connection manager with high/low water marks
-	ConnLowWater      int           // Minimum number of connections to maintain
-	ConnHighWater     int           // Maximum number of connections before pruning
-	ConnGracePeriod   time.Duration // Grace period before pruning new connections
-	EnableConnGater   bool          // Enable connection gater for fine-grained control
-	MaxConnsPerPeer   int           // Maximum connections allowed per peer
+	RelayPeers  []string // Relay peers for NAT traversal (multiaddr strings)
 
 	// Peer persistence (from go-p2p improvements)
-	EnablePeerCache bool          // Enable peer caching for persistence across restarts
-	PeerCacheDir    string        // Directory for peer cache file (empty = binary directory)
-	MaxCachedPeers  int           // Maximum number of peers to cache
-	PeerCacheTTL    time.Duration // How long to keep cached peers
+	PeerCacheDir string // Directory for peer cache file (empty = binary directory)
 
 	BanThreshold int
 	BanDuration  time.Duration
 
 	// Sync manager configuration
-	MinPeersForSync    int           // Minimum number of peers needed before selecting sync peer
-	MaxWaitForMinPeers time.Duration // Maximum time to wait for minimum peers
-	ForceSyncPeer      string        // Force sync from specific peer ID, overrides automatic selection
+	ForceSyncPeer string // Force sync from specific peer ID, overrides automatic selection
 
 	// Address sharing configuration
 	// SharePrivateAddresses controls whether to advertise private/local IP addresses to peers.
@@ -442,6 +418,11 @@ type P2PSettings struct {
 	PeerMapMaxSize         int           // Maximum entries in peer maps (default: 100000)
 	PeerMapTTL             time.Duration // Time-to-live for peer map entries (default: 30m)
 	PeerMapCleanupInterval time.Duration // Cleanup interval (default: 5m)
+
+	// Peer health checker configuration
+	PeerHealthCheckInterval       time.Duration // Interval between health checks (default: 30s)
+	PeerHealthHTTPTimeout         time.Duration // HTTP timeout for DataHub checks (default: 5s)
+	PeerHealthRemoveAfterFailures int           // Consecutive failures before removing a peer (default: 3)
 }
 
 type CoinbaseSettings struct {
@@ -475,24 +456,16 @@ type SubtreeValidationSettings struct {
 	QuorumPath                                string
 	QuorumAbsoluteTimeout                     time.Duration
 	SubtreeStore                              *url.URL
-	FailFastValidation                        bool
 	GetMissingTransactions                    int
 	GRPCAddress                               string
 	GRPCListenAddress                         string
 	ProcessTxMetaUsingCacheBatchSize          int
 	ProcessTxMetaUsingCacheConcurrency        int
 	ProcessTxMetaUsingCacheMissingTxThreshold int
-	ProcessTxMetaUsingStoreBatchSize          int
-	ProcessTxMetaUsingStoreConcurrency        int
-	ProcessTxMetaUsingStoreMissingTxThreshold int
 	SubtreeBlockHeightRetention               uint32
 	SubtreeDAHConcurrency                     int
-	SubtreeValidationTimeout                  int
-	SubtreeValidationAbandonThreshold         int
 	TxMetaCacheEnabled                        bool
 	TxMetaCacheMaxMB                          int
-	ValidationMaxRetries                      int
-	ValidationRetrySleep                      string
 	TxChanBufferSize                          int
 	BatchMissingTransactions                  bool
 	SpendBatcherSize                          int
@@ -503,7 +476,8 @@ type SubtreeValidationSettings struct {
 	BlockHeightRetentionAdjustment int32 // Adjustment to GlobalBlockHeightRetention (can be positive or negative)
 	OrphanageTimeout               time.Duration
 	// Concurrency limits
-	CheckBlockSubtreesConcurrency int // Concurrency limit for CheckBlockSubtrees operations (default: 32)
+	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
+	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)
 }
 
 type LegacySettings struct {
@@ -520,7 +494,6 @@ type LegacySettings struct {
 	PrintInvMessages                 bool
 	GRPCAddress                      string
 	AllowBlockPriority               bool
-	WriteMsgBlocksToDisk             bool // Write blocks to disk when syncing with other nodes, this reduces the memory footprint
 	GRPCListenAddress                string
 	SavePeers                        bool
 	AllowSyncCandidateFromLocalPeers bool

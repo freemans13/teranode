@@ -6,15 +6,15 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // batchItem represents an item in a transaction batch.
@@ -186,8 +186,16 @@ func (s *Client) Health(ctx context.Context, checkLiveness bool) (int, string, e
 	// If all dependencies are ready, return http.StatusOK
 	// A failed dependency check does not imply the service needs restarting
 	resp, err := s.client.HealthGRPC(ctx, &blockassembly_api.EmptyMessage{})
-	if err != nil || !resp.GetOk() {
-		return http.StatusFailedDependency, resp.GetDetails(), errors.UnwrapGRPC(err)
+	if err != nil {
+		return http.StatusFailedDependency, "", errors.UnwrapGRPC(err)
+	}
+
+	if !resp.GetOk() {
+		details := ""
+		if resp != nil {
+			details = resp.GetDetails()
+		}
+		return http.StatusFailedDependency, details, errors.NewServiceError("health check failed: %s", details)
 	}
 
 	return http.StatusOK, "OK", nil
@@ -385,8 +393,26 @@ func (s *Client) sendBatchToBlockAssembly(ctx context.Context, batch []*batchIte
 //
 // Returns:
 //   - error: Any error encountered during reset
-func (s *Client) ResetBlockAssembly(_ context.Context) error {
-	_, err := s.client.ResetBlockAssembly(context.Background(), &blockassembly_api.EmptyMessage{})
+func (s *Client) ResetBlockAssembly(ctx context.Context) error {
+	_, err := s.client.ResetBlockAssembly(ctx, &blockassembly_api.EmptyMessage{})
+
+	unwrappedErr := errors.UnwrapGRPC(err)
+	if unwrappedErr == nil {
+		return nil
+	}
+
+	return unwrappedErr
+}
+
+// ResetBlockAssemblyFully triggers a full reset of the block assembly state.
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//
+// Returns:
+//   - error: Any error encountered during reset
+func (s *Client) ResetBlockAssemblyFully(ctx context.Context) error {
+	_, err := s.client.ResetBlockAssemblyFully(ctx, &blockassembly_api.EmptyMessage{})
 
 	unwrappedErr := errors.UnwrapGRPC(err)
 	if unwrappedErr == nil {
@@ -435,7 +461,7 @@ func (s *Client) GetBlockAssemblyBlockCandidate(ctx context.Context) (*model.Blo
 		return nil, errors.UnwrapGRPC(err)
 	}
 
-	block, err := model.NewBlockFromBytes(resp.Block, nil)
+	block, err := model.NewBlockFromBytes(resp.Block)
 	if err != nil {
 		return nil, errors.NewServiceError("failed to create block from bytes", err)
 	}

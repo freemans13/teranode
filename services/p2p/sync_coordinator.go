@@ -7,13 +7,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"google.golang.org/protobuf/proto"
 )
@@ -198,6 +198,18 @@ func (sc *SyncCoordinator) HandlePeerDisconnected(peerID peer.ID) {
 func (sc *SyncCoordinator) HandleCatchupFailure(reason string) {
 	sc.logger.Infof("[SyncCoordinator] Handling catchup failure: %s", reason)
 
+	// Get the failed peer before clearing
+	sc.mu.RLock()
+	failedPeer := sc.currentSyncPeer
+	sc.mu.RUnlock()
+
+	// Mark the failed peer as unhealthy BEFORE clearing and triggering sync
+	// This ensures the peer selector won't re-select the same peer
+	if failedPeer != "" {
+		sc.logger.Infof("[SyncCoordinator] Marking failed peer %s as unhealthy", failedPeer)
+		sc.registry.UpdateHealth(failedPeer, false)
+	}
+
 	// Clear current sync peer
 	sc.ClearSyncPeer()
 
@@ -321,16 +333,18 @@ func (sc *SyncCoordinator) handleFSMTransition(currentState *blockchain_api.FSMS
 					currentPeer, localHeight, peerInfo.Height)
 
 				// Add ban score for catchup failure
-				if sc.banManager != nil {
-					score, banned := sc.banManager.AddScore(string(currentPeer), ReasonCatchupFailure)
-					if banned {
-						sc.logger.Warnf("[SyncCoordinator] Peer %s banned after catchup failure (score: %d)", currentPeer, score)
-					} else {
-						sc.logger.Infof("[SyncCoordinator] Added ban score to peer %s for catchup failure (score: %d)", currentPeer, score)
-					}
-					// Update the ban status in the registry so the peer selector knows about it
-					sc.registry.UpdateBanStatus(currentPeer, score, banned)
-				}
+				// Disabled for now, there are many situations where this can happen, we should ban based on actual
+				// errors happening in the sync, not during FSM transitions
+				// if sc.banManager != nil {
+				//	score, banned := sc.banManager.AddScore(string(currentPeer), ReasonCatchupFailure)
+				//	if banned {
+				//		sc.logger.Warnf("[SyncCoordinator] Peer %s banned after catchup failure (score: %d)", currentPeer, score)
+				//	} else {
+				//		sc.logger.Infof("[SyncCoordinator] Added ban score to peer %s for catchup failure (score: %d)", currentPeer, score)
+				//	}
+				//	// Update the ban status in the registry so the peer selector knows about it
+				//	sc.registry.UpdateBanStatus(currentPeer, score, banned)
+				// }
 
 				sc.ClearSyncPeer()
 				_ = sc.TriggerSync()
@@ -532,8 +546,6 @@ func (sc *SyncCoordinator) UpdatePeerInfo(peerID peer.ID, height int32, blockHas
 	sc.registry.UpdateHeight(peerID, height, blockHash)
 	if dataHubURL != "" {
 		sc.registry.UpdateDataHubURL(peerID, dataHubURL)
-		// Trigger immediate health check for new DataHub URL
-		sc.healthChecker.CheckPeerNow(peerID)
 	}
 }
 

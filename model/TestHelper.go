@@ -11,17 +11,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/txmetacache"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/txmetacache"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -61,7 +60,7 @@ func GenerateTestBlock(transactionIDCount uint64, subtreeStore *TestLocalSubtree
 
 		_ = blockFile.Close()
 
-		block, err := NewBlockFromBytes(blockBytes, nil)
+		block, err := NewBlockFromBytes(blockBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -338,7 +337,6 @@ func GenerateTestBlock(transactionIDCount uint64, subtreeStore *TestLocalSubtree
 		SizeInBytes:      123123,
 		Subtrees:         subtreeHashes,
 		Height:           123,
-		settings:         settings.NewSettings(),
 	}
 
 	blockFile, err = os.Create(TestFileNameTemplateBlock)
@@ -376,7 +374,7 @@ func LoadTxMetaIntoMemory() error {
 	defer file.Close()
 
 	// create a buffered reader for the file
-	bufReader := bufio.NewReaderSize(file, 55*1024*1024)
+	bufReader := bufio.NewReaderSize(file, 1024*64)
 
 	if err = ReadTxMeta(bufReader, TestCachedTxMetaStore.(*txmetacache.TxMetaCache)); err != nil {
 		return err

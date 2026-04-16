@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // MockService is a configurable mock implementation of the Service interface

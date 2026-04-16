@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/p2p/p2p_api"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/services/p2p/p2p_api"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"

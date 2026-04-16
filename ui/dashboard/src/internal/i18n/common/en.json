@@ -235,7 +235,9 @@
           "confirmations_value": "{{ count }} Confirmations",
           "merkleroot": "Merkle Root",
           "chainwork": "Chainwork",
-          "miner": "Miner"
+          "miner": "Miner",
+          "invalid": "Invalid",
+          "processed_at": "Processed At"
         }
       },
       "coinbase": {
@@ -264,7 +266,8 @@
         "title": "Subtree Details #{{ height }}",
         "tab": {
           "overview": "Overview",
-          "json": "JSON"
+          "json": "JSON",
+          "merkleproof": "Merkle Proof"
         },
         "fields": {
           "block": "Block",
@@ -368,8 +371,11 @@
           "version": "Version",
           "fsm_state": "State",
           "height": "Height",
-          "chainwork_score": "Chainwork",
+          "chainwork_score": "Chain Rank",
           "tx_assembly": "TX Assembly",
+          "subtree_assembly": "Subtree Assembly",
+          "min_mining_fee": "Min Fee",
+          "connected_peers": "Peers",
           "uptime": "Uptime",
           "tx_count": "TX Count",
           "size_in_bytes": "Size",
@@ -382,10 +388,6 @@
           "last_update": "Last Update"
         }
       }
-    },
-    "updates": {
-      "menu-label": "Updates",
-      "title": "Updates"
     },
     "admin": {
       "menu-label": "Admin",

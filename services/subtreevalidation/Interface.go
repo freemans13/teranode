@@ -30,8 +30,8 @@ package subtreevalidation
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/stretchr/testify/mock"
 )
 

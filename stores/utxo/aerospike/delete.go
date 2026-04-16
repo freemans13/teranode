@@ -61,9 +61,9 @@ import (
 	"context"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // Delete removes a transaction and its associated UTXOs from the store.
@@ -119,7 +119,11 @@ func (s *Store) Delete(_ context.Context, hash *chainhash.Hash) error {
 			return nil
 		}
 
-		prometheusUtxoMapErrors.WithLabelValues("Delete", err.Error()).Inc()
+		if e, ok := err.(*aerospike.AerospikeError); ok {
+			prometheusUtxoMapErrors.WithLabelValues("Delete", e.ResultCode.String()).Inc()
+		} else {
+			prometheusUtxoMapErrors.WithLabelValues("Delete", "unknown").Inc()
+		}
 
 		return errors.NewStorageError("error in aerospike delete key", err)
 	}

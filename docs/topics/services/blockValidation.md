@@ -19,13 +19,6 @@
 6. [Directory Structure and Main Files](#6-directory-structure-and-main-files)
 7. [How to run](#7-how-to-run)
 8. [Configuration options (settings flags)](#8-configuration-options-settings-flags)
-    - [Network and Communication Settings](#network-and-communication-settings)
-    - [Kafka and Concurrency Settings](#kafka-and-concurrency-settings)
-    - [Performance and Optimization](#performance-and-optimization)
-    - [Transaction Processing](#transaction-processing)
-    - [Bloom Filter Management](#bloom-filter-management)
-    - [Advanced Settings](#advanced-settings)
-    - [Storage and State Management](#storage-and-state-management)
 9. [Other Resources](#9-other-resources)
 
 ## 1. Description
@@ -86,14 +79,14 @@ The block validator is a service that validates blocks. After validating them, i
 - The server will request the block data from the remote node (`DoHTTPRequest()`).
 - If the parent block is not known, it will be added to the catchupCh channel for processing. We stop at this point, as we can no longer proceed. The catchup process will be explained in the next section (section 2.2.2).
 - If the parent is known, the block will be validated.
-  - First, the service validates all the block subtrees.
-    - For each subtree, we check if it is known. If not, we kick off a subtree validation process (see section 2.2.3 for more details).
-  - The validator retrieves the last 100 block headers, which are used to validate the block data. We can see more about this specific step in the section 2.2.4.
-  - The validator stores the coinbase Tx in the UTXO Store and the Tx Store.
-  - The validator adds the block to the Blockchain.
-  - For each Subtree in the block, the validator updates the TTL (Time To Live) to zero for the subtree. This allows the Store to clear out data the services will no longer use.
-  - For each Tx for each Subtree, we set the Tx as mined in the UTXO Store. This allows the UTXO Store to know which block(s) the Tx is in.
-  - Should an error occur during the validation process, the block will be invalidated and removed from the blockchain.
+    - First, the service validates all the block subtrees.
+        - For each subtree, we check if it is known. If not, we kick off a subtree validation process (see section 2.2.3 for more details).
+    - The validator retrieves the last 100 block headers, which are used to validate the block data. We can see more about this specific step in the section 2.2.4.
+    - The validator stores the coinbase Tx in the UTXO Store and the Tx Store.
+    - The validator adds the block to the Blockchain.
+    - For each Subtree in the block, the validator updates the TTL (Time To Live) to zero for the subtree. This allows the Store to clear out data the services will no longer use.
+    - For each Tx for each Subtree, we set the Tx as mined in the UTXO Store. This allows the UTXO Store to know which block(s) the Tx is in.
+    - Should an error occur during the validation process, the block will be invalidated and removed from the blockchain.
 
 Note - there is a `optimisticMining` setting that allows to reverse the block validation and block addition to the blockchain steps.
 
@@ -159,6 +152,9 @@ During quick validation, the system also:
 - Reconstructs full subtree data (`.subtree`) with proper fee and size information
 - Stores transactions in non-extended format to reduce storage overhead
 - Extends transaction data on-demand only when needed for validation
+    - Transactions received in standard Bitcoin format are automatically extended in-memory
+    - Parent transaction data is retrieved from the UTXO store as needed
+    - Extension is transparent and does not affect storage format
 
 If quick validation encounters any errors, the system automatically falls back to normal validation to ensure correctness.
 
@@ -169,7 +165,6 @@ Should the validation process for a block encounter a subtree it does not know a
 ![block_validation_subtree_validation_request.svg](img/plantuml/subtreevalidation/block_validation_subtree_validation_request.svg)
 
 If any transaction under the subtree is also missing, the subtree validation process will kick off a recovery process for those transactions.
-
 
 #### 2.2.5. Block Data Validation
 
@@ -214,8 +209,8 @@ Teranode maintains bloom filters for recent blocks to efficiently detect re-pres
 - **Storage**: Bloom filters are stored in both memory (for active validation) and in the subtree store (for persistence)
 - **Retention**: Filters are maintained for a configurable number of recent blocks (`blockvalidation_bloom_filter_retention_size`)
 - **TTL Ordering**: The system enforces a strict TTL (Time-To-Live) ordering: txmetacache < utxo store < bloom filter
-  - This ensures that even if a transaction is pruned from txmetacache, the bloom filter can still detect its re-presentation
-  - The longer retention period for bloom filters provides an extended window for detecting re-presented transactions
+    - This ensures that even if a transaction is pruned from txmetacache, the bloom filter can still detect its re-presentation
+    - The longer retention period for bloom filters provides an extended window for detecting re-presented transactions
 
 ##### The validOrderAndBlessed Mechanism
 
@@ -270,13 +265,13 @@ The `BlockValidation` proceeds to mark all transactions within the block as "min
 >
 ## 3. gRPC Protobuf Definitions
 
-The Block Validation Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen [here](../../references/protobuf_docs/blockvalidationProto.md).
+The Block Validation Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen in the [Block Validation protobuf documentation](../../references/protobuf_docs/blockvalidationProto.md).
 
 ## 4. Data Model
 
 - [Block Data Model](../datamodel/block_data_model.md): Contain lists of subtree identifiers.
 - [Subtree Data Model](../datamodel/subtree_data_model.md): Contain lists of transaction IDs and their Merkle root.
-- [Extended Transaction Data Model](../datamodel/transaction_data_model.md): Includes additional metadata to facilitate processing.
+- [Transaction Data Model](../datamodel/transaction_data_model.md): Comprehensive documentation covering both standard Bitcoin format and Extended Format (BIP-239), including automatic format conversion during block validation.
 - [UTXO Data Model](../datamodel/utxo_data_model.md): UTXO and UTXO Metadata data models for managing unspent transaction outputs.
 
 ## 5. Technology
@@ -340,174 +335,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 
 ## 8. Configuration options (settings flags)
 
-The Block Validation service configuration can be adjusted through environment variables or command-line flags. This section provides a comprehensive overview of all available configuration options organized by functional category.
-
-### Network and Communication Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockvalidation_grpcAddress` | string | "localhost:8088" | Address that other services use to connect to this service | Affects how other services discover and communicate with the Block Validation service |
-| `blockvalidation_grpcListenAddress` | string | ":8088" | Network interface and port the service listens on for gRPC connections | Controls network binding and accessibility of the service |
-
-### Kafka and Concurrency Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `kafka_blocksConfig` | string | (none) | Kafka configuration for block messages | Required for consuming blocks from Kafka |
-| `blockvalidation_kafkaWorkers` | int | 0 (auto) | Number of Kafka consumer workers | Controls parallelism for Kafka-based block validation |
-
-### Performance and Optimization
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockvalidation_batch_missing_transactions` | bool | false | When enabled, missing transactions are fetched in batches | Improves network efficiency at the cost of slightly increased latency |
-| `blockvalidation_quickValidationEnabled` | bool | true | Enable quick validation for checkpointed blocks | Dramatically improves sync speed for historical blocks |
-| `blockvalidation_quickValidationCheckpointHeight` | int | varies | Height below which quick validation applies | Controls which blocks use optimized validation |
-| `blockvalidation_concurrency_createAllUTXOs` | int | CPU/2 (min 4) | Parallelism for UTXO creation during quick validation | Higher values improve performance but increase resource usage |
-| `blockvalidation_concurrency_spendAllTransactions` | int | CPU/2 (min 4) | Parallelism for spending transactions during quick validation | Controls parallel processing during validation |
-| `blockvalidation_processTxMetaUsingCache_BatchSize` | int | 1024 | Batch size for processing transaction metadata using cache | Affects performance and memory usage during cache operations |
-| `blockvalidation_processTxMetaUsingCache_Concurrency` | int | 32 | Concurrency level for processing transaction metadata using cache | Controls parallel cache operations |
-| `blockvalidation_processTxMetaUsingCache_MissingTxThreshold` | int | 1 | Threshold for switching to store-based processing when missing transactions | Controls fallback behavior when cache misses occur |
-| `blockvalidation_processTxMetaUsingStore_BatchSize` | int | CPU/2 (min 4) | Batch size for processing transaction metadata using store | Affects performance during store operations |
-| `blockvalidation_processTxMetaUsingStore_Concurrency` | int | 32 | Concurrency level for processing transaction metadata using store | Controls parallel store operations |
-| `blockvalidation_processTxMetaUsingStore_MissingTxThreshold` | int | 1 | Threshold for store-based processing when missing transactions | Controls fallback behavior for store operations |
-| `blockvalidation_skipCheckParentMined` | bool | false | Skips checking if parent block is mined during validation | Performance optimization that may reduce validation accuracy |
-| `blockvalidation_subtreeFoundChConcurrency` | int | 1 | Concurrency level for subtree found channel processing | Controls parallel subtree processing |
-| `blockvalidation_subtree_validation_abandon_threshold` | int | 1 | Threshold for abandoning subtree validation | Controls when to give up on problematic subtrees |
-| `blockvalidation_validateBlockSubtreesConcurrency` | int | CPU/2 (min 4) | Concurrency level for validating block subtrees | Higher values improve performance but increase resource usage |
-| `blockvalidation_validation_max_retries` | int | 3 | Maximum number of retries for validation operations | Controls resilience to transient failures |
-| `blockvalidation_validation_retry_sleep` | duration | 5s | Sleep duration between validation retries | Controls backoff timing for retry operations |
-| `blockvalidation_isParentMined_retry_max_retry` | int | 20 | Maximum retries for checking if parent block is mined | Controls persistence when checking parent block status |
-| `blockvalidation_isParentMined_retry_backoff_multiplier` | int | 30 | Backoff multiplier for parent mined check retries | Controls exponential backoff timing |
-| `blockvalidation_subtreeGroupConcurrency` | int | 1 | Concurrency level for subtree group processing | Controls parallel processing of subtree groups |
-| `blockvalidation_blockFoundCh_buffer_size` | int | 1000 | Buffer size for block found channel | Controls memory usage and throughput for block notifications |
-| `blockvalidation_catchupCh_buffer_size` | int | 10 | Buffer size for catchup channel | Controls memory usage for catchup operations |
-| `blockvalidation_useCatchupWhenBehind` | bool | false | Enables catchup mechanism when node is behind | Improves sync performance but increases complexity |
-| `blockvalidation_catchupConcurrency` | int | CPU/2 (min 4) | Concurrency level for catchup operations | Controls parallel processing during catchup |
-| `blockvalidation_check_subtree_from_block_timeout` | duration | 5m | Timeout for checking subtree from block | Controls maximum wait time for subtree operations |
-| `blockvalidation_check_subtree_from_block_retries` | int | 5 | Maximum retries for subtree from block checks | Controls resilience for subtree operations |
-| `blockvalidation_check_subtree_from_block_retry_backoff_duration` | duration | 30s | Backoff duration for subtree check retries | Controls timing between retry attempts |
-| `blockvalidation_secret_mining_threshold` | uint32 | 10 | Threshold for detecting secret mining attacks | Security parameter for chain reorganization detection |
-| `blockvalidation_previous_block_header_count` | uint64 | 100 | Number of previous block headers to maintain | Controls memory usage and validation depth |
-| `blockvalidation_maxPreviousBlockHeadersToCheck` | uint64 | 100 | Maximum previous block headers to check during validation | Limits validation scope for performance |
-| `blockvalidation_fail_fast_validation` | bool | true | Enables fail-fast validation mode | Improves performance by stopping validation early on errors |
-| `blockvalidation_finalizeBlockValidationConcurrency` | int | 8 | Concurrency level for finalizing block validation | Controls parallel finalization operations |
-| `blockvalidation_getMissingTransactions` | int | 32 | Concurrency level for retrieving missing transactions | Controls parallel transaction retrieval |
-
-### Transaction Processing
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockvalidation_localSetTxMinedConcurrency` | int | 8 | Concurrency level for marking transactions as mined | Higher values improve performance but increase memory usage |
-| `blockvalidation_missingTransactionsBatchSize` | int | 5000 | Batch size for retrieving missing transactions | Larger batches improve throughput but increase memory usage |
-
-### Bloom Filter Management
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockvalidation_bloom_filter_retention_size` | uint32 | GlobalBlockHeightRetention + 2 | Number of recent blocks to maintain bloom filters for | Affects memory usage and duplicate transaction detection efficiency. Automatically set based on global retention settings |
-
-### Advanced Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockvalidation_optimistic_mining` | bool | true | When enabled, blocks are conditionally accepted before full validation | Dramatically improves throughput at the cost of temporary chain inconsistency if validation fails |
-| `blockvalidation_invalidBlockTracking` | bool | true | Track invalid blocks during validation | Prevents reprocessing of known invalid blocks |
-| `blockvalidation_validation_warmup_count` | int | 128 | Number of validation operations during warmup | Helps prime caches and establish performance baselines |
-| `excessiveblocksize` | int | 4GB | Maximum allowed block size | Limits resource consumption for extremely large blocks |
-
-### Storage and State Management
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockValidationMaxRetries` | int | 3 | Maximum retry attempts for block validation operations | Controls resilience and retry behavior for failed validation operations |
-| `blockValidationRetrySleep` | duration | 1s | Sleep duration between retry attempts | Controls retry timing and system load during failures |
-| `utxostore` | URL | (none) | URL for the UTXO store | Required for UTXO validation and updates |
-| `fsm_state_restore` | bool | false | Enables FSM state restoration | Affects recovery behavior after service restart |
-| `blockvalidation_subtreeBlockHeightRetention` | uint32 | (global setting) | How long to keep subtrees (in terms of block height) | Affects storage utilization and historical data availability |
-
-### Validator Integration Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockValidationDelay` | int | 0 | Delay for block validation operations in validator | Controls timing of validation operations within the validator component |
-| `blockValidationMaxRetries` | int | 3 | Maximum retries for validator block validation operations | Controls validator-specific retry behavior for block validation |
-| `blockValidationRetrySleep` | string | "1s" | Sleep duration between validator retry attempts | Controls validator retry timing and backoff behavior |
-
-### Policy and Chain Configuration Dependencies
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `excessiveblocksize` | int | 4GB | Maximum allowed block size (Policy.ExcessiveBlockSize) | Controls block size validation limits in ValidateBlock() - blocks exceeding this size are rejected |
-| `network` | string | "mainnet" | Network type (mainnet/testnet/regtest) affecting ChainCfgParams | Controls chain-specific parameters including MaxCoinbaseScriptSigSize for coinbase validation |
-
-### Missing Retry and Backoff Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `blockvalidation_arePreviousBlocksProcessed_max_retry` | int | 20 | Maximum retries for previous block processing checks | Controls retry behavior when verifying previous block processing status |
-| `blockvalidation_arePreviousBlocksProcessed_retry_backoff_multiplier` | int | 30 | Backoff multiplier for previous block processing retries | Controls exponential backoff timing for previous block processing verification |
-
-## Configuration Interactions and Dependencies
-
-Many configuration settings interact with each other to affect overall system behavior. Understanding these interactions is crucial for optimal tuning.
-
-### Optimistic Mining
-
-The `blockvalidation_optimistic_mining` setting enables a performance optimization where blocks are conditionally accepted before full validation completes. This dramatically improves blockchain throughput but introduces a risk of temporary chain inconsistency if validation later fails.
-
-When enabled:
-
-- The system achieves higher throughput and lower latency
-- Validation continues asynchronously after block acceptance
-- If validation fails, a chain reorganization may be necessary
-
-Related settings that affect this behavior include:
-
-- `blockvalidation_validation_max_retries` - Controls resilience during validation
-- `blockvalidation_validation_retry_sleep` - Affects backoff behavior during retries
-
-### Bloom Filter Operations
-
-Bloom filters are used to efficiently detect duplicate transactions and optimize validation performance. The Block Validation Service manages bloom filters with the following operational characteristics:
-
-**Creation and Storage**:
-
-- Bloom filters are created for each validated block containing transaction hashes
-- Filters are stored in the subtree store with automatic expiration based on `blockvalidation_bloom_filter_retention_size`
-- The retention size is automatically calculated as `GlobalBlockHeightRetention + 2` to ensure adequate coverage
-
-**Performance Impact**:
-
-- **Memory Usage**: Each bloom filter consumes memory proportional to the number of transactions in the block
-- **CPU Overhead**: Filter creation requires hashing all transaction IDs in the block
-- **Storage I/O**: Filters are persisted to disk and retrieved during validation operations
-
-**Operational Considerations**:
-
-- Bloom filters reduce false positive rates for duplicate transaction detection
-- Automatic pruning prevents unbounded storage growth
-- Filter retrieval from subtree store may introduce latency during validation
-- Consider increasing retention size for nodes with high transaction volumes
-
-### Transaction Processing Pipeline
-
-The transaction processing pipeline uses a hybrid approach combining cache and store operations:
-
-- **Subtree Validation Integration**: Transaction metadata operations are delegated to the Subtree Validation Service, which may use caching internally via `subtreevalidation_txMetaCacheEnabled`
-- **Batch Processing**: Transaction operations are batched using `blockvalidation_processTxMetaUsingStore_BatchSize` and `blockvalidation_processTxMetaUsingCache_BatchSize`
-- **Concurrency Control**: Parallel processing is controlled by `blockvalidation_processTxMetaUsingStore_Concurrency` and related settings
-- **Fallback Behavior**: When cache operations fail, the system falls back to store-based processing based on threshold settings
-
-### Synchronization Strategy
-
-When a node falls behind the blockchain tip, its synchronization strategy is controlled by:
-
-- `blockvalidation_useCatchupWhenBehind` - Enables specialized catchup mode
-- `blockvalidation_catchupConcurrency` - Controls parallel processing during catchup
-- `blockvalidation_catchupCh_buffer_size` - Affects buffer capacity for catchup operations
-
-Optimal settings depend on hardware capabilities and network conditions.
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [block Validation Settings Reference](../../references/settings/services/blockvalidation_settings.md).
 
 ## 9. Other Resources
 

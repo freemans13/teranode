@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 func setupTestServer() (*httptest.Server, *HTTPStore, error) {

@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: teranode-operator-config
 data:
-  # overwrite defaults from the main config: https://github.com/bitcoin-sv/teranode/blob/master/settings.conf
+  # overwrite defaults from the main config: https://github.com/bsv-blockchain/teranode/blob/master/settings.conf
   SETTINGS_CONTEXT: "operator"
   network: "testnet"
   clientName: "teranode-operator"

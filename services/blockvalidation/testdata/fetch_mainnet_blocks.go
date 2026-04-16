@@ -16,8 +16,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // TestBlockData stores the block data in JSON format

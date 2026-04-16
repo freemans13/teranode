@@ -3,7 +3,7 @@ package consensus
 import (
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // MapValidatorError maps validator package errors to our ScriptError types

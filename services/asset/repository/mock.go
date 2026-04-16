@@ -4,12 +4,12 @@ import (
 	"context"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -108,6 +108,16 @@ func (m *Mock) GetBlockByHeight(_ context.Context, height uint32) (*model.Block,
 	return args.Get(0).(*model.Block), args.Error(1)
 }
 
+func (m *Mock) GetBlockByID(_ context.Context, id uint64) (*model.Block, error) {
+	args := m.Called(id)
+
+	if args.Error(1) != nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*model.Block), args.Error(1)
+}
+
 func (m *Mock) GetLastNBlocks(_ context.Context, n int64, includeOrphans bool, fromHeight uint32) ([]*model.BlockInfo, error) {
 	args := m.Called(n, includeOrphans, fromHeight)
 
@@ -167,6 +177,16 @@ func (m *Mock) GetBlockHeadersFromHeight(_ context.Context, height, limit uint32
 	}
 
 	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Error(2)
+}
+
+func (m *Mock) GetBlocksByHeight(_ context.Context, startHeight, endHeight uint32) ([]*model.Block, error) {
+	args := m.Called(startHeight, endHeight)
+
+	if args.Error(1) != nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*model.Block), args.Error(1)
 }
 
 func (m *Mock) GetSubtreeBytes(_ context.Context, hash *chainhash.Hash) ([]byte, error) {
@@ -288,14 +308,26 @@ func (m *Mock) GetBlockHeader(_ context.Context, hash *chainhash.Hash) (*model.B
 	return args.Get(0).(*model.BlockHeader), args.Get(1).(*model.BlockHeaderMeta), args.Error(2)
 }
 
-func (m *Mock) GetBlockLocator(_ context.Context, _ *chainhash.Hash, _ uint32) ([]*chainhash.Hash, error) {
-	return nil, nil
-}
+func (m *Mock) GetBlockLocator(_ context.Context, hash *chainhash.Hash, height uint32) ([]*chainhash.Hash, error) {
+	args := m.Called(hash, height)
 
-func (m *Mock) GetBlockByID(_ context.Context, id uint64) (*model.Block, error) {
-	args := m.Called(id)
 	if args.Error(1) != nil {
 		return nil, args.Error(1)
 	}
-	return args.Get(0).(*model.Block), nil
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*chainhash.Hash), args.Error(1)
+}
+
+func (m *Mock) FindBlocksContainingSubtree(_ context.Context, subtreeHash *chainhash.Hash) ([]uint32, []uint32, []int, error) {
+	args := m.Called(subtreeHash)
+
+	if args.Error(3) != nil {
+		return nil, nil, nil, args.Error(3)
+	}
+
+	return args.Get(0).([]uint32), args.Get(1).([]uint32), args.Get(2).([]int), args.Error(3)
 }

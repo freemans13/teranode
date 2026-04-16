@@ -17,9 +17,9 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetHashOfAncestorBlock retrieves the hash of an ancestor block at a specified depth.

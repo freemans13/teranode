@@ -6,13 +6,13 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/factory"
-	"github.com/bitcoin-sv/teranode/test/utils/aerospike"
-	"github.com/bitcoin-sv/teranode/test/utils/postgres"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/factory"
+	"github.com/bsv-blockchain/teranode/test/utils/aerospike"
+	"github.com/bsv-blockchain/teranode/test/utils/postgres"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -74,7 +74,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 		require.NoError(t, store.Delete(ctx, tx1.TxIDChainHash()))
 		require.NoError(t, store.Delete(ctx, tx2.TxIDChainHash()))
 
-		it, err := store.GetUnminedTxIterator()
+		it, err := store.GetUnminedTxIterator(false)
 		require.NoError(t, err)
 
 		var count int
@@ -114,7 +114,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 		))
 		require.NoError(t, err)
 
-		it, err := store.GetUnminedTxIterator()
+		it, err := store.GetUnminedTxIterator(false)
 		require.NoError(t, err)
 
 		var count int
@@ -132,6 +132,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 			assert.Equal(t, tx1Meta.SizeInBytes, unminedTransaction.Size)
 			assert.Len(t, unminedTransaction.TxInpoints.ParentTxHashes, 1)
 			assert.Greater(t, unminedTransaction.CreatedAt, 0)
+			assert.NotNil(t, unminedTransaction.BlockIDs)
 
 			count++
 		}
@@ -161,7 +162,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 		))
 		require.NoError(t, err)
 
-		it, err := store.GetUnminedTxIterator()
+		it, err := store.GetUnminedTxIterator(false)
 		require.NoError(t, err)
 
 		var count int
@@ -181,7 +182,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 	})
 
 	t.Run("iterator Close cancels context and marks done", func(t *testing.T) {
-		it, err := store.GetUnminedTxIterator()
+		it, err := store.GetUnminedTxIterator(false)
 		require.NoError(t, err)
 
 		assert.NoError(t, it.Close())

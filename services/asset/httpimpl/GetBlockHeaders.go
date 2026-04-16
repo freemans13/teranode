@@ -8,11 +8,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 )
 
@@ -177,6 +177,8 @@ func (h *HTTP) GetBlockHeaders(mode ReadMode) func(c echo.Context) error {
 					TxCount:     headerMetas[idx].TxCount,
 					SizeInBytes: headerMetas[idx].SizeInBytes,
 					Miner:       headerMetas[idx].Miner,
+					Invalid:     headerMetas[idx].Invalid,
+					ProcessedAt: headerMetas[idx].ProcessedAt,
 				})
 			}
 

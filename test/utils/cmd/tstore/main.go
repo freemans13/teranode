@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/bitcoin-sv/teranode/test/utils/tconfig"
-	"github.com/bitcoin-sv/teranode/test/utils/tstore"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/test/utils/tconfig"
+	"github.com/bsv-blockchain/teranode/test/utils/tstore"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )

@@ -1,6 +1,6 @@
 import { formatNum, shortHash } from '$lib/utils/format'
 import { getDetailsUrl, DetailType } from '$internal/utils/urls'
-import { humanTime } from '$internal/utils/format'
+import { humanTime, humanTimeNoSeconds } from '$internal/utils/format'
 import { valueSet } from '$lib/utils/types'
 // eslint-ignore-next-line
 import RenderLink from '$lib/components/table/renderers/render-link/index.svelte'
@@ -9,6 +9,8 @@ import RenderSpanWithTooltip from '$lib/components/table/renderers/render-span-w
 import RenderHashWithMiner from '$lib/components/table/renderers/render-hash-with-miner/index.svelte'
 import RenderClickableSpan from '$lib/components/table/renderers/render-clickable-span/index.svelte'
 import { blockAssemblyModalStore } from '$internal/stores/blockAssemblyModalStore'
+import { blockHashToMiner } from '$internal/stores/p2pStore'
+import { get } from 'svelte/store'
 
 const pageKey = 'page.network.nodes'
 const fieldKey = `${pageKey}.fields`
@@ -25,16 +27,16 @@ export function calculateChainworkScores(nodes: any[]): Map<string, number> {
     }
   })
   
-  // Convert to array and sort in ascending order (lower chainwork = lower score)
+  // Convert to array and sort in descending order (higher chainwork = lower score number)
   const sortedChainworks = Array.from(chainworkSet).sort((a, b) => {
-    // Compare hex strings as big integers
+    // Compare hex strings as big integers (reversed for descending)
     if (a.length !== b.length) {
-      return a.length - b.length
+      return b.length - a.length
     }
-    return a.localeCompare(b)
+    return b.localeCompare(a)
   })
-  
-  // Assign scores (1 is lowest, n is highest)
+
+  // Assign scores (1 is highest chainwork, n is lowest)
   const chainworkToScore = new Map<string, number>()
   sortedChainworks.forEach((chainwork, index) => {
     chainworkToScore.set(chainwork, index + 1)
@@ -56,6 +58,14 @@ export function calculateChainworkScores(nodes: any[]): Map<string, number> {
 export const getColDefs = (t) => {
   return [
     {
+      id: 'fsm_state',
+      name: '',
+      type: 'string',
+      props: {
+        width: '3%',
+      },
+    },
+    {
       id: 'client_name',
       name: t(`${fieldKey}.client_name`),
       type: 'string',
@@ -69,14 +79,6 @@ export const getColDefs = (t) => {
       type: 'string',
       props: {
         width: '12%',
-      },
-    },
-    {
-      id: 'fsm_state',
-      name: t(`${fieldKey}.fsm_state`),
-      type: 'string',
-      props: {
-        width: '10%',
       },
     },
     {
@@ -104,11 +106,35 @@ export const getColDefs = (t) => {
       },
     },
     {
-      id: 'tx_count_in_assembly',
+      id: 'tx_count',
       name: t(`${fieldKey}.tx_assembly`),
       type: 'number',
       props: {
-        width: '8%',
+        width: '6%',
+      },
+    },
+    {
+      id: 'subtree_count',
+      name: t(`${fieldKey}.subtree_assembly`),
+      type: 'number',
+      props: {
+        width: '6%',
+      },
+    },
+    {
+      id: 'min_mining_tx_fee',
+      name: t(`${fieldKey}.min_mining_fee`),
+      type: 'number',
+      props: {
+        width: '7%',
+      },
+    },
+    {
+      id: 'connected_peers_count',
+      name: t(`${fieldKey}.connected_peers`),
+      type: 'number',
+      props: {
+        width: '7%',
       },
     },
     {
@@ -116,7 +142,7 @@ export const getColDefs = (t) => {
       name: t(`${fieldKey}.uptime`),
       type: 'number',
       props: {
-        width: '8%',
+        width: '7%',
       },
     },
     {
@@ -192,20 +218,30 @@ export const renderCells = {
   },
   fsm_state: (idField, item, colId) => {
     const state = item[colId] || '-'
-    let className = ''
-    // Color code based on actual FSM states
+    let emoji = ''
+    let tooltip = state
+    
+    // Add colorful emojis based on actual FSM states
     if (state === 'RUNNING') {
-      className = 'status-success'
-    } else if (state === 'CATCHINGBLOCKS' || state === 'LEGACYSYNCING') {
-      className = 'status-warning'
+      emoji = '✅'
+      tooltip = 'RUNNING'
+    } else if (state === 'CATCHINGBLOCKS') {
+      emoji = '🟠'
+      tooltip = 'CATCHINGBLOCKS'
+    } else if (state === 'LEGACYSYNC') {
+      emoji = '🟡'
+      tooltip = 'LEGACYSYNC'
     } else if (state === 'IDLE') {
-      className = 'status-info'
+      emoji = '⏸️'
+      tooltip = 'IDLE'
     }
+    
     return {
-      component: RenderSpan,
+      component: RenderSpanWithTooltip,
       props: {
-        value: state,
-        className: className,
+        value: emoji,
+        className: '',
+        tooltip: tooltip,
       },
       value: '',
     }
@@ -227,18 +263,17 @@ export const renderCells = {
   chainwork_score: (idField, item, colId) => {
     // The score will be calculated and added to items in the parent component
     const score = item[colId] || 0
-    const maxScore = item.maxChainworkScore || 0
-    const isTopScore = score > 0 && score === maxScore
-    
+    const isTopScore = score === 1 // Score 1 is now the highest chainwork
+
     let displayValue = '-'
     let className = 'num'
-    
+
     if (score > 0) {
       displayValue = score.toString()
       // Use CSS classes for coloring
       className = isTopScore ? 'chainwork-score-top num' : 'chainwork-score-other num'
     }
-    
+
     return {
       component: RenderSpan,
       props: {
@@ -248,37 +283,103 @@ export const renderCells = {
       value: '',
     }
   },
-  tx_count_in_assembly: (idField, item, colId) => {
-    // Get the transaction count (either from the mapped field or from block_assembly)
-    const txCount = item[colId] || item.block_assembly?.txCount || 0
-    const blockAssembly = item.block_assembly
-    
-    // If we have block assembly details, make it clickable
-    if (blockAssembly) {
-      const nodeId = item.peer_id || item.base_url
-      const nodeUrl = item.base_url || ''
-      
-      return {
-        component: RenderClickableSpan,
-        props: {
-          text: txCount !== undefined ? formatNum(txCount) : '-',
-          className: 'num',
-          onClick: () => {
-            blockAssemblyModalStore.show(nodeId, nodeUrl, blockAssembly)
-          },
-        },
-        value: '',
-      }
-    } else {
-      // No block assembly details, just show the number
+  tx_count: (idField, item, colId) => {
+    const txCount = item[colId] ?? item.tx_count ?? 0
+
+    return {
+      component: RenderSpan,
+      props: {
+        value: txCount !== undefined ? formatNum(txCount) : '-',
+        className: 'num',
+      },
+      value: '',
+    }
+  },
+  subtree_count: (idField, item, colId) => {
+    const subtreeCount = item[colId] ?? item.subtree_count ?? 0
+
+    return {
+      component: RenderSpan,
+      props: {
+        value: subtreeCount !== undefined ? formatNum(subtreeCount) : '-',
+        className: 'num',
+      },
+      value: '',
+    }
+  },
+  min_mining_tx_fee: (idField, item, colId) => {
+    // Use nullish coalescing to properly handle 0 as a valid value
+    const fee = item[colId] ?? item.min_mining_tx_fee
+
+    // Check if fee is truly undefined/null (0 is a valid value meaning "no minimum")
+    if (fee === undefined || fee === null) {
       return {
         component: RenderSpan,
+        props: { value: '-', className: 'num' },
+        value: '',
+      }
+    }
+
+    // Handle 0 as a special case - it means "no minimum fee"
+    if (fee === 0) {
+      return {
+        component: RenderSpanWithTooltip,
         props: {
-          value: txCount !== undefined ? formatNum(txCount) : '-',
+          value: '0 sat/kB',
           className: 'num',
+          tooltip: 'No minimum fee required',
         },
         value: '',
       }
+    }
+
+    // The min_mining_tx_fee setting is in BSV per kilobyte
+    // Convert from BSV/kB to satoshis per kilobyte
+    // 1 BSV = 100,000,000 satoshis
+    const satoshisPerKB = fee * 100000000
+
+    // Format the display
+    let displayValue = ''
+    if (satoshisPerKB < 0.01) {
+      // For very small values, show with more decimal places
+      displayValue = `${satoshisPerKB.toFixed(4)} sat/kB`
+    } else if (satoshisPerKB < 1) {
+      // For values less than 1, show with 2 decimal places
+      displayValue = `${satoshisPerKB.toFixed(2)} sat/kB`
+    } else if (satoshisPerKB === Math.floor(satoshisPerKB)) {
+      // For whole numbers, don't show decimal places
+      displayValue = `${Math.floor(satoshisPerKB)} sat/kB`
+    } else {
+      // For other fractional values, show up to 2 decimal places
+      displayValue = `${satoshisPerKB.toFixed(2)} sat/kB`
+    }
+
+    // Create a tooltip with both formats
+    const bsvValue = fee.toFixed(8)
+    const satPerByteStr = (satoshisPerKB / 1000).toFixed(4)
+    const tooltip = `${displayValue}\n(${satPerByteStr} sat/B)\n(${bsvValue} BSV/kB)`
+
+    return {
+      component: RenderSpanWithTooltip,
+      props: {
+        value: displayValue,
+        className: 'num',
+        tooltip: tooltip,
+      },
+      value: '',
+    }
+  },
+  connected_peers_count: (idField, item, colId) => {
+    // Get the peer count value
+    const peersCount = item[colId] ?? item.connected_peers_count ?? 0
+
+    return {
+      component: RenderSpan,
+      props: {
+        value: peersCount.toString(),
+        className: 'num'
+      },
+      value: '',
     }
   },
   uptime: (idField, item, colId) => {
@@ -289,9 +390,9 @@ export const renderCells = {
         value: '',
       }
     }
-    // Use humanTime function to calculate uptime from start time
+    // Use humanTimeNoSeconds function to calculate uptime from start time
     const startTime = item.start_time * 1000 // Convert to milliseconds
-    const uptimeStr = humanTime(startTime)
+    const uptimeStr = humanTimeNoSeconds(startTime)
 
     return {
       component: RenderSpan,
@@ -340,7 +441,13 @@ export const renderCells = {
   best_block_hash: (idField, item, colId) => {
     // Support both best_block_hash (from node_status) and hash (from mining_on)
     const hash = item[colId] || item.hash
-    const miner = item.miner_name || item.miner || ''
+    let miner = item.miner_name || item.miner || ''
+    
+    // If miner is not available, lookup from block hash -> miner cache
+    if (!miner && hash) {
+      const minerCache = get(blockHashToMiner)
+      miner = minerCache.get(hash) || ''
+    }
     
     return {
       component: hash ? RenderHashWithMiner : null,

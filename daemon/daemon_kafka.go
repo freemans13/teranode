@@ -4,16 +4,17 @@ import (
 	"context"
 	"net/url"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/kafka"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	"github.com/labstack/gommon/random"
 	"github.com/ordishs/gocore"
 )
 
 // getKafkaAsyncProducer creates a new Kafka async producer from the provided URL.
-func getKafkaAsyncProducer(ctx context.Context, logger ulogger.Logger, url *url.URL, kafkaSettings ...*settings.KafkaSettings) (*kafka.KafkaAsyncProducer, error) {
-	producer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, url, kafkaSettings...)
+func getKafkaAsyncProducer(ctx context.Context, logger ulogger.Logger, url *url.URL, kafkaSettings *settings.KafkaSettings) (*kafka.KafkaAsyncProducer, error) {
+	producer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, url, kafkaSettings)
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +101,8 @@ func getKafkaTxAsyncProducer(ctx context.Context, logger ulogger.Logger, setting
 
 // getKafkaConsumerGroup creates a new Kafka consumer group from the provided URL and consumer group ID.
 func getKafkaConsumerGroup(logger ulogger.Logger, url *url.URL, consumerGroupID string,
-	autoCommit bool, kafkaSettings ...*settings.KafkaSettings) (*kafka.KafkaConsumerGroup, error) {
-	consumer, err := kafka.NewKafkaConsumerGroupFromURL(logger, url, consumerGroupID, autoCommit, kafkaSettings...)
+	autoCommit bool, kafkaSettings *settings.KafkaSettings) (*kafka.KafkaConsumerGroup, error) {
+	consumer, err := kafka.NewKafkaConsumerGroupFromURL(logger, url, consumerGroupID, autoCommit, kafkaSettings)
 	if err != nil {
 		return nil, errors.NewConfigurationError("missing Kafka URL for "+url.String(), err)
 	}
@@ -168,6 +169,10 @@ func getKafkaTxmetaConsumerGroup(logger ulogger.Logger, settings *settings.Setti
 		return nil, errors.NewConfigurationError("missing Kafka URL for txmeta consumer - txmetaConfig")
 	}
 
+	// add a random postfix to the consumer group ID to allow multiple instances to run
+	// concurrently and consuming the same messages independently
+	consumerGroupID = consumerGroupID + "." + random.String(16, random.Alphanumeric)
+
 	return getKafkaConsumerGroup(logger, kafkaTxmetaConfig, consumerGroupID, true, &settings.Kafka)
 }
 
@@ -186,5 +191,5 @@ func getKafkaInvalidSubtreeConsumerGroup(logger ulogger.Logger, settings *settin
 		return nil, nil // Optional, return nil if not configured
 	}
 
-	return getKafkaConsumerGroup(logger, kafkaInvalidSubtreeConfig, consumerGroupID, true)
+	return getKafkaConsumerGroup(logger, kafkaInvalidSubtreeConfig, consumerGroupID, true, &settings.Kafka)
 }

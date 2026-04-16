@@ -9,23 +9,23 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/utxopersister/filestorer"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/blob/memory"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -120,7 +120,7 @@ func (m *MockStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	return nil, nil
 }
 
-func (m *MockStore) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+func (m *MockStore) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return nil, errors.NewProcessingError("not implemented")
 }
 
@@ -184,6 +184,10 @@ func (m *MockStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, se
 	return nil
 }
 
+func (m *MockStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	return nil
+}
+
 func (m *MockStore) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeight uint32) ([]chainhash.Hash, error) {
 	return nil, nil
 }
@@ -215,7 +219,7 @@ func TestBlock(t *testing.T) {
 	newBlockBytes, err := blockStore.Get(context.Background(), mockUTXOStore.subtrees[0].RootHash()[:], fileformat.FileTypeBlock)
 	require.NoError(t, err)
 
-	newBlockModel, err := model.NewBlockFromBytes(newBlockBytes, tSettings)
+	newBlockModel, err := model.NewBlockFromBytes(newBlockBytes)
 	require.NoError(t, err)
 
 	assert.Equal(t, block.Header.Hash().String(), newBlockModel.Header.Hash().String())
@@ -234,6 +238,17 @@ func TestBlock(t *testing.T) {
 	subtreeData, err := subtreepkg.NewSubtreeDataFromBytes(subtree, subtreeDataBytes)
 	require.NoError(t, err)
 	assert.Len(t, subtreeData.Txs, 4)
+
+	// Verify UTXO additions file exists and contains data
+	blockHash := block.Header.Hash()
+	utxoAdditionsBytes, err := blockStore.Get(t.Context(), blockHash[:], fileformat.FileTypeUtxoAdditions)
+	require.NoError(t, err)
+	assert.Greater(t, len(utxoAdditionsBytes), 36, "UTXO additions file should contain header (32 byte hash + 4 byte height) and data")
+
+	// Verify UTXO deletions file exists and contains data
+	utxoDeletionsBytes, err := blockStore.Get(t.Context(), blockHash[:], fileformat.FileTypeUtxoDeletions)
+	require.NoError(t, err)
+	assert.Greater(t, len(utxoDeletionsBytes), 36, "UTXO deletions file should contain header (32 byte hash + 4 byte height) and data")
 }
 
 func TestFileStorer(t *testing.T) {

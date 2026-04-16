@@ -5,13 +5,13 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 )
 
@@ -156,8 +156,6 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 
 			data := make([]SubtreeTx, 0, limit)
 
-			var txMeta *meta.Data
-
 			for i := offset; i < offset+limit; i++ {
 				if i >= subtree.Length() {
 					break
@@ -168,7 +166,11 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 				subtreeTx := SubtreeTx{
 					Index: i,
 					TxID:  node.Hash.String(),
+					Fee:   int(node.Fee),
+					Size:  int(node.SizeInBytes),
 				}
+
+				var txMeta *meta.Data
 
 				if subtreepkg.CoinbasePlaceholderHash.Equal(node.Hash) {
 					txMeta = &meta.Data{
@@ -182,6 +184,12 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 						txMeta, err = util.TxMetaDataFromTx(subtreeData.Txs[i])
 						if err != nil {
 							h.logger.Warnf("[GetSubtreeTxs][%s] error getting transaction meta from subtreeData: %s", node.Hash.String(), err.Error())
+						}
+
+						// Ensure Fee and SizeInBytes are set from the subtree node, the subtreeData.Txs[i] may not be extended
+						if txMeta != nil {
+							txMeta.Fee = node.Fee
+							txMeta.SizeInBytes = node.SizeInBytes
 						}
 					}
 
@@ -198,6 +206,8 @@ func (h *HTTP) GetSubtreeTxs(mode ReadMode) func(c echo.Context) error {
 							}
 						}
 					}
+
+					h.logger.Debugf("[GetSubtreeTxs][%s] txMeta: %+v", node.Hash.String(), txMeta)
 
 					if txMeta == nil || txMeta.Tx == nil {
 						h.logger.Warnf("[GetSubtreeTxs][%s] txMeta is nil", node.Hash.String())

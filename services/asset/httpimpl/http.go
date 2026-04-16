@@ -1,6 +1,4 @@
-// Package httpimpl provides the HTTP server implementation for the Bitcoin SV blockchain service.
-// It implements a comprehensive REST API for accessing blockchain data with support for multiple
-// response formats.
+// Package httpimpl provides HTTP REST API endpoints for blockchain data access.
 package httpimpl
 
 import (
@@ -10,13 +8,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/asset/repository"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ui/dashboard"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/servicemanager"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/asset/repository"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ui/dashboard"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/servicemanager"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -25,8 +23,7 @@ import (
 
 var AssetStat = gocore.NewStat("Asset")
 
-// HTTP represents the main HTTP server structure for the blockchain service.
-// It handles routing, middleware, and request processing for all blockchain data endpoints.
+// HTTP handles blockchain data API endpoints using the Echo framework.
 type HTTP struct {
 	logger     ulogger.Logger
 	settings   *settings.Settings
@@ -251,6 +248,10 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/bestblockheader", h.GetBestBlockHeader(BINARY_STREAM))
 	apiGroup.GET("/bestblockheader/hex", h.GetBestBlockHeader(HEX))
 	apiGroup.GET("/bestblockheader/json", h.GetBestBlockHeader(JSON))
+
+	apiGroup.GET("/merkle_proof/:hash", h.GetMerkleProof(BINARY_STREAM))
+	apiGroup.GET("/merkle_proof/:hash/hex", h.GetMerkleProof(HEX))
+	apiGroup.GET("/merkle_proof/:hash/json", h.GetMerkleProof(JSON))
 
 	if h.settings.StatsPrefix != "" {
 		e.GET(h.settings.StatsPrefix+"stats", AdaptStdHandler(gocore.HandleStats))

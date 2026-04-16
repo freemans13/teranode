@@ -52,20 +52,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
-	"github.com/bitcoin-sv/teranode/util/usql"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/util/usql"
 	pq "github.com/lib/pq"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -803,7 +803,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.Ignore
 }
 
 func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
-	blockHeight := s.GetBlockHeight()
+	blockHeight := s.GetBlockHeight() + 1
 
 	spends, err := utxo.GetSpends(tx)
 	if err != nil {
@@ -956,7 +956,7 @@ func (s *Store) spendWithRetry(ctx context.Context, tx *bt.Tx, ignoreFlags ...ut
 			}
 
 			// If this utxo has a coinbase spending height, check it is time to spend it
-			if coinbaseSpendingHeight > 0 && blockHeight < coinbaseSpendingHeight {
+			if coinbaseSpendingHeight > 0 && coinbaseSpendingHeight > blockHeight {
 				errorFound = true
 				spend.Err = errors.NewStorageError("[Spend] coinbase utxo not ready to spend for %s:%d", spend.TxID, spend.Vout)
 
@@ -1396,13 +1396,26 @@ func (s *Store) setMinedMultiBulk(ctx context.Context, hashes []*chainhash.Hash,
 	}
 
 	// Step 3: Bulk update transactions to mark as mined
-	qBulkUpdate := `
+	qBulkUpdateLongestChain := `
 		UPDATE transactions
 		SET locked = false, unmined_since = NULL
 		WHERE hash = ANY($1::bytea[])
 	`
-	if _, err = txn.ExecContext(ctx, qBulkUpdate, pq.Array(existingHashBytes)); err != nil {
-		return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+
+	qBulkUpdateNotLongestChain := `
+		UPDATE transactions
+		SET locked = false
+		WHERE hash = ANY($1::bytea[])
+	`
+
+	if minedBlockInfo.OnLongestChain {
+		if _, err = txn.ExecContext(ctx, qBulkUpdateLongestChain, pq.Array(existingHashBytes)); err != nil {
+			return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+		}
+	} else {
+		if _, err = txn.ExecContext(ctx, qBulkUpdateNotLongestChain, pq.Array(existingHashBytes)); err != nil {
+			return nil, errors.NewStorageError("SQL error bulk updating transactions: %v", err)
+		}
 	}
 
 	// Check context before final fetch operation
@@ -1500,10 +1513,16 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 		AND block_id = $2;
 	`
 
-	q2 := `
+	qLongestChain := `
 		UPDATE transactions SET
 		 locked = false
 		,unmined_since = NULL
+		WHERE hash = $1;
+	`
+
+	qNotOnLongestChain := `
+		UPDATE transactions SET
+		 locked = false
 		WHERE hash = $1;
 	`
 
@@ -1562,8 +1581,14 @@ func (s *Store) setMinedMultiOriginal(ctx context.Context, hashes []*chainhash.H
 	for _, hash := range hashes {
 		// Only update transactions that exist in blockIDsMap (which means they exist in the database)
 		if _, exists := blockIDsMap[*hash]; exists {
-			if _, err = txn.ExecContext(ctx, q2, hash[:]); err != nil {
-				return nil, errors.NewStorageError("SQL error calling update locked on tx %s:%v", hash.String(), err)
+			if minedBlockInfo.OnLongestChain {
+				if _, err = txn.ExecContext(ctx, qLongestChain, hash[:]); err != nil {
+					return nil, errors.NewStorageError("SQL error calling update longest chain on tx %s:%v", hash.String(), err)
+				}
+			} else {
+				if _, err = txn.ExecContext(ctx, qNotOnLongestChain, hash[:]); err != nil {
+					return nil, errors.NewStorageError("SQL error calling update locked on tx %s:%v", hash.String(), err)
+				}
 			}
 		}
 	}
@@ -1879,7 +1904,156 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	return nil
 }
 
+// MarkTransactionsOnLongestChain updates unmined_since for transactions based on their chain status.
+//
+// This function is critical for maintaining data integrity during blockchain reorganizations.
+// It ensures transactions have the correct unmined_since value based on whether they are on
+// the longest (main) chain or on a side chain.
+//
+// Behavior:
+//   - onLongestChain=true: Clears unmined_since (transaction is mined on main chain)
+//   - onLongestChain=false: Sets unmined_since to current height (transaction is unmined)
+//
+// CRITICAL - Resilient Error Handling (Must Not Fail Fast):
+// This function attempts to update ALL transactions even if some fail. This is essential during
+// large reorgs where millions of transactions need updating.
+//
+// Error handling strategy:
+//   - Processes ALL transactions (does not stop on first error)
+//   - Collects up to 10 errors for logging/debugging (prevents log spam)
+//   - Logs summary: attempted, succeeded, failed counts
+//   - Returns aggregated errors after attempting all transactions
+//   - Missing transactions trigger FATAL error (data corruption)
+//
+// Why resilient processing is critical:
+//   - Large reorgs can affect millions of transactions
+//   - Transient network errors shouldn't prevent updating other transactions
+//   - Maximizes data integrity by updating as many as possible
+//   - Missing transaction = unrecoverable (FATAL to prevent corrupt state)
+//
+// Timing guarantee:
+// This function is called synchronously from reset/reorg operations. By the time cleanup
+// operations run (via setBestBlockHeader), all MarkTransactionsOnLongestChain calls have
+// completed, ensuring cleanup only sees consistent transaction state.
+//
+// Called from:
+//   - BlockAssembler.reset() - marks moveBack transactions during large reorgs
+//   - SubtreeProcessor.reorgBlocks() - marks transactions during small/medium reorgs
+//   - loadUnminedTransactions() - fixes data inconsistencies
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - txHashes: Transactions to update (can be millions during large reorgs)
+//   - onLongestChain: true = clear unmined_since (mined), false = set unmined_since (unmined)
+//
+// Returns:
+//   - error: Aggregated errors (up to 10) if any failures occurred
+//   - Note: Function calls logger.Fatalf for missing transactions before returning
+func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	var q string
+	allErrors := make([]error, 0, 10) // Pre-allocate capacity for up to 10 errors
+	missingTxErrors := make([]error, 0, 10)
+	attempted := len(txHashes)
+	errorCount := 0
+
+	if onLongestChain {
+		// Transaction is on longest chain - unset unminedSince field (set to NULL)
+		q = `
+			UPDATE transactions
+			SET unmined_since = NULL
+			WHERE hash = $1
+		`
+
+		for _, txHash := range txHashes {
+			result, err := s.db.ExecContext(ctx, q, txHash[:])
+			if err != nil {
+				errorCount++
+				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
+				if len(allErrors) < 10 {
+					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
+					allErrors = append(allErrors, errors.NewStorageError("failed to mark transaction %s as on longest chain", txHash, err))
+				}
+				// Continue processing remaining transactions
+			} else {
+				// Check if transaction was actually found and updated
+				rowsAffected, _ := result.RowsAffected()
+				if rowsAffected == 0 {
+					errorCount++
+					// Transaction not found - this is FATAL (data corruption)
+					if len(missingTxErrors) < 10 {
+						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash))
+					}
+				}
+			}
+		}
+	} else {
+		// Transaction is not on longest chain - set unminedSince to current block height
+		currentBlockHeight := s.GetBlockHeight()
+
+		q = `
+			UPDATE transactions
+			SET unmined_since = $2
+			WHERE hash = $1
+		`
+
+		for _, txHash := range txHashes {
+			result, err := s.db.ExecContext(ctx, q, txHash[:], currentBlockHeight)
+			if err != nil {
+				errorCount++
+				// Only log and collect first 10 errors to avoid spam (could be millions of transactions)
+				if len(allErrors) < 10 {
+					s.logger.Errorf("[MarkTransactionsOnLongestChain] error %d: transaction %s: %v", errorCount, txHash, err)
+					allErrors = append(allErrors, errors.NewStorageError("failed to mark transaction %s as not on longest chain", txHash, err))
+				}
+				// Continue processing remaining transactions
+			} else {
+				// Check if transaction was actually found and updated
+				rowsAffected, _ := result.RowsAffected()
+				if rowsAffected == 0 {
+					errorCount++
+					// Transaction not found - this is FATAL (data corruption)
+					if len(missingTxErrors) < 10 {
+						missingTxErrors = append(missingTxErrors, errors.NewStorageError("MISSING transaction %s", txHash))
+					}
+				}
+			}
+		}
+	}
+
+	// Log summary
+	succeeded := attempted - errorCount
+	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, succeeded=%d, failed=%d, onLongestChain=%t",
+		attempted, succeeded, errorCount, onLongestChain)
+
+	// FATAL if we have missing transactions - this indicates data corruption
+	if len(missingTxErrors) > 0 {
+		s.logger.Fatalf("CRITICAL: %d missing transactions during MarkTransactionsOnLongestChain - data integrity compromised. First errors: %v",
+			len(missingTxErrors), errors.Join(missingTxErrors...))
+	}
+
+	// Return aggregated errors (up to 10) for other error types
+	if len(allErrors) > 0 {
+		if errorCount > 10 {
+			s.logger.Errorf("[MarkTransactionsOnLongestChain] only returned first 10 of %d errors", errorCount)
+		}
+		return errors.Join(allErrors...)
+	}
+
+	return nil
+}
+
+// DBExecutor interface for database operations needed by schema creation
+type DBExecutor interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	Close() error
+}
+
 func createPostgresSchema(db *usql.DB) error {
+	return createPostgresSchemaImpl(db)
+}
+
+// createPostgresSchemaImpl contains the actual implementation, now testable
+func createPostgresSchemaImpl(db DBExecutor) error {
 	if _, err := db.Exec(`
       CREATE TABLE IF NOT EXISTS transactions (
          id               BIGSERIAL PRIMARY KEY

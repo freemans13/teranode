@@ -18,13 +18,13 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/blockvalidation_api"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/blockvalidation_api"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // Client provides an interface to interact with the block validation service.
@@ -149,15 +149,17 @@ func (s *Client) BlockFound(ctx context.Context, blockHash *chainhash.Hash, base
 //   - blockHeight: Expected chain height for the block
 //
 // Returns an error if block processing fails
-func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32) error {
+func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, baseURL, peerID string) error {
 	blockBytes, err := block.Bytes()
 	if err != nil {
 		return err
 	}
 
 	req := &blockvalidation_api.ProcessBlockRequest{
-		Block:  blockBytes,
-		Height: blockHeight,
+		Block:   blockBytes,
+		Height:  blockHeight,
+		PeerId:  peerID,
+		BaseUrl: baseURL,
 	}
 
 	_, err = s.apiClient.ProcessBlock(ctx, req)
@@ -175,9 +177,10 @@ func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeig
 // Parameters:
 //   - ctx: Context for the validation operation
 //   - block: Complete block data to validate including header and transactions
+//   - options: Optional validation options to control behavior (e.g., revalidation)
 //
 // Returns an error if block validation fails or service communication errors occur
-func (s *Client) ValidateBlock(ctx context.Context, block *model.Block) error {
+func (s *Client) ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error {
 	blockBytes, err := block.Bytes()
 	if err != nil {
 		return err
@@ -186,6 +189,11 @@ func (s *Client) ValidateBlock(ctx context.Context, block *model.Block) error {
 	req := &blockvalidation_api.ValidateBlockRequest{
 		Block:  blockBytes,
 		Height: block.Height,
+	}
+
+	// Add revalidation flag if options are provided
+	if options != nil && options.IsRevalidation {
+		req.IsRevalidation = true
 	}
 
 	_, err = s.apiClient.ValidateBlock(ctx, req)

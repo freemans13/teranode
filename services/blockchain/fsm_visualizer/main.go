@@ -6,7 +6,7 @@ package main
 import (
 	"os"
 
-	"github.com/bitcoin-sv/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/looplab/fsm"
 )
 

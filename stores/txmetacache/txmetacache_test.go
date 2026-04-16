@@ -7,18 +7,18 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/stores/utxo/tests"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -272,7 +272,8 @@ func Test_txMetaCache_HeightEncoding(t *testing.T) {
 
 	t.Run("test height-based cache invalidation", func(t *testing.T) {
 		ctx := context.Background()
-		c, _ := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
+		tSettings := test.CreateBaseTestSettings(t)
+		c, _ := NewTxMetaCache(ctx, tSettings, ulogger.TestLogger{}, utxoStore, Unallocated)
 		cache := c.(*TxMetaCache)
 
 		// Set initial block height
@@ -303,7 +304,8 @@ func Test_txMetaCache_HeightEncoding(t *testing.T) {
 
 	t.Run("test multiple transactions with different heights", func(t *testing.T) {
 		ctx := context.Background()
-		c, err := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
+		tSettings := test.CreateBaseTestSettings(t)
+		c, err := NewTxMetaCache(ctx, tSettings, ulogger.TestLogger{}, utxoStore, Unallocated)
 		require.NoError(t, err)
 
 		cache := c.(*TxMetaCache)
@@ -407,10 +409,11 @@ func Test_txMetaCache_GetFunctions(t *testing.T) {
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
 
-		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, settings.NewSettings(), utxoStoreURL)
+		tSettings := test.CreateBaseTestSettings(t)
+		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, tSettings, utxoStoreURL)
 		require.NoError(t, err)
 
-		c, err := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
+		c, err := NewTxMetaCache(ctx, tSettings, ulogger.TestLogger{}, utxoStore, Unallocated)
 		require.NoError(t, err)
 
 		cache := c.(*TxMetaCache)
@@ -629,10 +632,11 @@ func Test_txMetaCache_MultiOperations(t *testing.T) {
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
 
-		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, settings.NewSettings(), utxoStoreURL)
+		tSettings := test.CreateBaseTestSettings(t)
+		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, tSettings, utxoStoreURL)
 		require.NoError(t, err)
 
-		c, err := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
+		c, err := NewTxMetaCache(ctx, tSettings, ulogger.TestLogger{}, utxoStore, Unallocated)
 		require.NoError(t, err)
 
 		cache := c.(*TxMetaCache)
@@ -936,7 +940,7 @@ func Test_TxMetaCache_MiningOperations(t *testing.T) {
 
 	t.Run("GetUnminedTxIterator", func(t *testing.T) {
 		// Test GetUnminedTxIterator
-		iterator, err := cache.GetUnminedTxIterator()
+		iterator, err := cache.GetUnminedTxIterator(false)
 
 		// Function should execute for coverage, may return error in test setup
 		if err != nil {

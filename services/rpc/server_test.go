@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/util/test/mocklogger"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/util/test/mocklogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -909,7 +909,7 @@ func TestNewServer(t *testing.T) {
 			},
 		}
 
-		server, err := NewServer(logger, settings, nil, nil, nil, nil, nil)
+		server, err := NewServer(logger, settings, nil, nil, nil, nil, nil, nil)
 
 		require.Error(t, err)
 		assert.Nil(t, server)
@@ -923,7 +923,7 @@ func TestNewServer(t *testing.T) {
 			},
 		}
 
-		server, err := NewServer(logger, settings, nil, nil, nil, nil, nil)
+		server, err := NewServer(logger, settings, nil, nil, nil, nil, nil, nil)
 
 		require.Error(t, err)
 		assert.Nil(t, server)
@@ -940,7 +940,7 @@ func TestNewServer(t *testing.T) {
 			},
 		}
 
-		server, err := NewServer(logger, settings, nil, nil, nil, nil, nil)
+		server, err := NewServer(logger, settings, nil, nil, nil, nil, nil, nil)
 
 		require.Error(t, err)
 		assert.Nil(t, server)

@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/retry"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/retry"
 )
 
 // ValidateBlockHeaderBytes validates that the byte array can be properly parsed as block headers.
@@ -135,19 +135,22 @@ func FetchHeadersWithRetry(ctx context.Context, logger ulogger.Logger, url strin
 	return retry.Retry(ctx, logger, func() ([]byte, error) {
 		headerBytes, err := util.DoHTTPRequest(ctx, url)
 		if err != nil {
-			// Categorize the error for better handling
+			// If already a typed error, return as-is
+			var tErr *errors.Error
+			if errors.As(err, &tErr) {
+				return nil, err
+			}
 
-			// Check for network timeout errors
-			if errors.Is(err, os.ErrDeadlineExceeded) {
+			// Categorize raw errors for better handling
+			if errors.Is(err, os.ErrDeadlineExceeded) || strings.Contains(err.Error(), "timeout") {
 				return nil, errors.NewNetworkTimeoutError("request timed out: %w", err)
 			}
 
-			// Check for connection refused errors
 			if strings.Contains(err.Error(), "connection refused") {
 				return nil, errors.NewNetworkConnectionRefusedError("peer unavailable: %w", err)
 			}
 
-			if errors.IsNetworkError(err) {
+			if strings.Contains(err.Error(), "network") || strings.Contains(err.Error(), "dial") {
 				return nil, errors.NewNetworkError("network error: %w", err)
 			}
 

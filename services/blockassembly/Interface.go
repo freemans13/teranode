@@ -11,10 +11,10 @@ package blockassembly
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 )
 
 // ClientI defines the interface for block assembly client operations.
@@ -107,6 +107,15 @@ type ClientI interface {
 	// Returns:
 	//   - error: Any error encountered during reset
 	ResetBlockAssembly(ctx context.Context) error
+
+	// ResetBlockAssemblyFully fully resets the block assembly state.
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation
+	//
+	// Returns:
+	//   - error: Any error encountered during reset
+	ResetBlockAssemblyFully(ctx context.Context) error
 
 	// GetBlockAssemblyState retrieves the current state of block assembly.
 	//

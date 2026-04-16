@@ -21,10 +21,10 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetBlockHeadersFromOldest retrieves a sequence of consecutive block headers starting from a specified block hash.
@@ -94,6 +94,7 @@ func (s *SQL) GetBlockHeadersFromOldest(ctx context.Context, chainTipHash, targe
 			,b.mined_set
 			,b.subtrees_set
 			,b.invalid
+			,b.processed_at
 			,b.coinbase_tx
 		FROM blocks b
 		WHERE id IN (
@@ -128,5 +129,5 @@ func (s *SQL) GetBlockHeadersFromOldest(ctx context.Context, chainTipHash, targe
 
 	defer rows.Close()
 
-	return s.processBlockHeadersRows(rows, numberOfHeaders)
+	return s.processBlockHeadersRows(rows, numberOfHeaders, true)
 }

@@ -8,8 +8,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/addrmgr"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/addrmgr"
 )
 
 // TestIPTypes ensures the various functions which determine the type of an IP

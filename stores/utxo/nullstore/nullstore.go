@@ -13,14 +13,14 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // NullStore implements the utxo.Store interface with no-op operations.
@@ -131,7 +131,7 @@ func (m *NullStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	return nil, nil
 }
 
-func (m *NullStore) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+func (m *NullStore) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return nil, nil
 }
 
@@ -164,6 +164,10 @@ func (m *NullStore) SetConflicting(ctx context.Context, txHashes []chainhash.Has
 }
 
 func (m *NullStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
+	return nil
+}
+
+func (m *NullStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	return nil
 }
 

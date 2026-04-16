@@ -1,0 +1,179 @@
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam component {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam database {
+  BackgroundColor #f2f2f2
+  BorderColor #999999
+  FontColor black
+  RoundCorner 10
+}
+skinparam shadowing false
+skinparam ArrowColor #666666
+
+@startuml P2P_Component
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title P2P Service - Component Diagram (Code-Verified Connections)
+
+Container_Boundary(p2p, "P2P Service") {
+
+Component(libp2p_node, "libp2p Node", "Go libp2p", "Core P2P networking with DHT and pubsub")
+
+Component(topic_handlers, "Topic Handlers", "Go", "Handles block, subtree, and handshake topics")
+
+Component(peer_manager, "Peer Manager", "Go", "Manages peer connections and discovery")
+
+Component(grpc_api, "gRPC API", "Go gRPC", "Administrative API for peer management")
+
+Component(websocket_server, "WebSocket Server", "Go WebSocket", "Real-time notifications")
+
+Component(notification_router, "Notification Router", "Go", "Routes notifications to subscribers")
+
+Component(kafka_consumer_rejected, "Rejected Tx Consumer", "Go Kafka", "Consumes rejected transaction notifications")
+
+Component(kafka_consumer_invalid, "Invalid Block Consumer", "Go Kafka", "Consumes invalid block notifications")
+
+Component(kafka_consumer_invalid_subtree, "Invalid Subtree Consumer", "Go Kafka", "Consumes invalid subtree notifications")
+
+Component(kafka_producer_blocks, "Block Producer", "Go Kafka", "Publishes block notifications")
+
+Component(kafka_producer_subtrees, "Subtree Producer", "Go Kafka", "Publishes subtree notifications")
+
+Component(ban_manager, "Ban Manager", "Go", "Peer reputation and ban scoring system")
+
+Component(ban_list, "Ban List", "Go", "Manages banned IP addresses and subnets")
+
+Component(metrics_collector, "Metrics Collector", "Prometheus", "Collects P2P performance metrics")
+
+}
+
+Container_Boundary(external_services, "External Services") {
+
+Container(blockchain, "Blockchain Service", "Go", "Blockchain state management")
+
+Container(block_validation, "Block Validation Service", "Go", "Block validation")
+
+Container(transaction_validator, "Transaction Validator", "Go", "Transaction validation")
+
+Container(subtree_validator, "Subtree Validator", "Go", "Subtree validation")
+
+ContainerQueue(kafka, "Kafka", "Message Queue", "Message broker")
+
+ContainerDb(ban_database, "Ban Database", "SQL Database", "Persistent ban storage")
+
+}
+
+System_Ext(p2p_network, "P2P Network", "Other Bitcoin SV nodes")
+
+System_Ext(rpc_service, "RPC Service", "JSON-RPC API for peer management")
+
+System_Ext(alert_service, "Alert Service", "Alert processing and peer banning")
+
+System_Ext(asset_service, "Asset Service", "Asset server with P2P notifications")
+
+Person(admin, "Administrator", "Node operator")
+
+' External service interactions via gRPC
+
+Rel(rpc_service, grpc_api, "Peer management operations", "gRPC")
+
+Rel(alert_service, grpc_api, "Ban/unban peers", "gRPC")
+
+Rel(asset_service, websocket_server, "Subscribe to notifications", "WebSocket")
+
+' Network interactions
+
+Rel(p2p_network, libp2p_node, "Receive messages", "libp2p")
+
+Rel(libp2p_node, p2p_network, "Send messages", "libp2p")
+
+Rel(libp2p_node, topic_handlers, "Route topic messages")
+
+' Topic handling
+
+Rel(topic_handlers, kafka_producer_blocks, "Publish block notifications")
+
+Rel(topic_handlers, kafka_producer_subtrees, "Publish subtree notifications")
+
+Rel(topic_handlers, ban_manager, "Report misbehaving peers")
+
+' Kafka message processing
+
+Rel(kafka, kafka_consumer_rejected, "Rejected transactions", "Kafka")
+
+Rel(kafka, kafka_consumer_invalid, "Invalid blocks", "Kafka")
+
+Rel(kafka, kafka_consumer_invalid_subtree, "Invalid subtrees", "Kafka")
+
+Rel(kafka_producer_blocks, kafka, "Block notifications", "Kafka")
+
+Rel(kafka_producer_subtrees, kafka, "Subtree notifications", "Kafka")
+
+' Internal processing
+
+Rel(kafka_consumer_rejected, ban_manager, "Process rejected transactions")
+
+Rel(kafka_consumer_invalid, ban_manager, "Process invalid blocks")
+
+Rel(kafka_consumer_invalid_subtree, ban_manager, "Process invalid subtrees")
+
+Rel(ban_manager, ban_list, "Update ban status")
+
+Rel(ban_list, ban_database, "Persist ban data", "SQL")
+
+' API interactions
+
+Rel(grpc_api, peer_manager, "Peer operations")
+
+Rel(grpc_api, ban_manager, "Ban operations")
+
+Rel(peer_manager, libp2p_node, "Manage connections")
+
+Rel(websocket_server, notification_router, "Route notifications")
+
+Rel(notification_router, kafka_consumer_rejected, "Subscribe to events")
+
+Rel(notification_router, kafka_consumer_invalid, "Subscribe to events")
+
+' CODE-VERIFIED External service dependencies
+
+Rel(peer_manager, blockchain, "FSM state & block headers", "gRPC")
+
+Rel(topic_handlers, blockchain, "Block notifications subscription", "gRPC")
+
+Rel(ban_manager, block_validation, "Report invalid blocks/subtrees", "gRPC")
+
+' CODE-VERIFIED Kafka connections to validator services
+
+Rel(transaction_validator, kafka, "Rejected TX notifications", "Kafka")
+
+Rel(subtree_validator, kafka, "Invalid subtree notifications", "Kafka")
+
+' Administrative access
+
+Rel(admin, grpc_api, "Administrative operations", "gRPC")
+
+Rel(admin, websocket_server, "Monitor notifications", "WebSocket")
+
+' Metrics collection
+
+Rel(libp2p_node, metrics_collector, "Network metrics")
+
+Rel(peer_manager, metrics_collector, "Peer metrics")
+
+Rel(ban_manager, metrics_collector, "Ban metrics")
+
+SHOW_LEGEND()
+
+@enduml

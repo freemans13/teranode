@@ -14,18 +14,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/services/blockchain/work"
-	"github.com/bitcoin-sv/teranode/settings"
-	sqlstore "github.com/bitcoin-sv/teranode/stores/blockchain/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/test"
-	"github.com/bitcoin-sv/teranode/util/usql"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/services/blockchain/work"
+	"github.com/bsv-blockchain/teranode/settings"
+	sqlstore "github.com/bsv-blockchain/teranode/stores/blockchain/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -288,9 +288,12 @@ func TestGetNextWorkRequiredTestnet(t *testing.T) {
 
 	// Start blockchain service
 	t.Log("Starting blockchain service...")
-	port := "50051"
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
+	// Use port 0 to let the OS assign an available port
+	listener, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
+
+	// Get the actual port assigned by the OS
+	port := listener.Addr().(*net.TCPAddr).Port
 
 	grpcServer := grpc.NewServer()
 	ctx := context.Background()
@@ -311,7 +314,7 @@ func TestGetNextWorkRequiredTestnet(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Create gRPC client
-	conn, err := grpc.Dial(fmt.Sprintf("localhost:%s", port), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.Dial(fmt.Sprintf("localhost:%d", port), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	defer conn.Close()
 

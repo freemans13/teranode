@@ -21,24 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation"
-	"github.com/bitcoin-sv/teranode/services/p2p"
-	"github.com/bitcoin-sv/teranode/services/propagation"
-	distributor "github.com/bitcoin-sv/teranode/services/rpc"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/test/utils/transactions"
-	"github.com/bitcoin-sv/teranode/test/utils/wait"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -47,6 +29,25 @@ import (
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/services/p2p"
+	"github.com/bsv-blockchain/teranode/services/propagation"
+	distributor "github.com/bsv-blockchain/teranode/services/rpc"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/test/utils/wait"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	tc "github.com/testcontainers/testcontainers-go/modules/compose"
@@ -64,8 +65,10 @@ const (
 // TestDaemon is a struct that holds the test daemon instance and its dependencies.
 type TestDaemon struct {
 	AssetURL              string
+	BlockAssembler        *blockassembly.BlockAssembler
 	BlockAssemblyClient   *blockassembly.Client
 	BlockValidationClient *blockvalidation.Client
+	BlockValidation       *blockvalidation.BlockValidation
 	BlockchainClient      blockchain.ClientI
 	Ctx                   context.Context
 	DistributorClient     *distributor.Distributor
@@ -215,13 +218,6 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	appSettings.P2P.ListenAddresses = []string{"0.0.0.0"}
 	appSettings.P2P.Port = p2pPort
 
-	// Disable both NAT services to avoid libp2p "multiple NATManagers" error
-	appSettings.P2P.EnableNATService = false
-	appSettings.P2P.EnableNATPortMap = false
-
-	appSettings.P2P.MinPeersForSync = 0
-	appSettings.P2P.MaxWaitForMinPeers = 0
-
 	if opts.EnableP2P {
 		_, listenAddr, clientAddr, err = util.GetListener(appSettings.Context, "p2p", "", ":0")
 		require.NoError(t, err)
@@ -239,6 +235,8 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	require.NoError(t, err)
 	appSettings.SubtreeValidation.GRPCListenAddress = listenAddr
 	appSettings.SubtreeValidation.GRPCAddress = clientAddr
+	appSettings.SubtreeValidation.SubtreeStore, err = url.Parse("memory:///")
+	require.NoError(t, err)
 
 	// Asset
 	_, listenAddr, clientAddr, err = util.GetListener(appSettings.Context, "asset", "http://", ":0")
@@ -303,7 +301,6 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	appSettings.SubtreeValidation.TxMetaCacheEnabled = false
 	appSettings.ProfilerAddr = ""
 	appSettings.RPC.CacheEnabled = false
-	appSettings.P2P.DHTUsePrivate = true
 	appSettings.UsePrometheusGRPCMetrics = false
 	appSettings.P2P.BootstrapAddresses = nil
 
@@ -402,6 +399,12 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	)
 	require.NoError(t, err)
 
+	validatorClient, err := d.daemonStores.GetValidatorClient(ctx, logger, appSettings)
+	require.NoError(t, err)
+
+	subtreeValidationClient, err := d.daemonStores.GetSubtreeValidationClient(ctx, logger, appSettings)
+	require.NoError(t, err)
+
 	pk, err := bec.PrivateKeyFromWif(appSettings.BlockAssembly.MinerWalletPrivateKeys[0])
 	require.NoError(t, err)
 
@@ -418,6 +421,9 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	p2pClient, err = p2p.NewClient(ctx, logger, appSettings)
 	require.NoError(t, err)
 
+	txStore, err := d.daemonStores.GetTxStore(logger, appSettings)
+	require.NoError(t, err)
+
 	if opts.FSMState.String() != "" {
 		switch opts.FSMState {
 		case blockchain.FSMStateRUNNING:
@@ -432,6 +438,18 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		}
 	}
 
+	blockValidation := blockvalidation.NewBlockValidation(
+		d.Ctx,
+		logger,
+		appSettings,
+		blockchainClient,
+		subtreeStore,
+		txStore,
+		utxoStore,
+		validatorClient,
+		subtreeValidationClient,
+	)
+
 	assert.NotNil(t, blockchainClient)
 	assert.NotNil(t, blockAssemblyClient)
 	assert.NotNil(t, propagationClient)
@@ -440,11 +458,20 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	assert.NotNil(t, utxoStore)
 	assert.NotNil(t, p2pClient)
 	assert.NotNil(t, distributorClient)
+	assert.NotNil(t, blockValidation)
+
+	blockAssemblyService, err := d.ServiceManager.GetService("BlockAssembly")
+	require.NoError(t, err)
+
+	blockAssembler, ok := blockAssemblyService.(*blockassembly.BlockAssembly)
+	require.True(t, ok)
 
 	return &TestDaemon{
 		AssetURL:              fmt.Sprintf("http://127.0.0.1:%d", appSettings.Asset.HTTPPort),
+		BlockAssembler:        blockAssembler.GetBlockAssembler(),
 		BlockAssemblyClient:   blockAssemblyClient,
 		BlockValidationClient: blockValidationClient,
+		BlockValidation:       blockValidation,
 		BlockchainClient:      blockchainClient,
 		Ctx:                   ctx,
 		DistributorClient:     distributorClient,
@@ -717,6 +744,27 @@ func (td *TestDaemon) VerifyConflictingInUtxoStore(t *testing.T, conflictValue b
 	}
 }
 
+// VerifyOnLongestChainInUtxoStore verifies that the expected conflicting transactions are marked as conflicting in the UTXO store on the longest chain.
+func (td *TestDaemon) VerifyOnLongestChainInUtxoStore(t *testing.T, tx *bt.Tx) {
+	readTx, err := td.UtxoStore.Get(td.Ctx, tx.TxIDChainHash(), fields.UnminedSince)
+	require.NoError(t, err, "Failed to get transaction %s", tx.String())
+	assert.Zero(t, readTx.UnminedSince, "Expected transaction %s to be on the longest chain", tx.TxIDChainHash().String())
+}
+
+// VerifyNotOnLongestChainInUtxoStore verifies that the expected conflicting transactions are marked as conflicting in the UTXO store on the longest chain.
+func (td *TestDaemon) VerifyNotOnLongestChainInUtxoStore(t *testing.T, tx *bt.Tx) {
+	readTx, err := td.UtxoStore.Get(td.Ctx, tx.TxIDChainHash(), fields.UnminedSince)
+	require.NoError(t, err, "Failed to get transaction %s", tx.String())
+	assert.Greater(t, readTx.UnminedSince, uint32(0), "Expected transaction %s to be on the longest chain", tx.TxIDChainHash().String())
+}
+
+// VerifyNotInUtxoStore verifies that the transaction does not exist in the UTXO store.
+func (td *TestDaemon) VerifyNotInUtxoStore(t *testing.T, tx *bt.Tx) {
+	_, err := td.UtxoStore.Get(td.Ctx, tx.TxIDChainHash(), fields.UnminedSince)
+	require.Error(t, err, "Expected error when getting transaction %s", tx.String())
+	assert.Equal(t, errors.Is(err, errors.ErrTxNotFound), true, "Expected ErrTxNotFound when getting transaction %s", tx.String())
+}
+
 // VerifyNotInBlockAssembly checks that the given transactions are not present in the block assembly candidate's subtrees.
 func (td *TestDaemon) VerifyNotInBlockAssembly(t *testing.T, txs ...*bt.Tx) {
 	// get a mining candidate and check the subtree does not contain the given transactions
@@ -740,7 +788,7 @@ func (td *TestDaemon) VerifyNotInBlockAssembly(t *testing.T, txs ...*bt.Tx) {
 		for _, tx := range txs {
 			hash := *tx.TxIDChainHash()
 			found := subtree.HasNode(hash)
-			assert.False(t, found, "Expected subtree to not contain transaction %s", hash.String())
+			assert.False(t, found, "Expected candidate subtree to not contain transaction %s", hash.String())
 		}
 	}
 }
@@ -1099,9 +1147,11 @@ func (td *TestDaemon) CreateTestBlock(t *testing.T, previousBlock *model.Block, 
 	coinbaseTx, err = model.CreateCoinbase(previousBlock.Height+1, 50e8, "test", []string{address.AddressString})
 	require.NoError(t, err)
 
-	var merkleRoot *chainhash.Hash
-	var subtree *subtreepkg.Subtree
-	var subtrees []*chainhash.Hash
+	var (
+		merkleRoot *chainhash.Hash
+		subtree    *subtreepkg.Subtree
+		subtrees   []*chainhash.Hash
+	)
 
 	// Calculate the total size and transaction count
 	transactionCount := uint64(len(txs) + 1) // +1 for coinbase
@@ -1220,6 +1270,86 @@ finished:
 	}
 }
 
+func (td *TestDaemon) WaitForBlockStateChange(t *testing.T, expectedBlock *model.Block, timeout time.Duration) {
+	stateChangeCh := make(chan blockassembly.BestBlockInfo)
+	td.BlockAssembler.SetStateChangeCh(stateChangeCh)
+
+	defer func() {
+		td.BlockAssembler.SetStateChangeCh(nil)
+	}()
+
+	// wait until the block assembly reaches the expected block
+	ctx, cancel := context.WithTimeout(td.Ctx, timeout)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("Timeout waiting for block assembly to reach block %s", expectedBlock.Header.Hash().String())
+		case bestBlockInfo := <-stateChangeCh:
+			t.Logf("Received BestBlockInfo: Height=%d, Hash=%s", bestBlockInfo.Height, bestBlockInfo.Header.Hash().String())
+			if bestBlockInfo.Header.Hash().IsEqual(expectedBlock.Header.Hash()) {
+				return
+			}
+		}
+	}
+}
+
+func (td *TestDaemon) WaitForBlock(t *testing.T, expectedBlock *model.Block, timeout time.Duration, skipVerifyChain ...bool) {
+	ctx, cancel := context.WithTimeout(td.Ctx, timeout)
+	defer cancel()
+
+	var (
+		err error
+	)
+
+	_, err = td.BlockchainClient.GetBlock(ctx, expectedBlock.Header.Hash())
+	if err != nil {
+		t.Fatalf("Failed to get block at hash %s: %v", expectedBlock.Header.Hash().String(), err)
+	}
+
+	td.WaitForBlockStateChange(t, expectedBlock, timeout)
+
+	if len(skipVerifyChain) > 0 && skipVerifyChain[0] {
+		return
+	}
+
+	previousBlockHash := expectedBlock.Header.HashPrevBlock
+
+	for height := expectedBlock.Height - 1; height > 0; height-- {
+		var getBlockByHeight *model.Block
+
+		getBlockByHeight, err = td.BlockchainClient.GetBlockByHeight(ctx, height)
+		require.NoError(t, err)
+
+		require.Equal(t, previousBlockHash.String(), getBlockByHeight.Header.Hash().String(), blockHashMismatch, height)
+
+		previousBlockHash = getBlockByHeight.Header.HashPrevBlock
+	}
+}
+
+func (td *TestDaemon) WaitForBlockBeingMined(t *testing.T, block *model.Block) {
+	// try to wait for the block to be mined for maximum 30 sec
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("[waitForBlockBeingMined] block not mined within 30 seconds")
+		default:
+			blockMined, err := td.BlockchainClient.GetBlockIsMined(ctx, block.Hash())
+			require.NoError(t, err)
+
+			if blockMined {
+				return
+			}
+
+			time.Sleep(1 * time.Second)
+		}
+	}
+}
+
 // createAndSaveSubtrees creates a new subtree with the given transactions and saves it to the subtree store.
 func createAndSaveSubtrees(ctx context.Context, subtreeStore blob.Store, txs []*bt.Tx) (*subtreepkg.Subtree, error) {
 	subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(len(txs) + 1)
@@ -1276,7 +1406,7 @@ func storeSubtreeFiles(ctx context.Context, subtreeStore blob.Store, subtree *su
 	err = subtreeStore.Set(
 		ctx,
 		subtree.RootHash()[:],
-		fileformat.FileTypeSubtreeToCheck,
+		fileformat.FileTypeSubtreeToCheck, // this needs to be FileTypeSubtreeToCheck for tx processing to occur
 		subtreeBytes,
 		options.WithDeleteAt(100),
 		options.WithAllowOverwrite(true),

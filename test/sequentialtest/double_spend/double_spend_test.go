@@ -5,15 +5,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/test/txregistry"
-	"github.com/bitcoin-sv/teranode/test/utils/aerospike"
-	"github.com/bitcoin-sv/teranode/test/utils/postgres"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/test/txregistry"
+	"github.com/bsv-blockchain/teranode/test/utils/aerospike"
+	"github.com/bsv-blockchain/teranode/test/utils/postgres"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -56,6 +56,9 @@ func TestDoubleSpendSQLite(t *testing.T) {
 	})
 	t.Run("test_non_conflicting_tx_after_reorg", func(t *testing.T) {
 		testNonConflictingTxReorg(t, utxoStore)
+	})
+	t.Run("test_conflicting_tx_processed_after_reorg", func(t *testing.T) {
+		testConflictingTxReorg(t, utxoStore)
 	})
 	t.Run("test_non_conflicting_tx_after_block_assembly_reset", func(t *testing.T) {
 		testNonConflictingTxBlockAssemblyReset(t, utxoStore)
@@ -106,6 +109,9 @@ func TestDoubleSpendPostgres(t *testing.T) {
 	t.Run("test_non_conflicting_tx_after_reorg", func(t *testing.T) {
 		testNonConflictingTxReorg(t, utxoStore)
 	})
+	t.Run("test_conflicting_tx_processed_after_reorg", func(t *testing.T) {
+		testConflictingTxReorg(t, utxoStore)
+	})
 	t.Run("test_non_conflicting_tx_after_block_assembly_reset", func(t *testing.T) {
 		testNonConflictingTxBlockAssemblyReset(t, utxoStore)
 	})
@@ -152,6 +158,9 @@ func TestDoubleSpendAerospike(t *testing.T) {
 	})
 	t.Run("test_non_conflicting_tx_after_reorg", func(t *testing.T) {
 		testNonConflictingTxReorg(t, utxoStore)
+	})
+	t.Run("test_conflicting_tx_processed_after_reorg", func(t *testing.T) {
+		testConflictingTxReorg(t, utxoStore)
 	})
 	t.Run("test_non_conflicting_tx_after_block_assembly_reset", func(t *testing.T) {
 		testNonConflictingTxBlockAssemblyReset(t, utxoStore)
@@ -202,7 +211,7 @@ func testSingleDoubleSpend(t *testing.T, utxoStore string) {
 	// Create block 103b to make the longest chain...
 	_, block103b := td.CreateTestBlock(t, block102b, 10302) // Empty block
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.WaitForBlockHeight(t, block103b, blockWait, true)
@@ -228,11 +237,11 @@ func testSingleDoubleSpend(t *testing.T, utxoStore string) {
 
 	// fork back to the original chain and check that everything is processed properly
 	_, block103a := td.CreateTestBlock(t, block102a, 10301) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height, "legacy", ""),
 		"Failed to process block")
 
 	_, block104a := td.CreateTestBlock(t, block103a, 10401) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104a, block104a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104a, block104a.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.WaitForBlockHeight(t, block104a, blockWait)
@@ -264,7 +273,7 @@ func testDoubleSpendInSubsequentBlock(t *testing.T, utxoStore string) {
 	// Step 1: Create and validate block with double spend transaction
 	_, block103 := td.CreateTestBlock(t, block102, 10301, txB0)
 
-	require.Error(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103, block103.Height),
+	require.Error(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103, block103.Height, "legacy", ""),
 		"Failed to reject invalid block with double spend transaction")
 }
 
@@ -308,7 +317,7 @@ func testMarkAsConflictingMultiple(t *testing.T, utxoStore string) {
 
 	// Create block 103b to make the longest chain...
 	_, block103b := td.CreateTestBlock(t, block102b, 10302) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.WaitForBlockHeight(t, block103b, blockWait)
@@ -346,7 +355,7 @@ func testMarkAsConflictingChains(t *testing.T, utxoStore string) {
 	// Create block 103a with the original transactions
 	subtree103a, block103a := td.CreateTestBlock(t, block102a, 10301, txA1, txA2, txA3, txA4)
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height, "legacy", ""),
 		"Failed to process block")
 
 	// 0 -> 1 ... 101 -> 102a -> 103a
@@ -382,7 +391,7 @@ func testMarkAsConflictingChains(t *testing.T, utxoStore string) {
 	// switch forks by mining 104b
 	_, block104b := td.CreateTestBlock(t, block103b, 10402) // Empty block
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height, "legacy", ""),
 		"Failed to process block")
 
 	// wait for block assembly to reach height 104
@@ -430,7 +439,7 @@ func testDoubleSpendFork(t *testing.T, utxoStore string) {
 	// Create block 103a with chain A transactions
 	subtree103a, block103a := td.CreateTestBlock(t, block102a, 10301, txA1, txA2, txA3, txA4)
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height, "legacy", ""),
 		"Failed to process block103a")
 
 	// 0 -> 1 ... 101 -> 102a -> 103a
@@ -442,7 +451,7 @@ func testDoubleSpendFork(t *testing.T, utxoStore string) {
 	// Create block102b from block101
 	_, block102b := td.CreateTestBlock(t, block101, 10202) // Empty block
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block102b, block102b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block102b, block102b.Height, "legacy", ""),
 		"Failed to process block102b")
 
 	//                / 102a -> 103a (*)
@@ -456,7 +465,7 @@ func testDoubleSpendFork(t *testing.T, utxoStore string) {
 
 	// Create block103b with chain B transactions
 	_, block103b := td.CreateTestBlock(t, block102b, 10302, txB0, txB1, txB2, txB3)
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height, "legacy", ""),
 		"Failed to process block103b")
 
 	//                / 102a -> 103a (*)
@@ -468,7 +477,7 @@ func testDoubleSpendFork(t *testing.T, utxoStore string) {
 
 	// switch forks by mining 104b
 	_, block104b := td.CreateTestBlock(t, block103b, 10402) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height, "legacy", ""),
 		"Failed to process block104b")
 
 	//                / 102a -> 103a
@@ -497,13 +506,13 @@ func createConflictingBlock(t *testing.T, td *daemon.TestDaemon, originalBlock *
 	newBlockSubtree, newBlock := td.CreateTestBlock(t, previousBlock, nonce, blockTxs...)
 
 	if len(expectBlockError) > 0 && expectBlockError[0] {
-		require.Error(t, td.BlockValidationClient.ProcessBlock(td.Ctx, newBlock, newBlock.Height),
+		require.Error(t, td.BlockValidationClient.ProcessBlock(td.Ctx, newBlock, newBlock.Height, "legacy", ""),
 			"Failed to process block with double spend transaction")
 
 		return nil
 	}
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, newBlock, newBlock.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, newBlock, newBlock.Height, "legacy", ""),
 		"Failed to process block with double spend transaction")
 
 	td.VerifyBlockByHash(t, newBlock, newBlock.Header.Hash())
@@ -530,7 +539,7 @@ func createFork(t *testing.T, td *daemon.TestDaemon, originalBlock *model.Block,
 	// Step 1: Create and validate block with double spend transaction
 	_, newBlock := td.CreateTestBlock(t, previousBlock, nonce, blockTxs...)
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, newBlock, newBlock.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, newBlock, newBlock.Height, "legacy", ""),
 		"Failed to process block with double spend transaction")
 
 	td.VerifyBlockByHash(t, newBlock, newBlock.Header.Hash())
@@ -583,7 +592,7 @@ func testTripleForkedChain(t *testing.T, utxoStore string) {
 	// Create block 103a with chain A transactions
 	subtree103a, block103a := td.CreateTestBlock(t, block102a, 10301, txA1, txA2, txA3)
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height, "legacy", ""),
 		"Failed to process block103a")
 
 	//
@@ -598,7 +607,7 @@ func testTripleForkedChain(t *testing.T, utxoStore string) {
 
 	// Create block102b from block101
 	_, block102b := td.CreateTestBlock(t, block101, 10202) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block102b, block102b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block102b, block102b.Height, "legacy", ""),
 		"Failed to process block102b")
 
 	// Create chain B transactions
@@ -607,7 +616,7 @@ func testTripleForkedChain(t *testing.T, utxoStore string) {
 
 	// Create block103b with chain B transactions
 	subtree103b, block103b := td.CreateTestBlock(t, block102b, 10302, txB0, txB1, txB2)
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height, "legacy", ""),
 		"Failed to process block103b")
 
 	//                         txA1
@@ -630,12 +639,12 @@ func testTripleForkedChain(t *testing.T, utxoStore string) {
 
 	// Create block102c from block101
 	_, block102c := td.CreateTestBlock(t, block101, 10203) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block102c, block102c.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block102c, block102c.Height, "legacy", ""),
 		"Failed to process block102c")
 
 	// Create block103c with chain C transactions
 	_, block103c := td.CreateTestBlock(t, block102c, 10303, txC0, txC1, txC2)
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103c, block103c.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103c, block103c.Height, "legacy", ""),
 		"Failed to process block103c")
 
 	//                  102a -> 103a (*)
@@ -649,7 +658,7 @@ func testTripleForkedChain(t *testing.T, utxoStore string) {
 
 	// Make chain B win temporarily by mining 104b
 	_, block104b := td.CreateTestBlock(t, block103b, 10402) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height, "legacy", ""),
 		"Failed to process block104b")
 
 	//                  102a -> 103a
@@ -663,11 +672,11 @@ func testTripleForkedChain(t *testing.T, utxoStore string) {
 
 	// Make chain C the ultimate winner by mining 104c and 105c
 	_, block104c := td.CreateTestBlock(t, block103c, 10403) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104c, block104c.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104c, block104c.Height, "legacy", ""),
 		"Failed to process block104c")
 
 	_, block105c := td.CreateTestBlock(t, block104c, 10503) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105c, block105c.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105c, block105c.Height, "legacy", ""),
 		"Failed to process block105c")
 
 	//                  102a -> 103a
@@ -710,7 +719,7 @@ func testNonConflictingTxReorg(t *testing.T, utxoStore string) {
 	// Create block 103b to make the longest chain...
 	_, block103b := td.CreateTestBlock(t, block102b, 10302, txX0)
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.WaitForBlockHeight(t, block103b, blockWait)
@@ -730,7 +739,7 @@ func testNonConflictingTxReorg(t *testing.T, utxoStore string) {
 
 	// fork back to the original chain and check that everything is processed properly
 	_, block103a := td.CreateTestBlock(t, block102a, 10301) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height, "legacy", ""),
 		"Failed to process block")
 
 	//                   / 102a {txA0} -> 103a
@@ -749,7 +758,7 @@ func testNonConflictingTxReorg(t *testing.T, utxoStore string) {
 	td.VerifyConflictingInSubtrees(t, block102b.Subtrees[0], txB0)
 
 	_, block104a := td.CreateTestBlock(t, block103a, 10401) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104a, block104a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104a, block104a.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.WaitForBlockHeight(t, block104a, blockWait)
@@ -771,11 +780,75 @@ func testNonConflictingTxReorg(t *testing.T, utxoStore string) {
 
 	// create another block 105a with the tx2
 	_, block105a := td.CreateTestBlock(t, block104a, 10501, txX0)
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105a, block105a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105a, block105a.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.VerifyConflictingInUtxoStore(t, false, txX0)
 	td.VerifyConflictingInSubtrees(t, block105a.Subtrees[0]) // Should not have any conflicts
+}
+
+func testConflictingTxReorg(t *testing.T, utxoStore string) {
+	// Setup test environment
+	td, _, txOriginal, _, block102a, _ := setupDoubleSpendTest(t, utxoStore)
+	defer func() {
+		td.Stop(t)
+	}()
+
+	tx1 := td.CreateTransaction(t, txOriginal, 0)
+	tx1Conflicting := td.CreateTransaction(t, txOriginal, 0) // Conflicts with tx1
+
+	// 0 -> 1 ... 101 -> 102a (*)
+
+	// send tx1 to the block assembly
+	require.NoError(t, td.PropagationClient.ProcessTransaction(td.Ctx, tx1), "Failed to process transaction tx1")
+
+	// send tx1Conflicting to the block assembly
+	require.Error(t, td.PropagationClient.ProcessTransaction(td.Ctx, tx1Conflicting), "Failed to reject conflicting transaction tx1Conflicting")
+
+	// Create block 103a with the conflicting tx
+	_, block103a := td.CreateTestBlock(t, block102a, 10301, tx1Conflicting)
+
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height, "legacy", ""), "Failed to process block")
+
+	// Create block 103b with the conflicting tx
+	_, block103b := td.CreateTestBlock(t, block102a, 10302, tx1Conflicting)
+
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height, "legacy", ""), "Failed to process block")
+
+	td.WaitForBlockHeight(t, block103a, blockWait)
+
+	//                   / 103a {tx1Conflicting} (*)
+	// 0 -> 1 ... 102a ->
+	//                   \ 103b {tx1Conflicting}
+
+	// Check the tx1Conflicting is marked as conflicting
+	td.VerifyConflictingInSubtrees(t, block103a.Subtrees[0], tx1Conflicting)
+	td.VerifyConflictingInSubtrees(t, block103b.Subtrees[0], tx1Conflicting)
+	td.VerifyConflictingInUtxoStore(t, true, tx1)
+	td.VerifyConflictingInUtxoStore(t, false, tx1Conflicting)
+
+	td.VerifyNotInBlockAssembly(t, tx1)
+	td.VerifyNotInBlockAssembly(t, tx1Conflicting)
+
+	// fork to the new chain and check that everything is processed properly
+	_, block104b := td.CreateTestBlock(t, block103b, 10402) // Empty block
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height, "legacy", ""), "Failed to process block")
+
+	// When we reorg, tx1Conflicting should be processed properly and removed from block assembly
+	//                   / 103a {tx1Conflicting}
+	// 0 -> 1 ... 102a ->
+	//                   \ 103b {tx1Conflicting} -> 104b (*)
+
+	td.WaitForBlockHeight(t, block104b, blockWait)
+
+	td.VerifyNotInBlockAssembly(t, tx1Conflicting)
+
+	// check that tx1Conflicting has not been marked again as conflicting
+	td.VerifyConflictingInUtxoStore(t, false, tx1Conflicting)
+
+	// check that both transactions are still marked as conflicting in the subtrees
+	td.VerifyConflictingInSubtrees(t, block103a.Subtrees[0], tx1Conflicting)
+	td.VerifyConflictingInSubtrees(t, block103b.Subtrees[0], tx1Conflicting)
 }
 
 func testNonConflictingTxBlockAssemblyReset(t *testing.T, utxoStore string) {
@@ -793,7 +866,7 @@ func testNonConflictingTxBlockAssemblyReset(t *testing.T, utxoStore string) {
 	// Create block 103b to make the longest chain...
 	_, block103b := td.CreateTestBlock(t, block102b, 10302, txX0)
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.WaitForBlockHeight(t, block103b, blockWait)
@@ -819,11 +892,11 @@ func testNonConflictingTxBlockAssemblyReset(t *testing.T, utxoStore string) {
 
 	// fork back to the original chain and check that everything is processed properly
 	_, block103a := td.CreateTestBlock(t, block102a, 10301) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height, "legacy", ""),
 		"Failed to process block")
 
 	_, block104a := td.CreateTestBlock(t, block103a, 10401) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104a, block104a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104a, block104a.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.WaitForBlockHeight(t, block104a, blockWait)
@@ -847,7 +920,7 @@ func testNonConflictingTxBlockAssemblyReset(t *testing.T, utxoStore string) {
 
 	// create another block 105a with the tx2
 	_, block105a := td.CreateTestBlock(t, block104a, 10501, txX0)
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105a, block105a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105a, block105a.Height, "legacy", ""),
 		"Failed to process block")
 
 	td.VerifyConflictingInUtxoStore(t, false, txX0)
@@ -892,7 +965,7 @@ func testDoubleSpendForkWithNestedTXs(t *testing.T, utxoStore string) {
 	// Create block 103a with chain A transactions
 	_, block103a := td.CreateTestBlock(t, block102a, 10301, txA1)
 
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103a, block103a.Height, "legacy", ""),
 		"Failed to process block103a")
 
 	//
@@ -911,7 +984,7 @@ func testDoubleSpendForkWithNestedTXs(t *testing.T, utxoStore string) {
 
 	// Create block102b from block101
 	_, block102b := td.CreateTestBlock(t, block101, 10202) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block102b, block102b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block102b, block102b.Height, "legacy", ""),
 		"Failed to process block102b")
 
 	//
@@ -923,7 +996,7 @@ func testDoubleSpendForkWithNestedTXs(t *testing.T, utxoStore string) {
 
 	// Create block103b with chain B transactions
 	_, block103b := td.CreateTestBlock(t, block102b, 10302, txB0)
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block103b, block103b.Height, "legacy", ""),
 		"Failed to process block103b")
 
 	//
@@ -947,7 +1020,7 @@ func testDoubleSpendForkWithNestedTXs(t *testing.T, utxoStore string) {
 
 	// switch forks by mining 104b
 	_, block104b := td.CreateTestBlock(t, block103b, 10402) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104b, block104b.Height, "legacy", ""),
 		"Failed to process block104b")
 
 	//
@@ -975,7 +1048,7 @@ func testDoubleSpendForkWithNestedTXs(t *testing.T, utxoStore string) {
 
 	// Add a new block 105b on top of 104b with the new double spends
 	_, block105b := td.CreateTestBlock(t, block104b, 10502, txB1)
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105b, block105b.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105b, block105b.Height, "legacy", ""),
 		"Failed to process block105b")
 
 	td.WaitForBlockHeight(t, block105b, blockWait)
@@ -1003,15 +1076,15 @@ func testDoubleSpendForkWithNestedTXs(t *testing.T, utxoStore string) {
 
 	// now make the other chain longer
 	_, block104a := td.CreateTestBlock(t, block103a, 10401) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104a, block104a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block104a, block104a.Height, "legacy", ""),
 		"Failed to process block104a")
 
 	_, block105a := td.CreateTestBlock(t, block104a, 10501) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105a, block105a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block105a, block105a.Height, "legacy", ""),
 		"Failed to process block105a")
 
 	_, block106a := td.CreateTestBlock(t, block105a, 10601) // Empty block
-	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block106a, block106a.Height),
+	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block106a, block106a.Height, "legacy", ""),
 		"Failed to process block106a")
 
 	//

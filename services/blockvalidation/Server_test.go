@@ -26,27 +26,27 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/blockvalidation_api"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/catchup"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/testhelpers"
-	"github.com/bitcoin-sv/teranode/stores/blob/memory"
-	blobmemory "github.com/bitcoin-sv/teranode/stores/blob/memory"
-	blockchain_store "github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/blockvalidation_api"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jarcoal/httpmock"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/ordishs/go-utils/expiringmap"
@@ -72,13 +72,13 @@ func (m *mockBlockValidationInterface) BlockFound(ctx context.Context, blockHash
 	return args.Error(0)
 }
 
-func (m *mockBlockValidationInterface) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32) error {
+func (m *mockBlockValidationInterface) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, baseURL string, peerID string) error {
 	args := m.Called(ctx, block, blockHeight)
 	return args.Error(0)
 }
 
-func (m *mockBlockValidationInterface) ValidateBlock(ctx context.Context, block *model.Block) error {
-	args := m.Called(ctx, block)
+func (m *mockBlockValidationInterface) ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error {
+	args := m.Called(ctx, block, options)
 	return args.Error(0)
 }
 
@@ -136,7 +136,7 @@ func TestOneTransaction(t *testing.T) {
 		},
 		coinbaseTx,
 		subtreeHashes,
-		0, 0, 0, 0, tSettings)
+		0, 0, 0, 0)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -146,7 +146,7 @@ func TestOneTransaction(t *testing.T) {
 	_ = subtreeStore.Set(ctx, subtrees[0].RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
 
 	// loads the subtrees into the block
-	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore)
+	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
 	require.NoError(t, err)
 
 	// err = blockValidationService.CheckMerkleRoot(block)
@@ -202,7 +202,7 @@ func TestTwoTransactions(t *testing.T) {
 		},
 		coinbaseTx,
 		subtreeHashes,
-		0, 0, 0, 0, tSettings)
+		0, 0, 0, 0)
 	assert.NoError(t, err)
 
 	ctx := context.Background()
@@ -212,7 +212,7 @@ func TestTwoTransactions(t *testing.T) {
 	_ = subtreeStore.Set(ctx, subtrees[0].RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
 
 	// loads the subtrees into the block
-	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore)
+	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
 	require.NoError(t, err)
 
 	// err = blockValidationService.CheckMerkleRoot(block)
@@ -294,14 +294,14 @@ func TestMerkleRoot(t *testing.T) {
 		},
 		coinbaseTx,
 		subtreeHashes,
-		0, 0, 0, 0, tSettings)
+		0, 0, 0, 0)
 	assert.NoError(t, err)
 
 	// blockValidationService, err := New(ulogger.TestLogger{}, nil, nil, nil, nil)
 	// require.NoError(t, err)
 
 	// loads the subtrees into the block
-	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore)
+	err = block.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, subtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
 	require.NoError(t, err)
 
 	// err = blockValidationService.CheckMerkleRoot(block)
@@ -388,7 +388,7 @@ func Test_Server_processBlockFound(t *testing.T) {
 	blockBytes, err := hex.DecodeString(blockHex)
 	require.NoError(t, err)
 
-	block, err := model.NewBlockFromBytes(blockBytes, tSettings)
+	block, err := model.NewBlockFromBytes(blockBytes)
 	require.NoError(t, err)
 
 	blockchainStore := blockchain_store.NewMockStore()
@@ -445,11 +445,13 @@ func TestServer_processBlockFoundChannel(t *testing.T) {
 	}()
 
 	s := &Server{
-		logger:       ulogger.TestLogger{},
-		settings:     tSettings,
-		catchupCh:    make(chan processBlockCatchup, 1),
-		blockFoundCh: make(chan processBlockFound, 100),
-		stats:        gocore.NewStat("test"),
+		logger:              ulogger.TestLogger{},
+		settings:            tSettings,
+		catchupCh:           make(chan processBlockCatchup, 1),
+		blockFoundCh:        make(chan processBlockFound, 100),
+		stats:               gocore.NewStat("test"),
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	blockFound := processBlockFound{
@@ -510,15 +512,16 @@ func TestServer_catchup(t *testing.T) {
 		subtreeStore := blobmemory.New()
 
 		server := &Server{
-			logger:               logger,
-			settings:             tSettings,
-			blockchainClient:     mockBlockchainClient,
-			blockValidation:      NewBlockValidation(testCtx, logger, tSettings, mockBlockchainClient, subtreeStore, nil, nil, nil, nil),
-			utxoStore:            utxoStore,
-			processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
-			headerChainCache:     catchup.NewHeaderChainCache(logger),
-			subtreeStore:         subtreeStore,
-			peerMetrics:          catchup.NewCatchupMetrics(),
+			logger:              logger,
+			settings:            tSettings,
+			blockchainClient:    mockBlockchainClient,
+			blockValidation:     NewBlockValidation(testCtx, logger, tSettings, mockBlockchainClient, subtreeStore, nil, nil, nil, nil),
+			utxoStore:           utxoStore,
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
+			headerChainCache:    catchup.NewHeaderChainCache(logger),
+			subtreeStore:        subtreeStore,
+			peerMetrics:         catchup.NewCatchupMetrics(),
 		}
 
 		// Create a chain of test blocks
@@ -729,26 +732,19 @@ func TestServer_blockHandler_processBlockFound_happyPath(t *testing.T) {
 	bv := NewBlockValidation(context.Background(), ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, txMetaStore, nil, subtreeValidationClient)
 
 	server := &Server{
-		logger:          ulogger.TestLogger{},
-		settings:        tSettings,
-		blockValidation: bv,
-		blockFoundCh:    blockFoundCh,
-		stats:           gocore.NewStat("test"),
-		peerMetrics:     catchup.NewCatchupMetrics(),
+		logger:              ulogger.TestLogger{},
+		settings:            tSettings,
+		blockValidation:     bv,
+		blockFoundCh:        blockFoundCh,
+		stats:               gocore.NewStat("test"),
+		peerMetrics:         catchup.NewCatchupMetrics(),
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	kafkaMsg := &kafkamessage.KafkaBlockTopicMessage{
 		Hash: hashStr,
 		URL:  url,
-	}
-
-	msgBytes, err := proto.Marshal(kafkaMsg)
-	require.NoError(t, err)
-
-	msg := &kafka.KafkaMessage{
-		ConsumerMessage: sarama.ConsumerMessage{
-			Value: msgBytes,
-		},
 	}
 
 	go func() {
@@ -757,11 +753,10 @@ func TestServer_blockHandler_processBlockFound_happyPath(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, hash.String(), found.hash.String())
 		assert.Equal(t, url, found.baseURL)
-		assert.NotNil(t, found.errCh)
-		found.errCh <- nil
+		assert.Nil(t, found.errCh) // errCh should be nil to avoid blocking Kafka consumer
 	}()
 
-	err = server.blockHandler(msg)
+	err := server.blockHandler(kafkaMsg)
 	assert.NoError(t, err)
 }
 
@@ -813,6 +808,8 @@ func Test_HealthReadiness(t *testing.T) {
 		subtreeStore:        subtreeStore,
 		txStore:             txStore,
 		utxoStore:           utxoStore,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	status, msg, err := server.Health(ctx, false)
@@ -851,6 +848,8 @@ func Test_HealthReadiness_UnhealthyDependency(t *testing.T) {
 		subtreeStore:        subtreeStore,
 		txStore:             txStore,
 		utxoStore:           utxoStore,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	status, msg, err := server.Health(ctx, false)
@@ -885,6 +884,8 @@ func Test_HealthGRPC(t *testing.T) {
 		subtreeStore:        subtreeStore,
 		txStore:             txStore,
 		utxoStore:           utxoStore,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	response, err := server.HealthGRPC(ctx, &blockvalidation_api.EmptyMessage{})
@@ -927,6 +928,8 @@ func Test_HealthGRPC_Unhealthy(t *testing.T) {
 		subtreeStore:        subtreeStore,
 		txStore:             txStore,
 		utxoStore:           utxoStore,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	response, err := server.HealthGRPC(ctx, &blockvalidation_api.EmptyMessage{})
@@ -937,23 +940,14 @@ func Test_HealthGRPC_Unhealthy(t *testing.T) {
 	require.Contains(t, response.Details, "Blockchain service unavailable")
 }
 
-// Mock kafka consumer for testing
-type mockKafkaConsumer struct {
-	mock.Mock
+// Mock kafka consumer for testing is now in mock.go
+
+func (m *mockKafkaConsumer) PauseAll() {
+	m.Called()
 }
 
-func (m *mockKafkaConsumer) Start(ctx context.Context, consumerFn func(message *kafka.KafkaMessage) error, opts ...kafka.ConsumerOption) {
-	m.Called(ctx, consumerFn, opts)
-}
-
-func (m *mockKafkaConsumer) BrokersURL() []string {
-	args := m.Called()
-	return args.Get(0).([]string)
-}
-
-func (m *mockKafkaConsumer) Close() error {
-	args := m.Called()
-	return args.Error(0)
+func (m *mockKafkaConsumer) ResumeAll() {
+	m.Called()
 }
 
 func Test_Start(t *testing.T) {
@@ -974,14 +968,15 @@ func Test_Start(t *testing.T) {
 	mockKafkaConsumer.On("Start", mock.Anything, mock.Anything, mock.Anything).Return()
 
 	server := &Server{
-		logger:               logger,
-		settings:             tSettings,
-		kafkaConsumerClient:  mockKafkaConsumer,
-		blockchainClient:     mockBlockchainClient,
-		subtreeStore:         subtreeStore,
-		txStore:              txStore,
-		utxoStore:            utxoStore,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
+		logger:              logger,
+		settings:            tSettings,
+		kafkaConsumerClient: mockKafkaConsumer,
+		blockchainClient:    mockBlockchainClient,
+		subtreeStore:        subtreeStore,
+		txStore:             txStore,
+		utxoStore:           utxoStore,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
 	// Create a context with quick timeout since Start() blocks on GRPC server
@@ -1033,15 +1028,17 @@ func Test_Stop(t *testing.T) {
 	mockKafkaConsumer.On("Close").Return(nil)
 
 	server := &Server{
-		logger:               logger,
-		settings:             tSettings,
-		kafkaConsumerClient:  mockKafkaConsumer,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
+		logger:              logger,
+		settings:            tSettings,
+		kafkaConsumerClient: mockKafkaConsumer,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
-	// Start the ttl cache so we can stop it
-	go server.processSubtreeNotify.Start()
-	time.Sleep(10 * time.Millisecond) // Give it time to start
+	// Start the ttl caches so we can stop them
+	go server.processBlockNotify.Start()
+	go server.catchupAlternatives.Start()
+	time.Sleep(10 * time.Millisecond) // Give them time to start
 
 	err := server.Stop(ctx)
 	require.NoError(t, err)
@@ -1058,15 +1055,17 @@ func Test_Stop_KafkaCloseError(t *testing.T) {
 	mockKafkaConsumer.On("Close").Return(errors.New(errors.ERR_NETWORK_ERROR, "failed to close kafka"))
 
 	server := &Server{
-		logger:               logger,
-		settings:             tSettings,
-		kafkaConsumerClient:  mockKafkaConsumer,
-		processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
+		logger:              logger,
+		settings:            tSettings,
+		kafkaConsumerClient: mockKafkaConsumer,
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
-	// Start the ttl cache so we can stop it
-	go server.processSubtreeNotify.Start()
-	time.Sleep(10 * time.Millisecond) // Give it time to start
+	// Start the ttl caches so we can stop them
+	go server.processBlockNotify.Start()
+	go server.catchupAlternatives.Start()
+	time.Sleep(10 * time.Millisecond) // Give them time to start
 
 	err := server.Stop(ctx)
 	require.NoError(t, err) // Stop doesn't return the kafka error
@@ -1088,7 +1087,7 @@ func Test_BlockFound(t *testing.T) {
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 		}
 
 		// Mark block as existing
@@ -1119,16 +1118,18 @@ func Test_BlockFound(t *testing.T) {
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
 
 		server := &Server{
-			logger:          logger,
-			settings:        tSettings,
-			blockValidation: bv,
-			blockFoundCh:    make(chan processBlockFound, 10),
-			stats:           gocore.NewStat("test"),
+			logger:              logger,
+			settings:            tSettings,
+			blockValidation:     bv,
+			blockFoundCh:        make(chan processBlockFound, 10),
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		req := &blockvalidation_api.BlockFoundRequest{
@@ -1159,16 +1160,18 @@ func Test_BlockFound(t *testing.T) {
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
 
 		server := &Server{
-			logger:          logger,
-			settings:        tSettings,
-			blockValidation: bv,
-			blockFoundCh:    make(chan processBlockFound, 10),
-			stats:           gocore.NewStat("test"),
+			logger:              logger,
+			settings:            tSettings,
+			blockValidation:     bv,
+			blockFoundCh:        make(chan processBlockFound, 10),
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		req := &blockvalidation_api.BlockFoundRequest{
@@ -1197,16 +1200,18 @@ func Test_BlockFound(t *testing.T) {
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 		}
 
 		server := &Server{
-			logger:          logger,
-			settings:        tSettings,
-			blockValidation: bv,
-			blockFoundCh:    make(chan processBlockFound, 10),
-			stats:           gocore.NewStat("test"),
+			logger:              logger,
+			settings:            tSettings,
+			blockValidation:     bv,
+			blockFoundCh:        make(chan processBlockFound, 10),
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		req := &blockvalidation_api.BlockFoundRequest{
@@ -1269,7 +1274,7 @@ func Test_ProcessBlock(t *testing.T) {
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			logger:                        logger,
 			settings:                      tSettings,
 			blockchainClient:              mockBlockchainClient,
@@ -1283,12 +1288,13 @@ func Test_ProcessBlock(t *testing.T) {
 		}
 
 		server := &Server{
-			logger:               logger,
-			settings:             tSettings,
-			blockValidation:      bv,
-			blockchainClient:     mockBlockchainClient,
-			stats:                gocore.NewStat("test"),
-			processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
+			logger:              logger,
+			settings:            tSettings,
+			blockValidation:     bv,
+			blockchainClient:    mockBlockchainClient,
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		// Mock the blockchain client methods
@@ -1313,7 +1319,7 @@ func Test_ProcessBlock(t *testing.T) {
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			logger:                        logger,
 			settings:                      tSettings,
 			blockchainClient:              mockBlockchainClient,
@@ -1327,12 +1333,13 @@ func Test_ProcessBlock(t *testing.T) {
 		}
 
 		server := &Server{
-			logger:               logger,
-			settings:             tSettings,
-			blockValidation:      bv,
-			blockchainClient:     mockBlockchainClient,
-			stats:                gocore.NewStat("test"),
-			processSubtreeNotify: ttlcache.New[chainhash.Hash, bool](),
+			logger:              logger,
+			settings:            tSettings,
+			blockValidation:     bv,
+			blockchainClient:    mockBlockchainClient,
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		// Mock getting previous block header
@@ -1415,7 +1422,7 @@ func Test_ValidateBlock(t *testing.T) {
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			logger:                        logger,
 			settings:                      tSettings,
 			blockchainClient:              mockBlockchainClient,
@@ -1429,11 +1436,13 @@ func Test_ValidateBlock(t *testing.T) {
 		}
 
 		server := &Server{
-			logger:           logger,
-			settings:         tSettings,
-			blockValidation:  bv,
-			blockchainClient: mockBlockchainClient,
-			stats:            gocore.NewStat("test"),
+			logger:              logger,
+			settings:            tSettings,
+			blockValidation:     bv,
+			blockchainClient:    mockBlockchainClient,
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		// Mock blockchain client calls
@@ -1485,7 +1494,7 @@ func Test_ValidateBlock(t *testing.T) {
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			logger:                        logger,
 			settings:                      tSettings,
 			blockchainClient:              mockBlockchainClient,
@@ -1499,11 +1508,13 @@ func Test_ValidateBlock(t *testing.T) {
 		}
 
 		server := &Server{
-			logger:           logger,
-			settings:         tSettings,
-			blockValidation:  bv,
-			blockchainClient: mockBlockchainClient,
-			stats:            gocore.NewStat("test"),
+			logger:              logger,
+			settings:            tSettings,
+			blockValidation:     bv,
+			blockchainClient:    mockBlockchainClient,
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		// Mock blockchain client to return error
@@ -1546,17 +1557,19 @@ func Test_consumerMessageHandler(t *testing.T) {
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,
 		}
 
 		server := &Server{
-			logger:          logger,
-			settings:        tSettings,
-			blockFoundCh:    make(chan processBlockFound, 10),
-			blockValidation: bv,
-			stats:           gocore.NewStat("test"),
+			logger:              logger,
+			settings:            tSettings,
+			blockFoundCh:        make(chan processBlockFound, 10),
+			blockValidation:     bv,
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		// Set up a mock for blockHandler
@@ -1596,16 +1609,18 @@ func Test_consumerMessageHandler(t *testing.T) {
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,
 		}
 
 		server := &Server{
-			logger:          logger,
-			settings:        tSettings,
-			blockValidation: bv,
-			stats:           gocore.NewStat("test"),
+			logger:              logger,
+			settings:            tSettings,
+			blockValidation:     bv,
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		// Invalid message that will cause a parsing error
@@ -1631,17 +1646,19 @@ func Test_consumerMessageHandler(t *testing.T) {
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
-			blockExists:                   expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 			blockchainClient:              mockBlockchainClient,
 			logger:                        logger,
 		}
 
 		server := &Server{
-			logger:          logger,
-			settings:        tSettings,
-			blockFoundCh:    make(chan processBlockFound, 10),
-			blockValidation: bv,
-			stats:           gocore.NewStat("test"),
+			logger:              logger,
+			settings:            tSettings,
+			blockFoundCh:        make(chan processBlockFound, 10),
+			blockValidation:     bv,
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		// Create a cancellable context

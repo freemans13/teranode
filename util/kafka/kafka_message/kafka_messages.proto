@@ -24,6 +24,7 @@ message KafkaInvalidSubtreeTopicMessage {
 message KafkaSubtreeTopicMessage {
   string hash = 1;
   string URL = 2;
+  string peer_id = 3;  // Originator peer ID
 }
 
 message KafkaTxValidationTopicMessage {
@@ -42,6 +43,7 @@ message KafkaTxValidationOptions {
 message KafkaRejectedTxTopicMessage {
   string txHash = 1;
   string reason = 2;
+  string peer_id = 3;  // Empty = internal rejection, non-empty = external peer
 }
 
 enum KafkaTxMetaActionType {

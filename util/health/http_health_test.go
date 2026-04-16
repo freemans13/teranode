@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/util/health"
+	"github.com/bsv-blockchain/teranode/util/health"
 	"github.com/stretchr/testify/assert"
 )
 

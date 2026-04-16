@@ -14,9 +14,11 @@ type PeerInfo struct {
 	BlockHash       string
 	DataHubURL      string
 	IsHealthy       bool
+	HealthDuration  time.Duration
 	LastHealthCheck time.Time
 	BanScore        int
 	IsBanned        bool
+	IsConnected     bool // Whether this peer is directly connected (vs gossiped)
 	ConnectedAt     time.Time
 	BytesReceived   uint64
 	LastBlockTime   time.Time
@@ -133,6 +135,16 @@ func (pr *PeerRegistry) UpdateHealth(id peer.ID, healthy bool) {
 	}
 }
 
+// UpdateHealthDuration updates a peer's health duration
+func (pr *PeerRegistry) UpdateHealthDuration(id peer.ID, duration time.Duration) {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+
+	if info, exists := pr.peers[id]; exists {
+		info.HealthDuration = duration
+	}
+}
+
 // UpdateBanStatus updates a peer's ban status
 func (pr *PeerRegistry) UpdateBanStatus(id peer.ID, score int, banned bool) {
 	pr.mu.Lock()
@@ -182,4 +194,29 @@ func (pr *PeerRegistry) PeerCount() int {
 	defer pr.mu.RUnlock()
 
 	return len(pr.peers)
+}
+
+// UpdateConnectionState updates whether a peer is directly connected
+func (pr *PeerRegistry) UpdateConnectionState(id peer.ID, connected bool) {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+
+	if info, exists := pr.peers[id]; exists {
+		info.IsConnected = connected
+	}
+}
+
+// GetConnectedPeers returns only directly connected peers
+func (pr *PeerRegistry) GetConnectedPeers() []*PeerInfo {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+
+	result := make([]*PeerInfo, 0, len(pr.peers))
+	for _, info := range pr.peers {
+		if info.IsConnected {
+			copy := *info
+			result = append(result, &copy)
+		}
+	}
+	return result
 }

@@ -4,7 +4,7 @@
 // Uses build tags to select appropriate cache size for high-throughput production deployments.
 package txmetacache
 
-import "github.com/bitcoin-sv/teranode/ulogger"
+import "github.com/bsv-blockchain/teranode/ulogger"
 
 // BucketsCount defines the number of cache buckets (8,192 for production environments).
 const BucketsCount = 8 * 1024

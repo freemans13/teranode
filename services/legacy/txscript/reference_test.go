@@ -15,9 +15,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 // fixedExcessiveBlockSize should not be the default -we want to ensure it will work in all cases

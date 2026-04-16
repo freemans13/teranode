@@ -5,9 +5,9 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -15,16 +15,17 @@ import (
 func TestSQLInvalidateBlock(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
-	t.Run("empty - error", func(t *testing.T) {
+	t.Run("empty - no error (idempotent)", func(t *testing.T) {
 		storeURL, err := url.Parse("sqlitememory:///")
 		require.NoError(t, err)
 
 		s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
 		require.NoError(t, err)
 
+		// InvalidateBlock should be idempotent - returns success even if block doesn't exist
 		hashes, err := s.InvalidateBlock(context.Background(), block2.Hash())
-		require.Error(t, err)
-		require.Nil(t, hashes)
+		require.NoError(t, err)
+		require.Empty(t, hashes)
 	})
 
 	t.Run("Block invalidated", func(t *testing.T) {
@@ -86,7 +87,7 @@ func TestSQLInvalidateBlock(t *testing.T) {
 		assert.Equal(t, 3, id)
 		assert.Equal(t, uint32(3), height)
 		assert.True(t, invalid)
-		assert.False(t, mined_set) // this should be false as we set mined_set to false when invalidating a block
+		assert.False(t, mined_set) // mined_set is set to false when invalidating to trigger tx unsetting
 	})
 
 	t.Run("Blocks invalidated", func(t *testing.T) {
@@ -146,7 +147,7 @@ func TestSQLInvalidateBlock(t *testing.T) {
 		assert.Equal(t, 2, id)
 		assert.Equal(t, uint32(2), height)
 		assert.True(t, invalid)
-		assert.False(t, mined_set)
+		assert.False(t, mined_set) // mined_set is set to false when invalidating to trigger tx unsetting
 
 		err = s.db.QueryRowContext(context.Background(),
 			"SELECT id, height, invalid, mined_set FROM blocks WHERE hash = $1",
@@ -156,7 +157,7 @@ func TestSQLInvalidateBlock(t *testing.T) {
 		assert.Equal(t, 3, id)
 		assert.Equal(t, uint32(3), height)
 		assert.True(t, invalid)
-		assert.False(t, mined_set)
+		assert.False(t, mined_set) // mined_set is set to false when invalidating to trigger tx unsetting
 	})
 
 	// Ensure best block header cache is invalidated when the tip is marked invalid

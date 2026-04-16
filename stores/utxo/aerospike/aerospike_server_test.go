@@ -2,27 +2,31 @@ package aerospike_test
 
 import (
 	"context"
+	"encoding/hex"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/blob/memory"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	teranode_aerospike "github.com/bitcoin-sv/teranode/stores/utxo/aerospike"
-	"github.com/bitcoin-sv/teranode/stores/utxo/aerospike/cleanup"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
-	"github.com/bitcoin-sv/teranode/stores/utxo/tests"
-	utxo2 "github.com/bitcoin-sv/teranode/test/longtest/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/test"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	teranode_aerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
+	utxo2 "github.com/bsv-blockchain/teranode/test/longtest/stores/utxo"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -176,7 +180,7 @@ func TestAerospike(t *testing.T) {
 		assert.Len(t, value.TxInpoints.ParentTxHashes, 1)
 		assert.Equal(t, []chainhash.Hash{*parentTxHash}, value.TxInpoints.ParentTxHashes)
 		assert.Len(t, value.BlockIDs, 0)
-		assert.Nil(t, value.BlockIDs)
+		assert.NotNil(t, value.BlockIDs)
 
 		blockIDsMap, err := store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: blockID2, BlockHeight: 102, SubtreeIdx: 4})
 		require.NoError(t, err)
@@ -872,6 +876,137 @@ func TestAerospike(t *testing.T) {
 		assert.Len(t, txSpends, 1)
 		assert.Nil(t, txSpends[0].Err)
 		assert.Equal(t, tx2.TxIDChainHash().String(), txSpends[0].SpendingData.TxID.String())
+	})
+
+	// New test to validate SetMinedMulti over multiple txids in a single call
+	t.Run("aerospike_setmined_multi_batch_two", func(t *testing.T) {
+		cleanDB(t, client)
+
+		// Create two transactions in the store
+		_, err = store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		_, err = store.Create(ctx, txWithOPReturn, 0)
+		require.NoError(t, err)
+
+		// Call SetMinedMulti for both transactions at once
+		blockID1 := uint32(111)
+		blockHeight1 := uint32(1001)
+		subtreeIdx1 := 1
+
+		blockID2 := uint32(222)
+		blockHeight2 := uint32(1002)
+		subtreeIdx2 := 2
+
+		ids := []*chainhash.Hash{tx.TxIDChainHash(), txWithOPReturn.TxIDChainHash()}
+
+		blockIDsMap, err := store.SetMinedMulti(ctx, ids, utxo.MinedBlockInfo{BlockID: blockID1, BlockHeight: blockHeight1, SubtreeIdx: subtreeIdx1})
+		require.NoError(t, err)
+		require.Equal(t, 2, len(blockIDsMap))
+		require.Equal(t, []uint32{blockID1}, blockIDsMap[*tx.TxIDChainHash()])
+		require.Equal(t, []uint32{blockID1}, blockIDsMap[*txWithOPReturn.TxIDChainHash()])
+
+		// Verify via direct read of bins
+		value, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey)
+		require.NoError(t, err)
+		assert.Equal(t, []interface{}{int(blockID1)}, value.Bins[fields.BlockIDs.String()].([]interface{}))
+
+		value2, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txWithOPReturnKey)
+		require.NoError(t, err)
+		assert.Equal(t, []interface{}{int(blockID1)}, value2.Bins[fields.BlockIDs.String()].([]interface{}))
+
+		// Add another block to both using a single multi call again
+		blockIDsMap, err = store.SetMinedMulti(ctx, ids, utxo.MinedBlockInfo{BlockID: blockID2, BlockHeight: blockHeight2, SubtreeIdx: subtreeIdx2})
+		require.NoError(t, err)
+		require.Equal(t, 2, len(blockIDsMap))
+		require.Equal(t, []uint32{blockID1, blockID2}, blockIDsMap[*tx.TxIDChainHash()])
+		require.Equal(t, []uint32{blockID1, blockID2}, blockIDsMap[*txWithOPReturn.TxIDChainHash()])
+
+		value, err = client.Get(util.GetAerospikeReadPolicy(tSettings), txKey)
+		require.NoError(t, err)
+		assert.Equal(t, []interface{}{int(blockID1), int(blockID2)}, value.Bins[fields.BlockIDs.String()].([]interface{}))
+
+		value2, err = client.Get(util.GetAerospikeReadPolicy(tSettings), txWithOPReturnKey)
+		require.NoError(t, err)
+		assert.Equal(t, []interface{}{int(blockID1), int(blockID2)}, value2.Bins[fields.BlockIDs.String()].([]interface{}))
+	})
+
+	// New test to validate IncrementSpentRecordsMulti coalesces increments and updates the counter
+	t.Run("aerospike_increment_spent_records_multi", func(t *testing.T) {
+		cleanDB(t, client)
+
+		_, err = store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		// Read initial counter
+		rec, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey, "totalExtraRecs")
+		require.NoError(t, err)
+		initial := 0
+		if v, ok := rec.Bins["totalExtraRecs"].(int); ok {
+			initial = v
+		}
+
+		// Increment via multi API
+		require.NoError(t, store.IncrementSpentRecordsMulti([]*chainhash.Hash{tx.TxIDChainHash()}, 1))
+
+		rec2, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey, "totalExtraRecs")
+		require.NoError(t, err)
+		v2, ok := rec2.Bins["totalExtraRecs"].(int)
+		require.True(t, ok)
+		assert.Equal(t, initial+1, v2)
+	})
+
+	// New test: SetMinedMulti with one valid and one invalid hash should partially succeed and return an error
+	t.Run("aerospike_setmined_multi_partial_failure", func(t *testing.T) {
+		cleanDB(t, client)
+
+		_, err = store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		valid := tx.TxIDChainHash()
+		var invalid chainhash.Hash // zero hash not present in DB
+		ids := []*chainhash.Hash{valid, &invalid}
+
+		blockID := uint32(333)
+		blockHeight := uint32(2001)
+		subtreeIdx := 5
+
+		blockIDsMap, err := store.SetMinedMulti(ctx, ids, utxo.MinedBlockInfo{BlockID: blockID, BlockHeight: blockHeight, SubtreeIdx: subtreeIdx})
+		require.Error(t, err)
+		// Valid tx should be present and updated
+		require.Contains(t, blockIDsMap, *valid)
+		require.Equal(t, []uint32{blockID}, blockIDsMap[*valid])
+		// Invalid hash should not be present in successful map
+		_, hasInvalid := blockIDsMap[invalid]
+		require.False(t, hasInvalid)
+	})
+
+	// New test: IncrementSpentRecordsMulti with one invalid key should aggregate errors and still update the valid one
+	t.Run("aerospike_increment_spent_records_multi_with_errors", func(t *testing.T) {
+		cleanDB(t, client)
+
+		_, err = store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		rec, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey, "totalExtraRecs")
+		require.NoError(t, err)
+		base := 0
+		if v, ok := rec.Bins["totalExtraRecs"].(int); ok {
+			base = v
+		}
+
+		valid := tx.TxIDChainHash()
+		var invalid chainhash.Hash // zero hash, not present
+		ids := []*chainhash.Hash{valid, &invalid}
+
+		aggErr := store.IncrementSpentRecordsMulti(ids, 1)
+		require.Error(t, aggErr)
+
+		rec2, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey, "totalExtraRecs")
+		require.NoError(t, err)
+		v2, ok := rec2.Bins["totalExtraRecs"].(int)
+		require.True(t, ok)
+		assert.Equal(t, base+1, v2)
 	})
 
 	t.Run("set mined with locked", func(t *testing.T) {
@@ -1598,7 +1733,7 @@ func TestAerospikeWithBatchSize(t *testing.T) {
 		require.NoError(t, err)
 
 		for i := uint32(1); i <= 2; i++ {
-			childKey := uaerospike.CalculateKeySource(tx.TxIDChainHash(), i)
+			childKey := uaerospike.CalculateKeySourceInternal(tx.TxIDChainHash(), i)
 
 			aKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), childKey)
 			require.NoError(t, err)
@@ -1613,7 +1748,7 @@ func TestAerospikeWithBatchSize(t *testing.T) {
 		require.NoError(t, err)
 
 		for i := uint32(1); i <= 2; i++ {
-			childKey := uaerospike.CalculateKeySource(tx.TxIDChainHash(), i)
+			childKey := uaerospike.CalculateKeySourceInternal(tx.TxIDChainHash(), i)
 
 			aKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), childKey)
 			require.NoError(t, err)
@@ -1635,8 +1770,8 @@ func TestAerospikeWithBatchSize(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotNil(t, txMeta)
 
-		keySource0 := uaerospike.CalculateKeySource(tx.TxIDChainHash(), 0)
-		keySource1 := uaerospike.CalculateKeySource(tx.TxIDChainHash(), 1)
+		keySource0 := uaerospike.CalculateKeySourceInternal(tx.TxIDChainHash(), 0)
+		keySource1 := uaerospike.CalculateKeySourceInternal(tx.TxIDChainHash(), 1)
 
 		key0, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource0)
 		require.NoError(t, err)
@@ -1838,7 +1973,7 @@ func TestStore_AerospikeSplitTx(t *testing.T) {
 	assert.Equal(t, 3, extraRecords)
 
 	for i := 1; i <= extraRecords; i++ {
-		keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(i))
+		keySource := uaerospike.CalculateKeySourceInternal(tx.TxIDChainHash(), uint32(i))
 
 		key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, err)
@@ -1854,7 +1989,7 @@ func TestStore_AerospikeSplitTx(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i <= extraRecords; i++ {
-		keySource := uaerospike.CalculateKeySource(tx.TxIDChainHash(), uint32(i))
+		keySource := uaerospike.CalculateKeySourceInternal(tx.TxIDChainHash(), uint32(i))
 
 		key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), keySource)
 		require.NoError(t, err)
@@ -1865,6 +2000,106 @@ func TestStore_AerospikeSplitTx(t *testing.T) {
 		assert.NotNil(t, res)
 		assert.False(t, res.Bins[fields.Locked.String()].(bool), "Record %d should be false", i)
 	}
+}
+
+func TestRespendSameUTXO(t *testing.T) {
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	client, store, ctx, deferFn := initAerospike(t, tSettings, logger)
+
+	t.Cleanup(func() {
+		deferFn()
+	})
+
+	privKey, _ := bec.PrivateKeyFromBytes([]byte("ALWAYS_THE_SAME"))
+
+	parentTx := transactions.Create(t,
+		transactions.WithCoinbaseData(100, "/Test miner/"),
+		transactions.WithP2PKHOutputs(1, 100000, privKey.PubKey()),
+	)
+
+	t.Logf("Parent tx: %s", parentTx.TxIDChainHash().String())
+
+	// Create the parent tx
+	_, err := store.Create(ctx, parentTx, 0)
+	require.NoError(t, err)
+
+	parentKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), parentTx.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+
+	parentResp, err := client.Get(nil, parentKey, fields.Utxos.String())
+	require.NoError(t, err)
+	utxos := parentResp.Bins[fields.Utxos.String()].([]interface{})
+	require.Equal(t, 1, len(utxos))
+	h := hex.EncodeToString(utxos[0].([]byte))
+	require.Equal(t, "323ad5e6f4e332dfcc0995d4ab11491498da4935b3b5478d696df0b62e14a554", h)
+
+	// Create the tx
+	childTx1 := transactions.Create(t,
+		transactions.WithInput(parentTx, 0, privKey),
+		transactions.WithP2PKHOutputs(1, 100, privKey.PubKey()),
+	)
+
+	t.Logf("Child tx1: %s", childTx1.TxIDChainHash().String())
+
+	// Now let's create an alternative conflicting transaction
+	childTx2 := transactions.Create(t,
+		transactions.WithInput(parentTx, 0, privKey),
+		transactions.WithP2PKHOutputs(1, 101, privKey.PubKey()),
+	)
+
+	t.Logf("Child tx2: %s", childTx2.TxIDChainHash().String())
+
+	spendFn := func(tx *bt.Tx, expectError bool) {
+		spends, err := store.Spend(ctx, tx)
+
+		require.Len(t, spends, 1)
+		if expectError {
+			assert.Error(t, err)
+			assert.Error(t, spends[0].Err)
+		} else {
+			assert.NoError(t, err)
+			assert.NoError(t, spends[0].Err)
+		}
+
+		// parentResp, err := client.Get(nil, parentKey, fields.Utxos.String())
+		// require.NoError(t, err)
+		// t.Logf("Parent utxos: %x", parentResp.Bins[fields.Utxos.String()])
+		// t.Logf("Spend %s: %v", tx.TxIDChainHash().String(), spends[0])
+	}
+
+	// Explicitly spend childTx1 first
+	spendFn(childTx1, false)
+
+	// parentResp, err = client.Get(nil, parentKey, fields.Utxos.String())
+	// require.NoError(t, err)
+	// utxo := fmt.Sprintf("%x", parentResp.Bins[fields.Utxos.String()])
+	// require.Len(t, utxo, 136) // 32 + 32 + 4 bytes are hex
+	// require.Equal(t, "323ad5e6f4e332dfcc0995d4ab11491498da4935b3b5478d696df0b62e14a554", utxo[0:64])
+	// require.Equal(t, "87251f9f8ecb3d5a80a71e0b2d409b1f9c63a13e7b6eb35843b32c7094d6fd75", utxo[64:128])
+	// require.Equal(t, "00000000", utxo[128:])
+
+	wg := sync.WaitGroup{}
+	wg.Add(20)
+
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wg.Done()
+
+			spendFn(childTx1, false)
+		}()
+	}
+
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wg.Done()
+
+			spendFn(childTx2, true)
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestDeleteByBin(t *testing.T) {
@@ -1989,4 +2224,117 @@ func TestAerospikeCleanupService(t *testing.T) {
 
 	// Start the cleanup service
 	cleanupService.Start(ctx)
+}
+
+func TestDeletedChildren(t *testing.T) {
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	client, store, ctx, deferFn := initAerospike(t, tSettings, logger)
+
+	t.Cleanup(func() {
+		deferFn()
+	})
+
+	privKey, _ := bec.PrivateKeyFromBytes([]byte("ALWAYS_THE_SAME"))
+
+	// Create the coinbase tx
+	coinbaseTx := transactions.Create(t,
+		transactions.WithCoinbaseData(100, "/Test miner/"),
+		transactions.WithP2PKHOutputs(1, 5_000_000_000, privKey.PubKey()),
+	)
+
+	_, err := store.Create(ctx, coinbaseTx, 0, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+		BlockID:     1,
+		BlockHeight: 1,
+	}))
+	require.NoError(t, err)
+
+	t.Logf("Coinbase tx: %s", coinbaseTx.TxIDChainHash().String())
+
+	// Create the parentTx with 500 outputs
+	parentTxOptions := []transactions.TxOption{
+		transactions.WithInput(coinbaseTx, 0, privKey),
+	}
+
+	for i := 0; i < 500; i++ {
+		parentTxOptions = append(parentTxOptions, transactions.WithP2PKHOutputs(1, 10_000_000, privKey.PubKey()))
+	}
+
+	parentTx := transactions.Create(t, parentTxOptions...)
+
+	_, err = store.Create(ctx, parentTx, 0, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+		BlockID:     1,
+		BlockHeight: 1,
+	}))
+	require.NoError(t, err)
+
+	t.Logf("Parent tx: %s", parentTx.TxIDChainHash().String())
+
+	// Create the childTx with 100 outputs
+	childTxOptions := []transactions.TxOption{
+		transactions.WithInput(parentTx, 0, privKey),
+	}
+
+	for i := 0; i < 100; i++ {
+		childTxOptions = append(childTxOptions, transactions.WithP2PKHOutputs(1, 100_000, privKey.PubKey()))
+	}
+
+	childTx := transactions.Create(t, childTxOptions...)
+
+	_, err = store.Spend(ctx, childTx)
+	require.NoError(t, err)
+
+	_, err = store.Create(ctx, childTx, 0, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+		BlockID:     1,
+		BlockHeight: 1,
+	}))
+
+	require.NoError(t, err)
+
+	t.Logf("Child tx: %s", childTx.TxIDChainHash().String())
+
+	// Now we spend all the outputs in the childTx so it can be deleted...
+	for i := 0; i < len(childTx.Outputs); i++ {
+		spendTx := transactions.Create(t,
+			transactions.WithInput(childTx, uint32(i), privKey),
+			transactions.WithP2PKHOutputs(1, 100, privKey.PubKey()),
+		)
+
+		_, err = store.Spend(ctx, spendTx)
+		require.NoError(t, err)
+	}
+
+	parentKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), parentTx.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+
+	childKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), childTx.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+
+	childResp, err := client.Get(nil, childKey, fields.DeleteAtHeight.String())
+	require.NoError(t, err)
+
+	assert.Equal(t, 11, childResp.Bins[fields.DeleteAtHeight.String()])
+
+	opts := cleanup.Options{
+		Logger:         logger,
+		Client:         client,
+		ExternalStore:  memory.New(),
+		Namespace:      store.GetNamespace(),
+		Set:            store.GetName(),
+		MaxJobsHistory: 3,
+		IndexWaiter:    &mockIndexWaiter{},
+	}
+
+	cleanupService, err := cleanup.NewService(tSettings, opts)
+	require.NoError(t, err)
+
+	err = cleanupService.ProcessSingleRecord(childTx.TxIDChainHash(), childTx.Inputs)
+	require.NoError(t, err)
+
+	parentResp, err := client.Get(nil, parentKey, fields.DeletedChildren.String())
+	require.NoError(t, err)
+
+	deletedChildrenMap := parentResp.Bins[fields.DeletedChildren.String()].(map[interface{}]interface{})
+	assert.Len(t, deletedChildrenMap, 1)
 }

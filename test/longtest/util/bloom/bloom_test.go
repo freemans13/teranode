@@ -35,7 +35,7 @@ func Test_BloomFilter(t *testing.T) {
 		}
 
 		// create read buffer
-		r := bufio.NewReaderSize(f, 32*1024*1024)
+		r := bufio.NewReaderSize(f, 1024*64)
 
 		for i := 0; i < numTxids; i++ {
 			txids[i] = make([]byte, 32)

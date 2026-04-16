@@ -30,16 +30,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/usql"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/jellydator/ttlcache/v3"
 	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
@@ -557,7 +557,7 @@ func (c *blockchainCache) addBlockHeader(blockHeader *model.BlockHeader, blockHe
 		c.chain = append(c.chain, *blockHeader.Hash())
 
 		// only keep last 200 blocks in cache
-		if len(c.chain) >= c.cacheSize {
+		if len(c.chain) > c.cacheSize {
 			oldestHash := c.chain[0]
 			delete(c.headers, oldestHash)
 			delete(c.metas, oldestHash)
@@ -682,8 +682,8 @@ func (s *SQL) ResetResponseCache() {
 //   - StorageError when database operations fail during best block header retrieval
 //   - ProcessingError when header reconstruction or cache population fails
 func (s *SQL) ResetBlocksCache(ctx context.Context) error {
-	s.logger.Warnf("Reset")
-	defer s.logger.Warnf("Reset completed")
+	s.logger.Warnf("Reset blocks cache")
+	defer s.logger.Warnf("Reset blocks cache completed")
 
 	// empty the cache
 	s.blocksCache.RebuildBlockchain(nil, nil)

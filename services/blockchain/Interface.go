@@ -9,10 +9,10 @@ package blockchain
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 )
 
 // ClientI defines the interface for blockchain client operations.
@@ -443,6 +443,40 @@ type ClientI interface {
 	// - Error if the header retrieval fails
 	GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error)
 
+	// GetBlocksByHeight retrieves full blocks between two heights.
+	//
+	// This method fetches a sequence of complete blocks within a specified height range,
+	// inclusive of both the start and end heights. Unlike GetBlockHeadersByHeight which
+	// only returns header data, this method provides full block information including
+	// subtrees, transactions metadata, and coinbase data needed for operations like
+	// subtree searching and detailed block analysis.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - startHeight: Lower bound height to start retrieving blocks from (inclusive)
+	// - endHeight: Upper bound height to retrieve blocks until (inclusive)
+	//
+	// Returns:
+	// - Array of complete Block objects in ascending height order
+	// - Error if the block retrieval fails
+	GetBlocksByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.Block, error)
+
+	// FindBlocksContainingSubtree finds all blocks that contain the specified subtree hash.
+	//
+	// This method searches through the blockchain to find blocks whose subtree arrays contain
+	// the given subtree hash. It's useful for merkle proof construction and subtree tracking.
+	// The search is optimized using SQL queries to efficiently scan through blocks.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - subtreeHash: Hash of the subtree to search for
+	// - maxBlocks: Maximum number of blocks to search (0 means no limit)
+	//
+	// Returns:
+	// - Array of Block objects containing the specified subtree
+	// - Error if the search fails
+	FindBlocksContainingSubtree(ctx context.Context, subtreeHash *chainhash.Hash, maxBlocks uint32) ([]*model.Block, error)
+
 	// InvalidateBlock marks a block as invalid.
 	//
 	// This method flags a block as invalid in the blockchain, which prevents it from being
@@ -777,6 +811,23 @@ type ClientI interface {
 	// Returns:
 	// - Error if the catch-up process fails
 	CatchUpBlocks(ctx context.Context) error
+
+	// ReportPeerFailure notifies the blockchain service about peer download failures.
+	//
+	// This method allows other services (like block validation, subtree validation) to report
+	// when a peer fails to provide data correctly. The blockchain service broadcasts this to
+	// subscribers (like P2P) who can take action such as switching to a different peer.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - hash: Hash of the block/subtree/tx being processed when the failure occurred
+	// - peerID: Identifier of the failing peer
+	// - failureType: Type of failure (e.g., "catchup", "subtree", "block")
+	// - reason: Description of the failure
+	//
+	// Returns:
+	// - Error if the notification fails
+	ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error
 
 	// LegacySync performs a legacy synchronization process.
 	//

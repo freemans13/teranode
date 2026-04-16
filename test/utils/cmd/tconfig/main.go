@@ -5,7 +5,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/bitcoin-sv/teranode/test/utils/tconfig"
+	"github.com/bsv-blockchain/teranode/test/utils/tconfig"
 )
 
 // How to run

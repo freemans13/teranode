@@ -11,11 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/asset/asset_api"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,43 +24,6 @@ const (
 	shortTimeout      = 50 * time.Millisecond
 	errClientNotAdded = "Client channel not added to clientChannels"
 )
-
-func TestCreatePingMessage(t *testing.T) {
-	t.Run("with P2PNode", func(t *testing.T) {
-		// Create a mock P2PNode
-		mockP2PNode := new(MockServerP2PNode)
-		testPeerID, _ := peer.Decode("QmTestPeerID123")
-		mockP2PNode.On("HostID").Return(testPeerID)
-
-		// Create server with mock P2PNode
-		server := &Server{
-			P2PNode: mockP2PNode,
-			logger:  ulogger.New("test-server"),
-		}
-
-		msg, err := server.createPingMessage(baseURL)
-		require.NoError(t, err)
-		assert.Equal(t, asset_api.Type_PING.String(), msg.Type)
-		assert.Equal(t, baseURL, msg.BaseURL)
-		assert.Equal(t, testPeerID.String(), msg.PeerID)
-		assert.NotEmpty(t, msg.Timestamp)
-	})
-
-	t.Run("without P2PNode", func(t *testing.T) {
-		// Create server without P2PNode
-		server := &Server{
-			P2PNode: nil,
-			logger:  ulogger.New("test-server"),
-		}
-
-		msg, err := server.createPingMessage(baseURL)
-		require.NoError(t, err)
-		assert.Equal(t, asset_api.Type_PING.String(), msg.Type)
-		assert.Equal(t, baseURL, msg.BaseURL)
-		assert.Empty(t, msg.PeerID) // PeerID should be empty when P2PNode is nil
-		assert.NotEmpty(t, msg.Timestamp)
-	})
-}
 
 func TestBroadcastMessage(t *testing.T) {
 	tests := []struct {
@@ -261,6 +223,11 @@ func (c *testWebSocketConn) ReadMessage() (messageType int, p []byte, err error)
 func TestStartNotificationProcessor(t *testing.T) {
 	s := &Server{
 		logger: &ulogger.TestLogger{},
+		settings: &settings.Settings{
+			P2P: settings.P2PSettings{
+				ListenMode: settings.ListenModeFull,
+			},
+		},
 	}
 
 	clientChannels := newClientChannelMap()
@@ -278,7 +245,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	go func() {
 		close(processorStarted)
-		s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, baseURL, ctx)
+		s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, ctx)
 		close(processorDone)
 	}()
 
@@ -316,7 +283,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, "node_status", initialMsg.Type, "First message should be node_status")
 		case <-time.After(100 * time.Millisecond):
-			// No initial message is OK too if the server doesn't have a P2PNode
+			// No initial message is OK too if the server doesn't have a P2PClient
 		}
 
 		// Send our test notification
@@ -395,6 +362,11 @@ func TestHandleWebSocket(t *testing.T) {
 	s := &Server{
 		gCtx:   t.Context(),
 		logger: &ulogger.TestLogger{},
+		settings: &settings.Settings{
+			P2P: settings.P2PSettings{
+				ListenMode: settings.ListenModeFull,
+			},
+		},
 	}
 
 	// Create notification channel

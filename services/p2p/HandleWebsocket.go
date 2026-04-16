@@ -8,9 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/asset/asset_api"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 )
@@ -35,23 +33,26 @@ type notificationMsg struct {
 	SizeInBytes  uint64 `json:"size_in_bytes,omitempty"`     // Size of the block or data in bytes
 	Miner        string `json:"miner,omitempty"`             // Miner identifier for mining-related notifications
 	// Node status fields
-	Version              string                          `json:"version,omitempty"`         // Node version
-	CommitHash           string                          `json:"commit_hash,omitempty"`     // Git commit hash
-	BestBlockHash        string                          `json:"best_block_hash,omitempty"` // Best block hash
-	BestHeight           uint32                          `json:"best_height"`               // Best block height
-	BlockAssemblyDetails *blockassembly_api.StateMessage `json:"block_assembly_details"`    // Block assembly details
-	FSMState             string                          `json:"fsm_state,omitempty"`       // FSM state
-	StartTime            int64                           `json:"start_time,omitempty"`      // Node start time
-	Uptime               float64                         `json:"uptime,omitempty"`          // Node uptime in seconds
-	ClientName           string                          `json:"client_name,omitempty"`     // Client name of this node
-	MinerName            string                          `json:"miner_name,omitempty"`      // Miner name that mined the best block
-	ListenMode           string                          `json:"listen_mode,omitempty"`     // Listen mode
-	ChainWork            string                          `json:"chain_work,omitempty"`      // Chain work as hex string
+	Version       string  `json:"version,omitempty"`         // Node version
+	CommitHash    string  `json:"commit_hash,omitempty"`     // Git commit hash
+	BestBlockHash string  `json:"best_block_hash,omitempty"` // Best block hash
+	BestHeight    uint32  `json:"best_height"`               // Best block height
+	SubtreeCount  uint32  `json:"subtree_count,omitempty"`   // Number of subtrees in block assembly
+	FSMState      string  `json:"fsm_state,omitempty"`       // FSM state
+	StartTime     int64   `json:"start_time,omitempty"`      // Node start time
+	Uptime        float64 `json:"uptime,omitempty"`          // Node uptime in seconds
+	ClientName    string  `json:"client_name,omitempty"`     // Client name of this node
+	MinerName     string  `json:"miner_name,omitempty"`      // Miner name that mined the best block
+	ListenMode    string  `json:"listen_mode,omitempty"`     // Listen mode
+	ChainWork     string  `json:"chain_work,omitempty"`      // Chain work as hex string
 	// Sync peer fields
 	SyncPeerID        string `json:"sync_peer_id,omitempty"`         // ID of the peer we're syncing from
 	SyncPeerHeight    int32  `json:"sync_peer_height,omitempty"`     // Height of the sync peer
 	SyncPeerBlockHash string `json:"sync_peer_block_hash,omitempty"` // Best block hash of the sync peer
 	SyncConnectedAt   int64  `json:"sync_connected_at,omitempty"`    // Unix timestamp when we first connected to this sync peer
+	// New fields for enhanced node status
+	MinMiningTxFee      *float64 `json:"min_mining_tx_fee,omitempty"`     // Minimum mining transaction fee configured for this node (nil = unknown, 0 = no fee)
+	ConnectedPeersCount int      `json:"connected_peers_count,omitempty"` // Number of connected peers
 }
 
 // clientChannelMap manages a thread-safe collection of WebSocket client channels.
@@ -158,22 +159,6 @@ func (s *Server) broadcastMessage(data []byte, clientChannels *clientChannelMap)
 	clientChannels.broadcast(data, s.logger)
 }
 
-// createPingMessage creates a ping notification message
-func (s *Server) createPingMessage(baseURL string) (*notificationMsg, error) {
-	msg := &notificationMsg{
-		Timestamp: time.Now().UTC().Format(isoFormat),
-		Type:      asset_api.Type_PING.String(),
-		BaseURL:   baseURL,
-	}
-
-	// Add PeerID if P2PNode is available
-	if s.P2PNode != nil {
-		msg.PeerID = s.P2PNode.HostID().String()
-	}
-
-	return msg, nil
-}
-
 // handleClientMessages processes messages for a single websocket client
 func (s *Server) handleClientMessages(ws WebSocketConn, ch chan []byte, deadClientCh chan<- chan []byte) {
 ClientMessageLoop:
@@ -212,36 +197,21 @@ func (s *Server) startNotificationProcessor(
 	newClientCh <-chan chan []byte,
 	deadClientCh <-chan chan []byte,
 	notificationCh <-chan *notificationMsg,
-	baseURL string,
 	ctx context.Context,
 ) {
-	pingTimer := time.NewTicker(10 * time.Second)
-	defer pingTimer.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
+
 		case newClient := <-newClientCh:
 			clientChannels.add(newClient)
 			// Send initial node_status messages to the new client
 			s.sendInitialNodeStatuses(newClient)
+
 		case deadClient := <-deadClientCh:
 			clientChannels.remove(deadClient)
-		case <-pingTimer.C:
-			msg, err := s.createPingMessage(baseURL)
-			if err != nil {
-				s.logger.Errorf("Failed to create ping message: %v", err)
-				continue
-			}
 
-			data, err := json.Marshal(msg)
-			if err != nil {
-				s.logger.Errorf("Failed to marshal ping message: %v", err)
-				continue
-			}
-
-			s.broadcastMessage(data, clientChannels)
 		case notification := <-notificationCh:
 			data, err := json.Marshal(notification)
 			if err != nil {
@@ -284,7 +254,7 @@ func (s *Server) HandleWebSocket(notificationCh chan *notificationMsg, baseURL s
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	go s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, baseURL, ctx)
+	go s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, ctx)
 
 	return func(c echo.Context) error {
 		ch := make(chan []byte, 100) // Add buffer to help prevent blocking

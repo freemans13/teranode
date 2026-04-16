@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/docker/go-connections/nat"
 	_ "github.com/lib/pq"
 	testcontainers "github.com/testcontainers/testcontainers-go"

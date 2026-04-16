@@ -4,12 +4,12 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model/time"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model/time"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
 // unminedTxIterator implements utxo.UnminedTxIterator for SQL
@@ -33,6 +33,8 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 		,t.size_in_bytes
 		,t.inserted_at
 		,t.locked
+		,t.coinbase
+		,t.unmined_since
 		FROM transactions t
 		WHERE t.unmined_since IS NOT NULL
 		  AND t.conflicting = false
@@ -64,15 +66,17 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 	}
 
 	var (
-		id          uint64
-		txID        *chainhash.Hash
-		fee         uint64
-		sizeInBytes uint64
-		insertedAt  time.CustomTime
-		locked      bool
+		id           uint64
+		txID         *chainhash.Hash
+		fee          uint64
+		sizeInBytes  uint64
+		insertedAt   time.CustomTime
+		locked       bool
+		isCoinbase   bool
+		unminedSince uint32
 	)
 
-	if err := it.rows.Scan(&id, &txID, &fee, &sizeInBytes, &insertedAt, &locked); err != nil {
+	if err := it.rows.Scan(&id, &txID, &fee, &sizeInBytes, &insertedAt, &locked, &isCoinbase, &unminedSince); err != nil {
 		if err := it.Close(); err != nil {
 			it.store.logger.Warnf("failed to close iterator: %v", err)
 		}
@@ -107,6 +111,13 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 	}
 
 	defer rows.Close()
+
+	if isCoinbase {
+		// skip coinbase transactions
+		return &utxo.UnminedTransaction{
+			Skip: true,
+		}, nil
+	}
 
 	tx := bt.Tx{}
 
@@ -155,13 +166,52 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 		return nil, errors.NewProcessingError("failed to create tx inpoints from inputs", err)
 	}
 
+	blockIds := make([]uint32, 0, 2)
+
+	q3 := `
+			SELECT
+			    block_id
+			FROM block_ids
+			WHERE transaction_id = $1
+			ORDER BY block_id
+		`
+
+	rows2, err := it.store.db.QueryContext(ctx, q3, id)
+	if err != nil {
+		if err := it.Close(); err != nil {
+			it.store.logger.Warnf("failed to close iterator: %v", err)
+		}
+
+		it.err = err
+
+		return nil, it.err
+	}
+
+	defer rows2.Close()
+
+	for rows2.Next() {
+		var blockId uint32
+
+		if err = rows2.Scan(&blockId); err != nil {
+			if err = it.Close(); err != nil {
+				it.store.logger.Warnf("failed to close iterator: %v", err)
+			}
+
+			return nil, err
+		}
+
+		blockIds = append(blockIds, blockId)
+	}
+
 	return &utxo.UnminedTransaction{
-		Hash:       txID,
-		Fee:        fee,
-		Size:       sizeInBytes,
-		TxInpoints: txInpoints,
-		CreatedAt:  int(insertedAt.UnixMilli()),
-		Locked:     locked,
+		Hash:         txID,
+		Fee:          fee,
+		Size:         sizeInBytes,
+		TxInpoints:   txInpoints,
+		CreatedAt:    int(insertedAt.UnixMilli()),
+		Locked:       locked,
+		BlockIDs:     blockIds,
+		UnminedSince: int(unminedSince),
 	}, nil
 }
 
@@ -175,6 +225,6 @@ func (it *unminedTxIterator) Close() error {
 	return it.rows.Close()
 }
 
-func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+func (s *Store) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
 	return newUnminedTxIterator(s)
 }

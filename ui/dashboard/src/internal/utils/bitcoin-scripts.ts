@@ -13,6 +13,7 @@ export enum ScriptType {
 }
 
 // Bitcoin opcodes
+const OP_FALSE = 0x00
 const OP_DUP = 0x76
 const OP_HASH160 = 0xa9
 const OP_EQUALVERIFY = 0x88
@@ -54,6 +55,11 @@ export function detectScriptType(scriptHex: string): ScriptType {
 
   // OP_RETURN: OP_RETURN <data>
   if (bytes[0] === OP_RETURN) {
+    return ScriptType.OP_RETURN
+  }
+
+  // OP_FALSE OP_RETURN: OP_RETURN <data>
+  if (bytes[0] === OP_FALSE && bytes[1] === OP_RETURN) {
     return ScriptType.OP_RETURN
   }
 
@@ -239,7 +245,12 @@ function getOpcodeName(opcode: number): string {
  */
 export function extractOpReturnData(scriptHex: string): string | null {
   const bytes = hexToBytes(scriptHex)
-  
+
+  if (bytes[0] === OP_FALSE) {
+    // Skip OP_FALSE for data extraction
+    bytes.shift()
+  }
+
   if (bytes[0] !== OP_RETURN) {
     return null
   }
@@ -328,7 +339,13 @@ function base58Encode(bytes: Uint8Array): string {
  * Note: This is an async function wrapped to work synchronously for simplicity
  */
 async function doubleSha256(data: Uint8Array): Promise<Uint8Array> {
-  const hash1 = await crypto.subtle.digest('SHA-256', data)
+  // Ensure we pass an ArrayBuffer (not ArrayBufferLike) to satisfy BufferSource
+  const input: ArrayBuffer =
+    data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+      ? (data.buffer as ArrayBuffer)
+      : (data.slice().buffer as ArrayBuffer)
+
+  const hash1 = await crypto.subtle.digest('SHA-256', input)
   const hash2 = await crypto.subtle.digest('SHA-256', hash1)
   return new Uint8Array(hash2)
 }

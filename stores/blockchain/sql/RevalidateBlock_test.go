@@ -5,9 +5,9 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -63,7 +63,7 @@ func TestSQL_RevalidateBlock(t *testing.T) {
 		assert.Equal(t, 3, id)
 		assert.Equal(t, uint32(3), height)
 		assert.True(t, invalid)
-		assert.False(t, mined_set)
+		assert.False(t, mined_set) // mined_set is set to false when invalidating to trigger tx unsetting
 
 		// reset the mined_set to true, the revalidation should set it back to false
 		err = s.SetBlockMinedSet(t.Context(), block3.Hash())

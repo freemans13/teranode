@@ -44,20 +44,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/txmetacache"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/txmetacache"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 )
@@ -884,7 +884,14 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 
 	start = gocore.CurrentTime()
 	buffer := make([]byte, chainhash.HashSize)
-	bufferedReader := bufio.NewReaderSize(body, 1024*1024*4) // 4MB buffer
+
+	// Use pooled bufio.Reader
+	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+	bufferedReader.Reset(body)
+	defer func() {
+		bufferedReader.Reset(nil)
+		bufioReaderPool.Put(bufferedReader)
+	}()
 
 	u.logger.Debugf("[getSubtreeTxHashes][%s] processing subtree response into tx hashes", subtreeHash.String())
 
@@ -993,15 +1000,15 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 	var (
 		errorsFound      = atomic.Uint64{}
 		addedToOrphanage = atomic.Uint64{}
-		lastError        error
-		lastErrorMu      sync.Mutex
+		firstError       error
+		firstErrorOnce   sync.Once
 	)
 
 	for level := uint32(0); level <= maxLevel; level++ {
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
 
-		u.logger.Debugf("[processMissingTransactions][%s] processing level %d with %d transactions", subtreeHash.String(), level, len(txsPerLevel[level]))
+		u.logger.Debugf("[processMissingTransactions][%s] processing level %d/%d with %d transactions", subtreeHash.String(), level+1, maxLevel+1, len(txsPerLevel[level]))
 
 		for _, mTx = range txsPerLevel[level] {
 			tx := mTx.tx
@@ -1019,11 +1026,9 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 					u.logger.Debugf("[validateSubtree][%s] failed to bless missing transaction: %s: %v", subtreeHash.String(), tx.TxIDChainHash().String(), err)
 					errorsFound.Add(1)
 
-					lastErrorMu.Lock()
-					lastError = errors.NewProcessingError("[validateSubtree][%s] failed to bless missing transaction: %s", subtreeHash.String(), tx.TxIDChainHash().String(), err)
-					lastErrorMu.Unlock()
-
-					// TODO handle storage and service errors differently
+					firstErrorOnce.Do(func() {
+						firstError = errors.NewProcessingError("[validateSubtree][%s] failed to bless missing transaction: %s", subtreeHash.String(), tx.TxIDChainHash().String(), err)
+					})
 
 					// Check if this is a truly invalid transaction (not just policy error)
 					if errors.Is(err, errors.ErrTxMissingParent) {
@@ -1061,9 +1066,9 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 						u.logger.Debugf("[validateSubtree][%s] tx meta already exists in txMetaSlice at index %d: %s", subtreeHash.String(), txIdx, tx.TxIDChainHash().String())
 						errorsFound.Add(1)
 
-						lastErrorMu.Lock()
-						lastError = errors.NewProcessingError("[validateSubtree][%s] tx meta already exists in txMetaSlice at index %d: %s", subtreeHash.String(), txIdx, tx.TxIDChainHash().String())
-						lastErrorMu.Unlock()
+						firstErrorOnce.Do(func() {
+							firstError = errors.NewProcessingError("[validateSubtree][%s] tx meta already exists in txMetaSlice at index %d: %s", subtreeHash.String(), txIdx, tx.TxIDChainHash().String())
+						})
 
 						return nil
 					}
@@ -1083,7 +1088,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 
 	if errorsFound.Load() > 0 {
 		// If there are errors found, we return here, so that the caller can handle it
-		return errors.NewProcessingError("[validateSubtree][%s] found %d errors while processing subtree, added %d to orphanage", subtreeHash.String(), errorsFound.Load(), addedToOrphanage.Load(), lastError)
+		return errors.NewProcessingError("[validateSubtree][%s] found %d errors while processing subtree, added %d to orphanage", subtreeHash.String(), errorsFound.Load(), addedToOrphanage.Load(), firstError)
 	}
 
 	if missingCount.Load() > 0 {
@@ -1149,19 +1154,65 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "peer_cannot_provide_subtree_data")
 				u.logger.Errorf("[validateSubtree][%s] failed to get subtree data from %s: %v", subtreeHash.String(), url, subtreeDataErr)
 			} else {
-				if subtreeDataErr = u.subtreeStore.SetFromReader(ctx,
-					subtreeHash[:],
-					fileformat.FileTypeSubtreeData,
-					body,
-				); subtreeDataErr != nil {
-					u.logger.Errorf("[validateSubtree][%s] failed to store subtree data: %v", subtreeHash.String(), subtreeDataErr)
+				// Build subtree structure from allTxs for deserialization
+				// We cannot use the empty 'subtree' parameter as it has no nodes yet
+				subtreeForData, buildErr := subtreepkg.NewIncompleteTreeByLeafCount(len(allTxs))
+				if buildErr != nil {
+					u.logger.Errorf("[validateSubtree][%s] failed to create subtree for data: %v", subtreeHash.String(), buildErr)
+					_ = body.Close()
 				} else {
-					u.logger.Infof("[validateSubtree][%s] stored subtree data from %s", subtreeHash.String(), url)
+					// Add all transaction hashes to the subtree structure
+					for _, txHash := range allTxs {
+						if txHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+							buildErr = subtreeForData.AddCoinbaseNode()
+						} else {
+							buildErr = subtreeForData.AddNode(txHash, 0, 0)
+						}
+						if buildErr != nil {
+							u.logger.Errorf("[validateSubtree][%s] failed to add node to subtree: %v", subtreeHash.String(), buildErr)
+							break
+						}
+					}
 
-					subtreeDataExists = true
+					if buildErr != nil {
+						_ = body.Close()
+					} else {
+						// load the subtree data, making sure to validate it against the subtree txs
+						// this is less efficient than reading straight to disk with SetFromReader, but we need to validate the
+						// data before storing it on disk
+						subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, body)
+						_ = body.Close()
+						if err != nil {
+							u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
+							// Can't proceed without valid subtree data, skip to next steps
+						} else if subtreeData == nil || len(subtreeData.Txs) == 0 || subtreeData.Txs[len(subtreeData.Txs)-1] == nil {
+							u.logger.Errorf("[validateSubtree][%s] subtree data is nil or empty", subtreeHash.String())
+							// Invalid subtree data, skip to next steps
+						} else if !subtreeForData.Nodes[len(subtreeForData.Nodes)-1].Hash.Equal(*subtreeData.Txs[len(subtreeData.Txs)-1].TxIDChainHash()) {
+							return nil, errors.NewProcessingError("[validateSubtree][%s] subtree data does not match subtree", subtreeHash.String())
+						} else {
+							// Valid subtree data - proceed with serialization and storage
+							subtreeDataBytes, err := subtreeData.Serialize()
+							if err != nil {
+								u.logger.Errorf("[validateSubtree][%s] failed to serialize subtree data: %v", subtreeHash.String(), err)
+							} else {
+								dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
+
+								if subtreeDataErr = u.subtreeStore.Set(ctx,
+									subtreeHash[:],
+									fileformat.FileTypeSubtreeData,
+									subtreeDataBytes,
+									options.WithDeleteAt(dah),
+								); subtreeDataErr != nil {
+									u.logger.Errorf("[validateSubtree][%s] failed to store subtree data: %v", subtreeHash.String(), subtreeDataErr)
+								} else {
+									u.logger.Infof("[validateSubtree][%s] stored subtree data from %s", subtreeHash.String(), url)
+									subtreeDataExists = true
+								}
+							}
+						}
+					}
 				}
-
-				_ = body.Close()
 			}
 		}
 	}
@@ -1261,44 +1312,84 @@ func (u *Server) prepareTxsPerLevel(ctx context.Context, transactions []missingT
 		}
 	}
 
-	// Second pass: build dependency graph
+	// Second pass: calculate dependency levels using topological approach
+	// Build dependency graph first
+	dependencies := make(map[chainhash.Hash][]chainhash.Hash) // child -> parents
+	childrenMap := make(map[chainhash.Hash][]chainhash.Hash)  // parent -> children
+
 	for _, mTx := range transactions {
-		if mTx.tx == nil {
+		if mTx.tx == nil || mTx.tx.IsCoinbase() {
 			continue
 		}
 
-		wrapper := txMap[*mTx.tx.TxIDChainHash()]
+		txHash := *mTx.tx.TxIDChainHash()
+		dependencies[txHash] = make([]chainhash.Hash, 0)
+
+		// Check each input of the transaction to find its parents
+		for _, input := range mTx.tx.Inputs {
+			parentHash := *input.PreviousTxIDChainHash()
+
+			// check if parentHash exists in the map, which means it is part of the subtree
+			if _, exists := txMap[parentHash]; exists {
+				dependencies[txHash] = append(dependencies[txHash], parentHash)
+
+				if childrenMap[parentHash] == nil {
+					childrenMap[parentHash] = make([]chainhash.Hash, 0)
+				}
+				childrenMap[parentHash] = append(childrenMap[parentHash], txHash)
+			}
+		}
+	}
+
+	// Calculate levels using recursive approach with memoization
+	levelCache := make(map[chainhash.Hash]uint32)
+
+	var calculateLevel func(chainhash.Hash) uint32
+	calculateLevel = func(txHash chainhash.Hash) uint32 {
+		if level, exists := levelCache[txHash]; exists {
+			return level
+		}
+
+		// If no dependencies in subtree, level is 0
+		parents := dependencies[txHash]
+		if len(parents) == 0 {
+			levelCache[txHash] = 0
+			return 0
+		}
+
+		// Level is 1 + max(parent levels)
+		maxParentLevel := uint32(0)
+		for _, parentHash := range parents {
+			parentLevel := calculateLevel(parentHash)
+			if parentLevel > maxParentLevel {
+				maxParentLevel = parentLevel
+			}
+		}
+
+		level := maxParentLevel + 1
+		levelCache[txHash] = level
+		return level
+	}
+
+	// Calculate levels for all transactions and update wrappers
+	for _, mTx := range transactions {
+		if mTx.tx == nil || mTx.tx.IsCoinbase() {
+			continue
+		}
+
+		txHash := *mTx.tx.TxIDChainHash()
+		wrapper := txMap[txHash]
 		if wrapper == nil {
 			continue
 		}
 
-		maxParentLevel := uint32(0)
+		level := calculateLevel(txHash)
+		wrapper.childLevelInBlock = level
+		wrapper.someParentsInBlock = len(dependencies[txHash]) > 0
 
-		// Check each input of the transaction to find its parents
-		// and determine the maximum level of those parents
-		// This is done to ensure that we can process transactions in the correct order
-		for _, input := range wrapper.missingTx.tx.Inputs {
-			parentHash := *input.PreviousTxIDChainHash()
-
-			// check if parentHash exists in the map, which means it is part of the subtree and already processed
-			if parentWrapper, exists := txMap[parentHash]; exists {
-				wrapper.someParentsInBlock = true
-				// Update the maximum parent level found
-				// Child must be at one level higher than its highest parent
-				if parentWrapper.childLevelInBlock+1 > maxParentLevel {
-					maxParentLevel = parentWrapper.childLevelInBlock + 1
-				}
-			}
-		}
-
-		wrapper.childLevelInBlock = maxParentLevel
-
-		// increment the sizePerLevel for the current level
-		sizePerLevel[maxParentLevel]++
-
-		// Update the transaction's level in the block
-		if maxParentLevel > maxLevel {
-			maxLevel = maxParentLevel
+		sizePerLevel[level]++
+		if level > maxLevel {
+			maxLevel = level
 		}
 	}
 
@@ -1390,6 +1481,17 @@ func (u *Server) getMissingTransactionsFromFile(ctx context.Context, subtreeHash
 	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, subtreeDataReader)
 	if err != nil {
 		return nil, err
+	}
+
+	// Check that subtreeData is not nil or empty
+	if subtreeData == nil || len(subtreeData.Txs) == 0 {
+		return nil, errors.NewProcessingError("[getMissingTransactionsFromFile][%s] subtree data is nil or empty", subtreeHash.String())
+	}
+
+	// check that the last tx is the same, making sure we are not missing any transactions
+	lastSubtreeDataTx := subtreeData.Txs[len(subtreeData.Txs)-1]
+	if lastSubtreeDataTx == nil || !subtree.Nodes[len(subtree.Nodes)-1].Hash.Equal(*lastSubtreeDataTx.TxIDChainHash()) {
+		return nil, errors.NewProcessingError("[validateSubtree][%s] subtree data does not match subtree", subtreeHash.String())
 	}
 
 	subtreeLookupMap, err := subtree.GetMap()
@@ -1490,4 +1592,139 @@ func (u *Server) isPrioritySubtreeCheckActive(subtreeHash string) bool {
 	active, ok := u.prioritySubtreeCheckActiveMap[subtreeHash]
 
 	return ok && active
+}
+
+// setPauseProcessing pauses the Kafka consumer and acquires the distributed pause lock.
+//
+// This method coordinates pausing of subtree processing across all pods in the cluster by:
+// 1. Pausing the Kafka consumer to stop fetching new subtree messages (prevents handler blocking)
+// 2. Acquiring a distributed lock via the quorum system for cross-pod coordination
+// 3. Setting the local atomic flag for fast local checks
+//
+// The Kafka consumer pause is superior to blocking in the handler because:
+// - Heartbeats continue to be sent (no risk of session timeout)
+// - No messages are held unprocessed
+// - Handler threads are not blocked
+//
+// The distributed lock is kept alive with periodic heartbeat updates and is automatically
+// released on context cancellation or if the pod crashes.
+//
+// To prevent indefinite pauses that could halt cluster-wide subtree processing, this method
+// enforces a maximum pause duration of 5 minutes. If the pause exceeds this duration, the
+// context will be cancelled automatically. The pause duration is tracked via Prometheus metrics
+// to enable monitoring and alerting on abnormally long pauses.
+//
+// Parameters:
+//   - ctx: Context for cancellation and request-scoped values
+//
+// Returns:
+//   - func(): Release function to explicitly release the pause lock and resume the consumer
+//   - error: Error if the distributed lock cannot be acquired
+func (u *Server) setPauseProcessing(ctx context.Context) (func(), error) {
+	// Create a context with timeout to prevent indefinite pauses
+	// Default to 5 minutes if not configured
+	maxPauseDuration := u.settings.SubtreeValidation.PauseTimeout
+	if maxPauseDuration == 0 {
+		maxPauseDuration = 5 * time.Minute
+	}
+	pauseCtx, cancelPause := context.WithTimeout(ctx, maxPauseDuration)
+
+	// Track when the pause started for metrics
+	pauseStartTime := time.Now()
+	// Pause the Kafka consumer first to stop receiving new messages
+	if u.subtreeConsumerClient != nil {
+		u.subtreeConsumerClient.PauseAll()
+		u.logger.Infof("[setPauseProcessing] Paused Kafka subtree consumer")
+	}
+
+	// Start goroutine to log periodic pause messages
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-pauseCtx.Done():
+				return
+			case <-ticker.C:
+				u.logger.Warnf("[setPauseProcessing] subtree validation paused (elapsed: %.0fs, max: %.0fs)", time.Since(pauseStartTime).Seconds(), maxPauseDuration.Seconds())
+			}
+		}
+	}()
+
+	// If quorum not initialized, just do local pause with consumer paused
+	if q == nil {
+		u.logger.Warnf("[setPauseProcessing] Quorum not initialized - falling back to local-only pause")
+		u.pauseSubtreeProcessing.Store(true)
+		return func() {
+			// Record pause duration when released
+			pauseDuration := time.Since(pauseStartTime).Seconds()
+			prometheusSubtreeValidationPauseDuration.Observe(pauseDuration)
+			u.logger.Infof("[setPauseProcessing] Pause duration: %.2f seconds", pauseDuration)
+
+			cancelPause()
+			u.pauseSubtreeProcessing.Store(false)
+			if u.subtreeConsumerClient != nil {
+				u.subtreeConsumerClient.ResumeAll()
+				u.logger.Infof("[setPauseProcessing] Resumed Kafka subtree consumer (local-only)")
+			}
+		}, nil
+	}
+
+	// Acquire distributed lock for cross-pod coordination with timeout
+	releaseLock, err := q.AcquirePauseLock(pauseCtx)
+	if err != nil {
+		cancelPause()
+		// If lock acquisition fails, resume the consumer
+		if u.subtreeConsumerClient != nil {
+			u.subtreeConsumerClient.ResumeAll()
+			u.logger.Warnf("[setPauseProcessing] Failed to acquire distributed lock, resumed Kafka consumer")
+		}
+		return noopFunc, err
+	}
+
+	u.pauseSubtreeProcessing.Store(true)
+	u.logger.Infof("[setPauseProcessing] Subtree processing paused across all pods (consumer paused, distributed lock acquired)")
+
+	// Track if resume was already called to prevent double-resume
+	resumed := &atomic.Bool{}
+
+	// Monitor for timeout in background and force resume if exceeded
+	go func() {
+		<-pauseCtx.Done()
+		if pauseCtx.Err() == context.DeadlineExceeded {
+			u.logger.Errorf("[setPauseProcessing] Pause exceeded maximum duration of %v - forcing consumer resume to prevent indefinite pause", maxPauseDuration)
+
+			// Force resume the consumer to prevent it being stuck forever
+			if resumed.CompareAndSwap(false, true) {
+				u.pauseSubtreeProcessing.Store(false)
+				releaseLock()
+				if u.subtreeConsumerClient != nil {
+					u.subtreeConsumerClient.ResumeAll()
+					u.logger.Warnf("[setPauseProcessing] TIMEOUT: Force-resumed Kafka subtree consumer after %v timeout", maxPauseDuration)
+				}
+			}
+		}
+	}()
+
+	return func() {
+		// Only resume if not already resumed by timeout goroutine
+		if !resumed.CompareAndSwap(false, true) {
+			u.logger.Debugf("[setPauseProcessing] Consumer already resumed by timeout, skipping normal resume")
+			return
+		}
+
+		// Record pause duration when released
+		pauseDuration := time.Since(pauseStartTime).Seconds()
+		prometheusSubtreeValidationPauseDuration.Observe(pauseDuration)
+		u.logger.Infof("[setPauseProcessing] Pause duration: %.2f seconds", pauseDuration)
+
+		cancelPause()
+		u.pauseSubtreeProcessing.Store(false)
+		releaseLock()
+		if u.subtreeConsumerClient != nil {
+			u.subtreeConsumerClient.ResumeAll()
+			u.logger.Infof("[setPauseProcessing] Resumed Kafka subtree consumer and released distributed lock")
+		}
+	}, nil
 }

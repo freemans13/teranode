@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/catchup"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -188,11 +188,11 @@ func TestCheckContextCancellation(t *testing.T) {
 	})
 
 	t.Run("Timeout", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
 
 		// Wait for timeout
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 
 		err := catchup.CheckContextCancellation(ctx)
 		assert.Error(t, err, "Timed out context should error")

@@ -24,35 +24,35 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation"
-	"github.com/bitcoin-sv/teranode/services/legacy/addrmgr"
-	blockchain2 "github.com/bitcoin-sv/teranode/services/legacy/blockchain"
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil/bloom"
-	"github.com/bitcoin-sv/teranode/services/legacy/connmgr"
-	"github.com/bitcoin-sv/teranode/services/legacy/netsync"
-	"github.com/bitcoin-sv/teranode/services/legacy/peer"
-	"github.com/bitcoin-sv/teranode/services/legacy/txscript"
-	"github.com/bitcoin-sv/teranode/services/legacy/version"
-	"github.com/bitcoin-sv/teranode/services/p2p"
-	"github.com/bitcoin-sv/teranode/services/subtreevalidation"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	blob_options "github.com/bitcoin-sv/teranode/stores/blob/options"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/services/legacy/addrmgr"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/legacy/blockchain"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil/bloom"
+	"github.com/bsv-blockchain/teranode/services/legacy/connmgr"
+	"github.com/bsv-blockchain/teranode/services/legacy/netsync"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/legacy/txscript"
+	"github.com/bsv-blockchain/teranode/services/legacy/version"
+	"github.com/bsv-blockchain/teranode/services/p2p"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	blob_options "github.com/bsv-blockchain/teranode/stores/blob/options"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 const (
@@ -917,11 +917,6 @@ func (sp *serverPeer) OnGetHeaders(_ *peer.Peer, msg *wire.MsgGetHeaders) {
 		tracing.WithHistogram(peerServerMetrics["OnGetHeaders"]),
 	)
 
-	// Ignore OnGetHeaders requests if not in sync.
-	if !sp.server.syncManager.IsCurrent() {
-		return
-	}
-
 	// Find the most recent known block in the best chain based on the block
 	// locator and fetch all the headers after it until either
 	// wire.MaxBlockHeadersPerMsg have been fetched or the provided stop
@@ -939,19 +934,21 @@ func (sp *serverPeer) OnGetHeaders(_ *peer.Peer, msg *wire.MsgGetHeaders) {
 		return
 	}
 
-	blockHeaders, _, err := sp.server.blockchainClient.GetBlockHeadersToCommonAncestor(sp.ctx, bestHeader.Hash(), msg.BlockLocatorHashes, wire.MaxBlockHeadersPerMsg)
+	blockHeaders, _, err := sp.server.blockchainClient.GetBlockHeadersFromCommonAncestor(sp.ctx, bestHeader.Hash(), util.HashPointersToValues(msg.BlockLocatorHashes), wire.MaxBlockHeadersPerMsg)
 	if err != nil {
-		sp.server.logger.Errorf("Failed to fetch block headers to common ancestor: %v", err)
+		sp.server.logger.Errorf("Failed to fetch block headers from common ancestor: %v", err)
 	}
 
 	// Send found headers to the requesting peer.
 	wireBlockHeaders := make([]*wire.BlockHeader, 0, len(blockHeaders))
 
 	for _, blockHeader := range blockHeaders {
-		if blockHeader.HashPrevBlock.IsEqual(&chainhash.Hash{}) {
-			// skip genesis block
-			continue
-		}
+		// Note: We now include genesis block for proper header chain continuity
+		// SVNode needs genesis to validate the chain from block 0
+		// if blockHeader.HashPrevBlock.IsEqual(&chainhash.Hash{}) {
+		// 	// skip genesis block
+		// 	continue
+		// }
 
 		wireBlockHeaders = append(wireBlockHeaders, blockHeader.ToWireBlockHeader())
 
@@ -1772,6 +1769,7 @@ func (s *server) handleRelayInvMsg(state *peerState, msg relayMsg) {
 			// }
 
 			s.handleRelayTxMsg(sp, msg, feeFilter)
+			return
 		}
 	})
 }
@@ -2658,6 +2656,8 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 
 	if tSettings.ChainCfgParams.Name == "testnet" {
 		activeNetParams = &testNetParams
+	} else if tSettings.ChainCfgParams.Name == "teratestnet" {
+		activeNetParams = &teraTestNetParams
 	} else if tSettings.ChainCfgParams.Name == "regtest" {
 		activeNetParams = &regressionNetParams
 	}
@@ -2696,9 +2696,12 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	services &^= wire.SFNodeCF
 	// cfg.Prune
 
+	// We want to be able to advertise as full node, this should depend on determineNodeMode
+	// Requires https://github.com/bsv-blockchain/teranode/pull/50 to be merged
+	//services |= wire.SFNodeNetwork
+
 	services &^= wire.SFNodeNetwork
 	services |= wire.SFNodeNetworkLimited
-	// services |= wire.SFNodeNetwork
 
 	peersDir := cfg.DataDir
 	if !tSettings.Legacy.SavePeers {
@@ -2778,7 +2781,6 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		validationClient,
 		utxoStore,
 		subtreeStore,
-		tempStore,
 		subtreeValidation,
 		blockValidation,
 		blockAssembly,

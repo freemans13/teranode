@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 
-	"github.com/bitcoin-sv/teranode/compose/chainintegrity"
+	"github.com/bsv-blockchain/teranode/compose/chainintegrity"
 )
 
 func main() {

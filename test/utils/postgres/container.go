@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -80,7 +80,10 @@ func SetupTestPostgresContainer() (string, func() error, error) {
 	}
 
 	cleanup := func() error {
-		return postgresC.Terminate(ctx)
+		// Create a new context with timeout for cleanup to prevent hanging
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return postgresC.Terminate(cleanupCtx)
 	}
 
 	return connStr, cleanup, nil

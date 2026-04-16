@@ -5,17 +5,17 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob/memory"
-	blockchainstore "github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/stretchr/testify/require"
 )
 
@@ -57,9 +57,6 @@ func initStores(t *testing.T) (*memory.Memory, utxo.Store, *settings.Settings, b
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Policy.BlockMaxSize = 1000000
 	tSettings.ChainCfgParams = &chaincfg.MainNetParams
-
-	tSettings.BlockAssembly.ResetWaitCount = 0
-	tSettings.BlockAssembly.ResetWaitDuration = 0
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)

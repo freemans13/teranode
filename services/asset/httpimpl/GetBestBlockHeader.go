@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"net/http"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 )
 
@@ -102,6 +102,8 @@ func (h *HTTP) GetBestBlockHeader(mode ReadMode) func(c echo.Context) error {
 			TxCount:     meta.TxCount,
 			SizeInBytes: meta.SizeInBytes,
 			Miner:       meta.Miner,
+			Invalid:     meta.Invalid,
+			ProcessedAt: meta.ProcessedAt,
 		}
 
 		switch mode {

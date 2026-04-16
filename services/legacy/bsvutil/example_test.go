@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 func ExampleAmount() {

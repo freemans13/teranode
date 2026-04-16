@@ -1,0 +1,92 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam database {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+title Transaction Format Extension Process
+
+participant "Client/Wallet" as Client
+participant "Propagation" as Propagation
+database "Tx Store" as TxStore
+participant "Validator" as Validator
+database "UTXO Store" as UTXOStore
+
+== Transaction Submission ==
+
+Client -> Propagation: Submit Tx\n(standard or extended format)
+activate Propagation
+
+Propagation -> TxStore: Store tx (standard format)
+activate TxStore
+note right of TxStore: Always stored in\nnon-extended format\nfor efficiency
+TxStore --> Propagation: Stored
+deactivate TxStore
+
+Propagation -> Validator: Validate(tx)
+activate Validator
+
+== Format Detection & Extension ==
+
+Validator -> Validator: Check tx.IsExtended()
+
+alt Transaction NOT Extended
+    note over Validator: Automatic extension required
+
+    Validator -> UTXOStore: Get parent tx outputs\nfor all inputs (parallel batch)
+    activate UTXOStore
+
+    note right of UTXOStore: Retrieves parent\noutput data:\n- Satoshis\n- Locking script
+
+    UTXOStore --> Validator: Parent output data
+    deactivate UTXOStore
+
+    Validator -> Validator: Decorate inputs (in-memory)
+    note right of Validator: tx.Inputs[i].PreviousTxSatoshis\ntx.Inputs[i].PreviousTxScript
+
+    Validator -> Validator: Mark as extended
+    note right of Validator: Extension happens\nentirely in memory\n(not persisted)
+
+else Transaction Already Extended
+    note over Validator: Skip UTXO lookup\nProceed directly to validation
+end
+
+== Validation with Extended Data ==
+
+Validator -> Validator: Validate transaction\n- Consensus rules\n- Policy checks\n- Script verification
+
+alt Validation Success
+    Validator -> UTXOStore: Create UTXOs\nSpend inputs
+    Validator --> Propagation: Valid
+    Propagation --> Client: Accepted
+else Validation Failure
+    Validator --> Propagation: Invalid (reason)
+    Propagation --> Client: Rejected
+end
+
+deactivate Validator
+deactivate Propagation
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

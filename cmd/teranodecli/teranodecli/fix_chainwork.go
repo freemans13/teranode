@@ -13,8 +13,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/blockchain/work"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )

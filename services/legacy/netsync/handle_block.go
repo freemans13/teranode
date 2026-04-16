@@ -1,27 +1,13 @@
 package netsync
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"sync"
+	"runtime"
+	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
-	"github.com/bitcoin-sv/teranode/services/legacy/peer"
-	"github.com/bitcoin-sv/teranode/services/utxopersister/filestorer"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/blockassemblyutil"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -29,6 +15,19 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/blockassemblyutil"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -53,48 +52,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		return nil
 	}
 
-	var (
-		blockReader io.ReadCloser
-		block       *bsvutil.Block
-	)
-
-	if msgBlock == nil {
-		// read block from disk
-		blockReader, err = sm.tempStore.GetIoReader(ctx,
-			blockHash.CloneBytes(),
-			fileformat.FileTypeMsgBlock,
-			options.WithSubDirectory("blocks"),
-		)
-		if err != nil {
-			sm.logger.Errorf("[HandleBlockDirect][%s] failed to get block reader from disk: %s", blockHash.String(), err)
-			return errors.NewStorageError("failed to get block reader from disk", err)
-		}
-
-		block, err = bsvutil.NewBlockFromReader(bufio.NewReaderSize(blockReader, 4*1024*1024))
-		if err != nil {
-			sm.logger.Errorf("[HandleBlockDirect][%s] failed to read block from disk: %s", blockHash.String(), err)
-			return errors.NewProcessingError("failed to read block from disk", err)
-		}
-
-		// close the reader
-		if err = blockReader.Close(); err != nil {
-			sm.logger.Errorf("[HandleBlockDirect][%s] failed to close block reader: %s", blockHash.String(), err)
-			return errors.NewStorageError("failed to close block reader", err)
-		}
-
-		defer func() {
-			// delete the temporarily saved block from disk after this function completes
-			if err = sm.tempStore.Del(ctx,
-				blockHash.CloneBytes(),
-				fileformat.FileTypeMsgBlock,
-				options.WithSubDirectory("blocks"),
-			); err != nil {
-				sm.logger.Errorf("failed to delete block from disk: %v", err)
-			}
-		}()
-	} else {
-		block = bsvutil.NewBlock(msgBlock)
-	}
+	block := bsvutil.NewBlock(msgBlock)
 
 	// Lookup previous block height from blockchain
 	_, previousBlockHeaderMeta, err = sm.blockchainClient.GetBlockHeader(ctx, &block.MsgBlock().Header.PrevBlock)
@@ -151,7 +109,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	}()
 
 	// Wait for block assembly to be ready
-	if err = blockassemblyutil.WaitForBlockAssemblyReady(ctx, sm.logger, sm.blockAssembly, blockHeight, uint32(sm.settings.ChainCfgParams.CoinbaseMaturity/2)); err != nil {
+	if err = blockassemblyutil.WaitForBlockAssemblyReady(ctx, sm.logger, sm.blockAssembly, blockHeight); err != nil {
 		// block-assembly is still behind, so we cannot process this block
 		return err
 	}
@@ -193,7 +151,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		return err
 	}
 
-	teranodeBlock, err := model.NewBlock(header, coinbaseTx, subtrees, uint64(len(block.Transactions())), blockSizeUint64, blockHeight, 0, sm.settings)
+	teranodeBlock, err := model.NewBlock(header, coinbaseTx, subtrees, uint64(len(block.Transactions())), blockSizeUint64, blockHeight, 0)
 	if err != nil {
 		return errors.NewProcessingError("failed to create model.NewBlock", err)
 	}
@@ -243,7 +201,7 @@ func (sm *SyncManager) ProcessBlock(ctx context.Context, teranodeBlock *model.Bl
 
 	// send the block to the blockValidation for processing and validation
 	// all the block subtrees should have been validated in processSubtrees
-	if err = sm.blockValidation.ProcessBlock(ctx, teranodeBlock, teranodeBlock.Height); err != nil {
+	if err = sm.blockValidation.ProcessBlock(ctx, teranodeBlock, teranodeBlock.Height, "legacy", ""); err != nil {
 		if errors.Is(err, errors.ErrBlockExists) {
 			sm.logger.Infof("[SyncManager:processBlock][%s %d] block already exists", teranodeBlock.Hash().String(), teranodeBlock.Height)
 			return nil
@@ -388,6 +346,8 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 	defer deferFn()
 
 	g, gCtx := errgroup.WithContext(ctx)
+	// Limit to 3 concurrent writes (subtree, subtreeData, subtreeMeta)
+	util.SafeSetLimit(g, 3)
 
 	g.Go(func() error {
 		subtreeBytes, err := subtree.Serialize()
@@ -965,10 +925,12 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 	}
 
 	inputLen := len(tx.Inputs)
-	populatedInputs := 0
+	populatedInputs := atomic.Int32{}
 
 	g := errgroup.Group{}
-	inputsLock := sync.Mutex{} // to protect the inputs slice from concurrent writes
+	// Limit goroutines to number of CPU cores to prevent scheduler thrashing
+	// This prevents spawning thousands of goroutines for transactions with many inputs
+	util.SafeSetLimit(&g, runtime.NumCPU()*2)
 
 	for i, input := range tx.Inputs {
 		i := i         // capture the loop variable
@@ -997,15 +959,11 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 					}
 				}
 
-				// lock the inputs slice to prevent concurrent writes
-				inputsLock.Lock()
-
+				// No lock needed - each goroutine writes to a unique index
 				tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
 				tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
 
-				populatedInputs++
-
-				inputsLock.Unlock() // unlock the inputs slice
+				populatedInputs.Add(1)
 
 				return nil
 			})
@@ -1016,7 +974,7 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 		return errors.NewProcessingError("failed to extend transaction %s", tx.TxIDChainHash(), err)
 	}
 
-	if populatedInputs == inputLen {
+	if int(populatedInputs.Load()) == inputLen {
 		// all inputs were populated, we can return early
 		return nil
 	}

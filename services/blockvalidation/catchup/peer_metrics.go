@@ -192,11 +192,24 @@ func (pm *PeerMetrics) Reset() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	*pm = PeerMetrics{
-		TrustScore:          1.0,
-		FastestResponse:     time.Hour,
-		CircuitBreakerState: StateClosed,
-	}
+	pm.SuccessfulRequests = 0
+	pm.FailedRequests = 0
+	pm.TotalRequests = 0
+	pm.AverageResponseTime = 0
+	pm.FastestResponse = time.Hour
+	pm.SlowestResponse = 0
+	pm.LastResponseTime = 0
+	pm.BytesReceived = 0
+	pm.HeadersReceived = 0
+	pm.ConsecutiveFailures = 0
+	pm.ConsecutiveSuccesses = 0
+	pm.LastFailureTime = time.Time{}
+	pm.LastSuccessTime = time.Time{}
+	pm.MaliciousAttempts = 0
+	pm.InvalidDataReceived = 0
+	pm.TrustScore = 1.0
+	pm.CircuitBreakerState = StateClosed
+	pm.CircuitBreakerTrips = 0
 }
 
 // PeerMetricsCollection manages metrics for multiple peers

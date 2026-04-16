@@ -10,26 +10,26 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/services/subtreevalidation/subtreevalidation_api"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/txmetacache"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/health"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/txmetacache"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/health"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/go-utils/expiringmap"
 	"github.com/ordishs/gocore"
@@ -279,14 +279,7 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			if subscribeCancel != nil {
-				u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] cancelling blockchain subscription")
-
-				subscribeCancel()
-			}
-
 			u.logger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] exiting setMined goroutine: %s", ctx.Err())
-
 			return
 		default:
 			u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] subscribing to blockchain for setTxMined signal")
@@ -297,35 +290,52 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 			if err != nil {
 				u.logger.Errorf("[SubtreeValidation:blockchainSubscriptionListener] failed to subscribe to blockchain: %s", err)
 
+				// Cancel context before retrying to prevent leak
+				subscribeCancel()
+
 				// backoff for 5 seconds and try again
 				time.Sleep(5 * time.Second)
 
 				continue
 			}
 
-			for notification := range blockchainSubscription {
-				if notification == nil {
-					continue
-				}
+		subscriptionLoop:
+			for {
+				select {
+				case <-ctx.Done():
+					subscribeCancel()
+					return
 
-				if notification.Type == model.NotificationType_Block {
-					cHash := chainhash.Hash(notification.Hash)
-					u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] received Block notification: %s", cHash.String())
+				case notification, ok := <-blockchainSubscription:
+					if !ok {
+						// Channel closed, reconnect
+						u.logger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] subscription channel closed, reconnecting")
+						subscribeCancel()
+						time.Sleep(1 * time.Second)
+						break subscriptionLoop
+					}
 
-					// get the best block header, we might have just added an invalid block that we do not want to count
-					if err = u.updateBestBlock(ctx); err != nil {
-						// Check if context was cancelled - if so, exit gracefully
-						if ctx.Err() != nil {
-							u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] context cancelled, stopping listener")
-							subscribeCancel()
-							return
+					if notification == nil {
+						continue
+					}
+
+					if notification.Type == model.NotificationType_Block {
+						cHash := chainhash.Hash(notification.Hash)
+						u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] received Block notification: %s", cHash.String())
+
+						// get the best block header, we might have just added an invalid block that we do not want to count
+						if err = u.updateBestBlock(ctx); err != nil {
+							// Check if context was cancelled - if so, exit gracefully
+							if ctx.Err() != nil {
+								u.logger.Infof("[SubtreeValidation:blockchainSubscriptionListener] context cancelled, stopping listener")
+								subscribeCancel()
+								return
+							}
+							u.logger.Errorf("[SubtreeValidation:blockchainSubscriptionListener] failed to update best block: %s", err)
 						}
-						u.logger.Errorf("[SubtreeValidation:blockchainSubscriptionListener] failed to update best block: %s", err)
 					}
 				}
 			}
-
-			subscribeCancel()
 		}
 	}
 }
@@ -507,8 +517,8 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	}
 
 	// start kafka consumers
-	u.subtreeConsumerClient.Start(ctx, u.consumerMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())
-	u.txmetaConsumerClient.Start(ctx, u.txmetaHandler, kafka.WithLogErrorAndMoveOn())
+	u.subtreeConsumerClient.Start(ctx, u.subtreeMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())
+	u.txmetaConsumerClient.Start(ctx, u.txmetaMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())
 
 	// this will block
 	if err := util.StartGRPCServer(ctx, u.logger, u.settings, "subtreevalidation", u.settings.SubtreeValidation.GRPCListenAddress, func(server *grpc.Server) {
@@ -740,6 +750,22 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 			AllowFailFast: false,
 		}
 
+		validatorOptions := []validator.Option{
+			validator.WithSkipPolicyChecks(true),
+			validator.WithCreateConflicting(true),
+			validator.WithIgnoreLocked(true),
+		}
+
+		currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
+		if err != nil {
+			return false, errors.NewProcessingError("[CheckSubtree] Failed to get FSM current state", err)
+		}
+
+		// During legacy syncing or catching up, disable adding transactions to block assembly
+		if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
+			validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
+		}
+
 		// Call the validateSubtreeInternal method
 		// making sure to skip policy checks, since we are validating a block that has already been mined
 		if _, err = u.ValidateSubtreeInternal(
@@ -747,10 +773,7 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 			v,
 			request.BlockHeight,
 			blockIds,
-			validator.WithSkipPolicyChecks(true),
-			validator.WithAddTXToBlockAssembly(false),
-			validator.WithCreateConflicting(true),
-			validator.WithIgnoreLocked(true),
+			validatorOptions...,
 		); err != nil {
 			return false, errors.NewProcessingError("[CheckSubtree] Failed to validate legacy subtree %s", hash.String(), err)
 		}
@@ -870,7 +893,7 @@ func initialiseInvalidSubtreeKafkaProducer(ctx context.Context, logger ulogger.L
 	logger.Infof("InvalidBlocksConfig: %s", tSettings.Kafka.InvalidBlocksConfig)
 	logger.Infof("InvalidSubtreesConfig: %s", tSettings.Kafka.InvalidSubtreesConfig)
 
-	invalidSubtreeKafkaProducer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, tSettings.Kafka.InvalidSubtreesConfig)
+	invalidSubtreeKafkaProducer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, tSettings.Kafka.InvalidSubtreesConfig, &tSettings.Kafka)
 	if err != nil {
 		return nil, err
 	}

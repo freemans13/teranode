@@ -10,12 +10,12 @@ package validator
 import (
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript/interpreter"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // init registers the Go-BT script verifier with the verification factory
@@ -25,6 +25,7 @@ func init() {
 	TxScriptInterpreterFactory[TxInterpreterGoBT] = newScriptVerifierGoBt
 }
 
+// newScriptVerifierGoBt creates a new Go-BT script verifier instance.
 func newScriptVerifierGoBt(l ulogger.Logger, po *settings.PolicySettings, pa *chaincfg.Params) TxScriptInterpreter {
 	l.Infof("Use Script Verifier with GoBT")
 
@@ -110,6 +111,7 @@ func (v *scriptVerifierGoBt) VerifyScript(tx *bt.Tx, blockHeight uint32, consens
 	return nil
 }
 
+// Interpreter returns the Go-BT interpreter type identifier.
 func (v *scriptVerifierGoBt) Interpreter() TxInterpreter {
 	return TxInterpreterGoBT
 }

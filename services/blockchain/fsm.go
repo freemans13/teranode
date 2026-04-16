@@ -5,23 +5,16 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/looplab/fsm"
 )
 
 // NewFiniteStateMachine creates a new finite state machine for the blockchain service.
-// The finite state machine has the following states:
-// - Idle
-// - Running
-// - CatchingBlocks
-// - LegacySyncing
-// The finite state machine has the following events:
-// - Run
-// - CatchupBlocks
-// - LegacySync
-// - Stop
+//
+// States: Idle, Running, CatchingBlocks, LegacySyncing
+// Events: Run, CatchupBlocks, LegacySync, Stop
 func (b *Blockchain) NewFiniteStateMachine(opts ...func(*fsm.FSM)) *fsm.FSM {
 	// Define callbacks
 	callbacks := fsm.Callbacks{

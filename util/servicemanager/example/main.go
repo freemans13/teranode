@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/servicemanager"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/servicemanager"
 )
 
 // SampleService is a mock service for demonstration purposes.
@@ -39,6 +39,7 @@ func (s *SampleService) Health(ctx context.Context, checkLiveness bool) (int, st
 func (s *SampleService) Init(ctx context.Context) error {
 	return nil
 }
+
 // Start starts the service and runs it until the context is cancelled.
 // It implements the Service interface start method.
 // The ready channel is signaled when the service is ready to accept requests.
@@ -93,9 +94,9 @@ func main() {
 	serviceManager := servicemanager.NewServiceManager(rootCtx, logger)
 
 	// Add services to the service manager
-	serviceManager.AddService("ServiceA", NewService("SvcA"))
-	serviceManager.AddService("ServiceB", NewService("SvcB"))
-	serviceManager.AddService("ServiceC", NewService("SvcC"))
+	_ = serviceManager.AddService("ServiceA", NewService("SvcA"))
+	_ = serviceManager.AddService("ServiceB", NewService("SvcB"))
+	_ = serviceManager.AddService("ServiceC", NewService("SvcC"))
 
 	err := serviceManager.Wait()
 	if err != nil {

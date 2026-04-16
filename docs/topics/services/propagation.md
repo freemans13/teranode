@@ -94,6 +94,24 @@ The transaction processing involves several steps to ensure proper validation an
     - **Kafka**: Normal-sized transactions are sent to the validator through Kafka for asynchronous processing.
     - **HTTP Fallback**: Large transactions exceeding Kafka message size limits are sent directly to the validator's HTTP endpoint.
 
+#### Format Handling
+
+The Propagation Service is format-agnostic and handles transaction formats flexibly:
+
+- **Accepts both formats**: Standard Bitcoin format and Extended Format (BIP-239) transactions
+- **No format validation at ingress**: Transactions are not rejected based on their format
+- **Storage preserves received format**: Transactions are initially stored as received in the blob store
+- **Format handling delegation**: The actual format conversion and extension is handled downstream by the Validator Service
+
+This design ensures:
+
+- **Maximum compatibility** with diverse wallet implementations (from legacy to modern)
+- **No format-based rejection** at the network edge
+- **Flexible deployment** supporting both traditional Bitcoin clients and BIP-239 aware applications
+- **Backward compatibility** with the broader Bitcoin ecosystem
+
+The Propagation Service focuses on efficient transaction ingress and distribution, delegating format-specific processing to the appropriate downstream services.
+
 ### 2.4. Error Handling
 
 The Propagation Service implements comprehensive error handling:
@@ -110,9 +128,9 @@ The Propagation Service uses gRPC for communication between nodes. The protobuf 
 
 ## 4. Data Model
 
-The Propagation Service deals with the extended transaction format, as seen below:
+The Propagation Service accepts transactions in multiple formats:
 
-- [Extended Transaction Data Model](../datamodel/transaction_data_model.md): Include additional metadata to facilitate processing.
+- [Transaction Data Model](../datamodel/transaction_data_model.md): Comprehensive guide covering both standard Bitcoin format and Extended Format (BIP-239), including how Teranode handles format conversion and storage.
 
 ## 5. Technology
 
@@ -169,82 +187,7 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 
 ## 8. Configuration options (settings flags)
 
-The Propagation service serves as the transaction intake and distribution system for the Teranode network, critical for handling transaction flow between clients and the internal services. This section provides a comprehensive overview of all configuration options, organized by functional category.
-
-### Network and Communication Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `propagation_grpcListenAddress` | string | "" | Address for gRPC server to listen on | Controls the endpoint where the gRPC API is exposed |
-| `propagation_grpcAddresses` | []string | [] | List of gRPC addresses for other services to connect to | Affects how other services discover and communicate with this service |
-| `propagation_httpListenAddress` | string | "" | Address for HTTP server to listen on | Controls if and where the HTTP transaction API is exposed |
-| `propagation_httpAddresses` | []string | [] | List of HTTP addresses for other services to connect to | Affects how other services discover this service's HTTP API |
-| `ipv6_addresses` | string | "" | Comma-separated list of IPv6 multicast addresses | Controls which IPv6 multicast addresses are used for transaction reception |
-| `ipv6_interface` | string | "" (falls back to "en0") | Network interface name for IPv6 multicast | Determines which network interface is used for multicast communication |
-
-### Performance and Throttling Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `propagation_grpcMaxConnectionAge` | duration | 90s | Maximum duration for gRPC connections before forced renewal | Controls connection lifecycle and helps with load balancing |
-| `propagation_httpRateLimit` | int | 1024 | Rate limit for HTTP API requests (per second) | Controls how many requests per second the HTTP API can handle |
-| `propagation_sendBatchSize` | int | 100 | Maximum number of transactions to send in a batch | Affects efficiency and throughput of transaction processing |
-| `propagation_sendBatchTimeout` | int | 5 | Timeout in milliseconds for batch sending operations | Controls how long the service waits to collect a full batch before processing |
-
-### Validator Integration Settings
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `propagation_alwaysUseHTTP` | bool | false | Forces using HTTP instead of Kafka for transaction validation | Affects performance and reliability of transaction validation |
-
-### Dependency-Injected Settings (from other services)
-
-| Setting | Type | Default | Description | Impact |
-|---------|------|---------|-------------|--------|
-| `validator_httpAddress` | url | null | URL for validator HTTP API | Used as fallback for large transactions exceeding Kafka limits |
-| `validator_kafkaMaxMessageBytes` | int | varies | Maximum size for Kafka messages in bytes | Determines when HTTP fallback is used for large transactions |
-| `useLocalValidator` | bool | false | Daemon-level setting for validator deployment mode | Controls whether validator runs in-process or as separate service |
-
-### 8.4 Configuration Interactions and Dependencies
-
-### Transaction Ingestion Paths
-
-The Propagation service supports multiple methods for receiving transactions, controlled by several related settings:
-
-- HTTP API (`propagation_httpListenAddress`): REST-based transaction submission, rate-limited by `propagation_httpRateLimit`
-- gRPC API (`propagation_grpcListenAddress`): High-performance RPC interface for transaction submission
-- IPv6 Multicast (`ipv6_addresses` on the specified `ipv6_interface`): Efficient multicast reception of transactions
-
-At least one ingestion path must be configured for the service to be functional. For production deployments, all three methods should be configured for maximum compatibility and performance.
-
-### Transaction Validation Architecture
-
-The Propagation service interacts with the Validator service using one of two architectural patterns:
-
-- **Local Validator Mode** (`useLocalValidator=true`):
-
-    - Validator runs in-process with the Propagation service
-    - Eliminates network overhead for validation operations
-    - Recommended for production deployments to minimize latency
-
-- **Remote Validator Mode** (`useLocalValidator=false`):
-
-    - Propagation service communicates with a separate Validator service
-    - Transactions are sent via Kafka or HTTP, controlled by `propagation_alwaysUseHTTP`
-    - Large transactions exceeding `validator_kafkaMaxMessageBytes` are automatically sent via HTTP using `validator_httpAddress`
-    - Fallback mechanism ensures reliability for transactions of any size
-
-### Batch Processing Optimization
-
-The transaction processing pipeline uses batching to optimize throughput, controlled by:
-
-- `propagation_sendBatchSize`: Determines maximum batch size for transaction processing (default: 100)
-- `propagation_sendBatchTimeout`: Controls how long to wait in milliseconds for a batch to fill before processing (default: 5ms)
-
-These settings should be tuned together based on expected transaction volume and size characteristics:
-
-- **Higher batch sizes** improve throughput but increase latency
-- **Shorter timeouts** decrease latency but may result in smaller, less efficient batches
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [Propagation Settings Reference](../../references/settings/services/propagation_settings.md).
 
 ## 9. Other Resources
 

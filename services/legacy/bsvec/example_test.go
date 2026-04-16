@@ -8,8 +8,8 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvec"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvec"
 )
 
 // This example demonstrates signing a message with a secp256k1 private key that

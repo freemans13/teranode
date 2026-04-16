@@ -62,21 +62,21 @@ import (
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/utxopersister"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/ordishs/gocore"
 	"golang.org/x/exp/slices"
 )
@@ -133,16 +133,15 @@ type batchOutpoint struct {
 func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
 	prometheusUtxoMapGet.Inc()
 
-	sUtxoBatchSizeUint32, err := safeconversion.IntToUint32(s.utxoBatchSize)
-	if err != nil {
-		return nil, err
-	}
-
-	keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout/sUtxoBatchSizeUint32)
+	keySource := uaerospike.CalculateKeySource(spend.TxID, spend.Vout, s.utxoBatchSize)
 
 	key, aErr := aerospike.NewKey(s.namespace, s.setName, keySource)
 	if aErr != nil {
-		prometheusUtxoMapErrors.WithLabelValues("Get", aErr.Error()).Inc()
+		if e, ok := aErr.(*aerospike.AerospikeError); ok {
+			prometheusUtxoMapErrors.WithLabelValues("GetSpend", e.ResultCode.String()).Inc()
+		} else {
+			prometheusUtxoMapErrors.WithLabelValues("GetSpend", "unknown").Inc()
+		}
 		s.logger.Errorf("Failed to init new aerospike key: %v\n", aErr)
 
 		return nil, aErr
@@ -155,7 +154,11 @@ func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendRespo
 
 	value, aErr := s.client.Get(policy, key, fields.FieldNamesToStrings(binNames)...)
 	if aErr != nil {
-		prometheusUtxoMapErrors.WithLabelValues("Get", aErr.Error()).Inc()
+		if e, ok := aErr.(*aerospike.AerospikeError); ok {
+			prometheusUtxoMapErrors.WithLabelValues("GetSpend", e.ResultCode.String()).Inc()
+		} else {
+			prometheusUtxoMapErrors.WithLabelValues("GetSpend", "unknown").Inc()
+		}
 
 		if errors.Is(aErr, aerospike.ErrKeyNotFound) {
 			return &utxo.SpendResponse{
@@ -178,7 +181,7 @@ func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendRespo
 	if value != nil {
 		utxos, ok := value.Bins[fields.Utxos.String()].([]interface{})
 		if ok {
-			b, ok := utxos[spend.Vout%sUtxoBatchSizeUint32].([]byte)
+			b, ok := utxos[spend.Vout%uint32(s.utxoBatchSize)].([]byte)
 			if ok {
 				if len(b) < 32 {
 					return nil, errors.NewProcessingError("invalid utxo hash length", nil)
@@ -345,7 +348,11 @@ func (s *Store) get(_ context.Context, hash *chainhash.Hash, bins []fields.Field
 
 	data := <-done
 	if data.Err != nil {
-		prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", data.Err.Error()).Inc()
+		if e, ok := data.Err.(*errors.Error); ok {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", e.Code().Enum().String()).Inc()
+		} else {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", "unknown").Inc()
+		}
 	} else {
 		prometheusTxMetaAerospikeMapGet.Inc()
 	}
@@ -831,11 +838,11 @@ func processInputsToTxInpoints(bins aerospike.BinMap) (txInpoints subtree.TxInpo
 func processBlockIDs(bins aerospike.BinMap) ([]uint32, error) {
 	blockIDs, ok := bins[fields.BlockIDs.String()].([]interface{})
 	if !ok {
-		return nil, errors.NewTxInvalidError("missing block IDs")
+		return []uint32{}, nil
 	}
 
 	if len(blockIDs) == 0 {
-		return nil, nil
+		return []uint32{}, nil
 	}
 
 	res := make([]uint32, len(blockIDs))
@@ -1049,7 +1056,7 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 		default: // Empty default to prevent blocking
 		}
 
-		keySource := uaerospike.CalculateKeySource(txID, uint32(recordNum)) // nolint: gosec
+		keySource := uaerospike.CalculateKeySourceInternal(txID, uint32(recordNum)) // nolint: gosec
 
 		extraKey, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {

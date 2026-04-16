@@ -15,7 +15,7 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // GetFSMState retrieves the current state of the blockchain's Finite State Machine (FSM).

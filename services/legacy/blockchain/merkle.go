@@ -7,8 +7,8 @@ package blockchain
 import (
 	"math"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 // nextPowerOfTwo returns the next highest power of two from a given number if

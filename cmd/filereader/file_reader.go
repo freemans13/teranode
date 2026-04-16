@@ -27,17 +27,17 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	blockmodel "github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/utxopersister"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+	blockmodel "github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 const (
@@ -146,7 +146,7 @@ func ProcessFile(ctx context.Context, path string, logger ulogger.Logger, settin
 // readFile reads the contents of a file and processes it based on its type.
 func readFile(ctx context.Context, filename string, ext fileformat.FileType, logger ulogger.Logger,
 	settings *settings.Settings, r io.Reader, dir string) error {
-	br := bufio.NewReaderSize(r, 1024*1024)
+	br := bufio.NewReaderSize(r, 1024*128)
 
 	// Read the header
 	header, err := fileformat.ReadHeader(br)
@@ -176,6 +176,9 @@ func readFile(ctx context.Context, filename string, ext fileformat.FileType, log
 		return handleUtxoDeletions(br)
 
 	case fileformat.FileTypeSubtree:
+		return handleSubtree(br)
+
+	case fileformat.FileTypeSubtreeToCheck:
 		return handleSubtree(br)
 
 	case fileformat.FileTypeSubtreeData:
@@ -300,7 +303,7 @@ func handleBlockHeader(br *bufio.Reader) error {
 
 // handleBlock processes FileTypeBlock files.
 func handleBlock(br *bufio.Reader, logger ulogger.Logger, settings *settings.Settings, dir string) error {
-	block, err := blockmodel.NewBlockFromReader(br, nil)
+	block, err := blockmodel.NewBlockFromReader(br)
 	if err != nil {
 		return errors.NewBlockError("error reading block", err)
 	}

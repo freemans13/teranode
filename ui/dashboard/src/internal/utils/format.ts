@@ -47,6 +47,42 @@ export function humanTime(time: number) {
   return '0s'
 }
 
+export function humanTimeNoSeconds(time: number) {
+  let diff = new Date().getTime() - new Date(time).getTime()
+  diff = diff / 1000
+  const days = Math.floor(diff / 86400)
+  const hours = Math.floor((diff % 86400) / 3600)
+  const minutes = Math.floor(((diff % 86400) % 3600) / 60)
+
+  let difference = ''
+
+  if (days > 0) {
+    difference += days
+    difference += 'd'
+    difference += hours
+    difference += 'h'
+    difference += minutes
+    difference += 'm'
+    return difference
+  }
+
+  if (hours > 0) {
+    difference += hours
+    difference += 'h'
+    difference += minutes
+    difference += 'm'
+    return difference
+  }
+
+  if (minutes > 0) {
+    difference += minutes
+    difference += 'm'
+    return difference
+  }
+
+  return '<1m'
+}
+
 export function getHumanReadableTime(diff: number) {
   const days = Math.floor(diff / (1000 * 60 * 60 * 24))
   const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60))

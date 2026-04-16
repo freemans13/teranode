@@ -42,7 +42,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // NAT is an interface representing a NAT traversal options for example UPNP or

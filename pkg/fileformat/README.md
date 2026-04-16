@@ -27,7 +27,7 @@ Each file type has a unique 8-byte magic header for identification.
 ```go
 import (
     "os"
-    "github.com/bitcoin-sv/teranode/pkg/fileformat"
+    "github.com/bsv-blockchain/teranode/pkg/fileformat"
 )
 
 // Writing a header

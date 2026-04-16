@@ -30,6 +30,7 @@ The functional requirements are organized into the following categories:
 Tests are organized in two main locations:
 
 1. **Dedicated test folders** (`/test/[category]/`):
+
    - `/test/tna/` - Node responsibilities tests
    - `/test/tnb/` - Transaction validation tests
    - `/test/tnd/` - Block propagation tests
@@ -38,6 +39,7 @@ Tests are organized in two main locations:
    - `/test/tec/` - Error handling tests
 
 2. **Integration tests** (`/test/e2e/daemon/`):
+
    - `tnc*_test.go` - Block assembly tests
    - `tne*_test.go` - Block validation tests
    - Additional integration tests for various requirements
@@ -51,6 +53,7 @@ The test framework is built on the testify suite package and is defined primaril
 ## Test Suites and Setup
 
 The test framework provides two main components:
+
 - **TeranodeTestSuite** (`test/utils/arrange.go`): Base test suite that embeds testify's suite.Suite and provides common test setup/teardown
 - **TeranodeTestEnv** (`test/utils/testenv.go`): Manages the test environment including Docker Compose stacks, node clients, and service connections
 
@@ -58,13 +61,10 @@ Each test suite can customize its configuration through the TConfig system, whic
 
 ## Test Execution
 
-
 Prerequisites:
 
 - Docker must be running
 - Docker compose must be installed
-
-
 
 To execute a given test suite (e.g., TNA, TNB, TNJ), use the following standard command template from the terminal:
 
@@ -86,6 +86,7 @@ go test -v -tags test_tnj
 ```
 
 **Note**: Some tests don't require build tags and can be run directly:
+
 ```bash
 # For TNC tests in e2e/daemon
 cd /teranode/test/e2e/daemon
@@ -123,16 +124,16 @@ The naming convention for files in this folder is as follows:
 For example:
 
 - `tna1_test.go` covers TNA-1: `Teranode must broadcast new transactions to all nodes (although new transaction broadcasts do not necessarily need to reach all nodes)`.
-    - **Implementation**: The test starts three distinct Teranode instances in Docker containers. It sends 35 transactions to the first node and verifies transaction propagation by checking that at least one of these transactions appears in subtree notifications received from the network, confirming the broadcast functionality.
+  - **Implementation**: The test starts three distinct Teranode instances in Docker containers. It sends 35 transactions to the first node and verifies transaction propagation by checking that at least one of these transactions appears in subtree notifications received from the network, confirming the broadcast functionality.
 
 - `tna2_test.go` covers TNA-2: `Teranode collects new transactions into a block`.
-    - **Implementation**: The test starts three Teranode instances in Docker containers and runs three sub-tests to verify transaction collection: (1) single transaction propagation - sending one transaction and verifying it appears in all nodes' block assembly, (2) multiple transaction propagation - sending 5 sequential transactions and confirming all appear in all nodes' block assembly, and (3) concurrent transaction propagation - sending 10 simultaneous transactions and verifying their presence in block assembly on all nodes.
+  - **Implementation**: The test starts three Teranode instances in Docker containers and runs three sub-tests to verify transaction collection: (1) single transaction propagation - sending one transaction and verifying it appears in all nodes' block assembly, (2) multiple transaction propagation - sending 5 sequential transactions and confirming all appear in all nodes' block assembly, and (3) concurrent transaction propagation - sending 10 simultaneous transactions and verifying their presence in block assembly on all nodes.
 
 - `tna4_test.go` covers TNA-4: `Teranode must broadcast the block to all nodes when it finds a proof-of-work`.
-    - **Implementation**: The test configures three Teranode nodes and sets up notification listeners on two receiving nodes. It sends transactions to the first node, mines a block containing these transactions, and then verifies that all receiving nodes get block notifications with the correct block hash. It also confirms that each node successfully stores the block in its blockchain database, proving complete block propagation across the network.
+  - **Implementation**: The test configures three Teranode nodes and sets up notification listeners on two receiving nodes. It sends transactions to the first node, mines a block containing these transactions, and then verifies that all receiving nodes get block notifications with the correct block hash. It also confirms that each node successfully stores the block in its blockchain database, proving complete block propagation across the network.
 
 - TNA-5: `Teranode must only accept the block if all transactions in it are valid and not already spent`
-    - **Implementation**: This requirement is covered extensively by the `test/sequentialtest/double_spend/double_spend_test.go` file, which contains comprehensive tests for double-spend detection and handling across multiple storage backends (SQLite, Postgres, and Aerospike). These tests verify:
+  - **Implementation**: This requirement is covered extensively by the `test/sequentialtest/double_spend/double_spend_test.go` file, which contains comprehensive tests for double-spend detection and handling across multiple storage backends (SQLite, Postgres, and Aerospike). These tests verify:
       1. **Single Double-Spend Detection**: Tests that Teranode can detect and properly handle simple double-spend attempts.
       2. **Multiple Conflicting Transactions**: Verifies detection of multiple transactions conflicting with each other across different blocks.
       3. **Transaction Chain Conflicts**: Tests handling of entire chains of transactions that conflict with each other.
@@ -143,14 +144,15 @@ For example:
       8. **Frozen Transaction Handling**: Tests interaction of double-spends with frozen transactions.
 
       The tests confirm that Teranode correctly identifies double-spend attempts, properly marks conflicting transactions, and maintains UTXO integrity throughout chain reorganizations. Additional transaction validity checks are provided by the Block Development Kit (BDK) tests.
-    - These tests collectively ensure that Teranode only accepts blocks containing valid, non-double-spent transactions, fulfilling the TNA-5 requirement.
+  - These tests collectively ensure that Teranode only accepts blocks containing valid, non-double-spent transactions, fulfilling the TNA-5 requirement.
 
 - `tna6_test.go` covers TNA-6: `Teranode must express its acceptance of a block by working on creating the next block in the chain, using the hash of the accepted block as the previous hash`.
-    - **Implementation**: The test instantiates three Teranode nodes, mines a block on the first node, and then verifies that the block is accepted by checking that it becomes the best block. It then retrieves a mining candidate from each node and confirms that they all use the accepted block's hash as their previous hash, demonstrating that all nodes are building on top of the accepted block.
+  - **Implementation**: The test instantiates three Teranode nodes, mines a block on the first node, and then verifies that the block is accepted by checking that it becomes the best block. It then retrieves a mining candidate from each node and confirms that they all use the accepted block's hash as their previous hash, demonstrating that all nodes are building on top of the accepted block.
 
 ### Running TNA Tests
 
 #### Running All TNA Tests
+
 ```bash
 cd /teranode/test/tna
 go test -v -tags test_tna
@@ -166,29 +168,32 @@ go test -v -run "^TestTNA1TestSuite$/TestTNA1$"
 Examples for each TNA test:
 
 - For TNA-1 (transaction broadcasting):
+
   ```bash
   cd /teranode/test/tna
   go test -v -run "^TestTNA1TestSuite$/TestBroadcastNewTxAllNodes$" -tags test_tna
   ```
 
 - For TNA-2 (transaction collection):
+
   ```bash
   cd /teranode/test/tna
   go test -v -run "^TestTNA2TestSuite$/TestTxsReceivedAllNodes$" -tags test_tna
   ```
 
 - For TNA-4 (block broadcasting):
+
   ```bash
   cd /teranode/test/tna
   go test -v -run "^TestTNA4TestSuite$/TestBlockBroadcast$" -tags test_tna
   ```
 
 - For TNA-6 (block acceptance):
+
   ```bash
   cd /teranode/test/tna
   go test -v -run "^TestTNA6TestSuite$/TestAcceptanceNextBlock$" -tags test_tna
   ```
-
 
 ## TNB
 
@@ -223,18 +228,18 @@ In addition to the functional test suite, there are two important test files in 
 1. **TxValidator_test.go**: Tests transaction validation network policies:
 
     - **MaxTxSizePolicy**: Tests that transactions exceeding the maximum size are rejected.
-   - **MaxOpsPerScriptPolicy**: Verifies enforcement of operation count limits in scripts.
-   - **MaxScriptSizePolicy**: Ensures scripts exceeding the maximum size are rejected.
-   - **MaxTxSigopsCountsPolicy**: Tests enforcement of signature operation count limits.
-   - **MinFeePolicy**: Validates that transactions with insufficient fees are rejected based on their size and the presence of OP_RETURN data.
+    - **MaxOpsPerScriptPolicy**: Verifies enforcement of operation count limits in scripts.
+    - **MaxScriptSizePolicy**: Ensures scripts exceeding the maximum size are rejected.
+    - **MaxTxSigopsCountsPolicy**: Tests enforcement of signature operation count limits.
+    - **MinFeePolicy**: Validates that transactions with insufficient fees are rejected based on their size and the presence of OP_RETURN data.
 
 2. **Validator_test.go**: Tests integration of the validator with other Teranode components:
 
     - **TestValidate_CoinbaseTransaction**: Verifies correct handling of coinbase transactions.
-   - **TestValidate_BlockAssemblyAndTxMetaChannels**: Tests the integration between transaction validation and block assembly.
-   - **TestValidate_RejectedTransactionChannel**: Ensures rejected transactions are properly handled and reported.
-   - **TestValidate_BlockAssemblyError**: Verifies proper error handling during the block assembly process.
-   - **Transaction-specific tests**: Contains tests for several specific real-world transactions to ensure they validate correctly, including edge cases like non-zero OP_RETURN outputs and complex script execution.
+    - **TestValidate_BlockAssemblyAndTxMetaChannels**: Tests the integration between transaction validation and block assembly.
+    - **TestValidate_RejectedTransactionChannel**: Ensures rejected transactions are properly handled and reported.
+    - **TestValidate_BlockAssemblyError**: Verifies proper error handling during the block assembly process.
+    - **Transaction-specific tests**: Contains tests for several specific real-world transactions to ensure they validate correctly, including edge cases like non-zero OP_RETURN outputs and complex script execution.
 
 Together, these tests ensure that Teranode maintains proper network health by enforcing transaction validation rules and correctly integrating with the block assembly process, UTXO management, and Kafka messaging. They provide critical protection against potential denial-of-service vectors and ensure that transactions are properly processed throughout the entire validation pipeline.
 
@@ -257,6 +262,7 @@ Together, these tests ensure that Teranode maintains proper network health by en
 ### Running TNB Tests
 
 #### Running All TNB Tests
+
 ```bash
 cd /teranode/test/tnb
 go test -v -tags test_tnb
@@ -272,29 +278,32 @@ go test -v -run "^TestTNB1TestSuite$/TestSendTxsInBatch$" -tags test_tnb
 Examples for each TNB test:
 
 - For TNB-1 (transaction processing):
+
   ```bash
   cd /teranode/test/tnb
   go test -v -run "^TestTNB1TestSuite$/TestSendTxsInBatch$" -tags test_tnb
   ```
 
 - For TNB-2 (transaction validation):
+
   ```bash
   cd /teranode/test/tnb
   go test -v -run "^TestTNB2TestSuite$/TestUTXOValidation$" -tags test_tnb
   ```
 
 - For TNB-6 (UTXO set management):
+
   ```bash
   cd /teranode/test/tnb
   go test -v -run "^TestTNB6TestSuite$/TestUnspentTransactionOutputs$" -tags test_tnb
   ```
 
 - For TNB-7 (transaction input spending):
+
   ```bash
   cd /teranode/test/tnb
   go test -v -run "^TestTNB7TestSuite$/TestValidatedTxShouldSpendInputs$" -tags test_tnb
   ```
-
 
 ## TNC
 
@@ -376,7 +385,6 @@ In addition to the TNC functional tests and system tests, `services/blockassembl
 
 These unit tests provide additional verification of the core block assembly functionality at a lower level than the functional tests, ensuring that the individual components work correctly before they're integrated into the complete system.
 
-
 ## TND
 
 As outlined in the Functional Requirements for Teranode reference document, the tests in the `/test/tnd` folder verify the block propagation functionality between nodes in the network.
@@ -396,6 +404,7 @@ The naming convention for files in this folder is as follows:
 ### Running TND Tests
 
 #### Running All TND Tests
+
 ```bash
 cd /teranode/test/tnd
 go test -v -tags test_tnd
@@ -429,6 +438,7 @@ The naming convention for these test files is:
 ### Running TNE Tests
 
 #### Running TNE Tests
+
 ```bash
 cd /teranode/test/e2e/daemon
 # Run specific TNE test
@@ -468,6 +478,7 @@ These smoke tests provide additional verification of the chain reorganization fu
 ### Running TNF Tests
 
 #### Running All TNF Tests
+
 ```bash
 cd /teranode/test/tnf
 go test -v -tags test_tnf
@@ -509,6 +520,7 @@ The naming convention for files in this folder is descriptive, using names like 
 ### Running TNJ Tests
 
 #### Running All TNJ Tests
+
 ```bash
 cd /teranode/test/tnj
 go test -v -tags test_tnj

@@ -18,11 +18,11 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 )
 
 // Data represents transaction metadata including the transaction itself,
@@ -59,8 +59,8 @@ type Data struct {
 	LockTime uint32 `json:"lockTime"`
 
 	// UnminedSince is the block height when an unmined transaction was first stored.
-	// When set to a block height value, it indicates the transaction is unmined.
-	// When 0, it indicates the transaction has been mined.
+	// When set to a block height value, it indicates the transaction is unmined on the longest chain.
+	// When 0, it indicates the transaction has been mined on the longest chain.
 	UnminedSince uint32 `json:"unminedSince"`
 
 	// Frozen is a flag indicating if the transaction is frozen

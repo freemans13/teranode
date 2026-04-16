@@ -7,7 +7,7 @@ package bsvjson_test
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/rpc/bsvjson"
+	"github.com/bsv-blockchain/teranode/services/rpc/bsvjson"
 )
 
 // TestErrorCodeStringer tests the stringized output for the ErrorCode type.

@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -128,7 +128,6 @@ func TestWaitForBlockAssemblyReady(t *testing.T) {
 				logger,
 				mockClient,
 				tt.blockHeight,
-				1, // Allow 1 block behind for the test
 			)
 
 			if tt.expectedError {
@@ -172,7 +171,6 @@ func TestWaitForBlockAssemblyReadyContextCancellation(t *testing.T) {
 		logger,
 		mockClient,
 		100,
-		1, // Allow 1 block behind for the test
 	)
 
 	assert.Error(t, err)

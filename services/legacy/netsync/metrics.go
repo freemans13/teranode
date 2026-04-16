@@ -3,7 +3,7 @@ package netsync
 import (
 	"sync"
 
-	"github.com/bitcoin-sv/teranode/util"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

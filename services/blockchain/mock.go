@@ -4,24 +4,24 @@ import (
 	"context"
 	"encoding/binary"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	blockchain_store "github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/stretchr/testify/mock"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Mock implements the blockchain.ClientI interface for testing purposes
+// Mock implements the blockchain.ClientI interface for testing purposes.
 type Mock struct {
 	mock.Mock
 }
 
-// Health mocks the Health method
+// Health mocks the Health method.
 func (m *Mock) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	args := m.Called(ctx, checkLiveness)
 
@@ -282,6 +282,27 @@ func (m *Mock) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeig
 	return args.Get(0).([]*model.BlockHeader), args.Get(1).([]*model.BlockHeaderMeta), args.Error(2)
 }
 
+// GetBlocksByHeight mocks the GetBlocksByHeight method
+func (m *Mock) GetBlocksByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.Block, error) {
+	args := m.Called(ctx, startHeight, endHeight)
+
+	if args.Error(1) != nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*model.Block), args.Error(1)
+}
+
+func (m *Mock) FindBlocksContainingSubtree(ctx context.Context, subtreeHash *chainhash.Hash, maxBlocks uint32) ([]*model.Block, error) {
+	args := m.Called(ctx, subtreeHash, maxBlocks)
+
+	if args.Error(1) != nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*model.Block), args.Error(1)
+}
+
 // InvalidateBlock mocks the InvalidateBlock method
 func (m *Mock) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) ([]chainhash.Hash, error) {
 	args := m.Called(ctx, blockHash)
@@ -456,6 +477,12 @@ func (m *Mock) Run(ctx context.Context, source string) error {
 // CatchUpBlocks mocks the CatchUpBlocks method
 func (m *Mock) CatchUpBlocks(ctx context.Context) error {
 	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+// ReportPeerFailure mocks the ReportPeerFailure method
+func (m *Mock) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
+	args := m.Called(ctx, hash, peerID, failureType, reason)
 	return args.Error(0)
 }
 

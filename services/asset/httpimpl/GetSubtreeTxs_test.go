@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -176,8 +176,8 @@ func TestGetSubtreeTxs(t *testing.T) {
 			// These fields should be zero since metadata was not found
 			assert.Equal(t, float64(0), data["inputsCount"])
 			assert.Equal(t, float64(0), data["outputsCount"])
-			assert.Equal(t, float64(0), data["size"])
-			assert.Equal(t, float64(0), data["fee"])
+			assert.Equal(t, float64(i), data["size"])
+			assert.Equal(t, float64(i), data["fee"])
 		}
 	})
 

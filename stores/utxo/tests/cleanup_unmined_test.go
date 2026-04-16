@@ -33,12 +33,12 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -356,7 +356,7 @@ func createTestTransactions(t *testing.T, count int) []*bt.Tx {
 
 // getUnminedTransactions returns all unmined transaction hashes using the unmined iterator
 func getUnminedTransactions(t *testing.T, ctx context.Context, store utxo.Store) []chainhash.Hash {
-	iterator, err := store.GetUnminedTxIterator()
+	iterator, err := store.GetUnminedTxIterator(false)
 	require.NoError(t, err, "Should be able to get unmined tx iterator")
 
 	var hashes []chainhash.Hash

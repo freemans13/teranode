@@ -4,12 +4,10 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// UTXOMap represents a bitcoin transaction outpoint, i.e. the transaction ID and the output index.
-// It is used as a key in the UTXOMap and is hashable.
-// UTXOMap provides thread-safe storage for UTXOs
+// UTXOMap provides thread-safe storage for UTXO collections.
 type UTXOMap struct {
 	genericMap[UTXOKey, *UTXOValue]
 }

@@ -1,8 +1,6 @@
 # Syncing the Blockchain
 
-<!-- markdownlint-disable MD046 -->
-
-Last modified: 15-July-2025
+Last modified: 15-October-2025
 
 ## Table of Contents
 
@@ -208,7 +206,7 @@ docker run -it \
     -v /mnt/bitcoin-sv-data:/home/ubuntu/bitcoin-data:ro \
     -v /mnt/teranode/seed:/mnt/teranode/seed \
     --entrypoint="" \
-    ghcr.io/bsv-blockchain/teranode:v0.9.76 \
+    ghcr.io/bsv-blockchain/teranode:v0.11.13 \
     /app/teranode-cli bitcointoutxoset \
         -bitcoinDir=/home/ubuntu/bitcoin-data \
         -outputDir=/mnt/teranode/seed/export
@@ -287,6 +285,7 @@ docker compose stop blockchain asset blockvalidation # Add other services as nee
 **For Kubernetes Deployments:**
 
 You can scale down the Teranode services using the `spec.enabled` option in the CR:
+
 ```yaml
 ---
 apiVersion: teranode.bsvblockchain.org/v1alpha1
@@ -337,12 +336,12 @@ ls -la /mnt/teranode/seed/export/
 # Make sure to add any environment variables you have defined in your docker-compose.yml
 docker run -it \
     -e SETTINGS_CONTEXT=docker.m \
-    -e network=mainnet
+    -e network=mainnet \
     -v ${PWD}/docker/mainnet/data/teranode:/app/data \
     -v /mnt/teranode/seed:/mnt/teranode/seed \
     --network my-teranode-network \
     --entrypoint="" \
-    ghcr.io/bsv-blockchain/teranode:v0.9.76 \
+    ghcr.io/bsv-blockchain/teranode:v0.11.13 \
     /app/teranode-cli seeder \
         -inputDir /mnt/teranode/seed/export \
         -hash 0000000000013b8ab2cd513b0261a14096412195a72a0c4827d229dcc7e0f7af
@@ -353,7 +352,7 @@ docker run -it \
 ```bash
 # Create a temporary seeder pod
 kubectl run teranode-seeder \
-    --image=ghcr.io/bsv-blockchain/teranode:v0.9.76 \
+    --image=ghcr.io/bsv-blockchain/teranode:v0.11.13 \
     --restart=Never \
     --rm -i --tty \
     -n teranode-operator \
@@ -472,7 +471,7 @@ docker run -it \
     -v /mnt/teranode/seed:/mnt/teranode/seed \
     --network my-teranode-network \
     --entrypoint="" \
-    ghcr.io/bsv-blockchain/teranode:v0.9.76 \
+    ghcr.io/bsv-blockchain/teranode:v0.11.13 \
     /app/teranode-cli seeder \
         -inputDir /mnt/teranode/seed/export \
         -hash <blockhash-from-filename>
@@ -486,7 +485,7 @@ kubectl scale deployment blockchain --replicas=0 -n teranode-operator
 
 # Run seeder
 kubectl run teranode-seeder \
-    --image=ghcr.io/bsv-blockchain/teranode:v0.9.76 \
+    --image=ghcr.io/bsv-blockchain/teranode:v0.11.13 \
     --restart=Never --rm -i --tty \
     -n teranode-operator \
     -- /app/teranode-cli seeder \

@@ -37,12 +37,12 @@ package utxo
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 )
 
 // ReAssignedUtxoSpendableAfterBlocks is the number of blocks that must pass
@@ -75,6 +75,8 @@ type Spend struct {
 	Err error `json:"err,omitempty"`
 }
 
+// Clone creates a deep copy of the Spend struct.
+// Returns nil if the receiver is nil.
 func (s *Spend) Clone() *Spend {
 	if s == nil {
 		return nil
@@ -112,6 +114,7 @@ func (s *Spend) Clone() *Spend {
 	return clone
 }
 
+// IgnoreFlags controls which UTXO states should be ignored during spend operations.
 type IgnoreFlags struct {
 	IgnoreConflicting bool
 	IgnoreLocked      bool
@@ -204,10 +207,11 @@ func WithLocked(b bool) CreateOption {
 }
 
 type MinedBlockInfo struct {
-	BlockID     uint32
-	BlockHeight uint32
-	SubtreeIdx  int
-	UnsetMined  bool // if true, the mined info will be removed from the tx
+	BlockID        uint32
+	BlockHeight    uint32
+	SubtreeIdx     int
+	OnLongestChain bool
+	UnsetMined     bool // if true, the mined info will be removed from the tx
 }
 
 // Store defines the interface for UTXO management operations.
@@ -247,7 +251,7 @@ type Store interface {
 	SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo MinedBlockInfo) (map[chainhash.Hash][]uint32, error)
 
 	// GetUnminedTxIterator returns an iterator for all unmined transactions in the store.
-	GetUnminedTxIterator() (UnminedTxIterator, error)
+	GetUnminedTxIterator(fullScan bool) (UnminedTxIterator, error)
 
 	// QueryOldUnminedTransactions returns transaction hashes for unmined transactions older than the cutoff height.
 	// This method is used by the store-agnostic cleanup implementation.
@@ -296,6 +300,11 @@ type Store interface {
 
 	// SetLocked marks transactions as locked for spending.
 	SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error
+
+	// MarkTransactionsOnLongestChain marks transactions as being on the longest chain or not.
+	// When onLongestChain is true, the unminedSince field is unset (transaction is mined).
+	// When onLongestChain is false, the unminedSince field is set to the current block height.
+	MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error
 
 	// internal state functions
 

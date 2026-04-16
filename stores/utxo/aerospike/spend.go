@@ -62,17 +62,16 @@ import (
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	spendpkg "github.com/bitcoin-sv/teranode/stores/utxo/spend"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 )
@@ -97,6 +96,146 @@ type batchSpend struct {
 	errCh             chan error  // Channel for completion notification
 	ignoreConflicting bool
 	ignoreLocked      bool
+}
+
+// IncrementSpentRecordsMulti performs a single BatchOperate to increment spent-extra-records for many txids.
+// This avoids enqueueing each increment through the batcher and waiting per-item.
+func (s *Store) IncrementSpentRecordsMulti(txids []*chainhash.Hash, increment int) error {
+	if len(txids) == 0 {
+		return nil
+	}
+
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
+
+	currentBlockHeight := s.blockHeight.Load()
+
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(txids))
+
+	for _, txid := range txids {
+		key, err := aerospike.NewKey(s.namespace, s.setName, txid[:])
+		if err != nil {
+			return errors.NewProcessingError("failed to init new aerospike key for txMeta", err)
+		}
+
+		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, key, LuaPackage, "incrementSpentExtraRecs",
+			aerospike.NewIntegerValue(increment),
+			aerospike.NewIntegerValue(int(currentBlockHeight)),
+			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
+		))
+	}
+
+	if err := s.client.BatchOperate(batchPolicy, batchRecords); err != nil {
+		return errors.NewStorageError("[IncrementSpentRecordsMulti] error in aerospike batch", err)
+	}
+
+	// Inspect per-record errors
+	var aggErr error
+	for i := range batchRecords {
+		if recErr := batchRecords[i].BatchRec().Err; recErr != nil {
+			if aggErr == nil {
+				aggErr = recErr
+			} else {
+				aggErr = errors.Join(aggErr, recErr)
+			}
+		}
+	}
+
+	return aggErr
+}
+
+// SetDAHForChildRecordsMulti expands childCount per tx and performs a single BatchOperate
+// to set/unset DeleteAtHeight across all child pagination records.
+func (s *Store) SetDAHForChildRecordsMulti(items []struct {
+	TxID           *chainhash.Hash
+	ChildCount     int
+	DeleteAtHeight uint32
+}) error {
+	// Expand into individual child records
+	total := 0
+	for _, it := range items {
+		if it.ChildCount > 0 {
+			total += it.ChildCount
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, total)
+
+	for _, it := range items {
+		for i := uint32(1); i <= uint32(it.ChildCount); i++ { // nolint: gosec
+			keySource := uaerospike.CalculateKeySourceInternal(it.TxID, i) // children start at 1
+			key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
+			if err != nil {
+				return errors.NewProcessingError("[SetDAHForChildRecordsMulti][%s] failed to create key for pagination record %d: %v", it.TxID.String(), i, err)
+			}
+
+			batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
+			if it.DeleteAtHeight > 0 {
+				batchRecords = append(batchRecords, aerospike.NewBatchWrite(batchWritePolicy, key, aerospike.PutOp(aerospike.NewBin(fields.DeleteAtHeight.String(), it.DeleteAtHeight))))
+			} else {
+				batchRecords = append(batchRecords, aerospike.NewBatchWrite(batchWritePolicy, key, aerospike.PutOp(aerospike.NewBin(fields.DeleteAtHeight.String(), nil))))
+			}
+		}
+	}
+
+	if err := s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords); err != nil {
+		return errors.NewStorageError("[SetDAHForChildRecordsMulti] failed to set DAH", err)
+	}
+
+	var aggErr error
+	for _, br := range batchRecords {
+		if recErr := br.BatchRec().Err; recErr != nil {
+			if aggErr == nil {
+				aggErr = recErr
+			} else {
+				aggErr = errors.Join(aggErr, recErr)
+			}
+		}
+	}
+
+	return aggErr
+}
+
+// setDAHExternalTransactionMulti updates DAH in the external store for many txids using a limited worker pool.
+func (s *Store) setDAHExternalTransactionMulti(ctx context.Context, updates []struct {
+	TxID *chainhash.Hash
+	DAH  uint32
+}) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	// Limit concurrency to avoid IO overload; 16 is a reasonable default.
+	const maxWorkers = 16
+	sem := make(chan struct{}, maxWorkers)
+	g, ctx2 := errgroup.WithContext(ctx)
+
+	for i := range updates {
+		upd := updates[i]
+		g.Go(func() error {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// Try tx file first, then outputs
+			if err := s.externalStore.SetDAH(ctx2, upd.TxID[:], fileformat.FileTypeTx, upd.DAH); err != nil {
+				if errors.Is(err, errors.ErrNotFound) {
+					if err2 := s.externalStore.SetDAH(ctx2, upd.TxID[:], fileformat.FileTypeOutputs, upd.DAH); err2 != nil {
+						return errors.NewStorageError("[setDAHExternalTransactionMulti][%s] failed to %s DAH for external transaction outputs: %v", upd.TxID, dahOperation(upd.DAH), err2)
+					}
+				} else {
+					return errors.NewStorageError("[setDAHExternalTransactionMulti][%s] failed to %s DAH for external transaction: %v", upd.TxID, dahOperation(upd.DAH), err)
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // batchIncrement handles record count updates for paginated transactions
@@ -303,6 +442,7 @@ func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
 	}
 
 	batchRecords, batchRecordKeys := s.createBatchRecords(batchesByKey)
+
 	if err := s.executeSpendBatch(batchRecords, batch, batchID); err != nil {
 		return
 	}
@@ -324,14 +464,8 @@ func (s *Store) prepareSpendBatches(batch []*batchSpend, batchID uint64) (map[ke
 	aeroKeyMap := make(map[string]*aerospike.Key)
 	batchesByKey := make(map[keyIgnoreLocked][]aerospike.MapValue, len(batch))
 
-	sUtxoBatchSizeUint32, err := safeconversion.IntToUint32(s.utxoBatchSize)
-	if err != nil {
-		s.logger.Errorf("Could not convert utxoBatchSize (%d) to uint32", s.utxoBatchSize)
-		return nil, err
-	}
-
 	for idx, bItem := range batch {
-		key, err := s.getOrCreateAerospikeKey(bItem, sUtxoBatchSizeUint32, aeroKeyMap)
+		key, err := s.getOrCreateAerospikeKey(bItem, s.utxoBatchSize, aeroKeyMap)
 		if err != nil {
 			bItem.errCh <- err
 			continue
@@ -356,8 +490,8 @@ func (s *Store) prepareSpendBatches(batch []*batchSpend, batchID uint64) (map[ke
 }
 
 // getOrCreateAerospikeKey gets or creates an Aerospike key for the spend
-func (s *Store) getOrCreateAerospikeKey(bItem *batchSpend, utxoBatchSize uint32, keyMap map[string]*aerospike.Key) (*aerospike.Key, error) {
-	keySource := uaerospike.CalculateKeySource(bItem.spend.TxID, bItem.spend.Vout/utxoBatchSize)
+func (s *Store) getOrCreateAerospikeKey(bItem *batchSpend, utxoBatchSize int, keyMap map[string]*aerospike.Key) (*aerospike.Key, error) {
+	keySource := uaerospike.CalculateKeySource(bItem.spend.TxID, bItem.spend.Vout, utxoBatchSize)
 	keySourceStr := string(keySource)
 
 	if key, ok := keyMap[keySourceStr]; ok {
@@ -582,29 +716,12 @@ func (s *Store) createGeneralError(errorCode LuaErrorCode, txID *chainhash.Hash,
 func (s *Store) handleIndividualErrors(errors map[int]LuaErrorInfo, batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash) {
 	for _, batchItem := range batchByKey {
 		idx := batchItem["idx"].(int)
-		offset := s.extractOffset(batchItem, batch, idx, txID)
-		if offset < 0 {
-			continue
-		}
 
-		if errMsg, hasError := errors[offset]; hasError {
+		if errMsg, hasError := errors[idx]; hasError {
 			batch[idx].errCh <- s.createSpendError(errMsg, batch[idx], txID)
 		} else {
 			batch[idx].errCh <- nil
 		}
-	}
-}
-
-// extractOffset extracts the offset from batch item
-func (s *Store) extractOffset(batchItem aerospike.MapValue, batch []*batchSpend, idx int, txID *chainhash.Hash) int {
-	switch v := batchItem["offset"].(type) {
-	case int:
-		return v
-	case uint32:
-		return int(v)
-	default:
-		batch[idx].errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] invalid offset type: %T", txID.String(), v)
-		return -1
 	}
 }
 
@@ -900,7 +1017,7 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 	batchRecords := make([]aerospike.BatchRecordIfc, len(batch))
 
 	for i, b := range batch {
-		keySource := uaerospike.CalculateKeySource(b.txID, b.childIdx)
+		keySource := uaerospike.CalculateKeySourceInternal(b.txID, b.childIdx)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {

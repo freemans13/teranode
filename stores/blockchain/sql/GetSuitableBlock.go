@@ -16,11 +16,11 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetSuitableBlock retrieves information needed for mining a new block.
@@ -101,7 +101,10 @@ func (s *SQL) GetSuitableBlock(ctx context.Context, hash *chainhash.Hash) (*mode
 		block_time,
 		chain_work
 	FROM
-		block_chain`
+		block_chain
+	ORDER BY
+		depth DESC
+	`
 
 	rows, err := s.db.QueryContext(ctx, q, hash[:])
 	if err != nil {

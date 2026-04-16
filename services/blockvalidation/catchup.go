@@ -1,3 +1,4 @@
+// This file contains the main catchup logic for blockchain synchronization.
 package blockvalidation
 
 import (
@@ -6,16 +7,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation/catchup"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
-	"github.com/bitcoin-sv/teranode/util/blockassemblyutil"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/catchup"
+	"github.com/bsv-blockchain/teranode/util/blockassemblyutil"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -43,6 +43,7 @@ type CatchupContext struct {
 	headersFetchResult      *catchup.Result
 	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
 	highestCheckpointHeight uint32 // Highest checkpoint height for validation checks
+	catchupError            error  // Any error encountered during catchup
 }
 
 // catchup orchestrates the complete blockchain synchronization process.
@@ -508,7 +509,7 @@ func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) erro
 
 	if checkpointsChecked > 0 {
 		u.logger.Infof("[catchup][%s] Successfully verified %d checkpoint(s) in header chain", catchupCtx.blockUpTo.Hash().String(), checkpointsChecked)
-		catchupCtx.useQuickValidation = true
+		catchupCtx.useQuickValidation = false // quick validation is turned off for now, need more testing
 	} else {
 		catchupCtx.useQuickValidation = false
 	}
@@ -601,7 +602,12 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	})
 
 	// Wait for both operations to complete
-	return errorGroup.Wait()
+	err = errorGroup.Wait()
+	if err != nil {
+		catchupCtx.catchupError = err
+	}
+
+	return err
 }
 
 // cleanup cleans up resources after catchup.
@@ -785,7 +791,7 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan *model.Block, g
 			}
 
 			// Wait for block assembly to be ready if needed
-			if err := blockassemblyutil.WaitForBlockAssemblyReady(gCtx, u.logger, u.blockAssemblyClient, block.Height, uint32(u.settings.ChainCfgParams.CoinbaseMaturity/2)); err != nil {
+			if err := blockassemblyutil.WaitForBlockAssemblyReady(gCtx, u.logger, u.blockAssemblyClient, block.Height); err != nil {
 				return errors.NewProcessingError("[catchup:validateBlocksOnChannel][%s] failed to wait for block assembly for block %s: %v", blockUpTo.Hash().String(), block.Hash().String(), err)
 			}
 
@@ -808,18 +814,15 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan *model.Block, g
 				}
 
 				// Validate the block using standard validation
+				// Note: ValidateBlockWithOptions now automatically stores invalid blocks with invalid=true
 				if err := u.blockValidation.ValidateBlockWithOptions(gCtx, block, baseURL, nil, opts); err != nil {
 					u.logger.Errorf("[catchup:validateBlocksOnChannel][%s] failed to validate block %s at position %d: %v", blockUpTo.Hash().String(), block.Hash().String(), i, err)
 
-					// Only mark block as invalid for consensus violations (ErrBlockInvalid or ErrTxInvalid)
-					// Other errors like missing data, storage issues, or processing errors should not mark the block as invalid
+					// ValidateBlockWithOptions already stored the block as invalid if it's a consensus violation
+					// Just log and record metrics
 					if errors.Is(err, errors.ErrBlockInvalid) || errors.Is(err, errors.ErrTxInvalid) {
-						u.logger.Warnf("[catchup:validateBlocksOnChannel][%s] block %s violates consensus rules, marking as invalid", blockUpTo.Hash().String(), block.Hash().String())
-						if markErr := u.blockchainClient.AddBlock(gCtx, block, peerID, options.WithInvalid(true)); markErr != nil {
-							u.logger.Errorf("[catchup:validateBlocksOnChannel][%s] failed to store invalid block %s: %v", blockUpTo.Hash().String(), block.Hash().String(), markErr)
-						}
+						u.logger.Warnf("[catchup:validateBlocksOnChannel][%s] block %s violates consensus rules (already stored as invalid by ValidateBlockWithOptions)", blockUpTo.Hash().String(), block.Hash().String())
 					}
-					// For recoverable errors (storage, processing, missing data), don't mark as invalid - just fail and retry later
 
 					// Record metric for validation failure
 					if prometheusCatchupErrors != nil {

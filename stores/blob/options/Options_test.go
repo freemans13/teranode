@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

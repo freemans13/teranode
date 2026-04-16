@@ -11,12 +11,12 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/utxopersister"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	teranodeUtil "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/utxopersister"
 	"github.com/btcsuite/goleveldb/leveldb/util"
 )
 

@@ -16,8 +16,8 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetBlocksMinedNotSet retrieves blocks whose mining status has not been properly recorded.
@@ -56,13 +56,13 @@ func (s *SQL) GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, error) 
 	q := `
 		SELECT
 		 b.ID
-	  ,b.version
+        ,b.version
 		,b.block_time
 		,b.n_bits
-	  ,b.nonce
+        ,b.nonce
 		,b.previous_hash
 		,b.merkle_root
-	  ,b.tx_count
+	    ,b.tx_count
 		,b.size_in_bytes
 		,b.coinbase_tx
 		,b.subtree_count

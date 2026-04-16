@@ -7,8 +7,8 @@ package txscript
 import (
 	"fmt"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 const (

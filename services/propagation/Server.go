@@ -23,7 +23,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,21 +30,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/propagation/propagation_api"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/health"
-	"github.com/bitcoin-sv/teranode/util/kafka"
-	kafkamessage "github.com/bitcoin-sv/teranode/util/kafka/kafka_message"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/propagation/propagation_api"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/health"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/ordishs/gocore"
@@ -369,6 +368,7 @@ func (ps *PropagationServer) StartUDP6Listeners(ctx context.Context, ipv6Address
 			// Loop forever reading from the socket
 			var (
 				// numBytes int
+				n   int
 				src *net.UDPAddr
 				// oobn int
 				// flags int
@@ -381,17 +381,30 @@ func (ps *PropagationServer) StartUDP6Listeners(ctx context.Context, ipv6Address
 			buffer := make([]byte, maxDatagramSize)
 
 			for {
-				_, _, _, src, err = conn.ReadMsgUDP(buffer, oobB)
+				n, _, _, src, err = conn.ReadMsgUDP(buffer, oobB)
 				if err != nil {
-					log.Fatal("ReadFromUDP failed:", err)
+					ps.logger.Errorf("ReadMsgUDP failed: %v", err)
+					continue
 				}
 				// ps.logger.Infof("read %d bytes from %s, out of bounds data len %d", len(buffer), src.String(), len(oobB))
 
-				reader := bytes.NewReader(buffer)
+				reader := bytes.NewReader(buffer[:n])
 
-				msg, b, err = wire.ReadMessage(reader, wire.ProtocolVersion, wire.MainNet)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							err = errors.NewProcessingError("wire message parsing panic: %v", r)
+							ps.logger.Errorf("Recovered from panic in wire.ReadMessage: %v", r)
+						}
+					}()
+					// reset err before parsing to avoid stale errors
+					err = nil
+					msg, b, err = wire.ReadMessage(reader, wire.ProtocolVersion, wire.MainNet)
+				}()
+
 				if err != nil {
-					ps.logger.Errorf("wire.ReadMessage failed: %v", err)
+					ps.logger.Warnf("wire.ReadMessage failed: %v", err)
+					continue
 				}
 
 				ps.logger.Infof("read %d bytes into wire message from %s", len(b), src.String())
@@ -538,8 +551,19 @@ func (ps *PropagationServer) handleMultipleTx(_ context.Context) echo.HandlerFun
 		for {
 			tx := &bt.Tx{}
 
-			// Read transaction from request body
-			bytesRead, err := tx.ReadFrom(c.Request().Body)
+			// Read transaction from request body with panic recovery
+			var bytesRead int64
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err = errors.NewProcessingError("transaction parsing panic: %v", r)
+						ps.logger.Errorf("Recovered from panic in tx.ReadFrom: %v", r)
+					}
+				}()
+				bytesRead, err = tx.ReadFrom(c.Request().Body)
+			}()
+
 			if err != nil {
 				// End of stream is expected and not an error
 				if err == io.EOF {
@@ -548,6 +572,15 @@ func (ps *PropagationServer) handleMultipleTx(_ context.Context) echo.HandlerFun
 
 				processingErrorWg.Add(1)
 				processErrors <- err
+
+				// if the error came from panic recovery, the stream is likely corrupted
+				if terr, ok := err.(*errors.Error); ok && terr.Code() == errors.ERR_PROCESSING {
+					ps.logger.Errorf("Stream corrupted after panic, stopping transaction processing")
+					break
+				}
+
+				// skip counters and reading this tx if a non-EOF error occurred
+				continue
 			}
 
 			totalNrTransactions++
@@ -821,7 +854,18 @@ func (ps *PropagationServer) processTransaction(ctx context.Context, req *propag
 
 	timeStart := time.Now()
 
-	btTx, err := bt.NewTxFromBytes(req.Tx)
+	var btTx *bt.Tx
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = errors.NewProcessingError("transaction parsing panic: %v", r)
+				ps.logger.Errorf("Recovered from panic in bt.NewTxFromBytes: %v", r)
+			}
+		}()
+		btTx, err = bt.NewTxFromBytes(req.Tx)
+	}()
+
 	if err != nil {
 		prometheusInvalidTransactions.Inc()
 
@@ -1037,7 +1081,7 @@ func (ps *PropagationServer) validateTransactionViaKafka(btTx *bt.Tx) error {
 // This method implements the transaction storage mechanism with the following workflow:
 //
 // 1. Extracts the transaction chain hash to use as the unique key
-// 2. Obtains the extended transaction bytes for storage
+// 2. Obtains the transaction bytes in received format for storage
 // 3. Attempts to store the transaction in the configured blob store
 // 4. Handles errors with appropriate categorization and context
 // 5. Updates metrics for performance monitoring

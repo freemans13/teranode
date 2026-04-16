@@ -3,14 +3,12 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) error {
-	s.logger.Infof("InvalidateBlock %s", blockHash.String())
-
-	s.blocksCache.RebuildBlockchain(nil, nil) // reset cache so that GetBlockExists goes to the DB
+	s.logger.Infof("RevalidateBlock %s", blockHash.String())
 
 	exists, err := s.GetBlockExists(ctx, blockHash)
 	if err != nil {
@@ -31,11 +29,11 @@ func (s *SQL) RevalidateBlock(ctx context.Context, blockHash *chainhash.Hash) er
 		return errors.NewStorageError("error updating block to invalid", err)
 	}
 
+	s.ResetResponseCache()
+
 	if err := s.ResetBlocksCache(ctx); err != nil {
 		return errors.NewStorageError("error clearing caches", err)
 	}
-
-	s.ResetResponseCache()
 
 	return nil
 }

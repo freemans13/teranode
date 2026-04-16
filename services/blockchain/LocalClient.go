@@ -7,22 +7,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	"github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/health"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/health"
 )
 
 // LocalClient implements a blockchain client with direct store access.
-// It is an abstraction for a client that has a stored embedded directly
 type LocalClient struct {
 	logger       ulogger.Logger     // Logger instance
 	settings     *settings.Settings // Configuration settings
@@ -263,6 +262,14 @@ func (c *LocalClient) GetBlockHeadersByHeight(ctx context.Context, startHeight, 
 	return c.store.GetBlockHeadersByHeight(ctx, startHeight, endHeight)
 }
 
+func (c *LocalClient) GetBlocksByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.Block, error) {
+	return c.store.GetBlocksByHeight(ctx, startHeight, endHeight)
+}
+
+func (c *LocalClient) FindBlocksContainingSubtree(ctx context.Context, subtreeHash *chainhash.Hash, maxBlocks uint32) ([]*model.Block, error) {
+	return c.store.FindBlocksContainingSubtree(ctx, subtreeHash, maxBlocks)
+}
+
 func (c *LocalClient) InvalidateBlock(ctx context.Context, blockHash *chainhash.Hash) ([]chainhash.Hash, error) {
 	return c.store.InvalidateBlock(ctx, blockHash)
 }
@@ -422,6 +429,10 @@ func (c *LocalClient) Idle(ctx context.Context) error {
 }
 
 func (c *LocalClient) CatchUpBlocks(ctx context.Context) error {
+	return nil
+}
+
+func (c *LocalClient) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
 	return nil
 }
 

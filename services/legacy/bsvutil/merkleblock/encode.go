@@ -6,9 +6,9 @@
 package merkleblock
 
 import (
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
 // MerkleBlock is used to house intermediate information needed to generate a

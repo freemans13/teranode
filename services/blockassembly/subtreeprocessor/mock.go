@@ -1,14 +1,35 @@
+// Package subtreeprocessor provides functionality for processing transaction subtrees in Teranode.
+//
+// This file contains mock implementations of the subtree processor interfaces for testing purposes.
+// The mock implementations use the testify/mock framework to provide controllable behavior
+// during unit tests, allowing developers to simulate various scenarios and verify
+// interactions with the subtree processor without requiring actual processing dependencies.
 package subtreeprocessor
 
 import (
-	"github.com/bitcoin-sv/teranode/model"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
+	"context"
+
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/model"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/mock"
 )
 
+// MockSubtreeProcessor implements a mock version of the Interface for testing.
+// This mock provides controllable implementations of all Interface methods,
+// allowing tests to define expected behavior, verify method calls, and
+// simulate various success and failure scenarios. It uses the testify/mock
+// framework to track method calls and return predefined values.
+//
+// The mock is particularly useful for:
+//   - Unit testing components that depend on subtree processor functionality
+//   - Integration testing without requiring a full subtree processor
+//   - Simulating error conditions and edge cases
+//   - Verifying correct interaction patterns with the subtree processor API
+//   - Testing blockchain reorganization scenarios
+//   - Validating transaction processing workflows
 type MockSubtreeProcessor struct {
 	mock.Mock
 }
@@ -33,14 +54,18 @@ func (m *MockSubtreeProcessor) GetCurrentLength() int {
 	return args.Int(0)
 }
 
-func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool) ResetResponse {
-	args := m.Called(blockHeader, moveBackBlocks, moveForwardBlocks, isLegacySync)
+func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool, postProcess func() error) ResetResponse {
+	args := m.Called(blockHeader, moveBackBlocks, moveForwardBlocks, isLegacySync, postProcess)
 	return args.Get(0).(ResetResponse)
 }
 
 func (m *MockSubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {
 	args := m.Called()
 	return args.Get(0).(*model.BlockHeader)
+}
+
+func (m *MockSubtreeProcessor) SetCurrentBlockHeader(blockHeader *model.BlockHeader) {
+	m.Called(blockHeader)
 }
 
 func (m *MockSubtreeProcessor) GetCurrentSubtree() *subtree.Subtree {
@@ -152,4 +177,9 @@ func (m *MockSubtreeProcessor) InitCurrentBlockHeader(blockHeader *model.BlockHe
 // SetOnSubtreeSizeChanged implements Interface.SetOnSubtreeSizeChanged
 func (m *MockSubtreeProcessor) SetOnSubtreeSizeChanged(callback func()) {
 	m.Called(callback)
+}
+
+func (m *MockSubtreeProcessor) WaitForPendingBlocks(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
 }

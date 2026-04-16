@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/labstack/echo/v4"
 	"github.com/libsv/go-p2p/test"
 	"github.com/stretchr/testify/assert"

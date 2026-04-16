@@ -8,16 +8,17 @@ import (
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	teranodeaerospike "github.com/bitcoin-sv/teranode/stores/utxo/aerospike"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	teranodeaerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -384,16 +385,11 @@ func TestStore_TwoPhaseCommit(t *testing.T) {
 	err = td.BlockchainClient.Run(td.Ctx, "test")
 	require.NoError(t, err)
 
-	// Generate initial blocks
-	_, err = td.CallRPC(td.Ctx, "generate", []interface{}{11})
+	// Generate 11 blocks directly via BlockAssemblyClient (avoids RPC catchup issues)
+	err = td.BlockAssemblyClient.GenerateBlocks(td.Ctx, &blockassembly_api.GenerateBlocksRequest{Count: 11})
 	require.NoError(t, err)
 
-	block11, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 11)
-	require.NoError(t, err)
-
-	// Wait for block assembly to get to block 11
-	td.WaitForBlockHeight(t, block11, 10*time.Second)
-
+	// Fetch block 1 for the coinbase transaction
 	block1, err := td.BlockchainClient.GetBlockByHeight(td.Ctx, 1)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), block1.Height)

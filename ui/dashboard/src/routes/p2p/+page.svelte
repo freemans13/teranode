@@ -52,6 +52,7 @@
   let messageTypeSet = new Set(['All'])
   let messageTypeOptions: string[] = ['All']
   let selectedMessageType = 'All'
+  let reverseFilter = false
 
   // Function to process message types
   function processMessageType(messageType: string) {
@@ -103,7 +104,11 @@
 
     // Apply message type filter
     if (selectedMessageType !== 'All') {
-      filteredMessages = filteredMessages.filter((msg) => msg.type === selectedMessageType)
+      if (reverseFilter) {
+        filteredMessages = filteredMessages.filter((msg) => msg.type !== selectedMessageType)
+      } else {
+        filteredMessages = filteredMessages.filter((msg) => msg.type === selectedMessageType)
+      }
     }
 
     if (filter.length > 0) {
@@ -218,6 +223,15 @@
             name="messageType"
             bind:value={selectedMessageType}
             items={messageTypeOptions.map((type) => ({ value: type, label: type }))}
+          />
+          <Switch
+            size="small"
+            name="reverseFilter"
+            label="Reverse"
+            bind:checked={reverseFilter}
+            labelPlacement="left"
+            labelAlignment="center"
+            disabled={selectedMessageType === 'All'}
           />
           <TextInput size="small" name="filter" placeholder="Search..." bind:value={filter} />
         </div>

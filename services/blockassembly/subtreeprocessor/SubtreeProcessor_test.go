@@ -11,22 +11,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	blob_memory "github.com/bitcoin-sv/teranode/stores/blob/memory"
-	"github.com/bitcoin-sv/teranode/stores/blob/null"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/null"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/ordishs/go-utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -681,7 +682,7 @@ func TestMoveForwardBlock_LeftInQueue(t *testing.T) {
 	blockBytes, err := hex.DecodeString("000000206a21d13c3d2656557493b4652f67a763f835b86bf90107a60f412c290000000083ba48026c405d5a4b4d5aa3f10cee9de605a012e9a25f72a19aa9fe123380c689505c67c874461cc6dda18002fde501016b104579e34c5c12fad8899035be27f7605f8ff95db814ba02fbc49397a761fd01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1903af32190000000000205f7c477c327c437c5f200001000000ffffffff01e50b5402000000001976a9147a112f6a373b80b4ebb2b02acef97f35aef7494488ac00000000feaf321900")
 	require.NoError(t, err)
 
-	block, err := model.NewBlockFromBytes(blockBytes, tSettings)
+	block, err := model.NewBlockFromBytes(blockBytes)
 	require.NoError(t, err)
 
 	block.Header.HashPrevBlock = subtreeProcessor.currentBlockHeader.Hash()
@@ -1355,14 +1356,14 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp.InitCurrentBlockHeader(blockHeader)
 
-		err = stp.moveBackBlock(context.Background(), &model.Block{
+		_, _, err = stp.moveBackBlock(context.Background(), &model.Block{
 			Header: prevBlockHeader,
 			Subtrees: []*chainhash.Hash{
 				subtree1.RootHash(),
 				subtree2.RootHash(),
 			},
 			CoinbaseTx: coinbaseTx,
-		})
+		}, true)
 		require.NoError(t, err)
 
 		// Wait for any background processing to complete
@@ -1422,7 +1423,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		originalState := captureSubtreeProcessorState(stp)
 
 		// Test nil block
-		err = stp.moveBackBlock(context.Background(), nil)
+		_, _, err = stp.moveBackBlock(context.Background(), nil, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "you must pass in a block to moveBackBlock")
 
@@ -1464,7 +1465,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test empty block processing
-		err = stp.moveBackBlock(context.Background(), emptyBlock)
+		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
 		require.NoError(t, err)
 
 		// Verify state after processing empty block
@@ -1516,7 +1517,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree store error
-		err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingSubtree, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1568,7 +1569,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test coinbase placeholder handling
-		err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithCoinbasePlaceholder, true)
 		require.NoError(t, err)
 
 		// Verify the coinbase placeholder was handled correctly
@@ -1611,7 +1612,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// Test SetBlockProcessedAt error (should not cause overall failure)
-		err = stp.moveBackBlock(context.Background(), emptyBlock)
+		_, _, err = stp.moveBackBlock(context.Background(), emptyBlock, true)
 		require.NoError(t, err) // Error in SetBlockProcessedAt should not fail the operation
 	})
 
@@ -1687,7 +1688,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test single subtree processing
-		err = stp.moveBackBlock(context.Background(), singleSubtreeBlock)
+		_, _, err = stp.moveBackBlock(context.Background(), singleSubtreeBlock, true)
 		require.NoError(t, err)
 
 		// Verify result
@@ -1714,6 +1715,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		blockchainClient := &blockchain.Mock{}
+		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 
 		stp, err := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
@@ -1740,7 +1742,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree creation failure
-		err = stp.moveBackBlock(context.Background(), emptyBlock)
+		err = stp.reorgBlocks(context.Background(), []*model.Block{emptyBlock}, []*model.Block{})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error creating new subtree")
 
@@ -1792,7 +1794,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree deserialization failure
-		err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidSubtree, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1849,7 +1851,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta deserialization failure
-		err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithInvalidMeta, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1903,7 +1905,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree meta retrieval failure
-		err = stp.moveBackBlock(context.Background(), blockWithMissingMeta)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithMissingMeta, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error getting subtrees")
 
@@ -1986,7 +1988,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		// This should succeed since the UTXO exists and can be deleted
-		err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithCorruptCoinbase, true)
 		require.NoError(t, err) // This will pass, but we've tested the delete path
 
 		// Verify state was properly updated after successful operation
@@ -2074,7 +2076,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// This should succeed because addNode with skipNotification=true will handle duplicates gracefully
-		err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx)
+		_, _, err = stp.moveBackBlock(context.Background(), blockWithDuplicateTx, true)
 		require.NoError(t, err) // addNode with skipNotification doesn't fail on duplicates
 
 		// Verify state was properly updated after successful operation
@@ -3006,7 +3008,7 @@ func TestMoveBackBlockChildrenRemoval(t *testing.T) {
 		}
 
 		// Call moveBackBlockCreateNewSubtrees directly
-		err = stp.moveBackBlockCreateNewSubtrees(ctx, block)
+		_, _, err = stp.moveBackBlockCreateNewSubtrees(ctx, block, true)
 		require.NoError(t, err, "moveBackBlockCreateNewSubtrees should succeed")
 	})
 }
@@ -3062,7 +3064,7 @@ func TestMoveForwardBlock_BlockHeaderValidation(t *testing.T) {
 		}
 
 		// moveForwardBlock should fail with parent mismatch
-		err := stp.moveForwardBlock(context.Background(), invalidBlock, false)
+		_, err := stp.moveForwardBlock(context.Background(), invalidBlock, false, map[chainhash.Hash]bool{}, false, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "does not match the current block header")
 	})
@@ -3371,7 +3373,7 @@ func TestMoveBackBlockCreateNewSubtrees_ErrorRecovery(t *testing.T) {
 		originalState := captureSubtreeProcessorState(stp)
 
 		// Call moveBackBlockCreateNewSubtrees
-		err = stp.moveBackBlockCreateNewSubtrees(context.Background(), block)
+		_, _, err = stp.moveBackBlockCreateNewSubtrees(context.Background(), block, true)
 
 		// Should handle corrupted data gracefully or return appropriate error
 		if err != nil {
@@ -3410,5 +3412,439 @@ func TestSubtreeProcessor_ErrorRecovery_ChannelOperations(t *testing.T) {
 		// Verify that the system handles cancellation gracefully
 		// The processor should not panic or get stuck
 		time.Sleep(100 * time.Millisecond) // Allow time for operations to complete
+	})
+}
+
+func TestSubtreeProcessor_checkMarkNotOnLongestChain(t *testing.T) {
+	ctx := context.Background()
+
+	// Helper function to create transaction hashes
+	createTxHash := func(data string) chainhash.Hash {
+		return chainhash.HashH([]byte(data))
+	}
+
+	// Create test block and transaction hashes
+	invalidBlockID := uint32(123)
+	invalidBlock := &model.Block{
+		ID: invalidBlockID,
+		Header: &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      1234567890,
+			Bits:           model.NBit{},
+			Nonce:          1234,
+		},
+	}
+
+	txHash1 := createTxHash("tx1")
+	txHash2 := createTxHash("tx2")
+	txHash3 := createTxHash("tx3")
+	txHash4 := createTxHash("tx4")
+	markNotOnLongestChain := []chainhash.Hash{txHash1, txHash2, txHash3, txHash4}
+
+	t.Run("GetBlockHeaders fails", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return an error
+		expectedErr := errors.NewError("blockchain client error")
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader(nil), []*model.BlockHeaderMeta(nil), expectedErr)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, markNotOnLongestChain)
+
+		require.Error(t, err)
+		require.Nil(t, result)
+		require.Contains(t, err.Error(), "error getting last block headers")
+		mockBlockchainClient.AssertExpectations(t)
+	})
+
+	t.Run("utxoStore.Get fails", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: 2}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// Mock utxoStore.Get to return an error for first transaction
+		expectedErr := errors.NewError("utxo store error")
+		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(nil, expectedErr)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, markNotOnLongestChain)
+
+		require.Error(t, err)
+		require.Nil(t, result)
+		require.Contains(t, err.Error(), "error getting transaction from utxo store")
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
+	})
+
+	t.Run("transaction not found (nil txMeta)", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: 2}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// Mock utxoStore.Get to return nil (transaction not found)
+		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
+
+		require.Error(t, err)
+		require.Nil(t, result)
+		require.Contains(t, err.Error(), "error getting transaction")
+		require.Contains(t, err.Error(), "from longest chain")
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
+	})
+
+	t.Run("transaction only in invalid block", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: 2}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// Mock transaction that only exists in the invalid block
+		txMeta := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID},
+		}
+		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(txMeta, nil)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
+
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		require.Equal(t, txHash1, result[0])
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
+	})
+
+	t.Run("transaction in recent blocks (last 1000)", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success with recent block IDs
+		recentBlockID := uint32(500)
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: 2}, {ID: recentBlockID},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// Mock transaction that exists in invalid block AND recent block
+		txMeta := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID, recentBlockID},
+		}
+		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(txMeta, nil)
+
+		// Mock CheckBlockIsInCurrentChain - this will still be called due to the continue bug
+		// The transaction should be marked as on longest chain regardless
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
+
+		require.NoError(t, err)
+		require.Len(t, result, 0) // Should not mark as not on longest chain since it's still on longest chain
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
+	})
+
+	t.Run("CheckBlockIsInCurrentChain fails", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: 2}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// Mock transaction that exists in other blocks (not in recent 1000)
+		otherBlockID := uint32(999)
+		txMeta := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID, otherBlockID},
+		}
+		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(txMeta, nil)
+
+		// Mock CheckBlockIsInCurrentChain to return error
+		expectedErr := errors.NewError("blockchain check error")
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(false, expectedErr)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
+
+		require.Error(t, err)
+		require.Nil(t, result)
+		require.Contains(t, err.Error(), "error checking if transaction is on longest chain")
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
+	})
+
+	t.Run("transaction not on longest chain", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: 2}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// Mock transaction that exists in other blocks (not in recent 1000)
+		otherBlockID := uint32(999)
+		txMeta := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID, otherBlockID},
+		}
+		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(txMeta, nil)
+
+		// Mock CheckBlockIsInCurrentChain to return false (not on longest chain)
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(false, nil)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
+
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		require.Equal(t, txHash1, result[0])
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
+	})
+
+	t.Run("transaction still on longest chain", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: 2}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// Mock transaction that exists in other blocks (not in recent 1000)
+		otherBlockID := uint32(999)
+		txMeta := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID, otherBlockID},
+		}
+		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(txMeta, nil)
+
+		// Mock CheckBlockIsInCurrentChain to return true (still on longest chain)
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
+
+		require.NoError(t, err)
+		require.Len(t, result, 0) // Should not mark as not on longest chain since it's still on longest chain
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
+	})
+
+	t.Run("mixed scenario - multiple transactions with different outcomes", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success with recent block IDs
+		recentBlockID := uint32(500)
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: recentBlockID}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// TX1: Only in invalid block - should be marked
+		txMeta1 := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID},
+		}
+
+		// TX2: In invalid block AND recent block - should NOT be marked
+		txMeta2 := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID, recentBlockID},
+		}
+
+		// TX3: In invalid block and other block, not on longest chain - should be marked
+		otherBlockID1 := uint32(999)
+		txMeta3 := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID, otherBlockID1},
+		}
+
+		// TX4: In invalid block and other block, still on longest chain - should NOT be marked
+		otherBlockID2 := uint32(888)
+		txMeta4 := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID, otherBlockID2},
+		}
+
+		// Mock utxoStore.Get calls for each transaction
+		mockUtxoStore.On("Get", mock.Anything, &txHash1, mock.Anything).Return(txMeta1, nil)
+		mockUtxoStore.On("Get", mock.Anything, &txHash2, mock.Anything).Return(txMeta2, nil)
+		mockUtxoStore.On("Get", mock.Anything, &txHash3, mock.Anything).Return(txMeta3, nil)
+		mockUtxoStore.On("Get", mock.Anything, &txHash4, mock.Anything).Return(txMeta4, nil)
+
+		// Mock CheckBlockIsInCurrentChain calls
+		// TX2 will also call CheckBlockIsInCurrentChain due to the continue bug (even though it's in recent blocks)
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{invalidBlockID, recentBlockID}).Return(true, nil)  // TX2 still on longest chain
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{invalidBlockID, otherBlockID1}).Return(false, nil) // TX3 not on longest chain
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{invalidBlockID, otherBlockID2}).Return(true, nil)  // TX4 still on longest chain
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1, txHash2, txHash3, txHash4})
+
+		require.NoError(t, err)
+		require.Len(t, result, 2) // Only TX1 and TX3 should be marked
+		require.Contains(t, result, txHash1)
+		require.Contains(t, result, txHash3)
+		require.NotContains(t, result, txHash2) // Should not be marked (in recent blocks)
+		require.NotContains(t, result, txHash4) // Should not be marked (still on longest chain)
+
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
+	})
+
+	t.Run("empty input slice", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders to return success
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: 1}, {ID: 2}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{})
+
+		require.NoError(t, err)
+		require.Len(t, result, 0)
+		mockBlockchainClient.AssertExpectations(t)
+	})
+
+	t.Run("transaction in multiple recent blocks", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		mockUtxoStore := &utxo.MockUtxostore{}
+		settings := test.CreateBaseTestSettings(t)
+
+		stp := &SubtreeProcessor{
+			blockchainClient: mockBlockchainClient,
+			utxoStore:        mockUtxoStore,
+			settings:         settings,
+			logger:           ulogger.TestLogger{},
+		}
+
+		// Mock GetBlockHeaders with multiple recent blocks
+		recentBlockID1 := uint32(500)
+		recentBlockID2 := uint32(600)
+		blockHeaders := []*model.BlockHeader{}
+		blockHeaderMetas := []*model.BlockHeaderMeta{
+			{ID: recentBlockID1}, {ID: recentBlockID2}, {ID: 3},
+		}
+		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockHeaderMetas, nil)
+
+		// Transaction exists in invalid block and multiple recent blocks
+		txMeta := &meta.Data{
+			BlockIDs: []uint32{invalidBlockID, recentBlockID1, recentBlockID2},
+		}
+		mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(txMeta, nil)
+
+		// Mock CheckBlockIsInCurrentChain - this will still be called due to the continue bug
+		mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+
+		result, err := stp.checkMarkNotOnLongestChain(ctx, invalidBlock, []chainhash.Hash{txHash1})
+
+		require.NoError(t, err)
+		require.Len(t, result, 0) // Should not mark since it's still on longest chain
+		mockBlockchainClient.AssertExpectations(t)
+		mockUtxoStore.AssertExpectations(t)
 	})
 }

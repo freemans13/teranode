@@ -5,24 +5,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockassembly"
-	"github.com/bitcoin-sv/teranode/services/blockassembly/blockassembly_api"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/services/blockvalidation"
-	"github.com/bitcoin-sv/teranode/services/legacy/peer"
-	"github.com/bitcoin-sv/teranode/services/legacy/testdata"
-	"github.com/bitcoin-sv/teranode/services/subtreevalidation"
-	"github.com/bitcoin-sv/teranode/services/validator"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob/memory"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
 	"github.com/bsv-blockchain/go-chaincfg"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/legacy/testdata"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -87,8 +87,6 @@ func Test_HandleBlockDirect(t *testing.T) {
 	blockAssemblyClient.On("GetBlockAssemblyState", mock.Anything).Return(&blockassembly_api.StateMessage{
 		BlockAssemblyState:    "",
 		SubtreeProcessorState: "",
-		ResetWaitCount:        0,
-		ResetWaitTime:         0,
 		SubtreeCount:          0,
 		TxCount:               0,
 		QueueCount:            0,
@@ -110,7 +108,7 @@ func Test_HandleBlockDirect(t *testing.T) {
 
 	tSettings := &settings.Settings{}
 
-	mBlock, err := model.NewBlockFromBytes(blockBytes, tSettings)
+	mBlock, err := model.NewBlockFromBytes(blockBytes)
 	require.NoError(t, err)
 
 	mBlock.Height = 1
@@ -126,7 +124,6 @@ func Test_HandleBlockDirect(t *testing.T) {
 		validatorClient,
 		utxoStore,
 		subtreeStore,
-		subtreeStore, // tempStore
 		subtreeValidation,
 		blockValidation,
 		blockAssemblyClient,

@@ -27,9 +27,9 @@ package validator
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // Interface defines the core validation functionality required for Bitcoin transaction validation.

@@ -13,11 +13,13 @@
 package subtreeprocessor
 
 import (
-	"github.com/bitcoin-sv/teranode/model"
-	utxostore "github.com/bitcoin-sv/teranode/stores/utxo"
+	"context"
+
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/model"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
 // Interface defines the contract for subtree processor implementations.
@@ -115,7 +117,7 @@ type Interface interface {
 	//
 	// Returns:
 	//   - ResetResponse: Response containing reset operation results
-	Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool) ResetResponse
+	Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool, postProcess func() error) ResetResponse
 
 	// Remove removes a specific transaction from the processor by its hash.
 	// This is used when transactions become invalid or need to be excluded.
@@ -140,6 +142,13 @@ type Interface interface {
 	// Returns:
 	//   - *model.BlockHeader: Current block header
 	GetCurrentBlockHeader() *model.BlockHeader
+
+	// SetCurrentBlockHeader sets the current block header in the processor.
+	// This is used to update the processor's view of the blockchain tip.
+	//
+	// Parameters:
+	//   - blockHeader: New block header to set as current
+	SetCurrentBlockHeader(blockHeader *model.BlockHeader)
 
 	// InitCurrentBlockHeader updates the current block header in the processor.
 	// This is used to synchronize the processor with blockchain state changes.
@@ -234,4 +243,11 @@ type Interface interface {
 	// Parameters:
 	//   - callback: Function to invoke when subtree size changes, can be nil to clear
 	SetOnSubtreeSizeChanged(callback func())
+
+	// WaitForPendingBlocks waits for any pending block operations to complete.
+	// This ensures that all block-related processing is finalized before proceeding.
+	//
+	// Returns:
+	//   - error: Any error encountered while waiting
+	WaitForPendingBlocks(ctx context.Context) error
 }

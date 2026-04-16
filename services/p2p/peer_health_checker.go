@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -23,17 +23,38 @@ type PeerHealthChecker struct {
 	checkInterval time.Duration
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
+	// track consecutive health check failures to avoid flapping removals
+	countsMu        sync.Mutex
+	unhealthyCounts map[peer.ID]int
+	// threshold for consecutive failures before removal
+	removeAfterFailures int
 }
 
 // NewPeerHealthChecker creates a new health checker
 func NewPeerHealthChecker(logger ulogger.Logger, registry *PeerRegistry, settings *settings.Settings) *PeerHealthChecker {
+	// Sane defaults; only override with positive values
+	checkInterval := 30 * time.Second
+	httpTimeout := 5 * time.Second
+	removeAfter := 3
+
+	if settings != nil {
+		if settings.P2P.PeerHealthCheckInterval > 0 {
+			checkInterval = settings.P2P.PeerHealthCheckInterval
+		}
+		if settings.P2P.PeerHealthHTTPTimeout > 0 {
+			httpTimeout = settings.P2P.PeerHealthHTTPTimeout
+		}
+		if settings.P2P.PeerHealthRemoveAfterFailures > 0 {
+			removeAfter = settings.P2P.PeerHealthRemoveAfterFailures
+		}
+	}
 	return &PeerHealthChecker{
 		logger:        logger,
 		registry:      registry,
 		settings:      settings,
-		checkInterval: 30 * time.Second, // Check every 30 seconds
+		checkInterval: checkInterval,
 		httpClient: &http.Client{
-			Timeout: 5 * time.Second, // Reasonable timeout for health checks
+			Timeout: httpTimeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				// Allow redirects but limit to 3 to prevent loops
 				if len(via) >= 3 {
@@ -48,7 +69,9 @@ func NewPeerHealthChecker(logger ulogger.Logger, registry *PeerRegistry, setting
 				IdleConnTimeout:   30 * time.Second,
 			},
 		},
-		stopCh: make(chan struct{}),
+		stopCh:              make(chan struct{}),
+		unhealthyCounts:     make(map[peer.ID]int),
+		removeAfterFailures: removeAfter,
 	}
 }
 
@@ -88,17 +111,20 @@ func (hc *PeerHealthChecker) healthCheckLoop(ctx context.Context) {
 	}
 }
 
-// checkAllPeers checks health of all peers
+// checkAllPeers checks health of all directly connected peers
 func (hc *PeerHealthChecker) checkAllPeers() {
-	peers := hc.registry.GetAllPeers()
+	// Only check directly connected peers, not gossiped peers
+	connectedPeers := hc.registry.GetConnectedPeers()
+	allPeers := hc.registry.GetAllPeers()
 
-	hc.logger.Debugf("[HealthChecker] Checking health of %d peers", len(peers))
+	hc.logger.Debugf("[HealthChecker] Checking health of %d connected peers (out of %d total peers)", len(connectedPeers), len(allPeers))
 
 	// Check peers concurrently but limit concurrency
-	semaphore := make(chan struct{}, 5) // Max 5 concurrent checks
+	Semaphore := make(chan struct{}, 5) // Max 5 concurrent checks
 	var wg sync.WaitGroup
 
-	for _, p := range peers {
+	for _, p := range connectedPeers {
+		// ListenOnly mode nodes will not have a data hub URL set
 		if p.DataHubURL == "" {
 			continue // Skip peers without DataHub URLs
 		}
@@ -107,8 +133,8 @@ func (hc *PeerHealthChecker) checkAllPeers() {
 		go func(peer *PeerInfo) {
 			defer wg.Done()
 
-			semaphore <- struct{}{}        // Acquire
-			defer func() { <-semaphore }() // Release
+			Semaphore <- struct{}{}        // Acquire
+			defer func() { <-Semaphore }() // Release
 
 			hc.checkPeerHealth(peer)
 		}(p)
@@ -119,21 +145,42 @@ func (hc *PeerHealthChecker) checkAllPeers() {
 
 // checkPeerHealth checks a single peer's health
 func (hc *PeerHealthChecker) checkPeerHealth(p *PeerInfo) {
-	healthy := hc.isDataHubReachable(p.DataHubURL)
+	duration, healthy := hc.isDataHubReachable(p.DataHubURL)
 
+	// Update health status in registry
 	hc.registry.UpdateHealth(p.ID, healthy)
+	hc.registry.UpdateHealthDuration(p.ID, duration)
 
+	// Handle consecutive failures and potential removal
+	hc.countsMu.Lock()
+	defer hc.countsMu.Unlock()
 	if healthy {
+		// reset on success
+		if hc.unhealthyCounts[p.ID] != 0 {
+			delete(hc.unhealthyCounts, p.ID)
+		}
 		hc.logger.Debugf("[HealthChecker] Peer %s is healthy (DataHub: %s)", p.ID, p.DataHubURL)
-	} else {
-		hc.logger.Warnf("[HealthChecker] Peer %s is unhealthy (DataHub: %s unreachable)", p.ID, p.DataHubURL)
+		return
 	}
+
+	// increment failure count
+	failures := hc.unhealthyCounts[p.ID] + 1
+	hc.unhealthyCounts[p.ID] = failures
+
+	// Do not remove or ban here; just debug. Selection logic should ignore unhealthy peers.
+	if failures >= hc.removeAfterFailures && hc.removeAfterFailures > 0 {
+		hc.logger.Debugf("[HealthChecker] Peer %s reached failure threshold %d (DataHub: %s). Keeping peer but marking unhealthy.", p.ID, hc.removeAfterFailures, p.DataHubURL)
+		return
+	}
+
+	// Not yet at threshold, warn with current failure count
+	hc.logger.Warnf("[HealthChecker] Peer %s is unhealthy (DataHub: %s unreachable) [consecutive_failures=%d/%d]", p.ID, p.DataHubURL, failures, hc.removeAfterFailures)
 }
 
 // isDataHubReachable checks if a DataHub URL is reachable
-func (hc *PeerHealthChecker) isDataHubReachable(dataHubURL string) bool {
+func (hc *PeerHealthChecker) isDataHubReachable(dataHubURL string) (time.Duration, bool) {
 	if dataHubURL == "" {
-		return true // No DataHub is considered "healthy"
+		return 0, true // No DataHub is considered "healthy"
 	}
 
 	// Get genesis hash for the check
@@ -147,22 +194,31 @@ func (hc *PeerHealthChecker) isDataHubReachable(dataHubURL string) bool {
 
 	blockURL := dataHubURL + "/block/" + genesisHash
 
-	// Create request with timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// Create request with timeout context (use configured HTTP timeout)
+	timeout := hc.httpClient.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", blockURL, nil)
 	if err != nil {
 		hc.logger.Debugf("[HealthChecker] Failed to create request for %s: %v", dataHubURL, err)
-		return false
+		return 0, false
 	}
+
+	timeStart := time.Now()
 
 	resp, err := hc.httpClient.Do(req)
 	if err != nil {
 		hc.logger.Debugf("[HealthChecker] DataHub %s not reachable: %v", dataHubURL, err)
-		return false
+		return 0, false
 	}
 	defer resp.Body.Close()
+
+	duration := time.Since(timeStart)
+	hc.logger.Debugf("[HealthChecker] DataHub %s responded with %d in %v", dataHubURL, resp.StatusCode, duration)
 
 	// Check for offline indicators in 404 responses
 	if resp.StatusCode == 404 {
@@ -172,18 +228,23 @@ func (hc *PeerHealthChecker) isDataHubReachable(dataHubURL string) bool {
 			if strings.Contains(bodyStr, "offline") ||
 				strings.Contains(bodyStr, "tunnel not found") {
 				hc.logger.Debugf("[HealthChecker] DataHub %s is offline", dataHubURL)
-				return false
+				return 0, false
 			}
 		}
 	}
 
 	// Consider 2xx, 3xx, and 4xx (except offline 404s) as reachable
-	return resp.StatusCode < 500
+	return duration, resp.StatusCode < 500
 }
 
 // CheckPeerNow performs an immediate health check for a specific peer
 func (hc *PeerHealthChecker) CheckPeerNow(peerID peer.ID) {
 	if p, exists := hc.registry.GetPeer(peerID); exists {
+		// Skip listen-only peers (no DataHub URL)
+		if p.DataHubURL == "" {
+			hc.logger.Debugf("[HealthChecker] Skipping health check for listen-only peer %s (no DataHub URL)", peerID)
+			return
+		}
 		hc.checkPeerHealth(p)
 	}
 }

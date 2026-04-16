@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/bitcoin-sv/teranode/cmd/teranodecli/teranodecli"
+	"github.com/bsv-blockchain/teranode/cmd/teranodecli/teranodecli"
 )
 
 func main() {

@@ -25,11 +25,28 @@
   export let connected = false
   export let page = 1
   export let pageSize = 10
+  export let sortColumn = ''
+  export let sortOrder = ''
 
   function onPage(e) {
     // Forward pagination changes to parent component
     dispatch('pagechange', e.detail)
   }
+
+  function onSort(e) {
+    // Forward sort changes to parent component
+    dispatch('sort', e.detail)
+  }
+
+  function clearSort() {
+    // Dispatch a sort event with empty values to clear sorting
+    dispatch('sort', {
+      colId: '',
+      value: ''
+    })
+  }
+
+  $: hasSorting = sortColumn && sortOrder
 
   let totalPages = 0
 
@@ -69,6 +86,11 @@
       on:total={onTotal}
     />
     <TableToggle value={variant} on:change={onToggle} />
+    {#if hasSorting}
+      <button class="clear-sort-btn" on:click={clearSort} title="Clear sorting">
+        <Icon name="icon-close-line" size={16} />
+      </button>
+    {/if}
     <div class="live">
       <div class="live-icon" class:connected>
         <Icon name="icon-status-light-glow-solid" size={14} />
@@ -82,6 +104,11 @@
     idField="peer_id"
     {colDefs}
     {data}
+    sort={{
+      sortColumn,
+      sortOrder,
+    }}
+    sortEnabled={true}
     pagination={{
       page: 1,
       pageSize: -1,
@@ -94,6 +121,7 @@
     {getRenderProps}
     getRowIconActions={null}
     on:action={() => {}}
+    on:sort={onSort}
   />
   <div slot="footer">
     <Pager
@@ -116,6 +144,30 @@
 <BlockAssemblyModal />
 
 <style>
+  .clear-sort-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: rgba(255, 255, 255, 0.66);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    border-radius: 4px;
+  }
+
+  .clear-sort-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.9);
+  }
+
+  .clear-sort-btn:active {
+    background: rgba(255, 255, 255, 0.15);
+  }
+
   .live {
     display: flex;
     align-items: center;
@@ -156,31 +208,46 @@
   }
   
   /* Column header alignments */
-  /* Version - explicitly left align */
-  :global(th:nth-child(2)),
-  :global(.th:nth-child(2)) {
+  /* State column (1st) - center align */
+  :global(th:nth-child(1)),
+  :global(.th:nth-child(1)) {
+    text-align: center !important;
+  }
+  
+  :global(th:nth-child(1) .table-cell-row),
+  :global(.th:nth-child(1) .table-cell-row) {
+    justify-content: center !important;
+  }
+  
+  /* Version (3rd column now) - explicitly left align */
+  :global(th:nth-child(3)),
+  :global(.th:nth-child(3)) {
     text-align: left !important;
   }
   
-  :global(th:nth-child(2) .table-cell-row),
-  :global(.th:nth-child(2) .table-cell-row) {
+  :global(th:nth-child(3) .table-cell-row),
+  :global(.th:nth-child(3) .table-cell-row) {
     text-align: left !important;
     justify-content: flex-start !important;
   }
   
   :global(th:nth-child(4)), /* Height - right align */
   :global(.th:nth-child(4)),
-  :global(th:nth-child(6)), /* Chainwork - right align */
+  :global(th:nth-child(6)), /* Chain Rank - right align */
   :global(.th:nth-child(6)),
   :global(th:nth-child(7)), /* TX Assembly - right align */
   :global(.th:nth-child(7)),
-  :global(th:nth-child(8)), /* Uptime - right align */
+  :global(th:nth-child(8)), /* Min Mining Fee - right align */
   :global(.th:nth-child(8)),
-  :global(th:nth-child(10)), /* Last Update - right align */
-  :global(.th:nth-child(10)) {
+  :global(th:nth-child(9)), /* Connected Peers - right align */
+  :global(.th:nth-child(9)),
+  :global(th:nth-child(10)), /* Uptime - right align */
+  :global(.th:nth-child(10)),
+  :global(th:nth-child(12)), /* Last Update - right align */
+  :global(.th:nth-child(12)) {
     text-align: right !important;
   }
-  
+
   :global(th:nth-child(4) .table-cell-row),
   :global(.th:nth-child(4) .table-cell-row),
   :global(th:nth-child(6) .table-cell-row),
@@ -189,9 +256,19 @@
   :global(.th:nth-child(7) .table-cell-row),
   :global(th:nth-child(8) .table-cell-row),
   :global(.th:nth-child(8) .table-cell-row),
+  :global(th:nth-child(9) .table-cell-row),
+  :global(.th:nth-child(9) .table-cell-row),
   :global(th:nth-child(10) .table-cell-row),
-  :global(.th:nth-child(10) .table-cell-row) {
+  :global(.th:nth-child(10) .table-cell-row),
+  :global(th:nth-child(12) .table-cell-row),
+  :global(.th:nth-child(12) .table-cell-row) {
     justify-content: flex-end !important;
+  }
+
+  /* Prevent Chain Rank header from wrapping */
+  :global(th:nth-child(6)),
+  :global(.th:nth-child(6)) {
+    white-space: nowrap !important;
   }
   
   /* Right-align numeric values */

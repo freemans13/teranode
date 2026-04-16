@@ -3,7 +3,7 @@ package consensus
 import (
 	"strings"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // Script verification flags - must match C++ definitions

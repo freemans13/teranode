@@ -6,11 +6,11 @@ package utxo
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -100,7 +100,7 @@ func (m *MockUtxostore) SetMinedMulti(ctx context.Context, hashes []*chainhash.H
 
 // GetUnminedTxIterator mocks the creation of an iterator for unmined transactions.
 // Returns the configured mock response for unmined transaction iteration.
-func (m *MockUtxostore) GetUnminedTxIterator() (UnminedTxIterator, error) {
+func (m *MockUtxostore) GetUnminedTxIterator(bool) (UnminedTxIterator, error) {
 	args := m.Called()
 	return args.Get(0).(UnminedTxIterator), args.Error(1)
 }
@@ -165,6 +165,13 @@ func (m *MockUtxostore) SetConflicting(ctx context.Context, txHashes []chainhash
 // Returns the configured mock response for transaction locking operations.
 func (m *MockUtxostore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
 	args := m.Called(ctx, txHashes, value)
+	return args.Error(0)
+}
+
+// MarkTransactionsOnLongestChain mocks the marking of transactions as being on the longest chain.
+// Returns the configured mock response for longest chain marking operations.
+func (m *MockUtxostore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+	args := m.Called(ctx, txHashes, onLongestChain)
 	return args.Error(0)
 }
 

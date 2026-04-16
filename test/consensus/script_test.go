@@ -3,10 +3,10 @@ package consensus
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/sighash"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/stretchr/testify/require"
 )
 

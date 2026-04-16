@@ -3,10 +3,11 @@ package aerospike
 import (
 	"context"
 	"fmt"
+	"time"
 
-	"github.com/bitcoin-sv/teranode/stores/utxo/aerospike"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	aerospike2 "github.com/bitcoin-sv/testcontainers-aerospike-go"
+	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 )
 
 func InitAerospikeContainer() (string, func() error, error) {
@@ -20,7 +21,10 @@ func InitAerospikeContainer() (string, func() error, error) {
 	}
 
 	cleanup := func() error {
-		return container.Terminate(ctx)
+		// Create a new context with timeout for cleanup to prevent hanging
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return container.Terminate(cleanupCtx)
 	}
 
 	host, err := container.Host(ctx)

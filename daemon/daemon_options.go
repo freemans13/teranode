@@ -3,7 +3,7 @@ package daemon
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // Option is a functional option type for configuring the Daemon.

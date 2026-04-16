@@ -1,0 +1,30 @@
+networks:
+  teranode-network:
+    # we use my-teranode-network here to maintain consistency with any other
+    # separately deployed services like aerospike-ee
+    name: my-teranode-network
+
+services:
+  # Custom prometheus since we load in a yaml using localhost:9091 for metrics
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus:v2.44.0
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks:
+      - teranode-network
+    user: "0:0"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ${DATA_PATH}/prometheus:/prometheus
+
+  aerospike-exporter:
+    extends:
+      file: ../base/docker-services.yml
+      service: aerospike-exporter
+
+  grafana:
+    # this will also extend persistent volume mounts for /grafana
+    extends:
+      file: ../base/docker-services.yml
+      service: grafana

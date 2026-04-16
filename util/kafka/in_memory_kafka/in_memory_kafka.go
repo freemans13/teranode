@@ -296,9 +296,10 @@ func (c *InMemoryConsumer) ResumeAll() {
 
 // InMemoryPartitionConsumer implements sarama.PartitionConsumer.
 type InMemoryPartitionConsumer struct {
-	consumer *InMemoryConsumer
-	messages chan *sarama.ConsumerMessage
-	once     sync.Once
+	consumer     *InMemoryConsumer
+	messages     chan *sarama.ConsumerMessage
+	once         sync.Once
+	isPausedFunc func() bool // Function to check if consumption is paused
 }
 
 // Messages returns a channel of ConsumerMessages.
@@ -309,6 +310,12 @@ func (pc *InMemoryPartitionConsumer) Messages() <-chan *sarama.ConsumerMessage {
 			defer close(pc.messages)
 
 			for msg := range pc.consumer.ch {
+				// Wait while paused - keep checking until unpaused or context cancelled
+				for pc.isPausedFunc != nil && pc.isPausedFunc() {
+					// Sleep briefly to avoid busy waiting
+					time.Sleep(10 * time.Millisecond)
+				}
+
 				consumerSaramaMsg := &sarama.ConsumerMessage{
 					Topic:     msg.Topic,
 					Key:       msg.Key, // Populate Key from internal message
@@ -365,7 +372,9 @@ func (pc *InMemoryPartitionConsumer) HighWaterMarkOffset() int64 {
 
 // IsPaused returns whether this partition consumer is paused. Required by sarama.PartitionConsumer.
 func (pc *InMemoryPartitionConsumer) IsPaused() bool {
-	// This mock does not support pausing, so always return false.
+	if pc.isPausedFunc != nil {
+		return pc.isPausedFunc()
+	}
 	return false
 }
 
@@ -555,6 +564,7 @@ type InMemoryConsumerGroup struct {
 	wg            sync.WaitGroup
 	closed        chan struct{}
 	isRunning     bool
+	isPaused      bool // Track pause state
 	mu            sync.Mutex
 }
 
@@ -695,6 +705,15 @@ func (mcg *InMemoryConsumerGroup) Consume(ctx context.Context, topics []string, 
 		return consumeErr                                                       // Cleanup runs via defer
 	}
 
+	// If this is our InMemoryPartitionConsumer, set the pause check function
+	if inMemPC, ok := partitionConsumer.(*InMemoryPartitionConsumer); ok {
+		inMemPC.isPausedFunc = func() bool {
+			mcg.mu.Lock()
+			defer mcg.mu.Unlock()
+			return mcg.isPaused
+		}
+	}
+
 	// Prepare session and claim objects using the internalCtx
 	session := &InMemoryConsumerGroupSession{ctx: internalCtx, broker: mcg.broker, groupID: mcg.groupID}
 	claim := &InMemoryConsumerGroupClaim{
@@ -752,14 +771,20 @@ func (mcg *InMemoryConsumerGroup) Consume(ctx context.Context, topics []string, 
 	return consumeErr
 }
 
-// PauseAll pauses consumption for all claimed partitions. No-op for mock.
+// PauseAll pauses consumption for all claimed partitions.
+// For the in-memory implementation, this sets a flag that prevents messages from being consumed.
 func (mcg *InMemoryConsumerGroup) PauseAll() {
-	// No-op
+	mcg.mu.Lock()
+	defer mcg.mu.Unlock()
+	mcg.isPaused = true
 }
 
-// ResumeAll resumes consumption for all paused partitions. No-op for mock.
+// ResumeAll resumes consumption for all paused partitions.
+// For the in-memory implementation, this clears the pause flag allowing messages to be consumed again.
 func (mcg *InMemoryConsumerGroup) ResumeAll() {
-	// No-op
+	mcg.mu.Lock()
+	defer mcg.mu.Unlock()
+	mcg.isPaused = false
 }
 
 // Pause pauses consumption for the given partitions. No-op for mock.

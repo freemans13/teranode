@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/util"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/util"
 	"google.golang.org/grpc"
 )
 

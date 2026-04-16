@@ -3,7 +3,7 @@ package p2p
 import (
 	"testing"
 
-	"github.com/bitcoin-sv/teranode/settings"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -62,22 +62,6 @@ func TestAdvertiseConfiguration(t *testing.T) {
 
 		// Should use the explicitly configured addresses
 		assert.Equal(t, testSettings.P2P.AdvertiseAddresses, advertiseAddresses)
-	})
-
-	t.Run("nat_settings_configuration", func(t *testing.T) {
-		testSettings := &settings.Settings{}
-
-		// Test NAT settings
-		testSettings.P2P.EnableNATService = true
-		testSettings.P2P.EnableNATPortMap = true
-		testSettings.P2P.EnableHolePunching = true
-		testSettings.P2P.EnableRelay = true
-
-		// Verify settings are properly set
-		assert.True(t, testSettings.P2P.EnableNATService, "NAT service should be enabled")
-		assert.True(t, testSettings.P2P.EnableNATPortMap, "NAT port mapping should be enabled")
-		assert.True(t, testSettings.P2P.EnableHolePunching, "Hole punching should be enabled")
-		assert.True(t, testSettings.P2P.EnableRelay, "Relay should be enabled")
 	})
 }
 

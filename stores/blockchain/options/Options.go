@@ -29,6 +29,7 @@ type StoreBlockOptions struct {
 // It implements the functional options pattern for configuring block storage.
 type StoreBlockOption func(*StoreBlockOptions)
 
+// ProcessStoreBlockOptions creates a StoreBlockOptions instance with default values and applies the provided options.
 func ProcessStoreBlockOptions(opts ...StoreBlockOption) *StoreBlockOptions {
 	options := &StoreBlockOptions{
 		MinedSet:    false,

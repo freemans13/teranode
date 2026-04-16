@@ -9,6 +9,7 @@
   import { logout } from '$internal/stores/authStore'
   import LogoutButton from '../../components/LogoutButton.svelte'
   import { Icon } from '$lib/components'
+  import RenderHashWithMiner from '$lib/components/table/renderers/render-hash-with-miner/index.svelte'
 
   // FSM State Management
   let fsmState: FSMState | null = null
@@ -34,9 +35,9 @@
   let invalidBlocksError: string | null = null
   let lastInvalidBlocksRefresh: Date | null = null
 
-  // Reconsider block state
-  let reconsideringBlock = false
-  let reconsideringBlockHash = ''
+  // Re-validate block state
+  let revalidatingBlock = false
+  let revalidatingBlockHash = ''
 
   // Subscribe to the API base URL
   const unsubscribe = api.assetHTTPAddress.subscribe((value) => {
@@ -359,20 +360,20 @@
     }
   }
 
-  async function reconsiderBlock(hash: string) {
-    if (reconsideringBlock) return
+  async function revalidateBlock(hash: string) {
+    if (revalidatingBlock) return
 
-    reconsideringBlock = true
-    reconsideringBlockHash = hash
+    revalidatingBlock = true
+    revalidatingBlockHash = hash
 
     try {
-      console.log(`Reconsidering block hash: ${hash}`)
+      console.log(`Re-validating block hash: ${hash}`)
 
-      // Call the API to reconsider the block
+      // Call the API to re-validate the block
       const result = await api.revalidateBlock(hash)
 
       if (!result.ok) {
-        const errorMsg = result.error?.message || 'Failed to reconsider block'
+        const errorMsg = result.error?.message || 'Failed to re-validate block'
         const errorStatus = result.error?.status
 
         // Handle 404 errors specifically
@@ -392,7 +393,7 @@
       }
 
       success(
-        `Block reconsidered successfully: ${hash.substring(0, 8)}...${hash.substring(hash.length - 8)}`,
+        `Block re-validated successfully: ${hash.substring(0, 8)}...${hash.substring(hash.length - 8)}`,
       )
 
       // Refresh the invalid blocks list after a successful action
@@ -400,8 +401,8 @@
     } catch (error: unknown) {
       failure(`${getErrorMessage(error)}`)
     } finally {
-      reconsideringBlock = false
-      reconsideringBlockHash = ''
+      revalidatingBlock = false
+      revalidatingBlockHash = ''
     }
   }
 
@@ -736,39 +737,30 @@
                     <tr>
                       <td class="height-cell">{block.height}</td>
                       <td class="hash-cell">
-                        <div class="hash-content">
-                          <span title={block.hash}
-                            >{block.hash.substring(0, 10)}...{block.hash.substring(
-                              block.hash.length - 10,
-                            )}</span
-                          >
-                          <button
-                            class="copy-button"
-                            on:click={() => {
-                              navigator.clipboard.writeText(block.hash)
-                              success('Block hash copied to clipboard')
-                            }}
-                            title="Copy hash"
-                          >
-                            <i class="fas fa-copy"></i>
-                          </button>
-                        </div>
+                        <RenderHashWithMiner
+                          hash={block.hash}
+                          hashUrl={`/viewer/block?q=${block.hash}`}
+                          shortHash={`${block.hash.substring(0, 8)}...${block.hash.substring(block.hash.length - 8)}`}
+                          showCopyButton={true}
+                          copyTooltip="Copy hash to clipboard"
+                          tooltip={block.hash}
+                        />
                       </td>
                       <td style="text-align: center;">
                         {block.size ? `${block.size} B` : '-'}
                       </td>
                       <td class="actions-cell">
                         <button
-                          class="reconsider-button"
-                          on:click={() => reconsiderBlock(block.hash)}
-                          disabled={reconsideringBlock}
+                          class="revalidate-button"
+                          on:click={() => revalidateBlock(block.hash)}
+                          disabled={revalidatingBlock}
                         >
-                          {#if reconsideringBlock && reconsideringBlockHash === block.hash}
+                          {#if revalidatingBlock && revalidatingBlockHash === block.hash}
                             <div class="button-spinner"></div>
-                            <span>Reconsidering...</span>
+                            <span>Re-validating...</span>
                           {:else}
                             <i class="fas fa-sync-alt"></i>
-                            <span>Reconsider</span>
+                            <span>Re-validate</span>
                           {/if}
                         </button>
                       </td>
@@ -1324,21 +1316,8 @@
   }
 
   .hash-cell {
-    font-family: monospace;
     width: auto;
     overflow: hidden;
-  }
-
-  .hash-content {
-    display: flex;
-    align-items: center;
-  }
-
-  .hash-content span {
-    margin-right: 0.5rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .actions-cell {
@@ -1405,32 +1384,13 @@
     font-size: 0.9rem;
   }
 
-  .copy-button {
-    background: none;
-    border: none;
-    color: #6b7280;
-    cursor: pointer;
-    padding: 0.25rem;
-    font-size: 0.875rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s ease;
-    opacity: 0.7;
-  }
-
-  .copy-button:hover {
-    color: #3b82f6;
-    opacity: 1;
-  }
-
   .copy-icon {
     font-size: 16px;
     line-height: 1;
     font-weight: bold;
   }
 
-  .reconsider-button {
+  .revalidate-button {
     background-color: #3b82f6;
     color: white;
     border: none;
@@ -1444,11 +1404,11 @@
     gap: 0.5rem;
   }
 
-  .reconsider-button:hover {
+  .revalidate-button:hover {
     background-color: #2563eb;
   }
 
-  .reconsider-button:disabled {
+  .revalidate-button:disabled {
     background-color: #6b7280;
     cursor: not-allowed;
   }
@@ -1579,22 +1539,6 @@
     border-radius: 50%;
     border-left-color: #3b82f6;
     animation: spin 1s linear infinite;
-  }
-
-  .copy-button {
-    background-color: transparent;
-    border: none;
-    color: #6b7280;
-    cursor: pointer;
-    padding: 0.25rem 0.5rem;
-    border-radius: 0.25rem;
-    transition: all 0.2s ease;
-    font-size: 0.875rem;
-  }
-
-  .copy-button:hover {
-    color: #3b82f6;
-    background-color: rgba(59, 130, 246, 0.1);
   }
 
   .spinner-container {

@@ -3,7 +3,7 @@ package p2p
 import (
 	"sort"
 
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -93,6 +93,10 @@ func (ps *PeerSelector) SelectSyncPeer(peers []*PeerInfo, criteria SelectionCrit
 		// Second priority: Higher block height is better (more data available)
 		if candidates[i].Height != candidates[j].Height {
 			return candidates[i].Height > candidates[j].Height
+		}
+		// Third priority: Sort by peer health duration (lower is better)
+		if candidates[i].HealthDuration != candidates[j].HealthDuration {
+			return candidates[i].HealthDuration < candidates[j].HealthDuration
 		}
 		// Third priority: Sort by peer ID for deterministic ordering
 		// This ensures consistent selection when peers have identical scores and heights

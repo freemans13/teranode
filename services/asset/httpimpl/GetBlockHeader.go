@@ -6,10 +6,10 @@ import (
 	"encoding/hex"
 	"net/http"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/util/tracing"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 )
 
@@ -136,6 +136,8 @@ func (h *HTTP) GetBlockHeader(mode ReadMode) func(c echo.Context) error {
 				TxCount:     meta.TxCount,
 				SizeInBytes: meta.SizeInBytes,
 				Miner:       meta.Miner,
+				Invalid:     meta.Invalid,
+				ProcessedAt: meta.ProcessedAt,
 			}
 
 			return c.JSONPretty(200, headerResponse, "  ")

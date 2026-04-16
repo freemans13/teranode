@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // WaitForPortsToBeAvailable waits until all specified ports are available (not in use)

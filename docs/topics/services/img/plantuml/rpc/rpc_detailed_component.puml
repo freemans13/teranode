@@ -1,0 +1,177 @@
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam component {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam database {
+  BackgroundColor #f2f2f2
+  BorderColor #999999
+  FontColor black
+  RoundCorner 10
+}
+skinparam shadowing false
+skinparam ArrowColor #666666
+
+@startuml RPC_Component
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title RPC Service - Component Diagram (Code-Verified Connections)
+
+Container_Boundary(rpc_service, "RPC Service") {
+
+Component(http_server, "HTTP Server", "Go HTTP", "JSON-RPC over HTTP endpoint")
+
+Component(json_rpc_handler, "JSON-RPC Handler", "Go", "Processes JSON-RPC requests and responses")
+
+Component(command_router, "Command Router", "Go", "Routes RPC commands to appropriate handlers")
+
+Component(blockchain_handlers, "Blockchain Handlers", "Go", "Block and chain operation handlers")
+
+Component(mining_handlers, "Mining Handlers", "Go", "Mining and block template handlers")
+
+Component(peer_handlers, "Peer Handlers", "Go", "Peer management handlers")
+
+Component(utxo_handlers, "UTXO Handlers", "Go", "UTXO query and management handlers")
+
+Component(admin_handlers, "Admin Handlers", "Go", "Administrative operation handlers")
+
+Component(transaction_distributor, "Transaction Distributor", "Go", "Manages reliable transaction propagation to multiple propagation services")
+
+Component(help_cacher, "Help Cacher", "Go", "Caches RPC command help text")
+
+Component(metrics_collector, "Metrics Collector", "Prometheus", "Collects RPC performance metrics")
+
+Component(health_monitor, "Health Monitor", "Go", "Monitors service and dependency health")
+
+Component(blockchain_client, "Blockchain Client", "Go gRPC", "Interface to Blockchain service")
+
+Component(block_assembly_client, "Block Assembly Client", "Go gRPC", "Interface to Block Assembly service")
+
+Component(p2p_client, "P2P Client", "Go gRPC", "Interface to P2P service")
+
+Component(legacy_peer_client, "Legacy Peer Client", "Go gRPC", "Interface to Legacy Peer service")
+
+Component(propagation_clients, "Propagation Clients", "Go gRPC", "Multiple clients to Propagation service instances")
+
+Component(utxo_store_client, "UTXO Store Client", "Go", "Interface to UTXO database")
+
+Component(asset_http_client, "Asset HTTP Client", "Go HTTP", "Interface to Asset Server for hex data")
+
+}
+
+Container_Boundary(external_services, "External Services") {
+
+Container(blockchain, "Blockchain Service", "Go", "Blockchain state management")
+
+Container(block_assembly, "Block Assembly Service", "Go", "Block creation and mining")
+
+Container(p2p_service, "P2P Service", "Go", "P2P network management")
+
+Container(legacy_peer, "Legacy Peer Service", "Go", "Legacy peer management")
+
+Container(propagation, "Propagation Service", "Go", "Transaction propagation to network")
+
+Container(asset_server, "Asset Server", "Go", "Static asset serving and transaction hex API")
+
+ContainerDb(utxo_store, "UTXO Store", "Database", "UTXO database")
+
+}
+
+Person(external_user, "External User", "Bitcoin application developer, miner, or node operator")
+
+Person(admin, "Administrator", "Node operator")
+
+' External API interactions
+
+Rel(external_user, http_server, "JSON-RPC requests", "HTTP")
+
+Rel(admin, http_server, "Administrative requests", "HTTP")
+
+' Request processing flow
+
+Rel(http_server, json_rpc_handler, "Parse JSON-RPC")
+
+Rel(json_rpc_handler, command_router, "Route commands")
+
+Rel(command_router, blockchain_handlers, "Blockchain commands")
+
+Rel(command_router, mining_handlers, "Mining commands")
+
+Rel(command_router, peer_handlers, "Peer commands")
+
+Rel(command_router, utxo_handlers, "UTXO commands")
+
+Rel(command_router, admin_handlers, "Admin commands")
+
+' Handler to client interactions
+
+Rel(blockchain_handlers, blockchain_client, "Blockchain operations")
+
+Rel(mining_handlers, block_assembly_client, "Mining operations")
+
+Rel(mining_handlers, transaction_distributor, "Transaction distribution")
+
+Rel(peer_handlers, p2p_client, "P2P operations")
+
+Rel(peer_handlers, legacy_peer_client, "Legacy peer operations")
+
+Rel(utxo_handlers, utxo_store_client, "UTXO queries and operations")
+
+Rel(admin_handlers, blockchain_client, "Administrative operations")
+
+Rel(blockchain_handlers, asset_http_client, "Transaction hex data")
+
+' Transaction distribution (CODE-VERIFIED)
+
+Rel(transaction_distributor, propagation_clients, "Distribute transactions to multiple instances")
+
+' Service client connections (CODE-VERIFIED)
+
+Rel(blockchain_client, blockchain, "gRPC calls", "gRPC")
+
+Rel(block_assembly_client, block_assembly, "gRPC calls", "gRPC")
+
+Rel(p2p_client, p2p_service, "gRPC calls", "gRPC")
+
+Rel(legacy_peer_client, legacy_peer, "gRPC calls", "gRPC")
+
+Rel(propagation_clients, propagation, "gRPC calls", "gRPC")
+
+Rel(utxo_store_client, utxo_store, "Database queries", "Direct")
+
+Rel(asset_http_client, asset_server, "HTTP requests", "HTTP")
+
+' Support components
+
+Rel(command_router, help_cacher, "Get command help")
+
+Rel(json_rpc_handler, metrics_collector, "Request metrics")
+
+Rel(health_monitor, blockchain_client, "Health checks")
+
+Rel(health_monitor, block_assembly_client, "Health checks")
+
+Rel(health_monitor, p2p_client, "Health checks")
+
+Rel(health_monitor, utxo_store_client, "Health checks")
+
+Rel(health_monitor, propagation_clients, "Health checks")
+
+Rel(health_monitor, asset_http_client, "Health checks")
+
+' Administrative access
+
+Rel(admin, http_server, "Administrative operations", "HTTP")
+
+SHOW_LEGEND()
+
+@enduml

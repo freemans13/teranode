@@ -60,19 +60,19 @@ import (
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/aerospike/aerospike-client-go/v8/types"
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/utxopersister"
-	"github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/fields"
-	"github.com/bitcoin-sv/teranode/stores/utxo/meta"
-	"github.com/bitcoin-sv/teranode/util"
-	"github.com/bitcoin-sv/teranode/util/tracing"
-	"github.com/bitcoin-sv/teranode/util/uaerospike"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
 )
@@ -591,7 +591,13 @@ func (s *Store) GetBinsToStore(tx *bt.Tx, blockHeight uint32, blockIDs, blockHei
 	}
 
 	if err != nil {
-		prometheusTxMetaAerospikeMapErrors.WithLabelValues("Store", err.Error()).Inc()
+		if e, ok := err.(*errors.Error); ok {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Store", e.Code().Enum().String()).Inc()
+		} else if e, ok := err.(*aerospike.AerospikeError); ok {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Store", e.ResultCode.String()).Inc()
+		} else {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Store", "unknown").Inc()
+		}
 		return nil, errors.NewProcessingError("failed to get fees and utxo hashes for %s", txHash, err)
 	}
 
@@ -729,10 +735,7 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 
 	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
-	// Get a new write policy which will allow CREATE or UPDATE
 	wPolicy := util.GetAerospikeWritePolicy(s.settings, 0)
-
-	// For all records, set the write policy to CREATE_ONLY
 	wPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
 	for binIdx := len(binsToStore) - 1; binIdx >= 0; binIdx-- {
@@ -743,7 +746,7 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 			s.logger.Errorf("Could not convert binIdx (%d) to uint32", binIdx)
 		}
 
-		keySource := uaerospike.CalculateKeySource(bItem.txHash, binIdxUint32)
+		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, binIdxUint32)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
@@ -762,8 +765,11 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 			ok := errors.As(err, &aErr)
 			if ok {
 				if aErr.ResultCode == types.KEY_EXISTS_ERROR {
-					utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[StoreTransactionExternally][%s] bin %d already exists in store", bItem.txHash, binIdx))
-					return
+					// PAGINATION CORRUPTION RECOVERY: This bin was already written in a previous interrupted attempt.
+					// Skip it and continue with remaining bins to complete the partial record.
+					// This allows recovery from interrupted pagination writes.
+					s.logger.Infof("[StoreTransactionExternally][%s] bin %d already exists, skipping to write missing bins", bItem.txHash, binIdx)
+					continue
 				}
 			}
 
@@ -823,23 +829,18 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 
 	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
-	// Get a new write policy which will allow CREATE or UPDATE
 	wPolicy := util.GetAerospikeWritePolicy(s.settings, 0)
+	wPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
 	for i := len(binsToStore) - 1; i >= 0; i-- {
 		bins := binsToStore[i]
-
-		if i == 0 {
-			// For the "master" record, set the write policy to CREATE_ONLY
-			wPolicy.RecordExistsAction = aerospike.CREATE_ONLY
-		}
 
 		iUint32, err := safeconversion.IntToUint32(i)
 		if err != nil {
 			s.logger.Errorf("Could not convert i (%d) to uint32", i)
 		}
 
-		keySource := uaerospike.CalculateKeySource(bItem.txHash, iUint32)
+		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, iUint32)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
@@ -856,9 +857,11 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 			aErr, ok := err.(*aerospike.AerospikeError)
 			if ok {
 				if aErr.ResultCode == types.KEY_EXISTS_ERROR {
-					utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[StorePartialTransactionExternally] %v already exists in store", bItem.txHash))
-
-					return
+					// PAGINATION CORRUPTION RECOVERY: This bin was already written in a previous interrupted attempt.
+					// Skip it and continue with remaining bins to complete the partial record.
+					// This allows recovery from interrupted pagination writes.
+					s.logger.Infof("[StorePartialTransactionExternally][%s] bin %d already exists, skipping to write missing bins", bItem.txHash, i)
+					continue
 				}
 			}
 

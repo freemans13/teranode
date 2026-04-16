@@ -7,8 +7,7 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -148,7 +147,7 @@ func TestNewKafkaAsyncProducerFromURLMemoryScheme(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=4&replication=2&retention=300000")
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
@@ -164,7 +163,7 @@ func TestNewKafkaAsyncProducerFromURLDefaultValues(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic")
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
@@ -185,7 +184,7 @@ func TestNewKafkaAsyncProducerFromURLInvalidConversion(t *testing.T) {
 	kafkaURL, err := url.Parse("memory://localhost/test-topic?partitions=2147483648") // Max int32 + 1
 	require.NoError(t, err)
 
-	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL)
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
 
 	assert.Error(t, err)
 	assert.Nil(t, producer)
@@ -199,7 +198,7 @@ func TestNewKafkaAsyncProducerMemoryScheme(t *testing.T) {
 		Topic:  "memory-topic",
 	}
 
-	producer, err := NewKafkaAsyncProducer(logger, cfg, nil)
+	producer, err := NewKafkaAsyncProducer(logger, cfg)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
@@ -210,16 +209,15 @@ func TestNewKafkaAsyncProducerMemoryScheme(t *testing.T) {
 func TestNewKafkaAsyncProducerWithKafkaSettings(t *testing.T) {
 	logger := &mockAsyncLogger{}
 	cfg := KafkaProducerConfig{
-		Logger: logger,
-		URL:    &url.URL{Scheme: memoryScheme},
-		Topic:  "test-topic",
-	}
-	kafkaSettings := &settings.KafkaSettings{
-		EnableTLS:     false,
-		TLSSkipVerify: false,
+		Logger:             logger,
+		URL:                &url.URL{Scheme: memoryScheme},
+		Topic:              "test-topic",
+		EnableTLS:          false,
+		TLSSkipVerify:      false,
+		EnableDebugLogging: false,
 	}
 
-	producer, err := NewKafkaAsyncProducer(logger, cfg, kafkaSettings)
+	producer, err := NewKafkaAsyncProducer(logger, cfg)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
@@ -301,17 +299,146 @@ type mockAsyncLogger struct {
 	fatalCount int
 }
 
-func (m *mockAsyncLogger) Debug()                                       { m.debugCount++ }
-func (m *mockAsyncLogger) Debugf(string, ...interface{})                { m.debugCount++ }
-func (m *mockAsyncLogger) Info()                                        { m.infoCount++ }
-func (m *mockAsyncLogger) Infof(string, ...interface{})                 { m.infoCount++ }
-func (m *mockAsyncLogger) Warn()                                        {}
-func (m *mockAsyncLogger) Warnf(string, ...interface{})                 {}
-func (m *mockAsyncLogger) Error(...interface{})                         { m.errorCount++ }
-func (m *mockAsyncLogger) Errorf(string, ...interface{})                { m.errorCount++ }
-func (m *mockAsyncLogger) Fatal(...interface{})                         { m.fatalCount++ }
-func (m *mockAsyncLogger) Fatalf(string, ...interface{})                { m.fatalCount++ }
-func (m *mockAsyncLogger) LogLevel() int                                { return 0 }
-func (m *mockAsyncLogger) SetLogLevel(string)                           {}
-func (m *mockAsyncLogger) New(string, ...ulogger.Option) ulogger.Logger { return m }
-func (m *mockAsyncLogger) Duplicate(...ulogger.Option) ulogger.Logger   { return m }
+func (m *mockAsyncLogger) Debug()                                               { m.debugCount++ }
+func (m *mockAsyncLogger) Debugf(string, ...interface{})                        { m.debugCount++ }
+func (m *mockAsyncLogger) Info()                                                { m.infoCount++ }
+func (m *mockAsyncLogger) Infof(string, ...interface{})                         { m.infoCount++ }
+func (m *mockAsyncLogger) Warn()                                                {}
+func (m *mockAsyncLogger) Warnf(string, ...interface{})                         {}
+func (m *mockAsyncLogger) Error(...interface{})                                 { m.errorCount++ }
+func (m *mockAsyncLogger) Errorf(string, ...interface{})                        { m.errorCount++ }
+func (m *mockAsyncLogger) Fatal(...interface{})                                 { m.fatalCount++ }
+func (m *mockAsyncLogger) Fatalf(string, ...interface{})                        { m.fatalCount++ }
+func (m *mockAsyncLogger) LogLevel() int                                        { return 0 }
+func (m *mockAsyncLogger) SetLogLevel(string)                                   {}
+func (m *mockAsyncLogger) New(string, ...ulogger.Option) ulogger.Logger         { return m }
+func (m *mockAsyncLogger) Duplicate(...ulogger.Option) ulogger.Logger           { return m }
+func (m *mockAsyncLogger) Health() bool                                         { return true }
+func (m *mockAsyncLogger) Close() error                                         { return nil }
+func (m *mockAsyncLogger) SetCurrentBlockHeight(uint64)                         {}
+func (m *mockAsyncLogger) SetCurrentBlockTime(time.Time)                        {}
+func (m *mockAsyncLogger) SetCurrentBlockHash(string)                           {}
+func (m *mockAsyncLogger) SetCurrentBlockSize(uint64)                           {}
+func (m *mockAsyncLogger) SetCurrentBlockTransactions(uint64)                   {}
+func (m *mockAsyncLogger) SetCurrentBlockTransactionsSize(uint64)               {}
+func (m *mockAsyncLogger) SetCurrentBlockTransactionsInputs(uint64)             {}
+func (m *mockAsyncLogger) SetCurrentBlockTransactionsOutputs(uint64)            {}
+func (m *mockAsyncLogger) SetCurrentBlockTransactionsFees(uint64)               {}
+func (m *mockAsyncLogger) SetCurrentBlockTransactionsFeesPerByte(uint64)        {}
+func (m *mockAsyncLogger) SetCurrentBlockTransactionsFeesPerTransaction(uint64) {}
+
+// Additional configuration tests
+
+func TestKafkaAsyncProducerWithCustomFlushSettings(t *testing.T) {
+	logger := &mockAsyncLogger{}
+	ctx := context.Background()
+
+	kafkaURL, err := url.Parse("memory://localhost/test-topic?flush_bytes=2048&flush_messages=100&flush_frequency=5s")
+	require.NoError(t, err)
+
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
+	require.NoError(t, err)
+
+	// Verify flush settings
+	assert.Equal(t, 2048, producer.Config.FlushBytes)
+	assert.Equal(t, 100, producer.Config.FlushMessages)
+	assert.Equal(t, 5*time.Second, producer.Config.FlushFrequency)
+}
+
+func TestKafkaAsyncProducerBrokersURLParsing(t *testing.T) {
+	logger := &mockAsyncLogger{}
+	ctx := context.Background()
+
+	kafkaURL, err := url.Parse("memory://broker1:9092,broker2:9092,broker3:9092/test-topic")
+	require.NoError(t, err)
+
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
+	require.NoError(t, err)
+
+	brokers := producer.BrokersURL()
+	assert.Len(t, brokers, 3)
+	assert.Equal(t, "broker1:9092", brokers[0])
+	assert.Equal(t, "broker2:9092", brokers[1])
+	assert.Equal(t, "broker3:9092", brokers[2])
+}
+
+func TestKafkaAsyncProducerWithMultipleBrokers(t *testing.T) {
+	logger := &mockAsyncLogger{}
+	ctx := context.Background()
+
+	// Test with multiple brokers in URL
+	kafkaURL, err := url.Parse("memory://broker1:9092,broker2:9093/test-topic?partitions=3")
+	require.NoError(t, err)
+
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
+	require.NoError(t, err)
+
+	assert.Len(t, producer.Config.BrokersURL, 2)
+	assert.Equal(t, "broker1:9092", producer.Config.BrokersURL[0])
+	assert.Equal(t, "broker2:9093", producer.Config.BrokersURL[1])
+	assert.Equal(t, int32(3), producer.Config.Partitions)
+}
+
+func TestKafkaAsyncProducerURLQueryParams(t *testing.T) {
+	logger := &mockAsyncLogger{}
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		url       string
+		checkFunc func(*testing.T, *KafkaAsyncProducer)
+	}{
+		{
+			name: "custom retention",
+			url:  "memory://localhost/test?retention=300000",
+			checkFunc: func(t *testing.T, p *KafkaAsyncProducer) {
+				assert.Equal(t, "300000", p.Config.RetentionPeriodMillis)
+			},
+		},
+		{
+			name: "custom segment bytes",
+			url:  "memory://localhost/test?segment_bytes=536870912",
+			checkFunc: func(t *testing.T, p *KafkaAsyncProducer) {
+				assert.Equal(t, "536870912", p.Config.SegmentBytes)
+			},
+		},
+		{
+			name: "custom partitions and replication",
+			url:  "memory://localhost/test?partitions=5&replication=3",
+			checkFunc: func(t *testing.T, p *KafkaAsyncProducer) {
+				assert.Equal(t, int32(5), p.Config.Partitions)
+				assert.Equal(t, int16(3), p.Config.ReplicationFactor)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kafkaURL, err := url.Parse(tt.url)
+			require.NoError(t, err)
+
+			producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
+			require.NoError(t, err)
+			require.NotNil(t, producer)
+
+			tt.checkFunc(t, producer)
+		})
+	}
+}
+
+func TestKafkaAsyncProducerStopBeforeStart(t *testing.T) {
+	logger := &mockAsyncLogger{}
+	ctx := context.Background()
+
+	kafkaURL, err := url.Parse("memory://localhost/test-topic-stop-before-start")
+	require.NoError(t, err)
+
+	producer, err := NewKafkaAsyncProducerFromURL(ctx, logger, kafkaURL, nil)
+	require.NoError(t, err)
+
+	// Stop before Start - should handle gracefully
+	producer.closed.Store(true)
+	producer.publishChannel = make(chan *Message)
+	err = producer.Stop()
+	assert.NoError(t, err)
+}

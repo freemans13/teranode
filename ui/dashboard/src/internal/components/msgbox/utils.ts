@@ -32,9 +32,22 @@ export const getMessageFields = (
     switch (data.type) {
       case msg.MessageType.block:
         const blockMsg = data as BlockMessage
+
+        // Format UTC datetime consistently
+        const formatUTCDateTimeBlock = (date: Date) => {
+          const pad = (n: number) => n.toString().padStart(2, '0')
+          return (
+            `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ` +
+            `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
+          )
+        }
+
         fields.push({ label: t(`${key}.age`), value: age })
         fields.push({ label: t(`${key}.timestamp`), value: blockMsg.timestamp })
-        fields.push({ label: t(`${key}.receivedAt`), value: blockMsg.receivedAt })
+
+        const blockReceivedStr = formatUTCDateTimeBlock(blockMsg.receivedAt)
+        fields.push({ label: t(`${key}.receivedAt`), value: `${blockReceivedStr} (${age})` })
+
         fields.push({ label: t(`${key}.hash`), value: blockMsg.hash })
         fields.push({ label: t(`${key}.base_url`), value: blockMsg.base_url })
         if (!hidePeer) {

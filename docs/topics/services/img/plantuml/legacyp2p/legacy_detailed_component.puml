@@ -1,0 +1,231 @@
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam component {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam database {
+  BackgroundColor #f2f2f2
+  BorderColor #999999
+  FontColor black
+  RoundCorner 10
+}
+skinparam shadowing false
+skinparam ArrowColor #666666
+
+@startuml Legacy_Component
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title Legacy Service - Component Diagram
+
+Container_Boundary(legacy, "Legacy Service") {
+
+Component(p2p_manager, "P2P Manager", "Go", "Manages BSV P2P network connections")
+
+Component(sync_manager, "Sync Manager", "Go", "Handles block synchronization and processing")
+
+Component(inv_handler, "Inventory Handler", "Go", "Processes inventory messages from BSV network")
+
+Component(block_converter, "Block Converter", "Go", "Converts between BSV and Teranode formats")
+
+Component(tx_processor, "Transaction Processor", "Go", "Processes and validates transactions")
+
+Component(subtree_manager, "Subtree Manager", "Go", "Manages subtree creation and processing")
+
+
+
+Component(http_server, "HTTP Server", "Go Echo", "Asset Server compatible API endpoints")
+
+Component(block_handler, "Block Handler", "Go", "Handles /block/:hash requests")
+
+Component(subtree_handler, "Subtree Handler", "Go", "Handles /subtree/:hash requests")
+
+Component(tx_handler, "Transaction Handler", "Go", "Handles /tx/:hash and /txs requests")
+
+
+
+Component(blockchain_client, "Blockchain Client", "Go gRPC", "Interface to Blockchain service")
+
+Component(block_validation_client, "Block Validation Client", "Go gRPC", "Interface to Block Validation service")
+
+Component(subtree_validation_client, "Subtree Validation Client", "Go gRPC", "Interface to Subtree Validation service")
+
+Component(validator_client, "Validator Client", "Go", "Interface to Validator service (local/remote)")
+
+
+
+Component(legacy_store_client, "Legacy Store Client", "Go", "Interface to legacy block database")
+
+Component(subtree_store_client, "Subtree Store Client", "Go", "Interface to subtree storage")
+
+Component(temp_store_client, "Temp Store Client", "Go", "Interface to temporary storage")
+
+Component(utxo_store_client, "UTXO Store Client", "Go", "Interface to UTXO database")
+
+
+
+Component(kafka_consumer, "Kafka Consumer", "Go", "Consumes finalized block notifications")
+
+Component(peer_manager, "Peer Manager", "Go", "Manages BSV peer connections and state")
+
+
+
+Component(metrics_collector, "Metrics Collector", "Prometheus", "Collects bridge operation metrics")
+
+Component(health_monitor, "Health Monitor", "Go", "Monitors service and dependency health")
+
+}
+
+Container_Boundary(external_services, "External Services") {
+
+Container(bsv_network, "BSV P2P Network", "P2P", "Legacy Bitcoin SV network")
+
+Container(blockchain, "Blockchain Service", "Go", "Teranode blockchain state management")
+
+Container(block_validation, "Block Validation Service", "Go", "Teranode block validation")
+
+Container(subtree_validation, "Subtree Validation Service", "Go", "Teranode subtree validation")
+
+Container(validator, "Validator Service", "Go", "Transaction validation")
+
+
+
+ContainerDb(legacy_block_store, "Legacy Block Store", "Database", "Historical BSV block database")
+
+ContainerDb(subtree_store, "Subtree Store", "Blob Storage", "Merkle subtree storage")
+
+ContainerDb(temp_store, "Temp Store", "Blob Storage", "Temporary data storage")
+
+ContainerDb(utxo_store, "UTXO Store", "Database", "UTXO database")
+
+ContainerQueue(kafka, "Kafka", "Message Broker", "Message broker")
+
+}
+
+Person(admin, "Administrator", "Node operator")
+
+System_Ext(external_callers, "External Services", "Block Validation, Subtree Validation")
+
+' BSV P2P network interactions
+
+Rel(bsv_network, p2p_manager, "BSV protocol messages", "P2P")
+
+Rel(p2p_manager, inv_handler, "Inventory messages")
+
+Rel(inv_handler, sync_manager, "Block/transaction notifications")
+
+Rel(sync_manager, block_converter, "Convert BSV blocks")
+
+Rel(block_converter, subtree_manager, "Create subtrees")
+
+' Transaction processing
+
+Rel(sync_manager, tx_processor, "Process transactions")
+
+Rel(tx_processor, validator_client, "Validate transactions")
+
+' Block validation flow
+
+Rel(sync_manager, block_validation_client, "Submit blocks for validation")
+
+Rel(subtree_manager, subtree_validation_client, "Validate subtrees")
+
+' Teranode integration
+
+Rel(sync_manager, blockchain_client, "Subscribe to blockchain events")
+
+Rel(kafka_consumer, blockchain_client, "Consume finalized blocks")
+
+
+' HTTP API for external queries
+
+Rel(external_callers, http_server, "Query block/subtree data", "HTTP")
+
+Rel(http_server, block_handler, "Block requests")
+
+Rel(http_server, subtree_handler, "Subtree requests")
+
+Rel(http_server, tx_handler, "Transaction requests")
+
+' Data retrieval for HTTP API
+
+Rel(block_handler, legacy_store_client, "Retrieve block data")
+
+Rel(subtree_handler, subtree_store_client, "Retrieve subtree data")
+
+Rel(tx_handler, legacy_store_client, "Retrieve transaction data")
+
+' Storage operations
+
+Rel(sync_manager, legacy_store_client, "Store BSV blocks")
+
+Rel(subtree_manager, subtree_store_client, "Store subtrees")
+
+Rel(tx_processor, temp_store_client, "Temporary storage")
+
+Rel(tx_processor, utxo_store_client, "UTXO queries")
+
+' External service connections
+
+Rel(blockchain_client, blockchain, "gRPC calls", "gRPC")
+
+Rel(block_validation_client, block_validation, "gRPC calls", "gRPC")
+
+Rel(subtree_validation_client, subtree_validation, "gRPC calls", "gRPC")
+
+Rel(validator_client, validator, "Validation calls", "Direct/gRPC")
+
+
+' Storage connections
+
+Rel(legacy_store_client, legacy_block_store, "Database operations", "Direct")
+
+Rel(subtree_store_client, subtree_store, "Blob operations", "Direct")
+
+Rel(temp_store_client, temp_store, "Blob operations", "Direct")
+
+Rel(utxo_store_client, utxo_store, "Database queries", "Direct")
+
+' Kafka integration
+
+Rel(kafka_consumer, kafka, "Consume messages", "Kafka")
+
+' Peer management
+
+Rel(p2p_manager, peer_manager, "Manage peer state")
+
+Rel(peer_manager, bsv_network, "Peer connections", "P2P")
+
+' Administrative monitoring
+
+Rel(admin, metrics_collector, "Monitor bridge metrics", "HTTP")
+
+' Health and monitoring
+
+Rel(health_monitor, blockchain_client, "Health checks")
+
+Rel(health_monitor, legacy_store_client, "Health checks")
+
+Rel(health_monitor, p2p_manager, "Health checks")
+
+' Metrics collection
+
+Rel(sync_manager, metrics_collector, "Sync metrics")
+
+Rel(block_converter, metrics_collector, "Conversion metrics")
+
+Rel(tx_processor, metrics_collector, "Transaction metrics")
+
+Rel(http_server, metrics_collector, "API metrics")
+
+SHOW_LEGEND()
+
+@enduml

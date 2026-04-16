@@ -85,7 +85,7 @@ export const getRenderCells = (t, blockHash) => {
       return {
         component: valueSet(item[colId]) ? RenderSpan : null,
         props: {
-          value: formatSatoshi(item[colId]) + ' BSV',
+          value: formatNum(item[colId]) + ' sats',
           className: 'num',
         },
         value: '',

@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	helper "github.com/bitcoin-sv/teranode/test/utils"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 )
 
 func main() {

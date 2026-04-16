@@ -23,10 +23,18 @@
 // specific concurrency patterns documented in their respective implementations.
 package model
 
-// UTXO represents an unspent transaction output with its key and value
+// UTXO represents an unspent transaction output with its key and value.
+//
+// A UTXO is a fundamental unit in Bitcoin's accounting model, representing an output
+// that has not yet been spent. It combines identification information with the actual
+// value and script data that can be spent.
+//
+// The Val field is a pointer to allow for nil values when representing spent UTXOs
+// or for memory optimization with large UTXO sets.
 type UTXO struct {
-	// Key uniquely identifies the UTXO
+	// Key uniquely identifies this UTXO by transaction hash and output index
 	Key UTXOKey
-	// Val contains the UTXO's data
+
+	// Val contains the spendable value and script conditions for this UTXO
 	Val *UTXOValue
 }

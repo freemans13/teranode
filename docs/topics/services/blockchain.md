@@ -20,10 +20,7 @@
 5. [Technology](#5-technology)
 6. [Directory Structure and Main Files](#6-directory-structure-and-main-files)
 7. [How to run](#7-how-to-run)
-8. [Configuration options (settings flags)](#8-configuration-options-settings-flags)
-    - [Operational Settings](#operational-settings)
-    - [Mining and Difficulty Settings](#mining-and-difficulty-settings)
-    - [FSM Settings](#fsm-settings)
+8. [Configuration](#8-configuration)
 9. [Additional Technical Details](#9-additional-technical-details)
     - [9.1. Complete gRPC Method Coverage](#91-complete-grpc-method-coverage)
     - [9.2. Finite State Machine Implementation](#92-finite-state-machine-implementation)
@@ -152,7 +149,7 @@ There are 2 clients invoking this endpoint:
     - The `Asset Server` service calls the `GetBlock` method on the `Blockchain Service` to retrieve a block from the blockchain.
 
 - **The `Block Assembly` service:**
-    - The `Block Assembly` service calls the `GetBlock` method on the `Blockchain Service` to retrieve a block from the blockchain.
+  - The `Block Assembly` service calls the `GetBlock` method on the `Blockchain Service` to retrieve a block from the blockchain.
 
 ### 2.5. Getting the last N blocks from the blockchain
 
@@ -258,6 +255,7 @@ Each of these methods serves a specific need:
 - `GetBlockHeaderIDs` provides a lighter way to retrieve just the IDs of a range of block headers without the additional metadata.
 
 Multiple services make use of these endpoints, including the `Block Assembly`, `Block Validation`, and `Asset Server` services.
+
 ### 2.9. Invalidating a Block
 
 ![blockchain_invalidate_block.svg](img/plantuml/blockchain/blockchain_invalidate_block.svg)
@@ -310,6 +308,7 @@ For further detail, we show here the sequence for the `SetBlockSubtreesSet` call
 ## 3. gRPC Protobuf Definitions
 
 The Blockchain Service uses gRPC for communication between nodes. The protobuf definitions used for defining the service methods and message formats can be seen [here](../../references/protobuf_docs/blockchainProto.md).
+
 ## 4. Data Model
 
 The Blockchain works with the [Block Data Model](../datamodel/block_data_model.md).
@@ -339,7 +338,9 @@ The blockchain database stores the block header, coinbase TX, and block merkle r
 | inserted_at    | TIMESTAMPTZ       | NOT NULL DEFAULT CURRENT_TIMESTAMP   | Timestamp of when the block was inserted in the database. |
 
 The table structure is designed to store comprehensive information about each block in the blockchain, including its relationships with other blocks, its contents, and metadata.
+
 ## 5. Technology
+
 1. **PostgreSQL Database:**
     - The primary store technology for the blockchain service.
     - Used for persisting blockchain data such as blocks, block headers, and state information.
@@ -362,6 +363,7 @@ The table structure is designed to store comprehensive information about each bl
 6. **Prometheus for Metrics:**
     - Client in `metrics.go`.
     - Used for monitoring the performance and health of the service.
+
 ## 6. Directory Structure and Main Files
 
 The Blockchain service is located in the `./services/blockchain` directory. The following is the directory structure of the service:
@@ -469,114 +471,10 @@ SETTINGS_CONTEXT=dev.[YOUR_USERNAME] go run -Blockchain=1
 ```
 
 Please refer to the [Locally Running Services Documentation](../../howto/locallyRunningServices.md) document for more information on running the Blockchain Service locally.
-## 8. Configuration options (settings flags)
 
-The Blockchain service configuration is organized into several categories to manage different aspects of the service's operation. All settings can be provided via environment variables or configuration files.
+## 8. Configuration
 
-### Network Configuration
-
-- **GRPC Address (`blockchain_grpcAddress`)**: Specifies the address for other services to connect to the Blockchain service's gRPC API. This is how other services will address the blockchain service.
-    - Type: string
-    - Default Value: `localhost:8087`
-    - Impact: Critical for service discovery and inter-service communication
-    - Security Impact: In production environments, should be configured securely based on network architecture
-
-- **GRPC Listen Address (`blockchain_grpcListenAddress`)**: Specifies the network interface and port the Blockchain service's gRPC server binds to for accepting connections.
-    - Type: string
-    - Default Value: `:8087`
-    - Impact: Controls network interface binding for accepting gRPC connections
-    - Security Impact: Binding to `0.0.0.0` or empty address (`:8087`) exposes the port on all network interfaces
-
-- **HTTP Listen Address (`blockchain_httpListenAddress`)**: Specifies the network interface and port for the HTTP server that exposes REST endpoints (primarily for block invalidation/revalidation).
-    - Type: string
-    - Default Value: `:8082`
-    - Impact: Controls network interface binding for HTTP API access
-    - Security Impact: Should be configured based on who needs access to these endpoints
-
-### Data Storage Configuration
-
-- **Store URL (`blockchain_store`)**: URL connection string for the blockchain database that stores block data and service state.
-    - Type: URL
-    - Default Value: `sqlite:///blockchain`
-    - Supported Formats:
-
-        - SQLite: `sqlite:///path/to/db`
-        - PostgreSQL: `postgres://user:password@host:port/dbname`
-
-    - Impact: Stores block data and service state
-    - Performance Impact: Choice of database affects scalability and performance
-
-- **DB Timeout (`blockchain_store_dbTimeoutMillis`)**: The timeout in milliseconds for database operations.
-    - Type: integer
-    - Default Value: `5000` (5 seconds)
-    - Impact: Not currently implemented
-
-### State Machine Configuration
-
-- **Initialize Node In State (`blockchain_initializeNodeInState`)**: Specifies the initial state for the blockchain service's finite state machine (FSM).
-    - Type: string
-    - Default Value: `""` (empty, uses default FSM state)
-    - Possible Values:
-
-        - `"IDLE"`: Initial inactive state
-        - `"RUNNING"`: Normal operating state
-        - `"LEGACY_SYNC"`: Legacy synchronization mode
-        - `"CATCHUP_BLOCKS"`: Block catch-up mode
-
-    - Impact: Not currently implemented
-
-- **FSM State Restore (`fsm_state_restore`)**: Controls whether the service restores its previous FSM state from storage on startup.
-    - Type: boolean
-    - Default Value: `false`
-    - Impact: Not currently implemented
-
-- **FSM State Change Delay (`fsm_state_change_delay`)**: FOR TESTING ONLY - introduces an artificial delay when changing FSM states.
-    - Type: integer (milliseconds)
-    - Default Value: `0`
-    - Impact: Used only in tests for state transition synchronization
-    - Warning: Should not be used in production environments
-
-### Operational Settings
-
-- **Maximum Retries (`blockchain_maxRetries`)**: Maximum number of retry attempts for blockchain operations that encounter transient errors.
-    - Type: integer
-    - Default Value: `3`
-    - Impact: Not currently implemented
-
-- **Retry Sleep Duration (`blockchain_retrySleep`)**: The wait time in milliseconds between retry attempts, implementing a back-off mechanism.
-    - Type: integer
-    - Default Value: `1000` (1 second)
-    - Impact: Not currently implemented
-    - Tuning Advice: Adjust based on the nature of expected failures (shorter for quick-recovery scenarios)
-
-### Mining and Difficulty Settings
-
-- **Difficulty Cache (`blockassembly_difficultyCache`)**: Enables difficulty calculation caching for performance optimization.
-    - Type: boolean
-    - Default Value: `true`
-    - Impact: Improves performance when enabled
-
-### Configuration Interactions and Dependencies
-
-Some configuration settings work together or depend on other settings:
-
-1. **gRPC Server Management**: `blockchain_grpcListenAddress` controls server startup and health checks; `blockchain_grpcAddress` required for client connections
-
-2. **HTTP Administrative Interface**: `blockchain_httpListenAddress` must be configured for service startup; empty causes failure
-
-3. **Difficulty Calculation**: `blockassembly_difficultyCache` improves performance; Chain parameters control difficulty algorithm behavior
-
-4. **FSM State Management**: `fsm_state_restore` and `blockchain_initializeNodeInState` control service startup behavior and state persistence
-
-5. **Database Operations**: `blockchain_store` determines persistence backend; `blockchain_store_dbTimeoutMillis` controls operation limits
-
-### Critical Configuration Requirements
-
-1. **`blockchain_httpListenAddress`** must be configured (empty causes service startup failure)
-2. **`blockchain_grpcAddress`** must be configured for client functionality
-3. **`blockchain_grpcListenAddress`** can be empty (disables gRPC server)
-4. **`blockchain_store`** must be valid URL format for blockchain persistence
-5. **`Chain configuration parameters`** must be properly configured for difficulty calculations
+For comprehensive configuration documentation including all settings, defaults, and interactions, see the [Blockchain Settings Reference](../../references/settings/services/blockchain_settings.md).
 
 ## 9. Additional Technical Details
 
@@ -585,6 +483,7 @@ Some configuration settings work together or depend on other settings:
 In addition to the core methods described in the Functionality section, the Blockchain Service provides the following API endpoints:
 
 #### FSM Management Methods
+
 - **SendFSMEvent**: Sends an event to the blockchain FSM to trigger state transitions.
 - **GetFSMCurrentState**: Retrieves the current state of the FSM.
 - **WaitFSMToTransitionToGivenState**: Waits for FSM to reach a specific state.
@@ -592,10 +491,12 @@ In addition to the core methods described in the Functionality section, the Bloc
 - **Run, CatchUpBlocks, LegacySync, Idle**: Transitions the service to specific operational modes.
 
 #### State Management
+
 - **GetState**: Retrieves a value from the blockchain state storage by its key.
 - **SetState**: Stores a value in the blockchain state storage with the specified key.
 
 #### Block Mining Status Methods
+
 - **GetBlockIsMined**: Checks if a block has been marked as mined.
 - **SetBlockMinedSet**: Marks a block as mined in the blockchain.
 - **GetBlocksMinedNotSet**: Retrieves blocks that haven't been marked as mined.
@@ -603,6 +504,7 @@ In addition to the core methods described in the Functionality section, the Bloc
 - **GetBlocksSubtreesNotSet**: Retrieves blocks whose subtrees haven't been set.
 
 #### Legacy Synchronization Methods
+
 - **GetBlockLocator**: Creates block locators for chain synchronization.
 - **LocateBlockHeaders**: Finds block headers using a locator.
 - **GetBestHeightAndTime**: Retrieves the current best height and median time.
@@ -667,11 +569,49 @@ The Blockchain Service employs several strategies to handle errors and maintain 
 - Blocks with invalid headers, merkle roots, or proofs are rejected with appropriate error codes.
 - Invalid blocks can be explicitly marked using the InvalidateBlock method.
 
-#### Chain Reorganization
+#### Chain Reorganization and Longest Chain Tracking
 
-- Detects chain splits and reorganizations automatically.
-- Uses rollback and catch-up operations to handle chain reorganizations.
-- Limits reorganization depth for security (configurable).
+The Blockchain Service implements sophisticated chain reorganization handling with optimized longest chain tracking:
+
+##### Automatic Detection
+
+- Detects chain splits and reorganizations automatically through block header validation
+- Uses rollback and catch-up operations to handle chain reorganizations
+- Limits reorganization depth for security (configurable via `blockchain_maxReorgDepth`)
+
+##### Optimized Longest Chain Selection
+
+The service employs an optimized algorithm for tracking and selecting the longest valid chain:
+
+**Key Features:**
+
+- **Efficient Chain Comparison**: Uses cumulative proof-of-work (chainwork) rather than simple block height for chain selection
+- **Fast Fork Detection**: Maintains indexed fork points to quickly identify competing chains
+- **Minimal Database Queries**: Caches chain tips and their accumulated work to reduce database load
+- **Parallel Validation**: Can validate multiple competing chain tips simultaneously
+
+**Implementation Details:**
+
+1. **Chainwork Tracking**: Each block stores cumulative chainwork from genesis, allowing O(1) chain strength comparison
+2. **Fork Point Cache**: Maintains an in-memory cache of recent fork points for rapid reorganization detection
+3. **Tip Management**: Tracks multiple competing chain tips with their associated metadata:
+    - Total chainwork
+    - Block height
+    - Last validation timestamp
+    - Fork depth from main chain
+
+**Performance Benefits:**
+
+- Reduced latency in chain selection during high fork activity
+- Lower database load through intelligent caching
+- Faster recovery from network partitions
+- Improved resilience to chain split scenarios
+
+**Configuration Options:**
+
+- `blockchain_maxReorgDepth`: Maximum allowed reorganization depth (default: 6 blocks)
+- `blockchain_chainTipCacheSize`: Number of competing tips to track (default: 10)
+- `blockchain_forkPointCacheSize`: Size of fork point cache (default: 100)
 
 #### Storage Errors
 

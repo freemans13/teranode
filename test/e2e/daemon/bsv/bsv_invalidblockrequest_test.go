@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/daemon"
-	"github.com/bitcoin-sv/teranode/settings"
-	helper "github.com/bitcoin-sv/teranode/test/utils"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
+	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/settings"
+	helper "github.com/bsv-blockchain/teranode/test/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,9 +30,6 @@ import (
 //
 // This demonstrates block validation using Teranode's native block creation and validation!
 func TestBSVInvalidBlockRequest(t *testing.T) {
-	SharedTestLock.Lock()
-	defer SharedTestLock.Unlock()
-
 	t.Log("Testing BSV invalid block request handling across multiple Teranode nodes...")
 
 	// Create 3 nodes with P2P enabled (using proven multi-node pattern)
@@ -185,7 +182,7 @@ func testInvalidCoinbaseAmount(t *testing.T, nodes []*daemon.TestDaemon) {
 	_, validBlock := node0.CreateTestBlock(t, previousBlock, 12345) // Empty block with just coinbase
 
 	// Try to process the valid block first to ensure our setup works
-	err = node0.BlockValidationClient.ProcessBlock(ctx, validBlock, validBlock.Height)
+	err = node0.BlockValidationClient.ProcessBlock(ctx, validBlock, validBlock.Height, "legacy", "")
 	require.NoError(t, err, "Valid block should be accepted")
 
 	t.Log("✅ Valid block was accepted, now testing invalid scenarios...")
@@ -241,7 +238,7 @@ func testInvalidBlockProcessing(t *testing.T, nodes []*daemon.TestDaemon) {
 	_, testBlock := node0.CreateTestBlock(t, bestBlock, 54321, parentTx, childTx)
 
 	// Try to process the block - this should work if transactions are valid
-	err = node0.BlockValidationClient.ProcessBlock(ctx, testBlock, testBlock.Height)
+	err = node0.BlockValidationClient.ProcessBlock(ctx, testBlock, testBlock.Height, "legacy", "")
 	if err != nil {
 		t.Logf("Block validation failed as expected: %v", err)
 		t.Log("✅ Block validation correctly rejected invalid block")

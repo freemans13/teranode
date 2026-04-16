@@ -6,15 +6,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	blob_memory "github.com/bitcoin-sv/teranode/stores/blob/memory"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -48,7 +48,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		}
 
 		// Test reset with no blocks to move
-		response := stp.Reset(targetHeader, nil, nil, false)
+		response := stp.Reset(targetHeader, nil, nil, false, nil)
 		assert.NoError(t, response.Err)
 	})
 
@@ -64,18 +64,6 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		settings := test.CreateBaseTestSettings(t)
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
-		mockBlockchainClient := &blockchain.Mock{}
-		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
-		require.NoError(t, err)
-
-		// Use the pre-defined coinbase transactions from the test vars
-		// Create a simple block with just a coinbase tx
-		block1 := &model.Block{
-			Height:     1,
-			CoinbaseTx: coinbaseTx,
-			Subtrees:   []*chainhash.Hash{},
-		}
-
 		// Create a target block header
 		targetHeader := &model.BlockHeader{
 			Version:        1,
@@ -86,12 +74,28 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 			Nonce:          1234,
 		}
 
+		// Use the pre-defined coinbase transactions from the test vars
+		// Create a simple block with just a coinbase tx
+		block1 := &model.Block{
+			Header:     targetHeader,
+			Height:     1,
+			CoinbaseTx: coinbaseTx,
+			Subtrees:   []*chainhash.Hash{},
+		}
+
+		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlock", mock.Anything, mock.Anything).Return(block1, nil)
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+
 		// Store the coinbase UTXO first to avoid errors
 		_, err = utxoStore.Create(context.Background(), coinbaseTx, 1)
 		require.NoError(t, err)
 
 		// Test reset with a block to move back
-		response := stp.Reset(targetHeader, []*model.Block{block1}, nil, false)
+		response := stp.Reset(targetHeader, []*model.Block{block1}, nil, false, nil)
 		assert.NoError(t, response.Err)
 	})
 
@@ -108,6 +112,8 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 
@@ -129,7 +135,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		}
 
 		// Test reset with a block to move forward
-		response := stp.Reset(targetHeader, nil, []*model.Block{block2}, false)
+		response := stp.Reset(targetHeader, nil, []*model.Block{block2}, false, nil)
 		assert.NoError(t, response.Err)
 	})
 
@@ -160,7 +166,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		}
 
 		// Test reset with legacy sync enabled
-		response := stp.Reset(targetHeader, nil, nil, true)
+		response := stp.Reset(targetHeader, nil, nil, true, nil)
 		assert.NoError(t, response.Err)
 	})
 
@@ -175,20 +181,6 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
-
-		mockBlockchainClient := &blockchain.Mock{}
-		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
-
-		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
-		require.NoError(t, err)
-
-		// Create transactions that will conflict during reset
-		conflictTx1Hash, err := chainhash.NewHashFromStr("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
-		require.NoError(t, err)
-		conflictTx2Hash, err := chainhash.NewHashFromStr("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
-		require.NoError(t, err)
-		uniqueTxHash, err := chainhash.NewHashFromStr("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
-		require.NoError(t, err)
 
 		// Create block headers for reset scenario
 		currentHeader := &model.BlockHeader{
@@ -230,6 +222,21 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 				Nonce:          202,
 			},
 		}
+
+		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlock", mock.Anything, mock.Anything).Return(moveBackBlock1, nil)
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
+
+		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+
+		// Create transactions that will conflict during reset
+		conflictTx1Hash, err := chainhash.NewHashFromStr("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+		require.NoError(t, err)
+		conflictTx2Hash, err := chainhash.NewHashFromStr("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+		require.NoError(t, err)
+		uniqueTxHash, err := chainhash.NewHashFromStr("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+		require.NoError(t, err)
 
 		// Store necessary UTXOs
 		_, err = utxoStore.Create(context.Background(), coinbaseTx, 1)
@@ -290,7 +297,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		// 1. Move back the specified blocks
 		// 2. Add their transactions back to the processor
 		// 3. Reset the processor state to the target header
-		response := stp.Reset(resetTargetHeader, []*model.Block{moveBackBlock2, moveBackBlock1}, nil, false)
+		response := stp.Reset(resetTargetHeader, []*model.Block{moveBackBlock2, moveBackBlock1}, nil, false, nil)
 
 		// Verify reset results
 		finalTxCount := stp.TxCount()
@@ -566,7 +573,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 		// 3. duplicateTx should be handled properly (not duplicated)
 		// Note: We removed the concurrent transaction addition during reset as it was causing race conditions
 		// The test should verify that reset properly clears all existing transactions
-		response := stp.Reset(resetTargetHeader, []*model.Block{moveBackBlock}, []*model.Block{moveForwardBlock}, false)
+		response := stp.Reset(resetTargetHeader, []*model.Block{moveBackBlock}, []*model.Block{moveForwardBlock}, false, nil)
 
 		// Verify final state
 		finalTxMap := stp.GetCurrentTxMap()
@@ -594,7 +601,7 @@ func TestSubtreeProcessor_Reset(t *testing.T) {
 			assert.False(t, hasDuplicateTx, "All transactions should be cleared after reset")
 			assert.False(t, hasMoveBackOnlyTx, "All transactions should be cleared after reset")
 			assert.False(t, hasMoveForwardOnlyTx, "All transactions should be cleared after reset")
-			assert.Equal(t, uint64(0), finalTxCount, "Transaction count should be 0 after reset")
+			assert.Equal(t, uint64(1), finalTxCount, "Transaction count should be 1 after reset") // Only first coinbase tx
 
 			t.Logf("✅ RESET TEST PASSED: Reset properly cleared all transactions")
 		} else {
@@ -617,6 +624,8 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 
@@ -718,6 +727,8 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 
@@ -760,8 +771,10 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
+		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
@@ -874,8 +887,10 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
+		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
@@ -1100,8 +1115,10 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest, 10)
 
 		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
 		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
+		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)

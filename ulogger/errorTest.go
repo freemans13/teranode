@@ -91,7 +91,7 @@ func (l *ErrorTestLogger) Errorf(format string, args ...interface{}) {
 
 	_, file, line, _ := runtime.Caller(2)
 
-	prefix := fmt.Sprintf("%s:%d: [ERROR] %s ", file, line, format)
+	prefix := fmt.Sprintf("%s:%d: ERR_LEVEL %s ", file, line, format)
 
 	if l.skipCancelOnFail.Load() {
 		l.t.Logf(prefix, args...)
@@ -113,7 +113,7 @@ func (l *ErrorTestLogger) Fatalf(format string, args ...interface{}) {
 
 	_, file, line, _ := runtime.Caller(2)
 
-	prefix := fmt.Sprintf("%s:%d: [FATAL] %s ", file, line, format)
+	prefix := fmt.Sprintf("%s:%d: FATAL_LEVEL %s ", file, line, format)
 
 	if l.skipCancelOnFail.Load() {
 		l.t.Logf(prefix, args...)

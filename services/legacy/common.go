@@ -6,9 +6,9 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/bitcoin-sv/teranode/model"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/model"
 )
 
 // verifyHeadersChain validates a sequence of block headers to ensure they form a valid chain.

@@ -4,9 +4,9 @@ package utxo
 import (
 	"encoding/binary"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/stores/utxo/spend"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 )
 
 // SpendResponse contains the response from querying (GetSpend) a UTXO's spend status.

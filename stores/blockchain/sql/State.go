@@ -6,7 +6,7 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/util/tracing"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // GetState retrieves a value from the state key-value store.

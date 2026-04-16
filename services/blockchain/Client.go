@@ -13,16 +13,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blockchain/options"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/google/uuid"
 	"github.com/ordishs/go-utils"
 	"google.golang.org/grpc"
@@ -37,6 +37,9 @@ type clientSubscriber struct {
 }
 
 // Client represents a blockchain service client.
+//
+// Client provides a gRPC-based interface for communicating with the blockchain service,
+// enabling remote operations and managing connection lifecycle with subscription support.
 type Client struct {
 	client                blockchain_api.BlockchainAPIClient // gRPC client for blockchain service
 	logger                ulogger.Logger                     // Logger instance
@@ -283,7 +286,7 @@ func (c *Client) GetBlock(ctx context.Context, blockHash *chainhash.Hash) (*mode
 		subtreeHashes = append(subtreeHashes, hash)
 	}
 
-	return model.NewBlock(header, coinbaseTx, subtreeHashes, resp.TransactionCount, resp.SizeInBytes, resp.Height, resp.Id, c.settings)
+	return model.NewBlock(header, coinbaseTx, subtreeHashes, resp.TransactionCount, resp.SizeInBytes, resp.Height, resp.Id)
 }
 
 // GetBlocks retrieves multiple blocks starting from a specific hash.
@@ -299,7 +302,7 @@ func (c *Client) GetBlocks(ctx context.Context, blockHash *chainhash.Hash, numbe
 	blocks := make([]*model.Block, 0, len(resp.Blocks))
 
 	for _, blockBytes := range resp.Blocks {
-		block, err := model.NewBlockFromBytes(blockBytes, c.settings)
+		block, err := model.NewBlockFromBytes(blockBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -386,7 +389,7 @@ func (c *Client) blockFromResponse(resp *blockchain_api.GetBlockResponse) (*mode
 		subtreeHashes = append(subtreeHashes, hash)
 	}
 
-	return model.NewBlock(header, coinbaseTx, subtreeHashes, resp.TransactionCount, resp.SizeInBytes, resp.Height, resp.Id, c.settings)
+	return model.NewBlock(header, coinbaseTx, subtreeHashes, resp.TransactionCount, resp.SizeInBytes, resp.Height, resp.Id)
 }
 
 // GetBlockStats retrieves statistical information about the blockchain.
@@ -679,6 +682,11 @@ func (c *Client) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) 
 		Invalid:     resp.Invalid,
 	}
 
+	if resp.ProcessedAt != nil {
+		t := resp.ProcessedAt.AsTime()
+		meta.ProcessedAt = &t
+	}
+
 	return header, meta, nil
 }
 
@@ -919,6 +927,69 @@ func (c *Client) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHe
 	}
 
 	return headers, metas, nil
+}
+
+// GetBlocksByHeight retrieves full blocks between two specified heights.
+// This method fetches complete blocks within a height range in a single efficient operation,
+// which is particularly useful for operations like subtree searching where full block data
+// including subtree hashes is needed for multiple consecutive blocks.
+//
+// The method communicates with the blockchain service via gRPC to retrieve the blocks
+// from the underlying blockchain store, then deserializes each block into the internal
+// model representation with all components (headers, subtrees, transaction metadata).
+//
+// Parameters:
+//   - ctx: Context for the operation with timeout and cancellation support
+//   - startHeight: Starting height for block retrieval (inclusive)
+//   - endHeight: Ending height for block retrieval (inclusive)
+//
+// Returns:
+//   - []*model.Block: Array of complete blocks in ascending height order
+//   - error: Any error encountered during retrieval or deserialization
+func (c *Client) GetBlocksByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.Block, error) {
+	resp, err := c.client.GetBlocksByHeight(ctx, &blockchain_api.GetBlocksByHeightRequest{
+		StartHeight: startHeight,
+		EndHeight:   endHeight,
+	})
+	if err != nil {
+		return nil, errors.UnwrapGRPC(err)
+	}
+
+	blocks := make([]*model.Block, 0, len(resp.Blocks))
+
+	for _, blockBytes := range resp.Blocks {
+		block, err := model.NewBlockFromBytes(blockBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		blocks = append(blocks, block)
+	}
+
+	return blocks, nil
+}
+
+func (c *Client) FindBlocksContainingSubtree(ctx context.Context, subtreeHash *chainhash.Hash, maxBlocks uint32) ([]*model.Block, error) {
+	resp, err := c.client.FindBlocksContainingSubtree(ctx, &blockchain_api.FindBlocksContainingSubtreeRequest{
+		SubtreeHash: subtreeHash.CloneBytes(),
+		MaxBlocks:   maxBlocks,
+	})
+	if err != nil {
+		return nil, errors.UnwrapGRPC(err)
+	}
+
+	blocks := make([]*model.Block, 0, len(resp.Blocks))
+
+	for _, blockBytes := range resp.Blocks {
+		block, err := model.NewBlockFromBytes(blockBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		blocks = append(blocks, block)
+	}
+
+	return blocks, nil
 }
 
 // InvalidateBlock marks a block as invalid in the blockchain.
@@ -1329,7 +1400,7 @@ func (c *Client) GetBlocksMinedNotSet(ctx context.Context) ([]*model.Block, erro
 	blocks := make([]*model.Block, 0, len(resp.BlockBytes))
 
 	for _, blockBytes := range resp.BlockBytes {
-		block, err := model.NewBlockFromBytes(blockBytes, c.settings)
+		block, err := model.NewBlockFromBytes(blockBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -1391,7 +1462,7 @@ func (c *Client) GetBlocksSubtreesNotSet(ctx context.Context) ([]*model.Block, e
 	blocks := make([]*model.Block, 0, len(resp.BlockBytes))
 
 	for _, blockBytes := range resp.BlockBytes {
-		block, err := model.NewBlockFromBytes(blockBytes, c.settings)
+		block, err := model.NewBlockFromBytes(blockBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -1654,6 +1725,23 @@ func (c *Client) CatchUpBlocks(ctx context.Context) error {
 	c.logger.Infof("[Blockchain Client] Sending Catchup Transactions event")
 
 	_, err := c.client.CatchUpBlocks(ctx, &emptypb.Empty{})
+	if err != nil {
+		return errors.UnwrapGRPC(err)
+	}
+
+	return nil
+}
+
+// ReportPeerFailure reports a peer download failure to the blockchain service.
+func (c *Client) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
+	req := &blockchain_api.ReportPeerFailureRequest{
+		Hash:        hash[:],
+		PeerId:      peerID,
+		FailureType: failureType,
+		Reason:      reason,
+	}
+
+	_, err := c.client.ReportPeerFailure(ctx, req)
 	if err != nil {
 		return errors.UnwrapGRPC(err)
 	}

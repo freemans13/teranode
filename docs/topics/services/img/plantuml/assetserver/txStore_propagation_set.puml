@@ -30,7 +30,9 @@ activate Propagation
 Propagation -> Propagation : storeTransaction(btTx)
 activate Propagation
 
-Propagation -> TxStore : Set(txHash, txExtendedBytes)
+note right of Propagation : Preserves format as received
+
+Propagation -> TxStore : Set(txHash, txBytes)
 activate TxStore
 
 TxStore --> Propagation : Acknowledge Set

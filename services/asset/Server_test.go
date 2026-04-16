@@ -10,19 +10,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/settings"
-	"github.com/bitcoin-sv/teranode/stores/blob"
-	blobMemory "github.com/bitcoin-sv/teranode/stores/blob/memory"
-	blockchainstore "github.com/bitcoin-sv/teranode/stores/blockchain"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/stores/utxo/sql"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	blobMemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
-// getFreePort finds a free port to use for testing
+// getFreePort finds a free port for testing.
 func getFreePort(t *testing.T) int {
 	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
 	require.NoError(t, err)
@@ -33,6 +33,7 @@ func getFreePort(t *testing.T) int {
 	return port
 }
 
+// testCtx holds test dependencies for asset service testing.
 type testCtx struct {
 	server           *Server
 	logger           ulogger.Logger
@@ -42,6 +43,7 @@ type testCtx struct {
 	blobStore        blob.Store
 }
 
+// testSetup creates a test environment with required dependencies.
 func testSetup(t *testing.T) *testCtx {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)

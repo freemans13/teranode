@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/bitcoin-sv/teranode/stores/cleanup"
-	aerocleanup "github.com/bitcoin-sv/teranode/stores/utxo/aerospike/cleanup"
+	"github.com/bsv-blockchain/teranode/stores/cleanup"
+	aerocleanup "github.com/bsv-blockchain/teranode/stores/utxo/aerospike/cleanup"
 )
 
 // Ensure Store implements the cleanup.CleanupProvider interface
@@ -59,6 +59,7 @@ func (s *Store) GetCleanupService() (cleanup.Service, error) {
 	// Create options for the cleanup service
 	opts := aerocleanup.Options{
 		Logger:        s.logger,
+		Ctx:           s.ctx,
 		Client:        s.client,
 		ExternalStore: s.externalStore,
 		Namespace:     s.namespace,

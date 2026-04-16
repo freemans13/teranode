@@ -60,12 +60,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("[P2PNode] Peer ID: %s\n", libHost.ID().String())
-	fmt.Printf("[P2PNode] Connect to me on:\n")
+	fmt.Printf("[P2PClient] Peer ID: %s\n", libHost.ID().String())
+	fmt.Printf("[P2PClient] Connect to me on:\n")
 
 	// Print the addresses
 	for _, addr := range libHost.Addrs() {
-		fmt.Printf("[P2PNode]   %s/p2p/%s\n", addr, libHost.ID().String())
+		fmt.Printf("[P2PClient]   %s/p2p/%s\n", addr, libHost.ID().String())
 	}
 }
 

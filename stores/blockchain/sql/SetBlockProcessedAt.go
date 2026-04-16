@@ -3,9 +3,9 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/util"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // SetBlockProcessedAt updates the processed_at timestamp for a block.
@@ -50,6 +50,10 @@ func (s *SQL) SetBlockProcessedAt(ctx context.Context, blockHash *chainhash.Hash
 	// NOTE: We don't invalidate blocksCache here as processed_at isn't cached in blocksCache
 	// and ResetBlocksCache is expensive
 	s.ResetResponseCache()
+
+	if err = s.ResetBlocksCache(ctx); err != nil {
+		return errors.NewStorageError("error clearing caches", err)
+	}
 
 	return nil
 }

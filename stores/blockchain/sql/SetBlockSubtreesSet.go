@@ -3,8 +3,8 @@ package sql
 import (
 	"context"
 
-	"github.com/bitcoin-sv/teranode/errors"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 func (s *SQL) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash) error {
@@ -28,6 +28,10 @@ func (s *SQL) SetBlockSubtreesSet(ctx context.Context, blockHash *chainhash.Hash
 
 	// Invalidate response cache to ensure cached blocks reflect updated processed_at timestamp
 	s.ResetResponseCache()
+
+	if err = s.ResetBlocksCache(ctx); err != nil {
+		return errors.NewStorageError("error clearing caches", err)
+	}
 
 	return nil
 }

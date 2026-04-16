@@ -6,22 +6,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/teranode/errors"
-	"github.com/bitcoin-sv/teranode/model"
-	"github.com/bitcoin-sv/teranode/pkg/fileformat"
-	"github.com/bitcoin-sv/teranode/services/blockchain"
-	"github.com/bitcoin-sv/teranode/services/blockchain/blockchain_api"
-	"github.com/bitcoin-sv/teranode/settings"
-	bloboptions "github.com/bitcoin-sv/teranode/stores/blob/options"
-	"github.com/bitcoin-sv/teranode/stores/utxo"
-	"github.com/bitcoin-sv/teranode/ulogger"
-	"github.com/bitcoin-sv/teranode/util/test"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-bt/v2/unlocker"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/settings"
+	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -266,7 +266,7 @@ func createBlock(t *testing.T, header *model.BlockHeader, coinbaseTx *bt.Tx, sub
 		[]*chainhash.Hash{subtreeRoot},
 		uint64(subtree.Length()), //nolint:gosec
 		uint64(totalSize),        //nolint:gosec
-		100, 0, tSettings,
+		100, 0,
 	)
 
 	return block
@@ -345,7 +345,7 @@ func TestBlockValidation_ReportsInvalidBlock_OnInvalidBlock_UOM(t *testing.T) {
 		subtreeHashes,
 		uint64(subtree.Length()),  //nolint:gosec
 		uint64(coinbaseTx.Size()), //nolint:gosec
-		100, 0, tSettings,
+		100, 0,
 	)
 
 	// make the block invalid
@@ -477,7 +477,7 @@ func TestBlockValidation_ReportsInvalidBlock_OnInvalidBlock(t *testing.T) {
 		subtreeHashes,
 		uint64(subtree.Length()),  //nolint:gosec
 		uint64(coinbaseTx.Size()), //nolint:gosec
-		100, 0, tSettings,
+		100, 0,
 	)
 
 	// make the block invalid
