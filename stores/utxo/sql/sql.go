@@ -4604,6 +4604,29 @@ func buildINClause(hashes [][]byte, startIdx int) (string, []interface{}) {
 	return "(" + strings.Join(placeholders, ",") + ")", args
 }
 
+// outpointPair represents a (transaction hash, output index) pair for a composite IN filter.
+type outpointPair struct {
+	hash []byte
+	idx  uint32
+}
+
+// buildCompositeINClause generates a VALUES-style composite IN clause for a set of (hash, idx) pairs.
+// startIdx is the 1-based parameter index for the first placeholder ($startIdx, $startIdx+1, ...).
+// Returns the clause string like "(($3,$4),($5,$6))" and the args slice.
+// For empty input, returns ("", nil).
+func buildCompositeINClause(pairs []outpointPair, startIdx int) (string, []interface{}) {
+	if len(pairs) == 0 {
+		return "", nil
+	}
+	groups := make([]string, len(pairs))
+	args := make([]interface{}, 0, len(pairs)*2)
+	for i, p := range pairs {
+		groups[i] = fmt.Sprintf("($%d,$%d)", startIdx+(2*i), startIdx+(2*i)+1)
+		args = append(args, p.hash, p.idx)
+	}
+	return "(" + strings.Join(groups, ",") + ")", args
+}
+
 // buildMultiValueInsert generates a multi-row VALUES clause with positional parameters.
 // baseSQL is the INSERT ... VALUES prefix (without the actual values).
 // colsPerRow is the number of columns per row.
