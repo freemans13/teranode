@@ -92,10 +92,14 @@ const (
 // attempted. Keeping this in one place ensures both call sites stay in sync.
 //
 // These filters — not banned, has a DataHub URL, non-zero advertised height,
-// and sufficient reputation — are what defend us against a bad peer claiming
-// an inflated height. Peer selection applies an additional HTTP health check
-// when `settings.P2P.HealthCheckEnabled` is true, but that is layered on top
-// of these filters, not relied upon here.
+// and sufficient reputation — exclude obviously unsuitable peers. They are
+// not, on their own, a complete defense against a peer advertising an
+// inflated height: a peer can still claim an inflated height while passing
+// them (e.g., before reputation has been downgraded by catchup failures, or
+// when `settings.P2P.HealthCheckEnabled` is off). Protection against such
+// peers comes from the other layers — the HTTP health check in peer
+// selection when enabled, reputation adjustments after failed interactions,
+// and banning — not from a height-delta tolerance here.
 func isViableSyncCandidate(p *PeerInfo) bool {
 	return !p.IsBanned && p.DataHubURL != "" && p.Height != 0 && p.ReputationScore >= 20
 }
@@ -111,10 +115,11 @@ func (sc *SyncCoordinator) isCaughtUp() bool {
 	// This must align with sync peer selection criteria; otherwise, a low-quality
 	// peer we would never select could cause us to think we're perpetually behind.
 	for _, p := range peers {
-		// Only consider peers that satisfy the unconditional viability filters
-		// enforced here: not banned, with a DataHub URL, a non-zero height, and
-		// sufficient reputation. These filters are what defend us against a bad
-		// peer claiming an inflated height — no extra height-delta tolerance is
+		// Only consider peers that pass the unconditional viability filters
+		// (see isViableSyncCandidate). Additional defenses against peers
+		// advertising an inflated height — the HTTP health check when
+		// enabled, reputation downgrades after failed catchup, and banning —
+		// are handled elsewhere, so no extra height-delta tolerance is
 		// needed here.
 		if !isViableSyncCandidate(p) {
 			continue
