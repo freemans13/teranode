@@ -107,6 +107,10 @@ type Blockchain struct {
 	// Blob deletion batch token management
 	batchTokens   map[string]*blobDeletionBatchToken // Active batch tokens
 	batchTokensMu sync.RWMutex                       // Mutex for batch tokens map
+
+	// receivedAt tracks the wall-clock time each block header was first seen by
+	// this node, used by the subtree-only liveness gate.
+	receivedAt *receivedAtStore
 }
 
 // blobDeletionBatchToken represents an acquired batch of deletions with a lock.
@@ -163,6 +167,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		AppCtx:                        ctx,
 		blocksFinalKafkaAsyncProducer: blocksFinalKafkaAsyncProducer,
 		batchTokens:                   make(map[string]*blobDeletionBatchToken),
+		receivedAt:                    newReceivedAtStore(30 * time.Minute),
 	}
 
 	// Initialize subscription manager as not ready
@@ -843,6 +848,10 @@ func (b *Blockchain) AddBlock(ctx context.Context, request *blockchain_api.AddBl
 		return nil, errors.WrapGRPC(err)
 	}
 
+	// Record first-seen time for the subtree-only liveness gate.
+	// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md.
+	b.receivedAt.stamp(block.Hash())
+
 	// Clear difficulty cache when chain state changes to prevent stale cached values
 	// from causing incorrect difficulty calculations during rapid block processing
 	b.difficulty.ResetCache()
@@ -1224,6 +1233,30 @@ func (b *Blockchain) GetHashOfAncestorBlock(ctx context.Context, request *blockc
 
 	return &blockchain_api.GetHashOfAncestorBlockResponse{
 		Hash: hash[:],
+	}, nil
+}
+
+// GetHeaderReceivedAt returns the wall-clock timestamp this node first recorded
+// the given header, if still within the in-memory TTL.
+//
+// Returns found=false and received_at=nil for any hash we have no stamp for —
+// either because the header was never seen live, or because the stamp has
+// expired from the TTL-bounded store. Callers should treat "not found" the same
+// as "not live."
+func (b *Blockchain) GetHeaderReceivedAt(ctx context.Context, request *blockchain_api.GetHeaderReceivedAtRequest) (*blockchain_api.GetHeaderReceivedAtResponse, error) {
+	hash, err := chainhash.NewHash(request.BlockHash)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[GetHeaderReceivedAt] invalid block hash", err))
+	}
+
+	stamp, ok := b.receivedAt.lookup(hash)
+	if !ok {
+		return &blockchain_api.GetHeaderReceivedAtResponse{Found: false}, nil
+	}
+
+	return &blockchain_api.GetHeaderReceivedAtResponse{
+		Found:      true,
+		ReceivedAt: timestamppb.New(stamp),
 	}, nil
 }
 
