@@ -1350,11 +1350,15 @@ func Test_BlockFound(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 
-		// Drain the queued work so the background goroutine finishes before we
-		// assert, avoiding a race with the deferred cache.Stop().
-		time.Sleep(10 * time.Millisecond)
-		require.Equal(t, 1, len(server.blockFoundCh))
-		<-server.blockFoundCh
+		// Drain the queued work deterministically — BlockFound enqueues on a
+		// separate goroutine, so we block on the channel with a generous
+		// timeout instead of sleeping-then-checking len(), which is flaky on
+		// loaded CI.
+		select {
+		case <-server.blockFoundCh:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for blockFound work to be queued")
+		}
 
 		mockBlockchainClient.AssertNotCalled(t, "ReportPeerBlockHeaderSeen", mock.Anything, mock.Anything)
 	})
