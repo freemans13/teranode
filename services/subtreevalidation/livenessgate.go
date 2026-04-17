@@ -15,8 +15,6 @@ import (
 // wrapper and the catchup prefetch site in blockvalidation share exactly one
 // definition of "live." This wrapper layers Prometheus metrics + debug logging
 // on top so operators can see which decision branch fired.
-//
-// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md.
 func (u *Server) ShouldUseSubtreeOnlyPath(ctx context.Context, blockHash *chainhash.Hash) bool {
 	decision, err := livenessgate.Decide(
 		ctx,

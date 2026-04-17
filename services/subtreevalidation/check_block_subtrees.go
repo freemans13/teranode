@@ -61,10 +61,12 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	peerID := request.PeerId
 
 	// Once-per-block liveness gate. If true, every per-subtree worker in this
-	// invocation skips the subtreeData download and resolves transactions via
-	// the existing subtree manifest + UTXO/TxMetaCache + per-tx fetch path.
-	//
-	// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md.
+	// invocation skips the subtreeData download. In that path the per-subtree
+	// worker never populates subtreeTxs[subtreeIdx], so the block-level batch
+	// processTransactionsInLevels call is skipped entirely (batchTxCount == 0).
+	// Transaction resolution happens downstream in validation via the subtree
+	// manifest + UTXO/TxMetaCache, with per-tx fetch as the fallback for real
+	// misses (validator resolves each referenced tx hash on demand).
 	subtreeOnly := u.ShouldUseSubtreeOnlyPath(ctx, block.Hash())
 
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "CheckBlockSubtrees",
@@ -271,10 +273,12 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 				if subtreeOnly {
 					// Gate is on and the block's header was received recently — skip
-					// the subtreeData download entirely. The subtree structure was
-					// already populated from the hash manifest above; tx resolution
-					// happens later in processTransactionsInLevels via UTXO/TxMetaCache,
-					// with per-tx fetch for any real misses.
+					// the subtreeData download entirely. subtreeTxs[subtreeIdx] stays
+					// empty, so the block-level batch processTransactionsInLevels call
+					// downstream is skipped (batchTxCount == 0). Transaction resolution
+					// happens later in validation via the subtree manifest +
+					// UTXO/TxMetaCache, with per-tx fetch as the fallback for real
+					// misses.
 					return nil
 				}
 

@@ -855,8 +855,12 @@ func (b *Blockchain) AddBlock(ctx context.Context, request *blockchain_api.AddBl
 		return nil, errors.WrapGRPC(err)
 	}
 
-	// Record first-seen time for the subtree-only liveness gate.
-	// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md.
+	// Record first-seen time for the subtree-only liveness gate as a
+	// belt-and-braces fallback. The primary stamp happens earlier in
+	// blockvalidation.BlockFound via ReportPeerBlockHeaderSeen, but this write
+	// covers paths that reach AddBlock without having gone through BlockFound
+	// (e.g. locally mined blocks). Stamping is write-once, so double writes are
+	// cheap no-ops.
 	b.receivedAt.stamp(block.Hash())
 
 	// Clear difficulty cache when chain state changes to prevent stale cached values

@@ -1606,9 +1606,6 @@ func TestCheckBlockSubtrees_LivenessGate(t *testing.T) {
 // flip from RUNNING into CATCHINGBLOCKS even though the node is at tip; the
 // liveness gate must NOT consult FSM state because doing so would cascade every
 // subsequent block into subtreeData downloads and amplify the load.
-//
-// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md
-// section 5 (error table, FSM row) and section 7 (testing, PR #598 regression guard).
 func TestCheckBlockSubtrees_FSMCascadeDoesNotPoisonGate(t *testing.T) {
 	testHeaders := testhelpers.CreateTestHeaders(t, 1)
 

@@ -3,7 +3,10 @@
 // use the subtree-only path (skipping subtreeData downloads) based on
 // the age of its header's first-seen timestamp.
 //
-// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md.
+// The gate is an optimization enabled by SubtreeValidation.AssumeTxsBroadcastToAllNodes
+// when the operator trusts that peers broadcast transactions to all nodes. It is
+// never a correctness constraint — any fall-through returns false and the caller
+// uses the existing subtreeData path.
 package livenessgate
 
 import (

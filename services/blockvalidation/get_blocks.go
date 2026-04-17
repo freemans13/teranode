@@ -213,8 +213,6 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 			// was minted, skip the catchup subtreeData pre-fetch — CheckBlockSubtrees
 			// downstream will pull subtree manifests on demand, and the local
 			// UTXO/TxMetaCache + per-tx fetch path handles the rest.
-			//
-			// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md.
 			if livenessgate.ShouldUseSubtreeOnlyPath(
 				ctx,
 				u.blockchainClient,
