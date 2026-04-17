@@ -152,11 +152,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		logger.Errorf("[BlockAssembler] Couldn't create difficulty: %v", err)
 	}
 
-	// Settings may be nil in some test contexts; fall back to the default zero
-	// LivenessWindow so receivedAtTTL clamps to its 30m floor.
-	var livenessWindow time.Duration
-	if tSettings != nil {
-		livenessWindow = tSettings.SubtreeValidation.LivenessWindow
+	// Only allocate the receivedAt store (and its background cleanup goroutine)
+	// when the liveness gate is actually enabled — nodes running with the
+	// default config pay zero memory / goroutine cost. The stamp and lookup
+	// methods are nil-safe, so call sites don't need extra guards beyond the
+	// gate-setting checks they already perform.
+	var receivedAt *receivedAtStore
+	if tSettings != nil &&
+		tSettings.SubtreeValidation.AssumeTxsBroadcastToAllNodes &&
+		tSettings.SubtreeValidation.LivenessWindow > 0 {
+		receivedAt = newReceivedAtStore(receivedAtTTL(tSettings.SubtreeValidation.LivenessWindow))
 	}
 
 	b := &Blockchain{
@@ -174,7 +179,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		AppCtx:                        ctx,
 		blocksFinalKafkaAsyncProducer: blocksFinalKafkaAsyncProducer,
 		batchTokens:                   make(map[string]*blobDeletionBatchToken),
-		receivedAt:                    newReceivedAtStore(receivedAtTTL(livenessWindow)),
+		receivedAt:                    receivedAt,
 	}
 
 	// Initialize subscription manager as not ready
@@ -860,12 +865,17 @@ func (b *Blockchain) AddBlock(ctx context.Context, request *blockchain_api.AddBl
 	}
 
 	// Record first-seen time for the subtree-only liveness gate as a
-	// belt-and-braces fallback. The primary stamp happens earlier in
-	// blockvalidation.BlockFound via ReportPeerBlockHeaderSeen, but this write
-	// covers paths that reach AddBlock without having gone through BlockFound
-	// (e.g. locally mined blocks). Stamping is write-once, so double writes are
-	// cheap no-ops.
-	b.receivedAt.stamp(block.Hash())
+	// belt-and-braces fallback for paths that reach AddBlock without going
+	// through blockvalidation.BlockFound (e.g. locally mined blocks). Gated
+	// behind the operator-enabled flag so nodes that do not use the
+	// optimisation do not grow an in-memory map for every stored block during
+	// fast catchup. Stamping is write-once within the TTL, so the rare
+	// double-write (this call plus BlockFound) is a cheap no-op.
+	if b.settings != nil &&
+		b.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes &&
+		b.settings.SubtreeValidation.LivenessWindow > 0 {
+		b.receivedAt.stamp(block.Hash())
+	}
 
 	// Clear difficulty cache when chain state changes to prevent stale cached values
 	// from causing incorrect difficulty calculations during rapid block processing

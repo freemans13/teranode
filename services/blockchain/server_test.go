@@ -3838,9 +3838,18 @@ func Test_HeartbeatSenderStopsOnContextCancel(t *testing.T) {
 
 // TestGetHeaderReceivedAt_StampedOnAddBlock verifies that a block successfully
 // added via AddBlock has its header stamped with a ReceivedAt time retrievable
-// via GetHeaderReceivedAt.
+// via GetHeaderReceivedAt, when the liveness gate is enabled. AddBlock only
+// stamps when the gate is active to avoid growing the in-memory map during
+// fast catchup on nodes that don't use the optimisation.
 func TestGetHeaderReceivedAt_StampedOnAddBlock(t *testing.T) {
 	tc := setup(t)
+	// Enable the liveness gate so AddBlock performs its belt-and-braces stamp.
+	tc.server.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes = true
+	tc.server.settings.SubtreeValidation.LivenessWindow = time.Minute
+	// The receivedAt store is allocated only when the gate is on at construction,
+	// so initialise it here for this test that flips the setting after New.
+	tc.server.receivedAt = newReceivedAtStore(receivedAtTTL(tc.server.settings.SubtreeValidation.LivenessWindow))
+
 	block := mockBlock(tc, t)
 
 	subtreeHashBytes := make([][]byte, len(block.Subtrees))

@@ -37,7 +37,13 @@ func newReceivedAtStore(ttl time.Duration) *receivedAtStore {
 // hash within the TTL do not overwrite the initial stamp. After the TTL
 // elapses the prior entry has been evicted; a new stamp then records the new
 // observation rather than reviving the expired one.
+//
+// Safe to call on a nil receiver (useful when the liveness gate is disabled
+// and the store was not allocated); it is then a no-op.
 func (s *receivedAtStore) stamp(hash *chainhash.Hash) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -48,8 +54,12 @@ func (s *receivedAtStore) stamp(hash *chainhash.Hash) {
 }
 
 // lookup returns the stamp and true if the hash was seen within the TTL,
-// or a zero time and false otherwise.
+// or a zero time and false otherwise. Safe to call on a nil receiver — the
+// result is then (zero, false).
 func (s *receivedAtStore) lookup(hash *chainhash.Hash) (time.Time, bool) {
+	if s == nil {
+		return time.Time{}, false
+	}
 	return s.m.Get(*hash)
 }
 

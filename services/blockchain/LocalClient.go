@@ -42,11 +42,13 @@ type LocalClient struct {
 
 // NewLocalClient creates a new LocalClient instance with the provided dependencies.
 func NewLocalClient(logger ulogger.Logger, tSettings *settings.Settings, store blockchain.Store, subtreeStore blob.Store, utxoStore utxo.Store) (ClientI, error) {
-	// Settings may be nil in some test contexts; fall back to the default zero
-	// LivenessWindow so receivedAtTTL clamps to its 30m floor.
-	var livenessWindow time.Duration
-	if tSettings != nil {
-		livenessWindow = tSettings.SubtreeValidation.LivenessWindow
+	// Only allocate the receivedAt store (and its background cleanup goroutine)
+	// when the liveness gate is actually enabled.
+	var receivedAt *receivedAtStore
+	if tSettings != nil &&
+		tSettings.SubtreeValidation.AssumeTxsBroadcastToAllNodes &&
+		tSettings.SubtreeValidation.LivenessWindow > 0 {
+		receivedAt = newReceivedAtStore(receivedAtTTL(tSettings.SubtreeValidation.LivenessWindow))
 	}
 
 	return &LocalClient{
@@ -55,7 +57,7 @@ func NewLocalClient(logger ulogger.Logger, tSettings *settings.Settings, store b
 		store:        store,
 		subtreeStore: subtreeStore,
 		utxoStore:    utxoStore,
-		receivedAt:   newReceivedAtStore(receivedAtTTL(livenessWindow)),
+		receivedAt:   receivedAt,
 		subscribers:  make(map[string]chan *blockchain_api.Notification),
 	}, nil
 }
@@ -135,7 +137,15 @@ func (c *LocalClient) AddBlock(ctx context.Context, block *model.Block, peerID s
 		return err
 	}
 
-	c.receivedAt.stamp(block.Hash())
+	// Stamp the block header's first-seen time only when the subtree-only
+	// liveness gate is enabled; otherwise fast catchup would grow the
+	// in-memory receivedAt map for every stored block on nodes that don't
+	// use the optimisation.
+	if c.settings != nil &&
+		c.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes &&
+		c.settings.SubtreeValidation.LivenessWindow > 0 {
+		c.receivedAt.stamp(block.Hash())
+	}
 
 	c.logger.Infof("[Blockchain LocalClient] stored block %s (ID: %d, height: %d)", block.Hash(), ID, height)
 

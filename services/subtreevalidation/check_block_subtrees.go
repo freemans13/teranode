@@ -268,19 +268,22 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 				}
 
-				// PHASE 2: Exact pre-allocation
-				subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
-
 				if subtreeOnly {
 					// Gate is on and the block's header was received recently — skip
-					// the subtreeData download entirely. subtreeTxs[subtreeIdx] stays
-					// empty, so the block-level batch processTransactionsInLevels call
-					// downstream is skipped (batchTxCount == 0). Transaction resolution
-					// happens later in validation via the subtree manifest +
-					// UTXO/TxMetaCache, with per-tx fetch as the fallback for real
-					// misses.
+					// the subtreeData download entirely, including the exact
+					// pre-allocation for subtreeTxs[subtreeIdx] (would otherwise
+					// allocate cap=subtreeToCheck.Length() per missing subtree, which
+					// is wasted memory on the gated path). Leaving subtreeTxs[subtreeIdx]
+					// as the zero-value nil slice also ensures the block-level batch
+					// processTransactionsInLevels call downstream is skipped
+					// (batchTxCount == 0). Transaction resolution happens later in
+					// validation via the subtree manifest + UTXO/TxMetaCache, with
+					// per-tx fetch as the fallback for real misses.
 					return nil
 				}
+
+				// PHASE 2: Exact pre-allocation
+				subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
 
 				subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 				if err != nil {
