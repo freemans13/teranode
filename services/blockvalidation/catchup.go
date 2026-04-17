@@ -229,10 +229,9 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return err
 	}
 
-	// Early exit if no new blocks to process
+	// Early exit if no new blocks to process.
 	if len(catchupCtx.blockHeaders) == 0 {
-		u.logger.Infof("[catchup][%s] no new blocks to fetch - already synced", blockUpTo.Hash().String())
-		return nil
+		return u.handleNoNewHeaders(ctx, blockUpTo)
 	}
 
 	// Step 7: Build header chain cache for validation
@@ -263,6 +262,25 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 	// Report successful catchup to P2P service
 	u.reportCatchupSuccess(ctx, catchupCtx.peerID, time.Since(catchupCtx.startTime))
 
+	return nil
+}
+
+// handleNoNewHeaders is invoked when filterHeaders leaves zero headers to process.
+// A peer on a dead or shorter fork can legitimately return zero new headers even when
+// blockUpTo is unknown to us. Returning nil unconditionally would make the outer
+// peer-selection loop treat this as success and stop trying other peers, leaving the
+// node unable to sync past the announced block. Only treat it as "already synced"
+// when blockUpTo is actually in our chain; otherwise surface an error so the caller
+// moves on to the next peer.
+func (u *Server) handleNoNewHeaders(ctx context.Context, blockUpTo *model.Block) error {
+	exists, err := u.blockchainClient.GetBlockExists(ctx, blockUpTo.Hash())
+	if err != nil {
+		return errors.NewProcessingError("[catchup][%s] peer returned no new headers and block existence check failed: %v", blockUpTo.Hash().String(), err)
+	}
+	if !exists {
+		return errors.NewProcessingError("[catchup][%s] peer returned no new headers but target block is not in our chain - peer may be on a dead fork", blockUpTo.Hash().String())
+	}
+	u.logger.Infof("[catchup][%s] no new blocks to fetch - already synced", blockUpTo.Hash().String())
 	return nil
 }
 
