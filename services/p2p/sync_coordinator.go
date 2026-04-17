@@ -92,14 +92,15 @@ const (
 // attempted. Keeping this in one place ensures both call sites stay in sync.
 //
 // These filters — not banned, has a DataHub URL, non-zero advertised height,
-// and sufficient reputation — exclude obviously unsuitable peers. They are
-// not, on their own, a complete defense against a peer advertising an
-// inflated height: a peer can still claim an inflated height while passing
-// them (e.g., before reputation has been downgraded by catchup failures, or
-// when `settings.P2P.HealthCheckEnabled` is off). Protection against such
-// peers comes from the other layers — the HTTP health check in peer
-// selection when enabled, reputation adjustments after failed interactions,
-// and banning — not from a height-delta tolerance here.
+// and sufficient reputation — exclude obviously unsuitable peers. They do
+// not validate whether a peer's advertised height is truthful: a peer can
+// still claim an inflated height while passing them. The HTTP health check
+// applied during peer selection (when `settings.P2P.HealthCheckEnabled` is
+// true) only confirms that the peer's DataHub endpoint is reachable; it
+// does not check the advertised height either. Validation of advertised
+// height is handled elsewhere, via catchup validation, reputation
+// downgrades after failed catchup, and banning — not by a height-delta
+// tolerance here.
 func isViableSyncCandidate(p *PeerInfo) bool {
 	return !p.IsBanned && p.DataHubURL != "" && p.Height != 0 && p.ReputationScore >= 20
 }
@@ -116,10 +117,11 @@ func (sc *SyncCoordinator) isCaughtUp() bool {
 	// peer we would never select could cause us to think we're perpetually behind.
 	for _, p := range peers {
 		// Only consider peers that pass the unconditional viability filters
-		// (see isViableSyncCandidate). Additional defenses against peers
-		// advertising an inflated height — the HTTP health check when
-		// enabled, reputation downgrades after failed catchup, and banning —
-		// are handled elsewhere, so no extra height-delta tolerance is
+		// (see isViableSyncCandidate). The HTTP health check, when enabled,
+		// only confirms that the peer's DataHub endpoint is reachable.
+		// Validation of whether an advertised height is truthful is handled
+		// elsewhere via catchup validation, reputation downgrades after
+		// failed catchup, and banning, so no extra height-delta tolerance is
 		// needed here.
 		if !isViableSyncCandidate(p) {
 			continue
