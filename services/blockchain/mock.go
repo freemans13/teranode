@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/bsv-blockchain/teranode/util/livenessgate"
 	"github.com/stretchr/testify/mock"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -19,6 +20,7 @@ import (
 )
 
 var _ ClientI = (*Mock)(nil)
+var _ livenessgate.Client = (*Mock)(nil)
 
 // Mock implements the blockchain.ClientI interface for testing purposes.
 type Mock struct {

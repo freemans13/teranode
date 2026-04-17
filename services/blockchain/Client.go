@@ -24,12 +24,14 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/livenessgate"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var _ ClientI = (*Client)(nil)
+var _ livenessgate.Client = (*Client)(nil)
 
 // clientSubscriber represents a subscriber to blockchain notifications.
 type clientSubscriber struct {
