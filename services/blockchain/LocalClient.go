@@ -22,6 +22,8 @@ import (
 	"github.com/bsv-blockchain/teranode/util/health"
 )
 
+var _ ClientI = (*LocalClient)(nil)
+
 // LocalClient implements a blockchain client with direct store access.
 type LocalClient struct {
 	logger       ulogger.Logger     // Logger instance

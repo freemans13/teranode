@@ -29,6 +29,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
+var _ ClientI = (*Client)(nil)
+
 // clientSubscriber represents a subscriber to blockchain notifications.
 type clientSubscriber struct {
 	source string                            // Source identifier of the subscriber

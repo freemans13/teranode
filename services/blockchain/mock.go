@@ -18,6 +18,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+var _ ClientI = (*Mock)(nil)
+
 // Mock implements the blockchain.ClientI interface for testing purposes.
 type Mock struct {
 	mock.Mock
