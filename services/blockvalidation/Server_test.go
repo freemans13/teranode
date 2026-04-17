@@ -1131,11 +1131,9 @@ func Test_BlockFound(t *testing.T) {
 	hashBytes := hash.CloneBytes()
 
 	t.Run("block already exists", func(t *testing.T) {
-		mockBlockchainClient := &blockchain.Mock{}
-		// BlockFound now seeds the liveness gate via ReportPeerBlockHeaderSeen before
-		// checking whether the block already exists.
-		mockBlockchainClient.On("ReportPeerBlockHeaderSeen", mock.Anything, &hash).Return(nil)
-
+		// With default settings (AssumeTxsBroadcastToAllNodes=false) BlockFound
+		// does not call ReportPeerBlockHeaderSeen — the short-circuit on
+		// GetBlockExists returns before any blockchain client calls.
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
@@ -1148,11 +1146,10 @@ func Test_BlockFound(t *testing.T) {
 		require.NoError(t, err)
 
 		server := &Server{
-			logger:           logger,
-			settings:         tSettings,
-			blockValidation:  bv,
-			blockchainClient: mockBlockchainClient,
-			stats:            gocore.NewStat("test"),
+			logger:          logger,
+			settings:        tSettings,
+			blockValidation: bv,
+			stats:           gocore.NewStat("test"),
 		}
 
 		req := &blockvalidation_api.BlockFoundRequest{
@@ -1168,7 +1165,6 @@ func Test_BlockFound(t *testing.T) {
 	t.Run("new block without wait", func(t *testing.T) {
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, &hash).Return(false, nil)
-		mockBlockchainClient.On("ReportPeerBlockHeaderSeen", mock.Anything, &hash).Return(nil)
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
@@ -1213,7 +1209,6 @@ func Test_BlockFound(t *testing.T) {
 	t.Run("new block with wait - success", func(t *testing.T) {
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, &hash).Return(false, nil)
-		mockBlockchainClient.On("ReportPeerBlockHeaderSeen", mock.Anything, &hash).Return(nil)
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
@@ -1256,7 +1251,6 @@ func Test_BlockFound(t *testing.T) {
 	t.Run("new block with wait - error", func(t *testing.T) {
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, &hash).Return(false, nil)
-		mockBlockchainClient.On("ReportPeerBlockHeaderSeen", mock.Anything, &hash).Return(nil)
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
@@ -1313,6 +1307,46 @@ func Test_BlockFound(t *testing.T) {
 		require.Error(t, err)
 		require.Nil(t, resp)
 		require.Contains(t, err.Error(), "failed to create hash from bytes")
+	})
+
+	t.Run("ReportPeerBlockHeaderSeen only fires when gate setting is enabled", func(t *testing.T) {
+		// When AssumeTxsBroadcastToAllNodes is false (default), BlockFound must
+		// NOT call ReportPeerBlockHeaderSeen — the extra RPC would add overhead
+		// on the hot path for nodes not using the optimisation.
+		mockBlockchainClient := &blockchain.Mock{}
+		// Intentionally only program GetBlockExists — AssertNotCalled below
+		// verifies the stamp RPC is skipped.
+		// Allow any call sequence that doesn't include our gated RPC.
+
+		gateOffSettings := test.CreateBaseTestSettings(t)
+		gateOffSettings.SubtreeValidation.AssumeTxsBroadcastToAllNodes = false
+
+		bv := &BlockValidation{
+			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockchainClient:              mockBlockchainClient,
+		}
+		defer bv.blockExistsCache.Stop()
+		require.NoError(t, bv.SetBlockExists(&hash)) // short-circuits after stamp check
+
+		server := &Server{
+			logger:           logger,
+			settings:         gateOffSettings,
+			blockchainClient: mockBlockchainClient,
+			blockValidation:  bv,
+			stats:            gocore.NewStat("test"),
+		}
+
+		req := &blockvalidation_api.BlockFoundRequest{
+			Hash:    hashBytes,
+			BaseUrl: "http://test.com",
+		}
+
+		resp, err := server.BlockFound(ctx, req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		mockBlockchainClient.AssertNotCalled(t, "ReportPeerBlockHeaderSeen", mock.Anything, mock.Anything)
 	})
 }
 
