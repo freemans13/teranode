@@ -29,6 +29,7 @@ type LocalClient struct {
 	store        blockchain.Store   // Blockchain store
 	subtreeStore blob.Store         // Subtree store
 	utxoStore    utxo.Store         // UTXO store
+	receivedAt   *receivedAtStore   // First-seen timestamps for block headers
 
 	// Subscription management
 	subscribersMu sync.RWMutex
@@ -43,6 +44,7 @@ func NewLocalClient(logger ulogger.Logger, tSettings *settings.Settings, store b
 		store:        store,
 		subtreeStore: subtreeStore,
 		utxoStore:    utxoStore,
+		receivedAt:   newReceivedAtStore(30 * time.Minute),
 		subscribers:  make(map[string]chan *blockchain_api.Notification),
 	}, nil
 }
@@ -107,6 +109,8 @@ func (c *LocalClient) AddBlock(ctx context.Context, block *model.Block, peerID s
 	if err != nil {
 		return err
 	}
+
+	c.receivedAt.stamp(block.Hash())
 
 	c.logger.Infof("[Blockchain LocalClient] stored block %s (ID: %d, height: %d)", block.Hash(), ID, height)
 
@@ -221,6 +225,16 @@ func (c *LocalClient) GetBestBlockHeader(ctx context.Context) (*model.BlockHeade
 
 func (c *LocalClient) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
 	return c.store.GetBlockHeader(ctx, blockHash)
+}
+
+// GetHeaderReceivedAt returns the local first-seen timestamp for the given
+// block header, from this client's in-memory store. See ClientI for semantics.
+func (c *LocalClient) GetHeaderReceivedAt(_ context.Context, hash *chainhash.Hash) (time.Time, bool, error) {
+	stamp, ok := c.receivedAt.lookup(hash)
+	if !ok {
+		return time.Time{}, false, nil
+	}
+	return stamp, true, nil
 }
 
 func (c *LocalClient) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {

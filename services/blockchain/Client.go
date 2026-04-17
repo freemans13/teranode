@@ -748,6 +748,21 @@ func (c *Client) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) 
 	return header, meta, nil
 }
 
+// GetHeaderReceivedAt retrieves the first-seen timestamp for a block header
+// from the remote blockchain service. See ClientI for semantics.
+func (c *Client) GetHeaderReceivedAt(ctx context.Context, hash *chainhash.Hash) (time.Time, bool, error) {
+	resp, err := c.client.GetHeaderReceivedAt(ctx, &blockchain_api.GetHeaderReceivedAtRequest{
+		BlockHash: hash.CloneBytes(),
+	})
+	if err != nil {
+		return time.Time{}, false, errors.UnwrapGRPC(err)
+	}
+	if !resp.Found {
+		return time.Time{}, false, nil
+	}
+	return resp.ReceivedAt.AsTime(), true, nil
+}
+
 // GetBlockHeaders retrieves multiple block headers starting from a specific hash.
 func (c *Client) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	resp, err := c.client.GetBlockHeaders(ctx, &blockchain_api.GetBlockHeadersRequest{

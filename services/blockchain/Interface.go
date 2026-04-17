@@ -8,6 +8,7 @@ package blockchain
 
 import (
 	"context"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
@@ -320,6 +321,11 @@ type ClientI interface {
 	// - BlockHeaderMeta containing additional metadata about the header
 	// - Error if the header retrieval fails
 	GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error)
+
+	// GetHeaderReceivedAt returns the wall-clock timestamp this node first recorded
+	// the given block header. Returns (_, false, nil) if absent or TTL-expired; callers
+	// should treat that the same as "not live for this block."
+	GetHeaderReceivedAt(ctx context.Context, hash *chainhash.Hash) (time.Time, bool, error)
 
 	// GetBlockHeaders retrieves multiple block headers.
 	//
