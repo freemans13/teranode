@@ -1601,6 +1601,93 @@ func TestCheckBlockSubtrees_LivenessGate(t *testing.T) {
 	})
 }
 
+// TestCheckBlockSubtrees_FSMCascadeDoesNotPoisonGate guards against the regression
+// that forced PR #598 to be reverted (see also PR #647). Under load, the FSM can
+// flip from RUNNING into CATCHINGBLOCKS even though the node is at tip; the
+// liveness gate must NOT consult FSM state because doing so would cascade every
+// subsequent block into subtreeData downloads and amplify the load.
+//
+// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md
+// section 5 (error table, FSM row) and section 7 (testing, PR #598 regression guard).
+func TestCheckBlockSubtrees_FSMCascadeDoesNotPoisonGate(t *testing.T) {
+	testHeaders := testhelpers.CreateTestHeaders(t, 1)
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Disable batched store lookups so GetMeta mock returns a hit without needing
+	// a BatchDecorate implementation — keeps processTxMetaUsingStore at 0 misses.
+	server.settings.SubtreeValidation.BatchMissingTransactions = false
+
+	// Gate ON with a one-minute liveness window.
+	server.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes = true
+	server.settings.SubtreeValidation.LivenessWindow = time.Minute
+
+	mockClient := server.blockchainClient.(*blockchain.Mock)
+	mockClient.On("GetBestBlockHeader", mock.Anything).
+		Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Maybe()
+	mockClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+		Return([]uint32{1, 2, 3}, nil).Maybe()
+
+	// FSM is in CATCHINGBLOCKS — NOT RUNNING.
+	// IsFSMCurrentState(RUNNING) returns false; GetFSMCurrentState returns CATCHINGBLOCKS.
+	mockClient.On("IsFSMCurrentState", mock.Anything, blockchain.FSMStateRUNNING).
+		Return(false, nil).Maybe()
+	catchingBlocks := blockchain.FSMStateCATCHINGBLOCKS
+	mockClient.On("GetFSMCurrentState", mock.Anything).
+		Return(&catchingBlocks, nil).Maybe()
+
+	// Fresh ReceivedAt stamp: 10 seconds ago — well inside the 1-minute window.
+	mockClient.On("GetHeaderReceivedAt", mock.Anything, mock.Anything).
+		Return(time.Now().Add(-10*time.Second), true, nil).Maybe()
+
+	server.utxoStore.(*utxo.MockUtxostore).On("GetMeta", mock.Anything, mock.Anything, mock.Anything).
+		Return(nil).Maybe()
+
+	// Build a single-tx subtree and pre-populate FileTypeSubtreeToCheck.
+	// FileTypeSubtreeData is intentionally absent — the gate must skip it.
+	tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+	require.NoError(t, err)
+
+	subtree, err := subtreepkg.NewTreeByLeafCount(1)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+
+	subtreeBytes, err := subtree.Serialize()
+	require.NoError(t, err)
+
+	err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
+	require.NoError(t, err)
+	// FileTypeSubtreeData intentionally NOT stored.
+
+	header := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Timestamp:      uint32(time.Now().Unix()),
+		Bits:           model.NBit{},
+		Nonce:          0,
+	}
+	coinbaseTx := &bt.Tx{Version: 1}
+	block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash()}, 1, 400, 0, 0)
+	require.NoError(t, err)
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	// Unreachable BaseUrl — any subtreeData HTTP attempt would fail deterministically.
+	// The gate must short-circuit before touching the network.
+	request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+		Block:   blockBytes,
+		BaseUrl: "http://127.0.0.1:1",
+	}
+
+	_, callErr := server.CheckBlockSubtrees(context.Background(), request)
+	require.NoError(t, callErr,
+		"liveness gate must return true for a fresh ReceivedAt stamp regardless of FSM being CATCHINGBLOCKS; "+
+			"if this fails the gate has regressed into consulting FSM state (PR #598 / #647 regression)")
+}
+
 func TestBlessMissingTransaction(t *testing.T) {
 	t.Run("SuccessfulBlessing", func(t *testing.T) {
 		server, cleanup := setupTestServer(t)
