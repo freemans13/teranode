@@ -110,6 +110,10 @@ service BlockchainAPI {
   // GetBlockHeader retrieves the header of a specific block.
   rpc GetBlockHeader(GetBlockHeaderRequest) returns (GetBlockHeaderResponse) {}
 
+  // GetHeaderReceivedAt returns the wall-clock timestamp this node first recorded
+  // the given block header, if within the in-memory TTL.
+  rpc GetHeaderReceivedAt (GetHeaderReceivedAtRequest) returns (GetHeaderReceivedAtResponse) {}
+
   // InvalidateBlock marks a block as invalid in the blockchain.
   rpc InvalidateBlock(InvalidateBlockRequest) returns (InvalidateBlockResponse) {}
 
@@ -834,4 +838,13 @@ message BatchTokenInfo {
   int64 acquired_at = 2;  // Unix timestamp
   int32 deletion_count = 3;
   repeated int64 deletion_ids = 4;
+}
+
+message GetHeaderReceivedAtRequest {
+  bytes block_hash = 1;
+}
+
+message GetHeaderReceivedAtResponse {
+  bool found = 1;
+  google.protobuf.Timestamp received_at = 2;
 }
