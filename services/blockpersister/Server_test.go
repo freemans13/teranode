@@ -693,6 +693,9 @@ func (m *MockBlockchainClient) GetBlockHeader(ctx context.Context, blockHash *ch
 func (m *MockBlockchainClient) GetHeaderReceivedAt(_ context.Context, _ *chainhash.Hash) (time.Time, bool, error) {
 	return time.Time{}, false, nil
 }
+func (m *MockBlockchainClient) ReportPeerBlockHeaderSeen(_ context.Context, _ *chainhash.Hash) error {
+	return nil
+}
 func (m *MockBlockchainClient) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	return nil, nil, nil
 }

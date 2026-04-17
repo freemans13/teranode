@@ -20,26 +20,76 @@ type Client interface {
 	GetHeaderReceivedAt(ctx context.Context, hash *chainhash.Hash) (time.Time, bool, error)
 }
 
-// ShouldUseSubtreeOnlyPath returns true when block validation can safely
-// skip the subtreeData download for this block.
+// Decision describes why the gate resolved the way it did. Callers that
+// emit metrics or log diagnostics use this to distinguish fall-through
+// causes (error / absent stamp / stale stamp) from the disabled-setting
+// short-circuit and the happy subtree-only path.
+type Decision int
+
+const (
+	// DecisionSubtreeData — gate disabled by setting, or stamp is stale.
+	// Caller must fall back to the subtreeData path.
+	DecisionSubtreeData Decision = iota
+	// DecisionSubtreeOnly — stamp is within the liveness window; caller
+	// may skip subtreeData and rely on the local UTXO/TxMetaCache.
+	DecisionSubtreeOnly
+	// DecisionNotFound — blockchain client has no stamp for this header.
+	// Caller must fall back to the subtreeData path.
+	DecisionNotFound
+	// DecisionError — the blockchain client returned an error. Caller must
+	// fall back to the subtreeData path.
+	DecisionError
+)
+
+// String returns a stable lowercase label suitable for use as a Prometheus
+// metric value. Callers should prefer these labels so dashboards stay
+// consistent across call sites.
+func (d Decision) String() string {
+	switch d {
+	case DecisionSubtreeOnly:
+		return "subtreeonly"
+	case DecisionNotFound:
+		return "notfound"
+	case DecisionError:
+		return "err"
+	default:
+		return "subtreedata"
+	}
+}
+
+// Decide is the single source of truth for the gate's decision. It returns
+// the resolved Decision plus any client error. Callers that only want the
+// boolean answer should use ShouldUseSubtreeOnlyPath; callers that also
+// want to emit metrics/logging use Decide directly.
 //
-// Returns true only when BOTH:
-//   - the caller declared the gate enabled (typically from
-//     SubtreeValidation.AssumeTxsBroadcastToAllNodes), AND
-//   - the blockchain client has a ReceivedAt stamp for this header that
-//     is newer than window.
+// The gate resolves to DecisionSubtreeOnly only when BOTH:
+//   - enabled is true (typically from SubtreeValidation.AssumeTxsBroadcastToAllNodes), AND
+//   - the blockchain client has a ReceivedAt stamp for this header newer than window.
 //
-// Any error from the blockchain client, an absent stamp, or a stale
-// stamp returns false — callers fall through to the subtreeData path.
-// The gate is an optimization, never a correctness constraint. Callers
-// that want metrics or logging should wrap this function.
-func ShouldUseSubtreeOnlyPath(ctx context.Context, client Client, blockHash *chainhash.Hash, enabled bool, window time.Duration) bool {
+// Any other outcome (disabled, error, absent stamp, stale stamp) resolves
+// to a subtreeData fallback. The gate is an optimization, never a
+// correctness constraint.
+func Decide(ctx context.Context, client Client, blockHash *chainhash.Hash, enabled bool, window time.Duration) (Decision, error) {
 	if !enabled {
-		return false
+		return DecisionSubtreeData, nil
 	}
 	stamp, found, err := client.GetHeaderReceivedAt(ctx, blockHash)
-	if err != nil || !found {
-		return false
+	if err != nil {
+		return DecisionError, err
 	}
-	return time.Since(stamp) <= window
+	if !found {
+		return DecisionNotFound, nil
+	}
+	if time.Since(stamp) > window {
+		return DecisionSubtreeData, nil
+	}
+	return DecisionSubtreeOnly, nil
+}
+
+// ShouldUseSubtreeOnlyPath returns true when block validation can safely
+// skip the subtreeData download for this block. It is a thin wrapper over
+// Decide for callers that do not need the decision reason.
+func ShouldUseSubtreeOnlyPath(ctx context.Context, client Client, blockHash *chainhash.Hash, enabled bool, window time.Duration) bool {
+	decision, _ := Decide(ctx, client, blockHash, enabled, window)
+	return decision == DecisionSubtreeOnly
 }

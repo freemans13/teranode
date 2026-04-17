@@ -42,13 +42,20 @@ type LocalClient struct {
 
 // NewLocalClient creates a new LocalClient instance with the provided dependencies.
 func NewLocalClient(logger ulogger.Logger, tSettings *settings.Settings, store blockchain.Store, subtreeStore blob.Store, utxoStore utxo.Store) (ClientI, error) {
+	// Settings may be nil in some test contexts; fall back to the default zero
+	// LivenessWindow so receivedAtTTL clamps to its 30m floor.
+	var livenessWindow time.Duration
+	if tSettings != nil {
+		livenessWindow = tSettings.SubtreeValidation.LivenessWindow
+	}
+
 	return &LocalClient{
 		logger:       logger,
 		settings:     tSettings,
 		store:        store,
 		subtreeStore: subtreeStore,
 		utxoStore:    utxoStore,
-		receivedAt:   newReceivedAtStore(30 * time.Minute),
+		receivedAt:   newReceivedAtStore(receivedAtTTL(livenessWindow)),
 		subscribers:  make(map[string]chan *blockchain_api.Notification),
 	}, nil
 }
@@ -239,6 +246,13 @@ func (c *LocalClient) GetHeaderReceivedAt(_ context.Context, hash *chainhash.Has
 		return time.Time{}, false, nil
 	}
 	return stamp, true, nil
+}
+
+// ReportPeerBlockHeaderSeen stamps the first-seen time for a header in this
+// client's in-memory store. See ClientI for semantics.
+func (c *LocalClient) ReportPeerBlockHeaderSeen(_ context.Context, hash *chainhash.Hash) error {
+	c.receivedAt.stamp(hash)
+	return nil
 }
 
 func (c *LocalClient) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {

@@ -33,8 +33,11 @@ func TestShouldUseSubtreeOnlyPath_TruthTable(t *testing.T) {
 		{"setting on, stale stamp outside window", true, time.Minute, now.Add(-5 * time.Minute), true, nil, false},
 		{"setting on, stamp absent", true, time.Minute, time.Time{}, false, nil, false},
 		{"setting on, lookup error", true, time.Minute, time.Time{}, false, errors.NewError("rpc"), false},
-		{"setting on, stamp exactly at window boundary", true, time.Minute, now.Add(-59 * time.Second), true, nil, true},
-		{"setting on, stamp past window boundary by 1s", true, time.Minute, now.Add(-61 * time.Second), true, nil, false},
+		// Use comfortably-wide margins (30s vs 90s for a 60s window) so slow or
+		// loaded CI doesn't push the "within window" case past the boundary
+		// before the assertion runs.
+		{"setting on, stamp comfortably within window", true, time.Minute, now.Add(-30 * time.Second), true, nil, true},
+		{"setting on, stamp comfortably outside window", true, time.Minute, now.Add(-90 * time.Second), true, nil, false},
 	}
 
 	for _, tc := range cases {

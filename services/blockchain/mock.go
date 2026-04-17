@@ -206,6 +206,12 @@ func (m *Mock) GetHeaderReceivedAt(ctx context.Context, hash *chainhash.Hash) (t
 	return args.Get(0).(time.Time), args.Bool(1), args.Error(2)
 }
 
+// ReportPeerBlockHeaderSeen mocks the ReportPeerBlockHeaderSeen method.
+func (m *Mock) ReportPeerBlockHeaderSeen(ctx context.Context, hash *chainhash.Hash) error {
+	args := m.Called(ctx, hash)
+	return args.Error(0)
+}
+
 // GetBlockHeaders mocks the GetBlockHeaders method
 func (m *Mock) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	args := m.Called(ctx, blockHash, numberOfHeaders)

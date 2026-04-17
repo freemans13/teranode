@@ -74,3 +74,19 @@ func TestReceivedAtStore_Expiration(t *testing.T) {
 	_, found = s.lookup(&h)
 	require.False(t, found, "entry older than TTL must have been evicted")
 }
+
+func TestReceivedAtTTL(t *testing.T) {
+	t.Run("small liveness window clamps to 30m floor", func(t *testing.T) {
+		require.Equal(t, 30*time.Minute, receivedAtTTL(time.Minute))
+		require.Equal(t, 30*time.Minute, receivedAtTTL(0))
+		require.Equal(t, 30*time.Minute, receivedAtTTL(14*time.Minute))
+		// Exactly at the floor boundary: 2×15m = 30m, still returns the floor.
+		require.Equal(t, 30*time.Minute, receivedAtTTL(15*time.Minute))
+	})
+
+	t.Run("large liveness window scales to 2× window", func(t *testing.T) {
+		require.Equal(t, time.Hour+2*time.Second, receivedAtTTL(30*time.Minute+time.Second))
+		require.Equal(t, 2*time.Hour, receivedAtTTL(time.Hour))
+		require.Equal(t, 24*time.Hour, receivedAtTTL(12*time.Hour))
+	})
+}

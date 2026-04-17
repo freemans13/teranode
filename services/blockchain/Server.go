@@ -152,6 +152,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		logger.Errorf("[BlockAssembler] Couldn't create difficulty: %v", err)
 	}
 
+	// Settings may be nil in some test contexts; fall back to the default zero
+	// LivenessWindow so receivedAtTTL clamps to its 30m floor.
+	var livenessWindow time.Duration
+	if tSettings != nil {
+		livenessWindow = tSettings.SubtreeValidation.LivenessWindow
+	}
+
 	b := &Blockchain{
 		store:                         store,
 		logger:                        logger,
@@ -167,7 +174,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		AppCtx:                        ctx,
 		blocksFinalKafkaAsyncProducer: blocksFinalKafkaAsyncProducer,
 		batchTokens:                   make(map[string]*blobDeletionBatchToken),
-		receivedAt:                    newReceivedAtStore(30 * time.Minute),
+		receivedAt:                    newReceivedAtStore(receivedAtTTL(livenessWindow)),
 	}
 
 	// Initialize subscription manager as not ready
@@ -1258,6 +1265,24 @@ func (b *Blockchain) GetHeaderReceivedAt(ctx context.Context, request *blockchai
 		Found:      true,
 		ReceivedAt: timestamppb.New(stamp),
 	}, nil
+}
+
+// ReportPeerBlockHeaderSeen records the current wall-clock time as the first-seen
+// stamp for the supplied header hash. Repeated calls for the same hash are no-ops.
+//
+// Called by blockvalidation.BlockFound so the subtree-only liveness gate has a
+// stamp to consult before subtreeData fetch decisions are made. Without this
+// pre-stamp, the gate would only see stamps written by AddBlock (after
+// validation completes), rendering the optimization a no-op.
+func (b *Blockchain) ReportPeerBlockHeaderSeen(_ context.Context, request *blockchain_api.ReportPeerBlockHeaderSeenRequest) (*emptypb.Empty, error) {
+	hash, err := chainhash.NewHash(request.BlockHash)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[ReportPeerBlockHeaderSeen] invalid block hash", err))
+	}
+
+	b.receivedAt.stamp(hash)
+
+	return &emptypb.Empty{}, nil
 }
 
 func (b *Blockchain) GetLatestBlockHeaderFromBlockLocatorRequest(ctx context.Context, request *blockchain_api.GetLatestBlockHeaderFromBlockLocatorRequest) (*blockchain_api.GetBlockHeaderResponse, error) {

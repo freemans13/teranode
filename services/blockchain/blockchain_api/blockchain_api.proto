@@ -114,6 +114,12 @@ service BlockchainAPI {
   // the given block header, if within the in-memory TTL.
   rpc GetHeaderReceivedAt (GetHeaderReceivedAtRequest) returns (GetHeaderReceivedAtResponse) {}
 
+  // ReportPeerBlockHeaderSeen records the current wall-clock time as the first-seen
+  // stamp for the given block header, unless one already exists. Used by
+  // blockvalidation.BlockFound to seed the subtree-only liveness gate before
+  // subtreeData fetch decisions are made.
+  rpc ReportPeerBlockHeaderSeen (ReportPeerBlockHeaderSeenRequest) returns (google.protobuf.Empty) {}
+
   // InvalidateBlock marks a block as invalid in the blockchain.
   rpc InvalidateBlock(InvalidateBlockRequest) returns (InvalidateBlockResponse) {}
 
@@ -847,4 +853,8 @@ message GetHeaderReceivedAtRequest {
 message GetHeaderReceivedAtResponse {
   bool found = 1;
   google.protobuf.Timestamp received_at = 2;
+}
+
+message ReportPeerBlockHeaderSeenRequest {
+  bytes block_hash = 1;
 }

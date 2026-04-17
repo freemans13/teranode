@@ -767,6 +767,18 @@ func (c *Client) GetHeaderReceivedAt(ctx context.Context, hash *chainhash.Hash) 
 	return resp.ReceivedAt.AsTime(), true, nil
 }
 
+// ReportPeerBlockHeaderSeen stamps the first-seen time for a block header on
+// the remote blockchain service. See ClientI for semantics.
+func (c *Client) ReportPeerBlockHeaderSeen(ctx context.Context, hash *chainhash.Hash) error {
+	_, err := c.client.ReportPeerBlockHeaderSeen(ctx, &blockchain_api.ReportPeerBlockHeaderSeenRequest{
+		BlockHash: hash.CloneBytes(),
+	})
+	if err != nil {
+		return errors.UnwrapGRPC(err)
+	}
+	return nil
+}
+
 // GetBlockHeaders retrieves multiple block headers starting from a specific hash.
 func (c *Client) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	resp, err := c.client.GetBlockHeaders(ctx, &blockchain_api.GetBlockHeadersRequest{

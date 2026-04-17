@@ -45,3 +45,34 @@ func TestShouldUseSubtreeOnlyPath(t *testing.T) {
 		})
 	}
 }
+
+func TestDecide(t *testing.T) {
+	h := chainhash.HashH([]byte("block"))
+	now := time.Now()
+	rpcErr := errors.NewError("rpc error")
+
+	cases := []struct {
+		name         string
+		enabled      bool
+		client       *stubClient
+		window       time.Duration
+		wantDecision Decision
+		wantErr      error
+		wantLabel    string
+	}{
+		{"disabled short-circuits before client call", false, &stubClient{stamp: now, found: true}, time.Minute, DecisionSubtreeData, nil, "subtreedata"},
+		{"fresh stamp yields subtree-only", true, &stubClient{stamp: now.Add(-10 * time.Second), found: true}, time.Minute, DecisionSubtreeOnly, nil, "subtreeonly"},
+		{"stale stamp yields subtreedata", true, &stubClient{stamp: now.Add(-5 * time.Minute), found: true}, time.Minute, DecisionSubtreeData, nil, "subtreedata"},
+		{"absent stamp yields notfound", true, &stubClient{found: false}, time.Minute, DecisionNotFound, nil, "notfound"},
+		{"client error yields err with cause", true, &stubClient{err: rpcErr}, time.Minute, DecisionError, rpcErr, "err"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := Decide(context.Background(), tc.client, &h, tc.enabled, tc.window)
+			require.Equal(t, tc.wantDecision, decision)
+			require.Equal(t, tc.wantErr, err)
+			require.Equal(t, tc.wantLabel, decision.String())
+		})
+	}
+}

@@ -47,3 +47,17 @@ func (s *receivedAtStore) stamp(hash *chainhash.Hash) {
 func (s *receivedAtStore) lookup(hash *chainhash.Hash) (time.Time, bool) {
 	return s.m.Get(*hash)
 }
+
+// receivedAtTTL returns the TTL for the receivedAt store, ensuring the store
+// never evicts a header while it would still be considered "live" by the
+// subtree-only gate. The floor of 30 minutes prevents misconfigured tiny
+// LivenessWindows from shrinking the TTL so far that headers time out before
+// any gate check happens; the multiplier provides headroom for clock drift
+// and operator changes.
+func receivedAtTTL(livenessWindow time.Duration) time.Duration {
+	const floor = 30 * time.Minute
+	if scaled := 2 * livenessWindow; scaled > floor {
+		return scaled
+	}
+	return floor
+}

@@ -1122,6 +1122,15 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 			errors.NewProcessingError("[BlockFound][%s] failed to create hash from bytes", util.ReverseAndHexEncodeSlice(req.Hash), err))
 	}
 
+	// Seed the subtree-only liveness gate with a first-seen timestamp for this
+	// header. Must happen BEFORE CheckBlockSubtrees / subtreeData fetch decisions
+	// otherwise the gate only ever sees stamps written after AddBlock, making the
+	// optimisation a no-op in production.
+	// Stamping errors are informational — do not fail validation on a stamp failure.
+	if stampErr := u.blockchainClient.ReportPeerBlockHeaderSeen(ctx, hash); stampErr != nil {
+		u.logger.Debugf("[BlockFound][%s] ReportPeerBlockHeaderSeen failed, liveness gate may miss for this header: %v", hash.String(), stampErr)
+	}
+
 	// first check if the block exists, it is very expensive to do all the checks below
 	exists, err := u.blockValidation.GetBlockExists(ctx, hash)
 	if err != nil {

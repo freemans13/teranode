@@ -1131,6 +1131,11 @@ func Test_BlockFound(t *testing.T) {
 	hashBytes := hash.CloneBytes()
 
 	t.Run("block already exists", func(t *testing.T) {
+		mockBlockchainClient := &blockchain.Mock{}
+		// BlockFound now seeds the liveness gate via ReportPeerBlockHeaderSeen before
+		// checking whether the block already exists.
+		mockBlockchainClient.On("ReportPeerBlockHeaderSeen", mock.Anything, &hash).Return(nil)
+
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
@@ -1143,10 +1148,11 @@ func Test_BlockFound(t *testing.T) {
 		require.NoError(t, err)
 
 		server := &Server{
-			logger:          logger,
-			settings:        tSettings,
-			blockValidation: bv,
-			stats:           gocore.NewStat("test"),
+			logger:           logger,
+			settings:         tSettings,
+			blockValidation:  bv,
+			blockchainClient: mockBlockchainClient,
+			stats:            gocore.NewStat("test"),
 		}
 
 		req := &blockvalidation_api.BlockFoundRequest{
@@ -1162,6 +1168,7 @@ func Test_BlockFound(t *testing.T) {
 	t.Run("new block without wait", func(t *testing.T) {
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, &hash).Return(false, nil)
+		mockBlockchainClient.On("ReportPeerBlockHeaderSeen", mock.Anything, &hash).Return(nil)
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
@@ -1174,6 +1181,7 @@ func Test_BlockFound(t *testing.T) {
 		server := &Server{
 			logger:              logger,
 			settings:            tSettings,
+			blockchainClient:    mockBlockchainClient,
 			blockValidation:     bv,
 			blockFoundCh:        make(chan processBlockFound, 10),
 			stats:               gocore.NewStat("test"),
@@ -1205,6 +1213,7 @@ func Test_BlockFound(t *testing.T) {
 	t.Run("new block with wait - success", func(t *testing.T) {
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, &hash).Return(false, nil)
+		mockBlockchainClient.On("ReportPeerBlockHeaderSeen", mock.Anything, &hash).Return(nil)
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
@@ -1217,6 +1226,7 @@ func Test_BlockFound(t *testing.T) {
 		server := &Server{
 			logger:              logger,
 			settings:            tSettings,
+			blockchainClient:    mockBlockchainClient,
 			blockValidation:     bv,
 			blockFoundCh:        make(chan processBlockFound, 10),
 			stats:               gocore.NewStat("test"),
@@ -1246,6 +1256,7 @@ func Test_BlockFound(t *testing.T) {
 	t.Run("new block with wait - error", func(t *testing.T) {
 		mockBlockchainClient := &blockchain.Mock{}
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, &hash).Return(false, nil)
+		mockBlockchainClient.On("ReportPeerBlockHeaderSeen", mock.Anything, &hash).Return(nil)
 
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
@@ -1258,6 +1269,7 @@ func Test_BlockFound(t *testing.T) {
 		server := &Server{
 			logger:              logger,
 			settings:            tSettings,
+			blockchainClient:    mockBlockchainClient,
 			blockValidation:     bv,
 			blockFoundCh:        make(chan processBlockFound, 10),
 			stats:               gocore.NewStat("test"),
