@@ -3227,8 +3227,22 @@ func TestBlockWorker_LivenessGate(t *testing.T) {
 	}
 
 	// A minimal block that has one subtree (so fetchSubtreeDataForBlock has work to do).
+	// Include a non-nil Header with non-nil hash/bits fields because blockWorker
+	// calls block.Hash(), which dereferences b.Header.Hash() → BlockHeader.Bytes(),
+	// and that serialization calls .CloneBytes() on HashPrevBlock / HashMerkleRoot /
+	// Bits.
 	subtreeHash := createTestHash("liveness-gate-subtree")
+	prev := createTestHash("liveness-gate-prev")
+	merkle := createTestHash("liveness-gate-merkle")
 	block := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  prev,
+			HashMerkleRoot: merkle,
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{},
+			Nonce:          0,
+		},
 		Subtrees: []*chainhash.Hash{subtreeHash},
 	}
 

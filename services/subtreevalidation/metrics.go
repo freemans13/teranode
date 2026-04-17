@@ -81,11 +81,6 @@ var (
 	// prometheusLivenessGateDecision counts liveness-gate outcomes, labelled by decision.
 	// Labels: subtreeonly, subtreedata, notfound, err.
 	prometheusLivenessGateDecision *prometheus.CounterVec
-
-	// prometheusSubtreeOnlyTxMiss counts per-tx fetch fallbacks during the subtree-only
-	// path. A spike on a node configured with AssumeTxsBroadcastToAllNodes indicates
-	// upstream trouble (blaster health, peer connectivity, or misconfiguration).
-	prometheusSubtreeOnlyTxMiss prometheus.Counter
 )
 
 var (
@@ -203,14 +198,5 @@ func _initPrometheusMetrics() {
 			Help:      "Count of liveness-gate decisions by outcome (subtreeonly, subtreedata, notfound, err).",
 		},
 		[]string{"decision"},
-	)
-
-	prometheusSubtreeOnlyTxMiss = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: "teranode",
-			Subsystem: "subtreevalidation",
-			Name:      "subtreeonly_tx_miss_total",
-			Help:      "Count of per-tx fetch fallbacks during the subtree-only validation path.",
-		},
 	)
 }
