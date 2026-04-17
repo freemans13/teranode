@@ -17,8 +17,11 @@ import (
 // entries are reported as "not found" — the gate treats that as "not live" and
 // falls back to subtreeData, which is safe.
 //
-// The first stamp for a given hash wins; repeated inserts are no-ops. This matches
-// the semantic "when did we first learn about this header?"
+// Within a single TTL window the first stamp for a given hash wins and repeated
+// inserts are no-ops — this matches the semantic "when did we first learn about
+// this header?" After the TTL elapses the entry disappears; if the same hash is
+// stamped again later (unusual in practice for a growing chain) the store
+// records the new observation rather than resurrecting a stale one.
 type receivedAtStore struct {
 	mu sync.Mutex
 	m  *expiringmap.ExpiringMap[chainhash.Hash, time.Time]
@@ -31,7 +34,9 @@ func newReceivedAtStore(ttl time.Duration) *receivedAtStore {
 }
 
 // stamp records the first-seen time for hash. Subsequent calls for the same
-// hash do not overwrite the initial stamp.
+// hash within the TTL do not overwrite the initial stamp. After the TTL
+// elapses the prior entry has been evicted; a new stamp then records the new
+// observation rather than reviving the expired one.
 func (s *receivedAtStore) stamp(hash *chainhash.Hash) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -1310,13 +1310,14 @@ func Test_BlockFound(t *testing.T) {
 	})
 
 	t.Run("ReportPeerBlockHeaderSeen only fires when gate setting is enabled", func(t *testing.T) {
-		// When AssumeTxsBroadcastToAllNodes is false (default), BlockFound must
-		// NOT call ReportPeerBlockHeaderSeen — the extra RPC would add overhead
-		// on the hot path for nodes not using the optimisation.
+		// With AssumeTxsBroadcastToAllNodes=false (default), BlockFound must NOT
+		// call ReportPeerBlockHeaderSeen — the extra RPC would add overhead on
+		// the hot path for nodes not using the optimisation. Pick a fresh block
+		// (exists=false) so that the gate-off guard is the only reason the stamp
+		// RPC is skipped; otherwise the exists=true short-circuit would make the
+		// assertion trivially true.
 		mockBlockchainClient := &blockchain.Mock{}
-		// Intentionally only program GetBlockExists — AssertNotCalled below
-		// verifies the stamp RPC is skipped.
-		// Allow any call sequence that doesn't include our gated RPC.
+		mockBlockchainClient.On("GetBlockExists", mock.Anything, &hash).Return(false, nil)
 
 		gateOffSettings := test.CreateBaseTestSettings(t)
 		gateOffSettings.SubtreeValidation.AssumeTxsBroadcastToAllNodes = false
@@ -1328,14 +1329,16 @@ func Test_BlockFound(t *testing.T) {
 			blockchainClient:              mockBlockchainClient,
 		}
 		defer bv.blockExistsCache.Stop()
-		require.NoError(t, bv.SetBlockExists(&hash)) // short-circuits after stamp check
 
 		server := &Server{
-			logger:           logger,
-			settings:         gateOffSettings,
-			blockchainClient: mockBlockchainClient,
-			blockValidation:  bv,
-			stats:            gocore.NewStat("test"),
+			logger:              logger,
+			settings:            gateOffSettings,
+			blockchainClient:    mockBlockchainClient,
+			blockValidation:     bv,
+			blockFoundCh:        make(chan processBlockFound, 10),
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 		}
 
 		req := &blockvalidation_api.BlockFoundRequest{
@@ -1346,6 +1349,13 @@ func Test_BlockFound(t *testing.T) {
 		resp, err := server.BlockFound(ctx, req)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
+
+		// Drain the queued work so the background goroutine finishes before we
+		// assert, avoiding a race with the deferred cache.Stop().
+		time.Sleep(10 * time.Millisecond)
+		require.Equal(t, 1, len(server.blockFoundCh))
+		<-server.blockFoundCh
+
 		mockBlockchainClient.AssertNotCalled(t, "ReportPeerBlockHeaderSeen", mock.Anything, mock.Anything)
 	})
 }

@@ -60,6 +60,20 @@ func NewLocalClient(logger ulogger.Logger, tSettings *settings.Settings, store b
 	}, nil
 }
 
+// Stop releases resources owned by this LocalClient, in particular the
+// background cleanup goroutine started by the receivedAt ExpiringMap. It is
+// not part of the ClientI interface; callers that construct LocalClients
+// transiently (tests, benchmarks, short-lived subprocesses) should defer
+// Stop() to avoid leaking one goroutine per instance.
+//
+// Safe to call on a nil receiver or double-call.
+func (c *LocalClient) Stop() {
+	if c == nil {
+		return
+	}
+	c.receivedAt.Stop()
+}
+
 // Health performs health checks for the LocalClient and its dependencies.
 // This method implements the ClientI interface health check functionality by
 // examining the status of the blockchain store, subtree store, and UTXO store.
