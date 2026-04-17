@@ -3835,3 +3835,48 @@ func Test_HeartbeatSenderStopsOnContextCancel(t *testing.T) {
 		t.Fatal("Heartbeat sender did not stop when context was cancelled")
 	}
 }
+
+// TestGetHeaderReceivedAt_StampedOnAddBlock verifies that a block successfully
+// added via AddBlock has its header stamped with a ReceivedAt time retrievable
+// via GetHeaderReceivedAt.
+func TestGetHeaderReceivedAt_StampedOnAddBlock(t *testing.T) {
+	tc := setup(t)
+	block := mockBlock(tc, t)
+
+	subtreeHashBytes := make([][]byte, len(block.Subtrees))
+	for i, h := range block.Subtrees {
+		subtreeHashBytes[i] = h.CloneBytes()
+	}
+
+	_, err := tc.server.AddBlock(context.Background(), &blockchain_api.AddBlockRequest{
+		Header:           block.Header.Bytes(),
+		CoinbaseTx:       block.CoinbaseTx.Bytes(),
+		SubtreeHashes:    subtreeHashBytes,
+		TransactionCount: block.TransactionCount,
+		SizeInBytes:      block.SizeInBytes,
+		CoinbaseBump:     block.CoinbaseBUMP,
+	})
+	require.NoError(t, err)
+
+	resp, err := tc.server.GetHeaderReceivedAt(context.Background(), &blockchain_api.GetHeaderReceivedAtRequest{
+		BlockHash: block.Hash().CloneBytes(),
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Found)
+	require.NotNil(t, resp.ReceivedAt)
+	require.WithinDuration(t, time.Now(), resp.ReceivedAt.AsTime(), 5*time.Second)
+}
+
+// TestGetHeaderReceivedAt_AbsentHash verifies that looking up an unseen block
+// hash returns Found=false, ReceivedAt=nil, and no error.
+func TestGetHeaderReceivedAt_AbsentHash(t *testing.T) {
+	tc := setup(t)
+
+	absent := chainhash.HashH([]byte("never-added"))
+	resp, err := tc.server.GetHeaderReceivedAt(context.Background(), &blockchain_api.GetHeaderReceivedAtRequest{
+		BlockHash: absent.CloneBytes(),
+	})
+	require.NoError(t, err)
+	require.False(t, resp.Found)
+	require.Nil(t, resp.ReceivedAt)
+}
