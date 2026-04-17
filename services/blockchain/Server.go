@@ -769,6 +769,10 @@ func (b *Blockchain) sendInitialNotification(sub subscriber) {
 // Returns:
 // - Error if shutdown encounters issues, nil on successful shutdown
 func (b *Blockchain) Stop(_ context.Context) error {
+	// Release the receivedAt store's background cleanup goroutine (ticker).
+	// Safe on nil or double-call; important for tests and in-process restarts
+	// so we don't leak one goroutine per Blockchain instance.
+	b.receivedAt.Stop()
 	return nil
 }
 

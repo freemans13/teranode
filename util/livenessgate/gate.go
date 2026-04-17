@@ -65,15 +65,17 @@ func (d Decision) String() string {
 // boolean answer should use ShouldUseSubtreeOnlyPath; callers that also
 // want to emit metrics/logging use Decide directly.
 //
-// The gate resolves to DecisionSubtreeOnly only when BOTH:
+// The gate resolves to DecisionSubtreeOnly only when ALL of:
 //   - enabled is true (typically from SubtreeValidation.AssumeTxsBroadcastToAllNodes), AND
+//   - window > 0, AND
 //   - the blockchain client has a ReceivedAt stamp for this header newer than window.
 //
-// Any other outcome (disabled, error, absent stamp, stale stamp) resolves
-// to a subtreeData fallback. The gate is an optimization, never a
-// correctness constraint.
+// Any other outcome (disabled, non-positive window, error, absent stamp,
+// stale stamp) resolves to a subtreeData fallback without even attempting
+// the lookup when the result is foreordained. The gate is an optimization,
+// never a correctness constraint.
 func Decide(ctx context.Context, client Client, blockHash *chainhash.Hash, enabled bool, window time.Duration) (Decision, error) {
-	if !enabled {
+	if !enabled || window <= 0 {
 		return DecisionSubtreeData, nil
 	}
 	stamp, found, err := client.GetHeaderReceivedAt(ctx, blockHash)

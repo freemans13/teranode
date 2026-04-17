@@ -48,6 +48,16 @@ func (s *receivedAtStore) lookup(hash *chainhash.Hash) (time.Time, bool) {
 	return s.m.Get(*hash)
 }
 
+// Stop releases resources owned by the underlying expiring map, including any
+// background cleanup goroutine started for non-zero TTLs. Safe to call on a
+// nil receiver or double-call.
+func (s *receivedAtStore) Stop() {
+	if s == nil || s.m == nil {
+		return
+	}
+	s.m.Stop()
+}
+
 // receivedAtTTL returns the TTL for the receivedAt store, ensuring the store
 // never evicts a header while it would still be considered "live" by the
 // subtree-only gate. The floor of 30 minutes prevents misconfigured tiny

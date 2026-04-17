@@ -1122,21 +1122,6 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 			errors.NewProcessingError("[BlockFound][%s] failed to create hash from bytes", util.ReverseAndHexEncodeSlice(req.Hash), err))
 	}
 
-	// Seed the subtree-only liveness gate with a first-seen timestamp for this
-	// header. Must happen BEFORE CheckBlockSubtrees / subtreeData fetch decisions
-	// otherwise the gate only ever sees stamps written after AddBlock, making the
-	// optimisation a no-op in production.
-	//
-	// Gated behind the gate setting itself so nodes that do not use the
-	// optimisation (mainnet/testnet default) don't pay the extra blockchain-service
-	// RPC on the BlockFound hot path. Stamping errors are informational — do not
-	// fail validation on a stamp failure.
-	if u.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes && u.settings.SubtreeValidation.LivenessWindow > 0 {
-		if stampErr := u.blockchainClient.ReportPeerBlockHeaderSeen(ctx, hash); stampErr != nil {
-			u.logger.Debugf("[BlockFound][%s] ReportPeerBlockHeaderSeen failed, liveness gate may miss for this header: %v", hash.String(), stampErr)
-		}
-	}
-
 	// first check if the block exists, it is very expensive to do all the checks below
 	exists, err := u.blockValidation.GetBlockExists(ctx, hash)
 	if err != nil {
@@ -1147,6 +1132,25 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 	if exists {
 		u.logger.Infof("[BlockFound][%s] already validated, skipping", util.ReverseAndHexEncodeSlice(req.Hash))
 		return &blockvalidation_api.EmptyMessage{}, nil
+	}
+
+	// Seed the subtree-only liveness gate with a first-seen timestamp for this
+	// header, but only for new blocks (exists == false). Duplicate BlockFound
+	// announcements for already-validated blocks would otherwise pay an extra
+	// blockchain-service RPC for no benefit.
+	//
+	// The stamp must still happen BEFORE CheckBlockSubtrees / subtreeData fetch
+	// decisions otherwise the gate only sees stamps written after AddBlock, so
+	// this runs before queueing the block on blockFoundCh.
+	//
+	// Gated behind the gate setting itself so nodes that do not use the
+	// optimisation (mainnet/testnet default) don't pay the extra RPC on the
+	// BlockFound hot path. Stamping errors are informational — do not fail
+	// validation on a stamp failure.
+	if u.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes && u.settings.SubtreeValidation.LivenessWindow > 0 {
+		if stampErr := u.blockchainClient.ReportPeerBlockHeaderSeen(ctx, hash); stampErr != nil {
+			u.logger.Debugf("[BlockFound][%s] ReportPeerBlockHeaderSeen failed, liveness gate may miss for this header: %v", hash.String(), stampErr)
+		}
 	}
 
 	var errCh chan error
