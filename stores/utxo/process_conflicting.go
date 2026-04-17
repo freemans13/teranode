@@ -49,7 +49,7 @@ import (
  - 5: mark tx_parent1 & tx_parent2 & tx_parent4 as spendable again
 */
 func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, conflictingTxHashes []chainhash.Hash,
-	processedConflictingHashesMap map[chainhash.Hash]bool) (losingTxHashesMap txmap.TxMap, err error) {
+	processedConflictingHashesMap map[chainhash.Hash]struct{}) (losingTxHashesMap txmap.TxMap, err error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "ProcessConflicting")
 
 	defer deferFn()
@@ -83,7 +83,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 			// unless it was already processed in this run, then it will be in the processedConflictingHashesMap.
 			// This can occur when a transaction is in multiple forks, and we are moving back from one fork to another
 			// and the transaction was already processed in the previous fork.
-			if !txMeta.Conflicting && !processedConflictingHashesMap[txHash] {
+			if _, alreadyProcessed := processedConflictingHashesMap[txHash]; !txMeta.Conflicting && !alreadyProcessed {
 				return errors.NewProcessingError("[ProcessConflicting][%s] tx is not conflicting", txHash.String())
 			}
 

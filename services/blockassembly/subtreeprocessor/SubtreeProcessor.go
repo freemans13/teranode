@@ -688,7 +688,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					logger.Infof("[SubtreeProcessor][%s] moveForwardBlock subtree processor", moveForwardReq.block.String())
 
 					// create empty map for processed conflicting hashes
-					processedConflictingHashesMap := make(map[chainhash.Hash]bool)
+					processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
 					// store current state before attempting to move forward the block
 					originalChainedSubtrees := stp.chainedSubtrees
@@ -1136,7 +1136,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// the processed conflicting hashes map keeps track of all the conflicting hashes we've already processed
 	// this is to avoid processing the same conflicting hash multiple times if it appears in multiple blocks
 	// the map is only used during the reset process and is not stored in the SubtreeProcessor struct
-	processedConflictingHashesMap := make(map[chainhash.Hash]bool)
+	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
 	for _, block := range moveBackBlocks {
 		// delete / unspend all transactions spending the coinbase tx
@@ -1154,7 +1154,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 		if len(conflictingHashes) > 0 {
 			for _, hash := range conflictingHashes {
-				processedConflictingHashesMap[hash] = true
+				processedConflictingHashesMap[hash] = struct{}{}
 			}
 		}
 	}
@@ -2768,7 +2768,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 
 		// create empty map for processed conflicting hashes
-		processedConflictingHashesMap := make(map[chainhash.Hash]bool)
+		processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
 		// store current state before attempting to move forward the block
 		originalChainedSubtrees := stp.chainedSubtrees
@@ -2841,12 +2841,12 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// the processed conflicting hashes map keeps track of all the conflicting hashes we've already processed
 	// this is to avoid processing the same conflicting hash multiple times if it appears in multiple blocks
 	// the map is only used during the reorg process and is not stored in the SubtreeProcessor struct
-	processedConflictingHashesMap := make(map[chainhash.Hash]bool)
+	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
 	// movedBackBlockTxMap keeps track of all the transactions that were in the blocks we moved back
 	// this is used to determine which transactions need to be marked as on the longest chain when moving forward
 	// if a transaction was in a block we moved back, it means it was on the longest chain before the reorg
-	movedBackBlockTxMap := make(map[chainhash.Hash]bool) // keeps track of all the transactions that were in the blocks we moved back
+	movedBackBlockTxMap := make(map[chainhash.Hash]struct{}) // keeps track of all the transactions that were in the blocks we moved back
 
 	for _, block := range moveBackBlocks {
 		// move back the block, getting all the transactions in the block and any conflicting hashes
@@ -2859,7 +2859,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 
 		if len(conflictingHashes) > 0 {
 			for _, hash := range conflictingHashes {
-				processedConflictingHashesMap[hash] = true
+				processedConflictingHashesMap[hash] = struct{}{}
 			}
 		}
 
@@ -2867,7 +2867,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		for _, subtreeNodes := range subtreesNodes {
 			for _, node := range subtreeNodes {
 				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					movedBackBlockTxMap[node.Hash] = true
+					movedBackBlockTxMap[node.Hash] = struct{}{}
 				}
 			}
 		}
@@ -2904,7 +2904,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			transactionMap.Iter(func(hash chainhash.Hash, _ struct{}) bool {
 				if !hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 					winningTxSet[hash] = true
-					if !movedBackBlockTxMap[hash] {
+					if _, ok := movedBackBlockTxMap[hash]; !ok {
 						markOnLongestChain = append(markOnLongestChain, hash)
 					}
 				}
@@ -3549,7 +3549,7 @@ func (stp *SubtreeProcessor) createTransactionMapIfNeeded(ctx context.Context, b
 
 // processConflictingTransactions handles conflicting transactions and returns losing transaction hashes
 func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context, block *model.Block,
-	conflictingNodes []chainhash.Hash, processedConflictingHashesMap map[chainhash.Hash]bool) (txmap.TxMap, error) {
+	conflictingNodes []chainhash.Hash, processedConflictingHashesMap map[chainhash.Hash]struct{}) (txmap.TxMap, error) {
 	var losingTxHashesMap txmap.TxMap
 
 	// process conflicting txs
@@ -3811,7 +3811,7 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 // moveForwardBlock cleans out all transactions that are in the current subtrees and also in the block
 // given. It is akin to moving up the blockchain to the next block.
 func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.Block, skipNotification bool,
-	processedConflictingHashesMap map[chainhash.Hash]bool, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, err error) {
+	processedConflictingHashesMap map[chainhash.Hash]struct{}, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, err error) {
 	if block == nil {
 		return nil, nil, errors.NewProcessingError("[moveForwardBlock] you must pass in a block to moveForwardBlock")
 	}

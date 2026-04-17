@@ -427,7 +427,7 @@ func BenchmarkMoveForwardBlock(b *testing.B) {
 				runtime.GC()
 				b.StartTimer()
 
-				_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]bool), true, false)
+				_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]struct{}), true, false)
 				if err != nil {
 					b.Fatalf("moveForwardBlock failed: %v", err)
 				}
@@ -501,7 +501,7 @@ func BenchmarkFullReorg(b *testing.B) {
 				})
 
 				// Step 2: moveForwardBlock
-				_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]bool), true, false)
+				_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]struct{}), true, false)
 				if err != nil {
 					b.Fatalf("moveForwardBlock failed: %v", err)
 				}
@@ -731,7 +731,7 @@ func BenchmarkReorgMemoryProfile(b *testing.B) {
 			moveForwardStart := time.Now()
 
 			// moveForwardBlock
-			_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]bool), true, false)
+			_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]struct{}), true, false)
 			require.NoError(b, err)
 
 			moveForwardDuration := time.Since(moveForwardStart)
@@ -801,7 +801,7 @@ func TestReorgBenchmarkBaseline(t *testing.T) {
 		})
 
 		moveForwardStart := time.Now()
-		_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]bool), true, false)
+		_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]struct{}), true, false)
 		require.NoError(t, err)
 		moveForwardDuration := time.Since(moveForwardStart)
 
