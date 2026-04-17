@@ -590,7 +590,11 @@ func TestSequenceLocks_AllInputsDisabled(t *testing.T) {
 func TestSequenceLocks_PostGenesis_BypassesBIP68(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
-	// Regtest Genesis activation is 10000; use a block height well past it.
+	// Pin CSVHeight below GenesisActivationHeight so the only short-circuit
+	// the test can take is the Genesis bypass under test. Without this, a
+	// chain-params change where CSVHeight > GenesisActivationHeight would let
+	// the test pass via the unrelated `blockHeight < CSVHeight` early return.
+	tSettings.ChainCfgParams.CSVHeight = 1
 	txValidator := NewTxValidator(logger, tSettings)
 
 	tx := bt.NewTx()
@@ -612,6 +616,8 @@ func TestSequenceLocks_PostGenesis_BypassesBIP68(t *testing.T) {
 
 	require.Greater(t, blockHeight, tSettings.ChainCfgParams.GenesisActivationHeight,
 		"test precondition: blockHeight must be post-Genesis")
+	require.GreaterOrEqual(t, blockHeight, tSettings.ChainCfgParams.CSVHeight,
+		"test precondition: blockHeight must be at/after CSVHeight (otherwise the CSV early-return would mask the Genesis bypass)")
 
 	err := txValidator.ValidateTransaction(tx, blockHeight, utxoHeights, &Options{SkipPolicyChecks: true})
 	require.NoError(t, err, "BIP68 must not be enforced post-Genesis (height-based)")
@@ -631,6 +637,9 @@ func TestSequenceLocks_PostGenesis_BypassesBIP68(t *testing.T) {
 func TestSequenceLocks_AtGenesisActivationHeight(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
+	// Pin CSVHeight below GenesisActivationHeight so the CSV early-return
+	// cannot mask the Genesis boundary check we're validating here.
+	tSettings.ChainCfgParams.CSVHeight = 1
 	txValidator := NewTxValidator(logger, tSettings)
 
 	tx := bt.NewTx()
@@ -644,6 +653,9 @@ func TestSequenceLocks_AtGenesisActivationHeight(t *testing.T) {
 	utxoHeights := []uint32{blockHeight - 50}
 	utxoMTPs := []uint32{1000000}
 	blockMTP := uint32(1000100)
+
+	require.GreaterOrEqual(t, blockHeight, tSettings.ChainCfgParams.CSVHeight,
+		"test precondition: blockHeight must be at/after CSVHeight so the CSV early-return does not mask the Genesis boundary check")
 
 	err := txValidator.ValidateBIP68(tx, blockHeight, utxoHeights, utxoMTPs, blockMTP)
 	require.NoError(t, err, "block at exact GenesisActivationHeight must be treated as post-Genesis")
