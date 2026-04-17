@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/livenessgate"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
@@ -206,6 +207,31 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 			if !ok {
 				u.logger.Debugf("[catchup:blockWorker-%d][%s] work queue closed, worker shutting down", workerID, blockUpTo.Hash().String())
 				return nil
+			}
+
+			// Once-per-block liveness gate. If the node was live when this block
+			// was minted, skip the catchup subtreeData pre-fetch — CheckBlockSubtrees
+			// downstream will pull subtree manifests on demand, and the local
+			// UTXO/TxMetaCache + per-tx fetch path handles the rest.
+			//
+			// See docs/superpowers/specs/2026-04-16-subtree-only-validation-with-liveness-gate-design.md.
+			if livenessgate.ShouldUseSubtreeOnlyPath(
+				ctx,
+				u.blockchainClient,
+				work.block.Hash(),
+				u.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes,
+				u.settings.SubtreeValidation.LivenessWindow,
+			) {
+				result := resultItem{
+					block: work.block,
+					index: work.index,
+				}
+				select {
+				case resultQueue <- result:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
 			}
 
 			// Fetch subtree data for this block
