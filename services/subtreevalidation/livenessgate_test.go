@@ -15,6 +15,12 @@ import (
 )
 
 func TestShouldUseSubtreeOnlyPath_TruthTable(t *testing.T) {
+	// Ensure the Prometheus counters the wrapper increments are registered —
+	// otherwise running this test in isolation (without another test having
+	// previously triggered _initPrometheusMetrics via a shared sync.Once) would
+	// nil-deref inside WithLabelValues. InitPrometheusMetrics is idempotent.
+	InitPrometheusMetrics()
+
 	h := chainhash.HashH([]byte("block"))
 	now := time.Now()
 
