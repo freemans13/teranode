@@ -18,6 +18,7 @@ import (
 // helper — they should use test.CreateBaseTestSettings(t) and rely on the
 // regtest Genesis activation height (10000).
 func bip68TestSettings(t testing.TB) *settings.Settings {
+	t.Helper()
 	tSettings := test.CreateBaseTestSettings(t)
 	// int32 max, not uint32 max — ScriptVerifierGoBDK casts this to int32 and
 	// rejects zero/negative values, so MaxUint32 wraps to -1 and panics.
