@@ -1,0 +1,49 @@
+package blockchain
+
+import (
+	"sync"
+	"time"
+
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/util/expiringmap"
+)
+
+// receivedAtStore records the wall-clock time a block header was first seen by
+// this node. It is consulted by the subtree-only liveness gate to decide whether
+// validation can skip the subtreeData download path.
+//
+// Entries expire after a TTL (set large relative to SubtreeValidation.LivenessWindow
+// so a live-for-the-window header is never evicted prematurely). Expired or absent
+// entries are reported as "not found" — the gate treats that as "not live" and
+// falls back to subtreeData, which is safe.
+//
+// The first stamp for a given hash wins; repeated inserts are no-ops. This matches
+// the semantic "when did we first learn about this header?"
+type receivedAtStore struct {
+	mu sync.Mutex
+	m  *expiringmap.ExpiringMap[chainhash.Hash, time.Time]
+}
+
+func newReceivedAtStore(ttl time.Duration) *receivedAtStore {
+	return &receivedAtStore{
+		m: expiringmap.New[chainhash.Hash, time.Time](ttl),
+	}
+}
+
+// stamp records the first-seen time for hash. Subsequent calls for the same
+// hash do not overwrite the initial stamp.
+func (s *receivedAtStore) stamp(hash *chainhash.Hash) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.m.Get(*hash); ok {
+		return
+	}
+	s.m.Set(*hash, time.Now())
+}
+
+// lookup returns the stamp and true if the hash was seen within the TTL,
+// or a zero time and false otherwise.
+func (s *receivedAtStore) lookup(hash *chainhash.Hash) (time.Time, bool) {
+	return s.m.Get(*hash)
+}
