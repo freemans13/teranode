@@ -86,6 +86,20 @@ const (
 	slowMonitorInterval = 15 * time.Second // When caught up
 )
 
+// isViableSyncCandidate returns true if a peer passes the unconditional
+// viability filters used by the coordinator when deciding whether we're
+// caught up and when determining whether all eligible peers have been
+// attempted. Keeping this in one place ensures both call sites stay in sync.
+//
+// These filters — not banned, has a DataHub URL, non-zero advertised height,
+// and sufficient reputation — are what defend us against a bad peer claiming
+// an inflated height. Peer selection applies an additional HTTP health check
+// when `settings.P2P.HealthCheckEnabled` is true, but that is layered on top
+// of these filters, not relied upon here.
+func isViableSyncCandidate(p *PeerInfo) bool {
+	return !p.IsBanned && p.DataHubURL != "" && p.Height != 0 && p.ReputationScore >= 20
+}
+
 // isCaughtUp determines if we're caught up with the network
 func (sc *SyncCoordinator) isCaughtUp() bool {
 	localHeight := sc.getLocalHeightSafe()
@@ -97,11 +111,12 @@ func (sc *SyncCoordinator) isCaughtUp() bool {
 	// This must align with sync peer selection criteria; otherwise, a low-quality
 	// peer we would never select could cause us to think we're perpetually behind.
 	for _, p := range peers {
-		// Only consider peers that are viable sync candidates. These filters
-		// (plus the HTTP health check applied during peer selection) are what
-		// defend us against a bad peer claiming an inflated height — no extra
-		// height-delta tolerance is needed here.
-		if p.IsBanned || p.DataHubURL == "" || p.Height == 0 || p.ReputationScore < 20 {
+		// Only consider peers that satisfy the unconditional viability filters
+		// enforced here: not banned, with a DataHub URL, a non-zero height, and
+		// sufficient reputation. These filters are what defend us against a bad
+		// peer claiming an inflated height — no extra height-delta tolerance is
+		// needed here.
+		if !isViableSyncCandidate(p) {
 			continue
 		}
 		if p.Height > localHeight {
@@ -702,10 +717,10 @@ func (sc *SyncCoordinator) checkAllPeersAttempted() {
 
 	for _, p := range peers {
 		// Count peers that are viable sync candidates (must match isCaughtUp criteria)
-		if p.IsBanned || p.DataHubURL == "" || p.Height == 0 || p.ReputationScore < 20 {
+		if !isViableSyncCandidate(p) {
 			continue
 		}
-		if p.Height > localHeight+10 { // Same tolerance as isCaughtUp
+		if p.Height > localHeight { // Same comparison as isCaughtUp
 			eligibleCount++
 
 			// Check if attempted recently
