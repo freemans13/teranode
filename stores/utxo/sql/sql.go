@@ -226,12 +226,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 	}
 
-	// Initialize unlock batcher for Postgres — batches SetLocked(false) calls.
-	if storeURL.Scheme == "postgres" {
-		unlockBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
-		s.unlockBatcher = batcher.New(500, unlockBatchDuration, s.sendUnlockBatch, true)
-	}
-
 	return s, nil
 }
 
@@ -1014,19 +1008,17 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 				}, logError: true})
 			} else if !inserted {
 				// ON CONFLICT (hash) DO NOTHING — new_tx returned 0 rows, tx already exists
-				results = append(results, batchResult{idx: idx, result: batchCreateResult{
-					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v)", p.isCoinbase),
-				}})
+				batch[idx].done <- batchCreateResult{
+					Err: errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", p.isCoinbase),
+				}
 			} else {
 				results = append(results, batchResult{idx: idx, result: batchCreateResult{Data: p.txMeta}})
 			}
 		}
 
-		// Close the batch reader — ensures all pipelined commits are finalized
-		// and visible to other connections before callers proceed.
 		closeErr := br.Close()
 		if closeErr != nil {
-			s.logger.Errorf("[sendCreateBatch] error closing batch results: %v", closeErr)
+			s.logger.Warnf("[sendCreateBatch] error closing batch results: %v", closeErr)
 		}
 
 		// Now signal callers — if Close() failed, override successes with errors
@@ -2712,39 +2704,15 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 		}
 	} else {
 		// Not on longest chain: clear delete_at_height, set locked = false
-		if minedBlockInfo.UnsetMined {
-			// UnsetMined path (block invalidation): set unmined_since for transactions
-			// that no longer have any block_ids after the deletion above.
-			// This mirrors the aerospike Lua which sets unmined_since = currentBlockHeight
-			// when #blocks == 0 after removing the block_id.
-			inClause3, inArgs3 := buildINClause(existingHashBytes, 2)
-			qUpdate := fmt.Sprintf(`
-				UPDATE transactions
-				SET locked = false
-				   ,delete_at_height = NULL
-				   ,unmined_since = CASE
-				        WHEN NOT EXISTS (
-				            SELECT 1 FROM block_ids bi WHERE bi.transaction_id = transactions.id
-				        ) THEN $1
-				        ELSE unmined_since
-				    END
-				WHERE hash IN %s
-			`, inClause3)
-			args := append([]interface{}{minedBlockInfo.BlockHeight}, inArgs3...)
-			if _, err = txn.ExecContext(ctx, qUpdate, args...); err != nil {
-				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
-			}
-		} else {
-			// Normal not-on-longest-chain path: MarkTransactionsOnLongestChain handles unmined_since
-			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
-			qUpdate := fmt.Sprintf(`
-				UPDATE transactions
-				SET locked = false, delete_at_height = NULL
-				WHERE hash IN %s
-			`, inClause3)
-			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
-				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
-			}
+		// Do NOT set unmined_since here — that's MarkTransactionsOnLongestChain's job
+		inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
+		qUpdate := fmt.Sprintf(`
+			UPDATE transactions
+			SET locked = false, delete_at_height = NULL
+			WHERE hash IN %s
+		`, inClause3)
+		if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
+			return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
 		}
 	}
 
@@ -3629,18 +3597,6 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 			}
 		}
 		return nil
-	}
-
-	// Postgres: single-hash unlock → use batcher.
-	if s.unlockBatcher != nil && len(txHashes) == 1 {
-		done := make(chan error, 1)
-		s.unlockBatcher.Put(&batchUnlockItem{hash: txHashes[0], done: done})
-		select {
-		case err := <-done:
-			return err
-		case <-ctx.Done():
-			return ctx.Err()
-		}
 	}
 
 	// Postgres: bulk unlock + DAH in chunked UPDATE statements
@@ -4626,25 +4582,4 @@ func isLockError(err error) bool {
 	return strings.Contains(errStr, "database is locked") ||
 		strings.Contains(errStr, "deadlock") ||
 		strings.Contains(errStr, "lock timeout")
-}
-
-// sendUnlockBatch processes a batch of SetLocked(false) calls with a single bulk UPDATE.
-func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
-	ctx := context.Background()
-
-	if len(batch) == 1 {
-		hashes := []chainhash.Hash{batch[0].hash}
-		batch[0].done <- s.setUnlockedBulk(ctx, hashes)
-		return
-	}
-
-	hashes := make([]chainhash.Hash, len(batch))
-	for i, item := range batch {
-		hashes[i] = item.hash
-	}
-
-	err := s.setUnlockedBulk(ctx, hashes)
-	for _, item := range batch {
-		item.done <- err
-	}
 }

@@ -184,8 +184,14 @@ func (it *unminedTxIterator) Close() error {
 }
 
 // GetUnminedTxIterator returns an iterator for all unmined, non-conflicting transactions.
-func (s *Store) GetUnminedTxIterator(_ bool) (utxo.UnminedTxIterator, error) {
+func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 	return newUnminedTxIterator(s)
+}
+
+// ScanInconsistentUnminedTxs is a no-op for Postgres — the Postgres store always uses
+// index-based queries on unmined_since, so there's no fullScan inconsistency to fix.
+func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
+	return nil, nil
 }
 
 // GetPrunableUnminedTxIterator returns an iterator for unmined transactions

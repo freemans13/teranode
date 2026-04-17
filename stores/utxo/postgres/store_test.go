@@ -1198,7 +1198,7 @@ func TestGetUnminedTxIterator(t *testing.T) {
 	require.NoError(t, err)
 
 	// Get the iterator.
-	iter, err := store.GetUnminedTxIterator(false)
+	iter, err := store.GetUnminedTxIterator()
 	require.NoError(t, err)
 	require.NotNil(t, iter)
 	defer iter.Close()
