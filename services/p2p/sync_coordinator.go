@@ -93,20 +93,23 @@ func (sc *SyncCoordinator) isCaughtUp() bool {
 	// Get all peers
 	peers := sc.registry.GetAll()
 
-	// Check if any eligible peer is significantly ahead of us.
+	// Check if any eligible peer is ahead of us.
 	// This must align with sync peer selection criteria; otherwise, a low-quality
 	// peer we would never select could cause us to think we're perpetually behind.
 	for _, p := range peers {
-		// Only consider peers that are viable sync candidates
+		// Only consider peers that are viable sync candidates. These filters
+		// (plus the HTTP health check applied during peer selection) are what
+		// defend us against a bad peer claiming an inflated height — no extra
+		// height-delta tolerance is needed here.
 		if p.IsBanned || p.DataHubURL == "" || p.Height == 0 || p.ReputationScore < 20 {
 			continue
 		}
-		if p.Height > localHeight+10 { // Allow some tolerance
-			return false // At least one peer is significantly ahead
+		if p.Height > localHeight {
+			return false // At least one viable peer is ahead
 		}
 	}
 
-	return true // We're at the same height or ahead of all peers
+	return true // We're at the same height or ahead of every eligible peer
 }
 
 // Start begins the coordinator

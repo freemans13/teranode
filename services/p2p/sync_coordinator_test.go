@@ -777,11 +777,17 @@ func TestSyncCoordinator_IsCaughtUp(t *testing.T) {
 	registry.Put(peer2, "", 90, peerHash2, "")
 	assert.True(t, sc.isCaughtUp(), "Should be caught up when peers are behind")
 
-	// Add peer significantly ahead of us (more than 10 block tolerance) - should NOT be caught up
+	// Add peer one block ahead - should NOT be caught up
 	peer3 := peer.ID("peer3")
 	peerHash3, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.Put(peer3, "", 120, peerHash3, "http://peer3:8080") // 20 blocks ahead, beyond 10 block tolerance
-	assert.False(t, sc.isCaughtUp(), "Should NOT be caught up when a peer is significantly ahead")
+	registry.Put(peer3, "", 101, peerHash3, "http://peer3:8080")
+	assert.False(t, sc.isCaughtUp(), "Should NOT be caught up when a viable peer is ahead by even one block")
+
+	// Add peer further ahead - still not caught up
+	peer4 := peer.ID("peer4")
+	peerHash4, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+	registry.Put(peer4, "", 150, peerHash4, "http://peer4:8080")
+	assert.False(t, sc.isCaughtUp(), "Should NOT be caught up when a viable peer is far ahead")
 }
 
 func TestSyncCoordinator_IsCaughtUp_IgnoresNonViablePeers(t *testing.T) {
@@ -823,11 +829,11 @@ func TestSyncCoordinator_IsCaughtUp_IgnoresNonViablePeers(t *testing.T) {
 
 	assert.True(t, sc.isCaughtUp(), "Should be caught up when only non-viable peers are ahead")
 
-	// Now add a viable peer significantly ahead -> should not be caught up
+	// Now add a viable peer ahead -> should not be caught up
 	viable := peer.ID("peer-viable")
-	registry.Put(viable, "", 200, peerHash, "http://viable:8080")
+	registry.Put(viable, "", 101, peerHash, "http://viable:8080")
 	registry.UpdateReputation(viable, 80)
-	assert.False(t, sc.isCaughtUp(), "Should NOT be caught up when a viable peer is significantly ahead")
+	assert.False(t, sc.isCaughtUp(), "Should NOT be caught up when a viable peer is ahead")
 }
 
 func TestSyncCoordinator_BackoffClearsSyncAttemptsAndExpires(t *testing.T) {
