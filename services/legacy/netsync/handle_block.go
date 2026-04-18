@@ -324,6 +324,18 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		// we can skip some of the processing since we assume the block is valid
 		quickValidationMode := legacyMode
 
+		// Lazily construct the subtree write batcher on the first catch-up block.
+		// Safety: prepareSubtrees is only ever called from the blockHandler goroutine
+		// (single-threaded block processing path), so no mutex is needed here.
+		if quickValidationMode && sm.subtreeWriteBatcher == nil {
+			sm.subtreeWriteBatcher = NewSubtreeWriteBatcher(
+				sm.settings.Legacy.SubtreeWriteBatchBlocks,
+				sm.settings.Legacy.SubtreeWriteBatchWait,
+				sm.logger,
+				sm.flushSubtreeWriteBatch,
+			)
+		}
+
 		if quickValidationMode {
 			// in quickValidationMode, we can process transactions in a block in parallel, but in reverse order
 			// first we create all the utxos, then we spend them
@@ -370,7 +382,59 @@ func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, block *bsvutil
 	return nil
 }
 
+// writeSubtree dispatches to the batcher when active (catch-up), else writes synchronously.
 func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,
+	subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta, quickValidationMode bool) error {
+	if !quickValidationMode && sm.subtreeWriteBatcher != nil {
+		// FSM transitioned out of catch-up mode; drain and retire the batcher so
+		// subsequent blocks take the synchronous writeSubtreeDirect path.
+		if err := sm.subtreeWriteBatcher.Stop(ctx); err != nil {
+			sm.logger.Errorf("[writeSubtree] draining SubtreeWriteBatcher on quickValidationMode transition: %v", err)
+		}
+		sm.subtreeWriteBatcher = nil
+	}
+	if sm.subtreeWriteBatcher == nil {
+		return sm.writeSubtreeDirect(ctx, block, subtree, subtreeData, subtreeMetaData, quickValidationMode)
+	}
+
+	// Note: the batched path pre-serializes each payload to []byte before submitting.
+	// writeSubtreeDirect streams to avoid large intermediate allocations for big blocks,
+	// but coalescing requires the full payload in memory so the batcher can submit it
+	// across block boundaries. The memory trade-off is bounded by the batch count
+	// (legacy_subtreeWriteBatchBlocks, default 8 blocks) and is intentional during
+	// catch-up to reduce fsync count.
+	subtreeBytes, err := subtree.Serialize()
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] serialize subtree", err)
+	}
+	dataBytes, err := subtreeData.Serialize()
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] serialize subtree data", err)
+	}
+	metaBytes, err := subtreeMetaData.Serialize()
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] serialize subtree meta", err)
+	}
+
+	dah := uint32(block.Height()) + sm.settings.GlobalBlockHeightRetention //nolint:gosec
+	treeRootHash := *subtree.RootHash()
+	dataRootHash := *subtreeData.RootHash()
+
+	treeFileType := fileformat.FileTypeSubtreeToCheck
+	if quickValidationMode {
+		treeFileType = fileformat.FileTypeSubtree
+	}
+
+	if err := sm.subtreeWriteBatcher.Submit(SubtreeWriteItem{Kind: SubtreeKindTree, FileType: treeFileType, RootHash: treeRootHash, Bytes: subtreeBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
+		return err
+	}
+	if err := sm.subtreeWriteBatcher.Submit(SubtreeWriteItem{Kind: SubtreeKindData, RootHash: dataRootHash, Bytes: dataBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
+		return err
+	}
+	return sm.subtreeWriteBatcher.Submit(SubtreeWriteItem{Kind: SubtreeKindMeta, RootHash: dataRootHash, Bytes: metaBytes, DeleteAt: dah, BlockHeight: block.Height()})
+}
+
+func (sm *SyncManager) writeSubtreeDirect(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,
 	subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta, quickValidationMode bool) error {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "writeSubtree",
 		tracing.WithLogMessage(sm.logger, "[writeSubtree][%s] writing subtree for block %s height %d", subtree.RootHash().String(), block.Hash().String(), block.Height()),
@@ -537,6 +601,62 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 		return nil
 	})
 
+	return g.Wait()
+}
+
+// flushSubtreeWriteBatch is the SubtreeWriteBatcher flush callback. It writes each item
+// to the subtreeStore concurrently, bounded to 8 parallel writes.
+func (sm *SyncManager) flushSubtreeWriteBatch(ctx context.Context, items []SubtreeWriteItem) error {
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(g, 8)
+
+	for _, item := range items {
+		item := item
+		g.Go(func() error {
+			var fileType fileformat.FileType
+			switch item.Kind {
+			case SubtreeKindTree:
+				fileType = item.FileType
+			case SubtreeKindData:
+				fileType = fileformat.FileTypeSubtreeData
+			case SubtreeKindMeta:
+				// Mirror the existence check from writeSubtreeDirect: skip if already present
+				// (e.g., created by block assembly via P2P).
+				if exists, _ := sm.subtreeStore.Exists(gCtx, item.RootHash[:], fileformat.FileTypeSubtreeMeta); exists {
+					return nil
+				}
+				fileType = fileformat.FileTypeSubtreeMeta
+			default:
+				return errors.NewProcessingError("flushSubtreeWriteBatch: unknown SubtreeKind %d", item.Kind)
+			}
+
+			storer, err := filestorer.NewFileStorer(
+				gCtx, sm.logger, sm.settings, sm.subtreeStore,
+				item.RootHash[:], fileType,
+				options.WithDeleteAt(item.DeleteAt),
+			)
+			if err != nil {
+				if errors.Is(err, errors.ErrBlobAlreadyExists) {
+					return nil
+				}
+				return errors.NewStorageError("flushSubtreeWriteBatch: create file", err)
+			}
+			var ok bool
+			defer func() {
+				if !ok {
+					storer.Abort(errors.NewProcessingError("flushSubtreeWriteBatch: write aborted"))
+				}
+			}()
+			if _, err := storer.Write(item.Bytes); err != nil {
+				return errors.NewStorageError("flushSubtreeWriteBatch: write", err)
+			}
+			if err := storer.Close(gCtx); err != nil {
+				return errors.NewStorageError("flushSubtreeWriteBatch: close", err)
+			}
+			ok = true
+			return nil
+		})
+	}
 	return g.Wait()
 }
 

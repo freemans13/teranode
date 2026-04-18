@@ -343,15 +343,16 @@ type SyncManager struct {
 	quit         chan struct{}
 
 	// TERANODE services
-	blockchainClient  teranodeblockchain.ClientI
-	validationClient  validator.Interface
-	utxoStore         utxostore.Store
-	subtreeStore      blob.Store
-	subtreeValidation subtreevalidation.Interface
-	blockValidation   blockvalidation.Interface
-	blockAssembly     blockassembly.ClientI
-	legacyKafkaInvCh  chan *kafka.Message
-	txAnnounceBatcher *batcher.BatcherWithDedup[TxHashAndFee]
+	blockchainClient    teranodeblockchain.ClientI
+	validationClient    validator.Interface
+	utxoStore           utxostore.Store
+	subtreeStore        blob.Store
+	subtreeValidation   subtreevalidation.Interface
+	blockValidation     blockvalidation.Interface
+	blockAssembly       blockassembly.ClientI
+	legacyKafkaInvCh    chan *kafka.Message
+	txAnnounceBatcher   *batcher.BatcherWithDedup[TxHashAndFee]
+	subtreeWriteBatcher *SubtreeWriteBatcher // lazily created on first catch-up block; nil outside catch-up
 
 	// These fields should only be accessed from the blockHandler thread
 	// (except syncPeer/syncPeerState which are protected by syncPeerMu).
@@ -2190,6 +2191,13 @@ func (sm *SyncManager) Stop() error {
 	sm.orphanTxs.Stop()
 	sm.requestedTxns.Stop()
 	sm.requestedBlocks.Stop()
+
+	if sm.subtreeWriteBatcher != nil {
+		if err := sm.subtreeWriteBatcher.Stop(context.Background()); err != nil {
+			sm.logger.Errorf("[SyncManager] SubtreeWriteBatcher.Stop: %v", err)
+		}
+		sm.subtreeWriteBatcher = nil
+	}
 
 	return nil
 }
