@@ -304,8 +304,7 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	subtrees = make([]*chainhash.Hash, 0)
 
 	var (
-		subtree    *subtreepkg.Subtree
-		legacyMode bool
+		subtree *subtreepkg.Subtree
 	)
 
 	// create 1 subtree + subtree.subtreeData
@@ -341,13 +340,21 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 			return nil, err
 		}
 
-		if legacyMode, err = sm.blockchainClient.IsFSMCurrentState(sm.ctx, blockchain_api.FSMStateType_LEGACYSYNCING); err != nil {
-			sm.logger.Errorf("[prepareSubtrees] Failed to get current state: %s", err)
+		var inLegacySync, inCatchingBlocks bool
+		currentState, fsmErr := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
+		if fsmErr != nil {
+			sm.logger.Errorf("[prepareSubtrees] Failed to get FSM state: %s", fsmErr)
+		} else if currentState != nil {
+			inLegacySync = *currentState == blockchain_api.FSMStateType_LEGACYSYNCING
+			inCatchingBlocks = *currentState == blockchain_api.FSMStateType_CATCHINGBLOCKS
 		}
 
-		// quick validation mode is used when we are in legacy mode
-		// we can skip some of the processing since we assume the block is valid
-		quickValidationMode := legacyMode
+		quickValidationMode := shouldUseQuickValidationMode(
+			inLegacySync,
+			inCatchingBlocks,
+			sm.settings.Legacy.ForceQuickValidation,
+			sm.settings.Legacy.QuickValidationCatchupInCatchingBlocks,
+		)
 
 		if quickValidationMode {
 			// in quickValidationMode, we can process transactions in a block in parallel, but in reverse order
