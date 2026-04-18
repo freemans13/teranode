@@ -257,6 +257,31 @@ type TxMapWrapper struct {
 	ChildLevelInBlock  uint32
 }
 
+// shouldUseQuickValidationMode decides whether the legacy sync path should enable
+// the quickValidationMode optimisations (parallel UTXO create-then-spend, skip
+// checkSubtreeFromBlock, use PR #711's pre-assigned block ID path).
+//
+// The decision composes four inputs:
+//   - inLegacySync: FSM reports state == LEGACYSYNCING
+//   - inCatchingBlocks: FSM reports state == CATCHINGBLOCKS
+//   - forceFlag: operator has set legacy_forceQuickValidation=true
+//   - catchupInCatchingBlocks: legacy_quickValidationInCatchingBlocks setting
+//
+// Any of these paths activates the mode. The forceFlag is intended for operators
+// restarting from a pre-existing chain where FSM begins in RUNNING.
+func shouldUseQuickValidationMode(inLegacySync, inCatchingBlocks, forceFlag, catchupInCatchingBlocks bool) bool {
+	if forceFlag {
+		return true
+	}
+	if inLegacySync {
+		return true
+	}
+	if inCatchingBlocks && catchupInCatchingBlocks {
+		return true
+	}
+	return false
+}
+
 func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block) (subtrees []*chainhash.Hash, err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "prepareSubtrees",
 		tracing.WithLogMessage(

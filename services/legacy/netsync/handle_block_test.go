@@ -785,3 +785,30 @@ func TestPreValidateTransactions_ParentContextCancelled(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "context cancelled")
 }
+
+func TestShouldUseQuickValidationMode(t *testing.T) {
+	t.Run("force flag overrides FSM state", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, false, true, true)
+		require.True(t, result, "force flag must activate quickValidationMode even when FSM states are false")
+	})
+
+	t.Run("LEGACYSYNCING activates quickValidationMode", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(true, false, false, false)
+		require.True(t, result)
+	})
+
+	t.Run("CATCHINGBLOCKS activates when catchupInCatchingBlocks true", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, true, false, true)
+		require.True(t, result)
+	})
+
+	t.Run("CATCHINGBLOCKS does NOT activate when catchupInCatchingBlocks false", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, true, false, false)
+		require.False(t, result)
+	})
+
+	t.Run("RUNNING + no flags remains disabled", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, false, false, false)
+		require.False(t, result)
+	})
+}
