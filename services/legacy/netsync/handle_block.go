@@ -401,8 +401,16 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 	// writeSubtreeDirect streams to avoid large intermediate allocations for big blocks,
 	// but coalescing requires the full payload in memory so the batcher can submit it
 	// across block boundaries. The memory trade-off is bounded by the batch count
-	// (legacy_subtreeWriteBatchBlocks, default 8 blocks) and is intentional during
-	// catch-up to reduce fsync count.
+	// (legacy_subtreeWriteBatchBlocks).
+	//
+	// With the default legacy_subtreeWriteBatchBlocks=1, the batcher flushes
+	// synchronously once this block's three items (tree + data + meta) have all been
+	// Submit()ted — the last Submit crosses the 3-item threshold and triggers an
+	// in-line flush. That matches CheckBlockSubtrees' expectation that the subtree
+	// files are durable on disk before block validation reads them. Operators can
+	// raise the setting to coalesce writes across blocks, but only where the
+	// reader-side knows how to tolerate the resulting lag between Submit and
+	// durability (none of the current consumers do).
 	subtreeBytes, err := subtree.Serialize()
 	if err != nil {
 		return errors.NewStorageError("[writeSubtree] serialize subtree", err)
