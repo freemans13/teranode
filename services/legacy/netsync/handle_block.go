@@ -1000,25 +1000,15 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		g.Go(func() error {
 			txWrapper.SomeParentsInBlock = true
 
-			// we do have a parent, but since everything is happening in parallel, we need to check if the parent has
-			// already been extended
-			timeOut := time.After(120 * time.Second)
-
-		WaitForParent:
-			for {
-				select {
-				case <-timeOut:
-					return errors.NewProcessingError("timed out waiting for parent transaction %s to be extended", prevTxHash.String())
-				default:
-					if prevTxWrapper.Tx.IsExtended() {
-						break WaitForParent
-					}
-
-					time.Sleep(10 * time.Millisecond) // wait for the parent transaction to be extended
-				}
-			}
-
-			// No lock needed - each goroutine writes to a unique index
+			// Parent's Outputs are populated at wire-parse time and never mutated
+			// afterwards, so we can read them immediately without waiting for the
+			// parent tx itself to finish being extended. The old implementation
+			// polled on prevTxWrapper.Tx.IsExtended(); that was unnecessary
+			// (IsExtended checks the parent's *inputs*, not its outputs) and caused
+			// a deadlock under the two-phase flow in extendTransactions, where a
+			// pure-non-local-parent tx only becomes "extended" after phase 2 runs.
+			//
+			// No lock needed — each goroutine writes to a unique input index.
 			tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
 			tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
 
