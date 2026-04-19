@@ -3384,14 +3384,32 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		return nil
 	}
 
-	// Collect unique parent hashes into a slice for chunked querying
-	parentHashes := make([][]byte, 0, len(needsByParent))
-	for h := range needsByParent {
+	// Build the exact list of (parent-hash, output-index) pairs we need to fetch.
+	// Using a composite (t.hash, o.idx) IN predicate — instead of the older
+	// parent-hash IN predicate — avoids scanning every output of every referenced
+	// parent, which matters on data-carrier-heavy blocks where parents may have
+	// many MB of script bytes in unreferenced outputs.
+	type compositePair struct {
+		hash []byte
+		idx  uint32
+	}
+	pairs := make([]compositePair, 0)
+	for h, refs := range needsByParent {
 		hCopy := h
-		parentHashes = append(parentHashes, hCopy[:])
+		hashSlice := hCopy[:]
+		// Deduplicate (hash, idx) pairs — the same output can be referenced by
+		// multiple inputs in a block, but we only need to fetch it once.
+		seenIdx := make(map[uint32]struct{}, len(refs))
+		for _, ref := range refs {
+			if _, seen := seenIdx[ref.outIdx]; seen {
+				continue
+			}
+			seenIdx[ref.outIdx] = struct{}{}
+			pairs = append(pairs, compositePair{hash: hashSlice, idx: ref.outIdx})
+		}
 	}
 
-	// Query in chunks using IN clause
+	// Query in chunks using a composite IN clause.
 	// Result key: (parentHash, outputIdx) -> (lockingScript, satoshis)
 	type outputInfo struct {
 		lockingScript []byte
@@ -3403,25 +3421,40 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	}
 	results := make(map[outputKey]*outputInfo)
 
-	for chunkStart := 0; chunkStart < len(parentHashes); chunkStart += maxINClauseSize {
+	// maxINClauseSize bounds the total parameter count. Each pair contributes
+	// two parameters, so chunk size must be halved.
+	pairChunkSize := maxINClauseSize / 2
+	if pairChunkSize < 1 {
+		pairChunkSize = 1
+	}
+
+	for chunkStart := 0; chunkStart < len(pairs); chunkStart += pairChunkSize {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		chunkEnd := chunkStart + maxINClauseSize
-		if chunkEnd > len(parentHashes) {
-			chunkEnd = len(parentHashes)
+		chunkEnd := chunkStart + pairChunkSize
+		if chunkEnd > len(pairs) {
+			chunkEnd = len(pairs)
 		}
-		chunk := parentHashes[chunkStart:chunkEnd]
+		chunk := pairs[chunkStart:chunkEnd]
 
-		inClause, args := buildINClause(chunk, 1)
+		// Inline composite-IN construction keeps this function standalone;
+		// mirrors the pattern used in PreviousOutputsDecorate above.
+		placeholders := make([]string, len(chunk))
+		args := make([]interface{}, 0, len(chunk)*2)
+		for i, p := range chunk {
+			placeholders[i] = fmt.Sprintf("($%d,$%d)", 2*i+1, 2*i+2)
+			args = append(args, p.hash, p.idx)
+		}
+		inClause := "(" + strings.Join(placeholders, ",") + ")"
 
 		q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
 			FROM outputs o
 			JOIN transactions t ON o.transaction_id = t.id
-			WHERE t.hash IN ` + inClause
+			WHERE (t.hash, o.idx) IN ` + inClause
 
 		rows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
