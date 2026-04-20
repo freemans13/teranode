@@ -29,7 +29,8 @@ Backportable pieces, in scope:
 
 1. **Enable the Create batcher on SQLite**, using a new bulk `INSERT … VALUES` path (Option X below).
 2. **Enable the Unlock batcher on SQLite**.
-3. **Set `MaxOpenConns` / `MaxIdleConns` on the Postgres engine** to match #684's pool size.
+
+Originally a third item — setting `MaxOpenConns`/`MaxIdleConns` for the Postgres engine — was in scope. Investigation showed `util.InitSQLDB` already applies pool sizing via either `tSettings.UtxoStore.PostgresPool` (UTXO-specific override) or `tSettings.Postgres` (global defaults: 50 open, 10 idle). Operators who want to match #684's `MaxConns = 100` can already set `utxostore_postgres_maxopenconns=100` via environment — no code change required. Dropped.
 
 Explicitly out of scope: pgx pipelining, COPY protocol, any in-process cache (#684's txCache is dead code — `cache.Add` is called but `cache.Get` is never invoked; its throughput numbers do not depend on it), switching the spend batcher to `background=true` (vanilla's bulk CTE has the same row-lock ordering concerns the existing comment flags), anything that changes the database schema.
 
@@ -76,20 +77,7 @@ No code changes beyond removing the `scheme == "postgres"` guard at `sql.go:231`
 
 ### Component 3 — Postgres pool sizing
 
-In `New()`, after opening the `*sql.DB`:
-
-```go
-if s.engine == "postgres" {
-    n := tSettings.UtxoStore.SQLMaxOpenConns
-    if n <= 0 { n = 100 }
-    s.db.SetMaxOpenConns(n)
-    s.db.SetMaxIdleConns(n)
-}
-```
-
-Add `UtxoStore.SQLMaxOpenConns` (int, env `utxostore_sqlMaxOpenConns`, default 100) to `settings/utxostore_settings.go` and `settings/settings.go`.
-
-SQLite: leave pool defaults alone. SQLite is single-writer on a file; a wider pool just causes lock contention.
+Not needed as a code change. `util.InitSQLDB` (already called from the SQL store's `New`) applies `SetMaxOpenConns` / `SetMaxIdleConns` from either `tSettings.UtxoStore.PostgresPool` or the global `tSettings.Postgres`. Operators who want to match #684's `MaxConns=100` can set `utxostore_postgres_maxopenconns=100` at deployment time. No engine-specific default change bundled with this plan — changing the global default would affect every service.
 
 ## Testing
 
@@ -111,8 +99,7 @@ The shared `stores/utxo/tests` suite runs against SQLite with the batcher enable
 
 ## Settings additions
 
-- `utxostore_sqlMaxOpenConns` (default 100) — already described above.
-- No new batcher-size settings — reuse the existing `StoreBatcherSize` / `LockedBatcherSize` that already gate the current postgres-only paths.
+- No new settings. Reuse the existing `StoreBatcherSize` / `LockedBatcherSize` that gate the currently postgres-only paths; after this plan they'll gate on both engines.
 
 ## Follow-up (not in this design)
 
@@ -121,7 +108,6 @@ The shared `stores/utxo/tests` suite runs against SQLite with the batcher enable
 
 ## Files affected
 
-- `stores/utxo/sql/sql.go` — batcher construction guards; new `sendCreateBatchSQL`; existing `sendCreateBatch` renamed to `sendCreateBatchPostgres`; `sendCreateBatch` becomes dispatcher; `SetMaxOpenConns` in `New()`.
-- `settings/utxostore_settings.go`, `settings/settings.go` — `SQLMaxOpenConns` setting.
+- `stores/utxo/sql/sql.go` — batcher construction guards; new `sendCreateBatchSQL`; existing `sendCreateBatch` renamed to `sendCreateBatchPostgres`; `sendCreateBatch` becomes dispatcher.
 - `stores/utxo/sql/create_batcher_sqlite_test.go` (new) — create batcher SQLite tests.
 - `stores/utxo/sql/unlock_batcher_sqlite_test.go` (new) — unlock batcher SQLite tests.
