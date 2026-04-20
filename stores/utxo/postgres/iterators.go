@@ -184,8 +184,15 @@ func (it *unminedTxIterator) Close() error {
 }
 
 // GetUnminedTxIterator returns an iterator for all unmined, non-conflicting transactions.
-func (s *Store) GetUnminedTxIterator(_ bool) (utxo.UnminedTxIterator, error) {
+func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 	return newUnminedTxIterator(s)
+}
+
+// ScanInconsistentUnminedTxs is not yet implemented for the postgres store.
+// It returns a nil iterator so the BlockAssembler's consistency scan treats
+// this store as having no inconsistent entries to recover.
+func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
+	return nil, nil
 }
 
 // GetPrunableUnminedTxIterator returns an iterator for unmined transactions

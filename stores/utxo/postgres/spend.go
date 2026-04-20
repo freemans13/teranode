@@ -30,8 +30,11 @@ type batchSpendItem struct {
 // Direct-mode SQL (used when batcher is not active)
 // ---------------------------------------------------------------------------
 
-// spendValidationSQL is the CTE used to validate a spend attempt and insert
-// into the append-only spends table in a single round-trip.
+// spendValidationSQL is the CTE used to validate a spend attempt, insert into
+// the append-only spends table, and — if this spend drained the parent tx's
+// last unspent output — set delete_at_height so the pruner can reclaim it.
+//
+// $8 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH branch.
 const spendValidationSQL = `
 WITH validation AS (
     SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
@@ -43,19 +46,36 @@ WITH validation AS (
     JOIN txs t ON t.hash = o.tx_hash
     LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
     WHERE o.tx_hash = $1 AND o.idx = $2
+),
+inserted AS (
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
+    SELECT $1, $2, $3
+    FROM validation v
+    WHERE v.existing_spend IS NULL
+      AND v.utxo_hash = $4
+      AND NOT v.output_frozen AND NOT v.tx_frozen
+      AND ($6 OR NOT v.tx_locked)
+      AND ($7 OR NOT v.tx_conflicting)
+      AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
+      AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
+    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
+    RETURNING prev_tx_hash
+),
+dah_upd AS (
+    UPDATE txs t SET delete_at_height = $8
+    FROM inserted i
+    WHERE $8 > 0
+      AND t.hash = i.prev_tx_hash
+      AND t.preserve_until IS NULL
+      AND t.unmined_since IS NULL
+      AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
+      -- Pre-insert spends + this one newly-inserted row == total outputs ⇔ fully spent.
+      AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + 1
+          = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
+      AND (t.delete_at_height IS NULL OR t.delete_at_height < $8)
+    RETURNING 1
 )
-INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
-SELECT $1, $2, $3
-FROM validation v
-WHERE v.existing_spend IS NULL
-  AND v.utxo_hash = $4
-  AND NOT v.output_frozen AND NOT v.tx_frozen
-  AND ($6 OR NOT v.tx_locked)
-  AND ($7 OR NOT v.tx_conflicting)
-  AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
-  AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
-ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
-RETURNING 1
+SELECT 1 FROM inserted
 `
 
 // spendDiagnosticSQL re-queries the validation CTE when the INSERT returned
@@ -202,6 +222,7 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 			int64(blockHeight), // $5 blockHeight
 			ignoreLocked,       // $6 ignoreLocked
 			ignoreConflicting,  // $7 ignoreConflicting
+			s.newDAHOrZero(),   // $8 newDAH for dah_upd CTE
 		).Scan(&inserted)
 
 		if prometheusDirectSpendDuration != nil {
@@ -278,6 +299,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			item.spend.TxID[:], item.spend.Vout,
 			item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
 			int64(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
+			s.newDAHOrZero(),
 		).Scan(&inserted)
 		if err == nil {
 			item.errCh <- nil
@@ -332,6 +354,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	rows, err := conn.Query(ctx, bulkSpendSQL,
 		prevTxHashes, prevIdxs, spendingDatas, utxoHashes,
 		blockHeights, ignLockeds, ignConflictings, batchIdxs,
+		s.newDAHOrZero(),
 	)
 	if err != nil {
 		for _, item := range batch {
@@ -417,6 +440,14 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 }
 
 // bulkSpendSQL processes an entire batch in ONE query: UNNEST → validate → INSERT → results.
+//
+// The trailing dah_upd CTE re-evaluates delete_at_height for every parent tx whose
+// last unspent output was drained by this batch. Postgres CTEs share a snapshot,
+// so count(spends) inside dah_upd sees the PRE-insert state; adding p.spent_in_batch
+// gives the post-insert total. Equality with count(outputs) means fully spent.
+//
+// The caller passes $9 = newDAH (blockHeight+1+retention). When retention is 0,
+// the caller must pass 0, and the `$9 > 0` guard makes the DAH UPDATE a no-op.
 const bulkSpendSQL = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
@@ -456,6 +487,23 @@ inserted AS (
     SELECT prev_tx_hash, prev_idx, spending_data FROM to_insert
     ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
     RETURNING prev_tx_hash, prev_output_idx
+),
+parents AS (
+    SELECT prev_tx_hash AS tx_hash, count(*) AS spent_in_batch
+    FROM inserted GROUP BY prev_tx_hash
+),
+dah_upd AS (
+    UPDATE txs t SET delete_at_height = $9
+    FROM parents p
+    WHERE $9 > 0
+      AND t.hash = p.tx_hash
+      AND t.preserve_until IS NULL
+      AND t.unmined_since IS NULL
+      AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
+      AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + p.spent_in_batch
+          = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
+      AND (t.delete_at_height IS NULL OR t.delete_at_height < $9)
+    RETURNING 1
 )
 SELECT v.batch_idx,
        (i.prev_tx_hash IS NOT NULL) AS inserted,
@@ -603,4 +651,18 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	}
 
 	return nil
+}
+
+// newDAHOrZero returns the delete_at_height to assign to a tx that becomes
+// fully spent by the current batch, or 0 when retention is disabled. The
+// spend-side SQL CTEs use a `$N > 0` guard to no-op when this is zero.
+func (s *Store) newDAHOrZero() int64 {
+	if s.settings == nil {
+		return 0
+	}
+	retention := s.settings.GetUtxoStoreBlockHeightRetention()
+	if retention == 0 {
+		return 0
+	}
+	return int64(s.blockHeight.Load() + 1 + retention)
 }
