@@ -1445,7 +1445,7 @@ func (s *Store) sendCreateBatchPostgres(batch []*batchCreateItem) {
 		// and visible to other connections before callers proceed.
 		closeErr := br.Close()
 		if closeErr != nil {
-			s.logger.Errorf("[sendCreateBatch] error closing batch results: %v", closeErr)
+			s.logger.Errorf("[sendCreateBatchPostgres] error closing batch results: %v", closeErr)
 		}
 
 		// Now signal callers — if Close() failed, override successes with errors
@@ -1458,7 +1458,7 @@ func (s *Store) sendCreateBatchPostgres(batch []*batchCreateItem) {
 				continue
 			}
 			if r.logError {
-				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %+v", prepared[r.idx].txHash[:], r.result.Err)
+				s.logger.Errorf("[sendCreateBatchPostgres] CTE failed for tx %x: %+v", prepared[r.idx].txHash[:], r.result.Err)
 			}
 			batch[r.idx].done <- r.result
 		}
@@ -1489,7 +1489,7 @@ func (s *Store) sendCreateBatchPostgres(batch []*batchCreateItem) {
 		p := &prepared[idx]
 		if p.txMeta != nil && p.txMeta.Conflicting {
 			if conflictErr := s.insertConflictingChildrenPgx(s.ctx, batch[idx].tx, p.txHash); conflictErr != nil {
-				s.logger.Warnf("[sendCreateBatch] failed to insert conflicting children for %x: %v", p.txHash[:], conflictErr)
+				s.logger.Warnf("[sendCreateBatchPostgres] failed to insert conflicting children for %x: %v", p.txHash[:], conflictErr)
 			}
 		}
 	}
