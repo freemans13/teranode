@@ -3662,7 +3662,7 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		return nil
 	}
 
-	// Postgres: single-hash unlock → use batcher.
+	// Single-hash unlock → use batcher (works for both Postgres and SQLite).
 	if s.unlockBatcher != nil && len(txHashes) == 1 {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -3678,45 +3678,8 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		}
 	}
 
-	// Postgres: bulk unlock + DAH in chunked UPDATE statements
-	if s.engine == "postgres" {
-		return s.setUnlockedBulk(ctx, txHashes)
-	}
-
-	// SQLite: sequential unlock + DAH
-	txn, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = txn.Rollback()
-	}()
-
-	q := `
-		UPDATE transactions
-		SET locked = false
-		WHERE hash = $1
-		RETURNING id
-	`
-
-	for _, txHash := range txHashes {
-		var transactionID int
-		err := txn.QueryRowContext(ctx, q, txHash[:]).Scan(&transactionID)
-		if err != nil {
-			return errors.NewStorageError("failed to clear locked flag for %s", txHash, err)
-		}
-
-		// Recalculate DAH now that the tx is unlocked
-		if err = s.setDAH(ctx, txn, transactionID); err != nil {
-			return err
-		}
-	}
-
-	if err = txn.Commit(); err != nil {
-		return errors.NewStorageError("failed to commit unlock transaction", err)
-	}
-
-	return nil
+	// Bulk unlock + DAH recalculation (engine-aware: Postgres uses CTE, SQLite uses sequential in one txn).
+	return s.setUnlockedBulk(ctx, txHashes)
 }
 
 // setUnlockedBulk performs a bulk unlock + DAH recalculation.
@@ -3724,8 +3687,6 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 // For SQLite: batches N sequential unlock+setDAH calls into one BEGIN…COMMIT,
 // eliminating the per-call fsync overhead of individual transactions.
 func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) error {
-	// SQLite does not support UPDATE…FROM so use the sequential path wrapped
-	// in a single transaction — same semantics, far fewer fsyncs.
 	if s.engine != "postgres" {
 		txn, err := s.db.Begin()
 		if err != nil {
