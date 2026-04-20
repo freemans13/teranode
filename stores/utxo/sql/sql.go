@@ -1126,6 +1126,22 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		return false, false
 	}
 
+	// Phase 4d: conflicting_children (before commit, since we're in a transaction).
+	for _, c := range successes {
+		if c.prep.txMeta != nil && c.prep.txMeta.Conflicting {
+			if conflictErr := s.updateParentConflictingChildren(s.ctx, c.transactionID, c.prep.tx, txn); conflictErr != nil {
+				if isLockError(conflictErr) {
+					return true, true
+				}
+				for _, c2 := range successes {
+					c2.prep.item.done <- batchCreateResult{Err: conflictErr}
+					c2.prep.item.done = nil
+				}
+				return false, false
+			}
+		}
+	}
+
 	// Phase 5: commit.
 	if err := txn.Commit(); err != nil {
 		if isLockError(err) {
@@ -1143,6 +1159,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		c.prep.item.done <- batchCreateResult{Data: c.prep.txMeta}
 		c.prep.item.done = nil
 	}
+
 	return false, false
 }
 

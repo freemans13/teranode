@@ -90,3 +90,40 @@ func TestCreateBatcher_SQLite_Mined(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []uint32{100}, meta.BlockIDs)
 }
+
+// TestSharedSuite_SQLite_Batched runs the shared stores/utxo/tests suite
+// against a SQLite store with the Create and Unlock batchers enabled.
+// If any test in this suite fails, the batched path has behavioural drift
+// from the unbatched path — that's a regression, not a perf concern.
+func TestSharedSuite_SQLite_Batched(t *testing.T) {
+	store, ctx := setupSQLiteBatched(t)
+
+	t.Run("Store", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Store(t, store)
+	})
+	t.Run("Spend", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Spend(t, store)
+	})
+	t.Run("Restore", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Restore(t, store)
+	})
+	t.Run("Freeze", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Freeze(t, store)
+	})
+	t.Run("ReAssign", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.ReAssign(t, store)
+	})
+	t.Run("SetMined", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.SetMined(t, store)
+	})
+	t.Run("Conflicting", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Conflicting(t, store)
+	})
+}
