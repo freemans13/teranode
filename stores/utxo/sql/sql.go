@@ -2002,15 +2002,26 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		}
 	}
 
-	// Bulk UPDATE with optimistic locking
+	// Bulk UPDATE with optimistic locking.
+	// When retention > 0, the UPDATE is wrapped in a CTE that also runs a DAH
+	// recompute on any parent tx whose last unspent output was just drained.
+	// Mirrors aerospike's inline setDeleteAtHeight Lua call; without this, mined
+	// txs spent gradually over time never get a DAH and disk usage grows unbounded.
 	updatedSet := make(map[int]bool) // batchIdx -> updated
 	if len(dedupedUpdate) > 0 {
+		retention := s.settings.GetUtxoStoreBlockHeightRetention()
+		wrapDAH := retention > 0
+
 		var ub strings.Builder
-		ub.WriteString(`
+		if wrapDAH {
+			ub.WriteString(`WITH v(transaction_id,idx,spending_data,batch_idx) AS (VALUES `)
+		} else {
+			ub.WriteString(`
 			UPDATE outputs o
 			SET spending_data = v.spending_data
 			FROM (VALUES `)
-		updateArgs := make([]interface{}, 0, len(dedupedUpdate)*4)
+		}
+		updateArgs := make([]interface{}, 0, len(dedupedUpdate)*4+1)
 		pidx := 1
 		for j, u := range dedupedUpdate {
 			if j > 0 {
@@ -2020,10 +2031,41 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			updateArgs = append(updateArgs, u.transactionID, u.vout, u.spendingData, u.batchIdx)
 			pidx += 4
 		}
-		ub.WriteString(`) AS v(transaction_id,idx,spending_data,batch_idx)
+		if wrapDAH {
+			newDAH := int64(s.blockHeight.Load() + 1 + retention)
+			dahIdx := pidx
+			updateArgs = append(updateArgs, newDAH)
+			// Postgres CTEs share a snapshot, so the count(*) over outputs inside
+			// dah_upd sees the PRE-update state. "unspent-before == spent_in_batch"
+			// ⇔ this batch just drained the tx's last unspent output.
+			ub.WriteString(fmt.Sprintf(`),
+			upd AS (
+				UPDATE outputs o SET spending_data = v.spending_data FROM v
+				WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx
+				  AND (o.spending_data IS NULL OR o.spending_data = v.spending_data)
+				RETURNING v.batch_idx, o.transaction_id
+			),
+			parents AS (
+				SELECT transaction_id, count(*) AS spent_in_batch FROM upd GROUP BY transaction_id
+			),
+			dah_upd AS (
+				UPDATE transactions t SET delete_at_height = $%d
+				FROM parents p
+				WHERE t.id = p.transaction_id
+				  AND t.preserve_until IS NULL
+				  AND t.unmined_since IS NULL
+				  AND EXISTS (SELECT 1 FROM block_ids bi WHERE bi.transaction_id = t.id)
+				  AND (SELECT count(*) FROM outputs o WHERE o.transaction_id = t.id AND o.spending_data IS NULL) = p.spent_in_batch
+				  AND (t.delete_at_height IS NULL OR t.delete_at_height < $%d)
+				RETURNING 1
+			)
+			SELECT batch_idx FROM upd`, dahIdx, dahIdx))
+		} else {
+			ub.WriteString(`) AS v(transaction_id,idx,spending_data,batch_idx)
 			WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx
 			AND (o.spending_data IS NULL OR o.spending_data = v.spending_data)
 			RETURNING v.batch_idx`)
+		}
 
 		uRows, err := txn.QueryContext(s.ctx, ub.String(), updateArgs...)
 		if err != nil {
@@ -2148,7 +2190,8 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 	`
 
 	successItems := make([]*batchSpend, 0, len(batch))
-	validationErrors := make(map[int]error) // index -> validation error (non-retryable)
+	spentParentIDs := make(map[int]struct{}, len(batch)) // distinct parent tx ids whose outputs were just spent
+	validationErrors := make(map[int]error)              // index -> validation error (non-retryable)
 	aborted := false
 
 	// Phase 1: SELECT + validate + UPDATE outputs
@@ -2253,9 +2296,12 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 		}
 
 		if affected == 0 {
-			// Idempotent re-spend: same tx spending the same output again
+			// Idempotent re-spend: same tx spending the same output again.
+			// Still record the parent so DAH can be (re)evaluated — this heals DAHs
+			// that an earlier spend (before the DAH-on-spend fix) failed to set.
 			if len(spendingDataBytes) > 0 && spend.SpendingData != nil && bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
 				successItems = append(successItems, item)
+				spentParentIDs[transactionID] = struct{}{}
 				continue
 			}
 			// Concurrently spent by a different tx between SELECT and UPDATE.
@@ -2266,6 +2312,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 		}
 
 		successItems = append(successItems, item)
+		spentParentIDs[transactionID] = struct{}{}
 	}
 
 	// If aborted, roll back — send errors for items not yet notified
@@ -2281,6 +2328,28 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 			item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DB error")
 		}
 		return false
+	}
+
+	// Recompute DAH for every parent tx whose outputs were just spent. Mirrors
+	// aerospike's inline setDeleteAtHeight Lua call — if this batch drained the
+	// last unspent output of a mined, on-longest-chain tx, setDAH sets DAH so
+	// the pruner can later reclaim it. Without this, mined txs spent gradually
+	// over time never become prunable and disk usage grows unbounded.
+	for parentID := range spentParentIDs {
+		if err := s.setDAH(s.ctx, txn, parentID); err != nil {
+			if isDeadlock(err) {
+				return true
+			}
+			for i, item := range batch {
+				if valErr, ok := validationErrors[i]; ok {
+					item.errCh <- valErr
+				}
+			}
+			for _, item := range successItems {
+				item.errCh <- errors.NewStorageError("[Spend] failed to recompute DAH", err)
+			}
+			return false
+		}
 	}
 
 	// Commit
