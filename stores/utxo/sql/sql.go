@@ -901,10 +901,6 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 // preparedCreateSQL holds pre-computed per-item data for sendCreateBatchSQL.
 // Kept separate from preparedCreate (which carries Postgres array params) so
 // both types stay minimal and self-documenting.
-//
-// item is the original *batchCreateItem. After every per-item send (success or
-// error), callers must nil item.done via item so Phase 1's existing
-// item.done == nil guard naturally skips already-notified entries on retry.
 type preparedCreateSQL struct {
 	txHash       *chainhash.Hash
 	txMeta       *meta.Data
@@ -970,6 +966,8 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		txMeta, err := util.TxMetaDataFromTx(item.tx)
 		if err != nil {
 			item.done <- batchCreateResult{Err: errors.NewProcessingError("failed to get tx meta data", err)}
+			// Nil item.done after every send so Phase 1's item.done == nil guard
+			// skips already-notified entries on retry.
 			item.done = nil
 			continue
 		}
@@ -1034,7 +1032,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		)
 	}
 
-	rows, err := txn.Query(txSQL, txArgs...)
+	rows, err := txn.QueryContext(s.ctx, txSQL, txArgs...)
 	if err != nil {
 		if isLockError(err) {
 			return true, true
@@ -1045,6 +1043,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		}
 		return false, false
 	}
+	defer rows.Close()
 
 	// Build hash → id map from RETURNING rows (only newly-inserted txs appear).
 	hashToID := make(map[chainhash.Hash]int, len(preps))
@@ -1052,7 +1051,6 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		var id int
 		var hashBytes []byte
 		if err := rows.Scan(&id, &hashBytes); err != nil {
-			rows.Close()
 			for _, p := range preps {
 				p.item.done <- batchCreateResult{Err: errors.NewStorageError("scan RETURNING failed", err)}
 				p.item.done = nil
@@ -1064,14 +1062,12 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		hashToID[h] = id
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
 		for _, p := range preps {
 			p.item.done <- batchCreateResult{Err: errors.NewStorageError("iterating RETURNING failed", err)}
 			p.item.done = nil
 		}
 		return false, false
 	}
-	rows.Close()
 
 	// Phase 4: partition preps into successes (in RETURNING) and duplicates (not in RETURNING).
 	successes := make([]createBatchSuccess, 0, len(preps))
@@ -1095,7 +1091,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 	}
 
 	// Phase 4a: inputs.
-	if err := s.bulkInsertInputs(txn, successes); err != nil {
+	if err := s.bulkInsertInputs(s.ctx, txn, successes); err != nil {
 		if isLockError(err) {
 			return true, true
 		}
@@ -1107,7 +1103,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 	}
 
 	// Phase 4b: outputs.
-	if err := s.bulkInsertOutputs(txn, successes); err != nil {
+	if err := s.bulkInsertOutputs(s.ctx, txn, successes); err != nil {
 		if isLockError(err) {
 			return true, true
 		}
@@ -1119,7 +1115,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 	}
 
 	// Phase 4c: block_ids (only for items with MinedBlockInfos).
-	if err := s.bulkInsertBlockIDs(txn, successes); err != nil {
+	if err := s.bulkInsertBlockIDs(s.ctx, txn, successes); err != nil {
 		if isLockError(err) {
 			return true, true
 		}
@@ -1152,22 +1148,21 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 
 // bulkInsertInputs writes all inputs for every tx in successes via chunked
 // multi-row INSERT. Column ordering matches createInputsBatched exactly.
-func (s *Store) bulkInsertInputs(txn *sql.Tx, successes []createBatchSuccess) error {
+func (s *Store) bulkInsertInputs(ctx context.Context, txn *sql.Tx, successes []createBatchSuccess) error {
 	const colsPerRow = 8
 	const maxRowsPerChunk = maxPostgresParams / colsPerRow
 	baseSQL := `INSERT INTO inputs (transaction_id,idx,previous_transaction_hash,previous_tx_idx,previous_tx_satoshis,previous_tx_script,unlocking_script,sequence_number) VALUES `
 
 	// Flatten all inputs across all txs.
-	type inputRow struct{ args []interface{} }
-	allRows := make([]inputRow, 0, len(successes)*2)
+	allRows := make([][]interface{}, 0, len(successes)*2)
 	for _, c := range successes {
 		for i, input := range c.prep.tx.Inputs {
-			allRows = append(allRows, inputRow{args: []interface{}{
+			allRows = append(allRows, []interface{}{
 				c.transactionID, i,
 				input.PreviousTxIDChainHash()[:], input.PreviousTxOutIndex,
 				input.PreviousTxSatoshis, input.PreviousTxScript,
 				input.UnlockingScript, input.SequenceNumber,
-			}})
+			})
 		}
 	}
 	if len(allRows) == 0 {
@@ -1183,10 +1178,12 @@ func (s *Store) bulkInsertInputs(txn *sql.Tx, successes []createBatchSuccess) er
 		q := buildMultiValueInsert(baseSQL, colsPerRow, len(chunk), 1)
 		args := make([]interface{}, 0, len(chunk)*colsPerRow)
 		for _, r := range chunk {
-			args = append(args, r.args...)
+			args = append(args, r...)
 		}
-		if _, err := txn.Exec(q, args...); err != nil {
-			return classifyInsertError(err, false, "input")
+		// isCoinbase attribution is best-effort for multi-tx chunks; use the first row's tx.
+		chunkIsCoinbase := successes[0].prep.isCoinbase
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
+			return classifyInsertError(err, chunkIsCoinbase, "input")
 		}
 	}
 	return nil
@@ -1194,13 +1191,12 @@ func (s *Store) bulkInsertInputs(txn *sql.Tx, successes []createBatchSuccess) er
 
 // bulkInsertOutputs writes all outputs for every tx in successes via chunked
 // multi-row INSERT. Column ordering matches createOutputsBatched exactly.
-func (s *Store) bulkInsertOutputs(txn *sql.Tx, successes []createBatchSuccess) error {
+func (s *Store) bulkInsertOutputs(ctx context.Context, txn *sql.Tx, successes []createBatchSuccess) error {
 	const colsPerRow = 7
 	const maxRowsPerChunk = maxPostgresParams / colsPerRow
 	baseSQL := `INSERT INTO outputs (transaction_id,idx,locking_script,satoshis,coinbase_spending_height,utxo_hash,spending_data) VALUES `
 
-	type outputRow struct{ args []interface{} }
-	allRows := make([]outputRow, 0, len(successes)*2)
+	allRows := make([][]interface{}, 0, len(successes)*2)
 	for _, c := range successes {
 		var coinbaseSpendingHeight uint32
 		if c.prep.isCoinbase {
@@ -1218,11 +1214,11 @@ func (s *Store) bulkInsertOutputs(txn *sql.Tx, successes []createBatchSuccess) e
 			if err != nil {
 				return err
 			}
-			allRows = append(allRows, outputRow{args: []interface{}{
+			allRows = append(allRows, []interface{}{
 				c.transactionID, i,
 				output.LockingScript, output.Satoshis,
 				coinbaseSpendingHeight, utxoHash[:], nil,
-			}})
+			})
 		}
 	}
 	if len(allRows) == 0 {
@@ -1238,10 +1234,12 @@ func (s *Store) bulkInsertOutputs(txn *sql.Tx, successes []createBatchSuccess) e
 		q := buildMultiValueInsert(baseSQL, colsPerRow, len(chunk), 1)
 		args := make([]interface{}, 0, len(chunk)*colsPerRow)
 		for _, r := range chunk {
-			args = append(args, r.args...)
+			args = append(args, r...)
 		}
-		if _, err := txn.Exec(q, args...); err != nil {
-			return classifyInsertError(err, false, "output")
+		// isCoinbase attribution is best-effort for multi-tx chunks; use the first row's tx.
+		chunkIsCoinbase := successes[0].prep.isCoinbase
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
+			return classifyInsertError(err, chunkIsCoinbase, "output")
 		}
 	}
 	return nil
@@ -1249,18 +1247,17 @@ func (s *Store) bulkInsertOutputs(txn *sql.Tx, successes []createBatchSuccess) e
 
 // bulkInsertBlockIDs writes block_ids entries for any tx with MinedBlockInfos.
 // Column ordering matches createBlockIDsBatched exactly.
-func (s *Store) bulkInsertBlockIDs(txn *sql.Tx, successes []createBatchSuccess) error {
+func (s *Store) bulkInsertBlockIDs(ctx context.Context, txn *sql.Tx, successes []createBatchSuccess) error {
 	const colsPerRow = 4
 	const maxRowsPerChunk = maxPostgresParams / colsPerRow
 	baseSQL := `INSERT INTO block_ids (transaction_id,block_id,block_height,subtree_idx) VALUES `
 
-	type blockIDRow struct{ args []interface{} }
-	allRows := make([]blockIDRow, 0)
+	allRows := make([][]interface{}, 0)
 	for _, c := range successes {
 		for _, bi := range c.prep.options.MinedBlockInfos {
-			allRows = append(allRows, blockIDRow{args: []interface{}{
+			allRows = append(allRows, []interface{}{
 				c.transactionID, bi.BlockID, bi.BlockHeight, bi.SubtreeIdx,
-			}})
+			})
 		}
 	}
 	if len(allRows) == 0 {
@@ -1276,9 +1273,9 @@ func (s *Store) bulkInsertBlockIDs(txn *sql.Tx, successes []createBatchSuccess) 
 		q := buildMultiValueInsert(baseSQL, colsPerRow, len(chunk), 1)
 		args := make([]interface{}, 0, len(chunk)*colsPerRow)
 		for _, r := range chunk {
-			args = append(args, r.args...)
+			args = append(args, r...)
 		}
-		if _, err := txn.Exec(q, args...); err != nil {
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
 			return classifyInsertError(err, false, "block_ids")
 		}
 	}
