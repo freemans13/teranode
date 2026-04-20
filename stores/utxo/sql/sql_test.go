@@ -73,6 +73,7 @@ func setup(ctx context.Context, t *testing.T) (*Store, *bt.Tx) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
 	tSettings.BatcherDrainMode = true // batcher fires immediately in tests
+	tSettings.UtxoStore.StoreBatcherSize = 1 // disable create batcher for unbatched tests
 
 	tx, err := bt.NewTxFromString("010000000000000000ef01032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a18700000000" +
 		"8c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5" +
@@ -591,6 +592,7 @@ func TestTombstoneAfterSpendAndUnspend(t *testing.T) {
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
 	tSettings.BatcherDrainMode = true        // batcher fires immediately in tests
 	tSettings.GlobalBlockHeightRetention = 5 // Use low retention but compatible with child stability checks
+	tSettings.UtxoStore.StoreBatcherSize = 1 // disable create batcher for unbatched tests
 
 	tx, err := bt.NewTxFromString("010000000000000000ef01032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a18700000000" +
 		"8c493046022100c352d3dd993a981beba4a63ad15c209275ca9470abfcd57da93b58e4eb5dce82022100840792bc1f456062819f15d33ee7055cf7b5" +
@@ -1417,6 +1419,7 @@ func TestCreateSqliteSchemaDirectly(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
 	tSettings.BatcherDrainMode = true // batcher fires immediately in tests
+	tSettings.UtxoStore.StoreBatcherSize = 1 // disable create batcher for unbatched tests
 
 	// Create a fresh SQLite in-memory database to test schema creation
 	utxoStoreURL, err := url.Parse("sqlitememory:///test_sqlite_schema")

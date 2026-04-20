@@ -17,6 +17,7 @@ func TestPrunableUnminedTxIterator_Integration(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	ctx := context.Background()
 	settings := test.CreateBaseTestSettings(t)
+	settings.UtxoStore.StoreBatcherSize = 1 // disable create batcher for unbatched tests
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
@@ -99,6 +100,7 @@ func TestUnminedTxIterator_Integration(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	ctx := context.Background()
 	settings := test.CreateBaseTestSettings(t)
+	settings.UtxoStore.StoreBatcherSize = 1 // disable create batcher for unbatched tests
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
