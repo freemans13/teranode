@@ -228,8 +228,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 	}
 
-	// Initialize unlock batcher for Postgres — batches single-hash SetLocked(false) calls.
-	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.LockedBatcherSize > 1 {
+	// Initialize unlock batcher — batches single-hash SetLocked(false) calls for both
+	// engines. Postgres wins through `ANY($1)` + CTE; SQLite wins through fewer
+	// BEGIN…COMMIT cycles on the single-writer file. `setUnlockedBulk` handles both.
+	if tSettings.UtxoStore.LockedBatcherSize > 1 {
 		unlockBatchSize := tSettings.UtxoStore.LockedBatcherSize
 		unlockBatchDuration := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
 		s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
@@ -4012,10 +4014,39 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	return nil
 }
 
-// setUnlockedBulk performs a bulk unlock + DAH recalculation for Postgres.
-// Replaces 3N sequential queries (unlock + setDAH SELECT + setDAH UPDATE per tx)
-// with 1 UPDATE per chunk of maxINClauseSize hashes.
+// setUnlockedBulk performs a bulk unlock + DAH recalculation.
+// For Postgres: replaces 3N sequential queries with 1 UPDATE per chunk via CTE.
+// For SQLite: batches N sequential unlock+setDAH calls into one BEGIN…COMMIT,
+// eliminating the per-call fsync overhead of individual transactions.
 func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) error {
+	// SQLite does not support UPDATE…FROM so use the sequential path wrapped
+	// in a single transaction — same semantics, far fewer fsyncs.
+	if s.engine != "postgres" {
+		txn, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = txn.Rollback() }()
+
+		q := `UPDATE transactions SET locked = false WHERE hash = $1 RETURNING id`
+		for _, txHash := range txHashes {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			var transactionID int
+			if err := txn.QueryRowContext(ctx, q, txHash[:]).Scan(&transactionID); err != nil {
+				return errors.NewStorageError("failed to clear locked flag for %s", txHash, err)
+			}
+			if err := s.setDAH(ctx, txn, transactionID); err != nil {
+				return err
+			}
+		}
+
+		return txn.Commit()
+	}
+
 	retention := s.settings.GetUtxoStoreBlockHeightRetention()
 
 	for i := 0; i < len(txHashes); i += maxINClauseSize {
