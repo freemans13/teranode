@@ -9,7 +9,28 @@ import (
 )
 
 // createSchema creates the v5 turbo UTXO tables in the connected PostgreSQL
-// database. 3 UNLOGGED tables (txs, outputs, spends) with 16 partitions each.
+// database: 3 LOGGED hash-partitioned tables (txs, outputs, spends).
+//
+// Schema design tradeoffs (vs. the standard stores/utxo/sql store):
+//
+//   - No foreign keys. Child rows (outputs, spends) reference txs by BYTEA
+//     hash rather than a surrogate id, and pruning explicitly cascades via
+//     DELETE FROM spends → outputs → txs inside one txn (see pruner_provider).
+//     Skips the FK check/maintenance cost on the write path but removes the
+//     DB-level safety net — any bug that deletes txs without the matching
+//     spends/outputs leaves orphans.
+//
+//   - "Is this output spent?" lives in the spends table as a row, not as a
+//     nullable spending_data column on outputs. Spends become pure INSERTs
+//     (no MVCC bloat on outputs) at the cost of needing a LEFT JOIN spends
+//     on every spend-validation query.
+//
+//   - block_ids / block_heights / subtree_idxs / conflicting_children are
+//     INT[] / BYTEA[] arrays on txs instead of separate tables. Reads are
+//     one column on one row; appends (new block_id on mine) are cheap via
+//     `|| $N::int[]`. A full reorg that touches millions of rows still
+//     has to rewrite whole arrays — heavy-reorg cost > separate-table
+//     variant that just INSERTs/DELETEs rows.
 func (s *Store) createSchema(ctx context.Context) error {
 	return createSchemaWithPool(ctx, s.pool)
 }
@@ -20,7 +41,10 @@ type partitionSpec struct {
 	fillfactor int
 }
 
-// numPartitions is the number of hash partitions per table.
+// numPartitions is the number of hash partitions per table. Local benchmarking
+// shows a single partition outperforms a higher partition count — the partition
+// machinery is kept so we can raise this if future profiling shows contention
+// at the PK level on larger deployments.
 const numPartitions = 1
 
 // createSchemaWithPool executes all DDL statements using the provided pool.
@@ -37,7 +61,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
-	// Create 16 hash partitions for each table with appropriate fillfactor.
+	// Create numPartitions hash partitions for each table with appropriate fillfactor.
 	tables := []partitionSpec{
 		{"txs", 70},      // HOT updates — reserve 30% for in-place updates
 		{"outputs", 100}, // immutable
@@ -75,11 +99,11 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 }
 
 // ---------------------------------------------------------------------------
-// Table DDL — 3 UNLOGGED tables
+// Table DDL — 3 LOGGED hash-partitioned tables
 // ---------------------------------------------------------------------------
 
 // txs: consolidated transaction metadata + state + inputs (raw_tx) + block_ids
-// (arrays) + conflicting_children (array). UNLOGGED for performance.
+// (arrays) + conflicting_children (array). LOGGED — UTXO set is durable state.
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
     hash                 BYTEA PRIMARY KEY,
@@ -107,7 +131,9 @@ const txsIndexesDDL = `
 CREATE INDEX IF NOT EXISTS px_unmined_since ON txs (unmined_since) WHERE unmined_since IS NOT NULL;
 CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE delete_at_height IS NOT NULL;`
 
-// outputs: immutable transaction outputs. UNLOGGED for performance.
+// outputs: immutable transaction outputs. LOGGED. Spent-ness is tracked by
+// row-presence in the spends table rather than a nullable column here, so
+// these rows never have to be updated after Create.
 const outputsDDL = `
 CREATE TABLE IF NOT EXISTS outputs (
     tx_hash                 BYTEA   NOT NULL,
@@ -121,7 +147,9 @@ CREATE TABLE IF NOT EXISTS outputs (
     PRIMARY KEY (tx_hash, idx)
 ) PARTITION BY HASH (tx_hash);`
 
-// spends: append-only spend records. UNLOGGED for performance.
+// spends: append-only spend records. LOGGED. A row here is the canonical
+// "this output was spent by that tx" marker; Unspend deletes the row, and
+// the pruner removes all rows for a parent_tx before removing the parent.
 const spendsDDL = `
 CREATE TABLE IF NOT EXISTS spends (
     prev_tx_hash    BYTEA  NOT NULL,

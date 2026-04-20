@@ -1,10 +1,15 @@
 # Turbo UTXO Store (v5) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Implementation note (post-plan):** The UNLOGGED direction below was dropped
+> during implementation — the UTXO set is durable state, so all permanent
+> tables are LOGGED. References to UNLOGGED in this plan are historical.
+> Authoritative schema: `stores/utxo/postgres/schema.go`.
 
-**Goal:** Refactor the v4 queue store to achieve 10x throughput via COPY protocol, 3-table schema, UNLOGGED tables, in-process cache, and connection pool tuning.
+**Goal:** Refactor the v4 queue store to achieve 10x throughput via COPY protocol, 3-table schema, in-process cache, and connection pool tuning.
 
-**Architecture:** Collapse 7 tables → 3 (txs, outputs, spends). All UNLOGGED. Creates use COPY to temp staging + INSERT...SELECT. Inputs stored as raw_tx blob. block_ids/conflicting_children stored as arrays on txs. LRU cache eliminates Get round-trips. Pool size 100 with synchronous_commit=off.
+**Architecture:** Collapse 7 tables → 3 (txs, outputs, spends). LOGGED (durable). Creates use COPY to temp staging + INSERT...SELECT. Inputs stored as raw_tx blob. block_ids/conflicting_children stored as arrays on txs. LRU cache eliminates Get round-trips. Pool size 100 with synchronous_commit=off.
 
 **Tech Stack:** Go, pgx/v5 (pgxpool, CopyFrom, SendBatch), PostgreSQL 17, hashicorp/golang-lru/v2
 

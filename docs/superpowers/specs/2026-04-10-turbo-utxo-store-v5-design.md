@@ -1,5 +1,12 @@
 # Turbo UTXO Store — 10x Performance Design
 
+> **Implementation note (post-design):** During implementation the UNLOGGED
+> table direction was dropped — the UTXO set is durable state, not ephemeral
+> cache, so all three permanent tables (`txs`, `outputs`, `spends`) are LOGGED
+> in `stores/utxo/postgres/schema.go`. The "UNLOGGED 3x writes" technique and
+> associated risk section below are therefore not in effect. Authoritative
+> current schema lives in `stores/utxo/postgres/schema.go`.
+
 **Date:** 2026-04-10 (v5 — COPY protocol, 3-table schema, in-process cache)
 **Supersedes:** v4 (append-only direct-write with batching)
 **Target:** 50,000+ TPS on validator hot path (10x current ~5,000 TPS)
