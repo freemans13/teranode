@@ -221,7 +221,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.StoreBatcherSize > 1 {
 		storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 		storeBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
-		s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
+		s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatchPostgres, true)
 		if tSettings.BatcherDrainMode {
 			s.createBatcher.SetDrainMode(true)
 		}
@@ -887,10 +887,10 @@ type preparedCreate struct {
 	blkArrs      blockIDArrayParams
 }
 
-// sendCreateBatch is the batcher callback that processes a batch of Create operations
+// sendCreateBatchPostgres is the pgx-specific batcher callback that processes a batch of Create operations
 // in a single pgx.SendBatch — N CTEs in one network flush.
 // Mirrors aerospike/create.go sendStoreBatch.
-func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
+func (s *Store) sendCreateBatchPostgres(batch []*batchCreateItem) {
 	// Phase 1: Pre-compute all array parameters (CPU only, no DB)
 	prepared := make([]preparedCreate, len(batch))
 	for i, item := range batch {
