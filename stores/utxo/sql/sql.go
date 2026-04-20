@@ -219,10 +219,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Batches individual Create() calls into a single pgx.SendBatch with N CTEs,
 	// reducing N network round-trips to 1. background=true because each CTE inserts
 	// a unique transaction hash — no row overlap, no deadlock risk between batches.
-	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.StoreBatcherSize > 1 {
+	if tSettings.UtxoStore.StoreBatcherSize > 1 {
 		storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 		storeBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
-		s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatchPostgres, true)
+		s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
 		if tSettings.BatcherDrainMode {
 			s.createBatcher.SetDrainMode(true)
 		}
@@ -886,6 +886,23 @@ type preparedCreate struct {
 	inpArrs      inputArrayParams
 	outArrs      outputArrayParams
 	blkArrs      blockIDArrayParams
+}
+
+// sendCreateBatch dispatches a Create batch to the engine-appropriate
+// implementation. Postgres uses pgx pipelined SendBatch; everything else
+// uses the portable database/sql multi-row INSERT path.
+func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
+	if s.engine == "postgres" {
+		s.sendCreateBatchPostgres(batch)
+		return
+	}
+	s.sendCreateBatchSQL(batch)
+}
+
+// sendCreateBatchSQL is the portable database/sql implementation. Stub —
+// see Task 4 of docs/superpowers/plans/2026-04-20-sql-store-perf-backports.md.
+func (s *Store) sendCreateBatchSQL(batch []*batchCreateItem) {
+	panic("sendCreateBatchSQL: not yet implemented — see Task 4 of the perf backports plan")
 }
 
 // sendCreateBatchPostgres is the pgx-specific batcher callback that processes a batch of Create operations
