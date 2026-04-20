@@ -901,6 +901,10 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 // preparedCreateSQL holds pre-computed per-item data for sendCreateBatchSQL.
 // Kept separate from preparedCreate (which carries Postgres array params) so
 // both types stay minimal and self-documenting.
+//
+// item is the original *batchCreateItem. After every per-item send (success or
+// error), callers must nil item.done via item so Phase 1's existing
+// item.done == nil guard naturally skips already-notified entries on retry.
 type preparedCreateSQL struct {
 	txHash       *chainhash.Hash
 	txMeta       *meta.Data
@@ -909,7 +913,7 @@ type preparedCreateSQL struct {
 	tx           *bt.Tx
 	options      *utxo.CreateOptions
 	blockHeight  uint32
-	done         chan batchCreateResult
+	item         *batchCreateItem
 }
 
 // createBatchSuccess carries the transactionID returned by INSERT RETURNING
@@ -992,7 +996,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		preps = append(preps, &preparedCreateSQL{
 			txHash: txHash, txMeta: txMeta, isCoinbase: isCoinbase,
 			unminedSince: unminedSince, tx: item.tx, options: item.options,
-			blockHeight: item.blockHeight, done: item.done,
+			blockHeight: item.blockHeight, item: item,
 		})
 	}
 	if len(preps) == 0 {
@@ -1006,7 +1010,8 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			return true, true
 		}
 		for _, p := range preps {
-			p.done <- batchCreateResult{Err: errors.NewStorageError("failed to begin tx", err)}
+			p.item.done <- batchCreateResult{Err: errors.NewStorageError("failed to begin tx", err)}
+			p.item.done = nil
 		}
 		return false, false
 	}
@@ -1035,7 +1040,8 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			return true, true
 		}
 		for _, p := range preps {
-			p.done <- batchCreateResult{Err: errors.NewStorageError("bulk INSERT transactions failed", err)}
+			p.item.done <- batchCreateResult{Err: errors.NewStorageError("bulk INSERT transactions failed", err)}
+			p.item.done = nil
 		}
 		return false, false
 	}
@@ -1048,7 +1054,8 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		if err := rows.Scan(&id, &hashBytes); err != nil {
 			rows.Close()
 			for _, p := range preps {
-				p.done <- batchCreateResult{Err: errors.NewStorageError("scan RETURNING failed", err)}
+				p.item.done <- batchCreateResult{Err: errors.NewStorageError("scan RETURNING failed", err)}
+				p.item.done = nil
 			}
 			return false, false
 		}
@@ -1059,7 +1066,8 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		for _, p := range preps {
-			p.done <- batchCreateResult{Err: errors.NewStorageError("iterating RETURNING failed", err)}
+			p.item.done <- batchCreateResult{Err: errors.NewStorageError("iterating RETURNING failed", err)}
+			p.item.done = nil
 		}
 		return false, false
 	}
@@ -1071,7 +1079,9 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		id, ok := hashToID[*p.txHash]
 		if !ok {
 			// Not in RETURNING → hash already existed in transactions table.
-			p.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", p.isCoinbase)}
+			// Nil item.done so a subsequent retry attempt's Phase 1 skips this item.
+			p.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", p.isCoinbase)}
+			p.item.done = nil
 			continue
 		}
 		successes = append(successes, createBatchSuccess{transactionID: id, prep: p})
@@ -1090,7 +1100,8 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			return true, true
 		}
 		for _, c := range successes {
-			c.prep.done <- batchCreateResult{Err: err}
+			c.prep.item.done <- batchCreateResult{Err: err}
+			c.prep.item.done = nil
 		}
 		return false, false
 	}
@@ -1101,7 +1112,8 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			return true, true
 		}
 		for _, c := range successes {
-			c.prep.done <- batchCreateResult{Err: err}
+			c.prep.item.done <- batchCreateResult{Err: err}
+			c.prep.item.done = nil
 		}
 		return false, false
 	}
@@ -1112,7 +1124,8 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			return true, true
 		}
 		for _, c := range successes {
-			c.prep.done <- batchCreateResult{Err: err}
+			c.prep.item.done <- batchCreateResult{Err: err}
+			c.prep.item.done = nil
 		}
 		return false, false
 	}
@@ -1123,14 +1136,16 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			return true, true
 		}
 		for _, c := range successes {
-			c.prep.done <- batchCreateResult{Err: errors.NewStorageError("batch commit failed", err)}
+			c.prep.item.done <- batchCreateResult{Err: errors.NewStorageError("batch commit failed", err)}
+			c.prep.item.done = nil
 		}
 		return false, false
 	}
 
 	// Notify successes.
 	for _, c := range successes {
-		c.prep.done <- batchCreateResult{Data: c.prep.txMeta}
+		c.prep.item.done <- batchCreateResult{Data: c.prep.txMeta}
+		c.prep.item.done = nil
 	}
 	return false, false
 }
