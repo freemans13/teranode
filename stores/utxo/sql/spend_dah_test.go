@@ -12,6 +12,11 @@ import (
 // TestMinedThenSpendAllPrunes_SQLite exercises the per-row spend path
 // (trySendSpendBatchPerRow) via the in-memory SQLite backend.
 func TestMinedThenSpendAllPrunes_SQLite(t *testing.T) {
+	// Pruner service is a process-wide singleton; reset so it binds to THIS
+	// test's Store rather than a stale one from a different backend or run.
+	ResetPrunerServiceForTests()
+	t.Cleanup(ResetPrunerServiceForTests)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -32,6 +37,9 @@ func TestMinedThenSpendAllPrunes_Postgres(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Postgres integration test in short mode")
 	}
+
+	ResetPrunerServiceForTests()
+	t.Cleanup(ResetPrunerServiceForTests)
 
 	store, ctx := setupPostgresStore(t)
 
