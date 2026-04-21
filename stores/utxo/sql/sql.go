@@ -2061,10 +2061,17 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			//   * upd_spent — only rows that were genuinely NULL before this UPDATE,
 			//     i.e. truly spent by this batch. These feed the drain check.
 			//   * upd_idem  — rows that were already spent with matching spending_data
-			//     (idempotent re-spend, possibly from a concurrent duplicate). These
-			//     are reported as "updated" so the caller sees success, but must NOT
-			//     be counted in spent_in_batch — otherwise the count would exceed the
-			//     real pre-state unspent count and the drain check would falsely miss.
+			//     at statement-snapshot time (idempotent re-spend). Reported as
+			//     "updated" so the caller sees success, but NOT counted in
+			//     spent_in_batch — otherwise the count would exceed the real
+			//     pre-state unspent count and the drain check would falsely miss.
+			//
+			// Edge case: if a concurrent transaction commits matching
+			// spending_data AFTER our statement snapshot is taken, neither CTE
+			// catches it (upd_spent's EPQ recheck sees non-NULL, upd_idem's
+			// snapshot predicate sees NULL). That race is caught by a second
+			// fresh-snapshot re-check after the statement — see the
+			// concurrent-idempotent re-check below.
 			ub.WriteString(fmt.Sprintf(`),
 			upd_spent AS (
 				UPDATE outputs o SET spending_data = v.spending_data FROM v
@@ -2157,6 +2164,87 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		}
 
 		// Check for items that were not updated (concurrent spend between SELECT and UPDATE)
+		// First pass: items absent from upd_spent AND upd_idem are candidates
+		// for UtxoSpentError. Gather them for a concurrent-idempotent re-check
+		// against a fresh snapshot before we finalise the error.
+		var missedIdxs []int
+		for _, u := range dedupedUpdate {
+			if !updatedSet[u.batchIdx] {
+				missedIdxs = append(missedIdxs, u.batchIdx)
+			}
+		}
+
+		// The bulk UPDATE and the sibling upd_idem CTE share one statement
+		// snapshot. If a concurrent transaction commits the SAME spending_data
+		// on one of our target rows after our snapshot is taken, upd_spent's
+		// EPQ recheck will reject the row (spending_data no longer NULL) and
+		// upd_idem's snapshot-level predicate won't match it (NULL at snapshot,
+		// filter is `= v.spending_data`). The row ends up in neither RETURNING
+		// set and would be wrongly marked as UtxoSpentError.
+		//
+		// Run a second, fresh-snapshot SELECT over the missed rows to catch
+		// those concurrent idempotent commits. Anything whose current
+		// spending_data matches ours is a successful idempotent spend.
+		if len(missedIdxs) > 0 {
+			var sb strings.Builder
+			sb.WriteString(`SELECT v.batch_idx FROM (VALUES `)
+			args := make([]interface{}, 0, len(missedIdxs)*4)
+			pidx := 1
+			for i, bIdx := range missedIdxs {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(fmt.Sprintf("($%d::int,$%d::int,$%d::bytea,$%d::int)", pidx, pidx+1, pidx+2, pidx+3))
+				spend := batch[bIdx].spend
+				r := resultMap[bIdx]
+				args = append(args, r.transactionID, spend.Vout, spend.SpendingData.Bytes(), bIdx)
+				pidx += 4
+			}
+			sb.WriteString(`) AS v(transaction_id,idx,spending_data,batch_idx)
+			JOIN outputs o ON o.transaction_id = v.transaction_id AND o.idx = v.idx
+			WHERE o.spending_data = v.spending_data`)
+
+			iRows, err := txn.QueryContext(s.ctx, sb.String(), args...)
+			if err != nil {
+				if isDeadlock(err) {
+					return true
+				}
+				for _, item := range batch {
+					item.errCh <- errors.NewStorageError("[Spend] failed: concurrent-idempotent re-check", err)
+				}
+				return false
+			}
+			for iRows.Next() {
+				var bIdx int
+				if err := iRows.Scan(&bIdx); err != nil {
+					iRows.Close()
+					if isDeadlock(err) {
+						return true
+					}
+					for _, item := range batch {
+						item.errCh <- errors.NewStorageError("[Spend] failed: scanning concurrent-idempotent re-check", err)
+					}
+					return false
+				}
+				updatedSet[bIdx] = true
+				// Parent has just had its output confirmed-spent by someone
+				// else with our exact spending_data. Treat it as an idempotent
+				// match for DAH-healing purposes, same as the in-statement path.
+				idempotentParentIDs[resultMap[bIdx].transactionID] = struct{}{}
+			}
+			if err := iRows.Close(); err != nil {
+				if isDeadlock(err) {
+					return true
+				}
+				for _, item := range batch {
+					item.errCh <- errors.NewStorageError("[Spend] failed: closing concurrent-idempotent re-check", err)
+				}
+				return false
+			}
+		}
+
+		// Anything still not in updatedSet after the re-check is a genuine
+		// UtxoSpentError (row was concurrently spent by a DIFFERENT spender).
 		for _, u := range dedupedUpdate {
 			if !updatedSet[u.batchIdx] {
 				spend := batch[u.batchIdx].spend
