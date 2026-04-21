@@ -72,7 +72,7 @@ func setup(ctx context.Context, t *testing.T) (*Store, *bt.Tx) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
-	tSettings.BatcherDrainMode = true // batcher fires immediately in tests
+	tSettings.BatcherDrainMode = true        // batcher fires immediately in tests
 	tSettings.UtxoStore.StoreBatcherSize = 1 // disable create batcher for unbatched tests
 
 	tx, err := bt.NewTxFromString("010000000000000000ef01032e38e9c0a84c6046d687d10556dcacc41d275ec55fc00779ac88fdf357a18700000000" +
@@ -1418,7 +1418,7 @@ func TestCreateSqliteSchemaDirectly(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
-	tSettings.BatcherDrainMode = true // batcher fires immediately in tests
+	tSettings.BatcherDrainMode = true        // batcher fires immediately in tests
 	tSettings.UtxoStore.StoreBatcherSize = 1 // disable create batcher for unbatched tests
 
 	// Create a fresh SQLite in-memory database to test schema creation
