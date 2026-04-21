@@ -49,6 +49,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2206,7 +2207,16 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		touchedParents[p] = struct{}{}
 	}
 	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && len(touchedParents) > 0 {
+		// Sort parent IDs before calling setDAH so concurrent bulk batches
+		// acquire row locks on `transactions` in a deterministic order. Map
+		// iteration is randomised per-run, which under contention would
+		// otherwise inflate deadlock rates.
+		sortedParents := make([]int, 0, len(touchedParents))
 		for parentID := range touchedParents {
+			sortedParents = append(sortedParents, parentID)
+		}
+		sort.Ints(sortedParents)
+		for _, parentID := range sortedParents {
 			if err := s.setDAH(s.ctx, txn, parentID); err != nil {
 				if isDeadlock(err) {
 					return true
@@ -2434,7 +2444,15 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 	// last unspent output of a mined, on-longest-chain tx, setDAH sets DAH so
 	// the pruner can later reclaim it. Without this, mined txs spent gradually
 	// over time never become prunable and disk usage grows unbounded.
+	//
+	// Sort parent IDs so concurrent per-row batches acquire row locks in a
+	// deterministic order and don't deadlock on cross-batch lock orderings.
+	sortedSpentParents := make([]int, 0, len(spentParentIDs))
 	for parentID := range spentParentIDs {
+		sortedSpentParents = append(sortedSpentParents, parentID)
+	}
+	sort.Ints(sortedSpentParents)
+	for _, parentID := range sortedSpentParents {
 		if err := s.setDAH(s.ctx, txn, parentID); err != nil {
 			if isDeadlock(err) {
 				return true
