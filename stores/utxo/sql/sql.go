@@ -1922,6 +1922,12 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		spendingData  []byte
 	}
 	var toUpdate []updateItem
+	// Parent tx IDs from idempotent re-spends (output already carries matching
+	// spending_data). The CTE-based DAH recompute below only covers parents
+	// touched by the bulk UPDATE, so it would miss these. Recording them here
+	// lets us run a post-UPDATE DAH recompute so parents whose DAH was left
+	// NULL by a pre-fix spend still get healed — matching the per-row path.
+	idempotentParentIDs := make(map[int]struct{})
 
 	for i, item := range batch {
 		spend := item.spend
@@ -1959,7 +1965,10 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
 				continue
 			}
-			// Idempotent re-spend: same spending data — treat as success without UPDATE
+			// Idempotent re-spend: same spending data — treat as success without UPDATE.
+			// Record the parent so DAH can still be (re)evaluated and heal NULL DAHs
+			// left by spends that happened before the DAH-on-spend fix landed.
+			idempotentParentIDs[r.transactionID] = struct{}{}
 			continue
 		}
 
@@ -2120,6 +2129,28 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if updatedSet[firstIdx] {
 					updatedSet[u.batchIdx] = true
 				}
+			}
+		}
+	}
+
+	// Heal DAH for parents touched only by idempotent re-spends. The CTE above
+	// skips them because there is no matching row in dedupedUpdate, so without
+	// this pass any tx whose pre-fix spend left DAH NULL would stay unprunable
+	// forever. Mirrors the per-row path's behavior.
+	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && len(idempotentParentIDs) > 0 {
+		for parentID := range idempotentParentIDs {
+			if err := s.setDAH(s.ctx, txn, parentID); err != nil {
+				if isDeadlock(err) {
+					return true
+				}
+				for i, item := range batch {
+					if valErr, ok := validationErrors[i]; ok {
+						item.errCh <- valErr
+					} else {
+						item.errCh <- errors.NewStorageError("[Spend] failed to recompute DAH for idempotent re-spend", err)
+					}
+				}
+				return false
 			}
 		}
 	}
