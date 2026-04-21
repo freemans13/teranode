@@ -41,7 +41,17 @@ func TestMinedThenSpendAllPrunes_Postgres(t *testing.T) {
 	ResetPrunerServiceForTests()
 	t.Cleanup(ResetPrunerServiceForTests)
 
-	store, ctx := setupPostgresStore(t)
+	store, baseCtx := setupPostgresStore(t)
+
+	// Wrap in a cancelable context and cancel in t.Cleanup. t.Cleanup runs in
+	// LIFO order, so this cancel (registered AFTER ResetPrunerServiceForTests)
+	// executes FIRST — stopping the pruner goroutine before the singleton
+	// pointer is cleared. ResetPrunerServiceForTests only clears the pointer;
+	// it does NOT stop a started pruner, so without explicit cancellation the
+	// goroutine would keep running after the test returns and the testcontainer
+	// terminates.
+	ctx, cancel := context.WithCancel(baseCtx)
+	t.Cleanup(cancel)
 
 	provider := any(store).(pruner.PrunerServiceProvider)
 	prunerSvc, err := provider.GetPrunerService()

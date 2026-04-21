@@ -2047,15 +2047,31 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			// Postgres CTEs share a snapshot, so the count(*) over outputs inside
 			// dah_upd sees the PRE-update state. "unspent-before == spent_in_batch"
 			// ⇔ this batch just drained the tx's last unspent output.
+			//
+			// We split the UPDATE into two sibling CTEs:
+			//   * upd_spent — only rows that were genuinely NULL before this UPDATE,
+			//     i.e. truly spent by this batch. These feed the drain check.
+			//   * upd_idem  — rows that were already spent with matching spending_data
+			//     (idempotent re-spend, possibly from a concurrent duplicate). These
+			//     are reported as "updated" so the caller sees success, but must NOT
+			//     be counted in spent_in_batch — otherwise the count would exceed the
+			//     real pre-state unspent count and the drain check would falsely miss.
 			ub.WriteString(fmt.Sprintf(`),
-			upd AS (
+			upd_spent AS (
 				UPDATE outputs o SET spending_data = v.spending_data FROM v
 				WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx
-				  AND (o.spending_data IS NULL OR o.spending_data = v.spending_data)
+				  AND o.spending_data IS NULL
 				RETURNING v.batch_idx, o.transaction_id
 			),
+			upd_idem AS (
+				SELECT v.batch_idx
+				FROM v
+				JOIN outputs o
+				  ON o.transaction_id = v.transaction_id AND o.idx = v.idx
+				WHERE o.spending_data = v.spending_data
+			),
 			parents AS (
-				SELECT transaction_id, count(*) AS spent_in_batch FROM upd GROUP BY transaction_id
+				SELECT transaction_id, count(*) AS spent_in_batch FROM upd_spent GROUP BY transaction_id
 			),
 			dah_upd AS (
 				UPDATE transactions t SET delete_at_height = $%d
@@ -2068,7 +2084,9 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				  AND (t.delete_at_height IS NULL OR t.delete_at_height < $%d)
 				RETURNING 1
 			)
-			SELECT batch_idx FROM upd`, dahIdx, dahIdx))
+			SELECT batch_idx FROM upd_spent
+			UNION ALL
+			SELECT batch_idx FROM upd_idem`, dahIdx, dahIdx))
 		} else {
 			ub.WriteString(`) AS v(transaction_id,idx,spending_data,batch_idx)
 			WHERE o.transaction_id = v.transaction_id AND o.idx = v.idx
