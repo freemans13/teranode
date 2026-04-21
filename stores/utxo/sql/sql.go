@@ -2178,24 +2178,40 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		}
 	}
 
-	// Post-UPDATE DAH fallbacks via setDAH. Two cases the bulk CTE does not
-	// cover are merged here so the bulk path stays behaviorally equivalent
-	// to the per-row path:
-	//   1. idempotentParentIDs — parents whose Phase 1 SELECT already showed
-	//      the output spent with matching spending_data (no row for dedupedUpdate).
-	//      Needed to heal NULL DAHs left by pre-fix spends on replay.
-	//   2. conflictingParentIDs — parents with t.conflicting=true touched under
-	//      IgnoreConflicting. setDAH has distinct semantics for conflicting txs
-	//      (DAH only when NULL, never bump, no mined/longest-chain requirement).
-	dahFallbackParents := make(map[int]struct{}, len(idempotentParentIDs)+len(conflictingParentIDs))
+	// Post-UPDATE DAH recompute via setDAH for every parent touched by this
+	// bulk batch. The CTE's dah_upd clause is an in-statement fast path that
+	// succeeds in the single-writer case, but it can miss DAH under concurrent
+	// spends of different outputs of the same parent: each statement only sees
+	// its own snapshot, so both observe unspent_before > spent_in_batch, skip
+	// dah_upd, and leave DAH NULL even though the parent is fully drained
+	// after both commits. Calling setDAH afterwards runs a fresh statement
+	// under READ COMMITTED that sees (a) the latest committed writes of any
+	// concurrent spend plus (b) this transaction's own pending writes — so
+	// whoever commits last correctly deterministically sets DAH.
+	//
+	// setDAH is idempotent w.r.t. the CTE: if the CTE already set DAH to
+	// newDAH, setDAH sees conditions met + existingDAH == newDAH and writes
+	// the same value (no-op). Extra round-trip cost is O(distinct parents),
+	// bounded by batch size.
+	//
+	// The set also includes idempotent and conflicting parents that the CTE
+	// would otherwise skip outright (see above tracking).
+	touchedParents := make(map[int]struct{}, len(dedupedUpdate)+len(idempotentParentIDs)+len(conflictingParentIDs))
+	for _, u := range dedupedUpdate {
+		// Only count parents whose UPDATE actually landed — avoids issuing
+		// setDAH for rows lost to a concurrent spender (UtxoSpentError path).
+		if updatedSet[u.batchIdx] {
+			touchedParents[u.transactionID] = struct{}{}
+		}
+	}
 	for p := range idempotentParentIDs {
-		dahFallbackParents[p] = struct{}{}
+		touchedParents[p] = struct{}{}
 	}
 	for p := range conflictingParentIDs {
-		dahFallbackParents[p] = struct{}{}
+		touchedParents[p] = struct{}{}
 	}
-	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && len(dahFallbackParents) > 0 {
-		for parentID := range dahFallbackParents {
+	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && len(touchedParents) > 0 {
+		for parentID := range touchedParents {
 			if err := s.setDAH(s.ctx, txn, parentID); err != nil {
 				if isDeadlock(err) {
 					return true
