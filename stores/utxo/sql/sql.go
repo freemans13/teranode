@@ -2547,6 +2547,14 @@ func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) erro
 	}
 	// else: conditions not met and no existing DAH, leave as NULL
 
+	// Short-circuit: if the computed DAH equals what's already stored (including
+	// NULL→NULL), skip the UPDATE entirely. Avoids taking a row lock, writing a
+	// new row version and generating WAL for a no-op — matters on the spend hot
+	// path where setDAH is called for every touched parent per batch.
+	if dahUnchanged(existingDAH, deleteAtHeightOrNull) {
+		return nil
+	}
+
 	// Update delete_at_height
 	qUpdate := `
 		UPDATE transactions
@@ -2559,6 +2567,19 @@ func (s *Store) setDAH(ctx context.Context, txn *sql.Tx, transactionID int) erro
 	}
 
 	return nil
+}
+
+// dahUnchanged reports whether two sql.NullInt64 DAH values are equivalent.
+// NULL==NULL is true; NULL vs valid and valid vs valid with different values
+// are false; valid vs valid with same value is true.
+func dahUnchanged(a, b sql.NullInt64) bool {
+	if a.Valid != b.Valid {
+		return false
+	}
+	if !a.Valid {
+		return true
+	}
+	return a.Int64 == b.Int64
 }
 
 // Unspend reverses a previous spend operation, marking UTXOs as unspent.
