@@ -915,20 +915,26 @@ func MinedThenSpendAllPrunes(t *testing.T, db utxostore.Store, prunerSvc pruner.
 	require.NoError(t, err)
 	defer func() { _ = db.Delete(ctx, ParentTx.TxIDChainHash()) }()
 
-	// Create Tx as mined on the longest chain: block_ids populated, unmined_since NULL.
-	// DAH stays NULL here because outputs are still unspent.
-	_, err = db.Create(ctx, Tx, mineHeight,
-		utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{
-			BlockID:        100,
-			BlockHeight:    mineHeight,
-			SubtreeIdx:     0,
-			OnLongestChain: true,
-		}),
-	)
+	// Create Tx as UNMINED, then transition to mined via SetMinedMulti — this is the
+	// real production flow (tx arrives, gets validated, later a block includes it).
+	// Creating directly with WithMinedBlockInfo would skip the mined-transition path
+	// that the disk-bloat bug was observed under.
+	_, err = db.Create(ctx, Tx, mineHeight)
 	require.NoError(t, err)
 	defer func() { _ = db.Delete(ctx, Tx.TxIDChainHash()) }()
 
 	txHash := Tx.TxIDChainHash()
+
+	// Transition to mined on the longest chain. After this, block_ids is populated
+	// and unmined_since is NULL, but all outputs are still unspent — so DAH stays
+	// NULL (SetMinedMulti only sets DAH when outputs happen to already be spent).
+	_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, utxostore.MinedBlockInfo{
+		BlockID:        100,
+		BlockHeight:    mineHeight,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
 
 	// Sanity: tx is retrievable before spending.
 	_, err = db.Get(ctx, txHash)
