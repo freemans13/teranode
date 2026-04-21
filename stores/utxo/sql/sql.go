@@ -1928,6 +1928,12 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 	// lets us run a post-UPDATE DAH recompute so parents whose DAH was left
 	// NULL by a pre-fix spend still get healed — matching the per-row path.
 	idempotentParentIDs := make(map[int]struct{})
+	// Parent tx IDs flagged as conflicting whose outputs we're spending under
+	// IgnoreConflicting. setDAH has distinct semantics for conflicting txs
+	// (set DAH only when NULL, never bump, don't require mined/on-longest-chain)
+	// that the bulk CTE's "drained & mined & on-longest-chain" branch does not
+	// cover. Route these through setDAH post-UPDATE to preserve per-row parity.
+	conflictingParentIDs := make(map[int]struct{})
 
 	for i, item := range batch {
 		spend := item.spend
@@ -1944,6 +1950,13 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		if r.conflicting && !item.ignoreConflicting {
 			validationErrors[i] = errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
 			continue
+		}
+		if r.conflicting {
+			// ignoreConflicting is true here; remember the parent so we can
+			// run setDAH for it after the bulk UPDATE. The CTE path's
+			// dah_upd clause excludes conflicting txs, so without this
+			// fallback they'd never get DAH via the bulk path.
+			conflictingParentIDs[r.transactionID] = struct{}{}
 		}
 		if r.locked && !item.ignoreLocked {
 			validationErrors[i] = errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
@@ -2073,14 +2086,28 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			parents AS (
 				SELECT transaction_id, count(*) AS spent_in_batch FROM upd_spent GROUP BY transaction_id
 			),
+			-- Aggregate the pre-update unspent count for every touched parent in
+			-- one scan over outputs (driven by the parents set). Avoids the
+			-- correlated subquery-per-parent pattern the drain check used to
+			-- issue, which scaled with #parents × index lookup rather than
+			-- #touched-outputs.
+			unspent_before AS (
+				SELECT o.transaction_id, count(*) AS n_unspent
+				FROM outputs o
+				JOIN parents p ON p.transaction_id = o.transaction_id
+				WHERE o.spending_data IS NULL
+				GROUP BY o.transaction_id
+			),
 			dah_upd AS (
 				UPDATE transactions t SET delete_at_height = $%d
 				FROM parents p
+				LEFT JOIN unspent_before u ON u.transaction_id = p.transaction_id
 				WHERE t.id = p.transaction_id
 				  AND t.preserve_until IS NULL
 				  AND t.unmined_since IS NULL
+				  AND NOT t.conflicting
 				  AND EXISTS (SELECT 1 FROM block_ids bi WHERE bi.transaction_id = t.id)
-				  AND (SELECT count(*) FROM outputs o WHERE o.transaction_id = t.id AND o.spending_data IS NULL) = p.spent_in_batch
+				  AND COALESCE(u.n_unspent, 0) = p.spent_in_batch
 				  AND (t.delete_at_height IS NULL OR t.delete_at_height < $%d)
 				RETURNING 1
 			)
@@ -2151,12 +2178,24 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		}
 	}
 
-	// Heal DAH for parents touched only by idempotent re-spends. The CTE above
-	// skips them because there is no matching row in dedupedUpdate, so without
-	// this pass any tx whose pre-fix spend left DAH NULL would stay unprunable
-	// forever. Mirrors the per-row path's behavior.
-	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && len(idempotentParentIDs) > 0 {
-		for parentID := range idempotentParentIDs {
+	// Post-UPDATE DAH fallbacks via setDAH. Two cases the bulk CTE does not
+	// cover are merged here so the bulk path stays behaviorally equivalent
+	// to the per-row path:
+	//   1. idempotentParentIDs — parents whose Phase 1 SELECT already showed
+	//      the output spent with matching spending_data (no row for dedupedUpdate).
+	//      Needed to heal NULL DAHs left by pre-fix spends on replay.
+	//   2. conflictingParentIDs — parents with t.conflicting=true touched under
+	//      IgnoreConflicting. setDAH has distinct semantics for conflicting txs
+	//      (DAH only when NULL, never bump, no mined/longest-chain requirement).
+	dahFallbackParents := make(map[int]struct{}, len(idempotentParentIDs)+len(conflictingParentIDs))
+	for p := range idempotentParentIDs {
+		dahFallbackParents[p] = struct{}{}
+	}
+	for p := range conflictingParentIDs {
+		dahFallbackParents[p] = struct{}{}
+	}
+	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && len(dahFallbackParents) > 0 {
+		for parentID := range dahFallbackParents {
 			if err := s.setDAH(s.ctx, txn, parentID); err != nil {
 				if isDeadlock(err) {
 					return true
@@ -2165,7 +2204,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 					if valErr, ok := validationErrors[i]; ok {
 						item.errCh <- valErr
 					} else {
-						item.errCh <- errors.NewStorageError("[Spend] failed to recompute DAH for idempotent re-spend", err)
+						item.errCh <- errors.NewStorageError("[Spend] failed to recompute DAH for bulk spend fallback", err)
 					}
 				}
 				return false
