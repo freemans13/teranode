@@ -1928,12 +1928,14 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 	// lets us run a post-UPDATE DAH recompute so parents whose DAH was left
 	// NULL by a pre-fix spend still get healed — matching the per-row path.
 	idempotentParentIDs := make(map[int]struct{})
-	// Parent tx IDs flagged as conflicting whose outputs we're spending under
-	// IgnoreConflicting. setDAH has distinct semantics for conflicting txs
-	// (set DAH only when NULL, never bump, don't require mined/on-longest-chain)
-	// that the bulk CTE's "drained & mined & on-longest-chain" branch does not
-	// cover. Route these through setDAH post-UPDATE to preserve per-row parity.
-	conflictingParentIDs := make(map[int]struct{})
+	// Note: we intentionally do NOT track conflicting parents as a separate
+	// set. The post-UPDATE setDAH loop below already runs for every parent
+	// that successfully had an output spent (via dedupedUpdate+updatedSet) or
+	// idempotent-matched (via idempotentParentIDs), and setDAH internally
+	// handles conflicting-vs-non-conflicting DAH semantics. Because we added
+	// "AND NOT t.conflicting" to the CTE's dah_upd clause, conflicting parents
+	// are exclusively routed through setDAH — no duplication, no risk of
+	// calling setDAH for a parent whose items all ended up in validationErrors.
 
 	for i, item := range batch {
 		spend := item.spend
@@ -1950,13 +1952,6 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		if r.conflicting && !item.ignoreConflicting {
 			validationErrors[i] = errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
 			continue
-		}
-		if r.conflicting {
-			// ignoreConflicting is true here; remember the parent so we can
-			// run setDAH for it after the bulk UPDATE. The CTE path's
-			// dah_upd clause excludes conflicting txs, so without this
-			// fallback they'd never get DAH via the bulk path.
-			conflictingParentIDs[r.transactionID] = struct{}{}
 		}
 		if r.locked && !item.ignoreLocked {
 			validationErrors[i] = errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
@@ -2194,9 +2189,12 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 	// the same value (no-op). Extra round-trip cost is O(distinct parents),
 	// bounded by batch size.
 	//
-	// The set also includes idempotent and conflicting parents that the CTE
-	// would otherwise skip outright (see above tracking).
-	touchedParents := make(map[int]struct{}, len(dedupedUpdate)+len(idempotentParentIDs)+len(conflictingParentIDs))
+	// The set also includes idempotent parents (Phase 1 SELECT already showed
+	// the output spent with matching spending_data — the CTE skips them).
+	// Conflicting parents are NOT tracked separately: they arrive via the
+	// same dedupedUpdate / idempotent paths whenever a spend actually targets
+	// them, and setDAH internally picks the conflicting-DAH semantics.
+	touchedParents := make(map[int]struct{}, len(dedupedUpdate)+len(idempotentParentIDs))
 	for _, u := range dedupedUpdate {
 		// Only count parents whose UPDATE actually landed — avoids issuing
 		// setDAH for rows lost to a concurrent spender (UtxoSpentError path).
@@ -2205,9 +2203,6 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		}
 	}
 	for p := range idempotentParentIDs {
-		touchedParents[p] = struct{}{}
-	}
-	for p := range conflictingParentIDs {
 		touchedParents[p] = struct{}{}
 	}
 	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && len(touchedParents) > 0 {

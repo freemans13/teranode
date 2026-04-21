@@ -22,7 +22,8 @@ func TestMinedThenSpendAllPrunes_SQLite(t *testing.T) {
 
 	store, _ := setup(ctx, t)
 
-	provider := any(store).(pruner.PrunerServiceProvider)
+	provider, ok := any(store).(pruner.PrunerServiceProvider)
+	require.True(t, ok, "store must implement pruner.PrunerServiceProvider")
 	prunerSvc, err := provider.GetPrunerService()
 	require.NoError(t, err)
 	require.NotNil(t, prunerSvc, "pruner service must be available")
@@ -53,7 +54,8 @@ func TestMinedThenSpendAllPrunes_Postgres(t *testing.T) {
 	ctx, cancel := context.WithCancel(baseCtx)
 	t.Cleanup(cancel)
 
-	provider := any(store).(pruner.PrunerServiceProvider)
+	provider, ok := any(store).(pruner.PrunerServiceProvider)
+	require.True(t, ok, "store must implement pruner.PrunerServiceProvider")
 	prunerSvc, err := provider.GetPrunerService()
 	require.NoError(t, err)
 	require.NotNil(t, prunerSvc, "pruner service must be available")
