@@ -218,7 +218,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Batches individual Create() calls into a single pgx.SendBatch with N CTEs,
 	// reducing N network round-trips to 1. background=true because each CTE inserts
 	// a unique transaction hash — no row overlap, no deadlock risk between batches.
-	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.StoreBatcherSize > 1 {
+	if tSettings.UtxoStore.StoreBatcherSize > 1 {
 		storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 		storeBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
 		s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
@@ -227,8 +227,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 	}
 
-	// Initialize unlock batcher for Postgres — batches single-hash SetLocked(false) calls.
-	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.LockedBatcherSize > 1 {
+	// Initialize unlock batcher — batches single-hash SetLocked(false) calls for both
+	// engines. Postgres wins through `ANY($1)` + CTE; SQLite wins through fewer
+	// BEGIN…COMMIT cycles on the single-writer file. `setUnlockedBulk` handles both.
+	if tSettings.UtxoStore.LockedBatcherSize > 1 {
 		unlockBatchSize := tSettings.UtxoStore.LockedBatcherSize
 		unlockBatchDuration := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
 		s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
@@ -885,10 +887,422 @@ type preparedCreate struct {
 	blkArrs      blockIDArrayParams
 }
 
-// sendCreateBatch is the batcher callback that processes a batch of Create operations
+// sendCreateBatch dispatches a Create batch to the engine-appropriate
+// implementation. Postgres uses pgx pipelined SendBatch; everything else
+// uses the portable database/sql multi-row INSERT path.
+func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
+	if s.engine == "postgres" {
+		s.sendCreateBatchPostgres(batch)
+		return
+	}
+	s.sendCreateBatchSQL(batch)
+}
+
+// preparedCreateSQL holds pre-computed per-item data for sendCreateBatchSQL.
+// Kept separate from preparedCreate (which carries Postgres array params) so
+// both types stay minimal and self-documenting.
+type preparedCreateSQL struct {
+	txHash       *chainhash.Hash
+	txMeta       *meta.Data
+	isCoinbase   bool
+	unminedSince interface{}
+	tx           *bt.Tx
+	options      *utxo.CreateOptions
+	blockHeight  uint32
+	item         *batchCreateItem
+}
+
+// createBatchSuccess carries the transactionID returned by INSERT RETURNING
+// alongside the pre-computed data for each tx inserted successfully into
+// `transactions` in this batch. Shared by the three bulkInsertX helpers.
+type createBatchSuccess struct {
+	transactionID int
+	prep          *preparedCreateSQL
+}
+
+// sendCreateBatchSQL runs a bulk Create batch against any database/sql backend
+// (primarily SQLite). It issues one BEGIN…COMMIT plus up to four INSERTs —
+// one for `transactions` using ON CONFLICT DO NOTHING RETURNING id,hash, then
+// one each for inputs/outputs/block_ids populated from the returned ids.
+// Items whose hash doesn't come back from the RETURNING clause are duplicates
+// and receive ErrTxExists.
+//
+// Retries the whole batch on SQLITE_BUSY up to 3 times with exponential backoff,
+// mirroring createWithRetry's behaviour.
+func (s *Store) sendCreateBatchSQL(batch []*batchCreateItem) {
+	const maxRetries = 3
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		retry, retryable := s.trySendCreateBatchSQL(batch)
+		if !retry {
+			return
+		}
+		if !retryable || attempt == maxRetries {
+			for _, item := range batch {
+				if item.done != nil {
+					item.done <- batchCreateResult{Err: errors.NewStorageError("[Create] lock persisted after %d retries", maxRetries)}
+					item.done = nil
+				}
+			}
+			return
+		}
+		backoff := time.Duration(100<<attempt) * time.Millisecond // 100ms, 200ms, 400ms
+		s.logger.Warnf("[sendCreateBatchSQL] lock error on attempt %d, retrying in %v", attempt+1, backoff)
+		time.Sleep(backoff)
+	}
+}
+
+// trySendCreateBatchSQL attempts the batch once.
+// Returns (false, _) when all callers have been notified (success or permanent error).
+// Returns (true, true) when the whole batch should be retried due to a lock condition.
+func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryable bool) {
+	// Phase 1: pre-compute per-item data. Items whose pre-compute fails are
+	// notified immediately and excluded from the SQL batch.
+	preps := make([]*preparedCreateSQL, 0, len(batch))
+	for _, item := range batch {
+		if item.done == nil {
+			// Already notified in a prior retry attempt — skip.
+			continue
+		}
+		txMeta, err := util.TxMetaDataFromTx(item.tx)
+		if err != nil {
+			item.done <- batchCreateResult{Err: errors.NewProcessingError("failed to get tx meta data", err)}
+			// Nil item.done after every send so Phase 1's item.done == nil guard
+			// skips already-notified entries on retry.
+			item.done = nil
+			continue
+		}
+		if item.options.Conflicting {
+			txMeta.Conflicting = true
+		}
+		if item.options.Locked {
+			txMeta.Locked = true
+		}
+		var unminedSince interface{}
+		if len(item.options.MinedBlockInfos) == 0 {
+			unminedSince = item.blockHeight
+		}
+		var txHash *chainhash.Hash
+		if item.options.TxID != nil {
+			txHash = item.options.TxID
+		} else {
+			txHash = item.tx.TxIDChainHash()
+		}
+		isCoinbase := item.tx.IsCoinbase()
+		if item.options.IsCoinbase != nil {
+			isCoinbase = *item.options.IsCoinbase
+		}
+		preps = append(preps, &preparedCreateSQL{
+			txHash: txHash, txMeta: txMeta, isCoinbase: isCoinbase,
+			unminedSince: unminedSince, tx: item.tx, options: item.options,
+			blockHeight: item.blockHeight, item: item,
+		})
+	}
+	if len(preps) == 0 {
+		return false, false
+	}
+
+	// Phase 2: one BEGIN…COMMIT for the whole batch.
+	txn, err := s.db.Begin()
+	if err != nil {
+		if isLockError(err) {
+			return true, true
+		}
+		for _, p := range preps {
+			p.item.done <- batchCreateResult{Err: errors.NewStorageError("failed to begin tx", err)}
+			p.item.done = nil
+		}
+		return false, false
+	}
+	defer func() { _ = txn.Rollback() }()
+
+	// Phase 3: one multi-row INSERT INTO transactions with ON CONFLICT DO NOTHING RETURNING id, hash.
+	const txColsPerRow = 10
+	txSQL := buildMultiValueInsert(
+		`INSERT INTO transactions (hash,version,lock_time,fee,size_in_bytes,coinbase,frozen,conflicting,locked,unmined_since) VALUES `,
+		txColsPerRow, len(preps), 1,
+	) + ` ON CONFLICT (hash) DO NOTHING RETURNING id, hash`
+
+	txArgs := make([]interface{}, 0, len(preps)*txColsPerRow)
+	for _, p := range preps {
+		txArgs = append(txArgs,
+			p.txHash[:], p.tx.Version, p.tx.LockTime,
+			p.txMeta.Fee, p.txMeta.SizeInBytes,
+			p.isCoinbase, p.options.Frozen, p.options.Conflicting,
+			p.options.Locked, p.unminedSince,
+		)
+	}
+
+	rows, err := txn.QueryContext(s.ctx, txSQL, txArgs...)
+	if err != nil {
+		if isLockError(err) {
+			return true, true
+		}
+		for _, p := range preps {
+			p.item.done <- batchCreateResult{Err: errors.NewStorageError("bulk INSERT transactions failed", err)}
+			p.item.done = nil
+		}
+		return false, false
+	}
+	defer rows.Close()
+
+	// Build hash → id map from RETURNING rows (only newly-inserted txs appear).
+	hashToID := make(map[chainhash.Hash]int, len(preps))
+	for rows.Next() {
+		var id int
+		var hashBytes []byte
+		if err := rows.Scan(&id, &hashBytes); err != nil {
+			for _, p := range preps {
+				p.item.done <- batchCreateResult{Err: errors.NewStorageError("scan RETURNING failed", err)}
+				p.item.done = nil
+			}
+			return false, false
+		}
+		var h chainhash.Hash
+		copy(h[:], hashBytes)
+		hashToID[h] = id
+	}
+	if err := rows.Err(); err != nil {
+		for _, p := range preps {
+			p.item.done <- batchCreateResult{Err: errors.NewStorageError("iterating RETURNING failed", err)}
+			p.item.done = nil
+		}
+		return false, false
+	}
+
+	// Phase 4: partition preps into successes (in RETURNING) and duplicates (not in RETURNING).
+	successes := make([]createBatchSuccess, 0, len(preps))
+	for _, p := range preps {
+		id, ok := hashToID[*p.txHash]
+		if !ok {
+			// Not in RETURNING → hash already existed in transactions table.
+			// Nil item.done so a subsequent retry attempt's Phase 1 skips this item.
+			p.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", p.isCoinbase)}
+			p.item.done = nil
+			continue
+		}
+		successes = append(successes, createBatchSuccess{transactionID: id, prep: p})
+	}
+	if len(successes) == 0 {
+		// All were duplicates; nothing to write in child tables. Commit is a no-op but safe.
+		if err := txn.Commit(); err != nil {
+			s.logger.Warnf("[Create] empty-batch commit failed: %v", err)
+		}
+		return false, false
+	}
+
+	// Phase 4a: inputs.
+	if err := s.bulkInsertInputs(s.ctx, txn, successes); err != nil {
+		if isLockError(err) {
+			return true, true
+		}
+		for _, c := range successes {
+			c.prep.item.done <- batchCreateResult{Err: err}
+			c.prep.item.done = nil
+		}
+		return false, false
+	}
+
+	// Phase 4b: outputs.
+	if err := s.bulkInsertOutputs(s.ctx, txn, successes); err != nil {
+		if isLockError(err) {
+			return true, true
+		}
+		for _, c := range successes {
+			c.prep.item.done <- batchCreateResult{Err: err}
+			c.prep.item.done = nil
+		}
+		return false, false
+	}
+
+	// Phase 4c: block_ids (only for items with MinedBlockInfos).
+	if err := s.bulkInsertBlockIDs(s.ctx, txn, successes); err != nil {
+		if isLockError(err) {
+			return true, true
+		}
+		for _, c := range successes {
+			c.prep.item.done <- batchCreateResult{Err: err}
+			c.prep.item.done = nil
+		}
+		return false, false
+	}
+
+	// Phase 4d: conflicting_children (before commit, since we're in a transaction).
+	for _, c := range successes {
+		if c.prep.txMeta != nil && c.prep.txMeta.Conflicting {
+			if conflictErr := s.updateParentConflictingChildren(s.ctx, c.transactionID, c.prep.tx, txn); conflictErr != nil {
+				if isLockError(conflictErr) {
+					return true, true
+				}
+				for _, c2 := range successes {
+					c2.prep.item.done <- batchCreateResult{Err: conflictErr}
+					c2.prep.item.done = nil
+				}
+				return false, false
+			}
+		}
+	}
+
+	// Phase 5: commit.
+	if err := txn.Commit(); err != nil {
+		if isLockError(err) {
+			return true, true
+		}
+		for _, c := range successes {
+			c.prep.item.done <- batchCreateResult{Err: errors.NewStorageError("batch commit failed", err)}
+			c.prep.item.done = nil
+		}
+		return false, false
+	}
+
+	// Notify successes.
+	for _, c := range successes {
+		c.prep.item.done <- batchCreateResult{Data: c.prep.txMeta}
+		c.prep.item.done = nil
+	}
+
+	return false, false
+}
+
+// bulkInsertInputs writes all inputs for every tx in successes via chunked
+// multi-row INSERT. Column ordering matches createInputsBatched exactly.
+func (s *Store) bulkInsertInputs(ctx context.Context, txn *sql.Tx, successes []createBatchSuccess) error {
+	const colsPerRow = 8
+	const maxRowsPerChunk = maxPostgresParams / colsPerRow
+	baseSQL := `INSERT INTO inputs (transaction_id,idx,previous_transaction_hash,previous_tx_idx,previous_tx_satoshis,previous_tx_script,unlocking_script,sequence_number) VALUES `
+
+	// Flatten all inputs across all txs.
+	allRows := make([][]interface{}, 0, len(successes)*2)
+	for _, c := range successes {
+		for i, input := range c.prep.tx.Inputs {
+			allRows = append(allRows, []interface{}{
+				c.transactionID, i,
+				input.PreviousTxIDChainHash()[:], input.PreviousTxOutIndex,
+				input.PreviousTxSatoshis, input.PreviousTxScript,
+				input.UnlockingScript, input.SequenceNumber,
+			})
+		}
+	}
+	if len(allRows) == 0 {
+		return nil
+	}
+
+	for start := 0; start < len(allRows); start += maxRowsPerChunk {
+		end := start + maxRowsPerChunk
+		if end > len(allRows) {
+			end = len(allRows)
+		}
+		chunk := allRows[start:end]
+		q := buildMultiValueInsert(baseSQL, colsPerRow, len(chunk), 1)
+		args := make([]interface{}, 0, len(chunk)*colsPerRow)
+		for _, r := range chunk {
+			args = append(args, r...)
+		}
+		// isCoinbase attribution is best-effort for multi-tx chunks; use the first row's tx.
+		chunkIsCoinbase := successes[0].prep.isCoinbase
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
+			return classifyInsertError(err, chunkIsCoinbase, "input")
+		}
+	}
+	return nil
+}
+
+// bulkInsertOutputs writes all outputs for every tx in successes via chunked
+// multi-row INSERT. Column ordering matches createOutputsBatched exactly.
+func (s *Store) bulkInsertOutputs(ctx context.Context, txn *sql.Tx, successes []createBatchSuccess) error {
+	const colsPerRow = 7
+	const maxRowsPerChunk = maxPostgresParams / colsPerRow
+	baseSQL := `INSERT INTO outputs (transaction_id,idx,locking_script,satoshis,coinbase_spending_height,utxo_hash,spending_data) VALUES `
+
+	allRows := make([][]interface{}, 0, len(successes)*2)
+	for _, c := range successes {
+		var coinbaseSpendingHeight uint32
+		if c.prep.isCoinbase {
+			coinbaseSpendingHeight = c.prep.blockHeight + uint32(s.settings.ChainCfgParams.CoinbaseMaturity)
+		}
+		for i, output := range c.prep.tx.Outputs {
+			if output == nil {
+				continue
+			}
+			iUint32, err := safeconversion.IntToUint32(i)
+			if err != nil {
+				return err
+			}
+			utxoHash, err := util.UTXOHashFromOutput(c.prep.txHash, output, iUint32)
+			if err != nil {
+				return err
+			}
+			allRows = append(allRows, []interface{}{
+				c.transactionID, i,
+				output.LockingScript, output.Satoshis,
+				coinbaseSpendingHeight, utxoHash[:], nil,
+			})
+		}
+	}
+	if len(allRows) == 0 {
+		return nil
+	}
+
+	for start := 0; start < len(allRows); start += maxRowsPerChunk {
+		end := start + maxRowsPerChunk
+		if end > len(allRows) {
+			end = len(allRows)
+		}
+		chunk := allRows[start:end]
+		q := buildMultiValueInsert(baseSQL, colsPerRow, len(chunk), 1)
+		args := make([]interface{}, 0, len(chunk)*colsPerRow)
+		for _, r := range chunk {
+			args = append(args, r...)
+		}
+		// isCoinbase attribution is best-effort for multi-tx chunks; use the first row's tx.
+		chunkIsCoinbase := successes[0].prep.isCoinbase
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
+			return classifyInsertError(err, chunkIsCoinbase, "output")
+		}
+	}
+	return nil
+}
+
+// bulkInsertBlockIDs writes block_ids entries for any tx with MinedBlockInfos.
+// Column ordering matches createBlockIDsBatched exactly.
+func (s *Store) bulkInsertBlockIDs(ctx context.Context, txn *sql.Tx, successes []createBatchSuccess) error {
+	const colsPerRow = 4
+	const maxRowsPerChunk = maxPostgresParams / colsPerRow
+	baseSQL := `INSERT INTO block_ids (transaction_id,block_id,block_height,subtree_idx) VALUES `
+
+	allRows := make([][]interface{}, 0)
+	for _, c := range successes {
+		for _, bi := range c.prep.options.MinedBlockInfos {
+			allRows = append(allRows, []interface{}{
+				c.transactionID, bi.BlockID, bi.BlockHeight, bi.SubtreeIdx,
+			})
+		}
+	}
+	if len(allRows) == 0 {
+		return nil
+	}
+
+	for start := 0; start < len(allRows); start += maxRowsPerChunk {
+		end := start + maxRowsPerChunk
+		if end > len(allRows) {
+			end = len(allRows)
+		}
+		chunk := allRows[start:end]
+		q := buildMultiValueInsert(baseSQL, colsPerRow, len(chunk), 1)
+		args := make([]interface{}, 0, len(chunk)*colsPerRow)
+		for _, r := range chunk {
+			args = append(args, r...)
+		}
+		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
+			return classifyInsertError(err, false, "block_ids")
+		}
+	}
+	return nil
+}
+
+// sendCreateBatchPostgres is the pgx-specific batcher callback that processes a batch of Create operations
 // in a single pgx.SendBatch — N CTEs in one network flush.
 // Mirrors aerospike/create.go sendStoreBatch.
-func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
+func (s *Store) sendCreateBatchPostgres(batch []*batchCreateItem) {
 	// Phase 1: Pre-compute all array parameters (CPU only, no DB)
 	prepared := make([]preparedCreate, len(batch))
 	for i, item := range batch {
@@ -1031,7 +1445,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 		// and visible to other connections before callers proceed.
 		closeErr := br.Close()
 		if closeErr != nil {
-			s.logger.Errorf("[sendCreateBatch] error closing batch results: %v", closeErr)
+			s.logger.Errorf("[sendCreateBatchPostgres] error closing batch results: %v", closeErr)
 		}
 
 		// Now signal callers — if Close() failed, override successes with errors
@@ -1044,7 +1458,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 				continue
 			}
 			if r.logError {
-				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %+v", prepared[r.idx].txHash[:], r.result.Err)
+				s.logger.Errorf("[sendCreateBatchPostgres] CTE failed for tx %x: %+v", prepared[r.idx].txHash[:], r.result.Err)
 			}
 			batch[r.idx].done <- r.result
 		}
@@ -1075,7 +1489,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 		p := &prepared[idx]
 		if p.txMeta != nil && p.txMeta.Conflicting {
 			if conflictErr := s.insertConflictingChildrenPgx(s.ctx, batch[idx].tx, p.txHash); conflictErr != nil {
-				s.logger.Warnf("[sendCreateBatch] failed to insert conflicting children for %x: %v", p.txHash[:], conflictErr)
+				s.logger.Warnf("[sendCreateBatchPostgres] failed to insert conflicting children for %x: %v", p.txHash[:], conflictErr)
 			}
 		}
 	}
@@ -3729,7 +4143,7 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		return nil
 	}
 
-	// Postgres: single-hash unlock → use batcher.
+	// Single-hash unlock → use batcher (works for both Postgres and SQLite).
 	if s.unlockBatcher != nil && len(txHashes) == 1 {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -3745,51 +4159,41 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		}
 	}
 
-	// Postgres: bulk unlock + DAH in chunked UPDATE statements
-	if s.engine == "postgres" {
-		return s.setUnlockedBulk(ctx, txHashes)
-	}
-
-	// SQLite: sequential unlock + DAH
-	txn, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = txn.Rollback()
-	}()
-
-	q := `
-		UPDATE transactions
-		SET locked = false
-		WHERE hash = $1
-		RETURNING id
-	`
-
-	for _, txHash := range txHashes {
-		var transactionID int
-		err := txn.QueryRowContext(ctx, q, txHash[:]).Scan(&transactionID)
-		if err != nil {
-			return errors.NewStorageError("failed to clear locked flag for %s", txHash, err)
-		}
-
-		// Recalculate DAH now that the tx is unlocked
-		if err = s.setDAH(ctx, txn, transactionID); err != nil {
-			return err
-		}
-	}
-
-	if err = txn.Commit(); err != nil {
-		return errors.NewStorageError("failed to commit unlock transaction", err)
-	}
-
-	return nil
+	// Bulk unlock + DAH recalculation (engine-aware: Postgres uses CTE, SQLite uses sequential in one txn).
+	return s.setUnlockedBulk(ctx, txHashes)
 }
 
-// setUnlockedBulk performs a bulk unlock + DAH recalculation for Postgres.
-// Replaces 3N sequential queries (unlock + setDAH SELECT + setDAH UPDATE per tx)
-// with 1 UPDATE per chunk of maxINClauseSize hashes.
+// setUnlockedBulk performs a bulk unlock + DAH recalculation.
+// For Postgres: replaces 3N sequential queries with 1 UPDATE per chunk via CTE.
+// For SQLite: batches N sequential unlock+setDAH calls into one BEGIN…COMMIT,
+// eliminating the per-call fsync overhead of individual transactions.
 func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) error {
+	if s.engine != "postgres" {
+		txn, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = txn.Rollback() }()
+
+		q := `UPDATE transactions SET locked = false WHERE hash = $1 RETURNING id`
+		for _, txHash := range txHashes {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			var transactionID int
+			if err := txn.QueryRowContext(ctx, q, txHash[:]).Scan(&transactionID); err != nil {
+				return errors.NewStorageError("failed to clear locked flag for %s", txHash, err)
+			}
+			if err := s.setDAH(ctx, txn, transactionID); err != nil {
+				return err
+			}
+		}
+
+		return txn.Commit()
+	}
+
 	retention := s.settings.GetUtxoStoreBlockHeightRetention()
 
 	for i := 0; i < len(txHashes); i += maxINClauseSize {
