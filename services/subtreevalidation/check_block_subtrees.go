@@ -862,12 +862,10 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
 						}
 					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
-						// Log truly invalid transactions
+						// Truly invalid (non-policy) transactions fail the level — no deferral
+						// possible because phase 3 revalidation can't resolve these.
 						u.logger.Warnf("[processTransactionsInLevels] Invalid transaction detected: %s: %v", tx.TxIDChainHash().String(), err)
-
-						if errors.Is(err, errors.ErrTxInvalid) {
-							return err
-						}
+						return err
 					} else {
 						u.logger.Errorf("[processTransactionsInLevels] Processing error for transaction %s: %v", tx.TxIDChainHash().String(), err)
 					}
