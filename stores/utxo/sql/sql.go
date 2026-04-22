@@ -1721,6 +1721,12 @@ func (s *Store) createBlockIDsPerRow(ctx context.Context, txn *sql.Tx, transacti
 
 // classifyInsertError converts constraint violation errors into appropriate typed errors.
 func classifyInsertError(err error, isCoinbase bool, entity string) error {
+	// Pass through lock/busy errors unwrapped so caller retry logic can still
+	// detect them via direct *sqlite.Error / *pgconn.PgError type assertions in
+	// isLockError — wrapping in a StorageError would otherwise hide the type.
+	if isLockError(err) {
+		return err
+	}
 	if pgErr := asPgUniqueViolation(err); pgErr != nil {
 		return errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v): %v", isCoinbase, err)
 	}
