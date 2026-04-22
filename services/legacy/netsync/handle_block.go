@@ -1042,7 +1042,9 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 				return errors.NewProcessingError("failed to extend transaction %s: previous transaction %s is missing", tx.TxIDChainHash(), prevTxHash)
 			}
 
-			if int(input.PreviousTxOutIndex) >= len(prevTxWrapper.Tx.Outputs) {
+			// Compare as uint32 so a 32-bit build can't silently overflow the
+			// int(input.PreviousTxOutIndex) cast and bypass the bounds check.
+			if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
 				return errors.NewProcessingError("failed to extend transaction %s: previous output index %d out of range for transaction %s (outputs=%d)", tx.TxIDChainHash(), input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
 			}
 
