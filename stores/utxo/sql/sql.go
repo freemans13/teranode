@@ -3546,19 +3546,22 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 		return nil
 	}
 
-	// Collect (parent_hash, idx) pairs needed for decoration (A1 composite IN).
-	totalPairs := 0
-	for _, refs := range needsByParent {
-		totalPairs += len(refs)
-	}
-	pairs := make([]outpointPair, 0, totalPairs)
+	// Collect unique (parent_hash, idx) pairs needed for decoration (A1 composite IN).
+	// A valid tx won't reference the same outpoint twice, but dedup defensively
+	// so we don't waste bind params / chunks on malformed input; also matches
+	// BatchPreviousOutputsDecorate's shape.
+	pairs := make([]outpointPair, 0, len(needsByParent))
 	for parentHash, refs := range needsByParent {
 		// Hoist the hash copy outside the inner loop so each parent's array
-		// escapes once, not once per referenced input, matching the shape used
-		// in BatchPreviousOutputsDecorate.
+		// escapes once, not once per unique referenced output.
 		hCopy := parentHash
 		hashSlice := hCopy[:]
+		seenIdx := make(map[uint32]struct{}, len(refs))
 		for _, ref := range refs {
+			if _, seen := seenIdx[ref.outIdx]; seen {
+				continue
+			}
+			seenIdx[ref.outIdx] = struct{}{}
 			pairs = append(pairs, outpointPair{hash: hashSlice, idx: ref.outIdx})
 		}
 	}
@@ -3695,7 +3698,15 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	// parent-hash IN predicate — avoids scanning every output of every referenced
 	// parent, which matters on data-carrier-heavy blocks where parents may have
 	// many MB of script bytes in unreferenced outputs.
-	pairs := make([]outpointPair, 0)
+	//
+	// Preallocate to an upper bound on pairs (sum of all refs across parents).
+	// Post-dedup the slice may be smaller, but this keeps append() from growing
+	// the backing array for whole-block calls where refs can be in the tens of thousands.
+	estPairs := 0
+	for _, refs := range needsByParent {
+		estPairs += len(refs)
+	}
+	pairs := make([]outpointPair, 0, estPairs)
 	for h, refs := range needsByParent {
 		hCopy := h
 		hashSlice := hCopy[:]

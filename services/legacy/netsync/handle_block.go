@@ -936,12 +936,16 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 // Inputs whose parents are not in txMap are left for a later bulk DB lookup (see
 // extendTransactions phase 2).
 func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) error {
-	timeStart := time.Now()
 	defer func() {
 		prometheusLegacyNetsyncBlockTxSize.Observe(float64(tx.Size()))
 		prometheusLegacyNetsyncBlockTxNrInputs.Observe(float64(len(tx.Inputs)))
 		prometheusLegacyNetsyncBlockTxNrOutputs.Observe(float64(len(tx.Outputs)))
-		prometheusLegacyNetsyncBlockTxExtend.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
+		// NOTE: prometheusLegacyNetsyncBlockTxExtend is intentionally NOT observed here.
+		// This function is phase 1 only (same-block parents from txMap); phase 2 (bulk
+		// DB decoration via BatchPreviousOutputsDecorate) runs block-wide in
+		// extendTransactions. Observing a tx-level duration here would under-report
+		// end-to-end extend cost versus the old per-tx DB path. We could revisit by
+		// adding a block-level phase-2 histogram if dashboards need it.
 	}()
 
 	txWrapper, found := txMap.Get(*tx.TxIDChainHash())
