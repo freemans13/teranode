@@ -261,7 +261,7 @@ type TxMapWrapper struct {
 // the quickValidationMode optimisations (parallel UTXO create-then-spend, skip
 // checkSubtreeFromBlock, use PR #711's pre-assigned block ID path).
 //
-// The decision composes five inputs:
+// The decision composes four inputs:
 //   - inLegacySync: FSM reports state == LEGACYSYNCING. The bsvd netsync path
 //     only enters this state below the final hardcoded checkpoint and uses
 //     headers-first download anchored to the next checkpoint hash, so blocks
@@ -274,18 +274,14 @@ type TxMapWrapper struct {
 //     chain guarantees subtree-content integrity and skipping subtree-level
 //     validation is safe. Above the final checkpoint (or when checkpoints are
 //     disabled) no such anchor exists and full subtree validation is required.
-//   - forceFlag: operator has set legacy_forceQuickValidation=true. Intended
-//     for snapshot/restart operators on trusted networks who accept the
-//     reduced validation regardless of checkpoint coverage.
-//   - catchupInCatchingBlocks: legacy_quickValidationInCatchingBlocks setting.
+//   - catchupInCatchingBlocks: legacy_quickValidationInCatchingBlocks setting,
+//     on by default. Lets operators disable the CATCHINGBLOCKS path if a
+//     regression surfaces there that does not appear in LEGACYSYNCING.
 //
-// CATCHINGBLOCKS activation additionally requires belowFinalCheckpoint so the
-// checkpoint-anchor safety argument continues to hold; past the final
-// checkpoint operators must opt in explicitly with forceFlag.
-func shouldUseQuickValidationMode(inLegacySync, inCatchingBlocks, belowFinalCheckpoint, forceFlag, catchupInCatchingBlocks bool) bool {
-	if forceFlag {
-		return true
-	}
+// There is no opt-in override for running quickValidationMode past the final
+// checkpoint: subtree validation on tip blocks protects against malicious or
+// forked peers and must not be skipped.
+func shouldUseQuickValidationMode(inLegacySync, inCatchingBlocks, belowFinalCheckpoint, catchupInCatchingBlocks bool) bool {
 	if inLegacySync {
 		return true
 	}
@@ -371,7 +367,6 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 			inLegacySync,
 			inCatchingBlocks,
 			belowFinalCheckpoint,
-			sm.settings.Legacy.ForceQuickValidation,
 			sm.settings.Legacy.QuickValidationCatchupInCatchingBlocks,
 		)
 
