@@ -552,25 +552,25 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CheckBlockSubtreesTimeout:                 getDuration("subtreevalidation_check_block_subtrees_timeout", 30*time.Minute, alternativeContext...),
 		},
 		Legacy: LegacySettings{
-			WorkingDir:                             getString("legacy_workingDir", "../../data", alternativeContext...),
-			ListenAddresses:                        getMultiString("legacy_listen_addresses", "|", []string{}, alternativeContext...),
-			ConnectPeers:                           getMultiString("legacy_connect_peers", "|", []string{}, alternativeContext...),
-			OrphanEvictionDuration:                 getDuration("legacy_orphanEvictionDuration", 10*time.Minute, alternativeContext...),
-			StoreBatcherSize:                       getInt("legacy_storeBatcherSize", 1024, alternativeContext...),
-			StoreBatcherConcurrency:                getInt("legacy_storeBatcherConcurrency", 32, alternativeContext...),
-			SpendBatcherSize:                       getInt("legacy_spendBatcherSize", 1024, alternativeContext...),
-			SpendBatcherConcurrency:                getInt("legacy_spendBatcherConcurrency", 4, alternativeContext...),
-			OutpointBatcherSize:                    getInt("legacy_outpointBatcherSize", 1024, alternativeContext...),
-			OutpointBatcherConcurrency:             getInt("legacy_outpointBatcherConcurrency", 32, alternativeContext...),
-			PrintInvMessages:                       getBool("legacy_printInvMessages", false, alternativeContext...),
-			GRPCAddress:                            getString("legacy_grpcAddress", "", alternativeContext...),
-			AllowBlockPriority:                     getBool("legacy_allowBlockPriority", false, alternativeContext...),
-			GRPCListenAddress:                      getString("legacy_grpcListenAddress", "", alternativeContext...),
-			SavePeers:                              getBool("legacy_savePeers", false, alternativeContext...), // by default we do not save the peers
-			AllowSyncCandidateFromLocalPeers:       getBool("legacy_allowSyncCandidateFromLocalPeers", false, alternativeContext...),
-			TempStore:                              getURL("temp_store", "file://./data/tempstore", alternativeContext...),
-			PeerIdleTimeout:                        getDuration("legacy_peerIdleTimeout", 125*time.Second, alternativeContext...),     // ping/pong interval is 2 mins, so we set this to 125s to be sure
-			PeerProcessingTimeout:                  getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
+			WorkingDir:                       getString("legacy_workingDir", "../../data", alternativeContext...),
+			ListenAddresses:                  getMultiString("legacy_listen_addresses", "|", []string{}, alternativeContext...),
+			ConnectPeers:                     getMultiString("legacy_connect_peers", "|", []string{}, alternativeContext...),
+			OrphanEvictionDuration:           getDuration("legacy_orphanEvictionDuration", 10*time.Minute, alternativeContext...),
+			StoreBatcherSize:                 getInt("legacy_storeBatcherSize", 1024, alternativeContext...),
+			StoreBatcherConcurrency:          getInt("legacy_storeBatcherConcurrency", 32, alternativeContext...),
+			SpendBatcherSize:                 getInt("legacy_spendBatcherSize", 1024, alternativeContext...),
+			SpendBatcherConcurrency:          getInt("legacy_spendBatcherConcurrency", 4, alternativeContext...),
+			OutpointBatcherSize:              getInt("legacy_outpointBatcherSize", 1024, alternativeContext...),
+			OutpointBatcherConcurrency:       getInt("legacy_outpointBatcherConcurrency", 32, alternativeContext...),
+			PrintInvMessages:                 getBool("legacy_printInvMessages", false, alternativeContext...),
+			GRPCAddress:                      getString("legacy_grpcAddress", "", alternativeContext...),
+			AllowBlockPriority:               getBool("legacy_allowBlockPriority", false, alternativeContext...),
+			GRPCListenAddress:                getString("legacy_grpcListenAddress", "", alternativeContext...),
+			SavePeers:                        getBool("legacy_savePeers", false, alternativeContext...), // by default we do not save the peers
+			AllowSyncCandidateFromLocalPeers: getBool("legacy_allowSyncCandidateFromLocalPeers", false, alternativeContext...),
+			TempStore:                        getURL("temp_store", "file://./data/tempstore", alternativeContext...),
+			PeerIdleTimeout:                  getDuration("legacy_peerIdleTimeout", 125*time.Second, alternativeContext...),     // ping/pong interval is 2 mins, so we set this to 125s to be sure
+			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
