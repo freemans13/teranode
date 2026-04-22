@@ -929,9 +929,9 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 }
 
 // extendFromTxMap populates a transaction's inputs whose parents are in the same
-// block (available via txMap). It waits up to 120 seconds for each same-block parent
-// to be fully extended itself, which is necessary because child and parent may be
-// processed by different goroutines in the enclosing errgroup.
+// block (available via txMap). Parent Outputs are populated at wire-parse time
+// and never mutated afterwards, so they can be read immediately without waiting
+// for the parent's own inputs to be extended.
 //
 // Inputs whose parents are not in txMap are left for a later bulk DB lookup (see
 // extendTransactions phase 2).
@@ -968,6 +968,11 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		g.Go(func() error {
 			txWrapper.SomeParentsInBlock = true
 
+			if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
+				return errors.NewProcessingError("tx %s input %d references invalid output index %d (parent %s has %d outputs)",
+					tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+			}
+
 			// Parent's Outputs are populated at wire-parse time and never mutated
 			// afterwards, so we can read them immediately without waiting for the
 			// parent tx itself to finish being extended. The old implementation
@@ -1001,6 +1006,10 @@ func (sm *SyncManager) extendPerTxFallback(ctx context.Context, txs []*bt.Tx) er
 			if errors.Is(err, errors.ErrProcessing) || errors.Is(err, errors.ErrTxNotFound) {
 				txMeta, metaErr := sm.utxoStore.Get(ctx, tx.TxIDChainHash(), fields.Tx)
 				if metaErr == nil && txMeta != nil && txMeta.Tx != nil {
+					if len(txMeta.Tx.Inputs) != len(tx.Inputs) {
+						return errors.NewProcessingError("recovered tx %s has %d inputs but expected %d",
+							tx.TxIDChainHash(), len(txMeta.Tx.Inputs), len(tx.Inputs))
+					}
 					for i, input := range txMeta.Tx.Inputs {
 						tx.Inputs[i].PreviousTxSatoshis = input.PreviousTxSatoshis
 						tx.Inputs[i].PreviousTxScript = input.PreviousTxScript
