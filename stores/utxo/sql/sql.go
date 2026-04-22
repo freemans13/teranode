@@ -1028,8 +1028,9 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		return false, false, nil
 	}
 
-	// Phase 2: one BEGIN…COMMIT for the whole batch.
-	txn, err := s.db.Begin()
+	// Phase 2: one BEGIN…COMMIT for the whole batch. Use BeginTx so shutdown/ctx
+	// cancellation can interrupt if the driver blocks acquiring the write lock.
+	txn, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
 		if isLockError(err) {
 			return true, true, err
@@ -1042,58 +1043,79 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 	}
 	defer func() { _ = txn.Rollback() }()
 
-	// Phase 3: one multi-row INSERT INTO transactions with ON CONFLICT DO NOTHING RETURNING id, hash.
+	// Phase 3: chunked multi-row INSERT INTO transactions with ON CONFLICT DO NOTHING
+	// RETURNING id, hash. Chunking keeps us under SQLite's SQLITE_MAX_VARIABLE_NUMBER
+	// (default 999) — with txColsPerRow=10 and maxPostgresParams=999, a batch of 100
+	// would emit 1000 bind parameters and fail with "too many SQL variables".
 	const txColsPerRow = 10
-	txSQL := buildMultiValueInsert(
-		`INSERT INTO transactions (hash,version,lock_time,fee,size_in_bytes,coinbase,frozen,conflicting,locked,unmined_since) VALUES `,
-		txColsPerRow, len(preps), 1,
-	) + ` ON CONFLICT (hash) DO NOTHING RETURNING id, hash`
-
-	txArgs := make([]interface{}, 0, len(preps)*txColsPerRow)
-	for _, p := range preps {
-		txArgs = append(txArgs,
-			p.txHash[:], p.tx.Version, p.tx.LockTime,
-			p.txMeta.Fee, p.txMeta.SizeInBytes,
-			p.isCoinbase, p.options.Frozen, p.options.Conflicting,
-			p.options.Locked, p.unminedSince,
-		)
+	maxTxRowsPerChunk := maxPostgresParams / txColsPerRow
+	if maxTxRowsPerChunk < 1 {
+		maxTxRowsPerChunk = 1
 	}
 
-	rows, err := txn.QueryContext(s.ctx, txSQL, txArgs...)
-	if err != nil {
-		if isLockError(err) {
-			return true, true, err
-		}
+	notifyAll := func(err error) {
 		for _, p := range preps {
-			p.item.done <- batchCreateResult{Err: errors.NewStorageError("bulk INSERT transactions failed", err)}
+			if p.item.done == nil {
+				continue
+			}
+			p.item.done <- batchCreateResult{Err: err}
 			p.item.done = nil
 		}
-		return false, false, nil
 	}
-	defer rows.Close()
 
-	// Build hash → id map from RETURNING rows (only newly-inserted txs appear).
 	hashToID := make(map[chainhash.Hash]int, len(preps))
-	for rows.Next() {
-		var id int
-		var hashBytes []byte
-		if err := rows.Scan(&id, &hashBytes); err != nil {
-			for _, p := range preps {
-				p.item.done <- batchCreateResult{Err: errors.NewStorageError("scan RETURNING failed", err)}
-				p.item.done = nil
+	for start := 0; start < len(preps); start += maxTxRowsPerChunk {
+		end := start + maxTxRowsPerChunk
+		if end > len(preps) {
+			end = len(preps)
+		}
+		chunk := preps[start:end]
+
+		txSQL := buildMultiValueInsert(
+			`INSERT INTO transactions (hash,version,lock_time,fee,size_in_bytes,coinbase,frozen,conflicting,locked,unmined_since) VALUES `,
+			txColsPerRow, len(chunk), 1,
+		) + ` ON CONFLICT (hash) DO NOTHING RETURNING id, hash`
+
+		txArgs := make([]interface{}, 0, len(chunk)*txColsPerRow)
+		for _, p := range chunk {
+			txArgs = append(txArgs,
+				p.txHash[:], p.tx.Version, p.tx.LockTime,
+				p.txMeta.Fee, p.txMeta.SizeInBytes,
+				p.isCoinbase, p.options.Frozen, p.options.Conflicting,
+				p.options.Locked, p.unminedSince,
+			)
+		}
+
+		rows, err := txn.QueryContext(s.ctx, txSQL, txArgs...)
+		if err != nil {
+			if isLockError(err) {
+				return true, true, err
 			}
+			notifyAll(errors.NewStorageError("bulk INSERT transactions failed", err))
 			return false, false, nil
 		}
-		var h chainhash.Hash
-		copy(h[:], hashBytes)
-		hashToID[h] = id
-	}
-	if err := rows.Err(); err != nil {
-		for _, p := range preps {
-			p.item.done <- batchCreateResult{Err: errors.NewStorageError("iterating RETURNING failed", err)}
-			p.item.done = nil
+
+		scanErr := func() error {
+			defer rows.Close()
+			for rows.Next() {
+				var id int
+				var hashBytes []byte
+				if err := rows.Scan(&id, &hashBytes); err != nil {
+					return errors.NewStorageError("scan RETURNING failed", err)
+				}
+				var h chainhash.Hash
+				copy(h[:], hashBytes)
+				hashToID[h] = id
+			}
+			return rows.Err()
+		}()
+		if scanErr != nil {
+			if isLockError(scanErr) {
+				return true, true, scanErr
+			}
+			notifyAll(errors.NewStorageError("iterating RETURNING failed", scanErr))
+			return false, false, nil
 		}
-		return false, false, nil
 	}
 
 	// Phase 4: partition preps into successes (in RETURNING) and duplicates (not in RETURNING).
@@ -4423,9 +4445,11 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 // eliminating the per-call fsync overhead of individual transactions.
 func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) error {
 	if s.engine != "postgres" {
-		txn, err := s.db.Begin()
+		// Use BeginTx so shutdown/ctx cancellation can interrupt if the driver
+		// blocks acquiring the write lock.
+		txn, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
-			return err
+			return errors.NewStorageError("failed to begin setUnlockedBulk tx", err)
 		}
 		defer func() { _ = txn.Rollback() }()
 
@@ -4445,7 +4469,10 @@ func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) 
 			}
 		}
 
-		return txn.Commit()
+		if err := txn.Commit(); err != nil {
+			return errors.NewStorageError("setUnlockedBulk commit failed", err)
+		}
+		return nil
 	}
 
 	retention := s.settings.GetUtxoStoreBlockHeightRetention()
