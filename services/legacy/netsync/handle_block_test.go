@@ -787,28 +787,34 @@ func TestPreValidateTransactions_ParentContextCancelled(t *testing.T) {
 }
 
 func TestShouldUseQuickValidationMode(t *testing.T) {
-	t.Run("force flag overrides FSM state", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(false, false, true, true)
-		require.True(t, result, "force flag must activate quickValidationMode even when FSM states are false")
+	// signature: inLegacySync, inCatchingBlocks, belowFinalCheckpoint, forceFlag, catchupInCatchingBlocks
+	t.Run("force flag overrides FSM state and checkpoint", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, false, false, true, true)
+		require.True(t, result, "force flag must activate quickValidationMode even when FSM states are false and past final checkpoint")
 	})
 
-	t.Run("LEGACYSYNCING activates quickValidationMode", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(true, false, false, false)
+	t.Run("LEGACYSYNCING activates regardless of checkpoint flag", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(true, false, false, false, false)
+		require.True(t, result, "LEGACYSYNCING is itself only reachable below the final checkpoint in bsvd netsync")
+	})
+
+	t.Run("CATCHINGBLOCKS activates when below final checkpoint and catchupInCatchingBlocks true", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, true, true, false, true)
 		require.True(t, result)
 	})
 
-	t.Run("CATCHINGBLOCKS activates when catchupInCatchingBlocks true", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(false, true, false, true)
-		require.True(t, result)
+	t.Run("CATCHINGBLOCKS does NOT activate when past final checkpoint", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, true, false, false, true)
+		require.False(t, result, "quick path must not skip subtree validation on tip blocks that lack a checkpoint anchor")
 	})
 
 	t.Run("CATCHINGBLOCKS does NOT activate when catchupInCatchingBlocks false", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(false, true, false, false)
+		result := shouldUseQuickValidationMode(false, true, true, false, false)
 		require.False(t, result)
 	})
 
 	t.Run("RUNNING + no flags remains disabled", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(false, false, false, false)
+		result := shouldUseQuickValidationMode(false, false, false, false, false)
 		require.False(t, result)
 	})
 }

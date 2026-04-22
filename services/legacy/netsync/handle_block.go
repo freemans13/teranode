@@ -261,22 +261,35 @@ type TxMapWrapper struct {
 // the quickValidationMode optimisations (parallel UTXO create-then-spend, skip
 // checkSubtreeFromBlock, use PR #711's pre-assigned block ID path).
 //
-// The decision composes four inputs:
-//   - inLegacySync: FSM reports state == LEGACYSYNCING
-//   - inCatchingBlocks: FSM reports state == CATCHINGBLOCKS
-//   - forceFlag: operator has set legacy_forceQuickValidation=true
-//   - catchupInCatchingBlocks: legacy_quickValidationInCatchingBlocks setting
+// The decision composes five inputs:
+//   - inLegacySync: FSM reports state == LEGACYSYNCING. The bsvd netsync path
+//     only enters this state below the final hardcoded checkpoint and uses
+//     headers-first download anchored to the next checkpoint hash, so blocks
+//     in this window are provably on the known-good chain.
+//   - inCatchingBlocks: FSM reports state == CATCHINGBLOCKS. This is set
+//     whenever we are >10 blocks behind a peer, regardless of checkpoint
+//     coverage, so on its own it does not imply a checkpoint anchor.
+//   - belowFinalCheckpoint: the block being validated is at or below the
+//     chain's final hardcoded checkpoint height. When true, the headers-first
+//     chain guarantees subtree-content integrity and skipping subtree-level
+//     validation is safe. Above the final checkpoint (or when checkpoints are
+//     disabled) no such anchor exists and full subtree validation is required.
+//   - forceFlag: operator has set legacy_forceQuickValidation=true. Intended
+//     for snapshot/restart operators on trusted networks who accept the
+//     reduced validation regardless of checkpoint coverage.
+//   - catchupInCatchingBlocks: legacy_quickValidationInCatchingBlocks setting.
 //
-// Any of these paths activates the mode. The forceFlag is intended for operators
-// restarting from a pre-existing chain where FSM begins in RUNNING.
-func shouldUseQuickValidationMode(inLegacySync, inCatchingBlocks, forceFlag, catchupInCatchingBlocks bool) bool {
+// CATCHINGBLOCKS activation additionally requires belowFinalCheckpoint so the
+// checkpoint-anchor safety argument continues to hold; past the final
+// checkpoint operators must opt in explicitly with forceFlag.
+func shouldUseQuickValidationMode(inLegacySync, inCatchingBlocks, belowFinalCheckpoint, forceFlag, catchupInCatchingBlocks bool) bool {
 	if forceFlag {
 		return true
 	}
 	if inLegacySync {
 		return true
 	}
-	if inCatchingBlocks && catchupInCatchingBlocks {
+	if inCatchingBlocks && catchupInCatchingBlocks && belowFinalCheckpoint {
 		return true
 	}
 	return false
@@ -349,9 +362,15 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 			inCatchingBlocks = *currentState == blockchain_api.FSMStateType_CATCHINGBLOCKS
 		}
 
+		belowFinalCheckpoint := false
+		if cps := sm.chainParams.Checkpoints; len(cps) > 0 {
+			belowFinalCheckpoint = block.Height() <= cps[len(cps)-1].Height
+		}
+
 		quickValidationMode := shouldUseQuickValidationMode(
 			inLegacySync,
 			inCatchingBlocks,
+			belowFinalCheckpoint,
 			sm.settings.Legacy.ForceQuickValidation,
 			sm.settings.Legacy.QuickValidationCatchupInCatchingBlocks,
 		)
