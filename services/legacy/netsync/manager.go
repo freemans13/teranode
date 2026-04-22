@@ -2190,14 +2190,18 @@ func (sm *SyncManager) Stop() error {
 	sm.requestedTxns.Stop()
 	sm.requestedBlocks.Stop()
 
+	var stopErr error
 	if sm.subtreeWriteBatcher != nil {
 		if err := sm.subtreeWriteBatcher.Stop(context.Background()); err != nil {
+			// Log and propagate: a drain failure may mean buffered subtree
+			// items were lost, and callers need to see the unclean shutdown.
 			sm.logger.Errorf("[SyncManager] SubtreeWriteBatcher.Stop: %v", err)
+			stopErr = err
 		}
 		sm.subtreeWriteBatcher = nil
 	}
 
-	return nil
+	return stopErr
 }
 
 // SyncPeerID returns the ID of the current sync peer, or 0 if there is none.

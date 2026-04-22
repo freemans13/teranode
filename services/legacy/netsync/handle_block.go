@@ -1126,6 +1126,14 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 			continue
 		}
 
+		// Bounds-check the referenced output index against the parent's outputs.
+		// A malformed block could reference an out-of-range index, and indexing
+		// directly would panic before structured validation has a chance to run.
+		if int(input.PreviousTxOutIndex) >= len(prevTxWrapper.Tx.Outputs) {
+			return errors.NewTxError("tx %s input %d references out-of-range output %d on parent %s (parent has %d outputs)",
+				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+		}
+
 		// Mark synchronously here (before launching the goroutine) so concurrent
 		// goroutines for sibling inputs don't race on this write. All writers
 		// set it to the same value (true), but per the Go memory model an
