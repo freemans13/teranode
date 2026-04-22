@@ -3553,9 +3553,13 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	}
 	pairs := make([]outpointPair, 0, totalPairs)
 	for parentHash, refs := range needsByParent {
+		// Hoist the hash copy outside the inner loop so each parent's array
+		// escapes once, not once per referenced input, matching the shape used
+		// in BatchPreviousOutputsDecorate.
+		hCopy := parentHash
+		hashSlice := hCopy[:]
 		for _, ref := range refs {
-			hCopy := parentHash
-			pairs = append(pairs, outpointPair{hash: hCopy[:], idx: ref.outIdx})
+			pairs = append(pairs, outpointPair{hash: hashSlice, idx: ref.outIdx})
 		}
 	}
 
