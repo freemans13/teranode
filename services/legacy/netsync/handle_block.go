@@ -873,8 +873,8 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 	// Phase 1: populate inputs whose parents are same-block transactions. These are
 	// served from the in-memory txMap, so no DB work is needed here. We run per-tx
 	// goroutines (bounded by OutpointBatcherSize) because each tx's own inputs are
-	// populated independently and may need to wait for a same-block parent to finish
-	// being extended first.
+	// populated independently, and same-block parent outputs are read directly from
+	// txMap without waiting for the parent transaction itself to be extended first.
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, outpointBatcherSize)
 
@@ -929,12 +929,12 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 }
 
 // extendFromTxMap populates a transaction's inputs whose parents are in the same
-// block (available via txMap). It waits up to 120 seconds for each same-block parent
-// to be fully extended itself, which is necessary because child and parent may be
-// processed by different goroutines in the enclosing errgroup.
+// block (available via txMap) using those parents' outputs.
 //
-// Inputs whose parents are not in txMap are left for a later bulk DB lookup (see
-// extendTransactions phase 2).
+// It does not wait for same-block parents to become fully extended; parent outputs
+// are available as soon as the transactions are parsed, so only those outputs are
+// used here. Inputs whose parents are not in txMap are left for a later bulk DB
+// lookup (see extendTransactions phase 2).
 func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) error {
 	timeStart := time.Now()
 	defer func() {
@@ -965,9 +965,12 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 			continue
 		}
 
-		g.Go(func() error {
-			txWrapper.SomeParentsInBlock = true
+		// Set once from the outer loop as soon as any same-block parent is detected.
+		// Writing from per-input goroutines would be a data race when multiple inputs
+		// share same-block parents.
+		txWrapper.SomeParentsInBlock = true
 
+		g.Go(func() error {
 			// Parent's Outputs are populated at wire-parse time and never mutated
 			// afterwards, so we can read them immediately without waiting for the
 			// parent tx itself to finish being extended. The old implementation
