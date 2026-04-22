@@ -878,7 +878,14 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, outpointBatcherSize)
 
-	txs := make([]*bt.Tx, 0, len(block.Transactions())-1)
+	// Blocks always include a coinbase, but guard against 0-tx edge cases
+	// (malformed/test blocks) where len-1 would produce a negative capacity.
+	txCount := len(block.Transactions())
+	txCapacity := 0
+	if txCount > 0 {
+		txCapacity = txCount - 1
+	}
+	txs := make([]*bt.Tx, 0, txCapacity)
 
 	for idx, wireTx := range block.Transactions() {
 		if idx == 0 {
