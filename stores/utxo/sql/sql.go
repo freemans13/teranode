@@ -3688,7 +3688,15 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		hash []byte
 		idx  uint32
 	}
-	pairs := make([]compositePair, 0)
+	// Pre-allocate pairs to the sum of refs across all parents. This is an upper
+	// bound (the actual length is bounded by unique (hash, idx) after dedupe) but
+	// avoids repeated slice growth on large blocks where the pair count can reach
+	// several tens of thousands.
+	totalRefs := 0
+	for _, refs := range needsByParent {
+		totalRefs += len(refs)
+	}
+	pairs := make([]compositePair, 0, totalRefs)
 	for h, refs := range needsByParent {
 		hCopy := h
 		hashSlice := hCopy[:]

@@ -1031,9 +1031,12 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 
 	// Phase 1: populate inputs whose parents are same-block transactions. These are
 	// served from the in-memory txMap, so no DB work is needed here. We run per-tx
-	// goroutines (bounded by OutpointBatcherSize) because each tx's own inputs are
-	// populated independently and may need to wait for a same-block parent to finish
-	// being extended first.
+	// goroutines (bounded by OutpointBatcherSize) because each tx's inputs are
+	// populated independently by reading same-block parent Outputs directly from
+	// txMap; this phase does not wait for a parent transaction to be extended first
+	// (parent Outputs are populated at wire-parse time and are never mutated during
+	// input extension, so reads are safe even before the parent's own inputs have
+	// been decorated).
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, outpointBatcherSize)
 
