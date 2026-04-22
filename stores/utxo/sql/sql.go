@@ -1120,17 +1120,25 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		}
 	}
 
-	// Phase 4: partition preps into successes (in RETURNING) and duplicates (not in RETURNING).
+	// Phase 4: partition preps into successes (first occurrence whose hash is in
+	// RETURNING) and duplicates (hash absent, or hash already consumed by an
+	// earlier prep in the same batch). Duplicates within the batch must map to
+	// ErrTxExists — ON CONFLICT DO NOTHING returns the hash once, but any
+	// subsequent prep with the same hash would otherwise collide on child-row
+	// inserts and bypass the ErrTxExists contract.
 	successes := make([]createBatchSuccess, 0, len(preps))
+	seenHashes := make(map[chainhash.Hash]struct{}, len(preps))
 	for _, p := range preps {
 		id, ok := hashToID[*p.txHash]
-		if !ok {
-			// Not in RETURNING → hash already existed in transactions table.
+		if _, alreadySeen := seenHashes[*p.txHash]; !ok || alreadySeen {
+			// Not in RETURNING → hash already existed in transactions table, or
+			// hash is a duplicate later occurrence within the same batch.
 			// Nil item.done so a subsequent retry attempt's Phase 1 skips this item.
 			p.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", p.isCoinbase)}
 			p.item.done = nil
 			continue
 		}
+		seenHashes[*p.txHash] = struct{}{}
 		successes = append(successes, createBatchSuccess{transactionID: id, prep: p})
 	}
 	if len(successes) == 0 {
