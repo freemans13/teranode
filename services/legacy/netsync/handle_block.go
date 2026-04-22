@@ -467,9 +467,18 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 	// multi-GB buffer on the largest historical blocks. flushSubtreeWriteBatch
 	// is still defensive against ErrBlobAlreadyExists inside NewFileStorer, but
 	// catching it here avoids the allocation entirely.
-	treeExists, _ := sm.subtreeStore.Exists(ctx, treeRootHash[:], treeFileType)
-	dataExists, _ := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeData)
-	metaExists, _ := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeMeta)
+	treeExists, err := sm.subtreeStore.Exists(ctx, treeRootHash[:], treeFileType)
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] check subtree exists", err)
+	}
+	dataExists, err := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeData)
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] check subtree data exists", err)
+	}
+	metaExists, err := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeMeta)
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] check subtree meta exists", err)
+	}
 
 	if !treeExists {
 		subtreeBytes, err := subtree.Serialize()
@@ -689,7 +698,11 @@ func (sm *SyncManager) flushSubtreeWriteBatch(ctx context.Context, items []Subtr
 			case SubtreeKindMeta:
 				// Mirror the existence check from writeSubtreeDirect: skip if already present
 				// (e.g., created by block assembly via P2P).
-				if exists, _ := sm.subtreeStore.Exists(gCtx, item.RootHash[:], fileformat.FileTypeSubtreeMeta); exists {
+				exists, err := sm.subtreeStore.Exists(gCtx, item.RootHash[:], fileformat.FileTypeSubtreeMeta)
+				if err != nil {
+					return errors.NewStorageError("flushSubtreeWriteBatch: check meta exists", err)
+				}
+				if exists {
 					return nil
 				}
 				fileType = fileformat.FileTypeSubtreeMeta

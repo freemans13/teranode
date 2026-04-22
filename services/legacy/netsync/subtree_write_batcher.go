@@ -61,7 +61,8 @@ type SubtreeWriteFlushFunc func(ctx context.Context, items []SubtreeWriteItem) e
 // are dropped from the buffer and the error is surfaced to the caller via one of:
 //   - Submit() returns the error directly (count-threshold path).
 //   - The next Submit() or Stop() returns lastErr (timer path).
-//   - Stop() returns the final-flush error and/or lastErr.
+//   - Stop() returns the final-flush error if one occurs; otherwise it returns
+//     the captured lastErr (and clears it).
 //
 // This is intentional. The caller (writeSubtree → prepareSubtrees → block
 // processing) treats any Submit/Stop error as a block-level failure and aborts
