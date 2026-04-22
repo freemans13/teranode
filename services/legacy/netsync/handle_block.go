@@ -358,8 +358,13 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		}
 
 		belowFinalCheckpoint := false
-		if cps := sm.chainParams.Checkpoints; len(cps) > 0 {
-			belowFinalCheckpoint = block.Height() <= cps[len(cps)-1].Height
+		// When the operator passes --nocheckpoints, no checkpoint anchor exists
+		// even if chainParams.Checkpoints is still populated, so we must not
+		// enable quickValidationMode on the CATCHINGBLOCKS path.
+		if !sm.disableCheckpoints {
+			if cps := sm.chainParams.Checkpoints; len(cps) > 0 {
+				belowFinalCheckpoint = block.Height() <= cps[len(cps)-1].Height
+			}
 		}
 
 		quickValidationMode := shouldUseQuickValidationMode(
@@ -973,9 +978,10 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 }
 
 // extendFromTxMap populates a transaction's inputs whose parents are in the same
-// block (available via txMap). It waits up to 120 seconds for each same-block parent
-// to be fully extended itself, which is necessary because child and parent may be
-// processed by different goroutines in the enclosing errgroup.
+// block (available via txMap) by reading the parent transaction's outputs
+// immediately. It does not wait for the parent transaction to become fully
+// extended, because only the parent's outputs are needed here and those are
+// available as soon as the transaction is parsed.
 //
 // Inputs whose parents are not in txMap are left for a later bulk DB lookup (see
 // extendTransactions phase 2).
@@ -1009,9 +1015,11 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 			continue
 		}
 
-		g.Go(func() error {
-			txWrapper.SomeParentsInBlock = true
+		// Set once from the caller goroutine to avoid concurrent writes from
+		// the per-input goroutines below (data race under -race).
+		txWrapper.SomeParentsInBlock = true
 
+		g.Go(func() error {
 			// Parent's Outputs are populated at wire-parse time and never mutated
 			// afterwards, so we can read them immediately without waiting for the
 			// parent tx itself to finish being extended. The old implementation
