@@ -38,6 +38,10 @@ func TestUnlockBatcher_SQLite_Wired(t *testing.T) {
 
 	store, _ := setup(ctx, t)
 
+	// Verify the precondition this test is asserting on, so the test fails
+	// loudly if the default changes rather than silently bypassing the check.
+	require.Greater(t, store.settings.UtxoStore.LockedBatcherSize, 1,
+		"test precondition: LockedBatcherSize must be > 1 for this wiring check")
 	require.NotNil(t, store.unlockBatcher,
 		"unlockBatcher must be initialised for the sqlite engine when LockedBatcherSize > 1")
 }
@@ -50,6 +54,8 @@ func TestUnlockBatcher_SQLite_DAH(t *testing.T) {
 	defer cancel()
 
 	store, _ := setup(ctx, t)
+	require.NotNil(t, store.unlockBatcher,
+		"unlockBatcher must be initialised so this test exercises the batched unlock path")
 	require.NoError(t, store.SetBlockHeight(1000))
 
 	_, err := store.Create(ctx, tests.ParentTx, 999)
