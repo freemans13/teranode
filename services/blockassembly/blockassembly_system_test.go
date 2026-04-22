@@ -1049,14 +1049,24 @@ func TestHandleReorgWithInvalidBlock_Integration(t *testing.T) {
 	err = waitForBestBlockHash(ctx, ba.blockchainClient, chainBHeaders[2].Hash(), 10*time.Second)
 	require.NoError(t, err, "timeout waiting for blockchain to reach chain B tip")
 
-	// Wait for BA to settle on chain B
+	// Wait for BA to settle on chain B AND all chain B blocks to have processed_at set.
 	// BA may process the invalidation reorg first (to A1), then advance to chain B.
-	// Either way, it should end up on chain B.
+	// CurrentBlock() is updated before subtreeProcessor.Reset runs, so waiting on it
+	// alone races with the Reset path that actually calls SetBlockProcessedAt.
 	require.Eventually(t, func() bool {
 		currentHeader, _ := ba.blockAssembler.CurrentBlock()
-		return currentHeader.Hash().IsEqual(chainBHeaders[2].Hash())
+		if !currentHeader.Hash().IsEqual(chainBHeaders[2].Hash()) {
+			return false
+		}
+		for _, header := range chainBHeaders {
+			_, meta, err := ba.blockchainClient.GetBlockHeader(ctx, header.Hash())
+			if err != nil || meta.ProcessedAt == nil {
+				return false
+			}
+		}
+		return true
 	}, 15*time.Second, 200*time.Millisecond,
-		"timeout waiting for BA to settle on chain B after reorg with invalid block")
+		"timeout waiting for BA to settle on chain B with processed_at set after reorg with invalid block")
 
 	// Verify BA is on chain B tip
 	currentHeader, currentHeight := ba.blockAssembler.CurrentBlock()
