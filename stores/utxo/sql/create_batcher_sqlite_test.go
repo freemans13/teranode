@@ -191,3 +191,61 @@ func TestCreateBatcher_SQLite_LargeBatch(t *testing.T) {
 		require.NotNil(t, meta)
 	}
 }
+
+// TestCreateBatcher_SQLite_DuplicateInBatch verifies that when two Creates
+// for the same tx hash land in a single batch, exactly one succeeds and the
+// other returns ErrTxExists. Without per-batch deduplication, both preps
+// would find the hash in hashToID (ON CONFLICT DO NOTHING inserts once but
+// returns the row once) and both would be classified as successes — causing
+// duplicate child-row inserts and violating the ErrTxExists contract.
+func TestCreateBatcher_SQLite_DuplicateInBatch(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.BatcherDrainMode = true
+	tSettings.UtxoStore.StoreBatcherSize = 4
+	// Long duration so the two concurrent Creates land in one batch on size.
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5000
+
+	storeURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	store, err := New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+
+	// Build a unique tx.
+	tx := bt.NewTx()
+	require.NoError(t, tx.AddP2PKHOutputFromAddress(
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1234))
+
+	// Submit the same tx twice concurrently so both items enter the same batch.
+	const dupes = 4
+	errs := make(chan error, dupes)
+	var wg sync.WaitGroup
+	for i := 0; i < dupes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, cerr := store.Create(ctx, tx, 1000)
+			errs <- cerr
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	successCount, existsCount := 0, 0
+	for cerr := range errs {
+		switch {
+		case cerr == nil:
+			successCount++
+		case errors.Is(cerr, errors.ErrTxExists):
+			existsCount++
+		default:
+			t.Fatalf("unexpected error: %v", cerr)
+		}
+	}
+	require.Equal(t, 1, successCount, "exactly one create of duplicate-in-batch txs should succeed")
+	require.Equal(t, dupes-1, existsCount, "the rest should return ErrTxExists")
+}
