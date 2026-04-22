@@ -1120,29 +1120,54 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		}
 	}
 
-	// Phase 4: partition preps into successes (first occurrence whose hash is in
-	// RETURNING) and duplicates (hash absent, or hash already consumed by an
-	// earlier prep in the same batch). Duplicates within the batch must map to
-	// ErrTxExists — ON CONFLICT DO NOTHING returns the hash once, but any
-	// subsequent prep with the same hash would otherwise collide on child-row
-	// inserts and bypass the ErrTxExists contract.
+	// Phase 4: partition preps into successes, pre-existing duplicates, and
+	// duplicate-within-batch followers.
+	//
+	// - successes: first occurrence of a hash present in RETURNING.
+	// - pre-existing duplicates (hash absent from RETURNING): the tx already
+	//   existed on disk before this batch. Safe to notify ErrTxExists now —
+	//   the state is independent of this batch's commit outcome.
+	// - duplicate-within-batch followers: later preps that share a hash with
+	//   an earlier prep in the *same* batch. Their ErrTxExists is only valid
+	//   once the winner commits. Defer notification until after commit; if the
+	//   batch fails, they must receive the same terminal error as the winner.
 	successes := make([]createBatchSuccess, 0, len(preps))
+	followersByHash := make(map[chainhash.Hash][]*preparedCreateSQL)
 	seenHashes := make(map[chainhash.Hash]struct{}, len(preps))
 	for _, p := range preps {
-		id, ok := hashToID[*p.txHash]
-		if _, alreadySeen := seenHashes[*p.txHash]; !ok || alreadySeen {
-			// Not in RETURNING → hash already existed in transactions table, or
-			// hash is a duplicate later occurrence within the same batch.
-			// Nil item.done so a subsequent retry attempt's Phase 1 skips this item.
+		id, inReturning := hashToID[*p.txHash]
+		if !inReturning {
+			// Hash already existed on disk before this batch — safe to notify now.
 			p.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", p.isCoinbase)}
 			p.item.done = nil
+			continue
+		}
+		if _, alreadySeen := seenHashes[*p.txHash]; alreadySeen {
+			// Duplicate-within-batch follower — defer notification until commit.
+			followersByHash[*p.txHash] = append(followersByHash[*p.txHash], p)
 			continue
 		}
 		seenHashes[*p.txHash] = struct{}{}
 		successes = append(successes, createBatchSuccess{transactionID: id, prep: p})
 	}
+
+	// notifyFollowers propagates a terminal error to all deferred
+	// duplicate-within-batch followers. Used on failure paths so followers
+	// don't get ErrTxExists when the winner's tx never committed.
+	notifyFollowersErr := func(err error) {
+		for _, group := range followersByHash {
+			for _, f := range group {
+				if f.item.done != nil {
+					f.item.done <- batchCreateResult{Err: err}
+					f.item.done = nil
+				}
+			}
+		}
+	}
+
 	if len(successes) == 0 {
-		// All were duplicates; nothing to write in child tables. Commit is a no-op but safe.
+		// All were pre-existing duplicates; nothing to write in child tables.
+		// No followers possible (no winner to shadow). Commit is a no-op but safe.
 		if err := txn.Commit(); err != nil {
 			s.logger.Warnf("[Create] empty-batch commit failed: %v", err)
 		}
@@ -1158,6 +1183,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			c.prep.item.done <- batchCreateResult{Err: err}
 			c.prep.item.done = nil
 		}
+		notifyFollowersErr(err)
 		return false, false, nil
 	}
 
@@ -1170,6 +1196,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			c.prep.item.done <- batchCreateResult{Err: err}
 			c.prep.item.done = nil
 		}
+		notifyFollowersErr(err)
 		return false, false, nil
 	}
 
@@ -1182,6 +1209,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			c.prep.item.done <- batchCreateResult{Err: err}
 			c.prep.item.done = nil
 		}
+		notifyFollowersErr(err)
 		return false, false, nil
 	}
 
@@ -1196,6 +1224,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 					c2.prep.item.done <- batchCreateResult{Err: conflictErr}
 					c2.prep.item.done = nil
 				}
+				notifyFollowersErr(conflictErr)
 				return false, false, nil
 			}
 		}
@@ -1206,17 +1235,28 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		if isLockError(err) {
 			return true, true, err
 		}
+		commitErr := errors.NewStorageError("batch commit failed", err)
 		for _, c := range successes {
-			c.prep.item.done <- batchCreateResult{Err: errors.NewStorageError("batch commit failed", err)}
+			c.prep.item.done <- batchCreateResult{Err: commitErr}
 			c.prep.item.done = nil
 		}
+		notifyFollowersErr(commitErr)
 		return false, false, nil
 	}
 
-	// Notify successes.
+	// Commit succeeded — notify winners (success) and duplicate-within-batch
+	// followers (ErrTxExists, now that the winning row is durable).
 	for _, c := range successes {
 		c.prep.item.done <- batchCreateResult{Data: c.prep.txMeta}
 		c.prep.item.done = nil
+	}
+	for _, group := range followersByHash {
+		for _, f := range group {
+			if f.item.done != nil {
+				f.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", f.isCoinbase)}
+				f.item.done = nil
+			}
+		}
 	}
 
 	return false, false, nil
