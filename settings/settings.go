@@ -562,7 +562,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SpendBatcherConcurrency:                getInt("legacy_spendBatcherConcurrency", 4, alternativeContext...),
 			OutpointBatcherSize:                    getInt("legacy_outpointBatcherSize", 1024, alternativeContext...),
 			OutpointBatcherConcurrency:             getInt("legacy_outpointBatcherConcurrency", 32, alternativeContext...),
-			QuickValidationCatchupInCatchingBlocks: getBool("legacy_quickValidationInCatchingBlocks", true, alternativeContext...),
 			PrintInvMessages:                       getBool("legacy_printInvMessages", false, alternativeContext...),
 			GRPCAddress:                            getString("legacy_grpcAddress", "", alternativeContext...),
 			AllowBlockPriority:                     getBool("legacy_allowBlockPriority", false, alternativeContext...),

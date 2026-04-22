@@ -787,29 +787,24 @@ func TestPreValidateTransactions_ParentContextCancelled(t *testing.T) {
 }
 
 func TestShouldUseQuickValidationMode(t *testing.T) {
-	// signature: inLegacySync, inCatchingBlocks, belowFinalCheckpoint, catchupInCatchingBlocks
-	t.Run("LEGACYSYNCING activates regardless of checkpoint flag", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(true, false, false, false)
-		require.True(t, result, "LEGACYSYNCING is itself only reachable below the final checkpoint in bsvd netsync")
+	// signature: inLegacySync, inCatchingBlocks, belowFinalCheckpoint
+	t.Run("LEGACYSYNCING activates", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(true, false, false)
+		require.True(t, result, "LEGACYSYNCING is only reachable below the final checkpoint in bsvd netsync")
 	})
 
-	t.Run("CATCHINGBLOCKS activates when below final checkpoint and catchupInCatchingBlocks true", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(false, true, true, true)
+	t.Run("CATCHINGBLOCKS activates when below final checkpoint", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, true, true)
 		require.True(t, result)
 	})
 
-	t.Run("CATCHINGBLOCKS does NOT activate when past final checkpoint", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(false, true, false, true)
+	t.Run("CATCHINGBLOCKS does NOT activate past final checkpoint", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, true, false)
 		require.False(t, result, "quick path must not skip subtree validation on tip blocks that lack a checkpoint anchor")
 	})
 
-	t.Run("CATCHINGBLOCKS does NOT activate when catchupInCatchingBlocks false", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(false, true, true, false)
-		require.False(t, result)
-	})
-
-	t.Run("RUNNING + no flags remains disabled", func(t *testing.T) {
-		result := shouldUseQuickValidationMode(false, false, false, false)
+	t.Run("RUNNING remains disabled", func(t *testing.T) {
+		result := shouldUseQuickValidationMode(false, false, false)
 		require.False(t, result)
 	})
 }

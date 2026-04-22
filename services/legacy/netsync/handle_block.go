@@ -261,7 +261,7 @@ type TxMapWrapper struct {
 // the quickValidationMode optimisations (parallel UTXO create-then-spend, skip
 // checkSubtreeFromBlock, use PR #711's pre-assigned block ID path).
 //
-// The decision composes four inputs:
+// The decision composes three inputs:
 //   - inLegacySync: FSM reports state == LEGACYSYNCING. The bsvd netsync path
 //     only enters this state below the final hardcoded checkpoint and uses
 //     headers-first download anchored to the next checkpoint hash, so blocks
@@ -274,18 +274,17 @@ type TxMapWrapper struct {
 //     chain guarantees subtree-content integrity and skipping subtree-level
 //     validation is safe. Above the final checkpoint (or when checkpoints are
 //     disabled) no such anchor exists and full subtree validation is required.
-//   - catchupInCatchingBlocks: legacy_quickValidationInCatchingBlocks setting,
-//     on by default. Lets operators disable the CATCHINGBLOCKS path if a
-//     regression surfaces there that does not appear in LEGACYSYNCING.
 //
-// There is no opt-in override for running quickValidationMode past the final
-// checkpoint: subtree validation on tip blocks protects against malicious or
-// forked peers and must not be skipped.
-func shouldUseQuickValidationMode(inLegacySync, inCatchingBlocks, belowFinalCheckpoint, catchupInCatchingBlocks bool) bool {
+// CATCHINGBLOCKS activation additionally requires belowFinalCheckpoint so the
+// checkpoint-anchor safety argument matches LEGACYSYNCING. There is no
+// override for running quickValidationMode past the final checkpoint: subtree
+// validation on tip blocks protects against malicious or forked peers and
+// must not be skipped.
+func shouldUseQuickValidationMode(inLegacySync, inCatchingBlocks, belowFinalCheckpoint bool) bool {
 	if inLegacySync {
 		return true
 	}
-	if inCatchingBlocks && catchupInCatchingBlocks && belowFinalCheckpoint {
+	if inCatchingBlocks && belowFinalCheckpoint {
 		return true
 	}
 	return false
@@ -367,7 +366,6 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 			inLegacySync,
 			inCatchingBlocks,
 			belowFinalCheckpoint,
-			sm.settings.Legacy.QuickValidationCatchupInCatchingBlocks,
 		)
 
 		if quickValidationMode {
