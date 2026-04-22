@@ -1287,12 +1287,14 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			mock.Anything, blockchain.FSMStateRUNNING).
 			Return(true, nil)
 
-		// Should fail because transaction has missing parent
+		// Missing-parent errors are deferred (not fatal) so the caller's
+		// sequential revalidation pass can re-run the failed subtrees in
+		// block order and resolve cross-subtree parent dependencies. The tx
+		// is still recorded in the orphanage.
 		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "processTransactionsInLevels")
+		require.NoError(t, err)
 
-		// Verify transaction was added to orphanage even though processing failed
+		// Verify transaction was added to orphanage for the caller to retry
 		assert.Equal(t, 1, server.orphanage.Len())
 	})
 
@@ -1317,10 +1319,11 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			mock.Anything, blockchain.FSMStateRUNNING).
 			Return(false, nil)
 
-		// Should fail because transaction has validation errors and blockchain not running
+		// Missing-parent errors are deferred to the sequential revalidation
+		// pass. The orphanage is skipped because FSM isn't RUNNING, but the
+		// caller still gets a chance to retry.
 		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "processTransactionsInLevels")
+		require.NoError(t, err)
 
 		// Verify transaction was NOT added to orphanage (blockchain not running)
 		assert.Equal(t, 0, server.orphanage.Len())
@@ -1347,10 +1350,12 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			mock.Anything, blockchain.FSMStateRUNNING).
 			Return(false, errors.NewServiceError("blockchain client error"))
 
-		// Should fail because transaction has validation errors and blockchain client error
+		// Missing-parent errors are deferred even when the FSM check fails.
+		// The orphanage is skipped (conservative when we can't confirm running
+		// state) but the caller's sequential revalidation pass still gets a
+		// chance to retry.
 		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "processTransactionsInLevels")
+		require.NoError(t, err)
 
 		// Verify transaction was NOT added to orphanage (blockchain client error)
 		assert.Equal(t, 0, server.orphanage.Len())

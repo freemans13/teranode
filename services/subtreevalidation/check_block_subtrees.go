@@ -359,15 +359,17 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
-	var revalidateSubtreesMutex sync.Mutex
-	revalidateSubtrees := make([]chainhash.Hash, 0, len(missingSubtrees))
+	// Parallel validation failures are collected positionally so the sequential
+	// revalidation pass below walks them in block-subtree order. Cross-subtree
+	// parent dependencies within a block only resolve left-to-right; arbitrary
+	// goroutine-completion order would leave children ahead of their parents.
+	failedParallel := make([]bool, len(missingSubtrees))
 
 	// validate all the subtrees in parallel, since we already validated all transactions
-	for _, subtreeHash := range missingSubtrees {
-		subtreeHash := subtreeHash
+	for i, subtreeHash := range missingSubtrees {
+		i, subtreeHash := i, subtreeHash
 
 		g.Go(func() (err error) {
-			// This line is only reached when the base URL is not "legacy"
 			v := ValidateSubtree{
 				SubtreeHash:   subtreeHash,
 				BaseURL:       request.BaseUrl,
@@ -386,9 +388,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			)
 			if err != nil {
 				u.logger.Debugf("[CheckBlockSubtreesRequest] Failed to validate subtree %s: %v", subtreeHash.String(), err)
-				revalidateSubtreesMutex.Lock()
-				revalidateSubtrees = append(revalidateSubtrees, subtreeHash)
-				revalidateSubtreesMutex.Unlock()
+				failedParallel[i] = true
 
 				return nil
 			}
@@ -407,10 +407,22 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed during parallel subtree validation", err))
 	}
 
-	// Now validate the subtrees, in order, which should be much faster since we already validated all transactions
-	// and they should have been added to the internal cache
-	for _, subtreeHash := range revalidateSubtrees {
-		// This line is only reached when the base URL is not "legacy"
+	// Sequential revalidation in block-subtree order.
+	//
+	// Transactions within a block can depend on transactions in earlier subtrees
+	// of the same block (cross-subtree parents). The parallel pass above races
+	// on these dependencies and fails children whose parents haven't populated
+	// the cache yet. Walking the failures in block order resolves them in a
+	// single pass: subtree N's validation populates the cache for subtrees > N.
+	//
+	// If a subtree still fails here it is a real error (not an ordering
+	// artefact), because all earlier subtrees in the block have already been
+	// validated successfully — either in the parallel pass, or in this loop.
+	for i, subtreeHash := range missingSubtrees {
+		if !failedParallel[i] {
+			continue
+		}
+
 		v := ValidateSubtree{
 			SubtreeHash:   subtreeHash,
 			BaseURL:       request.BaseUrl,
@@ -716,8 +728,9 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	// Track validation results
 	var (
-		errorsFound      atomic.Uint64
-		addedToOrphanage atomic.Uint64
+		errorsFound         atomic.Uint64
+		missingParentErrors atomic.Uint64
+		addedToOrphanage    atomic.Uint64
 	)
 
 	// Track successfully validated transactions per level for parent metadata
@@ -807,6 +820,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 					// Handle missing parent transactions by adding to orphanage
 					if errors.Is(err, errors.ErrTxMissingParent) {
+						missingParentErrors.Add(1)
 						isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(gCtx, blockchain.FSMStateRUNNING)
 						if runningErr == nil && isRunning {
 							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
@@ -865,7 +879,19 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	if errorsFound.Load() > 0 {
-		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors, %d transactions added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
+		// When every error is a missing-parent error, defer the failure to the
+		// caller's sequential revalidation pass instead of aborting this batch.
+		// A tx's parent can live in a later batch (not yet processed); once all
+		// batches are complete and the sequential pass re-validates the failed
+		// subtrees in block order, the parent is in the UTXO store and the
+		// child resolves. Failing fatally here would skip that recovery and
+		// stall the block (observed on teratestnet at block 15,631 where
+		// 1,305 of 9,216 txs had cross-subtree parents).
+		if errorsFound.Load() == missingParentErrors.Load() {
+			u.logger.Infof("[processTransactionsInLevels] %d missing-parent errors (deferred to sequential revalidation), %d added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
+			return nil
+		}
+		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors (%d missing-parent), %d transactions added to orphanage", errorsFound.Load(), missingParentErrors.Load(), addedToOrphanage.Load())
 	}
 
 	u.logger.Debugf("[processTransactionsInLevels] Successfully processed all %d transactions", totalTxCount)
