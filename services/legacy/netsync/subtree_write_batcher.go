@@ -43,7 +43,11 @@ type SubtreeWriteFlushFunc func(ctx context.Context, items []SubtreeWriteItem) e
 //
 // Flush triggers:
 //  1. Item count reaches maxBlocks*3 entries (3 items per block: tree + data + meta).
-//  2. Wall-clock time since the oldest pending item exceeds maxWait.
+//  2. Wall-clock time since the oldest pending item exceeds maxWait. This is a soft
+//     lower bound, not a strict upper bound: the timer ticks at maxWait/2, so the
+//     observed latency for a timer-triggered flush lies in [maxWait, 1.5*maxWait).
+//     Callers that need a hard upper bound should call Stop() or size maxWait with
+//     the tick tolerance in mind.
 //  3. Stop() is called — all pending items flushed before Stop returns.
 type SubtreeWriteBatcher struct {
 	maxItems int

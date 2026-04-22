@@ -460,10 +460,6 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 	if err != nil {
 		return errors.NewStorageError("[writeSubtree] serialize subtree data", err)
 	}
-	metaBytes, err := subtreeMetaData.Serialize()
-	if err != nil {
-		return errors.NewStorageError("[writeSubtree] serialize subtree meta", err)
-	}
 
 	dah := uint32(block.Height()) + sm.settings.GlobalBlockHeightRetention //nolint:gosec
 	treeRootHash := *subtree.RootHash()
@@ -474,11 +470,25 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 		treeFileType = fileformat.FileTypeSubtree
 	}
 
+	// Check meta existence before serialising — mirrors writeSubtreeDirect's
+	// "Always store subtree meta data" goroutine, which skips the work when the
+	// meta blob already exists (e.g. arrived via P2P or was created by block
+	// assembly). Skipping here saves a Serialize() allocation that would
+	// otherwise be held in the batcher buffer until flush.
+	metaExists, _ := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeMeta)
+
 	if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindTree, FileType: treeFileType, RootHash: treeRootHash, Bytes: subtreeBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
 		return err
 	}
 	if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindData, RootHash: dataRootHash, Bytes: dataBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
 		return err
+	}
+	if metaExists {
+		return nil
+	}
+	metaBytes, err := subtreeMetaData.Serialize()
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] serialize subtree meta", err)
 	}
 	return sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindMeta, RootHash: dataRootHash, Bytes: metaBytes, DeleteAt: dah, BlockHeight: block.Height()})
 }
