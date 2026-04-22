@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/util/livenessgate"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation/livenessgate"
 )
 
 // ShouldUseSubtreeOnlyPath returns true when block validation can safely skip

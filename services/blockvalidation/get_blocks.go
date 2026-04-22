@@ -16,8 +16,8 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation/livenessgate"
 	"github.com/bsv-blockchain/teranode/util"
-	"github.com/bsv-blockchain/teranode/util/livenessgate"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
@@ -213,13 +213,14 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 			// was minted, skip the catchup subtreeData pre-fetch — CheckBlockSubtrees
 			// downstream will pull subtree manifests on demand, and the local
 			// UTXO/TxMetaCache + per-tx fetch path handles the rest.
-			if livenessgate.ShouldUseSubtreeOnlyPath(
+			decision, _ := livenessgate.Decide(
 				ctx,
 				u.blockchainClient,
 				work.block.Hash(),
 				u.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes,
 				u.settings.SubtreeValidation.LivenessWindow,
-			) {
+			)
+			if decision == livenessgate.DecisionSubtreeOnly {
 				result := resultItem{
 					block: work.block,
 					index: work.index,

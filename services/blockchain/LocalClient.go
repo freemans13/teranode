@@ -20,11 +20,9 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/health"
-	"github.com/bsv-blockchain/teranode/util/livenessgate"
 )
 
 var _ ClientI = (*LocalClient)(nil)
-var _ livenessgate.Client = (*LocalClient)(nil)
 
 // LocalClient implements a blockchain client with direct store access.
 type LocalClient struct {

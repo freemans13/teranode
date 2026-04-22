@@ -1,12 +1,14 @@
-// Package livenessgate provides a shared, pure decision function used by
-// block validation and subtree validation to decide whether a block can
-// use the subtree-only path (skipping subtreeData downloads) based on
-// the age of its header's first-seen timestamp.
+// Package livenessgate provides the pure decision function for the
+// subtree-only validation path: whether a block can skip subtreeData
+// downloads based on the age of its header's first-seen timestamp.
+//
+// Shared between subtree validation (per-subtree gating in CheckBlockSubtrees)
+// and block validation (per-block gating for the catchup prefetch).
 //
 // The gate is an optimization enabled by SubtreeValidation.AssumeTxsBroadcastToAllNodes
 // when the operator trusts that peers broadcast transactions to all nodes. It is
-// never a correctness constraint — any fall-through returns false and the caller
-// uses the existing subtreeData path.
+// never a correctness constraint — any fall-through returns the subtreeData
+// decision and the caller uses the existing subtreeData path.
 package livenessgate
 
 import (
@@ -16,8 +18,8 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 )
 
-// Client is the narrow interface needed by ShouldUseSubtreeOnlyPath.
-// Both blockchain.ClientI and blockchain.LocalClient implement it by
+// Client is the narrow interface consumed by Decide. Both
+// blockchain.ClientI and blockchain.LocalClient implement it by
 // providing GetHeaderReceivedAt.
 type Client interface {
 	GetHeaderReceivedAt(ctx context.Context, hash *chainhash.Hash) (time.Time, bool, error)
@@ -61,9 +63,9 @@ func (d Decision) String() string {
 }
 
 // Decide is the single source of truth for the gate's decision. It returns
-// the resolved Decision plus any client error. Callers that only want the
-// boolean answer should use ShouldUseSubtreeOnlyPath; callers that also
-// want to emit metrics/logging use Decide directly.
+// the resolved Decision plus any client error. Callers compare the result
+// against DecisionSubtreeOnly for the boolean answer and use the Decision
+// value for metric labels / logging.
 //
 // The gate resolves to DecisionSubtreeOnly only when ALL of:
 //   - enabled is true (typically from SubtreeValidation.AssumeTxsBroadcastToAllNodes), AND
@@ -89,12 +91,4 @@ func Decide(ctx context.Context, client Client, blockHash *chainhash.Hash, enabl
 		return DecisionSubtreeData, nil
 	}
 	return DecisionSubtreeOnly, nil
-}
-
-// ShouldUseSubtreeOnlyPath returns true when block validation can safely
-// skip the subtreeData download for this block. It is a thin wrapper over
-// Decide for callers that do not need the decision reason.
-func ShouldUseSubtreeOnlyPath(ctx context.Context, client Client, blockHash *chainhash.Hash, enabled bool, window time.Duration) bool {
-	decision, _ := Decide(ctx, client, blockHash, enabled, window)
-	return decision == DecisionSubtreeOnly
 }
