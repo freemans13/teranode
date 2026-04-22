@@ -325,8 +325,22 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		quickValidationMode := legacyMode
 
 		// Lazily construct the subtree write batcher on the first catch-up block.
-		// Safety: prepareSubtrees is only ever called from the blockHandler goroutine
-		// (single-threaded block processing path), so no mutex is needed here.
+		//
+		// The batcher is gated on quickValidationMode for two reasons:
+		//   1. Reader durability contract: outside quick mode, CheckBlockSubtrees
+		//      reads each subtree file synchronously after writeSubtree returns.
+		//      Coalescing would leave the file in the batcher's in-memory buffer
+		//      when the reader asks for it. Quick mode skips that reader, so
+		//      there is no same-session consumer expecting immediate durability.
+		//   2. Memory footprint: writeSubtreeDirect streams payloads straight to
+		//      filestorer; the batcher must materialise each blob as []byte so
+		//      it can hold items across block boundaries. That's a bounded cost
+		//      for checkpoint-anchored historical catch-up, but an unbounded
+		//      liability on arbitrary-size tip blocks.
+		//
+		// Safety: prepareSubtrees is only ever called from the blockHandler
+		// goroutine (single-threaded block processing path), so no mutex is
+		// needed around the batcher pointer.
 		if quickValidationMode && sm.subtreeWriteBatcher == nil {
 			sm.subtreeWriteBatcher = NewSubtreeWriteBatcher(
 				sm.settings.Legacy.SubtreeWriteBatchBlocks,
@@ -382,12 +396,24 @@ func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, block *bsvutil
 	return nil
 }
 
-// writeSubtree dispatches to the batcher when active (catch-up), else writes synchronously.
+// writeSubtree dispatches subtree blob persistence to the batcher when it
+// is active, otherwise falls through to the synchronous writeSubtreeDirect
+// path.
+//
+// Only quickValidationMode blocks go through the batcher. In any other mode
+// (steady-state RUNNING, or catch-up blocks past the final checkpoint once
+// PR #723 lands) CheckBlockSubtrees reads each subtree file immediately
+// after this function returns, so the writes must be on disk synchronously;
+// and the direct path's streaming semantics avoid materialising
+// potentially-huge tip-block payloads in memory. See the comment on the
+// batcher construction in prepareSubtrees for the full rationale.
+//
+// When quickValidationMode flips to false mid-session (e.g. FSM transitions
+// out of catch-up and back to RUNNING), drain and retire the batcher so
+// subsequent blocks take the synchronous path with no lost items.
 func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,
 	subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta, quickValidationMode bool) error {
 	if !quickValidationMode && sm.subtreeWriteBatcher != nil {
-		// FSM transitioned out of catch-up mode; drain and retire the batcher so
-		// subsequent blocks take the synchronous writeSubtreeDirect path.
 		if err := sm.subtreeWriteBatcher.Stop(ctx); err != nil {
 			sm.logger.Errorf("[writeSubtree] draining SubtreeWriteBatcher on quickValidationMode transition: %v", err)
 		}
