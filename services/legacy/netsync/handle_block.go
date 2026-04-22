@@ -909,9 +909,9 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 		return errors.NewProcessingError("failed to extend transactions from txMap", err)
 	}
 
-	// Phase 2: for inputs whose parents are NOT same-block, batch the decoration into
-	// a single IN-clause DB query per chunk instead of issuing one per tx. For a
-	// 20k-tx block this collapses ~20k round-trips into O(N / maxINClauseSize).
+	// Phase 2: for inputs whose parents are NOT same-block, batch the decoration
+	// using the store's internal chunking instead of issuing one DB lookup per tx.
+	// For a 20k-tx block this collapses ~20k round-trips into roughly O(N / chunkSize).
 	//
 	// BatchPreviousOutputsDecorate skips inputs that already have PreviousTxScript set,
 	// so Phase 1's work is preserved. If it returns a processing/not-found error the
@@ -965,9 +965,11 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 			continue
 		}
 
-		g.Go(func() error {
-			txWrapper.SomeParentsInBlock = true
+		// Set SomeParentsInBlock synchronously (before the goroutine) to avoid a data race
+		// on txWrapper when multiple input goroutines detect an in-block parent.
+		txWrapper.SomeParentsInBlock = true
 
+		g.Go(func() error {
 			if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
 				return errors.NewProcessingError("tx %s input %d references invalid output index %d (parent %s has %d outputs)",
 					tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))

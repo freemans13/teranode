@@ -3718,21 +3718,18 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	}
 	results := make(map[outputKey]*outputInfo)
 
-	// maxINClauseSize bounds the total parameter count. Each pair contributes
-	// two parameters, so chunk size must be halved.
-	pairChunkSize := maxINClauseSize / 2
-	if pairChunkSize < 1 {
-		pairChunkSize = 1
-	}
-
-	for chunkStart := 0; chunkStart < len(pairs); chunkStart += pairChunkSize {
+	// maxINClauseSize (400 pairs) is already a safe bound: each pair contributes
+	// two parameters so this caps bind params at 800, under SQLite's 999 limit
+	// and well under Postgres' 65535. Halving would double DB round-trips for
+	// large batches and defeat the batching benefit.
+	for chunkStart := 0; chunkStart < len(pairs); chunkStart += maxINClauseSize {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		chunkEnd := chunkStart + pairChunkSize
+		chunkEnd := chunkStart + maxINClauseSize
 		if chunkEnd > len(pairs) {
 			chunkEnd = len(pairs)
 		}

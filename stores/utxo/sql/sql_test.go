@@ -2252,10 +2252,15 @@ func TestBuildCompositeINClause(t *testing.T) {
 	})
 }
 
-// TestPreviousOutputsDecorate_OnlyFetchesReferencedOutputs verifies A1: the SQL query
-// must filter by (hash, idx) composite, not fetch all outputs of each parent.
-// A parent tx with many outputs should only have the specific idx read back into memory.
-func TestPreviousOutputsDecorate_OnlyFetchesReferencedOutputs(t *testing.T) {
+// TestPreviousOutputsDecorate_DecoratesReferencedOutputValues verifies that
+// PreviousOutputsDecorate populates the referenced input with the expected
+// satoshis and script data from the stored parent transaction.
+//
+// Note: this is a functional decoration test only. It does not assert the
+// exact SQL shape or prove that unreferenced outputs were not also fetched;
+// see sql.go / buildCompositeINClause for the composite (hash,idx) filtering
+// behavior that bounds memory usage on data-carrier-heavy blocks.
+func TestPreviousOutputsDecorate_DecoratesReferencedOutputValues(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
