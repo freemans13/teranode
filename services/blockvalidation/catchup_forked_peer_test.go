@@ -18,9 +18,11 @@ import (
 // whether to try other peers. A peer on a dead fork can legitimately return
 // zero new headers while blockUpTo is still unknown to us — in that case we
 // must surface an error so the caller tries the next peer, not pretend we
-// are already synced.
+// are already synced. The local-existence check uses GetBlockExists, which is
+// a presence check against the blocks table (main chain and known off-chain
+// blocks both count as "known locally").
 func TestHandleNoNewHeaders(t *testing.T) {
-	t.Run("TargetInChainReturnsNil", func(t *testing.T) {
+	t.Run("TargetExistsLocallyReturnsNil", func(t *testing.T) {
 		ctx := context.Background()
 		server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
 		defer cleanup()
@@ -32,10 +34,10 @@ func TestHandleNoNewHeaders(t *testing.T) {
 			Return(true, nil)
 
 		err := server.handleNoNewHeaders(ctx, targetBlock)
-		require.NoError(t, err, "already-synced peer with target in our chain must return nil")
+		require.NoError(t, err, "already-synced peer with target known locally must return nil")
 	})
 
-	t.Run("TargetNotInChainReturnsError", func(t *testing.T) {
+	t.Run("TargetNotKnownLocallyReturnsError", func(t *testing.T) {
 		ctx := context.Background()
 		server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
 		defer cleanup()

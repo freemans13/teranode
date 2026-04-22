@@ -270,17 +270,22 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 // blockUpTo is unknown to us. Returning nil unconditionally would make the outer
 // peer-selection loop treat this as success and stop trying other peers, leaving the
 // node unable to sync past the announced block. Only treat it as "already synced"
-// when blockUpTo is actually in our chain; otherwise surface an error so the caller
-// moves on to the next peer.
+// when blockUpTo is known locally (present in our blocks table); otherwise surface
+// an error so the caller moves on to the next peer.
+//
+// Note: this uses GetBlockExists, which is a local-existence check — it returns true
+// for blocks on the main chain as well as for known off-chain (stale) blocks. That is
+// intentional here: if we already have the announced block in any form, we have at
+// least caught up to (or past) it and there is no value in asking another peer for it.
 func (u *Server) handleNoNewHeaders(ctx context.Context, blockUpTo *model.Block) error {
 	exists, err := u.blockchainClient.GetBlockExists(ctx, blockUpTo.Hash())
 	if err != nil {
-		return errors.NewProcessingError("[catchup][%s] peer returned no new headers and block existence check failed: %v", blockUpTo.Hash().String(), err)
+		return errors.NewProcessingError("[catchup][%s] peer returned no new headers and block existence check failed", blockUpTo.Hash().String(), err)
 	}
 	if !exists {
-		return errors.NewProcessingError("[catchup][%s] peer returned no new headers but target block is not in our chain - peer may be on a dead fork", blockUpTo.Hash().String())
+		return errors.NewProcessingError("[catchup][%s] peer returned no new headers but target block is not known locally - peer may be on a dead fork", blockUpTo.Hash().String())
 	}
-	u.logger.Infof("[catchup][%s] no new blocks to fetch - already synced", blockUpTo.Hash().String())
+	u.logger.Infof("[catchup][%s] no new blocks to fetch - target block already known locally", blockUpTo.Hash().String())
 	return nil
 }
 
