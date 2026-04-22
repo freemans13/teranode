@@ -949,12 +949,20 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		return errors.NewProcessingError("tx %s not found in txMap", tx.TxIDChainHash())
 	}
 
-	g := errgroup.Group{}
+	// Tie the errgroup to ctx so cancellation (either from the caller or from a
+	// sibling tx failing in the phase-1 outer errgroup) aborts spawning further
+	// per-input goroutines promptly.
+	g, gCtx := errgroup.WithContext(ctx)
 	// Limit goroutines to number of CPU cores to prevent scheduler thrashing
 	// This prevents spawning thousands of goroutines for transactions with many inputs
-	util.SafeSetLimit(&g, runtime.NumCPU()*2)
+	util.SafeSetLimit(g, runtime.NumCPU()*2)
 
 	for i, input := range tx.Inputs {
+		// Stop spawning new work if the context is already done.
+		if gCtx.Err() != nil {
+			break
+		}
+
 		i := i         // capture the loop variable
 		input := input // capture the input variable
 		prevTxHash := *input.PreviousTxIDChainHash()

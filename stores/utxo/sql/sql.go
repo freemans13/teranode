@@ -3573,7 +3573,8 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	}
 	results := make(map[outputKey]*outputInfo, len(pairs))
 
-	// Chunk in maxINClauseSize-sized batches; 400 pairs = 800 params, safely under pg's 65535 param limit.
+	// Chunk in maxINClauseSize-sized batches; 400 pairs = 800 params, safely
+	// under SQLite's default 999 variable limit (and well under Postgres' 65535).
 	for chunkStart := 0; chunkStart < len(pairs); chunkStart += maxINClauseSize {
 		select {
 		case <-ctx.Done():
