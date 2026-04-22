@@ -941,7 +941,9 @@ func (s *Store) sendCreateBatchSQL(batch []*batchCreateItem) {
 		for _, item := range batch {
 			if item.done != nil {
 				if lastLockErr != nil {
-					item.done <- batchCreateResult{Err: errors.NewStorageError(base+": %v", lastLockErr)}
+					// errors.New() pops the trailing error into the wrapped chain,
+					// so pass base (no %v) and let the wrapped error carry the detail.
+					item.done <- batchCreateResult{Err: errors.NewStorageError(base, lastLockErr)}
 				} else {
 					item.done <- batchCreateResult{Err: errors.NewStorageError(base)}
 				}
