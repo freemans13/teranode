@@ -54,6 +54,26 @@ type SubtreeWriteFlushFunc func(ctx context.Context, items []SubtreeWriteItem) e
 //     Callers that need a hard upper bound should call Stop() or size maxWait with
 //     the tick tolerance in mind.
 //  3. Stop() is called — all pending items flushed before Stop returns.
+//
+// Flush failure semantics (fail-fast by design):
+//
+// When flushFn returns an error, the in-flight batch is NOT requeued — the items
+// are dropped from the buffer and the error is surfaced to the caller via one of:
+//   - Submit() returns the error directly (count-threshold path).
+//   - The next Submit() or Stop() returns lastErr (timer path).
+//   - Stop() returns the final-flush error and/or lastErr.
+//
+// This is intentional. The caller (writeSubtree → prepareSubtrees → block
+// processing) treats any Submit/Stop error as a block-level failure and aborts
+// processing of the current block. The operator restarts catch-up from the last
+// valid block height. Requeueing failed items into b.buf would conflate the
+// rejected block's writes with the next block's writes and risk writing partial
+// per-block blob sets under a different block context, which is worse than
+// failing fast. Blind auto-retry of a persistent failure (disk full, permission
+// denied, etc.) would also grow b.buf unboundedly.
+//
+// This matches the pre-batcher behaviour: a single failed blob write aborted the
+// block; the batcher preserves that contract at the batch level.
 type SubtreeWriteBatcher struct {
 	maxItems int
 	maxWait  time.Duration
@@ -138,6 +158,10 @@ func (b *SubtreeWriteBatcher) Submit(ctx context.Context, item SubtreeWriteItem)
 
 	if toFlush != nil {
 		defer b.inflight.Done()
+		// Fail-fast: if flushFn errors, toFlush is intentionally NOT requeued.
+		// The caller aborts the current block and the operator restarts from the
+		// last valid block. See the type-level "Flush failure semantics" doc for
+		// why requeueing is worse than dropping here.
 		return b.flushFn(ctx, toFlush)
 	}
 	return nil
@@ -213,7 +237,9 @@ func (b *SubtreeWriteBatcher) timerLoop() {
 			b.mu.Unlock()
 			// Timer-path flushes are not tied to a caller context; use
 			// context.Background() and surface any error via lastErr for
-			// the next Submit/Stop to observe.
+			// the next Submit/Stop to observe. toFlush is intentionally NOT
+			// requeued on error — see the type-level "Flush failure
+			// semantics" doc for the rationale.
 			err := b.flushFn(context.Background(), toFlush)
 			b.inflight.Done()
 			if err != nil {
