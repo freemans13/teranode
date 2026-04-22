@@ -477,10 +477,10 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 	// otherwise be held in the batcher buffer until flush.
 	metaExists, _ := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeMeta)
 
-	if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindTree, FileType: treeFileType, RootHash: treeRootHash, Bytes: subtreeBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
+	if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindTree, FileType: treeFileType, RootHash: treeRootHash, Bytes: subtreeBytes, DeleteAt: dah}); err != nil {
 		return err
 	}
-	if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindData, RootHash: dataRootHash, Bytes: dataBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
+	if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindData, RootHash: dataRootHash, Bytes: dataBytes, DeleteAt: dah}); err != nil {
 		return err
 	}
 	if metaExists {
@@ -490,7 +490,7 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 	if err != nil {
 		return errors.NewStorageError("[writeSubtree] serialize subtree meta", err)
 	}
-	return sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindMeta, RootHash: dataRootHash, Bytes: metaBytes, DeleteAt: dah, BlockHeight: block.Height()})
+	return sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindMeta, RootHash: dataRootHash, Bytes: metaBytes, DeleteAt: dah})
 }
 
 func (sm *SyncManager) writeSubtreeDirect(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,

@@ -27,12 +27,11 @@ const (
 
 // SubtreeWriteItem is one enqueued blob write.
 type SubtreeWriteItem struct {
-	Kind        SubtreeKind
-	FileType    fileformat.FileType // resolved at Submit time; only meaningful for SubtreeKindTree (Data/Meta always map to fixed types inside the flush fn)
-	RootHash    [32]byte
-	Bytes       []byte
-	DeleteAt    uint32 // DAH passed through to options.WithDeleteAt
-	BlockHeight int32
+	Kind     SubtreeKind
+	FileType fileformat.FileType // resolved at Submit time; only meaningful for SubtreeKindTree (Data/Meta always map to fixed types inside the flush fn)
+	RootHash [32]byte
+	Bytes    []byte
+	DeleteAt uint32 // DAH passed through to options.WithDeleteAt
 }
 
 // SubtreeWriteFlushFunc is called with the accumulated items when a flush trigger fires.
@@ -42,7 +41,13 @@ type SubtreeWriteFlushFunc func(ctx context.Context, items []SubtreeWriteItem) e
 // SubtreeWriteBatcher accumulates blob-store write requests and flushes them in bulk.
 //
 // Flush triggers:
-//  1. Item count reaches maxBlocks*3 entries (3 items per block: tree + data + meta).
+//  1. Item count reaches maxItems (derived as maxBlocks*3 — tree + data + meta per
+//     block). Because meta may be omitted when the blob already exists (arrived via
+//     P2P / created by block assembly), a block may contribute only 2 items in
+//     practice, so maxItems is an *item* threshold and not a strict block-count
+//     threshold. The effective block count per flush can therefore lie in
+//     [maxBlocks, 1.5*maxBlocks]; this is acceptable because the purpose of the
+//     threshold is to bound buffer memory, not to flush on exact block boundaries.
 //  2. Wall-clock time since the oldest pending item exceeds maxWait. This is a soft
 //     lower bound, not a strict upper bound: the timer ticks at maxWait/2, so the
 //     observed latency for a timer-triggered flush lies in [maxWait, 1.5*maxWait).
@@ -68,7 +73,10 @@ type SubtreeWriteBatcher struct {
 
 // NewSubtreeWriteBatcher returns a running batcher. Call Stop() on shutdown to drain.
 //
-// maxBlocks is the block-count trigger; internally converted to 3×maxBlocks items.
+// maxBlocks sets the flush threshold; internally converted to 3×maxBlocks items
+// (3 is the maximum items-per-block at submit time: tree + data + meta). Because
+// meta is optional in practice, the actual block count per flush can exceed
+// maxBlocks — see the SubtreeWriteBatcher type doc.
 // logger is optional — pass nil to suppress timer-path error logging.
 func NewSubtreeWriteBatcher(maxBlocks int, maxWait time.Duration, logger batcherLogger, flushFn SubtreeWriteFlushFunc) *SubtreeWriteBatcher {
 	if maxBlocks < 1 {
