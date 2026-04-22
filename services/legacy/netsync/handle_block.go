@@ -338,10 +338,22 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		//      for checkpoint-anchored historical catch-up, but an unbounded
 		//      liability on arbitrary-size tip blocks.
 		//
+		// Additionally gated on SubtreeWriteBatchBlocks > 1: at the default
+		// batchBlocks=1 the batcher flushes after every block anyway (3 items =
+		// 1 block * 3), so we gain no cross-block coalescing — but we would
+		// still pay the cost of calling subtreeData.Serialize(), which can
+		// allocate ~10.9 GB for the largest historical blocks. writeSubtreeDirect
+		// streams subtreeData via WriteTransactionsToWriter and avoids that
+		// allocation. So at batchBlocks=1 we skip the batcher entirely and let
+		// writeSubtree dispatch straight to writeSubtreeDirect. The batcher is
+		// only constructed when operators explicitly opt in to cross-block
+		// coalescing (batchBlocks>1), in which case they have accepted the
+		// materialisation cost for the perf benefit.
+		//
 		// Safety: prepareSubtrees is only ever called from the blockHandler
 		// goroutine (single-threaded block processing path), so no mutex is
 		// needed around the batcher pointer.
-		if quickValidationMode && sm.subtreeWriteBatcher == nil {
+		if quickValidationMode && sm.subtreeWriteBatcher == nil && sm.settings.Legacy.SubtreeWriteBatchBlocks > 1 {
 			sm.subtreeWriteBatcher = NewSubtreeWriteBatcher(
 				sm.settings.Legacy.SubtreeWriteBatchBlocks,
 				sm.settings.Legacy.SubtreeWriteBatchWait,
@@ -429,19 +441,17 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 	}
 
 	// Note: the batched path pre-serializes each payload to []byte before submitting.
-	// writeSubtreeDirect streams to avoid large intermediate allocations for big blocks,
-	// but coalescing requires the full payload in memory so the batcher can submit it
-	// across block boundaries. The memory trade-off is bounded by the batch count
-	// (legacy_subtreeWriteBatchBlocks).
+	// writeSubtreeDirect streams to avoid large intermediate allocations for big blocks
+	// (subtreeData.Serialize() can produce a multi-GB buffer on the largest historical
+	// blocks), but coalescing requires the full payload in memory so the batcher can
+	// submit it across block boundaries. This memory cost is why the batcher is
+	// constructed only when SubtreeWriteBatchBlocks > 1 (see prepareSubtrees):
+	// operators opting in to cross-block coalescing accept the materialisation cost,
+	// while the default configuration (batchBlocks=1) bypasses the batcher entirely
+	// and goes through writeSubtreeDirect's streaming path.
 	//
-	// With the default legacy_subtreeWriteBatchBlocks=1, the batcher flushes
-	// synchronously once this block's three items (tree + data + meta) have all been
-	// Submit()ted — the last Submit crosses the 3-item threshold and triggers an
-	// in-line flush. That matches CheckBlockSubtrees' expectation that the subtree
-	// files are durable on disk before block validation reads them. Operators can
-	// raise the setting to coalesce writes across blocks, but only where the
-	// reader-side knows how to tolerate the resulting lag between Submit and
-	// durability (none of the current consumers do).
+	// The batched path must only be reached when batchBlocks>1; if sm.subtreeWriteBatcher
+	// is non-nil here, we trust prepareSubtrees' gating.
 	subtreeBytes, err := subtree.Serialize()
 	if err != nil {
 		return errors.NewStorageError("[writeSubtree] serialize subtree", err)

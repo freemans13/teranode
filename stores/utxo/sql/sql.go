@@ -3724,9 +3724,15 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	}
 	results := make(map[outputKey]*outputInfo)
 
-	// maxINClauseSize bounds the total parameter count. Each pair contributes
-	// two parameters, so chunk size must be halved.
-	pairChunkSize := maxINClauseSize / 2
+	// maxINClauseSize is the safe placeholder count for single-column IN
+	// clauses and leaves headroom under SQLite's default 999-variable limit.
+	// For this composite (hash, idx) IN query each pair contributes 2 parameters
+	// (so maxINClauseSize pairs = 800 params), and the query carries no other
+	// bound parameters — still within the SQLite limit with ~200 headroom. The
+	// extra parameter pressure is small enough that it is not worth halving the
+	// chunk size; doing so would double the number of chunked queries on large
+	// blocks. Use maxINClauseSize pairs directly.
+	pairChunkSize := maxINClauseSize
 	if pairChunkSize < 1 {
 		pairChunkSize = 1
 	}
