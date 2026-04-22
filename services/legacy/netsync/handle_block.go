@@ -467,44 +467,52 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 	// multi-GB buffer on the largest historical blocks. flushSubtreeWriteBatch
 	// is still defensive against ErrBlobAlreadyExists inside NewFileStorer, but
 	// catching it here avoids the allocation entirely.
+	// Context fields for every error in this path — mirrors the
+	// writeSubtreeDirect formatting so operators can trace a failing blob
+	// from a single log line.
+	blockHashStr := block.Hash().String()
+	blockHeight := block.Height()
+	subtreeRootStr := subtree.RootHash().String()
+	dataRootStr := dataRootHash.String()
+
 	treeExists, err := sm.subtreeStore.Exists(ctx, treeRootHash[:], treeFileType)
 	if err != nil {
-		return errors.NewStorageError("[writeSubtree] check subtree exists", err)
+		return errors.NewStorageError("[writeSubtree] check subtree exists: block_hash=%s block_height=%d subtree_root=%s file_type=%s", blockHashStr, blockHeight, subtreeRootStr, treeFileType, err)
 	}
 	dataExists, err := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeData)
 	if err != nil {
-		return errors.NewStorageError("[writeSubtree] check subtree data exists", err)
+		return errors.NewStorageError("[writeSubtree] check subtree data exists: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
 	}
 	metaExists, err := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeMeta)
 	if err != nil {
-		return errors.NewStorageError("[writeSubtree] check subtree meta exists", err)
+		return errors.NewStorageError("[writeSubtree] check subtree meta exists: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
 	}
 
 	if !treeExists {
 		subtreeBytes, err := subtree.Serialize()
 		if err != nil {
-			return errors.NewStorageError("[writeSubtree] serialize subtree", err)
+			return errors.NewStorageError("[writeSubtree] serialize subtree: block_hash=%s block_height=%d subtree_root=%s file_type=%s", blockHashStr, blockHeight, subtreeRootStr, treeFileType, err)
 		}
 		if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindTree, FileType: treeFileType, RootHash: treeRootHash, Bytes: subtreeBytes, DeleteAt: dah}); err != nil {
-			return err
+			return errors.NewStorageError("[writeSubtree] submit subtree: block_hash=%s block_height=%d subtree_root=%s file_type=%s", blockHashStr, blockHeight, subtreeRootStr, treeFileType, err)
 		}
 	}
 	if !dataExists {
 		dataBytes, err := subtreeData.Serialize()
 		if err != nil {
-			return errors.NewStorageError("[writeSubtree] serialize subtree data", err)
+			return errors.NewStorageError("[writeSubtree] serialize subtree data: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
 		}
 		if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindData, RootHash: dataRootHash, Bytes: dataBytes, DeleteAt: dah}); err != nil {
-			return err
+			return errors.NewStorageError("[writeSubtree] submit subtree data: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
 		}
 	}
 	if !metaExists {
 		metaBytes, err := subtreeMetaData.Serialize()
 		if err != nil {
-			return errors.NewStorageError("[writeSubtree] serialize subtree meta", err)
+			return errors.NewStorageError("[writeSubtree] serialize subtree meta: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
 		}
 		if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindMeta, RootHash: dataRootHash, Bytes: metaBytes, DeleteAt: dah}); err != nil {
-			return err
+			return errors.NewStorageError("[writeSubtree] submit subtree meta: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
 		}
 	}
 	return nil
