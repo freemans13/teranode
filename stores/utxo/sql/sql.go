@@ -216,9 +216,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	// Initialize create batcher — mirrors aerospike/aerospike.go storeBatcher setup.
-	// Batches individual Create() calls into a single pgx.SendBatch with N CTEs,
-	// reducing N network round-trips to 1. background=true because each CTE inserts
-	// a unique transaction hash — no row overlap, no deadlock risk between batches.
+	// Batches individual Create() calls for both engines: PostgreSQL uses a single
+	// pgx.SendBatch with N CTEs, while SQLite uses sendCreateBatchSQL with multi-row
+	// INSERTs. This reduces per-item round-trips/transaction overhead. background=true
+	// is safe because each batched item inserts a unique transaction hash — no row
+	// overlap, no deadlock risk between batches.
 	if tSettings.UtxoStore.StoreBatcherSize > 1 {
 		storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 		storeBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
@@ -932,30 +934,54 @@ type createBatchSuccess struct {
 // mirroring createWithRetry's behaviour.
 func (s *Store) sendCreateBatchSQL(batch []*batchCreateItem) {
 	const maxRetries = 3
+
+	var lastLockErr error
+
+	notifyLockErr := func(base string) {
+		for _, item := range batch {
+			if item.done != nil {
+				if lastLockErr != nil {
+					item.done <- batchCreateResult{Err: errors.NewStorageError(base+": %v", lastLockErr)}
+				} else {
+					item.done <- batchCreateResult{Err: errors.NewStorageError(base)}
+				}
+				item.done = nil
+			}
+		}
+	}
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		retry, retryable := s.trySendCreateBatchSQL(batch)
+		retry, retryable, err := s.trySendCreateBatchSQL(batch)
+		if err != nil {
+			lastLockErr = err
+		}
 		if !retry {
 			return
 		}
 		if !retryable || attempt == maxRetries {
-			for _, item := range batch {
-				if item.done != nil {
-					item.done <- batchCreateResult{Err: errors.NewStorageError("[Create] lock persisted after %d retries", maxRetries)}
-					item.done = nil
-				}
-			}
+			notifyLockErr(fmt.Sprintf("[Create] lock persisted after %d retries", maxRetries))
 			return
 		}
 		backoff := time.Duration(100<<attempt) * time.Millisecond // 100ms, 200ms, 400ms
-		s.logger.Warnf("[sendCreateBatchSQL] lock error on attempt %d, retrying in %v", attempt+1, backoff)
-		time.Sleep(backoff)
+		if lastLockErr != nil {
+			s.logger.Warnf("[sendCreateBatchSQL] lock error on attempt %d, retrying in %v: %v", attempt+1, backoff, lastLockErr)
+		} else {
+			s.logger.Warnf("[sendCreateBatchSQL] lock error on attempt %d, retrying in %v", attempt+1, backoff)
+		}
+		select {
+		case <-s.ctx.Done():
+			notifyLockErr(fmt.Sprintf("[Create] retry canceled while waiting to retry (context: %v)", s.ctx.Err()))
+			return
+		case <-time.After(backoff):
+		}
 	}
 }
 
 // trySendCreateBatchSQL attempts the batch once.
-// Returns (false, _) when all callers have been notified (success or permanent error).
-// Returns (true, true) when the whole batch should be retried due to a lock condition.
-func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryable bool) {
+// Returns (false, _, _) when all callers have been notified (success or permanent error).
+// Returns (true, true, err) when the whole batch should be retried due to a lock condition,
+// with err set to the underlying lock/busy error for logging and propagation.
+func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryable bool, retryErr error) {
 	// Phase 1: pre-compute per-item data. Items whose pre-compute fails are
 	// notified immediately and excluded from the SQL batch.
 	preps := make([]*preparedCreateSQL, 0, len(batch))
@@ -999,20 +1025,20 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		})
 	}
 	if len(preps) == 0 {
-		return false, false
+		return false, false, nil
 	}
 
 	// Phase 2: one BEGIN…COMMIT for the whole batch.
 	txn, err := s.db.Begin()
 	if err != nil {
 		if isLockError(err) {
-			return true, true
+			return true, true, err
 		}
 		for _, p := range preps {
 			p.item.done <- batchCreateResult{Err: errors.NewStorageError("failed to begin tx", err)}
 			p.item.done = nil
 		}
-		return false, false
+		return false, false, nil
 	}
 	defer func() { _ = txn.Rollback() }()
 
@@ -1036,13 +1062,13 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 	rows, err := txn.QueryContext(s.ctx, txSQL, txArgs...)
 	if err != nil {
 		if isLockError(err) {
-			return true, true
+			return true, true, err
 		}
 		for _, p := range preps {
 			p.item.done <- batchCreateResult{Err: errors.NewStorageError("bulk INSERT transactions failed", err)}
 			p.item.done = nil
 		}
-		return false, false
+		return false, false, nil
 	}
 	defer rows.Close()
 
@@ -1056,7 +1082,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 				p.item.done <- batchCreateResult{Err: errors.NewStorageError("scan RETURNING failed", err)}
 				p.item.done = nil
 			}
-			return false, false
+			return false, false, nil
 		}
 		var h chainhash.Hash
 		copy(h[:], hashBytes)
@@ -1067,7 +1093,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 			p.item.done <- batchCreateResult{Err: errors.NewStorageError("iterating RETURNING failed", err)}
 			p.item.done = nil
 		}
-		return false, false
+		return false, false, nil
 	}
 
 	// Phase 4: partition preps into successes (in RETURNING) and duplicates (not in RETURNING).
@@ -1088,43 +1114,43 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		if err := txn.Commit(); err != nil {
 			s.logger.Warnf("[Create] empty-batch commit failed: %v", err)
 		}
-		return false, false
+		return false, false, nil
 	}
 
 	// Phase 4a: inputs.
 	if err := s.bulkInsertInputs(s.ctx, txn, successes); err != nil {
 		if isLockError(err) {
-			return true, true
+			return true, true, err
 		}
 		for _, c := range successes {
 			c.prep.item.done <- batchCreateResult{Err: err}
 			c.prep.item.done = nil
 		}
-		return false, false
+		return false, false, nil
 	}
 
 	// Phase 4b: outputs.
 	if err := s.bulkInsertOutputs(s.ctx, txn, successes); err != nil {
 		if isLockError(err) {
-			return true, true
+			return true, true, err
 		}
 		for _, c := range successes {
 			c.prep.item.done <- batchCreateResult{Err: err}
 			c.prep.item.done = nil
 		}
-		return false, false
+		return false, false, nil
 	}
 
 	// Phase 4c: block_ids (only for items with MinedBlockInfos).
 	if err := s.bulkInsertBlockIDs(s.ctx, txn, successes); err != nil {
 		if isLockError(err) {
-			return true, true
+			return true, true, err
 		}
 		for _, c := range successes {
 			c.prep.item.done <- batchCreateResult{Err: err}
 			c.prep.item.done = nil
 		}
-		return false, false
+		return false, false, nil
 	}
 
 	// Phase 4d: conflicting_children (before commit, since we're in a transaction).
@@ -1132,13 +1158,13 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		if c.prep.txMeta != nil && c.prep.txMeta.Conflicting {
 			if conflictErr := s.updateParentConflictingChildren(s.ctx, c.transactionID, c.prep.tx, txn); conflictErr != nil {
 				if isLockError(conflictErr) {
-					return true, true
+					return true, true, conflictErr
 				}
 				for _, c2 := range successes {
 					c2.prep.item.done <- batchCreateResult{Err: conflictErr}
 					c2.prep.item.done = nil
 				}
-				return false, false
+				return false, false, nil
 			}
 		}
 	}
@@ -1146,13 +1172,13 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 	// Phase 5: commit.
 	if err := txn.Commit(); err != nil {
 		if isLockError(err) {
-			return true, true
+			return true, true, err
 		}
 		for _, c := range successes {
 			c.prep.item.done <- batchCreateResult{Err: errors.NewStorageError("batch commit failed", err)}
 			c.prep.item.done = nil
 		}
-		return false, false
+		return false, false, nil
 	}
 
 	// Notify successes.
@@ -1161,7 +1187,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		c.prep.item.done = nil
 	}
 
-	return false, false
+	return false, false, nil
 }
 
 // bulkInsertInputs writes all inputs for every tx in successes via chunked
@@ -1198,10 +1224,11 @@ func (s *Store) bulkInsertInputs(ctx context.Context, txn *sql.Tx, successes []c
 		for _, r := range chunk {
 			args = append(args, r...)
 		}
-		// isCoinbase attribution is best-effort for multi-tx chunks; use the first row's tx.
-		chunkIsCoinbase := successes[0].prep.isCoinbase
+		// inputs has no unique constraint, so classifyInsertError's TxExists branch
+		// cannot fire here. Pass false for isCoinbase — the flag is only meaningful
+		// in the TxExists message.
 		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
-			return classifyInsertError(err, chunkIsCoinbase, "input")
+			return classifyInsertError(err, false, "input")
 		}
 	}
 	return nil
@@ -1254,10 +1281,11 @@ func (s *Store) bulkInsertOutputs(ctx context.Context, txn *sql.Tx, successes []
 		for _, r := range chunk {
 			args = append(args, r...)
 		}
-		// isCoinbase attribution is best-effort for multi-tx chunks; use the first row's tx.
-		chunkIsCoinbase := successes[0].prep.isCoinbase
+		// outputs has no unique constraint, so classifyInsertError's TxExists branch
+		// cannot fire here. Pass false for isCoinbase — the flag is only meaningful
+		// in the TxExists message.
 		if _, err := txn.ExecContext(ctx, q, args...); err != nil {
-			return classifyInsertError(err, chunkIsCoinbase, "output")
+			return classifyInsertError(err, false, "output")
 		}
 	}
 	return nil
