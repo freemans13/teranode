@@ -3736,8 +3736,8 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		}
 		chunk := pairs[chunkStart:chunkEnd]
 
-		// Inline composite-IN construction keeps this function standalone;
-		// mirrors the pattern used in PreviousOutputsDecorate above.
+		// Build a composite (t.hash, o.idx) IN clause inline here to keep this
+		// function standalone.
 		placeholders := make([]string, len(chunk))
 		args := make([]interface{}, 0, len(chunk)*2)
 		for i, p := range chunk {

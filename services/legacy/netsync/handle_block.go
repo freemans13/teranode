@@ -920,10 +920,9 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 	outpointBatcherSize := sm.settings.Legacy.OutpointBatcherSize
 
 	// Phase 1: populate inputs whose parents are same-block transactions. These are
-	// served from the in-memory txMap, so no DB work is needed here. We run per-tx
-	// goroutines (bounded by OutpointBatcherSize) because each tx's own inputs are
-	// populated independently and may need to wait for a same-block parent to finish
-	// being extended first.
+	// served directly from the in-memory txMap, so no DB work is needed here. We run
+	// per-tx goroutines (bounded by OutpointBatcherSize) because each transaction's
+	// inputs can be populated independently from txMap lookups.
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, outpointBatcherSize)
 

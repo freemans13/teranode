@@ -467,19 +467,19 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 func (u *Server) findLocalSubtreeFile(ctx context.Context, subtreeHash chainhash.Hash) (fileformat.FileType, bool, error) {
 	exists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 	if err != nil {
-		return "", false, err
+		return fileformat.FileTypeUnknown, false, err
 	}
 	if exists {
 		return fileformat.FileTypeSubtreeToCheck, true, nil
 	}
 	exists, err = u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
 	if err != nil {
-		return "", false, err
+		return fileformat.FileTypeUnknown, false, err
 	}
 	if exists {
 		return fileformat.FileTypeSubtree, true, nil
 	}
-	return "", false, nil
+	return fileformat.FileTypeUnknown, false, nil
 }
 
 // extractAndCollectTransactions extracts all transactions from a subtree's data file
