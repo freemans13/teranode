@@ -1138,7 +1138,7 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		id, inReturning := hashToID[*p.txHash]
 		if !inReturning {
 			// Hash already existed on disk before this batch — safe to notify now.
-			p.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", p.isCoinbase)}
+			p.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (hash=%s, coinbase=%v)", p.txHash.String(), p.isCoinbase)}
 			p.item.done = nil
 			continue
 		}
@@ -1250,10 +1250,10 @@ func (s *Store) trySendCreateBatchSQL(batch []*batchCreateItem) (retry, retryabl
 		c.prep.item.done <- batchCreateResult{Data: c.prep.txMeta}
 		c.prep.item.done = nil
 	}
-	for _, group := range followersByHash {
+	for txHash, group := range followersByHash {
 		for _, f := range group {
 			if f.item.done != nil {
-				f.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", f.isCoinbase)}
+				f.item.done <- batchCreateResult{Err: errors.NewTxExistsError("Transaction already exists in sqlite store (hash=%s, coinbase=%v)", txHash.String(), f.isCoinbase)}
 				f.item.done = nil
 			}
 		}
