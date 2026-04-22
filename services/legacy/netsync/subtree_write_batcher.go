@@ -56,7 +56,8 @@ type SubtreeWriteBatcher struct {
 	oldest    time.Time
 	stopCh    chan struct{}
 	stopped   bool
-	wg        sync.WaitGroup
+	wg        sync.WaitGroup // timer goroutine
+	inflight  sync.WaitGroup // tracks all in-progress flushFn invocations (Submit, timerLoop, Stop)
 	lastErrMu sync.Mutex
 	lastErr   error
 }
@@ -94,7 +95,9 @@ func (b *SubtreeWriteBatcher) takeLastErr() error {
 }
 
 // Submit queues one write. May trigger a synchronous flush on count threshold.
-func (b *SubtreeWriteBatcher) Submit(item SubtreeWriteItem) error {
+// The provided ctx is forwarded to flushFn for any flush triggered by this call
+// (count-threshold flushes only — timer-path flushes use context.Background()).
+func (b *SubtreeWriteBatcher) Submit(ctx context.Context, item SubtreeWriteItem) error {
 	if err := b.takeLastErr(); err != nil {
 		return err
 	}
@@ -114,20 +117,26 @@ func (b *SubtreeWriteBatcher) Submit(item SubtreeWriteItem) error {
 		toFlush = b.buf
 		b.buf = nil
 	}
+	// Reserve an inflight slot under the mutex so Stop() (which sets b.stopped
+	// and then waits on b.inflight) cannot race past us before we call flushFn.
+	if toFlush != nil {
+		b.inflight.Add(1)
+	}
 	b.mu.Unlock()
 
 	if toFlush != nil {
-		return b.flushFn(context.Background(), toFlush)
+		defer b.inflight.Done()
+		return b.flushFn(ctx, toFlush)
 	}
 	return nil
 }
 
 // Stop drains and shuts down. Returns the error from the final flush, if any.
+// Stop waits for every in-flight flush (count-threshold from Submit, timer-path
+// from timerLoop, and the final pending flush here) before returning, so the
+// "all pending items flushed before Stop returns" contract holds even if a
+// Submit-triggered flush is racing with Stop.
 func (b *SubtreeWriteBatcher) Stop(ctx context.Context) error {
-	if err := b.takeLastErr(); err != nil {
-		return err
-	}
-
 	b.mu.Lock()
 	if b.stopped {
 		b.mu.Unlock()
@@ -139,10 +148,31 @@ func (b *SubtreeWriteBatcher) Stop(ctx context.Context) error {
 	close(b.stopCh)
 	b.mu.Unlock()
 
+	// Wait for the timer goroutine to exit first so it cannot start a new flush
+	// after we've decided to drain.
 	b.wg.Wait()
 
+	var finalErr error
 	if len(pending) > 0 {
-		return b.flushFn(ctx, pending)
+		b.inflight.Add(1)
+		finalErr = b.flushFn(ctx, pending)
+		b.inflight.Done()
+	}
+
+	// Wait for any flush triggered by a Submit call that observed !stopped
+	// before we flipped the flag.
+	b.inflight.Wait()
+
+	// Surface any timer-path flush error captured during shutdown. Prefer the
+	// final pending flush error if both are set, since the pending batch is
+	// what the caller most directly relied on being persisted.
+	if finalErr != nil {
+		// Clear any captured timer error so it isn't returned by a future Stop.
+		_ = b.takeLastErr()
+		return finalErr
+	}
+	if err := b.takeLastErr(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -167,8 +197,14 @@ func (b *SubtreeWriteBatcher) timerLoop() {
 			}
 			toFlush := b.buf
 			b.buf = nil
+			b.inflight.Add(1)
 			b.mu.Unlock()
-			if err := b.flushFn(context.Background(), toFlush); err != nil {
+			// Timer-path flushes are not tied to a caller context; use
+			// context.Background() and surface any error via lastErr for
+			// the next Submit/Stop to observe.
+			err := b.flushFn(context.Background(), toFlush)
+			b.inflight.Done()
+			if err != nil {
 				if b.logger != nil {
 					b.logger.Errorf("[SubtreeWriteBatcher] timer flush failed: %v", err)
 				}

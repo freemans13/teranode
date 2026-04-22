@@ -414,10 +414,15 @@ func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, block *bsvutil
 func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,
 	subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta, quickValidationMode bool) error {
 	if !quickValidationMode && sm.subtreeWriteBatcher != nil {
-		if err := sm.subtreeWriteBatcher.Stop(ctx); err != nil {
-			sm.logger.Errorf("[writeSubtree] draining SubtreeWriteBatcher on quickValidationMode transition: %v", err)
-		}
+		err := sm.subtreeWriteBatcher.Stop(ctx)
 		sm.subtreeWriteBatcher = nil
+		if err != nil {
+			// Fail fast: if the drain failed there may be buffered subtree
+			// items that never made it to disk, and subsequent validation
+			// readers would see missing blobs. Surface the error instead
+			// of silently falling through to the direct path.
+			return errors.NewStorageError("[writeSubtree] draining SubtreeWriteBatcher on quickValidationMode transition", err)
+		}
 	}
 	if sm.subtreeWriteBatcher == nil {
 		return sm.writeSubtreeDirect(ctx, block, subtree, subtreeData, subtreeMetaData, quickValidationMode)
@@ -459,13 +464,13 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 		treeFileType = fileformat.FileTypeSubtree
 	}
 
-	if err := sm.subtreeWriteBatcher.Submit(SubtreeWriteItem{Kind: SubtreeKindTree, FileType: treeFileType, RootHash: treeRootHash, Bytes: subtreeBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
+	if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindTree, FileType: treeFileType, RootHash: treeRootHash, Bytes: subtreeBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
 		return err
 	}
-	if err := sm.subtreeWriteBatcher.Submit(SubtreeWriteItem{Kind: SubtreeKindData, RootHash: dataRootHash, Bytes: dataBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
+	if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindData, RootHash: dataRootHash, Bytes: dataBytes, DeleteAt: dah, BlockHeight: block.Height()}); err != nil {
 		return err
 	}
-	return sm.subtreeWriteBatcher.Submit(SubtreeWriteItem{Kind: SubtreeKindMeta, RootHash: dataRootHash, Bytes: metaBytes, DeleteAt: dah, BlockHeight: block.Height()})
+	return sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindMeta, RootHash: dataRootHash, Bytes: metaBytes, DeleteAt: dah, BlockHeight: block.Height()})
 }
 
 func (sm *SyncManager) writeSubtreeDirect(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,
@@ -1119,9 +1124,14 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 			continue
 		}
 
-		g.Go(func() error {
-			txWrapper.SomeParentsInBlock = true
+		// Mark synchronously here (before launching the goroutine) so concurrent
+		// goroutines for sibling inputs don't race on this write. All writers
+		// set it to the same value (true), but per the Go memory model an
+		// unsynchronised write concurrent with another read/write is still a
+		// data race that -race will trip.
+		txWrapper.SomeParentsInBlock = true
 
+		g.Go(func() error {
 			// Parent's Outputs are populated at wire-parse time and never mutated
 			// afterwards, so we can read them immediately without waiting for the
 			// parent tx itself to finish being extended. The old implementation
