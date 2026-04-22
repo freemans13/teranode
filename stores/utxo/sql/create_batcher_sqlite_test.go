@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,4 +127,67 @@ func TestSharedSuite_SQLite_Batched(t *testing.T) {
 		_ = store.Delete(ctx, tests.TXHash)
 		tests.Conflicting(t, store)
 	})
+}
+
+// TestCreateBatcher_SQLite_LargeBatch is a regression test for the SQLite
+// bind-parameter limit (SQLITE_MAX_VARIABLE_NUMBER, default 999). The
+// transactions INSERT uses 10 columns per row, so a single-statement
+// multi-row INSERT of ≥100 rows emits ≥1000 bind parameters and fails with
+// "too many SQL variables" unless the Phase 3 INSERT is chunked.
+//
+// Uses a batcher large enough that 128 concurrent Creates land in a single
+// batch (flushed on size, not on timeout), exercising the chunked code path.
+func TestCreateBatcher_SQLite_LargeBatch(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.BatcherDrainMode = true
+	tSettings.UtxoStore.StoreBatcherSize = 128
+	// Long duration so the batch only flushes when full — we want all 128
+	// items in one batch so the single-INSERT chunking path runs.
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5000
+
+	storeURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	store, err := New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+	require.NotNil(t, store.createBatcher)
+
+	const n = 128
+	txs := make([]*bt.Tx, n)
+	for i := 0; i < n; i++ {
+		tx := bt.NewTx()
+		// Unique satoshi amount per tx → unique txid.
+		require.NoError(t, tx.AddP2PKHOutputFromAddress(
+			"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", uint64(1000+i))) //nolint:gosec
+		txs[i] = tx
+	}
+
+	// Submit all creates concurrently so they queue into a single batch.
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(tx *bt.Tx) {
+			defer wg.Done()
+			_, cerr := store.Create(ctx, tx, 1000)
+			errCh <- cerr
+		}(txs[i])
+	}
+	wg.Wait()
+	close(errCh)
+
+	for cerr := range errCh {
+		require.NoError(t, cerr, "Create should succeed for all txs in a large batch (chunked INSERT path)")
+	}
+
+	// Spot-check a few txs are retrievable.
+	for _, idx := range []int{0, n / 2, n - 1} {
+		meta, gerr := store.Get(ctx, txs[idx].TxIDChainHash())
+		require.NoError(t, gerr)
+		require.NotNil(t, meta)
+	}
 }
