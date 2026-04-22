@@ -3716,8 +3716,9 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	}
 	results := make(map[outputKey]*outputInfo)
 
-	// maxINClauseSize bounds the total parameter count. Each pair contributes
-	// two parameters, so chunk size must be halved.
+	// maxINClauseSize is the per-IN-clause placeholder limit derived from the
+	// database bind-parameter cap. Each (hash, idx) pair uses two parameters,
+	// so each chunk can contain at most maxINClauseSize/2 composite tuples.
 	pairChunkSize := maxINClauseSize / 2
 	if pairChunkSize < 1 {
 		pairChunkSize = 1

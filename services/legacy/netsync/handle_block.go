@@ -272,14 +272,22 @@ type TxMapWrapper struct {
 //   - belowFinalCheckpoint: the block being validated is at or below the
 //     chain's final hardcoded checkpoint height. When true, the headers-first
 //     chain guarantees subtree-content integrity and skipping subtree-level
-//     validation is safe. Above the final checkpoint (or when checkpoints are
-//     disabled) no such anchor exists and full subtree validation is required.
+//     validation is safe. The caller forces belowFinalCheckpoint=false when
+//     the operator passed --nocheckpoints (see prepareSubtrees) so no
+//     checkpoint anchor is asserted in that mode.
 //
 // CATCHINGBLOCKS activation additionally requires belowFinalCheckpoint so the
 // checkpoint-anchor safety argument matches LEGACYSYNCING. There is no
 // override for running quickValidationMode past the final checkpoint: subtree
 // validation on tip blocks protects against malicious or forked peers and
 // must not be skipped.
+//
+// LEGACYSYNCING does not re-check belowFinalCheckpoint here. Entering that
+// state already implies bsvd's headers-first checkpoint-anchored sync, which
+// is gated at startup by Config.DisableCheckpoints in manager.go (no
+// nextCheckpoint is set and headers-first mode never activates when
+// checkpoints are disabled), so the "no anchor without checkpoints" guard is
+// applied upstream rather than inside this helper.
 func shouldUseQuickValidationMode(inLegacySync, inCatchingBlocks, belowFinalCheckpoint bool) bool {
 	if inLegacySync {
 		return true
@@ -1027,9 +1035,25 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 			// a deadlock under the two-phase flow in extendTransactions, where a
 			// pure-non-local-parent tx only becomes "extended" after phase 2 runs.
 			//
+			// Validate the previous-output index is in range and the output/script
+			// are non-nil before dereferencing, so a malformed/hostile block
+			// returns a processing error instead of panicking with a slice OOB.
+			if prevTxWrapper.Tx == nil {
+				return errors.NewProcessingError("failed to extend transaction %s: previous transaction %s is missing", tx.TxIDChainHash(), prevTxHash)
+			}
+
+			if int(input.PreviousTxOutIndex) >= len(prevTxWrapper.Tx.Outputs) {
+				return errors.NewProcessingError("failed to extend transaction %s: previous output index %d out of range for transaction %s (outputs=%d)", tx.TxIDChainHash(), input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+			}
+
+			prevOutput := prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex]
+			if prevOutput == nil || prevOutput.LockingScript == nil {
+				return errors.NewProcessingError("failed to extend transaction %s: previous output %d is nil or has nil locking script for transaction %s", tx.TxIDChainHash(), input.PreviousTxOutIndex, prevTxHash)
+			}
+
 			// No lock needed — each goroutine writes to a unique input index.
-			tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
-			tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
+			tx.Inputs[i].PreviousTxSatoshis = prevOutput.Satoshis
+			tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevOutput.LockingScript)
 
 			return nil
 		})
