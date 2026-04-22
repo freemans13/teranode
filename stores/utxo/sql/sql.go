@@ -3546,11 +3546,19 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 		return nil
 	}
 
-	// Collect unique (parent_hash, idx) pairs needed for decoration (A1 composite IN).
+	// Collect unique composite (parent_hash, idx) pairs needed for decoration.
 	// A valid tx won't reference the same outpoint twice, but dedup defensively
 	// so we don't waste bind params / chunks on malformed input; also matches
 	// BatchPreviousOutputsDecorate's shape.
-	pairs := make([]outpointPair, 0, len(needsByParent))
+	//
+	// Preallocate to an upper bound on pairs (sum of all refs across parents).
+	// Post-dedup the slice may be smaller, but this keeps append() from growing
+	// the backing array for whole-block-sized input sets.
+	pairCap := 0
+	for _, refs := range needsByParent {
+		pairCap += len(refs)
+	}
+	pairs := make([]outpointPair, 0, pairCap)
 	for parentHash, refs := range needsByParent {
 		// Hoist the hash copy outside the inner loop so each parent's array
 		// escapes once, not once per unique referenced output.
@@ -3732,7 +3740,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		hash chainhash.Hash
 		idx  uint32
 	}
-	results := make(map[outputKey]*outputInfo)
+	results := make(map[outputKey]*outputInfo, len(pairs))
 
 	// maxINClauseSize (400 pairs) is already a safe bound: each pair contributes
 	// two parameters so this caps bind params at 800, under SQLite's 999 limit
@@ -4945,7 +4953,8 @@ type outpointPair struct {
 	idx  uint32
 }
 
-// buildCompositeINClause generates a VALUES-style composite IN clause for a set of (hash, idx) pairs.
+// buildCompositeINClause generates a composite row-tuple list for use in an IN clause
+// for a set of (hash, idx) pairs.
 // startIdx is the 1-based parameter index for the first placeholder ($startIdx, $startIdx+1, ...).
 // Returns the clause string like "(($3,$4),($5,$6))" and the args slice.
 // For empty input, returns ("", nil).

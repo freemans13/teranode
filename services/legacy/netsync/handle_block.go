@@ -953,22 +953,17 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		return errors.NewProcessingError("tx %s not found in txMap", tx.TxIDChainHash())
 	}
 
-	// Tie the errgroup to ctx so cancellation (either from the caller or from a
-	// sibling tx failing in the phase-1 outer errgroup) aborts spawning further
-	// per-input goroutines promptly.
-	g, gCtx := errgroup.WithContext(ctx)
-	// Limit goroutines to number of CPU cores to prevent scheduler thrashing
-	// This prevents spawning thousands of goroutines for transactions with many inputs
-	util.SafeSetLimit(g, runtime.NumCPU()*2)
-
+	// The per-input work here is trivial (bounds check + two field assignments),
+	// and extendTransactions already parallelises across transactions up to
+	// Legacy.OutpointBatcherSize (default 1024). Spawning another goroutine per
+	// input would multiply concurrency into the tens of thousands for large
+	// blocks with negligible wall-clock benefit. Process inputs synchronously.
 	for i, input := range tx.Inputs {
-		// Stop spawning new work if the context is already done.
-		if gCtx.Err() != nil {
-			break
+		// Honour caller-initiated cancellation between inputs.
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
-		i := i         // capture the loop variable
-		input := input // capture the input variable
 		prevTxHash := *input.PreviousTxIDChainHash()
 
 		prevTxWrapper, found := txMap.Get(prevTxHash)
@@ -977,34 +972,25 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 			continue
 		}
 
-		// Set SomeParentsInBlock synchronously (before the goroutine) to avoid a data race
-		// on txWrapper when multiple input goroutines detect an in-block parent.
+		// Flag the child tx as having at least one in-block parent (used by
+		// downstream bookkeeping). Safe to set repeatedly from this single
+		// goroutine.
 		txWrapper.SomeParentsInBlock = true
 
-		g.Go(func() error {
-			if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
-				return errors.NewProcessingError("tx %s input %d references invalid output index %d (parent %s has %d outputs)",
-					tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
-			}
+		if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
+			return errors.NewProcessingError("tx %s input %d references invalid output index %d (parent %s has %d outputs)",
+				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+		}
 
-			// Parent's Outputs are populated at wire-parse time and never mutated
-			// afterwards, so we can read them immediately without waiting for the
-			// parent tx itself to finish being extended. The old implementation
-			// polled on prevTxWrapper.Tx.IsExtended(); that was unnecessary
-			// (IsExtended checks the parent's *inputs*, not its outputs) and caused
-			// a deadlock under the two-phase flow in extendTransactions, where a
-			// pure-non-local-parent tx only becomes "extended" after phase 2 runs.
-			//
-			// No lock needed — each goroutine writes to a unique input index.
-			tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
-			tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
-
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		return errors.NewProcessingError("failed to extend transaction %s", tx.TxIDChainHash(), err)
+		// Parent's Outputs are populated at wire-parse time and never mutated
+		// afterwards, so we can read them immediately without waiting for the
+		// parent tx itself to finish being extended. The old implementation
+		// polled on prevTxWrapper.Tx.IsExtended(); that was unnecessary
+		// (IsExtended checks the parent's *inputs*, not its outputs) and caused
+		// a deadlock under the two-phase flow in extendTransactions, where a
+		// pure-non-local-parent tx only becomes "extended" after phase 2 runs.
+		tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
+		tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
 	}
 
 	return nil
