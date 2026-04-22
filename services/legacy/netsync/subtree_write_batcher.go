@@ -35,7 +35,13 @@ type SubtreeWriteItem struct {
 }
 
 // SubtreeWriteFlushFunc is called with the accumulated items when a flush trigger fires.
-// Implementations must be resilient: a single item's failure must not silently skip others in the batch.
+//
+// Implementations must not silently skip items: every item in the batch must be
+// either attempted or explicitly accounted for. Fail-fast cancellation of
+// sibling item writes on a first error is acceptable (and matches the
+// block-level fail-fast semantics in "Flush failure semantics" below): any
+// returned error aborts the enclosing block, and the operator restarts
+// catch-up — partial siblings are not expected to be preserved.
 type SubtreeWriteFlushFunc func(ctx context.Context, items []SubtreeWriteItem) error
 
 // SubtreeWriteBatcher accumulates blob-store write requests and flushes them in bulk.
@@ -100,6 +106,13 @@ type SubtreeWriteBatcher struct {
 // maxBlocks — see the SubtreeWriteBatcher type doc.
 // logger is optional — pass nil to suppress timer-path error logging.
 func NewSubtreeWriteBatcher(maxBlocks int, maxWait time.Duration, logger batcherLogger, flushFn SubtreeWriteFlushFunc) *SubtreeWriteBatcher {
+	if flushFn == nil {
+		// Fail loudly at construction rather than at first flush. A nil flushFn
+		// is always a programming error — there is no sensible default behaviour
+		// for "discard all pending writes", so constructing the batcher is
+		// unsafe and any Submit would silently lose data on first flush.
+		panic("netsync: NewSubtreeWriteBatcher requires a non-nil flushFn")
+	}
 	if maxBlocks < 1 {
 		maxBlocks = 1
 	}

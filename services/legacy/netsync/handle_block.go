@@ -689,6 +689,11 @@ func (sm *SyncManager) flushSubtreeWriteBatch(ctx context.Context, items []Subtr
 	for _, item := range items {
 		item := item
 		g.Go(func() error {
+			// rootHash is formatted once per item and used as a stable, searchable
+			// identifier in every error message so operators can grep logs for the
+			// failing blob without cross-referencing batch offsets.
+			rootHash := chainhash.Hash(item.RootHash).String()
+
 			var fileType fileformat.FileType
 			switch item.Kind {
 			case SubtreeKindTree:
@@ -700,14 +705,14 @@ func (sm *SyncManager) flushSubtreeWriteBatch(ctx context.Context, items []Subtr
 				// (e.g., created by block assembly via P2P).
 				exists, err := sm.subtreeStore.Exists(gCtx, item.RootHash[:], fileformat.FileTypeSubtreeMeta)
 				if err != nil {
-					return errors.NewStorageError("flushSubtreeWriteBatch: check meta exists", err)
+					return errors.NewStorageError("flushSubtreeWriteBatch: check meta exists (kind=%d hash=%s)", item.Kind, rootHash, err)
 				}
 				if exists {
 					return nil
 				}
 				fileType = fileformat.FileTypeSubtreeMeta
 			default:
-				return errors.NewProcessingError("flushSubtreeWriteBatch: unknown SubtreeKind %d", item.Kind)
+				return errors.NewProcessingError("flushSubtreeWriteBatch: unknown SubtreeKind %d (hash=%s)", item.Kind, rootHash)
 			}
 
 			storer, err := filestorer.NewFileStorer(
@@ -719,19 +724,19 @@ func (sm *SyncManager) flushSubtreeWriteBatch(ctx context.Context, items []Subtr
 				if errors.Is(err, errors.ErrBlobAlreadyExists) {
 					return nil
 				}
-				return errors.NewStorageError("flushSubtreeWriteBatch: create file", err)
+				return errors.NewStorageError("flushSubtreeWriteBatch: create file (kind=%d type=%s hash=%s)", item.Kind, fileType, rootHash, err)
 			}
 			var ok bool
 			defer func() {
 				if !ok {
-					storer.Abort(errors.NewProcessingError("flushSubtreeWriteBatch: write aborted"))
+					storer.Abort(errors.NewProcessingError("flushSubtreeWriteBatch: write aborted (kind=%d type=%s hash=%s)", item.Kind, fileType, rootHash))
 				}
 			}()
 			if _, err := storer.Write(item.Bytes); err != nil {
-				return errors.NewStorageError("flushSubtreeWriteBatch: write", err)
+				return errors.NewStorageError("flushSubtreeWriteBatch: write (kind=%d type=%s hash=%s)", item.Kind, fileType, rootHash, err)
 			}
 			if err := storer.Close(gCtx); err != nil {
-				return errors.NewStorageError("flushSubtreeWriteBatch: close", err)
+				return errors.NewStorageError("flushSubtreeWriteBatch: close (kind=%d type=%s hash=%s)", item.Kind, fileType, rootHash, err)
 			}
 			ok = true
 			return nil
