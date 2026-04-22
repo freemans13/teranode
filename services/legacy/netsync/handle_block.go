@@ -1088,9 +1088,11 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 }
 
 // extendFromTxMap populates a transaction's inputs whose parents are in the same
-// block (available via txMap). It waits up to 120 seconds for each same-block parent
-// to be fully extended itself, which is necessary because child and parent may be
-// processed by different goroutines in the enclosing errgroup.
+// block (available via txMap). Same-block parent outputs are read directly from
+// the parent's Tx.Outputs without waiting for the parent transaction to become
+// fully extended — parent Outputs are populated at wire-parse time and are not
+// mutated during input extension, so the read is safe regardless of whether the
+// parent's own inputs have been decorated yet.
 //
 // Inputs whose parents are not in txMap are left for a later bulk DB lookup (see
 // extendTransactions phase 2).
