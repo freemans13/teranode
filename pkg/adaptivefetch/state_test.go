@@ -112,3 +112,32 @@ func TestRecord_PessStays_WhenHitRateBelowThreshold(t *testing.T) {
 	s.Record(Observation{TotalTxs: 1000, LocalHits: 950, Mode: ModePessimistic})
 	require.Equal(t, ModePessimistic, s.Mode())
 }
+
+func TestRecord_OptToPess_SingleBadBlockTrips(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeOptimistic,
+	}, "test")
+	require.NoError(t, err)
+	require.Equal(t, ModeOptimistic, s.Mode())
+
+	s.Record(Observation{TotalTxs: 10000, LocalHits: 9800, MissingFetches: 200, Mode: ModeOptimistic})
+	require.Equal(t, ModePessimistic, s.Mode(), "single block with 200 misses must trip immediately")
+}
+
+func TestRecord_OptStays_WhenMissesBelowSingleBlockThreshold(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeOptimistic,
+	}, "test")
+	require.NoError(t, err)
+
+	s.Record(Observation{TotalTxs: 10000, LocalHits: 9950, MissingFetches: 50, Mode: ModeOptimistic})
+	require.Equal(t, ModeOptimistic, s.Mode())
+}

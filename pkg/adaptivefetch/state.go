@@ -60,16 +60,29 @@ func (s *State) Record(obs Observation) {
 }
 
 func (s *State) maybeTransition() {
-	if len(s.window) < s.cfg.WindowSize {
-		return
-	}
-
 	switch s.mode {
 	case ModePessimistic:
+		if len(s.window) < s.cfg.WindowSize {
+			return
+		}
 		if s.avgHitRateLocked() >= s.cfg.PessToOptHitRateThreshold {
 			s.mode = ModeOptimistic
 		}
+
+	case ModeOptimistic:
+		last := s.window[s.lastIndexLocked()]
+		if last.MissingFetches > s.cfg.OptToPessMissThreshold {
+			s.mode = ModePessimistic
+			return
+		}
 	}
+}
+
+func (s *State) lastIndexLocked() int {
+	if len(s.window) < s.cfg.WindowSize {
+		return len(s.window) - 1
+	}
+	return (s.windowHead - 1 + s.cfg.WindowSize) % s.cfg.WindowSize
 }
 
 func (s *State) avgHitRateLocked() float64 {
