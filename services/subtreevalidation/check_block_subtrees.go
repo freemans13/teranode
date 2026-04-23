@@ -13,6 +13,7 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
@@ -262,50 +263,82 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				// PHASE 2: Exact pre-allocation
 				subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
 
-				subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
-				if err != nil {
-					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
-				}
+				// Adaptive-fetch gate: when optimistic, skip subtreeData entirely.
+				// The subtree's txs are already in the local UTXO store via propagation,
+				// so downstream processTransactionsInLevels processes 0 new transactions
+				// from this subtree (subtreeTxs[subtreeIdx] stays empty). If a tx is
+				// genuinely missing, downstream validation will surface it via the
+				// existing processMissingTransactions fallback in SubtreeValidation.go.
+				optimistic := u.adaptiveFetch.ShouldSkipSubtreeData()
 
-				if !subtreeDataExists {
-					// get the subtree data from the peer and process it directly
-					url := fmt.Sprintf("%s/subtree_data/%s", request.BaseUrl, subtreeHash.String())
-
-					body, subtreeDataErr := util.DoHTTPRequestBodyReader(gCtx, url)
-					if subtreeDataErr != nil {
-						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
+				if !optimistic {
+					subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
+					if err != nil {
+						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
 					}
 
-					// Wrap with counting reader to track bytes downloaded
-					var bytesRead uint64
-					countingBody := &countingReadCloser{
-						reader:    body,
-						bytesRead: &bytesRead,
-					}
+					if !subtreeDataExists {
+						// get the subtree data from the peer and process it directly
+						url := fmt.Sprintf("%s/subtree_data/%s", request.BaseUrl, subtreeHash.String())
 
-					// Process transactions directly from the stream while storing to disk
-					err = u.processSubtreeDataStream(gCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah)
-					_ = countingBody.Close()
+						body, subtreeDataErr := util.DoHTTPRequestBodyReader(gCtx, url)
+						if subtreeDataErr != nil {
+							return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
+						}
 
-					// Track bytes downloaded from peer after stream is consumed
-					// Decouple the context to ensure tracking completes even if parent context is cancelled
-					if u.p2pClient != nil && peerID != "" {
-						trackCtx, _, deferFn := tracing.DecoupleTracingSpan(gCtx, "subtreevalidation", "recordBytesDownloaded")
-						defer deferFn()
-						if err := u.p2pClient.RecordBytesDownloaded(trackCtx, peerID, bytesRead); err != nil {
-							u.logger.Warnf("[CheckBlockSubtrees][%s] failed to record %d bytes downloaded from peer %s: %v", subtreeHash.String(), bytesRead, peerID, err)
+						// Wrap with counting reader to track bytes downloaded
+						var bytesRead uint64
+						countingBody := &countingReadCloser{
+							reader:    body,
+							bytesRead: &bytesRead,
+						}
+
+						// Process transactions directly from the stream while storing to disk
+						err = u.processSubtreeDataStream(gCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah)
+						_ = countingBody.Close()
+
+						// Track bytes downloaded from peer after stream is consumed
+						// Decouple the context to ensure tracking completes even if parent context is cancelled
+						if u.p2pClient != nil && peerID != "" {
+							trackCtx, _, deferFn := tracing.DecoupleTracingSpan(gCtx, "subtreevalidation", "recordBytesDownloaded")
+							defer deferFn()
+							if err := u.p2pClient.RecordBytesDownloaded(trackCtx, peerID, bytesRead); err != nil {
+								u.logger.Warnf("[CheckBlockSubtrees][%s] failed to record %d bytes downloaded from peer %s: %v", subtreeHash.String(), bytesRead, peerID, err)
+							}
+						}
+
+						if err != nil {
+							return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to process subtree data stream", subtreeHash.String(), err)
+						}
+					} else {
+						// SubtreeData exists, extract transactions from stored file
+						err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx])
+						if err != nil {
+							return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to extract transactions", subtreeHash.String(), err)
 						}
 					}
+				}
 
-					if err != nil {
-						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to process subtree data stream", subtreeHash.String(), err)
+				// Record an observation for the adaptive-fetch state machine.
+				// Pessimistic-mode observations are "perfect" (we fetched/extracted so
+				// LocalHits=TotalTxs, MissingFetches=0) — this drives Pess→Opt via the
+				// rolling hit rate. Optimistic-mode observations record
+				// MissingFetches=0 for now; the real Opt→Pess trip will come when a
+				// missing tx bubbles up through processTransactionsInLevels and the
+				// block validation fails — at which point operators will see metrics
+				// and the next run will start pessimistic.
+				txCount := subtreeToCheck.Length()
+				if txCount > 0 {
+					mode := adaptivefetch.ModePessimistic
+					if optimistic {
+						mode = adaptivefetch.ModeOptimistic
 					}
-				} else {
-					// SubtreeData exists, extract transactions from stored file
-					err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx])
-					if err != nil {
-						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to extract transactions", subtreeHash.String(), err)
-					}
+					u.adaptiveFetch.Record(adaptivefetch.Observation{
+						TotalTxs:       txCount,
+						LocalHits:      txCount,
+						MissingFetches: 0,
+						Mode:           mode,
+					})
 				}
 
 				return nil
