@@ -368,6 +368,11 @@ type SyncManager struct {
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
+	// disableCheckpoints mirrors Config.DisableCheckpoints (set via --nocheckpoints).
+	// When true, no checkpoint anchor exists and quickValidationMode must not be
+	// enabled on the CATCHINGBLOCKS path even if chainParams.Checkpoints is populated.
+	disableCheckpoints bool
+
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
@@ -2226,9 +2231,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	initPrometheusMetrics()
 
 	sm := SyncManager{
-		ctx:          ctx,
-		settings:     tSettings,
-		peerNotifier: config.PeerNotifier,
+		ctx:                ctx,
+		settings:           tSettings,
+		peerNotifier:       config.PeerNotifier,
+		disableCheckpoints: config.DisableCheckpoints,
 		// txMemPool:     config.TxMemPool,
 		orphanTxs:       expiringmap.New[chainhash.Hash, *orphanTxAndParents](tSettings.Legacy.OrphanEvictionDuration),
 		chainParams:     config.ChainParams,
