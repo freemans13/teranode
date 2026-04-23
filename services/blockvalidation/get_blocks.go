@@ -14,6 +14,7 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/util"
@@ -208,8 +209,18 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				return nil
 			}
 
-			// Fetch subtree data for this block
-			contributingPeers, err := u.fetchSubtreeDataForBlock(ctx, work.block, peerID, baseURL)
+			// Fetch subtree data for this block — adaptive-fetch state may skip it
+			// entirely when the node is receiving txs via a distributor.
+			optimistic := u.adaptiveFetch.ShouldSkipSubtreeData()
+
+			var contributingPeers map[string]struct{}
+			var err error
+			if optimistic {
+				contributingPeers, err = nil, nil
+			} else {
+				contributingPeers, err = u.fetchSubtreeDataForBlockFn(ctx, work.block, peerID, baseURL)
+			}
+
 			if err != nil {
 				// Send result (even if error occurred)
 				result := resultItem{
@@ -225,6 +236,30 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				}
 
 				continue
+			}
+
+			// Record an observation for the adaptive-fetch state machine.
+			// In pessimistic mode we've just fetched subtreeData successfully,
+			// so record a "perfect" observation (all txs effectively local via
+			// the download). This drives the rolling hit rate toward the Pess→Opt
+			// threshold. In optimistic mode we skipped the fetch entirely; any
+			// missing-tx recovery happens at the subtree-validation layer which
+			// maintains its own adaptive-fetch state.
+			txCount := 0
+			if work.block != nil {
+				txCount = int(work.block.TransactionCount)
+			}
+			if txCount > 0 {
+				mode := adaptivefetch.ModePessimistic
+				if optimistic {
+					mode = adaptivefetch.ModeOptimistic
+				}
+				u.adaptiveFetch.Record(adaptivefetch.Observation{
+					TotalTxs:       txCount,
+					LocalHits:      txCount,
+					MissingFetches: 0,
+					Mode:           mode,
+				})
 			}
 
 			// Send result

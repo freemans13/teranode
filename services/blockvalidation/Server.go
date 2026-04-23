@@ -171,6 +171,11 @@ type Server struct {
 	// or skipped because the tx distributor is keeping the UTXO store up to date.
 	adaptiveFetch *adaptivefetch.State
 
+	// fetchSubtreeDataForBlockFn is the function used by blockWorker to fetch
+	// subtree data for a block. Production code always uses the real method;
+	// tests override this field before dispatching work to blockWorker.
+	fetchSubtreeDataForBlockFn func(ctx context.Context, block *model.Block, peerID, baseURL string) (map[string]struct{}, error)
+
 	// peerCircuitBreakers manages circuit breakers for each peer to prevent
 	// cascading failures and protect against misbehaving peers
 	peerCircuitBreakers *catchup.PeerCircuitBreakers
@@ -345,6 +350,8 @@ func New(
 		headerChainCache:    catchup.NewHeaderChainCache(logger),
 		p2pClient:           p2pClient,
 	}
+
+	bVal.fetchSubtreeDataForBlockFn = bVal.fetchSubtreeDataForBlock
 
 	return bVal
 }
