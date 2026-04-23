@@ -8,6 +8,7 @@ package blockchain
 
 import (
 	"context"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
@@ -320,6 +321,20 @@ type ClientI interface {
 	// - BlockHeaderMeta containing additional metadata about the header
 	// - Error if the header retrieval fails
 	GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error)
+
+	// GetHeaderReceivedAt returns the wall-clock timestamp this node first recorded
+	// the given block header. Returns (_, false, nil) if absent or TTL-expired; callers
+	// should treat that the same as "not live for this block."
+	GetHeaderReceivedAt(ctx context.Context, hash *chainhash.Hash) (time.Time, bool, error)
+
+	// ReportPeerBlockHeaderSeen records the first-seen wall-clock time for a header
+	// announced by a peer. Callers should invoke this as soon as they learn about a
+	// live block (e.g. at the blockvalidation.BlockFound entry point) so the subtree-
+	// only liveness gate can fire before subtreeData fetch decisions are made.
+	//
+	// Repeated calls for the same hash are no-ops — the first stamp wins. Errors
+	// are informational only; the caller should not fail validation if stamping fails.
+	ReportPeerBlockHeaderSeen(ctx context.Context, hash *chainhash.Hash) error
 
 	// GetBlockHeaders retrieves multiple block headers.
 	//

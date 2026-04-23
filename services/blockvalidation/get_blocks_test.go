@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
@@ -25,6 +26,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jarcoal/httpmock"
+	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -3191,5 +3193,188 @@ func TestFetchBlocksConcurrently_BlockHeightIsSet(t *testing.T) {
 				t.Fatalf("Timeout waiting for block %d/%d", i+1, numBlocks)
 			}
 		}
+	})
+}
+
+// TestBlockWorker_LivenessGate verifies that blockWorker consults the liveness
+// gate before calling fetchSubtreeDataForBlock. Three cases:
+//  1. Gate setting off → subtreeData fetch is called (normal path).
+//  2. Gate on + fresh stamp → subtreeData fetch is NOT called; result arrives
+//     immediately with nil contributingPeers.
+//  3. Gate on + stale stamp → subtreeData fetch IS called.
+func TestBlockWorker_LivenessGate(t *testing.T) {
+	// We use httpmock to count /subtree_data/ requests — if the gate fires the
+	// request count stays zero; otherwise it increments once per block.
+	const peerID = "12D3KooWL1NF6fdTJ9cucEuwvuX8V8KtpJZZnUE4umdLBuK15eUZ"
+	const baseURL = "http://liveness-gate-test-peer:8080"
+
+	// Helper: build a minimal server that has a real subtreeStore + blockchainClient mock.
+	makeServer := func(t *testing.T, assumeBroadcast bool, livenessWindowSec int) (*Server, *blockchain.Mock) {
+		t.Helper()
+		initPrometheusMetrics()
+		settings := test.CreateBaseTestSettings(t)
+		settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes = assumeBroadcast
+		settings.SubtreeValidation.LivenessWindow = time.Duration(livenessWindowSec) * time.Second
+
+		mockBC := &blockchain.Mock{}
+		return &Server{
+			logger:           ulogger.TestLogger{},
+			settings:         settings,
+			subtreeStore:     memory.New(),
+			blockchainClient: mockBC,
+			stats:            gocore.NewStat("livenessgate_test"),
+		}, mockBC
+	}
+
+	// A minimal block that has one subtree (so fetchSubtreeDataForBlock has work to do).
+	// Include a non-nil Header with non-nil hash/bits fields because blockWorker
+	// calls block.Hash(), which dereferences b.Header.Hash() → BlockHeader.Bytes(),
+	// and that serialization calls .CloneBytes() on HashPrevBlock / HashMerkleRoot /
+	// Bits.
+	subtreeHash := createTestHash("liveness-gate-subtree")
+	prev := createTestHash("liveness-gate-prev")
+	merkle := createTestHash("liveness-gate-merkle")
+	block := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  prev,
+			HashMerkleRoot: merkle,
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{},
+			Nonce:          0,
+		},
+		Subtrees: []*chainhash.Hash{subtreeHash},
+	}
+
+	t.Run("SettingOff_SubtreeDataFetched", func(t *testing.T) {
+		httpmock.ActivateNonDefault(util.HTTPClient())
+		defer httpmock.DeactivateAndReset()
+
+		server, mockBC := makeServer(t, false /*off*/, 60)
+
+		// GetHeaderReceivedAt should NOT be called when the gate setting is off.
+		// (We assert via mock expectations: it is never registered.)
+
+		// Register a minimal subtree + subtreeData response so fetchSubtreeDataForBlock
+		// completes without error.
+		subtreeURL := fmt.Sprintf("%s/subtree/%s", baseURL, subtreeHash.String())
+		subtreeDataURL := fmt.Sprintf("%s/subtree_data/%s", baseURL, subtreeHash.String())
+
+		// Use an empty node hash list — fetchSubtreeDataForBlock just needs a 200.
+		httpmock.RegisterResponder("GET", subtreeURL, httpmock.NewBytesResponder(200, []byte{}))
+		httpmock.RegisterResponder("GET", subtreeDataURL, httpmock.NewBytesResponder(200, []byte{}))
+
+		workQueue := make(chan workItem, 1)
+		resultQueue := make(chan resultItem, 1)
+		workQueue <- workItem{block: block, index: 0}
+		close(workQueue)
+
+		blockUpTo := &model.Block{}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = server.blockWorker(context.Background(), 0, workQueue, resultQueue, peerID, baseURL, blockUpTo)
+		}()
+		wg.Wait()
+		close(resultQueue)
+
+		result := <-resultQueue
+		// Gate was off so fetchSubtreeDataForBlock ran; result may have an error
+		// (e.g. empty subtree bytes) but the key assertion is that GetHeaderReceivedAt
+		// was never called on the mock.
+		mockBC.AssertNotCalled(t, "GetHeaderReceivedAt")
+		_ = result // error or not — the gate-wiring is what matters here
+	})
+
+	t.Run("SettingOn_FreshStamp_SubtreeDataSkipped", func(t *testing.T) {
+		httpmock.ActivateNonDefault(util.HTTPClient())
+		defer httpmock.DeactivateAndReset()
+
+		server, mockBC := makeServer(t, true /*on*/, 60 /*window=60s*/)
+
+		// Fresh stamp: block was received 5 seconds ago — well within 60s window.
+		freshStamp := time.Now().Add(-5 * time.Second)
+		mockBC.On("GetHeaderReceivedAt", mock.Anything, mock.Anything).
+			Return(freshStamp, true, nil).Once()
+
+		// Register subtreeData URL — it must NOT be hit when the gate fires.
+		subtreeDataURL := fmt.Sprintf("%s/subtree_data/%s", baseURL, subtreeHash.String())
+		subtreeDataHitCount := 0
+		httpmock.RegisterResponder("GET", subtreeDataURL,
+			func(_ *http.Request) (*http.Response, error) {
+				subtreeDataHitCount++
+				return httpmock.NewStringResponse(200, ""), nil
+			})
+
+		workQueue := make(chan workItem, 1)
+		resultQueue := make(chan resultItem, 1)
+		workQueue <- workItem{block: block, index: 0}
+		close(workQueue)
+
+		blockUpTo := &model.Block{}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = server.blockWorker(context.Background(), 0, workQueue, resultQueue, peerID, baseURL, blockUpTo)
+		}()
+		wg.Wait()
+		close(resultQueue)
+
+		result := <-resultQueue
+		require.NoError(t, result.err, "gate-skipped block should produce no error")
+		require.Nil(t, result.contributingPeers, "no peers contributed when gate fired")
+		require.Zero(t, subtreeDataHitCount, "subtreeData endpoint must not be called when gate fires")
+		mockBC.AssertExpectations(t)
+	})
+
+	t.Run("SettingOn_StaleStamp_SubtreeDataFetched", func(t *testing.T) {
+		httpmock.ActivateNonDefault(util.HTTPClient())
+		defer httpmock.DeactivateAndReset()
+
+		server, mockBC := makeServer(t, true /*on*/, 60 /*window=60s*/)
+
+		// Stale stamp: block was received 5 minutes ago — outside the 60s window.
+		staleStamp := time.Now().Add(-5 * time.Minute)
+		mockBC.On("GetHeaderReceivedAt", mock.Anything, mock.Anything).
+			Return(staleStamp, true, nil).Once()
+
+		// Register the /subtree/ endpoint — it's the first thing fetchSubtreeDataForBlock
+		// calls. We count hits to prove the fetch path was taken. (fetchSubtreeDataForBlock
+		// may error out on empty bytes, but the key assertion is it was invoked at all.)
+		subtreeURL := fmt.Sprintf("%s/subtree/%s", baseURL, subtreeHash.String())
+		subtreeHitCount := 0
+		httpmock.RegisterResponder("GET", subtreeURL,
+			func(_ *http.Request) (*http.Response, error) {
+				subtreeHitCount++
+				return httpmock.NewBytesResponder(200, []byte{})(nil)
+			})
+
+		workQueue := make(chan workItem, 1)
+		resultQueue := make(chan resultItem, 1)
+		workQueue <- workItem{block: block, index: 0}
+		close(workQueue)
+
+		blockUpTo := &model.Block{}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = server.blockWorker(context.Background(), 0, workQueue, resultQueue, peerID, baseURL, blockUpTo)
+		}()
+		wg.Wait()
+		close(resultQueue)
+
+		result := <-resultQueue
+		// Gate did not fire so fetchSubtreeDataForBlock ran. The result may have an
+		// error due to empty subtree bytes, but the gate-wiring is verified by:
+		// (a) GetHeaderReceivedAt was called, and (b) the /subtree/ endpoint was hit.
+		require.Positive(t, subtreeHitCount, "/subtree/ endpoint must be called when gate does not fire")
+		mockBC.AssertExpectations(t)
+		_ = result
 	})
 }

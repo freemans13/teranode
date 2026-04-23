@@ -3,6 +3,7 @@ package blockchain
 import (
 	"context"
 	"encoding/binary"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -16,6 +17,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+var _ ClientI = (*Mock)(nil)
 
 // Mock implements the blockchain.ClientI interface for testing purposes.
 type Mock struct {
@@ -193,6 +196,18 @@ func (m *Mock) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*
 	}
 
 	return args.Get(0).(*model.BlockHeader), args.Get(1).(*model.BlockHeaderMeta), args.Error(2)
+}
+
+// GetHeaderReceivedAt mocks the GetHeaderReceivedAt method.
+func (m *Mock) GetHeaderReceivedAt(ctx context.Context, hash *chainhash.Hash) (time.Time, bool, error) {
+	args := m.Called(ctx, hash)
+	return args.Get(0).(time.Time), args.Bool(1), args.Error(2)
+}
+
+// ReportPeerBlockHeaderSeen mocks the ReportPeerBlockHeaderSeen method.
+func (m *Mock) ReportPeerBlockHeaderSeen(ctx context.Context, hash *chainhash.Hash) error {
+	args := m.Called(ctx, hash)
+	return args.Error(0)
 }
 
 // GetBlockHeaders mocks the GetBlockHeaders method

@@ -22,6 +22,8 @@ import (
 	"github.com/bsv-blockchain/teranode/util/health"
 )
 
+var _ ClientI = (*LocalClient)(nil)
+
 // LocalClient implements a blockchain client with direct store access.
 type LocalClient struct {
 	logger       ulogger.Logger     // Logger instance
@@ -29,6 +31,7 @@ type LocalClient struct {
 	store        blockchain.Store   // Blockchain store
 	subtreeStore blob.Store         // Subtree store
 	utxoStore    utxo.Store         // UTXO store
+	receivedAt   *receivedAtStore   // First-seen timestamps for block headers
 
 	// Subscription management
 	subscribersMu sync.RWMutex
@@ -37,14 +40,38 @@ type LocalClient struct {
 
 // NewLocalClient creates a new LocalClient instance with the provided dependencies.
 func NewLocalClient(logger ulogger.Logger, tSettings *settings.Settings, store blockchain.Store, subtreeStore blob.Store, utxoStore utxo.Store) (ClientI, error) {
+	// Only allocate the receivedAt store (and its background cleanup goroutine)
+	// when the liveness gate is actually enabled.
+	var receivedAt *receivedAtStore
+	if tSettings != nil &&
+		tSettings.SubtreeValidation.AssumeTxsBroadcastToAllNodes &&
+		tSettings.SubtreeValidation.LivenessWindow > 0 {
+		receivedAt = newReceivedAtStore(receivedAtTTL(tSettings.SubtreeValidation.LivenessWindow))
+	}
+
 	return &LocalClient{
 		logger:       logger,
 		settings:     tSettings,
 		store:        store,
 		subtreeStore: subtreeStore,
 		utxoStore:    utxoStore,
+		receivedAt:   receivedAt,
 		subscribers:  make(map[string]chan *blockchain_api.Notification),
 	}, nil
+}
+
+// Stop releases resources owned by this LocalClient, in particular the
+// background cleanup goroutine started by the receivedAt ExpiringMap. It is
+// not part of the ClientI interface; callers that construct LocalClients
+// transiently (tests, benchmarks, short-lived subprocesses) should defer
+// Stop() to avoid leaking one goroutine per instance.
+//
+// Safe to call on a nil receiver or double-call.
+func (c *LocalClient) Stop() {
+	if c == nil {
+		return
+	}
+	c.receivedAt.Stop()
 }
 
 // Health performs health checks for the LocalClient and its dependencies.
@@ -106,6 +133,16 @@ func (c *LocalClient) AddBlock(ctx context.Context, block *model.Block, peerID s
 	ID, height, err := c.store.StoreBlock(ctx, block, peerID, opts...)
 	if err != nil {
 		return err
+	}
+
+	// Stamp the block header's first-seen time only when the subtree-only
+	// liveness gate is enabled; otherwise fast catchup would grow the
+	// in-memory receivedAt map for every stored block on nodes that don't
+	// use the optimisation.
+	if c.settings != nil &&
+		c.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes &&
+		c.settings.SubtreeValidation.LivenessWindow > 0 {
+		c.receivedAt.stamp(block.Hash())
 	}
 
 	c.logger.Infof("[Blockchain LocalClient] stored block %s (ID: %d, height: %d)", block.Hash(), ID, height)
@@ -221,6 +258,23 @@ func (c *LocalClient) GetBestBlockHeader(ctx context.Context) (*model.BlockHeade
 
 func (c *LocalClient) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
 	return c.store.GetBlockHeader(ctx, blockHash)
+}
+
+// GetHeaderReceivedAt returns the local first-seen timestamp for the given
+// block header, from this client's in-memory store. See ClientI for semantics.
+func (c *LocalClient) GetHeaderReceivedAt(_ context.Context, hash *chainhash.Hash) (time.Time, bool, error) {
+	stamp, ok := c.receivedAt.lookup(hash)
+	if !ok {
+		return time.Time{}, false, nil
+	}
+	return stamp, true, nil
+}
+
+// ReportPeerBlockHeaderSeen stamps the first-seen time for a header in this
+// client's in-memory store. See ClientI for semantics.
+func (c *LocalClient) ReportPeerBlockHeaderSeen(_ context.Context, hash *chainhash.Hash) error {
+	c.receivedAt.stamp(hash)
+	return nil
 }
 
 func (c *LocalClient) GetBlockHeaders(ctx context.Context, blockHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {

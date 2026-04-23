@@ -55,6 +55,8 @@ const (
 	BlockchainAPI_CheckBlockIsAncestorOfBlock_FullMethodName          = "/blockchain_api.BlockchainAPI/CheckBlockIsAncestorOfBlock"
 	BlockchainAPI_GetChainTips_FullMethodName                         = "/blockchain_api.BlockchainAPI/GetChainTips"
 	BlockchainAPI_GetBlockHeader_FullMethodName                       = "/blockchain_api.BlockchainAPI/GetBlockHeader"
+	BlockchainAPI_GetHeaderReceivedAt_FullMethodName                  = "/blockchain_api.BlockchainAPI/GetHeaderReceivedAt"
+	BlockchainAPI_ReportPeerBlockHeaderSeen_FullMethodName            = "/blockchain_api.BlockchainAPI/ReportPeerBlockHeaderSeen"
 	BlockchainAPI_InvalidateBlock_FullMethodName                      = "/blockchain_api.BlockchainAPI/InvalidateBlock"
 	BlockchainAPI_RevalidateBlock_FullMethodName                      = "/blockchain_api.BlockchainAPI/RevalidateBlock"
 	BlockchainAPI_Subscribe_FullMethodName                            = "/blockchain_api.BlockchainAPI/Subscribe"
@@ -167,6 +169,14 @@ type BlockchainAPIClient interface {
 	GetChainTips(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetChainTipsResponse, error)
 	// GetBlockHeader retrieves the header of a specific block.
 	GetBlockHeader(ctx context.Context, in *GetBlockHeaderRequest, opts ...grpc.CallOption) (*GetBlockHeaderResponse, error)
+	// GetHeaderReceivedAt returns the wall-clock timestamp this node first recorded
+	// the given block header, if within the in-memory TTL.
+	GetHeaderReceivedAt(ctx context.Context, in *GetHeaderReceivedAtRequest, opts ...grpc.CallOption) (*GetHeaderReceivedAtResponse, error)
+	// ReportPeerBlockHeaderSeen records the current wall-clock time as the first-seen
+	// stamp for the given block header, unless one already exists. Used by
+	// blockvalidation.BlockFound to seed the subtree-only liveness gate before
+	// subtreeData fetch decisions are made.
+	ReportPeerBlockHeaderSeen(ctx context.Context, in *ReportPeerBlockHeaderSeenRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// InvalidateBlock marks a block as invalid in the blockchain.
 	InvalidateBlock(ctx context.Context, in *InvalidateBlockRequest, opts ...grpc.CallOption) (*InvalidateBlockResponse, error)
 	// RevalidateBlock restores a previously invalidated block.
@@ -568,6 +578,26 @@ func (c *blockchainAPIClient) GetBlockHeader(ctx context.Context, in *GetBlockHe
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetBlockHeaderResponse)
 	err := c.cc.Invoke(ctx, BlockchainAPI_GetBlockHeader_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *blockchainAPIClient) GetHeaderReceivedAt(ctx context.Context, in *GetHeaderReceivedAtRequest, opts ...grpc.CallOption) (*GetHeaderReceivedAtResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetHeaderReceivedAtResponse)
+	err := c.cc.Invoke(ctx, BlockchainAPI_GetHeaderReceivedAt_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *blockchainAPIClient) ReportPeerBlockHeaderSeen(ctx context.Context, in *ReportPeerBlockHeaderSeenRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, BlockchainAPI_ReportPeerBlockHeaderSeen_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1026,6 +1056,14 @@ type BlockchainAPIServer interface {
 	GetChainTips(context.Context, *emptypb.Empty) (*GetChainTipsResponse, error)
 	// GetBlockHeader retrieves the header of a specific block.
 	GetBlockHeader(context.Context, *GetBlockHeaderRequest) (*GetBlockHeaderResponse, error)
+	// GetHeaderReceivedAt returns the wall-clock timestamp this node first recorded
+	// the given block header, if within the in-memory TTL.
+	GetHeaderReceivedAt(context.Context, *GetHeaderReceivedAtRequest) (*GetHeaderReceivedAtResponse, error)
+	// ReportPeerBlockHeaderSeen records the current wall-clock time as the first-seen
+	// stamp for the given block header, unless one already exists. Used by
+	// blockvalidation.BlockFound to seed the subtree-only liveness gate before
+	// subtreeData fetch decisions are made.
+	ReportPeerBlockHeaderSeen(context.Context, *ReportPeerBlockHeaderSeenRequest) (*emptypb.Empty, error)
 	// InvalidateBlock marks a block as invalid in the blockchain.
 	InvalidateBlock(context.Context, *InvalidateBlockRequest) (*InvalidateBlockResponse, error)
 	// RevalidateBlock restores a previously invalidated block.
@@ -1208,6 +1246,12 @@ func (UnimplementedBlockchainAPIServer) GetChainTips(context.Context, *emptypb.E
 }
 func (UnimplementedBlockchainAPIServer) GetBlockHeader(context.Context, *GetBlockHeaderRequest) (*GetBlockHeaderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetBlockHeader not implemented")
+}
+func (UnimplementedBlockchainAPIServer) GetHeaderReceivedAt(context.Context, *GetHeaderReceivedAtRequest) (*GetHeaderReceivedAtResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetHeaderReceivedAt not implemented")
+}
+func (UnimplementedBlockchainAPIServer) ReportPeerBlockHeaderSeen(context.Context, *ReportPeerBlockHeaderSeenRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportPeerBlockHeaderSeen not implemented")
 }
 func (UnimplementedBlockchainAPIServer) InvalidateBlock(context.Context, *InvalidateBlockRequest) (*InvalidateBlockResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method InvalidateBlock not implemented")
@@ -1913,6 +1957,42 @@ func _BlockchainAPI_GetBlockHeader_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(BlockchainAPIServer).GetBlockHeader(ctx, req.(*GetBlockHeaderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BlockchainAPI_GetHeaderReceivedAt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetHeaderReceivedAtRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BlockchainAPIServer).GetHeaderReceivedAt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BlockchainAPI_GetHeaderReceivedAt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BlockchainAPIServer).GetHeaderReceivedAt(ctx, req.(*GetHeaderReceivedAtRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BlockchainAPI_ReportPeerBlockHeaderSeen_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportPeerBlockHeaderSeenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BlockchainAPIServer).ReportPeerBlockHeaderSeen(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BlockchainAPI_ReportPeerBlockHeaderSeen_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BlockchainAPIServer).ReportPeerBlockHeaderSeen(ctx, req.(*ReportPeerBlockHeaderSeenRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2710,6 +2790,14 @@ var BlockchainAPI_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetBlockHeader",
 			Handler:    _BlockchainAPI_GetBlockHeader_Handler,
+		},
+		{
+			MethodName: "GetHeaderReceivedAt",
+			Handler:    _BlockchainAPI_GetHeaderReceivedAt_Handler,
+		},
+		{
+			MethodName: "ReportPeerBlockHeaderSeen",
+			Handler:    _BlockchainAPI_ReportPeerBlockHeaderSeen_Handler,
 		},
 		{
 			MethodName: "InvalidateBlock",

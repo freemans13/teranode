@@ -1131,6 +1131,9 @@ func Test_BlockFound(t *testing.T) {
 	hashBytes := hash.CloneBytes()
 
 	t.Run("block already exists", func(t *testing.T) {
+		// With default settings (AssumeTxsBroadcastToAllNodes=false) BlockFound
+		// does not call ReportPeerBlockHeaderSeen — the short-circuit on
+		// GetBlockExists returns before any blockchain client calls.
 		bv := &BlockValidation{
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
@@ -1174,6 +1177,7 @@ func Test_BlockFound(t *testing.T) {
 		server := &Server{
 			logger:              logger,
 			settings:            tSettings,
+			blockchainClient:    mockBlockchainClient,
 			blockValidation:     bv,
 			blockFoundCh:        make(chan processBlockFound, 10),
 			stats:               gocore.NewStat("test"),
@@ -1217,6 +1221,7 @@ func Test_BlockFound(t *testing.T) {
 		server := &Server{
 			logger:              logger,
 			settings:            tSettings,
+			blockchainClient:    mockBlockchainClient,
 			blockValidation:     bv,
 			blockFoundCh:        make(chan processBlockFound, 10),
 			stats:               gocore.NewStat("test"),
@@ -1258,6 +1263,7 @@ func Test_BlockFound(t *testing.T) {
 		server := &Server{
 			logger:              logger,
 			settings:            tSettings,
+			blockchainClient:    mockBlockchainClient,
 			blockValidation:     bv,
 			blockFoundCh:        make(chan processBlockFound, 10),
 			stats:               gocore.NewStat("test"),
@@ -1301,6 +1307,60 @@ func Test_BlockFound(t *testing.T) {
 		require.Error(t, err)
 		require.Nil(t, resp)
 		require.Contains(t, err.Error(), "failed to create hash from bytes")
+	})
+
+	t.Run("ReportPeerBlockHeaderSeen only fires when gate setting is enabled", func(t *testing.T) {
+		// With AssumeTxsBroadcastToAllNodes=false (default), BlockFound must NOT
+		// call ReportPeerBlockHeaderSeen — the extra RPC would add overhead on
+		// the hot path for nodes not using the optimisation. Pick a fresh block
+		// (exists=false) so that the gate-off guard is the only reason the stamp
+		// RPC is skipped; otherwise the exists=true short-circuit would make the
+		// assertion trivially true.
+		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlockExists", mock.Anything, &hash).Return(false, nil)
+
+		gateOffSettings := test.CreateBaseTestSettings(t)
+		gateOffSettings.SubtreeValidation.AssumeTxsBroadcastToAllNodes = false
+
+		bv := &BlockValidation{
+			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
+			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+			blockchainClient:              mockBlockchainClient,
+		}
+		defer bv.blockExistsCache.Stop()
+
+		server := &Server{
+			logger:              logger,
+			settings:            gateOffSettings,
+			blockchainClient:    mockBlockchainClient,
+			blockValidation:     bv,
+			blockFoundCh:        make(chan processBlockFound, 10),
+			stats:               gocore.NewStat("test"),
+			processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
+		}
+
+		req := &blockvalidation_api.BlockFoundRequest{
+			Hash:    hashBytes,
+			BaseUrl: "http://test.com",
+		}
+
+		resp, err := server.BlockFound(ctx, req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+
+		// Drain the queued work deterministically — BlockFound enqueues on a
+		// separate goroutine, so we block on the channel with a generous
+		// timeout instead of sleeping-then-checking len(), which is flaky on
+		// loaded CI.
+		select {
+		case <-server.blockFoundCh:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for blockFound work to be queued")
+		}
+
+		mockBlockchainClient.AssertNotCalled(t, "ReportPeerBlockHeaderSeen", mock.Anything, mock.Anything)
 	})
 }
 

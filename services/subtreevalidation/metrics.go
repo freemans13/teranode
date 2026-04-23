@@ -77,6 +77,10 @@ var (
 	// This counter tracks how often errors occur when updating the transaction metadata cache
 	// from Kafka messages, which helps identify issues with the cache or Kafka connection.
 	prometheusSubtreeValidationSetTXMetaCacheKafkaErrors prometheus.Counter
+
+	// prometheusLivenessGateDecision counts liveness-gate outcomes, labelled by decision.
+	// Labels: subtreeonly, subtreedata, notfound, err.
+	prometheusLivenessGateDecision *prometheus.CounterVec
 )
 
 var (
@@ -184,5 +188,15 @@ func _initPrometheusMetrics() {
 			Name:      "set_tx_meta_cache_kafka_errors",
 			Help:      "Number of errors setting tx meta cache from kafka",
 		},
+	)
+
+	prometheusLivenessGateDecision = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "livenessgate_decision_total",
+			Help:      "Count of liveness-gate decisions by outcome (subtreeonly, subtreedata, notfound, err).",
+		},
+		[]string{"decision"},
 	)
 }

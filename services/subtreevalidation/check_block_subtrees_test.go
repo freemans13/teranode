@@ -1490,6 +1490,201 @@ func TestValidateSubtreeInternal(t *testing.T) {
 	})
 }
 
+// TestCheckBlockSubtrees_LivenessGate verifies that the liveness gate in CheckBlockSubtrees
+// skips the subtreeData HTTP download when AssumeTxsBroadcastToAllNodes is true and the
+// block header was received within LivenessWindow, and falls through to the download otherwise.
+func TestCheckBlockSubtrees_LivenessGate(t *testing.T) {
+	testHeaders := testhelpers.CreateTestHeaders(t, 1)
+
+	// run sets up a server, configures the gate setting + stamp behaviour, builds a block
+	// with one missing subtree (FileTypeSubtreeToCheck pre-populated, FileTypeSubtreeData absent),
+	// calls CheckBlockSubtrees with an unreachable BaseUrl, and returns the error.
+	//
+	// When the gate is ON and the stamp is fresh the worker returns nil without touching
+	// the network, so even an unreachable BaseUrl succeeds.
+	// When the gate is OFF (or stale) the worker attempts the subtreeData download and
+	// fails deterministically because the URL is unreachable.
+	run := func(t *testing.T, setting bool, window time.Duration, stamp time.Time, stampFound bool) error {
+		t.Helper()
+
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		// Disable batched store lookups so GetMeta mock returns a hit without needing
+		// a BatchDecorate implementation — keeps processTxMetaUsingStore at 0 misses.
+		server.settings.SubtreeValidation.BatchMissingTransactions = false
+
+		// Configure liveness gate settings.
+		server.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes = setting
+		server.settings.SubtreeValidation.LivenessWindow = window
+
+		// Standard blockchain client mocks required by CheckBlockSubtrees.
+		mockClient := server.blockchainClient.(*blockchain.Mock)
+		mockClient.On("GetBestBlockHeader", mock.Anything).
+			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Maybe()
+		mockClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]uint32{1, 2, 3}, nil).Maybe()
+		mockClient.On("IsFSMCurrentState", mock.Anything, blockchain.FSMStateRUNNING).
+			Return(true, nil).Maybe()
+
+		// Program the GetHeaderReceivedAt mock with concrete values.
+		mockClient.On("GetHeaderReceivedAt", mock.Anything, mock.Anything).
+			Return(stamp, stampFound, nil).Maybe()
+
+		// Override the GetMeta mock to match the 3-arg signature: (ctx, hash, *meta.Data).
+		// setupTestServer registers it with 2 matchers (old signature); the non-batched store
+		// path calls it with 3, so we register the correct 3-arg variant here.
+		server.utxoStore.(*utxo.MockUtxostore).On("GetMeta", mock.Anything, mock.Anything, mock.Anything).
+			Return(nil).Maybe()
+
+		// Build a single-tx subtree and pre-populate FileTypeSubtreeToCheck so neither
+		// the per-subtree worker nor ValidateSubtreeInternal needs an HTTP round-trip for
+		// the subtree manifest.
+		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+		require.NoError(t, err)
+
+		subtree, err := subtreepkg.NewTreeByLeafCount(1)
+		require.NoError(t, err)
+		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+
+		subtreeBytes, err := subtree.Serialize()
+		require.NoError(t, err)
+
+		err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
+		require.NoError(t, err)
+		// FileTypeSubtreeData intentionally NOT stored — the gate should skip it (on+fresh)
+		// or trigger an HTTP fetch that fails (off/stale).
+
+		// Build the block that references this subtree.
+		header := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{},
+			Nonce:          0,
+		}
+		coinbaseTx := &bt.Tx{Version: 1}
+		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash()}, 1, 400, 0, 0)
+		require.NoError(t, err)
+
+		blockBytes, err := block.Bytes()
+		require.NoError(t, err)
+
+		// Unreachable BaseUrl — any subtreeData HTTP attempt will fail deterministically.
+		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+			Block:   blockBytes,
+			BaseUrl: "http://127.0.0.1:1",
+		}
+
+		_, callErr := server.CheckBlockSubtrees(context.Background(), request)
+		return callErr
+	}
+
+	t.Run("SettingOff_FetchesSubtreeData", func(t *testing.T) {
+		// Gate OFF → subtreeData download is attempted → unreachable URL → error.
+		err := run(t, false, time.Minute, time.Time{}, false)
+		require.Error(t, err, "setting off must attempt subtreeData fetch (unreachable URL should produce an error)")
+	})
+
+	t.Run("SettingOn_FreshStamp_SkipsSubtreeData", func(t *testing.T) {
+		// Gate ON + stamp within window → subtreeData fetch is skipped entirely.
+		// Even with an unreachable BaseUrl the call must succeed.
+		err := run(t, true, time.Minute, time.Now().Add(-10*time.Second), true)
+		require.NoError(t, err, "fresh stamp must skip subtreeData — call should succeed despite unreachable URL")
+	})
+
+	t.Run("SettingOn_StaleStamp_FetchesSubtreeData", func(t *testing.T) {
+		// Gate ON but stamp outside window → falls through to subtreeData download → error.
+		err := run(t, true, time.Minute, time.Now().Add(-10*time.Minute), true)
+		require.Error(t, err, "stale stamp must fall through to subtreeData fetch (unreachable URL should produce an error)")
+	})
+}
+
+// TestCheckBlockSubtrees_FSMCascadeDoesNotPoisonGate guards against the regression
+// that forced PR #598 to be reverted (see also PR #647). Under load, the FSM can
+// flip from RUNNING into CATCHINGBLOCKS even though the node is at tip; the
+// liveness gate must NOT consult FSM state because doing so would cascade every
+// subsequent block into subtreeData downloads and amplify the load.
+func TestCheckBlockSubtrees_FSMCascadeDoesNotPoisonGate(t *testing.T) {
+	testHeaders := testhelpers.CreateTestHeaders(t, 1)
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Disable batched store lookups so GetMeta mock returns a hit without needing
+	// a BatchDecorate implementation — keeps processTxMetaUsingStore at 0 misses.
+	server.settings.SubtreeValidation.BatchMissingTransactions = false
+
+	// Gate ON with a one-minute liveness window.
+	server.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes = true
+	server.settings.SubtreeValidation.LivenessWindow = time.Minute
+
+	mockClient := server.blockchainClient.(*blockchain.Mock)
+	mockClient.On("GetBestBlockHeader", mock.Anything).
+		Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Maybe()
+	mockClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+		Return([]uint32{1, 2, 3}, nil).Maybe()
+
+	// FSM is in CATCHINGBLOCKS — NOT RUNNING.
+	// IsFSMCurrentState(RUNNING) returns false; GetFSMCurrentState returns CATCHINGBLOCKS.
+	mockClient.On("IsFSMCurrentState", mock.Anything, blockchain.FSMStateRUNNING).
+		Return(false, nil).Maybe()
+	catchingBlocks := blockchain.FSMStateCATCHINGBLOCKS
+	mockClient.On("GetFSMCurrentState", mock.Anything).
+		Return(&catchingBlocks, nil).Maybe()
+
+	// Fresh ReceivedAt stamp: 10 seconds ago — well inside the 1-minute window.
+	mockClient.On("GetHeaderReceivedAt", mock.Anything, mock.Anything).
+		Return(time.Now().Add(-10*time.Second), true, nil).Maybe()
+
+	server.utxoStore.(*utxo.MockUtxostore).On("GetMeta", mock.Anything, mock.Anything, mock.Anything).
+		Return(nil).Maybe()
+
+	// Build a single-tx subtree and pre-populate FileTypeSubtreeToCheck.
+	// FileTypeSubtreeData is intentionally absent — the gate must skip it.
+	tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+	require.NoError(t, err)
+
+	subtree, err := subtreepkg.NewTreeByLeafCount(1)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+
+	subtreeBytes, err := subtree.Serialize()
+	require.NoError(t, err)
+
+	err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
+	require.NoError(t, err)
+	// FileTypeSubtreeData intentionally NOT stored.
+
+	header := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Timestamp:      uint32(time.Now().Unix()),
+		Bits:           model.NBit{},
+		Nonce:          0,
+	}
+	coinbaseTx := &bt.Tx{Version: 1}
+	block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash()}, 1, 400, 0, 0)
+	require.NoError(t, err)
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	// Unreachable BaseUrl — any subtreeData HTTP attempt would fail deterministically.
+	// The gate must short-circuit before touching the network.
+	request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+		Block:   blockBytes,
+		BaseUrl: "http://127.0.0.1:1",
+	}
+
+	_, callErr := server.CheckBlockSubtrees(context.Background(), request)
+	require.NoError(t, callErr,
+		"liveness gate must return true for a fresh ReceivedAt stamp regardless of FSM being CATCHINGBLOCKS; "+
+			"if this fails the gate has regressed into consulting FSM state (PR #598 / #647 regression)")
+}
+
 func TestBlessMissingTransaction(t *testing.T) {
 	t.Run("SuccessfulBlessing", func(t *testing.T) {
 		server, cleanup := setupTestServer(t)

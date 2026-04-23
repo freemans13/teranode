@@ -60,6 +60,15 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	// Extract PeerID from request for tracking
 	peerID := request.PeerId
 
+	// Once-per-block liveness gate. If true, every per-subtree worker in this
+	// invocation skips the subtreeData download. In that path the per-subtree
+	// worker never populates subtreeTxs[subtreeIdx], so the block-level batch
+	// processTransactionsInLevels call is skipped entirely (batchTxCount == 0).
+	// Transaction resolution happens downstream in validation via the subtree
+	// manifest + UTXO/TxMetaCache, with per-tx fetch as the fallback for real
+	// misses (validator resolves each referenced tx hash on demand).
+	subtreeOnly := u.ShouldUseSubtreeOnlyPath(ctx, block.Hash())
+
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "CheckBlockSubtrees",
 		tracing.WithParentStat(u.stats),
 		tracing.WithHistogram(prometheusSubtreeValidationCheckSubtree),
@@ -257,6 +266,20 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					if err = u.subtreeStore.Set(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah)); err != nil {
 						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to store subtree", subtreeHash.String(), err)
 					}
+				}
+
+				if subtreeOnly {
+					// Gate is on and the block's header was received recently — skip
+					// the subtreeData download entirely, including the exact
+					// pre-allocation for subtreeTxs[subtreeIdx] (would otherwise
+					// allocate cap=subtreeToCheck.Length() per missing subtree, which
+					// is wasted memory on the gated path). Leaving subtreeTxs[subtreeIdx]
+					// as the zero-value nil slice also ensures the block-level batch
+					// processTransactionsInLevels call downstream is skipped
+					// (batchTxCount == 0). Transaction resolution happens later in
+					// validation via the subtree manifest + UTXO/TxMetaCache, with
+					// per-tx fetch as the fallback for real misses.
+					return nil
 				}
 
 				// PHASE 2: Exact pre-allocation

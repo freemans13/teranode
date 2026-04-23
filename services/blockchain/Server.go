@@ -107,6 +107,10 @@ type Blockchain struct {
 	// Blob deletion batch token management
 	batchTokens   map[string]*blobDeletionBatchToken // Active batch tokens
 	batchTokensMu sync.RWMutex                       // Mutex for batch tokens map
+
+	// receivedAt tracks the wall-clock time each block header was first seen by
+	// this node, used by the subtree-only liveness gate.
+	receivedAt *receivedAtStore
 }
 
 // blobDeletionBatchToken represents an acquired batch of deletions with a lock.
@@ -148,6 +152,18 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		logger.Errorf("[BlockAssembler] Couldn't create difficulty: %v", err)
 	}
 
+	// Only allocate the receivedAt store (and its background cleanup goroutine)
+	// when the liveness gate is actually enabled — nodes running with the
+	// default config pay zero memory / goroutine cost. The stamp and lookup
+	// methods are nil-safe, so call sites don't need extra guards beyond the
+	// gate-setting checks they already perform.
+	var receivedAt *receivedAtStore
+	if tSettings != nil &&
+		tSettings.SubtreeValidation.AssumeTxsBroadcastToAllNodes &&
+		tSettings.SubtreeValidation.LivenessWindow > 0 {
+		receivedAt = newReceivedAtStore(receivedAtTTL(tSettings.SubtreeValidation.LivenessWindow))
+	}
+
 	b := &Blockchain{
 		store:                         store,
 		logger:                        logger,
@@ -163,6 +179,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		AppCtx:                        ctx,
 		blocksFinalKafkaAsyncProducer: blocksFinalKafkaAsyncProducer,
 		batchTokens:                   make(map[string]*blobDeletionBatchToken),
+		receivedAt:                    receivedAt,
 	}
 
 	// Initialize subscription manager as not ready
@@ -757,6 +774,10 @@ func (b *Blockchain) sendInitialNotification(sub subscriber) {
 // Returns:
 // - Error if shutdown encounters issues, nil on successful shutdown
 func (b *Blockchain) Stop(_ context.Context) error {
+	// Release the receivedAt store's background cleanup goroutine (ticker).
+	// Safe on nil or double-call; important for tests and in-process restarts
+	// so we don't leak one goroutine per Blockchain instance.
+	b.receivedAt.Stop()
 	return nil
 }
 
@@ -841,6 +862,19 @@ func (b *Blockchain) AddBlock(ctx context.Context, request *blockchain_api.AddBl
 	ID, height, err := b.store.StoreBlock(ctx, block, request.PeerId, storeBlockOptions...)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
+	}
+
+	// Record first-seen time for the subtree-only liveness gate as a
+	// belt-and-braces fallback for paths that reach AddBlock without going
+	// through blockvalidation.BlockFound (e.g. locally mined blocks). Gated
+	// behind the operator-enabled flag so nodes that do not use the
+	// optimisation do not grow an in-memory map for every stored block during
+	// fast catchup. Stamping is write-once within the TTL, so the rare
+	// double-write (this call plus BlockFound) is a cheap no-op.
+	if b.settings != nil &&
+		b.settings.SubtreeValidation.AssumeTxsBroadcastToAllNodes &&
+		b.settings.SubtreeValidation.LivenessWindow > 0 {
+		b.receivedAt.stamp(block.Hash())
 	}
 
 	// Clear difficulty cache when chain state changes to prevent stale cached values
@@ -1225,6 +1259,48 @@ func (b *Blockchain) GetHashOfAncestorBlock(ctx context.Context, request *blockc
 	return &blockchain_api.GetHashOfAncestorBlockResponse{
 		Hash: hash[:],
 	}, nil
+}
+
+// GetHeaderReceivedAt returns the wall-clock timestamp this node first recorded
+// the given header, if still within the in-memory TTL.
+//
+// Returns found=false and received_at=nil for any hash we have no stamp for —
+// either because the header was never seen live, or because the stamp has
+// expired from the TTL-bounded store. Callers should treat "not found" the same
+// as "not live."
+func (b *Blockchain) GetHeaderReceivedAt(ctx context.Context, request *blockchain_api.GetHeaderReceivedAtRequest) (*blockchain_api.GetHeaderReceivedAtResponse, error) {
+	hash, err := chainhash.NewHash(request.BlockHash)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[GetHeaderReceivedAt] invalid block hash", err))
+	}
+
+	stamp, ok := b.receivedAt.lookup(hash)
+	if !ok {
+		return &blockchain_api.GetHeaderReceivedAtResponse{Found: false}, nil
+	}
+
+	return &blockchain_api.GetHeaderReceivedAtResponse{
+		Found:      true,
+		ReceivedAt: timestamppb.New(stamp),
+	}, nil
+}
+
+// ReportPeerBlockHeaderSeen records the current wall-clock time as the first-seen
+// stamp for the supplied header hash. Repeated calls for the same hash are no-ops.
+//
+// Called by blockvalidation.BlockFound so the subtree-only liveness gate has a
+// stamp to consult before subtreeData fetch decisions are made. Without this
+// pre-stamp, the gate would only see stamps written by AddBlock (after
+// validation completes), rendering the optimization a no-op.
+func (b *Blockchain) ReportPeerBlockHeaderSeen(_ context.Context, request *blockchain_api.ReportPeerBlockHeaderSeenRequest) (*emptypb.Empty, error) {
+	hash, err := chainhash.NewHash(request.BlockHash)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[ReportPeerBlockHeaderSeen] invalid block hash", err))
+	}
+
+	b.receivedAt.stamp(hash)
+
+	return &emptypb.Empty{}, nil
 }
 
 func (b *Blockchain) GetLatestBlockHeaderFromBlockLocatorRequest(ctx context.Context, request *blockchain_api.GetLatestBlockHeaderFromBlockLocatorRequest) (*blockchain_api.GetBlockHeaderResponse, error) {
