@@ -1,6 +1,7 @@
 package adaptivefetch
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -158,4 +159,34 @@ func TestRecord_OptToPess_RollingAverageTrip(t *testing.T) {
 	}
 	s.Record(Observation{TotalTxs: 10000, LocalHits: 9980, MissingFetches: 20, Mode: ModeOptimistic})
 	require.Equal(t, ModePessimistic, s.Mode())
+}
+
+func TestRecord_ConcurrentIsRaceClean(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                64,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    1000,
+		OptToPessAvgMissThreshold: 100,
+		BootstrapMode:             ModePessimistic,
+	}, "test")
+	require.NoError(t, err)
+
+	const goroutines = 16
+	const perGoroutine = 200
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, Mode: ModePessimistic})
+				_ = s.ShouldSkipSubtreeData()
+				_ = s.Mode()
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, ModeOptimistic, s.Mode())
 }
