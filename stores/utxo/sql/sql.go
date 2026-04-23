@@ -3546,14 +3546,34 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 		return nil
 	}
 
-	// Collect unique parent hashes for chunked IN query
-	parentHashes := make([][]byte, 0, len(needsByParent))
-	for h := range needsByParent {
-		hCopy := h
-		parentHashes = append(parentHashes, hCopy[:])
+	// Collect unique composite (parent_hash, idx) pairs needed for decoration.
+	// A valid tx won't reference the same outpoint twice, but dedup defensively
+	// so we don't waste bind params / chunks on malformed input; also matches
+	// BatchPreviousOutputsDecorate's shape.
+	//
+	// Preallocate to an upper bound on pairs (sum of all refs across parents).
+	// Post-dedup the slice may be smaller, but this keeps append() from growing
+	// the backing array for whole-block-sized input sets.
+	pairCap := 0
+	for _, refs := range needsByParent {
+		pairCap += len(refs)
+	}
+	pairs := make([]outpointPair, 0, pairCap)
+	for parentHash, refs := range needsByParent {
+		// Hoist the hash copy outside the inner loop so each parent's array
+		// escapes once, not once per unique referenced output.
+		hCopy := parentHash
+		hashSlice := hCopy[:]
+		seenIdx := make(map[uint32]struct{}, len(refs))
+		for _, ref := range refs {
+			if _, seen := seenIdx[ref.outIdx]; seen {
+				continue
+			}
+			seenIdx[ref.outIdx] = struct{}{}
+			pairs = append(pairs, outpointPair{hash: hashSlice, idx: ref.outIdx})
+		}
 	}
 
-	// Bulk query: fetch all needed outputs in chunks
 	type outputKey struct {
 		hash chainhash.Hash
 		idx  uint32
@@ -3562,9 +3582,11 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 		lockingScript []byte
 		satoshis      uint64
 	}
-	results := make(map[outputKey]*outputInfo)
+	results := make(map[outputKey]*outputInfo, len(pairs))
 
-	for chunkStart := 0; chunkStart < len(parentHashes); chunkStart += maxINClauseSize {
+	// Chunk in maxINClauseSize-sized batches; 400 pairs = 800 params, safely
+	// under SQLite's default 999 variable limit (and well under Postgres' 65535).
+	for chunkStart := 0; chunkStart < len(pairs); chunkStart += maxINClauseSize {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -3572,16 +3594,16 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 		}
 
 		chunkEnd := chunkStart + maxINClauseSize
-		if chunkEnd > len(parentHashes) {
-			chunkEnd = len(parentHashes)
+		if chunkEnd > len(pairs) {
+			chunkEnd = len(pairs)
 		}
-		chunk := parentHashes[chunkStart:chunkEnd]
+		chunk := pairs[chunkStart:chunkEnd]
 
-		inClause, args := buildINClause(chunk, 1)
+		inClause, args := buildCompositeINClause(chunk, 1)
 		q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
 			FROM outputs o
 			JOIN transactions t ON o.transaction_id = t.id
-			WHERE t.hash IN ` + inClause
+			WHERE (t.hash, o.idx) IN ` + inClause
 
 		rows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
@@ -3679,14 +3701,36 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		return nil
 	}
 
-	// Collect unique parent hashes into a slice for chunked querying
-	parentHashes := make([][]byte, 0, len(needsByParent))
-	for h := range needsByParent {
+	// Build the exact list of (parent-hash, output-index) pairs we need to fetch.
+	// Using a composite (t.hash, o.idx) IN predicate — instead of the older
+	// parent-hash IN predicate — avoids scanning every output of every referenced
+	// parent, which matters on data-carrier-heavy blocks where parents may have
+	// many MB of script bytes in unreferenced outputs.
+	//
+	// Preallocate to an upper bound on pairs (sum of all refs across parents).
+	// Post-dedup the slice may be smaller, but this keeps append() from growing
+	// the backing array for whole-block calls where refs can be in the tens of thousands.
+	estPairs := 0
+	for _, refs := range needsByParent {
+		estPairs += len(refs)
+	}
+	pairs := make([]outpointPair, 0, estPairs)
+	for h, refs := range needsByParent {
 		hCopy := h
-		parentHashes = append(parentHashes, hCopy[:])
+		hashSlice := hCopy[:]
+		// Deduplicate (hash, idx) pairs — the same output can be referenced by
+		// multiple inputs in a block, but we only need to fetch it once.
+		seenIdx := make(map[uint32]struct{}, len(refs))
+		for _, ref := range refs {
+			if _, seen := seenIdx[ref.outIdx]; seen {
+				continue
+			}
+			seenIdx[ref.outIdx] = struct{}{}
+			pairs = append(pairs, outpointPair{hash: hashSlice, idx: ref.outIdx})
+		}
 	}
 
-	// Query in chunks using IN clause
+	// Query in chunks using a composite IN clause.
 	// Result key: (parentHash, outputIdx) -> (lockingScript, satoshis)
 	type outputInfo struct {
 		lockingScript []byte
@@ -3696,9 +3740,13 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		hash chainhash.Hash
 		idx  uint32
 	}
-	results := make(map[outputKey]*outputInfo)
+	results := make(map[outputKey]*outputInfo, len(pairs))
 
-	for chunkStart := 0; chunkStart < len(parentHashes); chunkStart += maxINClauseSize {
+	// maxINClauseSize (400 pairs) is already a safe bound: each pair contributes
+	// two parameters so this caps bind params at 800, under SQLite's 999 limit
+	// and well under Postgres' 65535. Halving would double DB round-trips for
+	// large batches and defeat the batching benefit.
+	for chunkStart := 0; chunkStart < len(pairs); chunkStart += maxINClauseSize {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -3706,17 +3754,17 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		}
 
 		chunkEnd := chunkStart + maxINClauseSize
-		if chunkEnd > len(parentHashes) {
-			chunkEnd = len(parentHashes)
+		if chunkEnd > len(pairs) {
+			chunkEnd = len(pairs)
 		}
-		chunk := parentHashes[chunkStart:chunkEnd]
+		chunk := pairs[chunkStart:chunkEnd]
 
-		inClause, args := buildINClause(chunk, 1)
+		inClause, args := buildCompositeINClause(chunk, 1)
 
 		q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
 			FROM outputs o
 			JOIN transactions t ON o.transaction_id = t.id
-			WHERE t.hash IN ` + inClause
+			WHERE (t.hash, o.idx) IN ` + inClause
 
 		rows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
@@ -4897,6 +4945,30 @@ func buildINClause(hashes [][]byte, startIdx int) (string, []interface{}) {
 		args[i] = h
 	}
 	return "(" + strings.Join(placeholders, ",") + ")", args
+}
+
+// outpointPair represents a (transaction hash, output index) pair for a composite IN filter.
+type outpointPair struct {
+	hash []byte
+	idx  uint32
+}
+
+// buildCompositeINClause generates a composite row-tuple list for use in an IN clause
+// for a set of (hash, idx) pairs.
+// startIdx is the 1-based parameter index for the first placeholder ($startIdx, $startIdx+1, ...).
+// Returns the clause string like "(($3,$4),($5,$6))" and the args slice.
+// For empty input, returns ("", nil).
+func buildCompositeINClause(pairs []outpointPair, startIdx int) (string, []interface{}) {
+	if len(pairs) == 0 {
+		return "", nil
+	}
+	groups := make([]string, len(pairs))
+	args := make([]interface{}, 0, len(pairs)*2)
+	for i, p := range pairs {
+		groups[i] = fmt.Sprintf("($%d,$%d)", startIdx+(2*i), startIdx+(2*i)+1)
+		args = append(args, p.hash, p.idx)
+	}
+	return "(" + strings.Join(groups, ",") + ")", args
 }
 
 // buildMultiValueInsert generates a multi-row VALUES clause with positional parameters.

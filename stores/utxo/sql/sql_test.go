@@ -2221,3 +2221,33 @@ func TestUnspendSimple(t *testing.T) {
 	err = store.Unspend(ctx, []*utxo.Spend{spend})
 	require.NoError(t, err)
 }
+
+func TestBuildCompositeINClause(t *testing.T) {
+	t.Run("single pair", func(t *testing.T) {
+		pairs := []outpointPair{{hash: []byte{0x01, 0x02}, idx: 7}}
+		clause, args := buildCompositeINClause(pairs, 1)
+		require.Equal(t, "(($1,$2))", clause)
+		require.Equal(t, []interface{}{[]byte{0x01, 0x02}, uint32(7)}, args)
+	})
+
+	t.Run("multiple pairs preserve order", func(t *testing.T) {
+		pairs := []outpointPair{
+			{hash: []byte{0xaa}, idx: 0},
+			{hash: []byte{0xbb}, idx: 5},
+			{hash: []byte{0xcc}, idx: 9},
+		}
+		clause, args := buildCompositeINClause(pairs, 3)
+		require.Equal(t, "(($3,$4),($5,$6),($7,$8))", clause)
+		require.Equal(t, []interface{}{
+			[]byte{0xaa}, uint32(0),
+			[]byte{0xbb}, uint32(5),
+			[]byte{0xcc}, uint32(9),
+		}, args)
+	})
+
+	t.Run("empty pairs returns empty clause", func(t *testing.T) {
+		clause, args := buildCompositeINClause(nil, 1)
+		require.Equal(t, "", clause)
+		require.Nil(t, args)
+	})
+}
