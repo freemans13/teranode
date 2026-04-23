@@ -57,10 +57,11 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 		),
 	}
 	reg.MustRegister(m.modeGauge, m.hitRate, m.missesTotal, m.transitions)
-	// Initialise all series for this service so dashboards show a line even before first Record
-	// and so registry.Gather returns all metric families immediately.
+	// Initialise all series for this service so dashboards show a line even before first Record.
+	// Note: hitRate (histogram) is intentionally NOT pre-seeded — Observe() always records a real
+	// data point, so pre-seeding would poison the histogram with a fake 0% hit-rate entry.
+	// Gauges (Set) and counters (Add) are genuine no-ops at zero, so they are safe to initialise.
 	m.modeGauge.WithLabelValues(serviceName).Set(0)
-	m.hitRate.WithLabelValues(serviceName).Observe(0)
 	m.missesTotal.WithLabelValues(serviceName).Add(0)
 	m.transitions.WithLabelValues(serviceName, ModePessimistic.String(), ModeOptimistic.String()).Add(0)
 	m.transitions.WithLabelValues(serviceName, ModeOptimistic.String(), ModePessimistic.String()).Add(0)

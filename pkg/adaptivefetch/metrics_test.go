@@ -36,7 +36,10 @@ func TestMetrics_TransitionsCounter(t *testing.T) {
 
 func TestMetrics_RegisteredNamesMatchSpec(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	_ = newMetrics("test-service", reg)
+	m := newMetrics("test-service", reg)
+	// Seed one real observation so the histogram appears in Gather() output.
+	// (Histograms only show up after at least one Observe call — no pre-seeding in production.)
+	m.hitRate.WithLabelValues("test-service").Observe(0.5)
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
