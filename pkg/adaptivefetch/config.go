@@ -1,6 +1,9 @@
 package adaptivefetch
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Mode is the state of the adaptive fetch gate.
 type Mode int
@@ -48,6 +51,22 @@ type Config struct {
 
 	// BootstrapMode is the initial mode. ModeAuto resolves to ModePessimistic.
 	BootstrapMode Mode
+}
+
+// ParseBootstrapMode converts a settings string into a Mode. Empty string
+// and "auto" both resolve to ModeAuto. Unknown values return (ModeAuto, error)
+// so the caller can either surface the error or fall back silently.
+func ParseBootstrapMode(s string) (Mode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "auto":
+		return ModeAuto, nil
+	case "pessimistic":
+		return ModePessimistic, nil
+	case "optimistic":
+		return ModeOptimistic, nil
+	default:
+		return ModeAuto, fmt.Errorf("adaptivefetch: unknown bootstrap mode %q", s)
+	}
 }
 
 // Validate returns a non-nil error if cfg has nonsense values.

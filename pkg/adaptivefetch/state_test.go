@@ -248,6 +248,32 @@ func TestRecord_RingBufferWraparound(t *testing.T) {
 // Rationale: PR #598 was reverted via PR #647 because clock/FSM gating
 // cascaded under load. The adaptive-fetch design deliberately avoids
 // that whole class of bug by driving transitions solely from counts.
+func TestParseBootstrapMode(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Mode
+		err  bool
+	}{
+		{"pessimistic", ModePessimistic, false},
+		{"optimistic", ModeOptimistic, false},
+		{"auto", ModeAuto, false},
+		{"", ModeAuto, false},
+		{"Optimistic", ModeOptimistic, false},
+		{"nonsense", ModeAuto, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := ParseBootstrapMode(tc.in)
+			if tc.err {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
 func TestNoWallClockOrFSMDependency(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	require.NoError(t, err)
