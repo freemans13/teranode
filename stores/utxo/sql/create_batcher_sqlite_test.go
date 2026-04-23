@@ -1,0 +1,251 @@
+package sql
+
+import (
+	"context"
+	"net/url"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/require"
+)
+
+// setupSQLiteBatched builds a sqlitememory store with the create batcher
+// enabled (StoreBatcherSize > 1) so the SQLite create-batch path runs.
+func setupSQLiteBatched(t *testing.T) (*Store, context.Context) {
+	t.Helper()
+	ctx := context.Background()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.BatcherDrainMode = true
+	tSettings.UtxoStore.StoreBatcherSize = 8
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5
+
+	storeURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	store, err := New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+
+	require.NotNil(t, store.createBatcher,
+		"createBatcher must be initialised for sqlite when StoreBatcherSize > 1")
+
+	return store, ctx
+}
+
+// TestCreateBatcher_SQLite_Basic creates two distinct txs through the batcher
+// and verifies each is retrievable afterwards.
+func TestCreateBatcher_SQLite_Basic(t *testing.T) {
+	store, ctx := setupSQLiteBatched(t)
+
+	txs := []struct {
+		tx *bt.Tx
+	}{{tests.ParentTx}, {tests.Tx}}
+
+	for _, c := range txs {
+		_, err := store.Create(ctx, c.tx, 1000)
+		require.NoError(t, err)
+	}
+
+	for _, c := range txs {
+		meta, err := store.Get(ctx, c.tx.TxIDChainHash())
+		require.NoError(t, err)
+		require.NotNil(t, meta)
+	}
+}
+
+// TestCreateBatcher_SQLite_Duplicate verifies the batched path returns
+// ErrTxExists when the same tx is created twice.
+func TestCreateBatcher_SQLite_Duplicate(t *testing.T) {
+	store, ctx := setupSQLiteBatched(t)
+
+	_, err := store.Create(ctx, tests.Tx, 1000)
+	require.NoError(t, err)
+
+	_, err = store.Create(ctx, tests.Tx, 1000)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxExists),
+		"second Create of same tx should return ErrTxExists, got: %v", err)
+}
+
+// TestCreateBatcher_SQLite_Mined verifies that txs created with
+// MinedBlockInfo through the batcher have their block_ids populated.
+func TestCreateBatcher_SQLite_Mined(t *testing.T) {
+	store, ctx := setupSQLiteBatched(t)
+
+	_, err := store.Create(ctx, tests.Tx, 1000,
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+			BlockID: 100, BlockHeight: 1000, SubtreeIdx: 0, OnLongestChain: true,
+		}),
+	)
+	require.NoError(t, err)
+
+	meta, err := store.Get(ctx, tests.Tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Equal(t, []uint32{100}, meta.BlockIDs)
+}
+
+// TestSharedSuite_SQLite_Batched runs the shared stores/utxo/tests suite
+// against a SQLite store with the Create and Unlock batchers enabled.
+// If any test in this suite fails, the batched path has behavioural drift
+// from the unbatched path — that's a regression, not a perf concern.
+func TestSharedSuite_SQLite_Batched(t *testing.T) {
+	store, ctx := setupSQLiteBatched(t)
+
+	t.Run("Store", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Store(t, store)
+	})
+	t.Run("Spend", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Spend(t, store)
+	})
+	t.Run("Restore", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Restore(t, store)
+	})
+	t.Run("Freeze", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Freeze(t, store)
+	})
+	t.Run("ReAssign", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.ReAssign(t, store)
+	})
+	t.Run("SetMined", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.SetMined(t, store)
+	})
+	t.Run("Conflicting", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+		tests.Conflicting(t, store)
+	})
+}
+
+// TestCreateBatcher_SQLite_LargeBatch is a regression test for the SQLite
+// bind-parameter limit (SQLITE_MAX_VARIABLE_NUMBER, default 999). The
+// transactions INSERT uses 10 columns per row, so a single-statement
+// multi-row INSERT of ≥100 rows emits ≥1000 bind parameters and fails with
+// "too many SQL variables" unless the Phase 3 INSERT is chunked.
+//
+// Uses a batcher large enough that 128 concurrent Creates land in a single
+// batch (flushed on size, not on timeout), exercising the chunked code path.
+func TestCreateBatcher_SQLite_LargeBatch(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.BatcherDrainMode = true
+	tSettings.UtxoStore.StoreBatcherSize = 128
+	// Long duration so the batch only flushes when full — we want all 128
+	// items in one batch so the single-INSERT chunking path runs.
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5000
+
+	storeURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	store, err := New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+	require.NotNil(t, store.createBatcher)
+
+	const n = 128
+	txs := make([]*bt.Tx, n)
+	for i := 0; i < n; i++ {
+		tx := bt.NewTx()
+		// Unique satoshi amount per tx → unique txid.
+		require.NoError(t, tx.AddP2PKHOutputFromAddress(
+			"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", uint64(1000+i))) //nolint:gosec
+		txs[i] = tx
+	}
+
+	// Submit all creates concurrently so they queue into a single batch.
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(tx *bt.Tx) {
+			defer wg.Done()
+			_, cerr := store.Create(ctx, tx, 1000)
+			errCh <- cerr
+		}(txs[i])
+	}
+	wg.Wait()
+	close(errCh)
+
+	for cerr := range errCh {
+		require.NoError(t, cerr, "Create should succeed for all txs in a large batch (chunked INSERT path)")
+	}
+
+	// Spot-check a few txs are retrievable.
+	for _, idx := range []int{0, n / 2, n - 1} {
+		meta, gerr := store.Get(ctx, txs[idx].TxIDChainHash())
+		require.NoError(t, gerr)
+		require.NotNil(t, meta)
+	}
+}
+
+// TestCreateBatcher_SQLite_DuplicateInBatch verifies that when two Creates
+// for the same tx hash land in a single batch, exactly one succeeds and the
+// other returns ErrTxExists. Without per-batch deduplication, both preps
+// would find the hash in hashToID (ON CONFLICT DO NOTHING inserts once but
+// returns the row once) and both would be classified as successes — causing
+// duplicate child-row inserts and violating the ErrTxExists contract.
+func TestCreateBatcher_SQLite_DuplicateInBatch(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.BatcherDrainMode = true
+	tSettings.UtxoStore.StoreBatcherSize = 4
+	// Long duration so the two concurrent Creates land in one batch on size.
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5000
+
+	storeURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	store, err := New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+
+	// Build a unique tx.
+	tx := bt.NewTx()
+	require.NoError(t, tx.AddP2PKHOutputFromAddress(
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1234))
+
+	// Submit the same tx twice concurrently so both items enter the same batch.
+	const dupes = 4
+	errs := make(chan error, dupes)
+	var wg sync.WaitGroup
+	for i := 0; i < dupes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, cerr := store.Create(ctx, tx, 1000)
+			errs <- cerr
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	successCount, existsCount := 0, 0
+	for cerr := range errs {
+		switch {
+		case cerr == nil:
+			successCount++
+		case errors.Is(cerr, errors.ErrTxExists):
+			existsCount++
+		default:
+			t.Fatalf("unexpected error: %v", cerr)
+		}
+	}
+	require.Equal(t, 1, successCount, "exactly one create of duplicate-in-batch txs should succeed")
+	require.Equal(t, dupes-1, existsCount, "the rest should return ErrTxExists")
+}
