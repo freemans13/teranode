@@ -19,6 +19,15 @@ var (
 	prunerServiceMutex    sync.Mutex
 )
 
+// ResetPrunerServiceForTests resets the pruner service singleton. Only for
+// tests — the singleton captures a Store reference, so tests that Stop() their
+// store must reset between runs or subsequent tests see a closed pool.
+func ResetPrunerServiceForTests() {
+	prunerServiceMutex.Lock()
+	defer prunerServiceMutex.Unlock()
+	prunerServiceInstance = nil
+}
+
 // GetPrunerService returns a pruner service for the postgres store.
 func (s *Store) GetPrunerService() (pruner.Service, error) {
 	prunerServiceMutex.Lock()
