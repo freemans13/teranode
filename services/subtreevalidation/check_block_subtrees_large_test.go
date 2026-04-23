@@ -23,6 +23,7 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
@@ -34,6 +35,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -827,6 +829,13 @@ func setupLargeTestServer(t *testing.T, cacheDir string, subtreeStore blob.Store
 		Return(true, nil).Maybe()
 
 	// Create server with the topological order validator
+	af, _ := adaptivefetch.New(adaptivefetch.Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             adaptivefetch.ModePessimistic,
+	}, "test", prometheus.NewRegistry())
 	server := &Server{
 		logger:           logger,
 		settings:         tSettings,
@@ -835,6 +844,7 @@ func setupLargeTestServer(t *testing.T, cacheDir string, subtreeStore blob.Store
 		utxoStore:        utxoStore,
 		validatorClient:  topologicalValidator,
 		blockchainClient: mockBlockchainClient,
+		adaptiveFetch:    af,
 	}
 
 	// Initialize orphanage

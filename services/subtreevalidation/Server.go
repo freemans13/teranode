@@ -14,6 +14,7 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
@@ -31,6 +32,7 @@ import (
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/gocore"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -133,6 +135,10 @@ type Server struct {
 
 	// quorum manages distributed locking for subtree validation
 	quorum *Quorum
+
+	// adaptiveFetch tracks whether subtreeData downloads should be skipped
+	// when transactions are expected to already be in the local UTXO store via propagation.
+	adaptiveFetch *adaptivefetch.State
 }
 
 // New creates a new Server instance with the provided dependencies.
@@ -192,6 +198,32 @@ func New(
 	}
 
 	var err error
+
+	// Initialize adaptive fetch state machine
+	bootstrap, bootstrapErr := adaptivefetch.ParseBootstrapMode(tSettings.SubtreeValidation.AdaptiveFetch.BootstrapMode)
+	if bootstrapErr != nil {
+		logger.Warnf("[SubtreeValidation] unknown adaptive_fetch_bootstrap_mode %q, falling back to auto: %v",
+			tSettings.SubtreeValidation.AdaptiveFetch.BootstrapMode, bootstrapErr)
+		bootstrap = adaptivefetch.ModeAuto
+	}
+	af, afErr := adaptivefetch.New(adaptivefetch.Config{
+		WindowSize:                tSettings.SubtreeValidation.AdaptiveFetch.WindowSize,
+		PessToOptHitRateThreshold: tSettings.SubtreeValidation.AdaptiveFetch.PessToOptHitRateThreshold,
+		OptToPessMissThreshold:    tSettings.SubtreeValidation.AdaptiveFetch.OptToPessMissThreshold,
+		OptToPessAvgMissThreshold: tSettings.SubtreeValidation.AdaptiveFetch.OptToPessAvgMissThreshold,
+		BootstrapMode:             bootstrap,
+	}, "subtreevalidation", prometheus.DefaultRegisterer)
+	if afErr != nil {
+		logger.Errorf("[SubtreeValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults", afErr)
+		af, _ = adaptivefetch.New(adaptivefetch.Config{
+			WindowSize:                10,
+			PessToOptHitRateThreshold: 0.99,
+			OptToPessMissThreshold:    100,
+			OptToPessAvgMissThreshold: 10,
+			BootstrapMode:             adaptivefetch.ModeAuto,
+		}, "subtreevalidation", prometheus.DefaultRegisterer)
+	}
+	u.adaptiveFetch = af
 
 	// Initialize orphanage
 	u.orphanage, err = NewOrphanage(tSettings.SubtreeValidation.OrphanageTimeout, tSettings.SubtreeValidation.OrphanageMaxSize, logger)

@@ -18,6 +18,7 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
@@ -30,6 +31,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxometa "github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -1839,6 +1841,14 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	orphanage, err := NewOrphanage(time.Minute*10, 100, logger)
 	require.NoError(t, err)
 
+	af, _ := adaptivefetch.New(adaptivefetch.Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             adaptivefetch.ModePessimistic,
+	}, "test", prometheus.NewRegistry())
+
 	server := &Server{
 		logger:           logger,
 		settings:         testSettings,
@@ -1848,6 +1858,7 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 		validatorClient:  mockValidatorClient,
 		blockchainClient: mockBlockchainClient,
 		orphanage:        orphanage,
+		adaptiveFetch:    af,
 	}
 
 	return server, func() {
@@ -1898,6 +1909,13 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 			blockBytes, _ := block.Bytes()
 
 			// Create server
+			testAf, _ := adaptivefetch.New(adaptivefetch.Config{
+				WindowSize:                10,
+				PessToOptHitRateThreshold: 0.99,
+				OptToPessMissThreshold:    100,
+				OptToPessAvgMissThreshold: 10,
+				BootstrapMode:             adaptivefetch.ModePessimistic,
+			}, "test", prometheus.NewRegistry())
 			server := &Server{
 				settings:         testSettings,
 				logger:           ulogger.TestLogger{},
@@ -1905,6 +1923,7 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 				subtreeStore:     mockSubtreeStore,
 				txStore:          mockTxStore,
 				utxoStore:        mockUTXOStore,
+				adaptiveFetch:    testAf,
 			}
 
 			// Create request

@@ -16,9 +16,23 @@ type metrics struct {
 	transitions *prometheus.CounterVec
 }
 
+// registerOrReuse registers c with reg. If the metric is already registered,
+// it returns the previously-registered collector of the same type. This allows
+// production code to call New() more than once against prometheus.DefaultRegisterer
+// (e.g. in tests that call server.New() in multiple subtests) without panicking.
+func registerOrReuse[C prometheus.Collector](reg prometheus.Registerer, c C) C {
+	if err := reg.Register(c); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			return are.ExistingCollector.(C) //nolint:forcetypeassert // same type was registered
+		}
+		panic(err) // unexpected error — surface it
+	}
+	return c
+}
+
 func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 	m := &metrics{
-		modeGauge: prometheus.NewGaugeVec(
+		modeGauge: registerOrReuse(reg, prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: "teranode",
 				Subsystem: "adaptive_fetch",
@@ -26,8 +40,8 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 				Help:      "Current adaptive fetch mode (0=pessimistic, 1=optimistic), by service.",
 			},
 			[]string{"service"},
-		),
-		hitRate: prometheus.NewHistogramVec(
+		)),
+		hitRate: registerOrReuse(reg, prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Namespace: "teranode",
 				Subsystem: "adaptive_fetch",
@@ -36,8 +50,8 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 				Buckets:   []float64{0.0, 0.5, 0.9, 0.95, 0.99, 0.995, 1.0},
 			},
 			[]string{"service"},
-		),
-		missesTotal: prometheus.NewCounterVec(
+		)),
+		missesTotal: registerOrReuse(reg, prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: "teranode",
 				Subsystem: "adaptive_fetch",
@@ -45,8 +59,8 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 				Help:      "Running total of transactions recovered via processMissingTransactions, by service.",
 			},
 			[]string{"service"},
-		),
-		transitions: prometheus.NewCounterVec(
+		)),
+		transitions: registerOrReuse(reg, prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: "teranode",
 				Subsystem: "adaptive_fetch",
@@ -54,9 +68,8 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 				Help:      "Count of mode transitions, by service and direction.",
 			},
 			[]string{"service", "from", "to"},
-		),
+		)),
 	}
-	reg.MustRegister(m.modeGauge, m.hitRate, m.missesTotal, m.transitions)
 	// Initialise all series for this service so dashboards show a line even before first Record.
 	// Note: hitRate (histogram) is intentionally NOT pre-seeded — Observe() always records a real
 	// data point, so pre-seeding would poison the histogram with a fake 0% hit-rate entry.
