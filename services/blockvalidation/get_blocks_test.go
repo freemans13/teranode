@@ -3266,3 +3266,31 @@ func TestFetchBlocksConcurrently_BlockHeightIsSet(t *testing.T) {
 		}
 	})
 }
+
+func TestBlockvalidation_AdaptiveFetch_PessToOptToPess(t *testing.T) {
+	af, err := adaptivefetch.New(adaptivefetch.Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             adaptivefetch.ModePessimistic,
+	}, "test-e2e", prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	// 10 pessimistic blocks with perfect hit rate (simulates pessimistic-mode
+	// "fake-perfect" observations emitted by blockWorker).
+	for i := 0; i < 10; i++ {
+		af.Record(adaptivefetch.Observation{
+			TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0, Mode: adaptivefetch.ModePessimistic,
+		})
+	}
+	require.Equal(t, adaptivefetch.ModeOptimistic, af.Mode(),
+		"10 perfect pessimistic blocks must transition to optimistic")
+
+	// Single optimistic block with 500 missing-tx recoveries — immediate trip.
+	af.Record(adaptivefetch.Observation{
+		TotalTxs: 10000, LocalHits: 9500, MissingFetches: 500, Mode: adaptivefetch.ModeOptimistic,
+	})
+	require.Equal(t, adaptivefetch.ModePessimistic, af.Mode(),
+		"single 500-miss optimistic block must trip back to pessimistic")
+}
