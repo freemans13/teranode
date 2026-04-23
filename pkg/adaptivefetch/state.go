@@ -1,6 +1,10 @@
 package adaptivefetch
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // State is the adaptive fetch state machine. Safe for concurrent use.
 type State struct {
@@ -10,10 +14,14 @@ type State struct {
 	windowHead  int           // next write position
 	cfg         Config
 	serviceName string
+	metrics     *metrics
 }
 
-// New constructs a State with the given Config and a label used for metrics.
-func New(cfg Config, serviceName string) (*State, error) {
+// New constructs a State with the given Config, a label used for metrics, and
+// a prometheus.Registerer to register the four collectors against.
+// Pass prometheus.DefaultRegisterer in production and prometheus.NewRegistry()
+// in tests to avoid inter-test collector conflicts.
+func New(cfg Config, serviceName string, reg prometheus.Registerer) (*State, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -21,12 +29,27 @@ func New(cfg Config, serviceName string) (*State, error) {
 	if initial == ModeAuto {
 		initial = ModePessimistic
 	}
-	return &State{
+	m := newMetrics(serviceName, reg)
+	s := &State{
 		mode:        initial,
 		window:      make([]Observation, 0, cfg.WindowSize),
 		cfg:         cfg,
 		serviceName: serviceName,
-	}, nil
+		metrics:     m,
+	}
+	s.emitMode()
+	return s, nil
+}
+
+// emitMode updates the mode gauge to reflect s.mode. Callers must hold s.mu
+// (or be in a single-threaded context such as New). The prometheus GaugeVec
+// is itself concurrent-safe.
+func (s *State) emitMode() {
+	val := 0.0
+	if s.mode == ModeOptimistic {
+		val = 1.0
+	}
+	s.metrics.modeGauge.WithLabelValues(s.serviceName).Set(val)
 }
 
 // Mode returns the current mode.
@@ -44,7 +67,8 @@ func (s *State) ShouldSkipSubtreeData() bool {
 	return s.mode == ModeOptimistic
 }
 
-// Record adds an observation to the rolling window and may transition modes.
+// Record adds an observation to the rolling window, emits per-observation
+// metrics, and may transition modes.
 func (s *State) Record(obs Observation) {
 	// Defensive: ignore observations with nonsense counts. These should never
 	// occur in production but a silently-corrupted observation would skew the
@@ -70,7 +94,20 @@ func (s *State) Record(obs Observation) {
 		s.windowHead = (s.windowHead + 1) % s.cfg.WindowSize
 	}
 
+	// Per-observation metrics.
+	s.metrics.hitRate.WithLabelValues(s.serviceName).
+		Observe(float64(obs.LocalHits) / float64(obs.TotalTxs))
+	if obs.MissingFetches > 0 {
+		s.metrics.missesTotal.WithLabelValues(s.serviceName).
+			Add(float64(obs.MissingFetches))
+	}
+
+	prev := s.mode
 	s.maybeTransition()
+	if prev != s.mode {
+		s.metrics.transitions.WithLabelValues(s.serviceName, prev.String(), s.mode.String()).Inc()
+		s.emitMode()
+	}
 }
 
 func (s *State) maybeTransition() {

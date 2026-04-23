@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,7 +18,7 @@ func TestNew_ReturnsPessimisticByDefault(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModeAuto,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 	require.Equal(t, ModePessimistic, s.Mode())
 	require.False(t, s.ShouldSkipSubtreeData())
@@ -30,7 +31,7 @@ func TestNew_BootstrapOptimistic_StartsOptimistic(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModeOptimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 	require.Equal(t, ModeOptimistic, s.Mode())
 	require.True(t, s.ShouldSkipSubtreeData())
@@ -43,7 +44,7 @@ func TestNew_BootstrapAuto_ResolvesToPessimistic(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModeAuto,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 	require.Equal(t, ModePessimistic, s.Mode())
 }
@@ -75,7 +76,7 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := base
 			tc.mutate(&c)
-			_, err := New(c, "test")
+			_, err := New(c, "test", prometheus.NewRegistry())
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tc.needle)
 		})
@@ -89,7 +90,7 @@ func TestRecord_PessToOpt_HighHitRateFullWindow(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModePessimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	for i := 0; i < 4; i++ {
@@ -108,7 +109,7 @@ func TestRecord_PessStays_WhenHitRateBelowThreshold(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModePessimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, Mode: ModePessimistic})
@@ -124,7 +125,7 @@ func TestRecord_OptToPess_SingleBadBlockTrips(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModeOptimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 	require.Equal(t, ModeOptimistic, s.Mode())
 
@@ -139,7 +140,7 @@ func TestRecord_OptStays_WhenMissesBelowSingleBlockThreshold(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModeOptimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	s.Record(Observation{TotalTxs: 10000, LocalHits: 9950, MissingFetches: 50, Mode: ModeOptimistic})
@@ -153,7 +154,7 @@ func TestRecord_OptToPess_RollingAverageTrip(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModeOptimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	for i := 0; i < 4; i++ {
@@ -171,7 +172,7 @@ func TestRecord_ConcurrentIsRaceClean(t *testing.T) {
 		OptToPessMissThreshold:    1000,
 		OptToPessAvgMissThreshold: 100,
 		BootstrapMode:             ModePessimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	const goroutines = 16
@@ -201,7 +202,7 @@ func TestRecord_IgnoresInvalidObservations(t *testing.T) {
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModePessimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	// Each of these should be silently dropped — window should stay empty,
@@ -228,7 +229,7 @@ func TestRecord_RingBufferWraparound(t *testing.T) {
 		OptToPessMissThreshold:    1000, // never triggers
 		OptToPessAvgMissThreshold: 1000, // never triggers
 		BootstrapMode:             ModeOptimistic,
-	}, "test")
+	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	// Write 2×WindowSize observations to force wraparound. Mode should stay optimistic
