@@ -80,6 +80,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/ordishs/gocore"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -1178,15 +1179,37 @@ func (s *Store) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error {
 }
 
 // BatchPreviousOutputsDecorate fetches previous output information for inputs across
-// multiple transactions. The Aerospike implementation delegates to per-tx PreviousOutputsDecorate
-// which already uses an internal batcher for efficiency.
+// multiple transactions. The Aerospike implementation delegates to per-tx
+// PreviousOutputsDecorate, which puts each input into the shared outpointBatcher and
+// then waits for its own inputs' results. Calling PreviousOutputsDecorate concurrently
+// for each tx lets the outpointBatcher coalesce inputs across transactions into
+// larger Aerospike batch reads, which is critical on large blocks — a sequential
+// per-tx loop would lose that cross-tx batching and regress throughput.
 func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
-	for _, tx := range txs {
-		if err := s.PreviousOutputsDecorate(ctx, tx); err != nil {
-			return err
-		}
+	if len(txs) == 0 {
+		return nil
 	}
-	return nil
+
+	g, gCtx := errgroup.WithContext(ctx)
+	// Bound the number of concurrent per-tx goroutines. The outpointBatcher
+	// caps outstanding batch size internally, so we only need enough
+	// concurrency to keep it fed. Using the batcher's configured batch size as
+	// the concurrency ceiling keeps goroutine count bounded on huge blocks
+	// while still letting inputs from many txs pipeline into a single batch.
+	concurrency := s.settings.UtxoStore.OutpointBatcherSize
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	util.SafeSetLimit(g, concurrency)
+
+	for _, tx := range txs {
+		tx := tx
+		g.Go(func() error {
+			return s.PreviousOutputsDecorate(gCtx, tx)
+		})
+	}
+
+	return g.Wait()
 }
 
 func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {

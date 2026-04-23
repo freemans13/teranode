@@ -283,8 +283,7 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	subtrees = make([]*chainhash.Hash, 0)
 
 	var (
-		subtree    *subtreepkg.Subtree
-		legacyMode bool
+		subtree *subtreepkg.Subtree
 	)
 
 	// create 1 subtree + subtree.subtreeData
@@ -320,13 +319,31 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 			return nil, 0, err
 		}
 
-		if legacyMode, err = sm.blockchainClient.IsFSMCurrentState(sm.ctx, blockchain_api.FSMStateType_LEGACYSYNCING); err != nil {
-			sm.logger.Errorf("[prepareSubtrees] Failed to get current state: %s", err)
+		// Enable quickValidationMode when we're syncing on a known-good chain:
+		//   - LEGACYSYNCING: bsvd's headers-first path, only reachable below the
+		//     final hardcoded checkpoint, chain provably matches.
+		//   - CATCHINGBLOCKS (>10 blocks behind) + block at/below the final
+		//     checkpoint: same safety argument via the checkpoint anchor.
+		// Past the final checkpoint the quick path would skip subtree validation
+		// on tip blocks that lack a checkpoint anchor — not safe against forked
+		// or malicious peers. --nocheckpoints forces the anchor off entirely.
+		var inLegacySync, inCatchingBlocks bool
+		currentState, fsmErr := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
+		if fsmErr != nil {
+			sm.logger.Errorf("[prepareSubtrees] Failed to get FSM state: %s", fsmErr)
+		} else if currentState != nil {
+			inLegacySync = *currentState == blockchain_api.FSMStateType_LEGACYSYNCING
+			inCatchingBlocks = *currentState == blockchain_api.FSMStateType_CATCHINGBLOCKS
 		}
 
-		// quick validation mode is used when we are in legacy mode
-		// we can skip some of the processing since we assume the block is valid
-		quickValidationMode := legacyMode
+		belowFinalCheckpoint := false
+		if !sm.disableCheckpoints {
+			if cps := sm.chainParams.Checkpoints; len(cps) > 0 {
+				belowFinalCheckpoint = block.Height() <= cps[len(cps)-1].Height
+			}
+		}
+
+		quickValidationMode := inLegacySync || (inCatchingBlocks && belowFinalCheckpoint)
 
 		if quickValidationMode {
 			// Only in LEGACYSYNCING (LEGACY_SYNC mode) — fetch block ID upfront so UTXOs carry
