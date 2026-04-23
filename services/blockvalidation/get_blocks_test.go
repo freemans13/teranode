@@ -16,6 +16,7 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -25,6 +26,8 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jarcoal/httpmock"
+	"github.com/ordishs/gocore"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -3124,6 +3127,76 @@ func TestFetchAndStoreSubtreeDataEdgeCases(t *testing.T) {
 		err = suite.Server.fetchAndStoreSubtreeData(suite.Ctx, testBlock, &subtreeHash, subtree, "12D3KooWL1NF6fdTJ9cucEuwvuX8V8KtpJZZnUE4umdLBuK15eUZ", "http://test-peer")
 		assert.NoError(t, err)
 	})
+}
+
+func TestBlockWorker_Pessimistic_CallsFetchSubtreeData(t *testing.T) {
+	afState, err := adaptivefetch.New(adaptivefetch.Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             adaptivefetch.ModePessimistic,
+	}, "test-pess", prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	var fetchCalls atomic.Int32
+	server := &Server{
+		logger:        ulogger.TestLogger{},
+		stats:         gocore.NewStat("test-pess"),
+		adaptiveFetch: afState,
+	}
+	server.fetchSubtreeDataForBlockFn = func(ctx context.Context, b *model.Block, peerID, baseURL string) (map[string]struct{}, error) {
+		fetchCalls.Add(1)
+		return nil, nil
+	}
+
+	workQueue := make(chan workItem, 1)
+	resultQueue := make(chan resultItem, 1)
+
+	// Minimal fake block — just needs TransactionCount > 0 to drive the observation record.
+	fakeBlock := &model.Block{TransactionCount: 100}
+	workQueue <- workItem{block: fakeBlock, index: 0}
+	close(workQueue)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, server.blockWorker(ctx, 0, workQueue, resultQueue, "peer", "http://peer/", fakeBlock))
+	require.Equal(t, int32(1), fetchCalls.Load(), "pessimistic mode must call fetchSubtreeDataForBlock")
+}
+
+func TestBlockWorker_Optimistic_SkipsFetchSubtreeData(t *testing.T) {
+	afState, err := adaptivefetch.New(adaptivefetch.Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             adaptivefetch.ModeOptimistic,
+	}, "test-opt", prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	var fetchCalls atomic.Int32
+	server := &Server{
+		logger:        ulogger.TestLogger{},
+		stats:         gocore.NewStat("test-opt"),
+		adaptiveFetch: afState,
+	}
+	server.fetchSubtreeDataForBlockFn = func(ctx context.Context, b *model.Block, peerID, baseURL string) (map[string]struct{}, error) {
+		fetchCalls.Add(1)
+		return nil, nil
+	}
+
+	workQueue := make(chan workItem, 1)
+	resultQueue := make(chan resultItem, 1)
+	fakeBlock := &model.Block{TransactionCount: 100}
+	workQueue <- workItem{block: fakeBlock, index: 0}
+	close(workQueue)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, server.blockWorker(ctx, 0, workQueue, resultQueue, "peer", "http://peer/", fakeBlock))
+	require.Zero(t, fetchCalls.Load(), "optimistic mode must not call fetchSubtreeDataForBlock")
 }
 
 // TestFetchBlocksConcurrently_BlockHeightIsSet verifies that block.Height is set correctly
