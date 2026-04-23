@@ -44,6 +44,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -224,6 +225,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
 		if tSettings.BatcherDrainMode {
 			s.createBatcher.SetDrainMode(true)
+		}
+	}
+
+	// Initialize unlock batcher for Postgres — batches single-hash SetLocked(false) calls.
+	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.LockedBatcherSize > 1 {
+		unlockBatchSize := tSettings.UtxoStore.LockedBatcherSize
+		unlockBatchDuration := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
+		s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
+		if tSettings.BatcherDrainMode {
+			s.unlockBatcher.SetDrainMode(true)
 		}
 	}
 
@@ -1017,9 +1028,11 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 			}
 		}
 
+		// Close the batch reader — ensures all pipelined commits are finalized
+		// and visible to other connections before callers proceed.
 		closeErr := br.Close()
 		if closeErr != nil {
-			s.logger.Warnf("[sendCreateBatch] error closing batch results: %v", closeErr)
+			s.logger.Errorf("[sendCreateBatch] error closing batch results: %v", closeErr)
 		}
 
 		// Now signal callers — if Close() failed, override successes with errors
@@ -1032,14 +1045,19 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 				continue
 			}
 			if r.logError {
-				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %v", prepared[r.idx].txHash[:], r.result.Err)
+				s.logger.Errorf("[sendCreateBatch] CTE failed for tx %x: %+v", prepared[r.idx].txHash[:], r.result.Err)
 			}
 			batch[r.idx].done <- r.result
 		}
 
-		// Propagate close error so the connection is not returned to the pool
-		// and Phase 3 (conflicting children) does not run on an uncertain state.
-		return closeErr
+		// Return driver.ErrBadConn so database/sql discards the connection
+		// from the pool rather than reusing it, and Phase 3 (conflicting
+		// children) does not run on an uncertain state. The actual closeErr
+		// is already logged above.
+		if closeErr != nil {
+			return driver.ErrBadConn
+		}
+		return nil
 	})
 	if connErr != nil {
 		// Raw callback error — send to any items that haven't received a result yet
@@ -2999,15 +3017,58 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 		}
 	} else {
 		// Not on longest chain: clear delete_at_height, set locked = false
-		// Do NOT set unmined_since here — that's MarkTransactionsOnLongestChain's job
-		inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
-		qUpdate := fmt.Sprintf(`
-			UPDATE transactions
-			SET locked = false, delete_at_height = NULL
-			WHERE hash IN %s
-		`, inClause3)
-		if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
-			return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+		if minedBlockInfo.UnsetMined {
+			// UnsetMined path (block invalidation): unlock and clear delete_at_height
+			// for all affected transactions, then set unmined_since only for those
+			// with zero remaining block_ids.
+			// This mirrors the aerospike Lua which sets unmined_since = currentBlockHeight
+			// when #blocks == 0 after removing the block_id.
+			// Use the store's current block height (not the invalidated block's height)
+			// to match Aerospike's setMined UDF behavior.
+			currentBlockHeight := s.blockHeight.Load() + 1
+
+			// Step 1: Unlock and clear delete_at_height for all affected transactions
+			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
+			qUpdate := fmt.Sprintf(`
+				UPDATE transactions
+				SET locked = false
+				   ,delete_at_height = NULL
+				WHERE hash IN %s
+			`, inClause3)
+			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
+				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+			}
+
+			// Step 2: Set unmined_since only for transactions with no remaining block_ids
+			inClause3b, inArgs3b := buildINClause(existingHashBytes, 2)
+			qUpdateUnmined := fmt.Sprintf(`
+				WITH txs_without_blocks AS (
+					SELECT t.id
+					FROM transactions t
+					LEFT JOIN block_ids bi ON bi.transaction_id = t.id
+					WHERE t.hash IN %s
+					GROUP BY t.id
+					HAVING COUNT(bi.transaction_id) = 0
+				)
+				UPDATE transactions
+				SET unmined_since = $1
+				WHERE id IN (SELECT id FROM txs_without_blocks)
+			`, inClause3b)
+			args := append([]interface{}{currentBlockHeight}, inArgs3b...)
+			if _, err = txn.ExecContext(ctx, qUpdateUnmined, args...); err != nil {
+				return nil, errors.NewStorageError("SQL error updating unmined_since: %v", err)
+			}
+		} else {
+			// Normal not-on-longest-chain path: MarkTransactionsOnLongestChain handles unmined_since
+			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
+			qUpdate := fmt.Sprintf(`
+				UPDATE transactions
+				SET locked = false, delete_at_height = NULL
+				WHERE hash IN %s
+			`, inClause3)
+			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
+				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+			}
 		}
 	}
 
@@ -3892,6 +3953,22 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 			}
 		}
 		return nil
+	}
+
+	// Postgres: single-hash unlock → use batcher.
+	if s.unlockBatcher != nil && len(txHashes) == 1 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		done := make(chan error, 1)
+		s.unlockBatcher.Put(&batchUnlockItem{hash: txHashes[0], done: done})
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			s.logger.Warnf("[setLockedBatched] context cancelled while waiting for batcher result — unlock may or may not be applied")
+			return ctx.Err()
+		}
 	}
 
 	// Postgres: bulk unlock + DAH in chunked UPDATE statements
@@ -4877,4 +4954,26 @@ func isLockError(err error) bool {
 	return strings.Contains(errStr, "database is locked") ||
 		strings.Contains(errStr, "deadlock") ||
 		strings.Contains(errStr, "lock timeout")
+}
+
+// sendUnlockBatch processes a batch of SetLocked(false) calls via setUnlockedBulk,
+// which chunks large batches into multiple UPDATE statements (maxINClauseSize=400).
+func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
+	ctx := s.ctx
+
+	if len(batch) == 1 {
+		hashes := []chainhash.Hash{batch[0].hash}
+		batch[0].done <- s.setUnlockedBulk(ctx, hashes)
+		return
+	}
+
+	hashes := make([]chainhash.Hash, len(batch))
+	for i, item := range batch {
+		hashes[i] = item.hash
+	}
+
+	err := s.setUnlockedBulk(ctx, hashes)
+	for _, item := range batch {
+		item.done <- err
+	}
 }
