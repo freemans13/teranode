@@ -46,6 +46,20 @@ func (s *State) ShouldSkipSubtreeData() bool {
 
 // Record adds an observation to the rolling window and may transition modes.
 func (s *State) Record(obs Observation) {
+	// Defensive: ignore observations with nonsense counts. These should never
+	// occur in production but a silently-corrupted observation would skew the
+	// rolling average and either block a Pess→Opt transition or spuriously
+	// trigger one.
+	if obs.TotalTxs <= 0 {
+		return
+	}
+	if obs.LocalHits < 0 || obs.LocalHits > obs.TotalTxs {
+		return
+	}
+	if obs.MissingFetches < 0 {
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -102,9 +116,6 @@ func (s *State) lastIndexLocked() int {
 func (s *State) avgHitRateLocked() float64 {
 	var sum float64
 	for _, o := range s.window {
-		if o.TotalTxs == 0 {
-			continue
-		}
 		sum += float64(o.LocalHits) / float64(o.TotalTxs)
 	}
 	return sum / float64(len(s.window))

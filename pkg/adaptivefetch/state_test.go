@@ -194,6 +194,51 @@ func TestRecord_ConcurrentIsRaceClean(t *testing.T) {
 	require.Equal(t, ModeOptimistic, s.Mode())
 }
 
+func TestRecord_IgnoresInvalidObservations(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                3,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModePessimistic,
+	}, "test")
+	require.NoError(t, err)
+
+	// Each of these should be silently dropped — window should stay empty,
+	// so a subsequent Pess→Opt should not fire until 3 VALID observations arrive.
+	s.Record(Observation{TotalTxs: 0, LocalHits: 0, Mode: ModePessimistic})
+	s.Record(Observation{TotalTxs: -5, LocalHits: 10, Mode: ModePessimistic})
+	s.Record(Observation{TotalTxs: 100, LocalHits: -1, Mode: ModePessimistic})
+	s.Record(Observation{TotalTxs: 100, LocalHits: 200, Mode: ModePessimistic}) // LocalHits > TotalTxs
+	s.Record(Observation{TotalTxs: 100, LocalHits: 50, MissingFetches: -1, Mode: ModePessimistic})
+
+	require.Equal(t, ModePessimistic, s.Mode(), "invalid observations must not alter window")
+
+	// Now 3 valid perfect observations must be enough to flip Pess→Opt (WindowSize=3).
+	s.Record(Observation{TotalTxs: 100, LocalHits: 100, Mode: ModePessimistic})
+	s.Record(Observation{TotalTxs: 100, LocalHits: 100, Mode: ModePessimistic})
+	s.Record(Observation{TotalTxs: 100, LocalHits: 100, Mode: ModePessimistic})
+	require.Equal(t, ModeOptimistic, s.Mode())
+}
+
+func TestRecord_RingBufferWraparound(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                3,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    1000, // never triggers
+		OptToPessAvgMissThreshold: 1000, // never triggers
+		BootstrapMode:             ModeOptimistic,
+	}, "test")
+	require.NoError(t, err)
+
+	// Write 2×WindowSize observations to force wraparound. Mode should stay optimistic
+	// because all observations are clean.
+	for i := 0; i < 6; i++ {
+		s.Record(Observation{TotalTxs: 100, LocalHits: 100, MissingFetches: 0, Mode: ModeOptimistic})
+	}
+	require.Equal(t, ModeOptimistic, s.Mode())
+}
+
 // TestNoWallClockOrFSMDependency pins the design invariant that the gate
 // is NOT driven by FSM state or wall-clock time. If a future edit imports
 // blockchain_api for FSM checks or time for age-based logic inside this

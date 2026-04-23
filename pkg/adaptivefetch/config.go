@@ -7,12 +7,12 @@ type Mode int
 
 const (
 	// ModePessimistic always fetches subtreeData (safe, higher bandwidth).
-	ModePessimistic Mode = iota
+	ModePessimistic Mode = 0
 	// ModeOptimistic skips subtreeData and recovers missing txs individually.
-	ModeOptimistic
+	ModeOptimistic Mode = 1
 	// ModeAuto is a bootstrap-only value meaning "start pessimistic".
 	// Must not appear as the runtime mode on State.
-	ModeAuto
+	ModeAuto Mode = 2
 )
 
 // String is used for metric labels and log messages.
