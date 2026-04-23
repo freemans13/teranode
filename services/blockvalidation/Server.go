@@ -27,6 +27,7 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/blockvalidation_api"
@@ -45,6 +46,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/ordishs/gocore"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -165,6 +167,10 @@ type Server struct {
 	// stats tracks operational metrics for monitoring and troubleshooting
 	stats *gocore.Stat
 
+	// adaptiveFetch controls whether subtreeData is pre-fetched during catchup
+	// or skipped because the tx distributor is keeping the UTXO store up to date.
+	adaptiveFetch *adaptivefetch.State
+
 	// peerCircuitBreakers manages circuit breakers for each peer to prevent
 	// cascading failures and protect against misbehaving peers
 	peerCircuitBreakers *catchup.PeerCircuitBreakers
@@ -282,6 +288,40 @@ func New(
 		logger.Infof("Fork %s resolved to %s at height %d with %d blocks", resolution.ForkID, resolution.ResolvedTo, resolution.FinalHeight, resolution.BlocksInFork)
 	})
 
+	// Construct adaptive-fetch state machine. The gate decides whether to
+	// pre-fetch subtreeData during catchup or skip it because the tx
+	// distributor is keeping our UTXO store up to date. Transitions are
+	// driven purely by counts observed during normal work — no FSM state,
+	// no wall-clock time. See docs/superpowers/specs/2026-04-23-adaptive-subtreedata-fetch-design.md.
+	bootstrap, bootstrapErr := adaptivefetch.ParseBootstrapMode(tSettings.BlockValidation.AdaptiveFetch.BootstrapMode)
+	if bootstrapErr != nil {
+		logger.Warnf("[BlockValidation] unknown adaptive_fetch_bootstrap_mode %q, falling back to auto: %v",
+			tSettings.BlockValidation.AdaptiveFetch.BootstrapMode, bootstrapErr)
+		bootstrap = adaptivefetch.ModeAuto
+	}
+	af, afErr := adaptivefetch.New(adaptivefetch.Config{
+		WindowSize:                tSettings.BlockValidation.AdaptiveFetch.WindowSize,
+		PessToOptHitRateThreshold: tSettings.BlockValidation.AdaptiveFetch.PessToOptHitRateThreshold,
+		OptToPessMissThreshold:    tSettings.BlockValidation.AdaptiveFetch.OptToPessMissThreshold,
+		OptToPessAvgMissThreshold: tSettings.BlockValidation.AdaptiveFetch.OptToPessAvgMissThreshold,
+		BootstrapMode:             bootstrap,
+	}, "blockvalidation", prometheus.DefaultRegisterer)
+	if afErr != nil {
+		// New returns an error only on invalid Config. The defaults we
+		// provide in settings/adaptivefetch_settings.go pass validation,
+		// so this branch triggers only if an operator sets a nonsense
+		// value in settings_local.conf. Fall back to hardcoded defaults —
+		// adaptive-fetch is an optimisation, not a correctness gate.
+		logger.Errorf("[BlockValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults", afErr)
+		af, _ = adaptivefetch.New(adaptivefetch.Config{
+			WindowSize:                10,
+			PessToOptHitRateThreshold: 0.99,
+			OptToPessMissThreshold:    100,
+			OptToPessAvgMissThreshold: 10,
+			BootstrapMode:             adaptivefetch.ModeAuto,
+		}, "blockvalidation", prometheus.DefaultRegisterer)
+	}
+
 	bVal := &Server{
 		logger:              logger,
 		settings:            tSettings,
@@ -298,6 +338,7 @@ func New(
 		catchupCh:           make(chan processBlockCatchup, tSettings.BlockValidation.CatchupChBufferSize),
 		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](ttlcache.WithTTL[chainhash.Hash, []processBlockCatchup](10 * time.Minute)),
+		adaptiveFetch:       af,
 		stats:               gocore.NewStat("blockvalidation"),
 		kafkaConsumerClient: kafkaConsumerClient,
 		peerCircuitBreakers: catchup.NewPeerCircuitBreakers(*cbConfig),
