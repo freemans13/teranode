@@ -49,7 +49,6 @@ func (s *State) Record(obs Observation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Append to ring buffer.
 	if len(s.window) < s.cfg.WindowSize {
 		s.window = append(s.window, obs)
 	} else {
@@ -57,5 +56,29 @@ func (s *State) Record(obs Observation) {
 		s.windowHead = (s.windowHead + 1) % s.cfg.WindowSize
 	}
 
-	// Transitions implemented in later tasks.
+	s.maybeTransition()
+}
+
+func (s *State) maybeTransition() {
+	if len(s.window) < s.cfg.WindowSize {
+		return
+	}
+
+	switch s.mode {
+	case ModePessimistic:
+		if s.avgHitRateLocked() >= s.cfg.PessToOptHitRateThreshold {
+			s.mode = ModeOptimistic
+		}
+	}
+}
+
+func (s *State) avgHitRateLocked() float64 {
+	var sum float64
+	for _, o := range s.window {
+		if o.TotalTxs == 0 {
+			continue
+		}
+		sum += float64(o.LocalHits) / float64(o.TotalTxs)
+	}
+	return sum / float64(len(s.window))
 }

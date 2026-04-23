@@ -77,3 +77,38 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestRecord_PessToOpt_HighHitRateFullWindow(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                5,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModePessimistic,
+	}, "test")
+	require.NoError(t, err)
+
+	for i := 0; i < 4; i++ {
+		s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0, Mode: ModePessimistic})
+		require.Equal(t, ModePessimistic, s.Mode(), "block %d: window not full, must stay pessimistic", i)
+	}
+
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0, Mode: ModePessimistic})
+	require.Equal(t, ModeOptimistic, s.Mode())
+}
+
+func TestRecord_PessStays_WhenHitRateBelowThreshold(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                3,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModePessimistic,
+	}, "test")
+	require.NoError(t, err)
+
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, Mode: ModePessimistic})
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, Mode: ModePessimistic})
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 950, Mode: ModePessimistic})
+	require.Equal(t, ModePessimistic, s.Mode())
+}
