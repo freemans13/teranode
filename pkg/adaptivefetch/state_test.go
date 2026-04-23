@@ -141,3 +141,21 @@ func TestRecord_OptStays_WhenMissesBelowSingleBlockThreshold(t *testing.T) {
 	s.Record(Observation{TotalTxs: 10000, LocalHits: 9950, MissingFetches: 50, Mode: ModeOptimistic})
 	require.Equal(t, ModeOptimistic, s.Mode())
 }
+
+func TestRecord_OptToPess_RollingAverageTrip(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                5,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeOptimistic,
+	}, "test")
+	require.NoError(t, err)
+
+	for i := 0; i < 4; i++ {
+		s.Record(Observation{TotalTxs: 10000, LocalHits: 9980, MissingFetches: 20, Mode: ModeOptimistic})
+		require.Equal(t, ModeOptimistic, s.Mode(), "block %d: window not full yet", i)
+	}
+	s.Record(Observation{TotalTxs: 10000, LocalHits: 9980, MissingFetches: 20, Mode: ModeOptimistic})
+	require.Equal(t, ModePessimistic, s.Mode())
+}

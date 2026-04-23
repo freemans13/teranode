@@ -75,7 +75,21 @@ func (s *State) maybeTransition() {
 			s.mode = ModePessimistic
 			return
 		}
+		if len(s.window) < s.cfg.WindowSize {
+			return
+		}
+		if s.avgMissesLocked() > s.cfg.OptToPessAvgMissThreshold {
+			s.mode = ModePessimistic
+		}
 	}
+}
+
+func (s *State) avgMissesLocked() float64 {
+	var sum int
+	for _, o := range s.window {
+		sum += o.MissingFetches
+	}
+	return float64(sum) / float64(len(s.window))
 }
 
 func (s *State) lastIndexLocked() int {
