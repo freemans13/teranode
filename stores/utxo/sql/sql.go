@@ -4221,11 +4221,12 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		return nil
 	}
 
-	// Build the exact list of (parent-hash, output-index) pairs we need to fetch.
-	// Using a composite (t.hash, o.idx) IN predicate — instead of the older
-	// parent-hash IN predicate — avoids scanning every output of every referenced
-	// parent, which matters on data-carrier-heavy blocks where parents may have
-	// many MB of script bytes in unreferenced outputs.
+	// Build the exact list of (parent-hash, output-index) pairs we need to fetch
+	// and an index mapping each pair to the input slots it must populate. Using a
+	// composite (t.hash, o.idx) IN predicate — instead of the older parent-hash IN
+	// predicate — avoids scanning every output of every referenced parent, which
+	// matters on data-carrier-heavy blocks where parents may have many MB of
+	// script bytes in unreferenced outputs.
 	//
 	// Preallocate to an upper bound on pairs (sum of all refs across parents).
 	// Post-dedup the slice may be smaller, but this keeps append() from growing
@@ -4235,100 +4236,145 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		estPairs += len(refs)
 	}
 	pairs := make([]outpointPair, 0, estPairs)
+	// pairToRefs[i] holds every input slot that needs to be populated from
+	// pairs[i]. One pair can satisfy multiple inputs (same outpoint referenced
+	// by more than one tx in the block), so the slice-of-slices is required.
+	// Keeping this per-pair means each chunk worker writes only into the input
+	// slots its own pairs cover, so parallel workers never touch the same slot
+	// and no synchronisation is needed between them.
+	pairToRefs := make([][]inputRef, 0, estPairs)
 	for h, refs := range needsByParent {
 		hCopy := h
 		hashSlice := hCopy[:]
-		// Deduplicate (hash, idx) pairs — the same output can be referenced by
-		// multiple inputs in a block, but we only need to fetch it once.
-		seenIdx := make(map[uint32]struct{}, len(refs))
+		// Group refs by output index so we can attach each pair to every ref
+		// that needs it (a parent output referenced by N inputs fetches once
+		// and dispatches to all N slots).
+		byIdx := make(map[uint32][]inputRef, len(refs))
 		for _, ref := range refs {
-			if _, seen := seenIdx[ref.outIdx]; seen {
-				continue
-			}
-			seenIdx[ref.outIdx] = struct{}{}
-			pairs = append(pairs, outpointPair{hash: hashSlice, idx: ref.outIdx})
+			byIdx[ref.outIdx] = append(byIdx[ref.outIdx], ref)
+		}
+		for idx, idxRefs := range byIdx {
+			pairs = append(pairs, outpointPair{hash: hashSlice, idx: idx})
+			pairToRefs = append(pairToRefs, idxRefs)
 		}
 	}
 
-	// Query in chunks using a composite IN clause.
-	// Result key: (parentHash, outputIdx) -> (lockingScript, satoshis)
-	type outputInfo struct {
-		lockingScript []byte
-		satoshis      uint64
+	// Chunk the pair list, picking a size that fits comfortably under the
+	// dialect's bind-parameter limit:
+	//   - SQLite caps parameters at 999, and each pair uses 2 placeholders, so
+	//     400 pairs = 800 params keeps headroom.
+	//   - Postgres caps at 65535; fewer, larger queries win because the planner
+	//     fuses the IN list and we save round-trips. 4000 pairs = 8000 params.
+	chunkSize := maxINClauseSize
+	if s.engine == string(util.Postgres) {
+		chunkSize = postgresBatchDecorateChunkSize
 	}
-	type outputKey struct {
-		hash chainhash.Hash
-		idx  uint32
+	if batchDecorateChunkSizeOverride > 0 {
+		chunkSize = batchDecorateChunkSizeOverride
 	}
-	results := make(map[outputKey]*outputInfo, len(pairs))
 
-	// maxINClauseSize (400 pairs) is already a safe bound: each pair contributes
-	// two parameters so this caps bind params at 800, under SQLite's 999 limit
-	// and well under Postgres' 65535. Halving would double DB round-trips for
-	// large batches and defeat the batching benefit.
-	for chunkStart := 0; chunkStart < len(pairs); chunkStart += maxINClauseSize {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	// Parallelise chunk queries when configured: each chunk fetches a disjoint
+	// set of pairs, and the per-pair input slots in `pairToRefs` are disjoint
+	// across chunks by construction, so workers write directly into
+	// tx.Inputs[] without any shared state. `missingInputs` is the only
+	// cross-worker counter and uses atomic.Int64.
+	concurrency := s.settings.UtxoStore.BatchPreviousOutputsDecorateConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
 
-		chunkEnd := chunkStart + maxINClauseSize
+	var missingInputs atomic.Int64
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(g, concurrency)
+
+	for chunkStart := 0; chunkStart < len(pairs); chunkStart += chunkSize {
+		chunkEnd := chunkStart + chunkSize
 		if chunkEnd > len(pairs) {
 			chunkEnd = len(pairs)
 		}
-		chunk := pairs[chunkStart:chunkEnd]
+		chunkPairs := pairs[chunkStart:chunkEnd]
+		chunkRefs := pairToRefs[chunkStart:chunkEnd]
 
-		inClause, args := buildCompositeINClause(chunk, 1)
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+			}
 
-		q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
-			FROM outputs o
-			JOIN transactions t ON o.transaction_id = t.id
-			WHERE (t.hash, o.idx) IN ` + inClause
+			inClause, args := buildCompositeINClause(chunkPairs, 1)
+			q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
+				FROM outputs o
+				JOIN transactions t ON o.transaction_id = t.id
+				WHERE (t.hash, o.idx) IN ` + inClause
 
-		rows, err := s.db.QueryContext(ctx, q, args...)
-		if err != nil {
-			return err
-		}
-
-		for rows.Next() {
-			var hashBytes []byte
-			var idx uint32
-			var lockingScript []byte
-			var satoshis uint64
-			if err := rows.Scan(&hashBytes, &idx, &lockingScript, &satoshis); err != nil {
-				rows.Close()
+			rows, err := s.db.QueryContext(gCtx, q, args...)
+			if err != nil {
 				return err
 			}
-			var h chainhash.Hash
-			copy(h[:], hashBytes)
-			results[outputKey{hash: h, idx: idx}] = &outputInfo{
-				lockingScript: lockingScript,
-				satoshis:      satoshis,
+			defer rows.Close()
+
+			// Build a lookup from (hash, idx) to the index within this chunk so
+			// we can map each returned row back to its pairToRefs entry.
+			type chunkKey struct {
+				hash chainhash.Hash
+				idx  uint32
 			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
+			chunkIndex := make(map[chunkKey]int, len(chunkPairs))
+			for i, p := range chunkPairs {
+				var h chainhash.Hash
+				copy(h[:], p.hash)
+				chunkIndex[chunkKey{hash: h, idx: p.idx}] = i
+			}
+
+			found := make([]bool, len(chunkPairs))
+			for rows.Next() {
+				var hashBytes []byte
+				var idx uint32
+				var lockingScript []byte
+				var satoshis uint64
+				if err := rows.Scan(&hashBytes, &idx, &lockingScript, &satoshis); err != nil {
+					return err
+				}
+				var h chainhash.Hash
+				copy(h[:], hashBytes)
+				i, ok := chunkIndex[chunkKey{hash: h, idx: idx}]
+				if !ok {
+					// Postgres can return rows we didn't ask for only if the
+					// query is wrong; defend anyway.
+					continue
+				}
+				found[i] = true
+				for _, ref := range chunkRefs[i] {
+					txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxScript = bscript.NewFromBytes(lockingScript)
+					txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxSatoshis = satoshis
+				}
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+
+			// Count any pairs the DB didn't return a row for; each maps to one
+			// or more input slots still missing after this chunk.
+			var localMissing int64
+			for i, ok := range found {
+				if !ok {
+					localMissing += int64(len(chunkRefs[i]))
+				}
+			}
+			if localMissing > 0 {
+				missingInputs.Add(localMissing)
+			}
+			return nil
+		})
 	}
 
-	// Map results back to inputs
-	var missingInputs int
-	for parentHash, refs := range needsByParent {
-		for _, ref := range refs {
-			key := outputKey{hash: parentHash, idx: ref.outIdx}
-			if info, ok := results[key]; ok {
-				txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxScript = bscript.NewFromBytes(info.lockingScript)
-				txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxSatoshis = info.satoshis
-			} else {
-				missingInputs++
-			}
-		}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
-	if missingInputs > 0 {
-		return errors.NewProcessingError("failed to decorate previous outputs: %d inputs could not be resolved", missingInputs)
+	if m := missingInputs.Load(); m > 0 {
+		return errors.NewProcessingError("failed to decorate previous outputs: %d inputs could not be resolved", m)
 	}
 
 	return nil
@@ -5448,6 +5494,20 @@ func (s *Store) RawDB() *usql.DB {
 const maxPostgresParams = 999
 
 const maxINClauseSize = 400
+
+// postgresBatchDecorateChunkSize is used by BatchPreviousOutputsDecorate when
+// the store is backed by Postgres. Postgres allows up to 65535 bind parameters
+// per statement; each (hash, idx) pair uses 2 params, so 4000 pairs → 8000
+// params, well under the limit. Larger chunks cut the number of round-trips by
+// ~10× on a typical 1800-tx block, which is the dominant factor in per-block
+// wall time during legacy sync. SQLite keeps maxINClauseSize (400) to stay
+// under its 999-param default.
+const postgresBatchDecorateChunkSize = 4000
+
+// batchDecorateChunkSizeOverride is set by tests to force a smaller chunk size
+// so the multi-chunk path is exercised without building 400+ fixtures. Zero
+// means "use the engine-appropriate default". Never set in production.
+var batchDecorateChunkSizeOverride int
 
 // buildINClause generates a SQL IN clause placeholder string and corresponding args.
 // startIdx is the 1-based parameter index for the first placeholder ($startIdx, $startIdx+1, ...).

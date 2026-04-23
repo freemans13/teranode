@@ -398,6 +398,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockHeightRetention:               getUint32("utxostore_blockHeightRetention", globalBlockHeightRetention, alternativeContext...),
 			UnminedTxRetention:                 getUint32("utxostore_unminedTxRetention", globalBlockHeightRetention/2, alternativeContext...),
 			ParentPreservationBlocks:           getUint32("utxostore_parentPreservationBlocks", blocksInADayOnAverage*10, alternativeContext...),
+			BatchPreviousOutputsDecorateConcurrency: getInt("utxostore_batchPreviousOutputsDecorateConcurrency", 4, alternativeContext...),
 			OutpointBatcherSize:                getInt("utxostore_outpointBatcherSize", 100, alternativeContext...),
 			OutpointBatcherDurationMillis:      getInt("utxostore_outpointBatcherDurationMillis", 10, alternativeContext...),
 			SpendBatcherDurationMillis:         getInt("utxostore_spendBatcherDurationMillis", 100, alternativeContext...),
