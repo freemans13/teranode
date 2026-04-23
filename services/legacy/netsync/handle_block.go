@@ -345,6 +345,44 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 		quickValidationMode := inLegacySync || (inCatchingBlocks && belowFinalCheckpoint)
 
+		// Lazily construct the subtree write batcher on the first catch-up block.
+		//
+		// The batcher is gated on quickValidationMode for two reasons:
+		//   1. Reader durability contract: outside quick mode, CheckBlockSubtrees
+		//      reads each subtree file synchronously after writeSubtree returns.
+		//      Coalescing would leave the file in the batcher's in-memory buffer
+		//      when the reader asks for it. Quick mode skips that reader, so
+		//      there is no same-session consumer expecting immediate durability.
+		//   2. Memory footprint: writeSubtreeDirect streams payloads straight to
+		//      filestorer; the batcher must materialise each blob as []byte so
+		//      it can hold items across block boundaries. That's a bounded cost
+		//      for checkpoint-anchored historical catch-up, but an unbounded
+		//      liability on arbitrary-size tip blocks.
+		//
+		// Additionally gated on SubtreeWriteBatchBlocks > 1: at the default
+		// batchBlocks=1 the batcher flushes after every block anyway (3 items =
+		// 1 block * 3), so we gain no cross-block coalescing — but we would
+		// still pay the cost of calling subtreeData.Serialize(), which can
+		// allocate ~10.9 GB for the largest historical blocks. writeSubtreeDirect
+		// streams subtreeData via WriteTransactionsToWriter and avoids that
+		// allocation. So at batchBlocks=1 we skip the batcher entirely and let
+		// writeSubtree dispatch straight to writeSubtreeDirect. The batcher is
+		// only constructed when operators explicitly opt in to cross-block
+		// coalescing (batchBlocks>1), in which case they have accepted the
+		// materialisation cost for the perf benefit.
+		//
+		// Safety: prepareSubtrees is only ever called from the blockHandler
+		// goroutine (single-threaded block processing path), so no mutex is
+		// needed around the batcher pointer.
+		if quickValidationMode && sm.subtreeWriteBatcher == nil && sm.settings.Legacy.SubtreeWriteBatchBlocks > 1 {
+			sm.subtreeWriteBatcher = NewSubtreeWriteBatcher(
+				sm.settings.Legacy.SubtreeWriteBatchBlocks,
+				sm.settings.Legacy.SubtreeWriteBatchWait,
+				sm.logger,
+				sm.flushSubtreeWriteBatch,
+			)
+		}
+
 		if quickValidationMode {
 			// Only in LEGACYSYNCING (LEGACY_SYNC mode) — fetch block ID upfront so UTXOs carry
 			// mined info from creation. This ID is threaded through to blockvalidation via
@@ -407,7 +445,117 @@ func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, block *bsvutil
 	return nil
 }
 
+// writeSubtree dispatches subtree blob persistence to the batcher when it
+// is active, otherwise falls through to the synchronous writeSubtreeDirect
+// path.
+//
+// Only quickValidationMode blocks go through the batcher. In any other mode
+// (steady-state RUNNING, or catch-up blocks past the final checkpoint once
+// PR #723 lands) CheckBlockSubtrees reads each subtree file immediately
+// after this function returns, so the writes must be on disk synchronously;
+// and the direct path's streaming semantics avoid materialising
+// potentially-huge tip-block payloads in memory. See the comment on the
+// batcher construction in prepareSubtrees for the full rationale.
+//
+// When quickValidationMode flips to false mid-session (e.g. FSM transitions
+// out of catch-up and back to RUNNING), drain and retire the batcher so
+// subsequent blocks take the synchronous path with no lost items.
 func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,
+	subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta, quickValidationMode bool) error {
+	if !quickValidationMode && sm.subtreeWriteBatcher != nil {
+		err := sm.subtreeWriteBatcher.Stop(ctx)
+		sm.subtreeWriteBatcher = nil
+		if err != nil {
+			// Fail fast: if the drain failed there may be buffered subtree
+			// items that never made it to disk, and subsequent validation
+			// readers would see missing blobs. Surface the error instead
+			// of silently falling through to the direct path.
+			return errors.NewStorageError("[writeSubtree] draining SubtreeWriteBatcher on quickValidationMode transition", err)
+		}
+	}
+	if sm.subtreeWriteBatcher == nil {
+		return sm.writeSubtreeDirect(ctx, block, subtree, subtreeData, subtreeMetaData, quickValidationMode)
+	}
+
+	// Note: the batched path pre-serializes each payload to []byte before submitting.
+	// writeSubtreeDirect streams to avoid large intermediate allocations for big blocks
+	// (subtreeData.Serialize() can produce a multi-GB buffer on the largest historical
+	// blocks), but coalescing requires the full payload in memory so the batcher can
+	// submit it across block boundaries. This memory cost is why the batcher is
+	// constructed only when SubtreeWriteBatchBlocks > 1 (see prepareSubtrees):
+	// operators opting in to cross-block coalescing accept the materialisation cost,
+	// while the default configuration (batchBlocks=1) bypasses the batcher entirely
+	// and goes through writeSubtreeDirect's streaming path.
+	//
+	// The batched path must only be reached when batchBlocks>1; if sm.subtreeWriteBatcher
+	// is non-nil here, we trust prepareSubtrees' gating.
+	dah := uint32(block.Height()) + sm.settings.GlobalBlockHeightRetention //nolint:gosec
+	treeRootHash := *subtree.RootHash()
+	dataRootHash := *subtreeData.RootHash()
+
+	treeFileType := fileformat.FileTypeSubtreeToCheck
+	if quickValidationMode {
+		treeFileType = fileformat.FileTypeSubtree
+	}
+
+	// Check existence for all three blobs before serialising. When re-processing
+	// blocks, skipping Serialize() on blobs that are already on disk saves the
+	// worst-case allocation — subtreeData.Serialize() alone can produce a
+	// multi-GB buffer on the largest historical blocks. flushSubtreeWriteBatch
+	// is still defensive against ErrBlobAlreadyExists inside NewFileStorer, but
+	// catching it here avoids the allocation entirely.
+	// Context fields for every error in this path — mirrors the
+	// writeSubtreeDirect formatting so operators can trace a failing blob
+	// from a single log line.
+	blockHashStr := block.Hash().String()
+	blockHeight := block.Height()
+	subtreeRootStr := subtree.RootHash().String()
+	dataRootStr := dataRootHash.String()
+
+	treeExists, err := sm.subtreeStore.Exists(ctx, treeRootHash[:], treeFileType)
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] check subtree exists: block_hash=%s block_height=%d subtree_root=%s file_type=%s", blockHashStr, blockHeight, subtreeRootStr, treeFileType, err)
+	}
+	dataExists, err := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeData)
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] check subtree data exists: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
+	}
+	metaExists, err := sm.subtreeStore.Exists(ctx, dataRootHash[:], fileformat.FileTypeSubtreeMeta)
+	if err != nil {
+		return errors.NewStorageError("[writeSubtree] check subtree meta exists: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
+	}
+
+	if !treeExists {
+		subtreeBytes, err := subtree.Serialize()
+		if err != nil {
+			return errors.NewStorageError("[writeSubtree] serialize subtree: block_hash=%s block_height=%d subtree_root=%s file_type=%s", blockHashStr, blockHeight, subtreeRootStr, treeFileType, err)
+		}
+		if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindTree, FileType: treeFileType, RootHash: treeRootHash, Bytes: subtreeBytes, DeleteAt: dah}); err != nil {
+			return errors.NewStorageError("[writeSubtree] submit subtree: block_hash=%s block_height=%d subtree_root=%s file_type=%s", blockHashStr, blockHeight, subtreeRootStr, treeFileType, err)
+		}
+	}
+	if !dataExists {
+		dataBytes, err := subtreeData.Serialize()
+		if err != nil {
+			return errors.NewStorageError("[writeSubtree] serialize subtree data: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
+		}
+		if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindData, RootHash: dataRootHash, Bytes: dataBytes, DeleteAt: dah}); err != nil {
+			return errors.NewStorageError("[writeSubtree] submit subtree data: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
+		}
+	}
+	if !metaExists {
+		metaBytes, err := subtreeMetaData.Serialize()
+		if err != nil {
+			return errors.NewStorageError("[writeSubtree] serialize subtree meta: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
+		}
+		if err := sm.subtreeWriteBatcher.Submit(ctx, SubtreeWriteItem{Kind: SubtreeKindMeta, RootHash: dataRootHash, Bytes: metaBytes, DeleteAt: dah}); err != nil {
+			return errors.NewStorageError("[writeSubtree] submit subtree meta: block_hash=%s block_height=%d subtree_root=%s data_root=%s", blockHashStr, blockHeight, subtreeRootStr, dataRootStr, err)
+		}
+	}
+	return nil
+}
+
+func (sm *SyncManager) writeSubtreeDirect(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,
 	subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta, quickValidationMode bool) error {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "writeSubtree",
 		tracing.WithLogMessage(sm.logger, "[writeSubtree][%s] writing subtree for block %s height %d", subtree.RootHash().String(), block.Hash().String(), block.Height()),
@@ -574,6 +722,71 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, s
 		return nil
 	})
 
+	return g.Wait()
+}
+
+// flushSubtreeWriteBatch is the SubtreeWriteBatcher flush callback. It writes each item
+// to the subtreeStore concurrently, bounded to 8 parallel writes.
+func (sm *SyncManager) flushSubtreeWriteBatch(ctx context.Context, items []SubtreeWriteItem) error {
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(g, 8)
+
+	for _, item := range items {
+		item := item
+		g.Go(func() error {
+			// rootHash is formatted once per item and used as a stable, searchable
+			// identifier in every error message so operators can grep logs for the
+			// failing blob without cross-referencing batch offsets.
+			rootHash := chainhash.Hash(item.RootHash).String()
+
+			var fileType fileformat.FileType
+			switch item.Kind {
+			case SubtreeKindTree:
+				fileType = item.FileType
+			case SubtreeKindData:
+				fileType = fileformat.FileTypeSubtreeData
+			case SubtreeKindMeta:
+				// Mirror the existence check from writeSubtreeDirect: skip if already present
+				// (e.g., created by block assembly via P2P).
+				exists, err := sm.subtreeStore.Exists(gCtx, item.RootHash[:], fileformat.FileTypeSubtreeMeta)
+				if err != nil {
+					return errors.NewStorageError("flushSubtreeWriteBatch: check meta exists (kind=%d hash=%s)", item.Kind, rootHash, err)
+				}
+				if exists {
+					return nil
+				}
+				fileType = fileformat.FileTypeSubtreeMeta
+			default:
+				return errors.NewProcessingError("flushSubtreeWriteBatch: unknown SubtreeKind %d (hash=%s)", item.Kind, rootHash)
+			}
+
+			storer, err := filestorer.NewFileStorer(
+				gCtx, sm.logger, sm.settings, sm.subtreeStore,
+				item.RootHash[:], fileType,
+				options.WithDeleteAt(item.DeleteAt),
+			)
+			if err != nil {
+				if errors.Is(err, errors.ErrBlobAlreadyExists) {
+					return nil
+				}
+				return errors.NewStorageError("flushSubtreeWriteBatch: create file (kind=%d type=%s hash=%s)", item.Kind, fileType, rootHash, err)
+			}
+			var ok bool
+			defer func() {
+				if !ok {
+					storer.Abort(errors.NewProcessingError("flushSubtreeWriteBatch: write aborted (kind=%d type=%s hash=%s)", item.Kind, fileType, rootHash))
+				}
+			}()
+			if _, err := storer.Write(item.Bytes); err != nil {
+				return errors.NewStorageError("flushSubtreeWriteBatch: write (kind=%d type=%s hash=%s)", item.Kind, fileType, rootHash, err)
+			}
+			if err := storer.Close(gCtx); err != nil {
+				return errors.NewStorageError("flushSubtreeWriteBatch: close (kind=%d type=%s hash=%s)", item.Kind, fileType, rootHash, err)
+			}
+			ok = true
+			return nil
+		})
+	}
 	return g.Wait()
 }
 
