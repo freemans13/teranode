@@ -1,6 +1,9 @@
 package adaptivefetch
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -189,4 +192,39 @@ func TestRecord_ConcurrentIsRaceClean(t *testing.T) {
 	wg.Wait()
 
 	require.Equal(t, ModeOptimistic, s.Mode())
+}
+
+// TestNoWallClockOrFSMDependency pins the design invariant that the gate
+// is NOT driven by FSM state or wall-clock time. If a future edit imports
+// blockchain_api for FSM checks or time for age-based logic inside this
+// package, this test's grep-style check fails and forces a review.
+//
+// Rationale: PR #598 was reverted via PR #647 because clock/FSM gating
+// cascaded under load. The adaptive-fetch design deliberately avoids
+// that whole class of bug by driving transitions solely from counts.
+func TestNoWallClockOrFSMDependency(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+
+	forbidden := []string{
+		`"time"`,
+		"blockchain_api",
+		"FSMStateType",
+		"time.Now",
+		"time.Since",
+	}
+
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(f)
+		require.NoError(t, err)
+		src := string(data)
+		for _, needle := range forbidden {
+			require.NotContainsf(t, src, needle,
+				"adaptivefetch package must not reference %q (found in %s). "+
+					"See TestNoWallClockOrFSMDependency docstring for why.", needle, f)
+		}
+	}
 }
