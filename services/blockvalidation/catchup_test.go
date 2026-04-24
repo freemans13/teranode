@@ -3103,13 +3103,9 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
 	}
 
-	testAF, _ := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                10,
-		PessToOptHitRateThreshold: 0.99,
-		OptToPessMissThreshold:    100,
-		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             adaptivefetch.ModePessimistic,
-	}, "test", prometheus.NewRegistry())
+	testAFCfg := adaptivefetch.DefaultConfig()
+	testAFCfg.BootstrapMode = adaptivefetch.ModePessimistic
+	testAF, _ := adaptivefetch.New(testAFCfg, "test", prometheus.NewRegistry())
 
 	server := &Server{
 		logger:              ulogger.TestLogger{},
@@ -3218,13 +3214,9 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 		circuitBreakers = catchup.NewPeerCircuitBreakers(*config.CircuitBreakerConfig)
 	}
 
-	testAFWithConfig, _ := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                10,
-		PessToOptHitRateThreshold: 0.99,
-		OptToPessMissThreshold:    100,
-		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             adaptivefetch.ModePessimistic,
-	}, "test", prometheus.NewRegistry())
+	testAFWithConfigCfg := adaptivefetch.DefaultConfig()
+	testAFWithConfigCfg.BootstrapMode = adaptivefetch.ModePessimistic
+	testAFWithConfig, _ := adaptivefetch.New(testAFWithConfigCfg, "test", prometheus.NewRegistry())
 
 	server := &Server{
 		logger:              ulogger.TestLogger{},

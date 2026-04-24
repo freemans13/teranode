@@ -215,13 +215,7 @@ func New(
 	}, "subtreevalidation", prometheus.DefaultRegisterer)
 	if afErr != nil {
 		logger.Errorf("[SubtreeValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults", afErr)
-		af, _ = adaptivefetch.New(adaptivefetch.Config{
-			WindowSize:                10,
-			PessToOptHitRateThreshold: 0.99,
-			OptToPessMissThreshold:    100,
-			OptToPessAvgMissThreshold: 10,
-			BootstrapMode:             adaptivefetch.ModeAuto,
-		}, "subtreevalidation", prometheus.DefaultRegisterer)
+		af, _ = adaptivefetch.New(adaptivefetch.DefaultConfig(), "subtreevalidation", prometheus.DefaultRegisterer)
 	}
 	u.adaptiveFetch = af
 

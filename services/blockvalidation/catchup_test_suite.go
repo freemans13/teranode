@@ -128,13 +128,9 @@ func (s *CatchupTestSuite) createServer(t *testing.T) {
 
 	// Build a minimal adaptive-fetch state (pessimistic, never transitions in tests)
 	// so that blockWorker can safely call adaptiveFetch.ShouldSkipSubtreeData().
-	af, _ := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                10,
-		PessToOptHitRateThreshold: 0.99,
-		OptToPessMissThreshold:    100,
-		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             adaptivefetch.ModePessimistic,
-	}, "test", prometheus.NewRegistry())
+	afCfg := adaptivefetch.DefaultConfig()
+	afCfg.BootstrapMode = adaptivefetch.ModePessimistic
+	af, _ := adaptivefetch.New(afCfg, "test", prometheus.NewRegistry())
 
 	// Create server
 	s.Server = &Server{

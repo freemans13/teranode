@@ -300,3 +300,16 @@ func TestNoWallClockOrFSMDependency(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	require.NoError(t, cfg.Validate(), "DefaultConfig must pass Validate")
+
+	// Pin the semantics — changing these values is a behaviour change that
+	// should be reviewed explicitly. Not a locked contract, but a speed bump.
+	require.Equal(t, 10, cfg.WindowSize)
+	require.InDelta(t, 0.99, cfg.PessToOptHitRateThreshold, 0.0001)
+	require.Equal(t, 100, cfg.OptToPessMissThreshold)
+	require.InDelta(t, 10.0, cfg.OptToPessAvgMissThreshold, 0.0001)
+	require.Equal(t, ModeAuto, cfg.BootstrapMode)
+}

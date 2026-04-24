@@ -242,13 +242,23 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				continue
 			}
 
-			// Record an observation for the adaptive-fetch state machine.
-			// In pessimistic mode we've just fetched subtreeData successfully,
-			// so record a "perfect" observation (all txs effectively local via
-			// the download). This drives the rolling hit rate toward the Pess→Opt
-			// threshold. In optimistic mode we skipped the fetch entirely; any
-			// missing-tx recovery happens at the subtree-validation layer which
-			// maintains its own adaptive-fetch state.
+			// Record a synthetic observation for the adaptive-fetch state machine.
+			//
+			// Pessimistic mode does not actually measure hit rate here — we just
+			// stamp every successful subtreeData fetch as LocalHits=TotalTxs. This
+			// is a deliberate simplification: blockvalidation's catchup layer does
+			// not naturally know how many txs were already local. The Pess→Opt
+			// transition therefore effectively fires after WindowSize consecutive
+			// successful pessimistic blocks — it's a "wait until the node has
+			// proven stable, then try optimistic" gate, not a real measurement.
+			//
+			// Opt→Pess is where real safety lives. In optimistic mode we skipped
+			// the fetch entirely; if txs are genuinely missing, downstream
+			// validation fails and the block errors. Operational response is to
+			// restart the node, which auto-bootstraps pessimistic. A future
+			// improvement would plumb real miss counts through the validation
+			// path so Opt→Pess can trip based on observed recovery rate without
+			// needing a restart.
 			txCount := 0
 			if work.block != nil {
 				txCount = int(work.block.TransactionCount)

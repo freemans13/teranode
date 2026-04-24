@@ -318,13 +318,7 @@ func New(
 		// value in settings_local.conf. Fall back to hardcoded defaults —
 		// adaptive-fetch is an optimisation, not a correctness gate.
 		logger.Errorf("[BlockValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults", afErr)
-		af, _ = adaptivefetch.New(adaptivefetch.Config{
-			WindowSize:                10,
-			PessToOptHitRateThreshold: 0.99,
-			OptToPessMissThreshold:    100,
-			OptToPessAvgMissThreshold: 10,
-			BootstrapMode:             adaptivefetch.ModeAuto,
-		}, "blockvalidation", prometheus.DefaultRegisterer)
+		af, _ = adaptivefetch.New(adaptivefetch.DefaultConfig(), "blockvalidation", prometheus.DefaultRegisterer)
 	}
 
 	bVal := &Server{

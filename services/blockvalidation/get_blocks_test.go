@@ -3130,13 +3130,9 @@ func TestFetchAndStoreSubtreeDataEdgeCases(t *testing.T) {
 }
 
 func TestBlockWorker_Pessimistic_CallsFetchSubtreeData(t *testing.T) {
-	afState, err := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                10,
-		PessToOptHitRateThreshold: 0.99,
-		OptToPessMissThreshold:    100,
-		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             adaptivefetch.ModePessimistic,
-	}, "test-pess", prometheus.NewRegistry())
+	afStateCfg := adaptivefetch.DefaultConfig()
+	afStateCfg.BootstrapMode = adaptivefetch.ModePessimistic
+	afState, err := adaptivefetch.New(afStateCfg, "test-pess", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	var fetchCalls atomic.Int32
@@ -3166,13 +3162,9 @@ func TestBlockWorker_Pessimistic_CallsFetchSubtreeData(t *testing.T) {
 }
 
 func TestBlockWorker_Optimistic_SkipsFetchSubtreeData(t *testing.T) {
-	afState, err := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                10,
-		PessToOptHitRateThreshold: 0.99,
-		OptToPessMissThreshold:    100,
-		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             adaptivefetch.ModeOptimistic,
-	}, "test-opt", prometheus.NewRegistry())
+	afStateOptCfg := adaptivefetch.DefaultConfig()
+	afStateOptCfg.BootstrapMode = adaptivefetch.ModeOptimistic
+	afState, err := adaptivefetch.New(afStateOptCfg, "test-opt", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	var fetchCalls atomic.Int32
@@ -3268,13 +3260,9 @@ func TestFetchBlocksConcurrently_BlockHeightIsSet(t *testing.T) {
 }
 
 func TestBlockvalidation_AdaptiveFetch_PessToOptToPess(t *testing.T) {
-	af, err := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                10,
-		PessToOptHitRateThreshold: 0.99,
-		OptToPessMissThreshold:    100,
-		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             adaptivefetch.ModePessimistic,
-	}, "test-e2e", prometheus.NewRegistry())
+	afE2ECfg := adaptivefetch.DefaultConfig()
+	afE2ECfg.BootstrapMode = adaptivefetch.ModePessimistic
+	af, err := adaptivefetch.New(afE2ECfg, "test-e2e", prometheus.NewRegistry())
 	require.NoError(t, err)
 
 	// 10 pessimistic blocks with perfect hit rate (simulates pessimistic-mode

@@ -69,6 +69,21 @@ func ParseBootstrapMode(s string) (Mode, error) {
 	}
 }
 
+// DefaultConfig returns the canonical default configuration. Both services
+// use this as a fallback when operator-provided settings fail validation,
+// and tests use it to build representative State instances without
+// duplicating the 6-line literal. Tune thresholds here rather than in
+// caller-side literals so the defaults stay in one place.
+func DefaultConfig() Config {
+	return Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeAuto,
+	}
+}
+
 // Validate returns a non-nil error if cfg has nonsense values.
 func (c Config) Validate() error {
 	if c.WindowSize < 1 {

@@ -1841,13 +1841,9 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	orphanage, err := NewOrphanage(time.Minute*10, 100, logger)
 	require.NoError(t, err)
 
-	af, _ := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                10,
-		PessToOptHitRateThreshold: 0.99,
-		OptToPessMissThreshold:    100,
-		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             adaptivefetch.ModePessimistic,
-	}, "test", prometheus.NewRegistry())
+	afCfg := adaptivefetch.DefaultConfig()
+	afCfg.BootstrapMode = adaptivefetch.ModePessimistic
+	af, _ := adaptivefetch.New(afCfg, "test", prometheus.NewRegistry())
 
 	server := &Server{
 		logger:           logger,
@@ -1909,13 +1905,9 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 			blockBytes, _ := block.Bytes()
 
 			// Create server
-			testAf, _ := adaptivefetch.New(adaptivefetch.Config{
-				WindowSize:                10,
-				PessToOptHitRateThreshold: 0.99,
-				OptToPessMissThreshold:    100,
-				OptToPessAvgMissThreshold: 10,
-				BootstrapMode:             adaptivefetch.ModePessimistic,
-			}, "test", prometheus.NewRegistry())
+			testAfCfg := adaptivefetch.DefaultConfig()
+			testAfCfg.BootstrapMode = adaptivefetch.ModePessimistic
+			testAf, _ := adaptivefetch.New(testAfCfg, "test", prometheus.NewRegistry())
 			server := &Server{
 				settings:         testSettings,
 				logger:           ulogger.TestLogger{},

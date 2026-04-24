@@ -554,13 +554,9 @@ func TestServer_catchup(t *testing.T) {
 
 		subtreeStore := blobmemory.New()
 
-		testAF, _ := adaptivefetch.New(adaptivefetch.Config{
-			WindowSize:                10,
-			PessToOptHitRateThreshold: 0.99,
-			OptToPessMissThreshold:    100,
-			OptToPessAvgMissThreshold: 10,
-			BootstrapMode:             adaptivefetch.ModePessimistic,
-		}, "test", prometheus.NewRegistry())
+		testAFCfg := adaptivefetch.DefaultConfig()
+		testAFCfg.BootstrapMode = adaptivefetch.ModePessimistic
+		testAF, _ := adaptivefetch.New(testAFCfg, "test", prometheus.NewRegistry())
 
 		server := &Server{
 			logger:              logger,

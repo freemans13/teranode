@@ -319,14 +319,20 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 				}
 
-				// Record an observation for the adaptive-fetch state machine.
-				// Pessimistic-mode observations are "perfect" (we fetched/extracted so
-				// LocalHits=TotalTxs, MissingFetches=0) — this drives Pess→Opt via the
-				// rolling hit rate. Optimistic-mode observations record
-				// MissingFetches=0 for now; the real Opt→Pess trip will come when a
-				// missing tx bubbles up through processTransactionsInLevels and the
-				// block validation fails — at which point operators will see metrics
-				// and the next run will start pessimistic.
+				// Record a synthetic observation for the adaptive-fetch state machine.
+				//
+				// Neither mode currently measures real hit rate at this layer:
+				// pessimistic-mode observations stamp LocalHits=TotalTxs,
+				// optimistic-mode observations stamp MissingFetches=0. The Pess→Opt
+				// transition therefore fires after WindowSize consecutive subtrees
+				// have been processed (a "wait then try" gate, not a measurement).
+				// The Opt→Pess transition will not fire from observations alone —
+				// it relies on downstream processTransactionsInLevels surfacing a
+				// validation error, the block failing, and operator response /
+				// node restart auto-bootstrapping pessimistic. A future improvement
+				// would plumb real UTXO hit counts and processMissingTransactions
+				// recovery counts through this path so the state machine can
+				// self-correct without a restart.
 				txCount := subtreeToCheck.Length()
 				if txCount > 0 {
 					mode := adaptivefetch.ModePessimistic
