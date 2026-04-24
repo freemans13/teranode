@@ -101,6 +101,18 @@ func (m *mockCache) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, o
 func (m *mockCache) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
 	metas := make([]*meta.Data, len(txs))
 	errs := make([]error, len(txs))
+
+	// Validate opts length up-front per the utxo.Store contract:
+	// accepted shapes are 0, 1, or len(txs). Any other length is a
+	// programming error and must return an error for every slot.
+	if len(opts) > 1 && len(opts) != len(txs) {
+		err := errors.NewProcessingError("CreateBatch: opts length %d matches neither 0, 1, nor len(txs)=%d", len(opts), len(txs))
+		for i := range errs {
+			errs[i] = err
+		}
+		return metas, errs
+	}
+
 	for i, tx := range txs {
 		var o []utxo.CreateOption
 		switch len(opts) {

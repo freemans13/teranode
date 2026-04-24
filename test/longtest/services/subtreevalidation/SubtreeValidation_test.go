@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	stv "github.com/bsv-blockchain/teranode/services/subtreevalidation"
@@ -64,6 +65,18 @@ func (t *testUtxoStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint3
 func (t *testUtxoStore) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*utxometa.Data, []error) {
 	metas := make([]*utxometa.Data, len(txs))
 	errs := make([]error, len(txs))
+
+	// Validate opts length up-front per the utxo.Store contract:
+	// accepted shapes are 0, 1, or len(txs). Any other length is a
+	// programming error and must return an error for every slot.
+	if len(opts) > 1 && len(opts) != len(txs) {
+		err := errors.NewProcessingError("CreateBatch: opts length %d matches neither 0, 1, nor len(txs)=%d", len(opts), len(txs))
+		for i := range errs {
+			errs[i] = err
+		}
+		return metas, errs
+	}
+
 	for i, tx := range txs {
 		var o []utxo.CreateOption
 		switch len(opts) {
