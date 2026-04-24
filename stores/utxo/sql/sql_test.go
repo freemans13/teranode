@@ -2455,3 +2455,182 @@ func TestBuildCompositeValuesPairs(t *testing.T) {
 		require.Nil(t, args)
 	})
 }
+
+// TestSendSpendBatch_GroupFlatteningIndexMath locks in the per-group flatIdx
+// arithmetic that maps DB result rows back to the right (groupI, spendJ)
+// slot across a multi-group batch. This is the one chunk of logic in the
+// refactor with non-trivial index math; a one-off-by-one bug here would
+// silently miscategorise spend errors across transactions in the same batch.
+func TestSendSpendBatch_GroupFlatteningIndexMath(t *testing.T) {
+	// Helper: build a batchSpend for a tx with N synthetic inputs. The
+	// inputs don't need real data — this test exercises the plumbing only.
+	makeGroup := func(nInputs int) *batchSpend {
+		spends := make([]*utxo.Spend, nInputs)
+		for i := range spends {
+			h := chainhash.HashH([]byte{byte(nInputs), byte(i)})
+			uh := chainhash.HashH([]byte{0xaa, byte(nInputs), byte(i)})
+			spends[i] = &utxo.Spend{
+				TxID:     &h,
+				Vout:     uint32(i),
+				UTXOHash: &uh,
+			}
+		}
+		return &batchSpend{
+			spends:      spends,
+			blockHeight: 1,
+			errCh:       make(chan []error, 1),
+		}
+	}
+
+	// 5 groups with 1, 2, 3, 10, 1 inputs = 17 flat indices total.
+	groups := []*batchSpend{
+		makeGroup(1),
+		makeGroup(2),
+		makeGroup(3),
+		makeGroup(10),
+		makeGroup(1),
+	}
+
+	// Compute the expected (groupI, spendJ) for every flat index by
+	// doing the same walk the production code must do. This is the test's
+	// ground truth: the prod code must agree with it.
+	expectedGroupIdx := []spendFlatGroup{}
+	for gi, g := range groups {
+		for si := range g.spends {
+			expectedGroupIdx = append(expectedGroupIdx, spendFlatGroup{groupI: gi, spendJ: si})
+		}
+	}
+	require.Len(t, expectedGroupIdx, 17)
+
+	// Construct the same flat-index map the production flatten loop
+	// produces. The flatten helper we are about to write must produce
+	// an equivalent mapping; we test it via its observable effect —
+	// flattenSpendBatch returns the pairs + the per-flatIdx reverse map.
+	flatPairs, flatIdxToGroup := flattenSpendBatch(groups)
+	require.Len(t, flatPairs, 17)
+	require.Len(t, flatIdxToGroup, 17)
+	require.Equal(t, expectedGroupIdx, flatIdxToGroup)
+
+	// Simulate a DB result that errors on flat indices {0, 5, 16}.
+	// After dispatch, each group's errSlice must have the right length
+	// and the right slots populated.
+	errorAtFlat := map[int]error{
+		0:  errors.NewUtxoSpentError(*groups[0].spends[0].TxID, 0, *groups[0].spends[0].UTXOHash, nil),
+		5:  errors.NewUtxoFrozenError("synthetic frozen at flat 5"),
+		16: errors.NewUtxoSpentError(*groups[4].spends[0].TxID, 0, *groups[4].spends[0].UTXOHash, nil),
+	}
+	dispatchSpendErrors(groups, flatIdxToGroup, errorAtFlat)
+
+	// Group 0: one input, flat 0 errored.
+	g0 := <-groups[0].errCh
+	require.Len(t, g0, 1)
+	require.Error(t, g0[0])
+	require.True(t, errors.Is(g0[0], errors.ErrSpent))
+
+	// Group 1: two inputs, flat indices 1..2, no errors.
+	g1 := <-groups[1].errCh
+	require.Equal(t, []error{nil, nil}, g1)
+
+	// Group 2: three inputs, flat indices 3..5. Flat 5 is group 2 slot 2.
+	g2 := <-groups[2].errCh
+	require.Len(t, g2, 3)
+	require.NoError(t, g2[0])
+	require.NoError(t, g2[1])
+	require.Error(t, g2[2])
+	require.True(t, errors.Is(g2[2], errors.ErrFrozen))
+
+	// Group 3: ten inputs, flat indices 6..15, no errors.
+	g3 := <-groups[3].errCh
+	require.Len(t, g3, 10)
+	for _, e := range g3 {
+		require.NoError(t, e)
+	}
+
+	// Group 4: one input, flat 16 errored.
+	g4 := <-groups[4].errCh
+	require.Len(t, g4, 1)
+	require.Error(t, g4[0])
+	require.True(t, errors.Is(g4[0], errors.ErrSpent))
+
+	// Every errCh must have been signalled exactly once — any second
+	// send would block forever with a size-1 buffer. Do a non-blocking
+	// receive; every group should be empty/closed-like.
+	for gi, g := range groups {
+		select {
+		case extra := <-g.errCh:
+			t.Fatalf("group %d received a second error slice: %v", gi, extra)
+		default:
+			// ok — no second send
+		}
+	}
+}
+
+// TestSpend_MultiInputOneSpent covers the most realistic failure
+// scenario for a multi-input spend: one input is already spent (by some
+// other transaction), the rest are clean. Post-refactor, this exercises
+// the per-slot error dispatch through the group path. Pre-refactor it
+// also passes via the per-input fan-out path — so it's equally valid as
+// a regression gate.
+func TestSpend_MultiInputOneSpent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _ := setup(ctx, t)
+
+	// Three independent parents, each storable. The child tx will spend
+	// each parent's output 0.
+	parents := make([]*bt.Tx, 3)
+	for i := range parents {
+		p, err := bt.NewTxFromString("010000000000000000ef012935b177236ec1cb75cd9fba86d84acac9d76ced9c1b22ba8de4cd2de85a8393000000004948304502200f653627aff050093a83dabc12a2a9b627041d424f2eb18849a2d587f1acd38f022100a23f94acd94a4d24049140d5fbe12448a880fd8f8c1c2b4141f83bef2be409be01ffffffff00f2052a01000000434104ed83808a903a7e25be91349815f5d545f0c9dbec60b8ea914a6d6cbe9f830628039641231e2dbc1c0ca809f13405eb01f3a06614717f7859b788bd1305d9a3f2ac0100f2052a010000001976a91471d7dd96d9edda09180fe9d57a477b5acc9cad1188ac00000000")
+		require.NoError(t, err)
+		p.Version = uint32(100 + i) // make hashes unique
+		_, err = store.Create(ctx, p, 0)
+		require.NoError(t, err)
+		parents[i] = p
+	}
+
+	// Build a child tx that spends all three parents' output 0. `From` wires
+	// up PreviousTxScript/PreviousTxSatoshis so utxo.GetSpends can compute
+	// the UTXO hash.
+	child := bt.NewTx()
+	for _, parent := range parents {
+		require.NoError(t, child.From(parent.TxIDChainHash().String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	}
+	require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+
+	// Pre-spend parent[1]'s output 0 with a DIFFERENT spending tx, so
+	// when `child` tries to spend it the batcher returns ErrSpent for
+	// that slot only.
+	otherSpender := bt.NewTx()
+	require.NoError(t, otherSpender.From(parents[1].TxIDChainHash().String(), 0, parents[1].Outputs[0].LockingScript.String(), parents[1].Outputs[0].Satoshis))
+	require.NoError(t, otherSpender.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+	_, err := store.Spend(ctx, otherSpender, 1)
+	require.NoError(t, err)
+
+	// Now try to spend with `child`. Expect slot 1 to fail, 0 and 2 to
+	// succeed briefly before Unspend rolls them back.
+	spends, err := store.Spend(ctx, child, 1)
+	require.Error(t, err, "tx with one already-spent input must return an aggregated error")
+	require.Len(t, spends, 3)
+
+	require.NoError(t, spends[0].Err, "slot 0 had no error")
+	require.Error(t, spends[1].Err, "slot 1 was already spent by otherSpender")
+	require.True(t, errors.Is(spends[1].Err, errors.ErrSpent),
+		"slot 1 error class must be ErrSpent, got %T: %v", spends[1].Err, spends[1].Err)
+	require.NotNil(t, spends[1].ConflictingTxID,
+		"slot 1 must carry ConflictingTxID so callers know who has the output")
+	require.Equal(t, otherSpender.TxID(), spends[1].ConflictingTxID.String(),
+		"ConflictingTxID must point to otherSpender")
+	require.NoError(t, spends[2].Err, "slot 2 had no error")
+
+	// needsSpendRollback should have been true (ErrSpent triggers it),
+	// and Unspend should have been called on slots 0 and 2. Check by
+	// spending them freshly from a new tx — they should succeed.
+	cleanup := bt.NewTx()
+	for _, i := range []int{0, 2} {
+		require.NoError(t, cleanup.From(parents[i].TxIDChainHash().String(), 0, parents[i].Outputs[0].LockingScript.String(), parents[i].Outputs[0].Satoshis))
+	}
+	require.NoError(t, cleanup.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+	_, err = store.Spend(ctx, cleanup, 2)
+	require.NoError(t, err, "slots 0 and 2 must have been rolled back; a fresh spend of them must succeed")
+}

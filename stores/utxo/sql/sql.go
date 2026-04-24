@@ -51,7 +51,6 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -80,14 +79,18 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// batchSpend represents a single UTXO spend request in a batch.
-// Mirrors aerospike/spend.go batchSpend struct.
+// batchSpend represents all UTXO spend requests from a single transaction.
+// One batchSpend is produced per Store.Spend call; the spends slice lists the
+// tx's inputs in input order. The errCh receives exactly one []error whose
+// length equals len(spends); nil slots indicate success, non-nil slots
+// carry the specific per-input validation or storage error.
 type batchSpend struct {
-	spend             *utxo.Spend // UTXO to spend
-	blockHeight       uint32      // Current block height
-	errCh             chan error  // Channel for completion notification
+	spends            []*utxo.Spend
+	blockHeight       uint32
+	errCh             chan []error
 	ignoreConflicting bool
 	ignoreLocked      bool
+	txID              *chainhash.Hash // for logging only
 }
 
 // Store implements the UTXO store interface using a SQL database backend.
@@ -2150,103 +2153,96 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		return nil, errors.NewProcessingError("No spends provided", nil)
 	}
 
-	// Mirrors aerospike spend.go:287-420 — enqueue each spend into the batcher,
-	// wait for batch callback to signal completion via errCh.
-	var (
-		mu              sync.Mutex
-		txAlreadyExists bool
-		spentSpends     = make([]*utxo.Spend, 0, len(spends))
-		g               errgroup.Group
-	)
-
-	for idx, spend := range spends {
+	for _, spend := range spends {
 		if spend == nil {
 			return nil, errors.NewProcessingError("spend should not be nil")
 		}
-
-		idx := idx
-		spend := spend
-
-		g.Go(func() error {
-			errCh := make(chan error, 1)
-			s.spendBatcher.Put(&batchSpend{
-				spend:             spend,
-				blockHeight:       blockHeight,
-				errCh:             errCh,
-				ignoreConflicting: useIgnoreConflicting,
-				ignoreLocked:      useIgnoreLocked,
-			})
-
-			// Wait for batch response with timeout to prevent indefinite blocking
-			spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
-			if spendTimeout <= 0 {
-				spendTimeout = 30 * time.Second
-			}
-
-			timer := time.NewTimer(spendTimeout)
-			defer timer.Stop()
-
-			var batchErr error
-			select {
-			case batchErr = <-errCh:
-				// Batch completed successfully or with error
-			case <-ctx.Done():
-				spends[idx].Err = errors.NewContextCanceledError("[SPEND][%s:%d] context canceled while waiting for batch response", spend.TxID.String(), spend.Vout)
-				return nil
-			case <-timer.C:
-				prometheusUtxoErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
-				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND][%s:%d] batch operation timed out after %s", spend.TxID.String(), spend.Vout, spendTimeout)
-				return nil
-			}
-
-			// Handle "already blessed" — parent tx not found but spending tx exists.
-			// Mirrors aerospike spend.go:343-361.
-			if batchErr != nil && errors.Is(batchErr, errors.ErrTxNotFound) {
-				mu.Lock()
-				exists := txAlreadyExists
-				mu.Unlock()
-
-				if exists {
-					batchErr = nil
-				} else {
-					var spendingTxExists bool
-					if scanErr := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
-						s.logger.Errorf("[Spend][%s] failed to check if spending tx exists: %v", tx.TxID(), scanErr)
-					}
-					if spendingTxExists {
-						s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
-						batchErr = nil
-
-						mu.Lock()
-						txAlreadyExists = true
-						mu.Unlock()
-					}
-				}
-			}
-
-			if batchErr != nil {
-				spends[idx].Err = batchErr
-
-				s.logger.Debugf("[SPEND][%s:%d] error in sql spend: %+v", spend.TxID.String(), spend.Vout, batchErr)
-
-				var errSpent *errors.UtxoSpentErrData
-				if errors.AsData(batchErr, &errSpent) {
-					spends[idx].ConflictingTxID = errSpent.SpendingData.TxID
-				}
-
-				return nil
-			}
-
-			mu.Lock()
-			spentSpends = append(spentSpends, spend)
-			mu.Unlock()
-
-			return nil
-		})
 	}
 
-	if err = g.Wait(); err != nil {
-		return nil, errors.NewError("error in sql spend (batched mode)", err)
+	// Submit all of this tx's inputs as one group. The batcher signals
+	// completion by sending a single []error of length len(spends) to
+	// errCh; nil slots indicate success, non-nil slots carry the per-
+	// input validation or storage error.
+	errCh := make(chan []error, 1)
+	s.spendBatcher.Put(&batchSpend{
+		spends:            spends,
+		blockHeight:       blockHeight,
+		errCh:             errCh,
+		ignoreConflicting: useIgnoreConflicting,
+		ignoreLocked:      useIgnoreLocked,
+		txID:              tx.TxIDChainHash(),
+	})
+
+	spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
+	if spendTimeout <= 0 {
+		spendTimeout = 30 * time.Second
+	}
+	timer := time.NewTimer(spendTimeout)
+	defer timer.Stop()
+
+	var errs []error
+	select {
+	case errs = <-errCh:
+		// received — proceed to per-slot dispatch below
+	case <-ctx.Done():
+		cancelled := errors.NewContextCanceledError("[SPEND][%s] context canceled while waiting for batch response", tx.TxID())
+		for i := range spends {
+			spends[i].Err = cancelled
+		}
+		return spends, errors.NewUtxoError("error in sql spend (batched mode) - context canceled", cancelled)
+	case <-timer.C:
+		prometheusUtxoErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
+		timedOut := errors.NewServiceUnavailableError("[SPEND][%s] batch operation timed out after %s", tx.TxID(), spendTimeout)
+		for i := range spends {
+			spends[i].Err = timedOut
+		}
+		return spends, errors.NewUtxoError("error in sql spend (batched mode) - timeout", timedOut)
+	}
+
+	// Walk the error slice and populate per-input state, including
+	// ConflictingTxID derivation from UtxoSpentErrData.
+	spentSpends := make([]*utxo.Spend, 0, len(spends))
+	var alreadyBlessedChecked bool
+	for i, e := range errs {
+		if e == nil {
+			spentSpends = append(spentSpends, spends[i])
+			continue
+		}
+		// "Already blessed": parent tx not found but spending tx exists.
+		// Run the recovery probe at most once per Spend call; if positive,
+		// clear every ErrTxNotFound slot in the slice.
+		if !alreadyBlessedChecked && errors.Is(e, errors.ErrTxNotFound) {
+			alreadyBlessedChecked = true
+			var spendingTxExists bool
+			if scanErr := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
+				s.logger.Errorf("[Spend][%s] failed to check if spending tx exists: %v", tx.TxID(), scanErr)
+			}
+			if spendingTxExists {
+				s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
+				// Clear every ErrTxNotFound slot (this one and any later).
+				for k := range errs {
+					if errs[k] != nil && errors.Is(errs[k], errors.ErrTxNotFound) {
+						errs[k] = nil
+						spentSpends = append(spentSpends, spends[k])
+					}
+				}
+				// Also reflect the clear on spends[].Err for this slot so
+				// the later "if spend.Err != nil" aggregation agrees.
+				// (Subsequent iterations will see errs[k] == nil and skip.)
+				spends[i].Err = nil
+				continue
+			}
+		}
+
+		// Real error — populate the slot and derive ConflictingTxID if
+		// this is an "already spent" error.
+		spends[i].Err = e
+		s.logger.Debugf("[SPEND][%s:%d] error in sql spend: %+v", spends[i].TxID.String(), spends[i].Vout, e)
+
+		var errSpent *errors.UtxoSpentErrData
+		if errors.AsData(e, &errSpent) {
+			spends[i].ConflictingTxID = errSpent.SpendingData.TxID
+		}
 	}
 
 	if len(spends) != len(spentSpends) {
@@ -2308,6 +2304,94 @@ func isDeadlock(err error) bool {
 	return strings.Contains(err.Error(), "database is locked")
 }
 
+// outpointPair carries a (tx-hash, output-idx) pair for the bulk SELECT
+// VALUES list used by trySendSpendBatchBulk. Exists so flattenSpendBatch
+// can produce the ordered list of outpoints across an entire spend batch.
+type outpointPair struct {
+	hash []byte
+	idx  uint32
+}
+
+// spendFlatGroup records which (group, input) slot a flat index maps to.
+// Used to dispatch per-flat-index DB results back to the originating
+// batchSpend's per-input error slot.
+type spendFlatGroup struct {
+	groupI int // index into the batch []*batchSpend passed in
+	spendJ int // index into batch[groupI].spends
+}
+
+// flattenSpendBatch walks a batch of spend groups and returns:
+//   - pairs: one outpointPair per input, in (group, input) traversal order,
+//     suitable for the Phase-1 bulk SELECT VALUES list.
+//   - flatIdxToGroup: inverse map — flatIdxToGroup[k] tells the caller which
+//     (group, input) slot flat index k came from, so DB results can be
+//     written back into the right batchSpend.errSlice slot.
+//
+// The two slices are always the same length. If the input batch is empty
+// or every group has zero spends, returns (nil, nil).
+func flattenSpendBatch(batch []*batchSpend) ([]outpointPair, []spendFlatGroup) {
+	total := 0
+	for _, g := range batch {
+		total += len(g.spends)
+	}
+	if total == 0 {
+		return nil, nil
+	}
+	pairs := make([]outpointPair, 0, total)
+	idxMap := make([]spendFlatGroup, 0, total)
+	for gi, g := range batch {
+		for sj, sp := range g.spends {
+			h := *sp.TxID
+			pairs = append(pairs, outpointPair{hash: h[:], idx: sp.Vout})
+			idxMap = append(idxMap, spendFlatGroup{groupI: gi, spendJ: sj})
+		}
+	}
+	return pairs, idxMap
+}
+
+// dispatchSpendErrors allocates one per-group []error sized to the group's
+// input count, writes any errors from errorAtFlat into the right slot via
+// flatIdxToGroup, then sends each group's slice to its errCh exactly once.
+//
+// errorAtFlat maps flat indices to errors. Flat indices absent from the
+// map are treated as successes (nil slot). The function MUST send on every
+// group's errCh — including groups with no errors — because Store.Spend
+// always waits for one receive.
+func dispatchSpendErrors(batch []*batchSpend, flatIdxToGroup []spendFlatGroup, errorAtFlat map[int]error) {
+	// Pre-allocate per-group error slices.
+	errSlices := make([][]error, len(batch))
+	for gi, g := range batch {
+		errSlices[gi] = make([]error, len(g.spends))
+	}
+	// Populate per-slot errors.
+	for flatIdx, errAt := range errorAtFlat {
+		if flatIdx < 0 || flatIdx >= len(flatIdxToGroup) {
+			continue // defensive; caller should never do this
+		}
+		loc := flatIdxToGroup[flatIdx]
+		errSlices[loc.groupI][loc.spendJ] = errAt
+	}
+	// Signal every group's errCh once.
+	for gi, g := range batch {
+		g.errCh <- errSlices[gi]
+	}
+}
+
+// dispatchSpendErrorsUniform is the "one storage error taints the whole
+// batch" fast path: every slot of every group's error slice receives the
+// same err, then every errCh is signalled once. Used when BeginTx /
+// Scan / rows.Err fail at the batch level, where per-slot diagnosis is
+// impossible.
+func dispatchSpendErrorsUniform(batch []*batchSpend, err error) {
+	for _, g := range batch {
+		errs := make([]error, len(g.spends))
+		for i := range errs {
+			errs[i] = err
+		}
+		g.errCh <- errs
+	}
+}
+
 // sendSpendBatch is the batcher callback that processes a batch of spend operations
 // in a single DB transaction. Called by the go-batcher when the batch is full or
 // the timeout fires. Same SQL for both PostgreSQL and SQLite.
@@ -2332,9 +2416,7 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 	}
 	// Exhausted retries — send error to all items
-	for _, item := range batch {
-		item.errCh <- errors.NewStorageError("[Spend] deadlock persisted after %d retries", maxRetries)
-	}
+	dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] deadlock persisted after %d retries", maxRetries))
 }
 
 // trySendSpendBatch attempts to process a spend batch in a single DB transaction.
@@ -2363,11 +2445,49 @@ type spendSelectResult struct {
 
 // trySendSpendBatchBulk uses bulk SELECT + bulk UPDATE for PostgreSQL.
 func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
+	// Flatten all groups into a single list of (hash, vout) pairs so the
+	// SQL below can stay byte-identical to the pre-refactor version; only
+	// the Go-side error accounting changes to per-(group, input) slot.
+	pairs, flatIdxToGroup := flattenSpendBatch(batch)
+	if len(pairs) == 0 {
+		// Nothing to do; still signal every errCh so callers don't hang.
+		for _, g := range batch {
+			g.errCh <- make([]error, len(g.spends))
+		}
+		return false
+	}
+
+	// Pre-allocate per-group error slices; we fill slots as we go.
+	errSlices := make([][]error, len(batch))
+	for gi, g := range batch {
+		errSlices[gi] = make([]error, len(g.spends))
+	}
+
+	// spendAt returns the *utxo.Spend at flat index f.
+	spendAt := func(f int) *utxo.Spend {
+		loc := flatIdxToGroup[f]
+		return batch[loc.groupI].spends[loc.spendJ]
+	}
+	// itemAt returns the owning batchSpend at flat index f.
+	itemAt := func(f int) *batchSpend {
+		return batch[flatIdxToGroup[f].groupI]
+	}
+	// setErr records a per-slot validation/storage error into the right group slot.
+	setErr := func(f int, e error) {
+		loc := flatIdxToGroup[f]
+		errSlices[loc.groupI][loc.spendJ] = e
+	}
+	// dispatchAll sends every group's errSlice on its errCh. Must be called
+	// exactly once on every success return path.
+	dispatchAll := func() {
+		for gi, g := range batch {
+			g.errCh <- errSlices[gi]
+		}
+	}
+
 	txn, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] failed to begin transaction", err)
-		}
+		dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed to begin transaction", err))
 		return false
 	}
 	defer func() {
@@ -2375,21 +2495,22 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 	}()
 
 	// Phase 1: Bulk SELECT — fetch all output states in one query
-	// Build VALUES list: (hash, idx, batch_idx)
+	// Build VALUES list: (hash, idx, batch_idx) where batch_idx is the flat
+	// index across all groups' inputs.
 	var sb strings.Builder
 	sb.WriteString(`
 		SELECT v.batch_idx,
 		       o.transaction_id, o.coinbase_spending_height, o.utxo_hash,
 		       o.spending_data, o.frozen OR t.frozen AS frozen, t.conflicting, t.locked, o.spendableIn
 		FROM (VALUES `)
-	args := make([]interface{}, 0, len(batch)*3)
+	args := make([]interface{}, 0, len(pairs)*3)
 	paramIdx := 1
-	for i, item := range batch {
+	for i, p := range pairs {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
 		sb.WriteString(fmt.Sprintf("($%d::bytea,$%d::int,$%d::int)", paramIdx, paramIdx+1, paramIdx+2))
-		args = append(args, item.spend.TxID[:], item.spend.Vout, i)
+		args = append(args, p.hash, p.idx, i)
 		paramIdx += 3
 	}
 	sb.WriteString(`) AS v(hash,idx,batch_idx)
@@ -2401,14 +2522,12 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		if isDeadlock(err) {
 			return true
 		}
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] failed: bulk SELECT outputs", err)
-		}
+		dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed: bulk SELECT outputs", err))
 		return false
 	}
 
-	// Parse results into a map by batch index
-	resultMap := make(map[int]*spendSelectResult, len(batch))
+	// Parse results into a map by flat index
+	resultMap := make(map[int]*spendSelectResult, len(pairs))
 	for rows.Next() {
 		r := &spendSelectResult{}
 		if err := rows.Scan(&r.batchIdx, &r.transactionID, &r.coinbaseSpendingHeight,
@@ -2417,9 +2536,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			if isDeadlock(err) {
 				return true
 			}
-			for _, item := range batch {
-				item.errCh <- errors.NewStorageError("[Spend] failed: scanning bulk SELECT results", err)
-			}
+			dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed: scanning bulk SELECT results", err))
 			return false
 		}
 		resultMap[r.batchIdx] = r
@@ -2428,14 +2545,12 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		if isDeadlock(err) {
 			return true
 		}
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] failed: closing bulk SELECT results", err)
-		}
+		dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed: closing bulk SELECT results", err))
 		return false
 	}
 
-	// Phase 2: Validate each item and build the bulk UPDATE set
-	validationErrors := make(map[int]error, len(batch))
+	// Phase 2: Validate each flat-index and build the bulk UPDATE set
+	validationErrors := make(map[int]error, len(pairs))
 	type updateItem struct {
 		batchIdx      int
 		transactionID int
@@ -2458,8 +2573,9 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 	// are exclusively routed through setDAH — no duplication, no risk of
 	// calling setDAH for a parent whose items all ended up in validationErrors.
 
-	for i, item := range batch {
-		spend := item.spend
+	for i := range pairs {
+		spend := spendAt(i)
+		item := itemAt(i)
 		r, found := resultMap[i]
 		if !found {
 			validationErrors[i] = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
@@ -2526,7 +2642,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		transactionID int
 		vout          uint32
 	}
-	seenKeys := make(map[utxoKey]int, len(toUpdate)) // key -> first batchIdx
+	seenKeys := make(map[utxoKey]int, len(toUpdate)) // key -> first batchIdx (flat)
 	var dedupedUpdate []updateItem
 	for _, u := range toUpdate {
 		key := utxoKey{u.transactionID, u.vout}
@@ -2649,13 +2765,18 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			if isDeadlock(err) {
 				return true
 			}
-			for i, item := range batch {
+			// Write validation errors into their slots; for any slot that had
+			// no prior validation error, use the bulk-UPDATE storage error as a
+			// fallback so every group still sees a populated slice.
+			bulkErr := errors.NewStorageError("[Spend] failed: bulk UPDATE outputs", err)
+			for i := range pairs {
 				if valErr, ok := validationErrors[i]; ok {
-					item.errCh <- valErr
+					setErr(i, valErr)
 				} else {
-					item.errCh <- errors.NewStorageError("[Spend] failed: bulk UPDATE outputs", err)
+					setErr(i, bulkErr)
 				}
 			}
+			dispatchAll()
 			return false
 		}
 
@@ -2666,9 +2787,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true
 				}
-				for _, item := range batch {
-					item.errCh <- errors.NewStorageError("[Spend] failed: scanning bulk UPDATE results", err)
-				}
+				dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed: scanning bulk UPDATE results", err))
 				return false
 			}
 			updatedSet[bIdx] = true
@@ -2677,9 +2796,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			if isDeadlock(err) {
 				return true
 			}
-			for _, item := range batch {
-				item.errCh <- errors.NewStorageError("[Spend] failed: closing bulk UPDATE results", err)
-			}
+			dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed: closing bulk UPDATE results", err))
 			return false
 		}
 
@@ -2715,7 +2832,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 					sb.WriteByte(',')
 				}
 				sb.WriteString(fmt.Sprintf("($%d::int,$%d::int,$%d::bytea,$%d::int)", pidx, pidx+1, pidx+2, pidx+3))
-				spend := batch[bIdx].spend
+				spend := spendAt(bIdx)
 				r := resultMap[bIdx]
 				args = append(args, r.transactionID, spend.Vout, spend.SpendingData.Bytes(), bIdx)
 				pidx += 4
@@ -2729,9 +2846,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true
 				}
-				for _, item := range batch {
-					item.errCh <- errors.NewStorageError("[Spend] failed: concurrent-idempotent re-check", err)
-				}
+				dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed: concurrent-idempotent re-check", err))
 				return false
 			}
 			for iRows.Next() {
@@ -2741,9 +2856,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 					if isDeadlock(err) {
 						return true
 					}
-					for _, item := range batch {
-						item.errCh <- errors.NewStorageError("[Spend] failed: scanning concurrent-idempotent re-check", err)
-					}
+					dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed: scanning concurrent-idempotent re-check", err))
 					return false
 				}
 				updatedSet[bIdx] = true
@@ -2756,9 +2869,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true
 				}
-				for _, item := range batch {
-					item.errCh <- errors.NewStorageError("[Spend] failed: closing concurrent-idempotent re-check", err)
-				}
+				dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed: closing concurrent-idempotent re-check", err))
 				return false
 			}
 		}
@@ -2767,7 +2878,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		// UtxoSpentError (row was concurrently spent by a DIFFERENT spender).
 		for _, u := range dedupedUpdate {
 			if !updatedSet[u.batchIdx] {
-				spend := batch[u.batchIdx].spend
+				spend := spendAt(u.batchIdx)
 				validationErrors[u.batchIdx] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
 			}
 		}
@@ -2829,13 +2940,15 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true
 				}
-				for i, item := range batch {
+				dahErr := errors.NewStorageError("[Spend] failed to recompute DAH for bulk spend fallback", err)
+				for i := range pairs {
 					if valErr, ok := validationErrors[i]; ok {
-						item.errCh <- valErr
+						setErr(i, valErr)
 					} else {
-						item.errCh <- errors.NewStorageError("[Spend] failed to recompute DAH for bulk spend fallback", err)
+						setErr(i, dahErr)
 					}
 				}
+				dispatchAll()
 				return false
 			}
 		}
@@ -2846,35 +2959,47 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		if isDeadlock(err) {
 			return true
 		}
-		for i, item := range batch {
+		commitErr := errors.NewStorageError("[Spend] failed to commit transaction", err)
+		for i := range pairs {
 			if valErr, ok := validationErrors[i]; ok {
-				item.errCh <- valErr
+				setErr(i, valErr)
 			} else {
-				item.errCh <- errors.NewStorageError("[Spend] failed to commit transaction", err)
+				setErr(i, commitErr)
 			}
 		}
+		dispatchAll()
 		return false
 	}
 
 	// Signal results
-	for i, item := range batch {
+	for i := range pairs {
 		if valErr, ok := validationErrors[i]; ok {
-			item.errCh <- valErr
-		} else {
-			item.errCh <- nil // success
+			setErr(i, valErr)
 		}
 	}
+	dispatchAll()
 	return false
 }
 
 // trySendSpendBatchPerRow processes a spend batch with per-row SELECT+UPDATE (original behavior).
 // Used for SQLite or when BatchSQLOperations is disabled.
 func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
+	// Pre-allocate per-group error slices; we fill slots as we go.
+	errSlices := make([][]error, len(batch))
+	for gi, g := range batch {
+		errSlices[gi] = make([]error, len(g.spends))
+	}
+	// dispatchAll sends every group's errSlice on its errCh. Must be called
+	// exactly once on every non-retryable return path.
+	dispatchAll := func() {
+		for gi, g := range batch {
+			g.errCh <- errSlices[gi]
+		}
+	}
+
 	txn, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] failed to begin transaction", err)
-		}
+		dispatchSpendErrorsUniform(batch, errors.NewStorageError("[Spend] failed to begin transaction", err))
 		return false
 	}
 	defer func() {
@@ -2906,144 +3031,143 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 		AND spending_data IS NULL
 	`
 
-	successItems := make([]*batchSpend, 0, len(batch))
-	spentParentIDs := make(map[int]struct{}, len(batch)) // distinct parent tx ids whose outputs were just spent
-	validationErrors := make(map[int]error)              // index -> validation error (non-retryable)
+	// Tracks (groupI, spendJ) flat slots whose UPDATE succeeded (or idempotent).
+	type slotLoc struct{ gi, sj int }
+	var successSlots []slotLoc
+	spentParentIDs := make(map[int]struct{}) // distinct parent tx ids whose outputs were just spent
 	aborted := false
+	abortErr := errors.NewStorageError("[Spend] batch aborted due to previous DB error")
 
-	// Phase 1: SELECT + validate + UPDATE outputs
-	for i, item := range batch {
-		if aborted {
-			item.errCh <- errors.NewStorageError("[Spend] batch aborted due to previous DB error")
-			continue
-		}
-
-		spend := item.spend
-
-		var (
-			transactionID          int
-			coinbaseSpendingHeight uint32
-			utxoHash               []byte
-			spendingDataBytes      []byte
-			frozen                 bool
-			conflicting            bool
-			locked                 bool
-			spendableIn            *uint32
-		)
-
-		err = txn.QueryRowContext(s.ctx, q1, spend.TxID[:], spend.Vout).Scan(
-			&transactionID, &coinbaseSpendingHeight, &utxoHash,
-			&spendingDataBytes, &frozen, &conflicting, &locked, &spendableIn,
-		)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				validationErrors[i] = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+	// Phase 1: iterate groups and their spends: SELECT + validate + UPDATE per-row
+	for gi, g := range batch {
+		for sj, spend := range g.spends {
+			if aborted {
+				if errSlices[gi][sj] == nil {
+					errSlices[gi][sj] = abortErr
+				}
 				continue
 			}
-			if isDeadlock(err) {
-				return true // retryable
-			}
-			item.errCh <- errors.NewStorageError("[Spend] failed: SELECT output %s:%d - %v", spend.TxID, spend.Vout, err)
-			aborted = true
-			continue
-		}
 
-		// Validate the UTXO state
-		if frozen {
-			validationErrors[i] = errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
-			continue
-		}
+			var (
+				transactionID          int
+				coinbaseSpendingHeight uint32
+				utxoHash               []byte
+				spendingDataBytes      []byte
+				frozen                 bool
+				conflicting            bool
+				locked                 bool
+				spendableIn            *uint32
+			)
 
-		if conflicting && !item.ignoreConflicting {
-			validationErrors[i] = errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
-			continue
-		}
-
-		if locked && !item.ignoreLocked {
-			validationErrors[i] = errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
-			continue
-		}
-
-		if spendableIn != nil && *spendableIn > 0 && item.blockHeight < *spendableIn {
-			validationErrors[i] = errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
-			continue
-		}
-
-		// Check if already spent by a different transaction
-		if len(spendingDataBytes) > 0 {
-			if spend.SpendingData != nil && !bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
-				existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
-				if parseErr != nil {
-					validationErrors[i] = errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+			err = txn.QueryRowContext(s.ctx, q1, spend.TxID[:], spend.Vout).Scan(
+				&transactionID, &coinbaseSpendingHeight, &utxoHash,
+				&spendingDataBytes, &frozen, &conflicting, &locked, &spendableIn,
+			)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					errSlices[gi][sj] = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
 					continue
 				}
-				validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
+				if isDeadlock(err) {
+					return true // retryable
+				}
+				errSlices[gi][sj] = errors.NewStorageError("[Spend] failed: SELECT output %s:%d - %v", spend.TxID, spend.Vout, err)
+				aborted = true
 				continue
 			}
-		}
 
-		// Check UTXO hash matches
-		if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
-			validationErrors[i] = errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
-			continue
-		}
-
-		// Check coinbase maturity
-		if coinbaseSpendingHeight > 0 && coinbaseSpendingHeight > item.blockHeight {
-			validationErrors[i] = errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d", spend.TxID, spend.Vout, coinbaseSpendingHeight, item.blockHeight)
-			continue
-		}
-
-		// UPDATE outputs with optimistic locking
-		result, err := txn.ExecContext(s.ctx, q2, spend.SpendingData.Bytes(), transactionID, spend.Vout)
-		if err != nil {
-			if isDeadlock(err) {
-				return true // retryable
-			}
-			item.errCh <- errors.NewStorageError("[Spend] failed: UPDATE outputs for %s:%d", spend.TxID, spend.Vout, err)
-			aborted = true
-			continue
-		}
-
-		affected, err := result.RowsAffected()
-		if err != nil {
-			item.errCh <- errors.NewStorageError("[Spend] failed getting affected rows for %s:%d", spend.TxID, spend.Vout, err)
-			aborted = true
-			continue
-		}
-
-		if affected == 0 {
-			// Idempotent re-spend: same tx spending the same output again.
-			// Still record the parent so DAH can be (re)evaluated — this heals DAHs
-			// that an earlier spend (before the DAH-on-spend fix) failed to set.
-			if len(spendingDataBytes) > 0 && spend.SpendingData != nil && bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
-				successItems = append(successItems, item)
-				spentParentIDs[transactionID] = struct{}{}
+			// Validate the UTXO state
+			if frozen {
+				errSlices[gi][sj] = errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
 				continue
 			}
-			// Concurrently spent by a different tx between SELECT and UPDATE.
-			// spendingDataBytes was NULL from SELECT (WHERE spending_data IS NULL),
-			// so we don't have the actual conflicting spender — use current spend data.
-			validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
-			continue
-		}
 
-		successItems = append(successItems, item)
-		spentParentIDs[transactionID] = struct{}{}
+			if conflicting && !g.ignoreConflicting {
+				errSlices[gi][sj] = errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
+				continue
+			}
+
+			if locked && !g.ignoreLocked {
+				errSlices[gi][sj] = errors.NewTxLockedError("[Spend] utxo is not spendable for %s:%d", spend.TxID, spend.Vout)
+				continue
+			}
+
+			if spendableIn != nil && *spendableIn > 0 && g.blockHeight < *spendableIn {
+				errSlices[gi][sj] = errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
+				continue
+			}
+
+			// Check if already spent by a different transaction
+			if len(spendingDataBytes) > 0 {
+				if spend.SpendingData != nil && !bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
+					existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
+					if parseErr != nil {
+						errSlices[gi][sj] = errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+						continue
+					}
+					errSlices[gi][sj] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
+					continue
+				}
+			}
+
+			// Check UTXO hash matches
+			if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
+				errSlices[gi][sj] = errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
+				continue
+			}
+
+			// Check coinbase maturity
+			if coinbaseSpendingHeight > 0 && coinbaseSpendingHeight > g.blockHeight {
+				errSlices[gi][sj] = errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready to spend for %s:%d, requires height %d, current %d", spend.TxID, spend.Vout, coinbaseSpendingHeight, g.blockHeight)
+				continue
+			}
+
+			// UPDATE outputs with optimistic locking
+			result, err := txn.ExecContext(s.ctx, q2, spend.SpendingData.Bytes(), transactionID, spend.Vout)
+			if err != nil {
+				if isDeadlock(err) {
+					return true // retryable
+				}
+				errSlices[gi][sj] = errors.NewStorageError("[Spend] failed: UPDATE outputs for %s:%d", spend.TxID, spend.Vout, err)
+				aborted = true
+				continue
+			}
+
+			affected, err := result.RowsAffected()
+			if err != nil {
+				errSlices[gi][sj] = errors.NewStorageError("[Spend] failed getting affected rows for %s:%d", spend.TxID, spend.Vout, err)
+				aborted = true
+				continue
+			}
+
+			if affected == 0 {
+				// Idempotent re-spend: same tx spending the same output again.
+				// Still record the parent so DAH can be (re)evaluated — this heals DAHs
+				// that an earlier spend (before the DAH-on-spend fix) failed to set.
+				if len(spendingDataBytes) > 0 && spend.SpendingData != nil && bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
+					successSlots = append(successSlots, slotLoc{gi, sj})
+					spentParentIDs[transactionID] = struct{}{}
+					continue
+				}
+				// Concurrently spent by a different tx between SELECT and UPDATE.
+				// spendingDataBytes was NULL from SELECT (WHERE spending_data IS NULL),
+				// so we don't have the actual conflicting spender — use current spend data.
+				errSlices[gi][sj] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
+				continue
+			}
+
+			successSlots = append(successSlots, slotLoc{gi, sj})
+			spentParentIDs[transactionID] = struct{}{}
+		}
 	}
 
-	// If aborted, roll back — send errors for items not yet notified
+	// If aborted, roll back — successSlots need the rollback error.
 	if aborted {
-		for i, item := range batch {
-			if valErr, ok := validationErrors[i]; ok {
-				item.errCh <- valErr
-			}
-			// Items that already received errors via errCh (DB errors) or
-			// successItems are handled: successItems get rollback error below
+		rollbackErr := errors.NewStorageError("[Spend] batch rolled back due to DB error")
+		for _, loc := range successSlots {
+			errSlices[loc.gi][loc.sj] = rollbackErr
 		}
-		for _, item := range successItems {
-			item.errCh <- errors.NewStorageError("[Spend] batch rolled back due to DB error")
-		}
+		dispatchAll()
 		return false
 	}
 
@@ -3065,14 +3189,11 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 			if isDeadlock(err) {
 				return true
 			}
-			for i, item := range batch {
-				if valErr, ok := validationErrors[i]; ok {
-					item.errCh <- valErr
-				}
+			dahErr := errors.NewStorageError("[Spend] failed to recompute DAH", err)
+			for _, loc := range successSlots {
+				errSlices[loc.gi][loc.sj] = dahErr
 			}
-			for _, item := range successItems {
-				item.errCh <- errors.NewStorageError("[Spend] failed to recompute DAH", err)
-			}
+			dispatchAll()
 			return false
 		}
 	}
@@ -3082,26 +3203,17 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 		if isDeadlock(err) {
 			return true // retryable
 		}
-		for i, item := range batch {
-			if valErr, ok := validationErrors[i]; ok {
-				item.errCh <- valErr
-			}
+		commitErr := errors.NewStorageError("[Spend] failed to commit transaction", err)
+		for _, loc := range successSlots {
+			errSlices[loc.gi][loc.sj] = commitErr
 		}
-		for _, item := range successItems {
-			item.errCh <- errors.NewStorageError("[Spend] failed to commit transaction", err)
-		}
+		dispatchAll()
 		return false
 	}
 
-	// Signal results: validation errors and successes
-	for i, item := range batch {
-		if valErr, ok := validationErrors[i]; ok {
-			item.errCh <- valErr
-		}
-	}
-	for _, item := range successItems {
-		item.errCh <- nil
-	}
+	// Final dispatch. Success slots stay nil; validation-error slots already
+	// populated during the Phase-1 loop.
+	dispatchAll()
 	return false
 }
 
@@ -5553,12 +5665,6 @@ func buildINClause(hashes [][]byte, startIdx int) (string, []interface{}) {
 		args[i] = h
 	}
 	return "(" + strings.Join(placeholders, ",") + ")", args
-}
-
-// outpointPair represents a (transaction hash, output index) pair for a composite IN filter.
-type outpointPair struct {
-	hash []byte
-	idx  uint32
 }
 
 // buildCompositeValuesPairs generates a VALUES list for (hash, idx) pairs
