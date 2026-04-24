@@ -62,7 +62,17 @@ func (m *MockUTXOStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint3
 }
 
 func (m *MockUTXOStore) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
-	return make([]*meta.Data, len(txs)), make([]error, len(txs))
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+
+	// Validate opts length up-front per the utxo.Store contract.
+	if len(opts) > 1 && len(opts) != len(txs) {
+		err := errors.NewProcessingError("CreateBatch: opts length %d matches neither 0, 1, nor len(txs)=%d", len(opts), len(txs))
+		for i := range errs {
+			errs[i] = err
+		}
+	}
+	return metas, errs
 }
 
 func (m *MockUTXOStore) Get(ctx context.Context, hash *chainhash.Hash, fields ...fields.FieldName) (*meta.Data, error) {

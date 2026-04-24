@@ -388,6 +388,17 @@ func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint3
 	}()
 
 	for i, tx := range txs {
+		// Bail out if the context is cancelled (client disconnect, deadline)
+		// — no point starting another round-trip we're about to roll back.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			sErr := errors.NewStorageError("CreateBatch: context cancelled mid-batch", ctxErr)
+			for j := range errs {
+				metas[j] = nil
+				errs[j] = sErr
+			}
+			return metas, errs
+		}
+
 		options := &utxo.CreateOptions{}
 		for _, opt := range resolveOpts(i) {
 			opt(options)
