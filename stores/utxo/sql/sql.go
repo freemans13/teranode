@@ -89,7 +89,6 @@ type batchSpend struct {
 	errCh             chan []error
 	ignoreConflicting bool
 	ignoreLocked      bool
-	txID              *chainhash.Hash // for logging only
 }
 
 // Store implements the UTXO store interface using a SQL database backend.
@@ -1649,7 +1648,6 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		errCh:             errCh,
 		ignoreConflicting: useIgnoreConflicting,
 		ignoreLocked:      useIgnoreLocked,
-		txID:              tx.TxIDChainHash(),
 	})
 
 	spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
@@ -1699,16 +1697,19 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			if spendingTxExists {
 				s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
 				// Clear every ErrTxNotFound slot (this one and any later).
+				// The outer loop will append each now-successful spend exactly
+				// once when it reaches the corresponding errs[k] == nil slot,
+				// so we must NOT append here — doing so would double-count.
 				for k := range errs {
 					if errs[k] != nil && errors.Is(errs[k], errors.ErrTxNotFound) {
 						errs[k] = nil
-						spentSpends = append(spentSpends, spends[k])
+						spends[k].Err = nil
 					}
 				}
-				// Also reflect the clear on spends[].Err for this slot so
-				// the later "if spend.Err != nil" aggregation agrees.
-				// (Subsequent iterations will see errs[k] == nil and skip.)
-				spends[i].Err = nil
+				// This slot is now cleared; fall through so the outer loop's
+				// next iteration re-reads errs[i] == nil and appends once.
+				// (Go's range over a slice re-reads the element each step.)
+				spentSpends = append(spentSpends, spends[i])
 				continue
 			}
 		}
@@ -1820,8 +1821,10 @@ func flattenSpendBatch(batch []*batchSpend) ([]outpointPair, []spendFlatGroup) {
 	idxMap := make([]spendFlatGroup, 0, total)
 	for gi, g := range batch {
 		for sj, sp := range g.spends {
-			h := *sp.TxID
-			pairs = append(pairs, outpointPair{hash: h[:], idx: sp.Vout})
+			// Slice the caller's *chainhash.Hash directly to avoid an
+			// allocation: copying into a local array and slicing it forces
+			// the escaped slice onto the heap on this hot path.
+			pairs = append(pairs, outpointPair{hash: sp.TxID[:], idx: sp.Vout})
 			idxMap = append(idxMap, spendFlatGroup{groupI: gi, spendJ: sj})
 		}
 	}
@@ -2550,7 +2553,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 				if isDeadlock(err) {
 					return true // retryable
 				}
-				errSlices[gi][sj] = errors.NewStorageError("[Spend] failed: SELECT output %s:%d - %v", spend.TxID, spend.Vout, err)
+				errSlices[gi][sj] = errors.NewStorageError("[Spend] failed: SELECT output %s:%d", spend.TxID, spend.Vout, err)
 				aborted = true
 				continue
 			}
