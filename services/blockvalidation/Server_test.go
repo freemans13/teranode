@@ -32,6 +32,7 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
@@ -51,6 +52,7 @@ import (
 	"github.com/jarcoal/httpmock"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/ordishs/gocore"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -552,6 +554,14 @@ func TestServer_catchup(t *testing.T) {
 
 		subtreeStore := blobmemory.New()
 
+		testAF, _ := adaptivefetch.New(adaptivefetch.Config{
+			WindowSize:                10,
+			PessToOptHitRateThreshold: 0.99,
+			OptToPessMissThreshold:    100,
+			OptToPessAvgMissThreshold: 10,
+			BootstrapMode:             adaptivefetch.ModePessimistic,
+		}, "test", prometheus.NewRegistry())
+
 		server := &Server{
 			logger:              logger,
 			settings:            tSettings,
@@ -562,7 +572,9 @@ func TestServer_catchup(t *testing.T) {
 			catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 			headerChainCache:    catchup.NewHeaderChainCache(logger),
 			subtreeStore:        subtreeStore,
+			adaptiveFetch:       testAF,
 		}
+		server.fetchSubtreeDataForBlockFn = server.fetchSubtreeDataForBlock
 
 		// Create a chain of test blocks
 		blocks := testhelpers.CreateTestBlockChain(t, 100)

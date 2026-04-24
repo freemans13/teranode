@@ -53,7 +53,11 @@ func (s *State) emitMode() {
 }
 
 // Mode returns the current mode.
+// A nil receiver returns ModePessimistic.
 func (s *State) Mode() Mode {
+	if s == nil {
+		return ModePessimistic
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mode
@@ -61,7 +65,11 @@ func (s *State) Mode() Mode {
 
 // ShouldSkipSubtreeData reports whether the caller should skip the
 // subtreeData download for the block/subtree it is about to process.
+// A nil receiver returns false (pessimistic — always fetch subtreeData).
 func (s *State) ShouldSkipSubtreeData() bool {
+	if s == nil {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mode == ModeOptimistic
@@ -69,7 +77,11 @@ func (s *State) ShouldSkipSubtreeData() bool {
 
 // Record adds an observation to the rolling window, emits per-observation
 // metrics, and may transition modes.
+// A nil receiver is a no-op.
 func (s *State) Record(obs Observation) {
+	if s == nil {
+		return
+	}
 	// Defensive: ignore observations with nonsense counts. These should never
 	// occur in production but a silently-corrupted observation would skew the
 	// rolling average and either block a Pess→Opt transition or spuriously
