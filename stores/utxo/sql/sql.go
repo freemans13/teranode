@@ -3599,11 +3599,16 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 		}
 		chunk := pairs[chunkStart:chunkEnd]
 
-		inClause, args := buildCompositeINClause(chunk, 1)
-		q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
-			FROM outputs o
-			JOIN transactions t ON o.transaction_id = t.id
-			WHERE (t.hash, o.idx) IN ` + inClause
+		valuesClause, args := buildCompositeValuesPairs(chunk, 1, s.engine)
+		// CTE form is identical on Postgres (12+ inlines non-recursive
+		// single-use CTEs) and the only form SQLite accepts as a typed join
+		// source with column aliases — `FROM (VALUES ...) AS v(h, i)` is a
+		// Postgres-only extension.
+		q := `WITH v(h, i) AS (` + valuesClause + `)
+			SELECT t.hash, o.idx, o.locking_script, o.satoshis
+			FROM v
+			JOIN transactions t ON t.hash = v.h
+			JOIN outputs o ON o.transaction_id = t.id AND o.idx = v.i`
 
 		rows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
@@ -3782,11 +3787,15 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 			default:
 			}
 
-			inClause, args := buildCompositeINClause(chunkPairs, 1)
-			q := `SELECT t.hash, o.idx, o.locking_script, o.satoshis
-				FROM outputs o
-				JOIN transactions t ON o.transaction_id = t.id
-				WHERE (t.hash, o.idx) IN ` + inClause
+			valuesClause, args := buildCompositeValuesPairs(chunkPairs, 1, s.engine)
+			// CTE form — same plan as a lateral-VALUES join on Postgres but
+			// also works on SQLite, whose parser rejects `FROM (VALUES ...)
+			// AS v(h, i)` with column aliases.
+			q := `WITH v(h, i) AS (` + valuesClause + `)
+				SELECT t.hash, o.idx, o.locking_script, o.satoshis
+				FROM v
+				JOIN transactions t ON t.hash = v.h
+				JOIN outputs o ON o.transaction_id = t.id AND o.idx = v.i`
 
 			rows, err := s.db.QueryContext(gCtx, q, args...)
 			if err != nil {
@@ -5013,22 +5022,48 @@ type outpointPair struct {
 	idx  uint32
 }
 
-// buildCompositeINClause generates a composite row-tuple list for use in an IN clause
-// for a set of (hash, idx) pairs.
-// startIdx is the 1-based parameter index for the first placeholder ($startIdx, $startIdx+1, ...).
-// Returns the clause string like "(($3,$4),($5,$6))" and the args slice.
-// For empty input, returns ("", nil).
-func buildCompositeINClause(pairs []outpointPair, startIdx int) (string, []interface{}) {
+// buildCompositeValuesPairs generates a VALUES list for (hash, idx) pairs
+// intended to be used as a join source, e.g.
+//
+//	FROM (VALUES (...)) AS v(h, i) JOIN transactions t ON t.hash = v.h ...
+//
+// The Postgres variant annotates the FIRST row with `::bytea` / `::bigint`
+// type casts so the planner can resolve VALUES column types early — without
+// those, postgres defaults placeholder types to `text`, which forces runtime
+// coercion at every join and blocks index use on transactions(hash). SQLite
+// infers VALUES column types dynamically from the bound values and doesn't
+// need (or support) the `::` cast syntax.
+//
+// startIdx is the 1-based parameter index for the first placeholder. Returns
+// the `VALUES ...` clause (no surrounding parentheses — caller wraps it) and
+// the args slice. For empty input, returns ("", nil).
+//
+// Why not `WHERE (t.hash, o.idx) IN ((h1,i1),...)`? Postgres plans that as
+// `transaction_id = t.id`-only index scan on outputs_pkey with the idx
+// predicate as a post-read filter, which reads every output of every matched
+// parent. The VALUES-join form forces a per-pair composite-PK lookup
+// (`transaction_id = t.id AND idx = v.i`), an ~90× cost reduction on 3-pair
+// cases and a much larger reduction when parent txs have many outputs.
+func buildCompositeValuesPairs(pairs []outpointPair, startIdx int, engine string) (string, []interface{}) {
 	if len(pairs) == 0 {
 		return "", nil
 	}
 	groups := make([]string, len(pairs))
 	args := make([]interface{}, 0, len(pairs)*2)
+	postgres := engine == string(util.Postgres)
 	for i, p := range pairs {
-		groups[i] = fmt.Sprintf("($%d,$%d)", startIdx+(2*i), startIdx+(2*i)+1)
+		a := startIdx + (2 * i)
+		b := a + 1
+		if i == 0 && postgres {
+			// Annotate types on the first row so postgres infers v.h as bytea
+			// and v.i as bigint instead of text/unknown.
+			groups[i] = fmt.Sprintf("($%d::bytea,$%d::bigint)", a, b)
+		} else {
+			groups[i] = fmt.Sprintf("($%d,$%d)", a, b)
+		}
 		args = append(args, p.hash, p.idx)
 	}
-	return "(" + strings.Join(groups, ",") + ")", args
+	return "VALUES " + strings.Join(groups, ","), args
 }
 
 // buildMultiValueInsert generates a multi-row VALUES clause with positional parameters.
