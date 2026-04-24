@@ -2221,3 +2221,109 @@ func TestUnspendSimple(t *testing.T) {
 	err = store.Unspend(ctx, []*utxo.Spend{spend})
 	require.NoError(t, err)
 }
+
+// TestCreateBatch_IndexMath verifies that CreateBatch returns
+// (metas, errs) with lengths equal to len(txs) and that every
+// corresponding slot is populated correctly when the batch
+// succeeds end-to-end.
+func TestCreateBatch_IndexMath(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	utxoStore, template := setup(ctx, t)
+
+	// Build 5 distinct txs by cloning the template and varying Version so
+	// each one hashes differently.
+	const N = 5
+	txs := make([]*bt.Tx, N)
+	for i := range txs {
+		c := template.Clone()
+		c.Version = uint32(10000 + i)
+		txs[i] = c
+	}
+
+	metas, errs := utxoStore.CreateBatch(ctx, txs, 0, nil)
+	require.Len(t, metas, N)
+	require.Len(t, errs, N)
+
+	for i := 0; i < N; i++ {
+		require.NoError(t, errs[i], "slot %d errored: %v", i, errs[i])
+		require.NotNil(t, metas[i], "slot %d has nil meta", i)
+	}
+}
+
+// TestCreateBatch_DuplicateFailure verifies that when one tx in a batch
+// is a duplicate of an already-created tx, only that slot errors; the
+// other slots still succeed. Preserves the per-tx error isolation
+// contract.
+func TestCreateBatch_DuplicateFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	utxoStore, template := setup(ctx, t)
+
+	// Pre-create one tx so the next call for it is a duplicate.
+	existing := template.Clone()
+	existing.Version = 20000
+	_, err := utxoStore.Create(ctx, existing, 0)
+	require.NoError(t, err)
+
+	// Build a batch of 3: [new0, duplicate-of-existing, new2].
+	new0 := template.Clone()
+	new0.Version = 20001
+	new2 := template.Clone()
+	new2.Version = 20002
+	txs := []*bt.Tx{new0, existing, new2}
+
+	metas, errs := utxoStore.CreateBatch(ctx, txs, 0, nil)
+	require.Len(t, metas, 3)
+	require.Len(t, errs, 3)
+
+	require.NoError(t, errs[0], "new tx slot 0 must succeed")
+	require.NotNil(t, metas[0])
+
+	require.Error(t, errs[1], "duplicate tx slot 1 must error")
+	require.True(t, errors.Is(errs[1], errors.ErrTxExists),
+		"slot 1 error must be ErrTxExists, got %T: %v", errs[1], errs[1])
+	require.Nil(t, metas[1])
+
+	require.NoError(t, errs[2], "new tx slot 2 must succeed")
+	require.NotNil(t, metas[2])
+}
+
+// TestSetLockedSingleHashUsesBulkPath verifies that SetLocked with a
+// single-hash slice completes without relying on any batcher goroutine.
+// The pre-refactor code routed single-hash unlocks through a dedicated
+// unlockBatcher; that path is gone. This test gates regressions by
+// asserting the call finishes under a tight context deadline and the
+// row is actually unlocked.
+func TestSetLockedSingleHashUsesBulkPath(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	utxoStore, tx := setup(ctx, t)
+
+	// Create a tx so there's a row to lock/unlock.
+	_, err := utxoStore.Create(ctx, tx, 1)
+	require.NoError(t, err)
+
+	// Lock it first so we have something to unlock.
+	require.NoError(t, utxoStore.SetLocked(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true))
+
+	// Unlock with a single-hash slice — this is the path under test.
+	// Use a 5-second context deadline as the backstop: if any lingering
+	// batcher-based code tried to wait on a nil batcher's callback, the
+	// call would hang until deadline.
+	unlockCtx, unlockCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer unlockCancel()
+	require.NoError(t, utxoStore.SetLocked(unlockCtx, []chainhash.Hash{*tx.TxIDChainHash()}, false))
+
+	// Verify the row is actually unlocked in the DB.
+	var locked bool
+	err = utxoStore.db.QueryRowContext(ctx,
+		`SELECT locked FROM transactions WHERE hash = $1`,
+		tx.TxIDChainHash()[:],
+	).Scan(&locked)
+	require.NoError(t, err)
+	require.False(t, locked, "single-hash SetLocked(false) must actually unlock the row")
+}
