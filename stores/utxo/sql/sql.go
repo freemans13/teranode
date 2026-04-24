@@ -4456,6 +4456,23 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not create conflicting_children table - [%+v]", err)
 	}
 
+	// Partial index over unspent outputs, keyed by parent transaction_id.
+	// Used by the spend-path bulk UPDATE's unspent_before CTE stage, which
+	// counts how many outputs of each touched parent are still unspent to
+	// decide whether this batch has drained the parent's last unspent output
+	// (so DAH can be set). Without this index Postgres falls back to the
+	// composite PK's leading column only — scanning every output of every
+	// touched parent and filtering spending_data IS NULL after the read.
+	// For data-carrier / large-fan-out parents that's thousands of rows per
+	// parent per batch and was surfacing as multi-second IO:DataFileRead
+	// waits inside sendSpendBatch on mainnet. With this partial index the
+	// count becomes an index-only scan over just the unspent rows, which on
+	// a healthy chain is a small minority of the outputs table.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS px_outputs_unspent_by_parent ON outputs (transaction_id) WHERE spending_data IS NULL;`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create px_outputs_unspent_by_parent index - [%+v]", err)
+	}
+
 	return nil
 }
 
@@ -4529,6 +4546,13 @@ func createSqliteSchema(db *usql.DB) error {
 	`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not create outputs table - [%+v]", err)
+	}
+
+	// Partial index over unspent outputs — see Postgres schema for rationale.
+	// SQLite supports partial indexes via the WHERE clause.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS px_outputs_unspent_by_parent ON outputs (transaction_id) WHERE spending_data IS NULL;`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create px_outputs_unspent_by_parent index - [%+v]", err)
 	}
 
 	if _, err := db.Exec(`
