@@ -1697,18 +1697,19 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			if spendingTxExists {
 				s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
 				// Clear every ErrTxNotFound slot (this one and any later).
-				// The outer loop will append each now-successful spend exactly
-				// once when it reaches the corresponding errs[k] == nil slot,
-				// so we must NOT append here — doing so would double-count.
+				// Subsequent outer-loop iterations re-read errs[k] and will
+				// take the "if e == nil" success branch to append spends[k]
+				// exactly once. We therefore must NOT append inside this
+				// k-loop — doing so would double-count later slots.
 				for k := range errs {
 					if errs[k] != nil && errors.Is(errs[k], errors.ErrTxNotFound) {
 						errs[k] = nil
 						spends[k].Err = nil
 					}
 				}
-				// This slot is now cleared; fall through so the outer loop's
-				// next iteration re-reads errs[i] == nil and appends once.
-				// (Go's range over a slice re-reads the element each step.)
+				// The outer loop won't revisit the current slot i (it moves
+				// to i+1 after our continue), so append spends[i] inline
+				// exactly once here to keep the spentSpends length invariant.
 				spentSpends = append(spentSpends, spends[i])
 				continue
 			}
