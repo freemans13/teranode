@@ -454,6 +454,15 @@ func (m *TestMockValidator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, 
 	return &meta.Data{}, nil
 }
 
+func (m *TestMockValidator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...Option) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		metas[i], errs[i] = m.Validate(ctx, tx, blockHeight, opts...)
+	}
+	return metas, errs
+}
+
 func (m *TestMockValidator) GetBlockHeight() uint32 {
 	return 101
 }

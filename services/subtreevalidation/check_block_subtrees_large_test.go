@@ -156,6 +156,16 @@ func (v *TopologicalOrderValidator) ValidateWithOptions(ctx context.Context, tx 
 	return v.createMinimalMetadata(tx), nil
 }
 
+// ValidateBatch implements validator.Interface. Loop stub for topological order checks.
+func (v *TopologicalOrderValidator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...validator.Option) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		metas[i], errs[i] = v.Validate(ctx, tx, blockHeight, opts...)
+	}
+	return metas, errs
+}
+
 // createMinimalMetadata returns a minimal meta.Data without fee calculation
 func (v *TopologicalOrderValidator) createMinimalMetadata(tx *bt.Tx) *meta.Data {
 	// Extract TxInpoints from the transaction - needed for subtree serialization

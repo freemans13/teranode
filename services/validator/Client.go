@@ -213,6 +213,21 @@ func (c *Client) Validate(ctx context.Context, tx *bt.Tx, blockHeight uint32, op
 	return c.ValidateWithOptions(ctx, tx, blockHeight, validationOptions)
 }
 
+// ValidateBatch is a loop-over-Validate stub. The cross-process gRPC path does
+// not yet have a batch proto; when a profile shows cross-process fan-out
+// matters, a dedicated batch-protocol PR can replace this. In-process
+// deployments (which is where the 2,299-goroutine Create-path pile was
+// observed) use Validator.ValidateBatch directly and do not go through this
+// client.
+func (c *Client) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...Option) ([]*utxometa.Data, []error) {
+	metas := make([]*utxometa.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		metas[i], errs[i] = c.Validate(ctx, tx, blockHeight, opts...)
+	}
+	return metas, errs
+}
+
 type validateBatchResponse struct {
 	metaData []byte
 	err      error
