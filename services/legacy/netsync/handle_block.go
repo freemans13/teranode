@@ -805,9 +805,6 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 		deferFn(err)
 	}()
 
-	spendBatcherSize := sm.settings.Legacy.SpendBatcherSize
-	spendBatcherConcurrency := sm.settings.Legacy.SpendBatcherConcurrency
-
 	var timeStart time.Time
 
 	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
@@ -823,56 +820,40 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 
 	// try to pre-validate the transactions through the validation, to speed up subtree validation later on.
 	// This allows us to process all the transactions in parallel. The levels indicate the number of parents in the block.
+	//
+	// PR B of 2: a single ValidateBatch call per level replaces the previous
+	// errgroup+loop fan-out, collapsing the 2,299-goroutine Create-path pile
+	// observed in profile-4. The batch path internally uses utxoStore.CreateBatch
+	// so no external TriggerBatcher call is required.
 	for i := uint32(0); i <= maxLevel; i++ {
 		_, _, deferLevelFn := tracing.Tracer("netsync").Start(ctx, fmt.Sprintf("validateTransactions:level:%d", i))
 
-		if len(blockTxsPerLevel[i]) < 10 {
-			// if we have less than 10 transactions on a certain level, we can process them immediately by triggering the batcher
-			for txIdx := range blockTxsPerLevel[i] {
-				blockHeightUint32, err := safeconversion.Int32ToUint32(block.Height())
-				if err != nil {
-					return err
-				}
-
-				timeStart = time.Now()
-
-				_, _ = sm.validationClient.Validate(ctx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true))
-
-				prometheusLegacyNetsyncBlockTxValidate.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
-			}
-
-			sm.validationClient.TriggerBatcher()
-		} else {
-			// process all the transactions on a certain level in parallel
-			g, gCtx := errgroup.WithContext(ctx)
-			util.SafeSetLimit(g, spendBatcherSize*spendBatcherConcurrency) // we limit the number of concurrent requests, to not overload Aerospike
-
-			for txIdx := range blockTxsPerLevel[i] {
-				txIdx := txIdx
-
-				g.Go(func() error {
-					timeStart := time.Now()
-					defer func() {
-						prometheusLegacyNetsyncBlockTxValidate.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
-					}()
-
-					blockHeightUint32, err := safeconversion.Int32ToUint32(block.Height())
-					if err != nil {
-						return err
-					}
-
-					// send to validation, but only if the parent is not in the same block
-					_, _ = sm.validationClient.Validate(gCtx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true))
-
-					return nil
-				})
-			}
-
-			// we don't care about errors here, we are just pre-warming caches for a quicker subtree validation
-			_ = g.Wait()
-
+		levelTxs := blockTxsPerLevel[i]
+		if len(levelTxs) == 0 {
 			deferLevelFn()
+			continue
 		}
+
+		blockHeightUint32, err := safeconversion.Int32ToUint32(block.Height())
+		if err != nil {
+			deferLevelFn()
+			return err
+		}
+
+		timeStart = time.Now()
+		_, errs := sm.validationClient.ValidateBatch(ctx, levelTxs, blockHeightUint32, validator.WithSkipPolicyChecks(true))
+
+		// Preserve the per-tx prometheus observation semantic. The batch call's
+		// wall time is split evenly across its txs so existing dashboards that
+		// compute p50/p95 per-tx see a compatible distribution. This is a lossy
+		// approximation; a follow-up PR can introduce a dedicated batch
+		// histogram if the resolution matters.
+		perTxDuration := time.Since(timeStart) / time.Duration(len(levelTxs))
+		for range errs {
+			prometheusLegacyNetsyncBlockTxValidate.Observe(float64(perTxDuration.Microseconds()) / 1_000_000)
+		}
+
+		deferLevelFn()
 	}
 
 	return nil
