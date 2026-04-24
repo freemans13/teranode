@@ -448,15 +448,21 @@ func (v *Validator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight
 
 	validationOptions := ProcessOptions(opts...)
 
-	// Phase 1: per-tx pre-Create work in parallel.
+	// Phase 1: per-tx pre-Create work in parallel. We deliberately pass the
+	// caller's ctx (not the errgroup-derived gCtx) into validateInternalPreCreate
+	// because preCreateResult.decoupledCtx is derived from it and must outlive
+	// Phase 1's errgroup. When tracing is disabled, DecoupleTracingSpan returns
+	// the input ctx unchanged — so if we passed gCtx here it would be canceled
+	// once g.Wait() returns, breaking Phase 2 and Phase 3 reads. gCtx on the
+	// errgroup is only used to stop scheduling if the caller cancels ctx.
 	preResults := make([]preCreateResult, len(txs))
 	{
-		g, gCtx := errgroup.WithContext(ctx)
+		g, _ := errgroup.WithContext(ctx)
 		g.SetLimit(runtime.NumCPU() * 2)
 		for i, tx := range txs {
 			i, tx := i, tx
 			g.Go(func() error {
-				res, err := v.validateInternalPreCreate(gCtx, tx, blockHeight, validationOptions)
+				res, err := v.validateInternalPreCreate(ctx, tx, blockHeight, validationOptions)
 				preResults[i] = res
 				if res.earlyExit {
 					// Early exit from pre-Create (conflicting / already-blessed). Record
@@ -521,9 +527,11 @@ func (v *Validator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight
 	// Phase 3: per-tx post-Create work in parallel. Runs for every tx that
 	// reached Create (skipCreate or not) — including slots where Create
 	// returned an error, because validateInternalPostCreate handles the
-	// ErrTxExists / reverseSpends branches.
+	// ErrTxExists / reverseSpends branches. Same ctx-vs-gCtx consideration
+	// as Phase 1: validateInternalPostCreate's internal work uses
+	// pre.decoupledCtx (preserved across phases), so we pass ctx here.
 	{
-		g, gCtx := errgroup.WithContext(ctx)
+		g, _ := errgroup.WithContext(ctx)
 		g.SetLimit(runtime.NumCPU() * 2)
 		for i, tx := range txs {
 			if errs[i] != nil || preResults[i].earlyExit {
@@ -531,7 +539,7 @@ func (v *Validator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight
 			}
 			i, tx := i, tx
 			g.Go(func() error {
-				finalMeta, err := v.validateInternalPostCreate(gCtx, tx, blockHeight, validationOptions, preResults[i], metas[i], perSlotCreateErr[i])
+				finalMeta, err := v.validateInternalPostCreate(ctx, tx, blockHeight, validationOptions, preResults[i], metas[i], perSlotCreateErr[i])
 				// Fire the decoupled-span defer for this tx now that Phase 3 has completed.
 				if preResults[i].decoupledDeferFn != nil {
 					preResults[i].decoupledDeferFn(err)
