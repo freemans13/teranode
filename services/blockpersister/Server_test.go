@@ -981,6 +981,14 @@ func (m *MockUTXOStore) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeig
 		for i := range errs {
 			errs[i] = err
 		}
+		return metas, errs
+	}
+
+	// Contract: success slots must have a non-nil *meta.Data. Populate a
+	// minimal empty meta per slot so callers that start using CreateBatch
+	// in this test surface don't nil-dereference.
+	for i := range metas {
+		metas[i] = &meta.Data{}
 	}
 	return metas, errs
 }

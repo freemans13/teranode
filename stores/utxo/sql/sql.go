@@ -287,7 +287,14 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		return s.createBatched(ctx, tx, blockHeight, options)
 	}
 
-	// Try the operation with retry logic for lock errors
+	return s.createWithLockRetry(ctx, tx, blockHeight, options)
+}
+
+// createWithLockRetry wraps createWithRetry with the 3-attempt lock-error
+// retry/backoff loop used by Create. Factored out so CreateBatch's fallback
+// path can preserve the same retry semantics without re-entering the
+// batcher path that Create takes when createBatcher != nil.
+func (s *Store) createWithLockRetry(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
 	var txMeta *meta.Data
 	var err error
 
@@ -327,13 +334,20 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 // (e.g. BeginTx, Commit), every slot receives the same storage error
 // and metas holds nils at every slot.
 //
-// Per-slot error isolation is scoped exclusively to ErrTxExists — the
-// duplicate case — because createCTESQL uses ON CONFLICT (hash) DO
-// NOTHING, which is a no-op rather than a statement failure and
-// therefore does not poison the Postgres transaction. Successful
-// slots commit alongside duplicate-error slots.
+// Per-slot error isolation comes in two flavours:
 //
-// Any OTHER per-tx error (deadlock, serialization failure, lock
+//  1. Preflight / processing errors (e.g. TxMetaDataFromTx failing
+//     before any SQL is issued) are per-slot by construction — they
+//     never touched the Postgres transaction so neighbouring slots
+//     can still commit successfully.
+//
+//  2. The only SQL error safe to continue the batch after is
+//     ErrTxExists. createCTESQL uses ON CONFLICT (hash) DO NOTHING,
+//     which makes a duplicate a no-op rather than a statement
+//     failure, so it does not poison the Postgres transaction.
+//     Successful slots commit alongside duplicate-error slots.
+//
+// Any OTHER SQL error (deadlock, serialization failure, lock
 // timeout, constraint violation on inputs/outputs/block_ids, etc.)
 // puts the Postgres transaction into an aborted state. We detect
 // that case, short-circuit the loop, and propagate the real root
@@ -368,21 +382,21 @@ func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint3
 	}
 
 	// For non-postgres engines (sqlite) or when CTE batching is disabled,
-	// the single-CTE path doesn't apply. Fall back to a trivial loop — the
+	// the single-CTE path doesn't apply. Fall back to a per-tx loop — the
 	// fan-out concern is specific to postgres production deployments.
 	//
-	// We deliberately bypass s.Create here because Create can re-enter
+	// We deliberately avoid calling s.Create here because Create can re-enter
 	// createBatched when createBatcher is non-nil (postgres + StoreBatcherSize>1),
-	// which would reintroduce the goroutine/batcher fan-out we're trying
-	// to eliminate. createWithRetry is the per-tx body and doesn't touch
-	// the batcher.
+	// which would reintroduce the goroutine/batcher fan-out we're trying to
+	// eliminate. Instead, preserve Create's lock-error retry/backoff semantics
+	// inline around createWithRetry.
 	if !(s.settings.UtxoStore.BatchSQLOperations && s.engine == "postgres") {
 		for i, tx := range txs {
 			options := &utxo.CreateOptions{}
 			for _, opt := range resolveOpts(i) {
 				opt(options)
 			}
-			metas[i], errs[i] = s.createWithRetry(ctx, tx, blockHeight, options)
+			metas[i], errs[i] = s.createWithLockRetry(ctx, tx, blockHeight, options)
 		}
 		return metas, errs
 	}
