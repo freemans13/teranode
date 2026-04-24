@@ -2221,3 +2221,112 @@ func TestUnspendSimple(t *testing.T) {
 	err = store.Unspend(ctx, []*utxo.Spend{spend})
 	require.NoError(t, err)
 }
+
+// TestSendSpendBatch_GroupFlatteningIndexMath locks in the per-group flatIdx
+// arithmetic that maps DB result rows back to the right (groupI, spendJ)
+// slot across a multi-group batch. This is the one chunk of logic in the
+// refactor with non-trivial index math; a one-off-by-one bug here would
+// silently miscategorise spend errors across transactions in the same batch.
+func TestSendSpendBatch_GroupFlatteningIndexMath(t *testing.T) {
+	// Helper: build a batchSpend for a tx with N synthetic inputs. The
+	// inputs don't need real data — this test exercises the plumbing only.
+	makeGroup := func(nInputs int) *batchSpend {
+		spends := make([]*utxo.Spend, nInputs)
+		for i := range spends {
+			h := chainhash.HashH([]byte{byte(nInputs), byte(i)})
+			uh := chainhash.HashH([]byte{0xaa, byte(nInputs), byte(i)})
+			spends[i] = &utxo.Spend{
+				TxID:     &h,
+				Vout:     uint32(i),
+				UTXOHash: &uh,
+			}
+		}
+		return &batchSpend{
+			spends:      spends,
+			blockHeight: 1,
+			errCh:       make(chan []error, 1),
+		}
+	}
+
+	// 5 groups with 1, 2, 3, 10, 1 inputs = 17 flat indices total.
+	groups := []*batchSpend{
+		makeGroup(1),
+		makeGroup(2),
+		makeGroup(3),
+		makeGroup(10),
+		makeGroup(1),
+	}
+
+	// Compute the expected (groupI, spendJ) for every flat index by
+	// doing the same walk the production code must do. This is the test's
+	// ground truth: the prod code must agree with it.
+	expectedGroupIdx := []spendFlatGroup{}
+	for gi, g := range groups {
+		for si := range g.spends {
+			expectedGroupIdx = append(expectedGroupIdx, spendFlatGroup{groupI: gi, spendJ: si})
+		}
+	}
+	require.Len(t, expectedGroupIdx, 17)
+
+	// Construct the same flat-index map the production flatten loop
+	// produces. The flatten helper we are about to write must produce
+	// an equivalent mapping; we test it via its observable effect —
+	// flattenSpendBatch returns the pairs + the per-flatIdx reverse map.
+	flatPairs, flatIdxToGroup := flattenSpendBatch(groups)
+	require.Len(t, flatPairs, 17)
+	require.Len(t, flatIdxToGroup, 17)
+	require.Equal(t, expectedGroupIdx, flatIdxToGroup)
+
+	// Simulate a DB result that errors on flat indices {0, 5, 16}.
+	// After dispatch, each group's errSlice must have the right length
+	// and the right slots populated.
+	errorAtFlat := map[int]error{
+		0:  errors.NewUtxoSpentError(*groups[0].spends[0].TxID, 0, *groups[0].spends[0].UTXOHash, nil),
+		5:  errors.NewUtxoFrozenError("synthetic frozen at flat 5"),
+		16: errors.NewUtxoSpentError(*groups[4].spends[0].TxID, 0, *groups[4].spends[0].UTXOHash, nil),
+	}
+	dispatchSpendErrors(groups, flatIdxToGroup, errorAtFlat)
+
+	// Group 0: one input, flat 0 errored.
+	g0 := <-groups[0].errCh
+	require.Len(t, g0, 1)
+	require.Error(t, g0[0])
+	require.True(t, errors.Is(g0[0], errors.ErrSpent))
+
+	// Group 1: two inputs, flat indices 1..2, no errors.
+	g1 := <-groups[1].errCh
+	require.Equal(t, []error{nil, nil}, g1)
+
+	// Group 2: three inputs, flat indices 3..5. Flat 5 is group 2 slot 2.
+	g2 := <-groups[2].errCh
+	require.Len(t, g2, 3)
+	require.NoError(t, g2[0])
+	require.NoError(t, g2[1])
+	require.Error(t, g2[2])
+	require.True(t, errors.Is(g2[2], errors.ErrFrozen))
+
+	// Group 3: ten inputs, flat indices 6..15, no errors.
+	g3 := <-groups[3].errCh
+	require.Len(t, g3, 10)
+	for _, e := range g3 {
+		require.NoError(t, e)
+	}
+
+	// Group 4: one input, flat 16 errored.
+	g4 := <-groups[4].errCh
+	require.Len(t, g4, 1)
+	require.Error(t, g4[0])
+	require.True(t, errors.Is(g4[0], errors.ErrSpent))
+
+	// Every errCh must have been signalled exactly once — any second
+	// send would block forever with a size-1 buffer. Do a non-blocking
+	// receive; every group should be empty/closed-like.
+	for gi, g := range groups {
+		select {
+		case extra := <-g.errCh:
+			t.Fatalf("group %d received a second error slice: %v", gi, extra)
+		default:
+			// ok — no second send
+		}
+	}
+}
