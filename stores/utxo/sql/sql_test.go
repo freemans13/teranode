@@ -2225,7 +2225,7 @@ func TestUnspendSimple(t *testing.T) {
 // TestSendSpendBatch_GroupFlatteningIndexMath locks in the per-group flatIdx
 // arithmetic that maps DB result rows back to the right (groupI, spendJ)
 // slot across a multi-group batch. This is the one chunk of logic in the
-// refactor with non-trivial index math; a one-off-by-one bug here would
+// refactor with non-trivial index math; an off-by-one bug here would
 // silently miscategorise spend errors across transactions in the same batch.
 func TestSendSpendBatch_GroupFlatteningIndexMath(t *testing.T) {
 	// Helper: build a batchSpend for a tx with N synthetic inputs. The

@@ -1696,20 +1696,20 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			}
 			if spendingTxExists {
 				s.logger.Warnf("[Spend][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
-				// Clear every ErrTxNotFound slot (this one and any later).
-				// Subsequent outer-loop iterations re-read errs[k] and will
-				// take the "if e == nil" success branch to append spends[k]
-				// exactly once. We therefore must NOT append inside this
-				// k-loop — doing so would double-count later slots.
+				// Subsequent outer-loop iterations for later indices re-read
+				// errs[k] and will take the "if e == nil" success branch to
+				// append spends[k] exactly once. We therefore must NOT append
+				// inside this k-loop — doing so would double-count later slots.
 				for k := range errs {
 					if errs[k] != nil && errors.Is(errs[k], errors.ErrTxNotFound) {
 						errs[k] = nil
 						spends[k].Err = nil
 					}
 				}
-				// The outer loop won't revisit the current slot i (it moves
-				// to i+1 after our continue), so append spends[i] inline
-				// exactly once here to keep the spentSpends length invariant.
+				// The outer loop does not revisit the current slot i, and the
+				// current iteration's e value is not updated when errs[i] is
+				// cleared above. Append spends[i] inline exactly once here to
+				// keep the spentSpends length invariant.
 				spentSpends = append(spentSpends, spends[i])
 				continue
 			}
@@ -1806,7 +1806,7 @@ type spendFlatGroup struct {
 //     suitable for the Phase-1 bulk SELECT VALUES list.
 //   - flatIdxToGroup: inverse map — flatIdxToGroup[k] tells the caller which
 //     (group, input) slot flat index k came from, so DB results can be
-//     written back into the right batchSpend.errSlice slot.
+//     routed back to the correct per-input error position for that group.
 //
 // The two slices are always the same length. If the input batch is empty
 // or every group has zero spends, returns (nil, nil).
@@ -1926,8 +1926,29 @@ type spendSelectResult struct {
 	spendableIn            *uint32
 }
 
+// maxInputsPerBulkSpend bounds the flat-input count for a single bulk
+// SELECT/UPDATE round-trip in trySendSpendBatchBulk. PostgreSQL enforces a
+// 65,535-bind-parameter limit per statement; the bulk UPDATE carries 4
+// params/input (plus 2 for the DAH-wrap), so 15,000 inputs fits with a
+// healthy margin. Batches that exceed this (in practice a single tx with
+// many thousands of inputs) fall back to the per-row path, which emits one
+// statement per input and therefore has no aggregate param ceiling.
+const maxInputsPerBulkSpend = 15000
+
 // trySendSpendBatchBulk uses bulk SELECT + bulk UPDATE for PostgreSQL.
 func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
+	// Guard against PostgreSQL's 65,535-param-per-statement limit. When a
+	// batch's flattened input count would overflow the bulk UPDATE, fall
+	// back to the per-row path for the whole batch — correctness over
+	// performance for an uncommon edge case.
+	totalInputs := 0
+	for _, g := range batch {
+		totalInputs += len(g.spends)
+	}
+	if totalInputs > maxInputsPerBulkSpend {
+		return s.trySendSpendBatchPerRow(batch)
+	}
+
 	// Flatten all groups into a single list of (hash, vout) pairs so the
 	// SQL below can stay byte-identical to the pre-refactor version; only
 	// the Go-side error accounting changes to per-(group, input) slot.
