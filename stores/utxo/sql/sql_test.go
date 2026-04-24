@@ -2404,22 +2404,31 @@ func TestUnspendSimple(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestBuildCompositeINClause(t *testing.T) {
-	t.Run("single pair", func(t *testing.T) {
+func TestBuildCompositeValuesPairs(t *testing.T) {
+	t.Run("single pair sqlite (no casts)", func(t *testing.T) {
 		pairs := []outpointPair{{hash: []byte{0x01, 0x02}, idx: 7}}
-		clause, args := buildCompositeINClause(pairs, 1)
-		require.Equal(t, "(($1,$2))", clause)
+		clause, args := buildCompositeValuesPairs(pairs, 1, "sqlite")
+		require.Equal(t, "VALUES ($1,$2)", clause)
 		require.Equal(t, []interface{}{[]byte{0x01, 0x02}, uint32(7)}, args)
 	})
 
-	t.Run("multiple pairs preserve order", func(t *testing.T) {
+	t.Run("single pair postgres (first row cast)", func(t *testing.T) {
+		pairs := []outpointPair{{hash: []byte{0x01, 0x02}, idx: 7}}
+		clause, args := buildCompositeValuesPairs(pairs, 1, "postgres")
+		require.Equal(t, "VALUES ($1::bytea,$2::bigint)", clause)
+		require.Equal(t, []interface{}{[]byte{0x01, 0x02}, uint32(7)}, args)
+	})
+
+	t.Run("multiple pairs postgres — only first row cast", func(t *testing.T) {
 		pairs := []outpointPair{
 			{hash: []byte{0xaa}, idx: 0},
 			{hash: []byte{0xbb}, idx: 5},
 			{hash: []byte{0xcc}, idx: 9},
 		}
-		clause, args := buildCompositeINClause(pairs, 3)
-		require.Equal(t, "(($3,$4),($5,$6),($7,$8))", clause)
+		clause, args := buildCompositeValuesPairs(pairs, 3, "postgres")
+		// First row carries the casts to anchor column types; subsequent rows
+		// inherit. Repeating the casts would work but wastes bytes.
+		require.Equal(t, "VALUES ($3::bytea,$4::bigint),($5,$6),($7,$8)", clause)
 		require.Equal(t, []interface{}{
 			[]byte{0xaa}, uint32(0),
 			[]byte{0xbb}, uint32(5),
@@ -2427,8 +2436,21 @@ func TestBuildCompositeINClause(t *testing.T) {
 		}, args)
 	})
 
+	t.Run("multiple pairs sqlite", func(t *testing.T) {
+		pairs := []outpointPair{
+			{hash: []byte{0xaa}, idx: 0},
+			{hash: []byte{0xbb}, idx: 5},
+		}
+		clause, args := buildCompositeValuesPairs(pairs, 1, "sqlite")
+		require.Equal(t, "VALUES ($1,$2),($3,$4)", clause)
+		require.Equal(t, []interface{}{
+			[]byte{0xaa}, uint32(0),
+			[]byte{0xbb}, uint32(5),
+		}, args)
+	})
+
 	t.Run("empty pairs returns empty clause", func(t *testing.T) {
-		clause, args := buildCompositeINClause(nil, 1)
+		clause, args := buildCompositeValuesPairs(nil, 1, "postgres")
 		require.Equal(t, "", clause)
 		require.Nil(t, args)
 	})
