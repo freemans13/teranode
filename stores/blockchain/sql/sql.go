@@ -130,6 +130,10 @@ type SQL struct {
 	// eliminating per-block SQL queries in calculateMedianTimePastForHeight during
 	// sequential block processing (seeder, catchup). Cleared on fork detection/invalidation.
 	blockTimestampCache *blockTimestampCache
+	// bestBlockIDQueries counts how many times getBestBlockID has hit the database
+	// (cache misses only). Exposed for tests to catch regressions that reintroduce
+	// unnecessary per-block Postgres round-trips in the StoreBlock hot path.
+	bestBlockIDQueries atomic.Uint64
 }
 
 // New creates and initializes a new SQL blockchain store instance.
