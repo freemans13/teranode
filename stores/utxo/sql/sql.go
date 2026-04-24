@@ -1639,6 +1639,16 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		g               errgroup.Group
 	)
 
+	// Cap per-tx concurrency into the spend batcher. Without this, a single tx
+	// with tens of thousands of inputs (e.g. a consolidation) can flood the
+	// batcher queue faster than its serialised callback can drain it, producing
+	// a single bulk SELECT whose parameter count exceeds PostgreSQL's 65535
+	// extended-protocol limit. Using SpendBatcherSize*SpendBatcherConcurrency
+	// matches the pattern used in services/legacy/netsync/handle_block.go.
+	if limit := s.settings.UtxoStore.SpendBatcherSize * s.settings.UtxoStore.SpendBatcherConcurrency; limit > 0 {
+		g.SetLimit(limit)
+	}
+
 	for idx, spend := range spends {
 		if spend == nil {
 			return nil, errors.NewProcessingError("spend should not be nil")
