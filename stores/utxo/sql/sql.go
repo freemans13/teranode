@@ -327,11 +327,18 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 // (e.g. BeginTx, Commit), every slot receives the same storage error
 // and metas holds nils at every slot.
 //
-// Per-slot errors (e.g. ErrTxExists for a duplicate) do NOT abort the
-// batch — the successful slots still commit alongside the failed slots'
-// per-row errors. Postgres is happy with this: the ON CONFLICT DO NOTHING
-// pattern inside createCTESQL means a duplicate simply didn't insert a
-// transactions row, and the other slots' inserts remain committable.
+// Per-slot error isolation is scoped exclusively to ErrTxExists — the
+// duplicate case — because createCTESQL uses ON CONFLICT (hash) DO
+// NOTHING, which is a no-op rather than a statement failure and
+// therefore does not poison the Postgres transaction. Successful
+// slots commit alongside duplicate-error slots.
+//
+// Any OTHER per-tx error (deadlock, serialization failure, lock
+// timeout, constraint violation on inputs/outputs/block_ids, etc.)
+// puts the Postgres transaction into an aborted state. We detect
+// that case, short-circuit the loop, and propagate the real root
+// cause to every slot before returning — Commit is skipped so its
+// generic abort error doesn't overwrite the real cause.
 func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
 	metas := make([]*meta.Data, len(txs))
 	errs := make([]error, len(txs))
@@ -363,9 +370,19 @@ func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint3
 	// For non-postgres engines (sqlite) or when CTE batching is disabled,
 	// the single-CTE path doesn't apply. Fall back to a trivial loop — the
 	// fan-out concern is specific to postgres production deployments.
+	//
+	// We deliberately bypass s.Create here because Create can re-enter
+	// createBatched when createBatcher is non-nil (postgres + StoreBatcherSize>1),
+	// which would reintroduce the goroutine/batcher fan-out we're trying
+	// to eliminate. createWithRetry is the per-tx body and doesn't touch
+	// the batcher.
 	if !(s.settings.UtxoStore.BatchSQLOperations && s.engine == "postgres") {
 		for i, tx := range txs {
-			metas[i], errs[i] = s.Create(ctx, tx, blockHeight, resolveOpts(i)...)
+			options := &utxo.CreateOptions{}
+			for _, opt := range resolveOpts(i) {
+				opt(options)
+			}
+			metas[i], errs[i] = s.createWithRetry(ctx, tx, blockHeight, options)
 		}
 		return metas, errs
 	}
@@ -387,14 +404,21 @@ func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint3
 		}
 	}()
 
+	// aborted is set if we hit a per-tx error that poisons the Postgres
+	// transaction (anything other than ErrTxExists, which is safe under
+	// ON CONFLICT DO NOTHING). In that case we skip Commit and let the
+	// deferred Rollback clean up, because Commit would fail with a
+	// generic abort error and overwrite the real root cause.
+	aborted := false
+
 	for i, tx := range txs {
 		// Bail out if the context is cancelled (client disconnect, deadline)
 		// — no point starting another round-trip we're about to roll back.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			sErr := errors.NewStorageError("CreateBatch: context cancelled mid-batch", ctxErr)
+			cErr := errors.NewContextCanceledError("CreateBatch: context cancelled mid-batch", ctxErr)
 			for j := range errs {
 				metas[j] = nil
-				errs[j] = sErr
+				errs[j] = cErr
 			}
 			return metas, errs
 		}
@@ -432,6 +456,37 @@ func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint3
 		m, cErr := s.createCTEWithPreparedArgsInTxn(ctx, txn, tx, blockHeight, options, txHash, txMeta, isCoinbase, unminedSince)
 		metas[i] = m
 		errs[i] = cErr
+
+		// ErrTxExists is the only per-slot error we know is safe to keep
+		// going after: createCTESQL uses ON CONFLICT (hash) DO NOTHING so
+		// a duplicate is a no-op rather than a statement failure that
+		// poisons the Postgres transaction. Any other error (deadlock,
+		// constraint violation on inputs/outputs/block_ids, lock timeout,
+		// etc.) aborts the Postgres tx, which means every subsequent call
+		// will fail and Commit will return the generic abort error —
+		// overwriting the real root cause. Short-circuit: mark remaining
+		// slots with the same error and let the deferred Rollback clean up.
+		if cErr != nil && !errors.Is(cErr, errors.ErrTxExists) {
+			for j := i + 1; j < len(errs); j++ {
+				metas[j] = nil
+				errs[j] = cErr
+			}
+			// Also invalidate any earlier apparently-successful slots: the
+			// Postgres tx is aborted and nothing will actually persist.
+			for j := 0; j < i; j++ {
+				metas[j] = nil
+				if errs[j] == nil {
+					errs[j] = cErr
+				}
+			}
+			aborted = true
+			break
+		}
+	}
+
+	if aborted {
+		// Skip Commit — the tx is poisoned; deferred Rollback handles cleanup.
+		return metas, errs
 	}
 
 	if err := txn.Commit(); err != nil {
