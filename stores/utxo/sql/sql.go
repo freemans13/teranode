@@ -290,10 +290,11 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	return s.createWithLockRetry(ctx, tx, blockHeight, options)
 }
 
-// createWithLockRetry wraps createWithRetry with the 3-attempt lock-error
-// retry/backoff loop used by Create. Factored out so CreateBatch's fallback
-// path can preserve the same retry semantics without re-entering the
-// batcher path that Create takes when createBatcher != nil.
+// createWithLockRetry wraps createWithRetry with the lock-error
+// retry/backoff loop used by Create: 3 retries / 4 total attempts.
+// Factored out so CreateBatch's fallback path can preserve the same
+// retry semantics without re-entering the batcher path that Create
+// takes when createBatcher != nil.
 func (s *Store) createWithLockRetry(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
 	var txMeta *meta.Data
 	var err error
@@ -350,9 +351,13 @@ func (s *Store) createWithLockRetry(ctx context.Context, tx *bt.Tx, blockHeight 
 // Any OTHER SQL error (deadlock, serialization failure, lock
 // timeout, constraint violation on inputs/outputs/block_ids, etc.)
 // puts the Postgres transaction into an aborted state. We detect
-// that case, short-circuit the loop, and propagate the real root
-// cause to every slot before returning — Commit is skipped so its
-// generic abort error doesn't overwrite the real cause.
+// that case, short-circuit the loop, null out every slot's metas,
+// and propagate the real root cause into every slot that was still
+// nil at the abort point (i.e. apparently-successful up to then).
+// Slots that already failed their own per-slot processing (e.g.
+// TxMetaDataFromTx) keep that original error because it reflects
+// what was actually wrong with that particular tx. Commit is
+// skipped so its generic abort error doesn't overwrite the cause.
 func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
 	metas := make([]*meta.Data, len(txs))
 	errs := make([]error, len(txs))
