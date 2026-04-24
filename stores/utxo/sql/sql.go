@@ -425,13 +425,12 @@ func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint3
 
 	if err := txn.Commit(); err != nil {
 		sErr := errors.NewStorageError("CreateBatch: Commit failed", err)
-		// Commit failure invalidates any success we recorded in this tx —
-		// every slot must show the failure.
+		// Commit failure invalidates every per-slot outcome recorded in this tx —
+		// none of the inserts actually persisted, so every slot must show the
+		// same storage failure.
 		for i := range errs {
 			metas[i] = nil
-			if errs[i] == nil {
-				errs[i] = sErr
-			}
+			errs[i] = sErr
 		}
 		return metas, errs
 	}
