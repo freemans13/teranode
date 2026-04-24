@@ -2330,3 +2330,73 @@ func TestSendSpendBatch_GroupFlatteningIndexMath(t *testing.T) {
 		}
 	}
 }
+
+// TestSpend_MultiInputOneSpent covers the most realistic failure
+// scenario for a multi-input spend: one input is already spent (by some
+// other transaction), the rest are clean. Post-refactor, this exercises
+// the per-slot error dispatch through the group path. Pre-refactor it
+// also passes via the per-input fan-out path — so it's equally valid as
+// a regression gate.
+func TestSpend_MultiInputOneSpent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _ := setup(ctx, t)
+
+	// Three independent parents, each storable. The child tx will spend
+	// each parent's output 0.
+	parents := make([]*bt.Tx, 3)
+	for i := range parents {
+		p, err := bt.NewTxFromString("010000000000000000ef012935b177236ec1cb75cd9fba86d84acac9d76ced9c1b22ba8de4cd2de85a8393000000004948304502200f653627aff050093a83dabc12a2a9b627041d424f2eb18849a2d587f1acd38f022100a23f94acd94a4d24049140d5fbe12448a880fd8f8c1c2b4141f83bef2be409be01ffffffff00f2052a01000000434104ed83808a903a7e25be91349815f5d545f0c9dbec60b8ea914a6d6cbe9f830628039641231e2dbc1c0ca809f13405eb01f3a06614717f7859b788bd1305d9a3f2ac0100f2052a010000001976a91471d7dd96d9edda09180fe9d57a477b5acc9cad1188ac00000000")
+		require.NoError(t, err)
+		p.Version = uint32(100 + i) // make hashes unique
+		_, err = store.Create(ctx, p, 0)
+		require.NoError(t, err)
+		parents[i] = p
+	}
+
+	// Build a child tx that spends all three parents' output 0. `From` wires
+	// up PreviousTxScript/PreviousTxSatoshis so utxo.GetSpends can compute
+	// the UTXO hash.
+	child := bt.NewTx()
+	for _, parent := range parents {
+		require.NoError(t, child.From(parent.TxIDChainHash().String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	}
+	require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+
+	// Pre-spend parent[1]'s output 0 with a DIFFERENT spending tx, so
+	// when `child` tries to spend it the batcher returns ErrSpent for
+	// that slot only.
+	otherSpender := bt.NewTx()
+	require.NoError(t, otherSpender.From(parents[1].TxIDChainHash().String(), 0, parents[1].Outputs[0].LockingScript.String(), parents[1].Outputs[0].Satoshis))
+	require.NoError(t, otherSpender.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+	_, err := store.Spend(ctx, otherSpender, 1)
+	require.NoError(t, err)
+
+	// Now try to spend with `child`. Expect slot 1 to fail, 0 and 2 to
+	// succeed briefly before Unspend rolls them back.
+	spends, err := store.Spend(ctx, child, 1)
+	require.Error(t, err, "tx with one already-spent input must return an aggregated error")
+	require.Len(t, spends, 3)
+
+	require.NoError(t, spends[0].Err, "slot 0 had no error")
+	require.Error(t, spends[1].Err, "slot 1 was already spent by otherSpender")
+	require.True(t, errors.Is(spends[1].Err, errors.ErrSpent),
+		"slot 1 error class must be ErrSpent, got %T: %v", spends[1].Err, spends[1].Err)
+	require.NotNil(t, spends[1].ConflictingTxID,
+		"slot 1 must carry ConflictingTxID so callers know who has the output")
+	require.Equal(t, otherSpender.TxID(), spends[1].ConflictingTxID.String(),
+		"ConflictingTxID must point to otherSpender")
+	require.NoError(t, spends[2].Err, "slot 2 had no error")
+
+	// needsSpendRollback should have been true (ErrSpent triggers it),
+	// and Unspend should have been called on slots 0 and 2. Check by
+	// spending them freshly from a new tx — they should succeed.
+	cleanup := bt.NewTx()
+	for _, i := range []int{0, 2} {
+		require.NoError(t, cleanup.From(parents[i].TxIDChainHash().String(), 0, parents[i].Outputs[0].LockingScript.String(), parents[i].Outputs[0].Satoshis))
+	}
+	require.NoError(t, cleanup.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+	_, err = store.Spend(ctx, cleanup, 2)
+	require.NoError(t, err, "slots 0 and 2 must have been rolled back; a fresh spend of them must succeed")
+}
