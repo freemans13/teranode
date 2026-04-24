@@ -333,6 +333,129 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	return txMeta, err
 }
 
+// CreateBatch implements utxo.Store. It reuses the single-tx createCTE
+// implementation under a shared transaction so a block's worth of tx
+// creations is one `BeginTx` scope rather than N concurrent ones, each
+// paying connection-acquisition + commit overhead.
+//
+// Per-tx errors are returned in the errs slice at the same index as the
+// corresponding tx; results are returned in the metas slice at the same
+// index. Both slices are len(txs). On a transaction-level failure
+// (e.g. BeginTx, Commit), every slot receives the same storage error
+// and metas holds nils at every slot.
+//
+// Per-slot errors (e.g. ErrTxExists for a duplicate) do NOT abort the
+// batch — the successful slots still commit alongside the failed slots'
+// per-row errors. Postgres is happy with this: the ON CONFLICT DO NOTHING
+// pattern inside createCTESQL means a duplicate simply didn't insert a
+// transactions row, and the other slots' inserts remain committable.
+func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	if len(txs) == 0 {
+		return metas, errs
+	}
+
+	// Validate opts length up-front. Accepted shapes: 0, 1, len(txs).
+	if len(opts) > 1 && len(opts) != len(txs) {
+		err := errors.NewProcessingError("CreateBatch: opts length %d matches neither 0, 1, nor len(txs)=%d", len(opts), len(txs))
+		for i := range errs {
+			errs[i] = err
+		}
+		return metas, errs
+	}
+
+	// Resolve per-tx options. nil/0 → no options. 1 → broadcast. N → positional.
+	resolveOpts := func(i int) []utxo.CreateOption {
+		switch len(opts) {
+		case 0:
+			return nil
+		case 1:
+			return opts[0]
+		default:
+			return opts[i]
+		}
+	}
+
+	// For non-postgres engines (sqlite) or when CTE batching is disabled,
+	// the single-CTE path doesn't apply. Fall back to a trivial loop — the
+	// fan-out concern is specific to postgres production deployments.
+	if !(s.settings.UtxoStore.BatchSQLOperations && s.engine == "postgres") {
+		for i, tx := range txs {
+			metas[i], errs[i] = s.Create(ctx, tx, blockHeight, resolveOpts(i)...)
+		}
+		return metas, errs
+	}
+
+	// Postgres + bulk path: one BeginTx, loop the existing createCTE inside
+	// it so every insert pays one shared tx-lifecycle cost instead of N.
+	txn, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		sErr := errors.NewStorageError("CreateBatch: BeginTx failed", err)
+		for i := range errs {
+			errs[i] = sErr
+		}
+		return metas, errs
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = txn.Rollback()
+		}
+	}()
+
+	for i, tx := range txs {
+		options := &utxo.CreateOptions{}
+		for _, opt := range resolveOpts(i) {
+			opt(options)
+		}
+		txMeta, mErr := util.TxMetaDataFromTx(tx)
+		if mErr != nil {
+			errs[i] = errors.NewProcessingError("failed to get tx meta data", mErr)
+			continue
+		}
+		if options.Conflicting {
+			txMeta.Conflicting = true
+		}
+		if options.Locked {
+			txMeta.Locked = true
+		}
+		var unminedSince interface{} = nil
+		if len(options.MinedBlockInfos) == 0 {
+			unminedSince = blockHeight
+		}
+		var txHash *chainhash.Hash
+		if options.TxID != nil {
+			txHash = options.TxID
+		} else {
+			txHash = tx.TxIDChainHash()
+		}
+		isCoinbase := tx.IsCoinbase()
+		if options.IsCoinbase != nil {
+			isCoinbase = *options.IsCoinbase
+		}
+
+		m, cErr := s.createCTEWithPreparedArgsInTxn(ctx, txn, tx, blockHeight, options, txHash, txMeta, isCoinbase, unminedSince)
+		metas[i] = m
+		errs[i] = cErr
+	}
+
+	if err := txn.Commit(); err != nil {
+		sErr := errors.NewStorageError("CreateBatch: Commit failed", err)
+		// Commit failure invalidates any success we recorded in this tx —
+		// every slot must show the failure.
+		for i := range errs {
+			metas[i] = nil
+			if errs[i] == nil {
+				errs[i] = sErr
+			}
+		}
+		return metas, errs
+	}
+	committed = true
+	return metas, errs
+}
+
 // createBatched enqueues a Create request into the createBatcher for bulk processing.
 // Mirrors aerospike/create.go storeBatcher.Put pattern.
 func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
@@ -656,7 +779,33 @@ SELECT id FROM new_tx
 // and all its inputs/outputs/block_ids in one network round-trip (postgres only).
 // No explicit transaction needed — a single statement is auto-atomic.
 func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions, txHash *chainhash.Hash, txMeta *meta.Data, isCoinbase bool, unminedSince interface{}) (*meta.Data, error) {
-	// Build array parameters for UNNEST
+	txn, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, errors.NewStorageError("createCTE: BeginTx failed", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = txn.Rollback()
+		}
+	}()
+
+	m, err := s.createCTEWithPreparedArgsInTxn(ctx, txn, btTx, blockHeight, options, txHash, txMeta, isCoinbase, unminedSince)
+	if err != nil {
+		return nil, err
+	}
+	if err := txn.Commit(); err != nil {
+		return nil, errors.NewStorageError("createCTE: Commit failed", err)
+	}
+	committed = true
+	return m, nil
+}
+
+// createCTEWithPreparedArgsInTxn runs the single-tx createCTE INSERT using
+// the caller's sql.Tx. Factored out of createCTE so CreateBatch can share
+// one transaction across many txs. Semantics identical to the pre-split
+// createCTE body.
+func (s *Store) createCTEWithPreparedArgsInTxn(ctx context.Context, txn *sql.Tx, btTx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions, txHash *chainhash.Hash, txMeta *meta.Data, isCoinbase bool, unminedSince interface{}) (*meta.Data, error) {
 	inpArrs := buildInputArrays(btTx)
 	outArrs, err := buildOutputArrays(s.settings, txHash, btTx, isCoinbase, blockHeight)
 	if err != nil {
@@ -664,38 +813,26 @@ func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, 
 	}
 	blkArrs := buildBlockIDArrays(options.MinedBlockInfos)
 
-	// Execute single CTE — one round-trip, auto-atomic
-	sqlConn, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, err
+	rows, execErr := txn.QueryContext(ctx, createCTESQL,
+		// $1-$10: transaction scalars
+		txHash[:], btTx.Version, btTx.LockTime, txMeta.Fee, txMeta.SizeInBytes,
+		isCoinbase, options.Frozen, options.Conflicting, options.Locked, unminedSince,
+		// $11-$17: input arrays
+		inpArrs.idx, inpArrs.prevHash, inpArrs.prevIdx,
+		inpArrs.prevSatoshis, inpArrs.prevScript,
+		inpArrs.unlockScript, inpArrs.seqNum,
+		// $18-$22: output arrays
+		outArrs.idx, outArrs.lockingScript, outArrs.satoshis,
+		outArrs.coinbaseSpendingHeight, outArrs.utxoHash,
+		// $23-$25: block_id arrays
+		blkArrs.blockID, blkArrs.blockHeight, blkArrs.subtreeIdx,
+	)
+	if execErr != nil {
+		return nil, errors.NewStorageError("Failed to create UTXO", execErr)
 	}
-	defer sqlConn.Close()
-
-	var inserted bool
-	err = sqlConn.Raw(func(driverConn interface{}) error {
-		pgxConn := driverConn.(*stdlib.Conn).Conn()
-		rows, execErr := pgxConn.Query(ctx, createCTESQL,
-			// $1-$10: transaction scalars
-			txHash[:], btTx.Version, btTx.LockTime, txMeta.Fee, txMeta.SizeInBytes,
-			isCoinbase, options.Frozen, options.Conflicting, options.Locked, unminedSince,
-			// $11-$17: input arrays
-			inpArrs.idx, inpArrs.prevHash, inpArrs.prevIdx,
-			inpArrs.prevSatoshis, inpArrs.prevScript,
-			inpArrs.unlockScript, inpArrs.seqNum,
-			// $18-$22: output arrays
-			outArrs.idx, outArrs.lockingScript, outArrs.satoshis,
-			outArrs.coinbaseSpendingHeight, outArrs.utxoHash,
-			// $23-$25: block_id arrays
-			blkArrs.blockID, blkArrs.blockHeight, blkArrs.subtreeIdx,
-		)
-		if execErr != nil {
-			return execErr
-		}
-		defer rows.Close()
-		inserted = rows.Next() // true if new_tx returned a row (insert succeeded)
-		return rows.Err()
-	})
-	if err != nil {
+	defer rows.Close()
+	inserted := rows.Next() // true if new_tx returned a row (insert succeeded)
+	if err := rows.Err(); err != nil {
 		return nil, errors.NewStorageError("Failed to create UTXO", err)
 	}
 	if !inserted {
@@ -704,7 +841,7 @@ func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, 
 
 	// Handle conflicting children (rare path — separate round-trip only when needed)
 	if txMeta.Conflicting {
-		if err = s.insertConflictingChildrenPgx(ctx, btTx, txHash); err != nil {
+		if err = s.insertConflictingChildrenInTxn(ctx, txn, btTx, txHash); err != nil {
 			return nil, err
 		}
 	}
@@ -837,6 +974,24 @@ func buildBlockIDArrays(blockInfos []utxo.MinedBlockInfo) blockIDArrayParams {
 		p.subtreeIdx[i] = int32(info.SubtreeIdx)
 	}
 	return p
+}
+
+// insertConflictingChildrenInTxn inserts conflicting_children entries using
+// the caller-provided sql.Tx. Mirrors insertConflictingChildrenPgx but
+// participates in the caller's transaction so CreateBatch can share one
+// BeginTx across many txs. Only called for conflicting transactions.
+func (s *Store) insertConflictingChildrenInTxn(ctx context.Context, txn *sql.Tx, btTx *bt.Tx, txHash *chainhash.Hash) error {
+	var childTxID int
+	if err := txn.QueryRowContext(ctx, `SELECT id FROM transactions WHERE hash = $1`, txHash[:]).Scan(&childTxID); err != nil {
+		return errors.NewStorageError("Failed to find transaction for conflicting children", err)
+	}
+	q := `INSERT INTO conflicting_children (transaction_id, child_transaction_id) VALUES ((SELECT id FROM transactions WHERE hash = $1), $2) ON CONFLICT DO NOTHING`
+	for _, input := range btTx.Inputs {
+		if _, err := txn.ExecContext(ctx, q, input.PreviousTxIDChainHash()[:], childTxID); err != nil {
+			return errors.NewStorageError("Failed to insert conflicting_children", err)
+		}
+	}
+	return nil
 }
 
 // insertConflictingChildrenPgx inserts conflicting_children entries using pgx SendBatch.

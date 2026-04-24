@@ -236,6 +236,22 @@ type Store interface {
 	// Additional options can be specified using CreateOption functions.
 	Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...CreateOption) (*meta.Data, error)
 
+	// CreateBatch stores many transactions' metadata in one DB round-trip /
+	// one transaction boundary. Returns per-tx metadata and per-tx errors,
+	// both sized to len(txs). Success slots have a non-nil *meta.Data and
+	// a nil error; failure slots have a nil *meta.Data and a non-nil
+	// error. Used by block validators to avoid the per-tx goroutine fan-out
+	// that arises when Create is called N times concurrently through a
+	// size-based batcher.
+	//
+	// opts applies options per-tx. The expected shapes are:
+	//   - nil or len 0: no options
+	//   - len 1:        apply the single element to every tx in the batch
+	//   - len(txs):     positional, opts[i] applies to txs[i]
+	// Any other length is a programming error; implementations should
+	// return an error for every slot in that case.
+	CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]CreateOption) ([]*meta.Data, []error)
+
 	// Get retrieves UTXO metadata for a given transaction hash.
 	// The fields parameter can be used to specify which metadata fields to retrieve.
 	// If fields is empty, all fields will be retrieved.

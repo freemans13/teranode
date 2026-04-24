@@ -971,6 +971,9 @@ func (m *MockUTXOStore) Health(ctx context.Context, checkLiveness bool) (int, st
 func (m *MockUTXOStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
 	return nil, nil
 }
+func (m *MockUTXOStore) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
+	return make([]*meta.Data, len(txs)), make([]error, len(txs))
+}
 func (m *MockUTXOStore) Get(ctx context.Context, hash *chainhash.Hash, fields ...fields.FieldName) (*meta.Data, error) {
 	return nil, nil
 }

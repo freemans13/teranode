@@ -61,6 +61,22 @@ func (t *testUtxoStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	return &utxometa.Data{Fee: 100, SizeInBytes: 200}, nil
 }
 
+func (t *testUtxoStore) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*utxometa.Data, []error) {
+	metas := make([]*utxometa.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		var o []utxo.CreateOption
+		switch len(opts) {
+		case 1:
+			o = opts[0]
+		case len(txs):
+			o = opts[i]
+		}
+		metas[i], errs[i] = t.Create(ctx, tx, blockHeight, o...)
+	}
+	return metas, errs
+}
+
 func (t *testUtxoStore) GetBlockHeight() uint32 {
 	return 100
 }

@@ -167,6 +167,23 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	return data, err
 }
 
+// CreateBatch delegates to the inner store and logs the batch-level
+// outcome. Per-tx logs are intentionally suppressed here — the caller
+// inspects the returned error slice.
+func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
+	metas, errs := s.store.CreateBatch(ctx, txs, blockHeight, opts)
+	var failed int
+	for _, e := range errs {
+		if e != nil {
+			failed++
+		}
+	}
+	if failed > 0 {
+		s.logger.Infof("[CreateBatch] %d/%d txs failed at blockHeight %d", failed, len(txs), blockHeight)
+	}
+	return metas, errs
+}
+
 func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
 	err := s.store.GetMeta(ctx, hash, data)
 	s.logger.Debugf("[UTXOStore][logger][GetMeta] hash %s data %v err %v : %s", hash.String(), data, err, caller())

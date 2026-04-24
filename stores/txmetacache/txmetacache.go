@@ -516,6 +516,42 @@ func (t *TxMetaCache) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	return txMeta, nil
 }
 
+// CreateBatch delegates to the inner store's CreateBatch and caches every
+// successful slot. Cache population follows the same rules as the single-tx
+// Create: only cached when BlockIDs is empty and the tx is not conflicting.
+func (t *TxMetaCache) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
+	metas, errs := t.utxoStore.CreateBatch(ctx, txs, blockHeight, opts)
+	for i, tx := range txs {
+		if errs[i] != nil || metas[i] == nil {
+			continue
+		}
+
+		options := &utxo.CreateOptions{}
+		switch len(opts) {
+		case 1:
+			for _, opt := range opts[0] {
+				opt(options)
+			}
+		case len(txs):
+			for _, opt := range opts[i] {
+				opt(options)
+			}
+		}
+
+		var txHash *chainhash.Hash
+		if options.TxID != nil {
+			txHash = options.TxID
+		} else {
+			txHash = tx.TxIDChainHash()
+		}
+
+		if len(metas[i].BlockIDs) == 0 && !metas[i].Conflicting {
+			_ = t.SetCache(txHash, metas[i])
+		}
+	}
+	return metas, errs
+}
+
 // setMinedInCache updates the cache with information about a transaction that has been mined in a block.
 // This internal helper method is used by both SetMined and SetMinedMulti to maintain cache consistency.
 //

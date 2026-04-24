@@ -231,6 +231,27 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	return txMeta, nil
 }
 
+// CreateBatch is a straightforward loop over Create for now. The
+// aerospike backend already has its own bulk primitives under the
+// hood; a purpose-built bulk implementation would share them, but that
+// is out of scope for this PR — the SQL path is where the per-tx
+// goroutine fan-out was costing wall-time.
+func (s *Store) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		var o []utxo.CreateOption
+		switch len(opts) {
+		case 1:
+			o = opts[0]
+		case len(txs):
+			o = opts[i]
+		}
+		metas[i], errs[i] = s.Create(ctx, tx, blockHeight, o...)
+	}
+	return metas, errs
+}
+
 // sendStoreBatch processes a batch of transaction storage requests.
 // It handles automatic switching between in-database and external storage
 // based on transaction size and configuration.
