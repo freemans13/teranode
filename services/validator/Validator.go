@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
@@ -367,53 +368,206 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 	}
 
 	if err != nil {
-		if v.rejectedTxKafkaProducerClient != nil { // tests may not set this
-			// TODO should this also announce transactions with missing parents etc.?
-			if errors.Is(err, errors.ErrTxInvalid) {
-				if v.blockchainClient != nil {
-					var (
-						state *blockchain.FSMStateType
-						err1  error
-					)
-
-					if state, err1 = v.blockchainClient.GetFSMCurrentState(ctx); err1 != nil {
-						ctxLogger.Errorf("[ValidateWithOptions] failed to publish rejected tx - error getting blockchain FSM state: %v", err1)
-
-						return
-					}
-
-					if *state == blockchain_api.FSMStateType_CATCHINGBLOCKS || *state == blockchain_api.FSMStateType_LEGACYSYNCING {
-						// ignore notifications while syncing or catching up
-						return
-					}
-				}
-
-				startKafka := time.Now()
-
-				txID := tx.TxIDChainHash().String()
-
-				m := &kafkamessage.KafkaRejectedTxTopicMessage{
-					TxHash: txID,
-					Reason: err.Error(),
-					PeerId: "", // Empty peer_id indicates internal rejection
-				}
-
-				value, err := proto.Marshal(m)
-				if err != nil {
-					return nil, err
-				}
-
-				v.rejectedTxKafkaProducerClient.Publish(&kafka.Message{
-					Key:   []byte(txID),
-					Value: value,
-				})
-
-				prometheusValidatorSendToP2PKafka.Observe(float64(time.Since(startKafka).Microseconds()) / 1_000_000)
-			}
+		if reportErr := v.reportRejectedTx(ctx, tx, err); reportErr != nil {
+			return nil, reportErr
 		}
 	}
 
 	return txMetaData, err
+}
+
+// reportRejectedTx publishes a rejected-tx message to the configured Kafka
+// topic. Factored out of ValidateWithOptions so ValidateBatch can mirror
+// the same reporting for batch-mode failures. If the producer client is
+// nil (e.g. tests), this is a no-op.
+//
+// The returned error (if any) matches the legacy ValidateWithOptions
+// semantics of propagating a proto-marshal failure back to the caller.
+// A nil return means either "not applicable" or "published successfully";
+// callers treat this method as fire-and-forget otherwise.
+func (v *Validator) reportRejectedTx(ctx context.Context, tx *bt.Tx, reason error) error {
+	if v.rejectedTxKafkaProducerClient == nil { // tests may not set this
+		return nil
+	}
+	// TODO should this also announce transactions with missing parents etc.?
+	if !errors.Is(reason, errors.ErrTxInvalid) {
+		return nil
+	}
+
+	ctxLogger := v.logger.WithTraceContext(ctx)
+
+	if v.blockchainClient != nil {
+		state, err1 := v.blockchainClient.GetFSMCurrentState(ctx)
+		if err1 != nil {
+			ctxLogger.Errorf("[ValidateWithOptions] failed to publish rejected tx - error getting blockchain FSM state: %v", err1)
+			return nil
+		}
+
+		if *state == blockchain_api.FSMStateType_CATCHINGBLOCKS || *state == blockchain_api.FSMStateType_LEGACYSYNCING {
+			// ignore notifications while syncing or catching up
+			return nil
+		}
+	}
+
+	startKafka := time.Now()
+
+	txID := tx.TxIDChainHash().String()
+
+	m := &kafkamessage.KafkaRejectedTxTopicMessage{
+		TxHash: txID,
+		Reason: reason.Error(),
+		PeerId: "", // Empty peer_id indicates internal rejection
+	}
+
+	value, err := proto.Marshal(m)
+	if err != nil {
+		return err
+	}
+
+	v.rejectedTxKafkaProducerClient.Publish(&kafka.Message{
+		Key:   []byte(txID),
+		Value: value,
+	})
+
+	prometheusValidatorSendToP2PKafka.Observe(float64(time.Since(startKafka).Microseconds()) / 1_000_000)
+	return nil
+}
+
+// ValidateBatch implements validator.Interface. Runs per-tx compute work
+// (script verification, parent fetches, spend checks) in parallel across
+// runtime.NumCPU()*2 goroutines, collapses the Create calls into one
+// utxoStore.CreateBatch round, then runs per-tx post-Create work
+// (sendToBlockAssembler, txmeta kafka publish, twoPhaseCommit / SetLocked)
+// in parallel. Per-tx error classes match Validate.
+func (v *Validator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...Option) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	if len(txs) == 0 {
+		return metas, errs
+	}
+
+	validationOptions := ProcessOptions(opts...)
+
+	// Phase 1: per-tx pre-Create work in parallel.
+	preResults := make([]preCreateResult, len(txs))
+	{
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(runtime.NumCPU() * 2)
+		for i, tx := range txs {
+			i, tx := i, tx
+			g.Go(func() error {
+				res, err := v.validateInternalPreCreate(gCtx, tx, blockHeight, validationOptions)
+				preResults[i] = res
+				if res.earlyExit {
+					// Early exit from pre-Create (conflicting / already-blessed). Record
+					// the meta (if any) and the associated error in per-tx slots. When
+					// err == nil this slot succeeded early with a valid meta.
+					metas[i] = res.earlyExitMeta
+					errs[i] = err
+					return nil
+				}
+				if err != nil {
+					errs[i] = err
+					return nil
+				}
+				return nil
+			})
+		}
+		_ = g.Wait() // per-goroutine bodies record errors in per-slot positions; never return a hard error
+	}
+
+	// Phase 2: collect survivors that still need Create, issue a single
+	// CreateBatch call, and also synthesize meta for SkipUtxoCreation slots.
+	var (
+		survivors       []*bt.Tx
+		survivorOpts    [][]utxo.CreateOption
+		survivorOrigIdx []int
+	)
+	for i := range txs {
+		if errs[i] != nil || preResults[i].earlyExit {
+			continue
+		}
+		if preResults[i].skipCreate {
+			// no Create needed — carry the synthesized meta into Phase 3
+			metas[i] = preResults[i].skipCreateMeta
+			continue
+		}
+		survivors = append(survivors, txs[i])
+		survivorOpts = append(survivorOpts, preResults[i].createOptions)
+		survivorOrigIdx = append(survivorOrigIdx, i)
+	}
+
+	var (
+		createMetas []*meta.Data
+		createErrs  []error
+	)
+	if len(survivors) > 0 {
+		createMetas, createErrs = v.utxoStore.CreateBatch(ctx, survivors, blockHeight, survivorOpts)
+	}
+
+	// Merge CreateBatch results back into per-tx slots by original index.
+	// We keep per-slot createErrs around so Phase 3 can handle ErrTxExists
+	// fallbacks via validateInternalPostCreate — matching single-tx semantics.
+	perSlotCreateErr := make([]error, len(txs))
+	for k, origI := range survivorOrigIdx {
+		if k < len(createErrs) && createErrs[k] != nil {
+			perSlotCreateErr[origI] = createErrs[k]
+		}
+		if k < len(createMetas) {
+			metas[origI] = createMetas[k]
+		}
+	}
+
+	// Phase 3: per-tx post-Create work in parallel. Runs for every tx that
+	// reached Create (skipCreate or not) — including slots where Create
+	// returned an error, because validateInternalPostCreate handles the
+	// ErrTxExists / reverseSpends branches.
+	{
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(runtime.NumCPU() * 2)
+		for i, tx := range txs {
+			if errs[i] != nil || preResults[i].earlyExit {
+				continue
+			}
+			i, tx := i, tx
+			g.Go(func() error {
+				finalMeta, err := v.validateInternalPostCreate(gCtx, tx, blockHeight, validationOptions, preResults[i], metas[i], perSlotCreateErr[i])
+				// Fire the decoupled-span defer for this tx now that Phase 3 has completed.
+				if preResults[i].decoupledDeferFn != nil {
+					preResults[i].decoupledDeferFn(err)
+				}
+				if err != nil {
+					errs[i] = err
+					metas[i] = finalMeta // preserve txMetaData when returned with err (conflicting/2PC cases)
+					return nil
+				}
+				metas[i] = finalMeta
+				return nil
+			})
+		}
+		_ = g.Wait()
+	}
+
+	// Fire decoupled-span defer for slots that didn't reach Phase 3 (early exit
+	// with a decoupled span already opened, or Phase-1 error after decoupling).
+	for i := range txs {
+		if (errs[i] != nil || preResults[i].earlyExit) && preResults[i].decoupledDeferFn != nil {
+			preResults[i].decoupledDeferFn(errs[i])
+		}
+	}
+
+	// Mirror Validate's rejected-tx Kafka reporting semantic: for each per-tx
+	// error, call the same reportRejectedTx helper ValidateWithOptions uses.
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		if reportErr := v.reportRejectedTx(ctx, txs[i], err); reportErr != nil {
+			v.logger.Errorf("[ValidateBatch] reportRejectedTx failed for %s: %v", txs[i].TxIDChainHash().String(), reportErr)
+		}
+	}
+
+	return metas, errs
 }
 
 // validateInternal performs the core validation logic for a transaction.
@@ -448,13 +602,79 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 //
 //gocognit:ignore
 func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight uint32, validationOptions *Options) (txMetaData *meta.Data, err error) {
+	pre, err := v.validateInternalPreCreate(ctx, tx, blockHeight, validationOptions)
+	if pre.decoupledDeferFn != nil {
+		defer func() {
+			pre.decoupledDeferFn(err)
+		}()
+	}
+	if pre.earlyExit {
+		return pre.earlyExitMeta, err
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if pre.skipCreate {
+		// SkipUtxoCreation path: synthesize txMetaData without calling Create.
+		txMetaData = pre.skipCreateMeta
+	} else {
+		txMetaData, err = v.utxoStore.Create(pre.decoupledCtx, tx, blockHeight, pre.createOptions...)
+		// err handled inside validateInternalPostCreate to keep the ErrTxExists
+		// and reverseSpends branches co-located with the rest of the post-Create logic.
+	}
+
+	return v.validateInternalPostCreate(ctx, tx, blockHeight, validationOptions, pre, txMetaData, err)
+}
+
+// preCreateResult carries every piece of local state that the upper half of
+// validateInternal computes and the lower half reads. Fields prefixed with
+// "earlyExit" or "skip" direct the caller through one of validateInternal's
+// non-happy-path branches before any Create call is issued.
+type preCreateResult struct {
+	// Happy-path outputs — caller issues utxoStore.Create / CreateBatch.
+	createOptions      []utxo.CreateOption
+	spentUtxos         []*utxo.Spend
+	addToBlockAssembly bool
+	decoupledCtx       context.Context // nolint:containedctx
+	decoupledDeferFn   func(...error)  // caller must defer this
+	txID               string
+
+	// Early-exit: caller returns (earlyExitMeta, <err>) directly without
+	// invoking Create or PostCreate. Covers the conflicting-save and
+	// already-blessed paths in the original validateInternal body.
+	earlyExit     bool
+	earlyExitMeta *meta.Data
+
+	// SkipUtxoCreation path: caller skips Create, passes skipCreateMeta
+	// into PostCreate as the meta result.
+	skipCreate     bool
+	skipCreateMeta *meta.Data
+}
+
+// validateInternalPreCreate runs every step of validateInternal up to (but not
+// including) the utxoStore.Create call. On the happy path it returns a
+// preCreateResult populated with the CreateOptions / decoupled ctx / spend
+// results the post-Create phase needs. The caller is responsible for
+// deferring preCreateResult.decoupledDeferFn (if non-nil) — the function
+// always returns that field populated on non-error exits so PostCreate's
+// tracing span closes cleanly.
+//
+// Error returns: a non-nil error means either the tx cannot progress to
+// Create (err != nil, earlyExit == false — caller returns (nil, err))
+// or a branch produced a ready-to-return result (earlyExit == true — caller
+// returns (earlyExitMeta, err) where err may be nil for "already blessed").
+//
+//gocognit:ignore
+func (v *Validator) validateInternalPreCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, validationOptions *Options) (pre preCreateResult, err error) {
 	// this caches the tx hash in the object for the duration of all operations. It's immutable, so not a problem
 	tx.SetTxHash(tx.TxIDChainHash())
 	txID := tx.TxIDChainHash().String()
+	pre.txID = txID
 
 	ctx, span, deferFn := tracing.Tracer("validator").Start(
 		ctx,
-		"validateInternal",
+		"validateInternalPreCreate",
 		tracing.WithParentStat(v.stats),
 		tracing.WithHistogram(prometheusTransactionValidateTotal),
 		tracing.WithTag("txid", txID),
@@ -466,10 +686,6 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 
 	if v.settings.Validator.VerboseDebug {
 		v.logger.Debugf("[Validator:ValidateInternal] called for %s", txID)
-
-		defer func() {
-			v.logger.Debugf("[Validator:ValidateInternal] called for %s DONE", txID)
-		}()
 	}
 
 	var spentUtxos []*utxo.Spend
@@ -490,7 +706,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			err = errors.NewProcessingError("utxo store not ready, block height: %d, median block time: %d", blockHeight, utxoStoreMedianBlockTime)
 			span.RecordError(err)
 
-			return nil, err
+			return pre, err
 		}
 
 		// this function should be moved into go-bt
@@ -498,7 +714,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			err = errors.NewUtxoNonFinalError("[Validate][%s] transaction is not final", txID, err)
 			span.RecordError(err)
 
-			return nil, err
+			return pre, err
 		}
 	}
 
@@ -506,7 +722,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		err = errors.NewProcessingError("[Validate][%s] coinbase transactions are not supported", txID)
 		span.RecordError(err)
 
-		return nil, err
+		return pre, err
 	}
 
 	var utxoHeights []uint32
@@ -521,7 +737,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
 			span.RecordError(err)
 
-			return nil, err
+			return pre, err
 		}
 	}
 
@@ -533,7 +749,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
 			span.RecordError(err)
 
-			return nil, err
+			return pre, err
 		}
 	}
 
@@ -543,7 +759,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		err = errors.NewProcessingError("[Validate][%s] error validating transaction", txID, err)
 		span.RecordError(err)
 
-		return nil, err
+		return pre, err
 	}
 
 	// validate the transaction scripts and signatures
@@ -551,12 +767,13 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		err = errors.NewProcessingError("[Validate][%s] error validating transaction scripts", txID, err)
 		span.RecordError(err)
 
-		return nil, err
+		return pre, err
 	}
 
 	// decouple the tracing context to not cancel the context when finalize the block assembly
-	decoupledCtx, _, deferFn := tracing.DecoupleTracingSpan(ctx, "validator", "decoupledSpan")
-	defer deferFn()
+	decoupledCtx, _, decoupledDeferFn := tracing.DecoupleTracingSpan(ctx, "validator", "decoupledSpan")
+	pre.decoupledCtx = decoupledCtx
+	pre.decoupledDeferFn = decoupledDeferFn
 
 	/*
 		Scenario where store is done before adding to assembly:
@@ -604,6 +821,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			}
 
 			if saveAsConflicting {
+				var txMetaData *meta.Data
 				if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false); utxoMapErr != nil {
 					if errors.Is(utxoMapErr, errors.ErrTxExists) {
 						txMetaData = &meta.Data{}
@@ -611,7 +829,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 							err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, err)
 							span.RecordError(err)
 
-							return nil, err
+							return pre, err
 						}
 
 						// Tx already exists — ensure it and all its spending descendants are marked conflicting.
@@ -622,20 +840,24 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 								err = errors.NewProcessingError("[Validate][%s] failed to mark existing tx as conflicting", txID, setErr)
 								span.RecordError(err)
 
-								return nil, err
+								return pre, err
 							}
 						}
 
 						err = errors.NewTxConflictingError("[Validate][%s] tx is conflicting (already exists)", txID, err)
 						span.RecordError(err)
 
-						return txMetaData, err
+						pre.earlyExit = true
+						pre.earlyExitMeta = txMetaData
+						return pre, err
 					}
 
 					err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed: %v", txID, utxoMapErr)
 					span.RecordError(err)
 
-					return txMetaData, err
+					pre.earlyExit = true
+					pre.earlyExitMeta = txMetaData
+					return pre, err
 				}
 
 				// We successfully added the tx to the utxo store as a conflicting tx,
@@ -643,36 +865,94 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 				err = errors.NewTxConflictingError("[Validate][%s] tx is conflicting", txID, err)
 				span.RecordError(err)
 
-				return txMetaData, err
+				pre.earlyExit = true
+				pre.earlyExitMeta = txMetaData
+				return pre, err
 			}
 		} else if errors.Is(err, errors.ErrTxNotFound) {
 			// the parent transaction was not found, this can happen when the parent tx has been DAH'd and removed from
 			// the utxo store. We can check whether the tx already exists, which means it has been validated and
 			// blessed. In this case we can just return early.
-			txMetaData = &meta.Data{}
+			txMetaData := &meta.Data{}
 			if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err == nil {
 				v.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", txID)
 
-				return txMetaData, nil
+				pre.earlyExit = true
+				pre.earlyExitMeta = txMetaData
+				return pre, nil
 			}
 		}
 
 		err = errors.NewProcessingError("[Validate][%s] error spending utxos", txID, err)
 		span.RecordError(err)
 
-		return nil, err
+		return pre, err
 	}
+
+	pre.spentUtxos = spentUtxos
 
 	// the option blockAssemblyDisabled is false by default
 	blockAssemblyEnabled := !v.settings.BlockAssembly.Disabled
 	addToBlockAssembly := blockAssemblyEnabled && validationOptions.AddTXToBlockAssembly
+	pre.addToBlockAssembly = addToBlockAssembly
 
-	if !validationOptions.SkipUtxoCreation {
+	if validationOptions.SkipUtxoCreation {
+		// create the tx meta needed for the block assembly — no Create call
+		pre.skipCreate = true
+		skipMeta, metaErr := util.TxMetaDataFromTx(tx)
+		if metaErr != nil {
+			return pre, errors.NewProcessingError("[Validate][%s] failed to get tx meta data", txID, metaErr)
+		}
+		pre.skipCreateMeta = skipMeta
+	} else {
 		// store the transaction in the UTXO store, marking it as locked if we are going to add it to the block assembly
-		txMetaData, err = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, false, addToBlockAssembly)
-		if err != nil {
-			if errors.Is(err, errors.ErrTxExists) {
-				v.logger.Debugf("[Validate][%s] tx already exists in store, not sending to block assembly: %v", txID, err)
+		pre.createOptions = []utxo.CreateOption{
+			utxo.WithConflicting(false),
+		}
+		if addToBlockAssembly {
+			pre.createOptions = append(pre.createOptions, utxo.WithLocked(true))
+		}
+	}
+
+	return pre, nil
+}
+
+// validateInternalPostCreate runs every step of validateInternal from the
+// utxoStore.Create call onwards. Accepts the meta returned by Create (or by
+// the SkipUtxoCreation TxMetaDataFromTx synthesis) plus any error from the
+// Create call, so that the ErrTxExists fallback and reverseSpends branches
+// stay co-located with the post-Create control flow.
+func (v *Validator) validateInternalPostCreate(
+	ctx context.Context,
+	tx *bt.Tx,
+	blockHeight uint32,
+	validationOptions *Options,
+	pre preCreateResult,
+	metaFromCreate *meta.Data,
+	createErr error,
+) (txMetaData *meta.Data, err error) {
+	_ = ctx         // reserved for future use; per-phase span below uses pre.decoupledCtx
+	_ = blockHeight // currently unused but kept for parity with the pre-Create signature
+
+	_, span, deferFn := tracing.Tracer("validator").Start(
+		pre.decoupledCtx,
+		"validateInternalPostCreate",
+		tracing.WithParentStat(v.stats),
+		tracing.WithTag("txid", pre.txID),
+	)
+
+	defer func() {
+		deferFn(err)
+	}()
+
+	txID := pre.txID
+	decoupledCtx := pre.decoupledCtx
+
+	// Handle the Create call result (only meaningful when we actually called Create).
+	if !pre.skipCreate {
+		if createErr != nil {
+			if errors.Is(createErr, errors.ErrTxExists) {
+				v.logger.Debugf("[Validate][%s] tx already exists in store, not sending to block assembly: %v", txID, createErr)
 
 				txMetaData = &meta.Data{}
 				if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err != nil {
@@ -682,23 +962,21 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 				return txMetaData, nil
 			}
 
-			v.logger.Errorf("[Validate][%s] error registering tx in metaStore: %v", txID, err)
+			v.logger.Errorf("[Validate][%s] error registering tx in metaStore: %v", txID, createErr)
 
-			if reverseErr := v.reverseSpends(decoupledCtx, spentUtxos); reverseErr != nil {
-				err = errors.NewProcessingError("[Validate][%s] error reversing utxo spends: %v", txID, reverseErr, err)
+			if reverseErr := v.reverseSpends(decoupledCtx, pre.spentUtxos); reverseErr != nil {
+				createErr = errors.NewProcessingError("[Validate][%s] error reversing utxo spends: %v", txID, reverseErr, createErr)
 			}
 
-			return nil, errors.NewProcessingError("[Validate][%s] error registering tx in metaStore", txID, err)
+			return nil, errors.NewProcessingError("[Validate][%s] error registering tx in metaStore", txID, createErr)
 		}
+
+		txMetaData = metaFromCreate
 	} else {
-		// create the tx meta needed for the block assembly
-		txMetaData, err = util.TxMetaDataFromTx(tx)
-		if err != nil {
-			return nil, errors.NewProcessingError("[Validate][%s] failed to get tx meta data", txID, err)
-		}
+		txMetaData = metaFromCreate
 	}
 
-	if addToBlockAssembly {
+	if pre.addToBlockAssembly {
 		var txInpoints subtree.TxInpoints
 
 		if txMetaData.TxInpoints.ParentTxHashes != nil {
@@ -716,7 +994,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			Fee:           txMetaData.Fee,
 			Size:          uint64(tx.Size()), // nolint:gosec
 			TxInpoints:    txInpoints,
-		}, spentUtxos); err != nil {
+		}, pre.spentUtxos); err != nil {
 			err = errors.NewProcessingError("[Validate][%s] error sending tx to block assembler", txID, err)
 			span.RecordError(err)
 

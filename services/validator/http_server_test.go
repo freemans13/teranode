@@ -63,6 +63,15 @@ func (m *MockValidator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, bloc
 	return m.Validate(ctx, tx, blockHeight)
 }
 
+func (m *MockValidator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...validator.Option) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		metas[i], errs[i] = m.Validate(ctx, tx, blockHeight, opts...)
+	}
+	return metas, errs
+}
+
 func (m *MockValidator) GetBlockHeight() uint32 {
 	return 100
 }

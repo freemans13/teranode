@@ -95,6 +95,17 @@ func (m *MockValidatorClient) Validate(_ context.Context, tx *bt.Tx, blockHeight
 	return m.ValidateWithOptions(context.Background(), tx, blockHeight, validationOptions)
 }
 
+// ValidateBatch is a loop-over-Validate stub for the mock client. It mirrors
+// the per-slot semantics of Validate.
+func (m *MockValidatorClient) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...Option) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		metas[i], errs[i] = m.Validate(ctx, tx, blockHeight, opts...)
+	}
+	return metas, errs
+}
+
 // ValidateWithOptions performs mock transaction validation with error injection support.
 // If errors are queued, returns the first error and removes it from the queue.
 // Otherwise, creates UTXO entries using the configured UTXO store.

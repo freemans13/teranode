@@ -73,6 +73,21 @@ type Interface interface {
 	//   - error: Validation errors if transaction violates consensus rules or policy constraints
 	Validate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...Option) (*meta.Data, error)
 
+	// ValidateBatch runs full validation across many transactions in one
+	// call. Returns per-tx metadata and per-tx errors, both sized to
+	// len(txs). Success slots carry a non-nil *meta.Data and a nil error;
+	// failure slots carry a nil *meta.Data and an error of the same class
+	// Validate would return for the same tx.
+	//
+	// Semantics match Validate per-slot. Implementations should collapse
+	// per-tx DB writes where possible (e.g. utxoStore.CreateBatch); compute
+	// work (script verification, spend checks) may stay parallel per-tx
+	// inside the implementation.
+	//
+	// If opts is empty, no options apply. Otherwise opts applies to every
+	// tx in the batch (same semantics as Validate's variadic opts).
+	ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...Option) ([]*meta.Data, []error)
+
 	// ValidateWithOptions performs comprehensive validation of a transaction with validation
 	// options passed directly rather than using variadic parameters. This method provides
 	// the same validation functionality as Validate but with explicit options configuration.
@@ -167,6 +182,17 @@ func (mv *MockValidator) Health(ctx context.Context, checkLiveness bool) (int, s
 //   - error: Always returns nil
 func (mv *MockValidator) Validate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...Option) (*meta.Data, error) {
 	return util.TxMetaDataFromTx(tx)
+}
+
+// ValidateBatch implements mock batch transaction validation. Mirrors Validate's
+// no-op semantics per slot.
+func (mv *MockValidator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...Option) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		metas[i], errs[i] = util.TxMetaDataFromTx(tx)
+	}
+	return metas, errs
 }
 
 // ValidateWithOptions implements mock transaction validation with options set directly
