@@ -236,13 +236,15 @@ type Store interface {
 	// Additional options can be specified using CreateOption functions.
 	Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...CreateOption) (*meta.Data, error)
 
-	// CreateBatch stores many transactions' metadata in one DB round-trip /
-	// one transaction boundary. Returns per-tx metadata and per-tx errors,
-	// both sized to len(txs). Success slots have a non-nil *meta.Data and
-	// a nil error; failure slots have a nil *meta.Data and a non-nil
-	// error. Used by block validators to avoid the per-tx goroutine fan-out
-	// that arises when Create is called N times concurrently through a
-	// size-based batcher.
+	// CreateBatch stores many transactions' metadata under one transaction
+	// boundary (one BeginTx/Commit, for backends that have them). The SQL
+	// implementation still issues one INSERT per tx, but they all share the
+	// same transaction lifecycle, eliminating the per-tx connection-acquire
+	// + commit overhead and the per-tx goroutine fan-out that arises when
+	// Create is called N times concurrently through a size-based batcher.
+	// Returns per-tx metadata and per-tx errors, both sized to len(txs).
+	// Success slots have a non-nil *meta.Data and a nil error; failure slots
+	// have a nil *meta.Data and a non-nil error. Used by block validators.
 	//
 	// opts applies options per-tx. The expected shapes are:
 	//   - nil or len 0: no options
