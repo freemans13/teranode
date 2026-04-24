@@ -760,7 +760,8 @@ SELECT id FROM new_tx
 
 // createCTE executes a single CTE statement with UNNEST arrays to insert a transaction
 // and all its inputs/outputs/block_ids in one network round-trip (postgres only).
-// No explicit transaction needed — a single statement is auto-atomic.
+// Wraps createCTEWithPreparedArgsInTxn in an explicit BeginTx/Commit so the CTE insert
+// and any follow-up work (e.g. insertConflictingChildrenInTxn) commit atomically.
 func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions, txHash *chainhash.Hash, txMeta *meta.Data, isCoinbase bool, unminedSince interface{}) (*meta.Data, error) {
 	txn, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
