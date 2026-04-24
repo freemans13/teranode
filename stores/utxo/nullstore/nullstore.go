@@ -145,6 +145,22 @@ func (m *NullStore) Create(_ context.Context, tx *bt.Tx, blockHeight uint32, opt
 	return txMetaData, nil
 }
 
+func (m *NullStore) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		var o []utxo.CreateOption
+		switch len(opts) {
+		case 1:
+			o = opts[0]
+		case len(txs):
+			o = opts[i]
+		}
+		metas[i], errs[i] = m.Create(ctx, tx, blockHeight, o...)
+	}
+	return metas, errs
+}
+
 func (m *NullStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	if blockHeight == 0 {
 		return nil, errors.NewProcessingError("blockHeight must be greater than zero")

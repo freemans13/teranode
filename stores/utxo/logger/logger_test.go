@@ -62,6 +62,22 @@ func (m *MockStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, o
 	return args.Get(0).(*meta.Data), args.Error(1)
 }
 
+func (m *MockStore) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]utxo.CreateOption) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		var o []utxo.CreateOption
+		switch len(opts) {
+		case 1:
+			o = opts[0]
+		case len(txs):
+			o = opts[i]
+		}
+		metas[i], errs[i] = m.Create(ctx, tx, blockHeight, o...)
+	}
+	return metas, errs
+}
+
 func (m *MockStore) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
 	args := m.Called(ctx, hash, data)
 	if result := args.Get(0); result != nil {

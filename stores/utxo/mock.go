@@ -45,6 +45,25 @@ func (m *MockUtxostore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	return args.Get(0).(*meta.Data), args.Error(1)
 }
 
+// CreateBatch calls the mock's Create per-tx for parity with Create.
+// Mocks of higher-fidelity batch behaviour can override with a dedicated
+// Called("CreateBatch", ...) pattern if needed.
+func (m *MockUtxostore) CreateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts [][]CreateOption) ([]*meta.Data, []error) {
+	metas := make([]*meta.Data, len(txs))
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		var o []CreateOption
+		switch len(opts) {
+		case 1:
+			o = opts[0]
+		case len(txs):
+			o = opts[i]
+		}
+		metas[i], errs[i] = m.Create(ctx, tx, blockHeight, o...)
+	}
+	return metas, errs
+}
+
 // Get mocks the retrieval of transaction metadata from the UTXO store.
 // Returns the configured mock response for transaction lookup operations.
 func (m *MockUtxostore) Get(ctx context.Context, hash *chainhash.Hash, fields ...fields.FieldName) (*meta.Data, error) {
