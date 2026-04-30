@@ -51,7 +51,7 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 		done := make(chan batchGetResult, 1)
 		item := &batchGetItem{hash: hash, bins: bins, done: done}
 		rk := Route(hash)
-		s.getWorkers[rk.Partition].input <- item
+		s.getSlots[rk.Partition].input <- item
 		select {
 		case result := <-done:
 			return result.Data, result.Err

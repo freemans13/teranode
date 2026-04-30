@@ -194,7 +194,7 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	if s.workersStarted() && !setValue && len(txHashes) == 1 {
 		done := make(chan error, 1)
 		rk := Route(&txHashes[0])
-		s.unlockWorkers[rk.Partition].input <- &batchUnlockItem{hash: txHashes[0], done: done}
+		s.unlockSlots[rk.Partition].input <- &batchUnlockItem{hash: txHashes[0], done: done}
 		select {
 		case err := <-done:
 			return err

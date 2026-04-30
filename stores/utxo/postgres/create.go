@@ -150,7 +150,7 @@ func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32
 		txHash = tx.TxIDChainHash()
 	}
 	rk := Route(txHash)
-	s.createWorkers[rk.Partition].input <- &batchCreateItem{
+	s.createSlots[rk.Partition].input <- &batchCreateItem{
 		tx:          tx,
 		blockHeight: blockHeight,
 		options:     options,
@@ -405,14 +405,13 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, partition int, batch []*batch
 		}
 	}
 
-	pgxTx, err := conn.Begin(ctx)
-	if err != nil {
-		failAll(errors.NewStorageError("failed to begin transaction", err))
-		return
-	}
-	defer pgxTx.Rollback(ctx) //nolint:errcheck
-
-	rows, err := pgxTx.Query(ctx, fmt.Sprintf(`
+	// Pipeline BEGIN + INSERT txs + INSERT outputs + COMMIT into ONE
+	// network round-trip via pgx.Batch. The previous implementation made
+	// these 4 sequential round-trips per Create batch, which (per runtime
+	// trace 2026-04-29) accounted for 61% of all bench-worker blocking
+	// time. SendBatch sends all 4 statements in one TCP write; postgres
+	// processes them in order; we read the 4 responses in one TCP read.
+	insertTxsSQL := fmt.Sprintf(`
 		INSERT INTO %s (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since)
 		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
@@ -423,20 +422,50 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, partition int, batch []*batch
 		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 		          locked, conflicting, frozen, unmined_since)
 		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`, txsTable),
+		RETURNING hash`, txsTable)
+
+	insertOutputsSQL := fmt.Sprintf(`
+		INSERT INTO %s (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
+		SELECT u.tx_hash, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
+		FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
+		            $5::boolean[], $6::bytea[], $7::bigint[])
+		     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh)
+		ON CONFLICT (tx_hash, idx) DO NOTHING`, outputsTable)
+
+	pgxBatch := &pgx.Batch{}
+	pgxBatch.Queue("BEGIN")
+	pgxBatch.Queue(insertTxsSQL,
 		hashes, versions, lockTimes, fees, sizes, coinbases, rawTxs,
 		lockeds, conflictings, frozens, unminedSinces,
 	)
-	if err != nil {
-		failAll(errors.NewStorageError("failed to INSERT txs via UNNEST", err))
+	if len(outTxHashes) > 0 {
+		pgxBatch.Queue(insertOutputsSQL,
+			outTxHashes, outIdxs, outLockingScripts, outSatoshis,
+			outFrozens, outUtxoHashes, outCoinbaseSpendingHeights,
+		)
+	}
+	pgxBatch.Queue("COMMIT")
+
+	br := conn.SendBatch(ctx, pgxBatch)
+	// Drain BEGIN.
+	if _, err := br.Exec(); err != nil {
+		br.Close()
+		failAll(errors.NewStorageError("failed to BEGIN: %v", err))
 		return
 	}
-
+	// Read INSERT txs RETURNING rows.
+	rows, err := br.Query()
+	if err != nil {
+		br.Close()
+		failAll(errors.NewStorageError("failed to INSERT txs via UNNEST: %v", err))
+		return
+	}
 	newHashSet := make(map[chainhash.Hash]struct{})
 	for rows.Next() {
 		var hashBytes []byte
 		if scanErr := rows.Scan(&hashBytes); scanErr != nil {
 			rows.Close()
+			br.Close()
 			failAll(errors.NewStorageError("failed to scan inserted hash", scanErr))
 			return
 		}
@@ -445,26 +474,22 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, partition int, batch []*batch
 		newHashSet[h] = struct{}{}
 	}
 	rows.Close()
-
+	// Drain INSERT outputs (if queued).
 	if len(outTxHashes) > 0 {
-		_, err = pgxTx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
-			SELECT u.tx_hash, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
-			FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
-			            $5::boolean[], $6::bytea[], $7::bigint[])
-			     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh)
-			ON CONFLICT (tx_hash, idx) DO NOTHING`, outputsTable),
-			outTxHashes, outIdxs, outLockingScripts, outSatoshis,
-			outFrozens, outUtxoHashes, outCoinbaseSpendingHeights,
-		)
-		if err != nil {
-			failAll(errors.NewStorageError("failed to INSERT outputs via UNNEST", err))
+		if _, err := br.Exec(); err != nil {
+			br.Close()
+			failAll(errors.NewStorageError("failed to INSERT outputs via UNNEST: %v", err))
 			return
 		}
 	}
-
-	if err := pgxTx.Commit(ctx); err != nil {
-		failAll(errors.NewStorageError("failed to commit create batch", err))
+	// Drain COMMIT.
+	if _, err := br.Exec(); err != nil {
+		br.Close()
+		failAll(errors.NewStorageError("failed to commit create batch: %v", err))
+		return
+	}
+	if err := br.Close(); err != nil {
+		failAll(errors.NewStorageError("failed to close create batch: %v", err))
 		return
 	}
 
