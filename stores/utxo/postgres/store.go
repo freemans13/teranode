@@ -98,15 +98,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
-	pgxConfig.MaxConns = 80
-	// Pre-warm the pool. With 4 batchers × N partition goroutines per batch,
-	// burst connection demand is high; opening connections lazily costs a TCP
-	// handshake + auth round-trip (5-50ms each), which (per runtime trace
-	// 2026-04-29) was burning >50% of total network wait time. Holding the
-	// full set of connections open from startup eliminates this entirely.
-	pgxConfig.MinConns = 80
+	pgxConfig.MaxConns = 250
+	pgxConfig.MinConns = 250
 	pgxConfig.MaxConnIdleTime = 30 * time.Minute
-	pgxConfig.MaxConnLifetime = 0 // never reap — let the pool stay warm
+	pgxConfig.MaxConnLifetime = 0
 
 	// Full durability — financial data requires synchronous_commit = on (the default).
 	// Group commit (commit_delay + commit_siblings) is the safe way to get throughput.
