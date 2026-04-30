@@ -332,12 +332,14 @@ func TestThroughput_QueueStore(t *testing.T) {
 	terminateOtherConnections(t)
 	s := newQueueStoreForBench(t)
 	workerOffset := 0
-	for _, workers := range []int{1, 10, 100, 500, 1000, 5000, 10000, 15000} {
+	for _, workers := range []int{1, 10, 100, 500, 1000, 5000, 10000, 15000, 30000, 50000} {
 		opsPerWorker := 10
 		if workers <= 10 {
 			opsPerWorker = 50
 		} else if workers <= 1000 {
 			opsPerWorker = 20
+		} else if workers >= 30000 {
+			opsPerWorker = 5
 		}
 		offset := workerOffset
 		workerOffset += workers
