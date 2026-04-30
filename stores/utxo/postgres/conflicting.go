@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -158,13 +159,18 @@ type batchUnlockItem struct {
 	done chan error
 }
 
-// sendUnlockBatch pipelines N UPDATE queries via SendBatch.
+// sendUnlockBatch buckets the batch by partition and dispatches one UPDATE
+// per non-empty partition, each targeting its own `txs_pK` child table
+// directly. Multiple per-partition UPDATEs run in parallel so backends don't
+// share a single relation lock.
 func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 	ctx := context.Background()
 
-	// Single-item fast path: direct query.
+	// Single-item fast path: direct query against the partition.
 	if len(batch) == 1 {
-		_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = $1`, batch[0].hash[:])
+		rk := Route(&batch[0].hash)
+		q := fmt.Sprintf(`UPDATE txs%s SET locked = false WHERE hash = $1`, PartitionSuffix(rk.Partition))
+		_, err := s.pool.Exec(ctx, q, batch[0].hash[:])
 		if err != nil {
 			batch[0].done <- errors.NewStorageError("[Unlock] update: %v", err)
 		} else {
@@ -173,22 +179,40 @@ func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 		return
 	}
 
-	// Single bulk UPDATE — all hashes in one query.
-	hashBytes := make([][]byte, len(batch))
+	buckets := make([][]int, NumPartitions)
 	for i, item := range batch {
-		hashBytes[i] = item.hash[:]
+		rk := Route(&item.hash)
+		buckets[rk.Partition] = append(buckets[rk.Partition], i)
 	}
 
-	_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = ANY($1)`, hashBytes)
-	if err != nil {
-		for _, item := range batch {
-			item.done <- errors.NewStorageError("[Unlock] bulk update: %v", err)
+	var wg sync.WaitGroup
+	for partition := 0; partition < NumPartitions; partition++ {
+		idxs := buckets[partition]
+		if len(idxs) == 0 {
+			continue
 		}
-		return
+		wg.Add(1)
+		go func(partition int, idxs []int) {
+			defer wg.Done()
+			hashBytes := make([][]byte, len(idxs))
+			for j, i := range idxs {
+				hashBytes[j] = batch[i].hash[:]
+			}
+			q := fmt.Sprintf(`UPDATE txs%s SET locked = false WHERE hash = ANY($1)`, PartitionSuffix(partition))
+			_, err := s.pool.Exec(ctx, q, hashBytes)
+			if err != nil {
+				e := errors.NewStorageError("[Unlock] bulk update: %v", err)
+				for _, i := range idxs {
+					batch[i].done <- e
+				}
+				return
+			}
+			for _, i := range idxs {
+				batch[i].done <- nil
+			}
+		}(partition, idxs)
 	}
-	for _, item := range batch {
-		item.done <- nil
-	}
+	wg.Wait()
 }
 
 // SetLocked marks transactions as locked or unlocked.

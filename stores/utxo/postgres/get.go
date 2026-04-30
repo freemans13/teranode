@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -58,7 +59,10 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 	return s.getInternal(ctx, hash, bins)
 }
 
-// sendGetBatch pipelines N SELECT queries via SendBatch.
+// sendGetBatch buckets the batch by partition and dispatches one goroutine
+// per non-empty bucket. Each goroutine pipelines its bucket's SELECTs against
+// the partition's child table directly (txs_pK), so the planner sees only
+// one relation per query and no Append.
 func (s *Store) sendGetBatch(batch []*batchGetItem) {
 	ctx := context.Background()
 
@@ -69,29 +73,53 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 		return
 	}
 
+	buckets := make([][]int, NumPartitions)
+	for i, item := range batch {
+		rk := Route(item.hash)
+		buckets[rk.Partition] = append(buckets[rk.Partition], i)
+	}
+
+	var wg sync.WaitGroup
+	for partition := 0; partition < NumPartitions; partition++ {
+		idxs := buckets[partition]
+		if len(idxs) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(partition int, idxs []int) {
+			defer wg.Done()
+			s.getPartitionBucket(ctx, partition, batch, idxs)
+		}(partition, idxs)
+	}
+	wg.Wait()
+}
+
+// getPartitionBucket pipelines the partition's bucket of SELECTs against the
+// `txs_pK` child table directly via pgx SendBatch.
+func (s *Store) getPartitionBucket(ctx context.Context, partition int, batch []*batchGetItem, idxs []int) {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		for _, item := range batch {
-			item.done <- batchGetResult{Err: errors.NewStorageError("[Get] acquire: %v", err)}
+		for _, i := range idxs {
+			batch[i].done <- batchGetResult{Err: errors.NewStorageError("[Get] acquire: %v", err)}
 		}
 		return
 	}
 	defer conn.Release()
 
+	q := fmt.Sprintf(`
+		SELECT version, lock_time, fee, size_in_bytes, coinbase,
+		       locked, conflicting, frozen, unmined_since,
+		       block_ids, block_heights, subtree_idxs
+		FROM txs%s WHERE hash = $1`, PartitionSuffix(partition))
+
 	pgxBatch := &pgx.Batch{}
-	for _, item := range batch {
-		pgxBatch.Queue(`
-			SELECT version, lock_time, fee, size_in_bytes, coinbase,
-			       locked, conflicting, frozen, unmined_since,
-			       block_ids, block_heights, subtree_idxs
-			FROM txs WHERE hash = $1`,
-			item.hash[:],
-		)
+	for _, i := range idxs {
+		pgxBatch.Queue(q, batch[i].hash[:])
 	}
 
 	br := conn.SendBatch(ctx, pgxBatch)
-
-	for _, item := range batch {
+	for _, i := range idxs {
+		item := batch[i]
 		data := &meta.Data{}
 		var version, lockTime int64
 		var unminedSince *int64
@@ -116,20 +144,18 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 			data.BlockIDs = make([]uint32, len(blockIDs))
 			data.BlockHeights = make([]uint32, len(blockHeights))
 			data.SubtreeIdxs = make([]int, len(subtreeIdxs))
-			for i := range blockIDs {
-				data.BlockIDs[i] = uint32(blockIDs[i])
-				if i < len(blockHeights) {
-					data.BlockHeights[i] = uint32(blockHeights[i])
+			for j := range blockIDs {
+				data.BlockIDs[j] = uint32(blockIDs[j])
+				if j < len(blockHeights) {
+					data.BlockHeights[j] = uint32(blockHeights[j])
 				}
-				if i < len(subtreeIdxs) {
-					data.SubtreeIdxs[i] = int(subtreeIdxs[i])
+				if j < len(subtreeIdxs) {
+					data.SubtreeIdxs[j] = int(subtreeIdxs[j])
 				}
 			}
 		}
-
 		item.done <- batchGetResult{Data: data}
 	}
-
 	br.Close()
 }
 

@@ -3,6 +3,8 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -30,25 +32,29 @@ type batchSpendItem struct {
 // Direct-mode SQL (used when batcher is not active)
 // ---------------------------------------------------------------------------
 
-// spendValidationSQL is the CTE used to validate a spend attempt, insert into
-// the append-only spends table, and — if this spend drained the parent tx's
-// last unspent output — set delete_at_height so the pruner can reclaim it.
+// spendValidationSQL templates: one cached string per partition, all
+// references to outputs/txs/spends substituted with the partition's child
+// table (e.g. outputs_p03). Each Spend call computes its target partition
+// from prev_tx_hash and uses the matching template — the resulting query
+// touches exactly one partition's relations, so the planner doesn't fan out
+// over the whole tree and LockManager only acquires one partition's locks.
 //
 // $8 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH branch.
-const spendValidationSQL = `
+var spendValidationSQLByPartition = func() [NumPartitions]string {
+	const tmpl = `
 WITH validation AS (
     SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
            o.coinbase_spending_height,
            t.locked AS tx_locked, t.conflicting AS tx_conflicting,
            t.frozen AS tx_frozen,
            sp.spending_data AS existing_spend
-    FROM outputs o
-    JOIN txs t ON t.hash = o.tx_hash
-    LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+    FROM outputs%[1]s o
+    JOIN txs%[1]s t ON t.hash = o.tx_hash
+    LEFT JOIN spends%[1]s sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
     WHERE o.tx_hash = $1 AND o.idx = $2
 ),
 inserted AS (
-    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
+    INSERT INTO spends%[1]s (prev_tx_hash, prev_output_idx, spending_data)
     SELECT $1, $2, $3
     FROM validation v
     WHERE v.existing_spend IS NULL
@@ -62,35 +68,46 @@ inserted AS (
     RETURNING prev_tx_hash
 ),
 dah_upd AS (
-    UPDATE txs t SET delete_at_height = $8
+    UPDATE txs%[1]s t SET delete_at_height = $8
     FROM inserted i
     WHERE $8 > 0
       AND t.hash = i.prev_tx_hash
       AND t.preserve_until IS NULL
       AND t.unmined_since IS NULL
       AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
-      -- Pre-insert spends + this one newly-inserted row == total outputs ⇔ fully spent.
-      AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + 1
-          = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
+      AND (SELECT count(*) FROM spends%[1]s s WHERE s.prev_tx_hash = t.hash) + 1
+          = (SELECT count(*) FROM outputs%[1]s o WHERE o.tx_hash = t.hash)
       AND (t.delete_at_height IS NULL OR t.delete_at_height < $8)
     RETURNING 1
 )
 SELECT 1 FROM inserted
 `
+	var out [NumPartitions]string
+	for k := 0; k < NumPartitions; k++ {
+		out[k] = fmt.Sprintf(tmpl, PartitionSuffix(k))
+	}
+	return out
+}()
 
-// spendDiagnosticSQL re-queries the validation CTE when the INSERT returned
-// 0 rows, so we can determine the exact reason the spend failed.
-const spendDiagnosticSQL = `
+// spendDiagnosticSQL templates per partition.
+var spendDiagnosticSQLByPartition = func() [NumPartitions]string {
+	const tmpl = `
 SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
        o.coinbase_spending_height,
        t.locked AS tx_locked, t.conflicting AS tx_conflicting,
        t.frozen AS tx_frozen,
        sp.spending_data AS existing_spend
-FROM outputs o
-JOIN txs t ON t.hash = o.tx_hash
-LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+FROM outputs%[1]s o
+JOIN txs%[1]s t ON t.hash = o.tx_hash
+LEFT JOIN spends%[1]s sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
 WHERE o.tx_hash = $1 AND o.idx = $2
 `
+	var out [NumPartitions]string
+	for k := 0; k < NumPartitions; k++ {
+		out[k] = fmt.Sprintf(tmpl, PartitionSuffix(k))
+	}
+	return out
+}()
 
 // ---------------------------------------------------------------------------
 // Spend — public API
@@ -212,9 +229,10 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 		spendingDataBytes := spend.SpendingData.Bytes()
 		inputStart := time.Now()
 
-		// Try the atomic INSERT with validation CTE.
+		// Try the atomic INSERT with validation CTE — partition-routed.
+		rk := Route(spend.TxID)
 		var inserted int
-		err := s.pool.QueryRow(ctx, spendValidationSQL,
+		err := s.pool.QueryRow(ctx, spendValidationSQLByPartition[rk.Partition],
 			spend.TxID[:],      // $1 prev_tx_hash
 			spend.Vout,         // $2 prev_output_idx
 			spendingDataBytes,  // $3 spending_data
@@ -291,11 +309,13 @@ func (s *Store) sendSpendBatch(batch []*batchSpendItem) {
 func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	ctx := context.Background()
 
-	// Single-item fast path: use the direct validation CTE instead of bulk UNNEST.
+	// Single-item fast path: route to the spend's partition and use the
+	// direct validation CTE.
 	if len(batch) == 1 {
 		item := batch[0]
+		rk := Route(item.spend.TxID)
 		var inserted int
-		err := s.pool.QueryRow(ctx, spendValidationSQL,
+		err := s.pool.QueryRow(ctx, spendValidationSQLByPartition[rk.Partition],
 			item.spend.TxID[:], item.spend.Vout,
 			item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
 			int64(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
@@ -319,48 +339,78 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		return false
 	}
 
+	// Bucket batch items by partition. Each non-empty bucket is dispatched on
+	// its own goroutine + connection, running the partition-scoped bulk
+	// query against outputs_pK ⋈ txs_pK ⋈ spends_pK only.
+	buckets := make([][]int, NumPartitions)
+	for i, item := range batch {
+		rk := Route(item.spend.TxID)
+		buckets[rk.Partition] = append(buckets[rk.Partition], i)
+	}
+
+	newDAH := s.newDAHOrZero()
+
+	var wg sync.WaitGroup
+	for partition := 0; partition < NumPartitions; partition++ {
+		idxs := buckets[partition]
+		if len(idxs) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(partition int, idxs []int) {
+			defer wg.Done()
+			s.spendPartitionBucket(ctx, partition, batch, idxs, newDAH)
+		}(partition, idxs)
+	}
+	wg.Wait()
+	return false
+}
+
+// spendPartitionBucket executes the partition-scoped bulk Spend query for one
+// partition's worth of items. All items in `idxs` route to `partition`.
+func (s *Store) spendPartitionBucket(ctx context.Context, partition int, batch []*batchSpendItem, idxs []int, newDAH int64) {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] failed to acquire connection", err)
+		for _, i := range idxs {
+			batch[i].errCh <- errors.NewStorageError("[Spend] failed to acquire connection", err)
 		}
-		return false
+		return
 	}
 	defer conn.Release()
 
-	// Single bulk query: UNNEST parallel arrays → 3-table JOIN validation →
-	// INSERT valid spends → return per-item results with diagnostic flags.
-	// One parse/plan/execute for the entire batch (§6.1 multi-row INSERT).
-	prevTxHashes := make([][]byte, len(batch))
-	prevIdxs := make([]int64, len(batch))
-	spendingDatas := make([][]byte, len(batch))
-	utxoHashes := make([][]byte, len(batch))
-	blockHeights := make([]int64, len(batch))
-	ignLockeds := make([]bool, len(batch))
-	ignConflictings := make([]bool, len(batch))
-	batchIdxs := make([]int32, len(batch))
-
-	for i, item := range batch {
-		prevTxHashes[i] = item.spend.TxID[:]
-		prevIdxs[i] = int64(item.spend.Vout)
-		spendingDatas[i] = item.spend.SpendingData.Bytes()
-		utxoHashes[i] = item.spend.UTXOHash[:]
-		blockHeights[i] = int64(item.blockHeight)
-		ignLockeds[i] = item.ignoreLocked
-		ignConflictings[i] = item.ignoreConflicting
-		batchIdxs[i] = int32(i)
+	n := len(idxs)
+	prevTxHashes := make([][]byte, n)
+	prevIdxs := make([]int64, n)
+	spendingDatas := make([][]byte, n)
+	utxoHashes := make([][]byte, n)
+	blockHeights := make([]int64, n)
+	ignLockeds := make([]bool, n)
+	ignConflictings := make([]bool, n)
+	// batchIdx in the SQL maps back to the original batch position so the
+	// caller can route results to the right errCh.
+	batchIdxs := make([]int32, n)
+	for j, i := range idxs {
+		item := batch[i]
+		prevTxHashes[j] = item.spend.TxID[:]
+		prevIdxs[j] = int64(item.spend.Vout)
+		spendingDatas[j] = item.spend.SpendingData.Bytes()
+		utxoHashes[j] = item.spend.UTXOHash[:]
+		blockHeights[j] = int64(item.blockHeight)
+		ignLockeds[j] = item.ignoreLocked
+		ignConflictings[j] = item.ignoreConflicting
+		batchIdxs[j] = int32(i)
 	}
 
-	rows, err := conn.Query(ctx, bulkSpendSQL,
+	rows, err := conn.Query(ctx, bulkSpendSQLByPartition[partition],
 		prevTxHashes, prevIdxs, spendingDatas, utxoHashes,
 		blockHeights, ignLockeds, ignConflictings, batchIdxs,
-		s.newDAHOrZero(),
+		newDAH,
 	)
 	if err != nil {
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] bulk query failed: %v", err)
+		for _, i := range idxs {
+			batch[i].errCh <- errors.NewStorageError("[Spend] bulk query failed: %v", err)
 		}
-		return false
+		return
 	}
 
 	type bulkResult struct {
@@ -375,7 +425,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		coinbaseBlock  bool
 		spendableBlock bool
 	}
-	resultMap := make(map[int]*bulkResult, len(batch))
+	resultMap := make(map[int]*bulkResult, n)
 	for rows.Next() {
 		var bIdx int32
 		r := &bulkResult{}
@@ -383,17 +433,18 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			&r.outputFrozen, &r.txFrozen, &r.txLocked, &r.txConflicting,
 			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock); err != nil {
 			rows.Close()
-			for _, item := range batch {
-				item.errCh <- errors.NewStorageError("[Spend] scan: %v", err)
+			for _, i := range idxs {
+				batch[i].errCh <- errors.NewStorageError("[Spend] scan: %v", err)
 			}
-			return false
+			return
 		}
 		r.found = true
 		resultMap[int(bIdx)] = r
 	}
 	rows.Close()
 
-	for i, item := range batch {
+	for _, i := range idxs {
+		item := batch[i]
 		spend := item.spend
 		r, found := resultMap[i]
 
@@ -435,20 +486,18 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
 		}
 	}
-
-	return false
 }
 
-// bulkSpendSQL processes an entire batch in ONE query: UNNEST → validate → INSERT → results.
+// bulkSpendSQL templates per partition. Each template's FROM/JOIN/INSERT/
+// UPDATE references are scoped to a single partition's child tables, so the
+// query touches outputs_pK ⋈ txs_pK ⋈ spends_pK and writes to spends_pK and
+// txs_pK — one relation per role per query. The Go-side caller buckets
+// inputs by RouteKey.Partition before dispatching, so each template only
+// ever sees rows whose prev_tx_hash lands in its own partition.
 //
-// The trailing dah_upd CTE re-evaluates delete_at_height for every parent tx whose
-// last unspent output was drained by this batch. Postgres CTEs share a snapshot,
-// so count(spends) inside dah_upd sees the PRE-insert state; adding p.spent_in_batch
-// gives the post-insert total. Equality with count(outputs) means fully spent.
-//
-// The caller passes $9 = newDAH (blockHeight+1+retention). When retention is 0,
-// the caller must pass 0, and the `$9 > 0` guard makes the DAH UPDATE a no-op.
-const bulkSpendSQL = `
+// $9 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH UPDATE.
+var bulkSpendSQLByPartition = func() [NumPartitions]string {
+	const tmpl = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
            unnest($2::bigint[])  AS prev_idx,
@@ -467,9 +516,9 @@ validated AS (
            t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
            sp.spending_data AS existing_spend
     FROM items i
-    JOIN outputs o ON o.tx_hash = i.prev_tx_hash AND o.idx = i.prev_idx
-    JOIN txs t ON t.hash = i.prev_tx_hash
-    LEFT JOIN spends sp ON sp.prev_tx_hash = i.prev_tx_hash AND sp.prev_output_idx = i.prev_idx
+    JOIN outputs%[1]s o ON o.tx_hash = i.prev_tx_hash AND o.idx = i.prev_idx
+    JOIN txs%[1]s t ON t.hash = i.prev_tx_hash
+    LEFT JOIN spends%[1]s sp ON sp.prev_tx_hash = i.prev_tx_hash AND sp.prev_output_idx = i.prev_idx
 ),
 to_insert AS (
     SELECT prev_tx_hash, prev_idx, spending_data, batch_idx
@@ -483,7 +532,7 @@ to_insert AS (
       AND NOT (COALESCE(spendable_in, 0) > 0 AND block_height < COALESCE(spendable_in, 0))
 ),
 inserted AS (
-    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
+    INSERT INTO spends%[1]s (prev_tx_hash, prev_output_idx, spending_data)
     SELECT prev_tx_hash, prev_idx, spending_data FROM to_insert
     ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
     RETURNING prev_tx_hash, prev_output_idx
@@ -493,15 +542,15 @@ parents AS (
     FROM inserted GROUP BY prev_tx_hash
 ),
 dah_upd AS (
-    UPDATE txs t SET delete_at_height = $9
+    UPDATE txs%[1]s t SET delete_at_height = $9
     FROM parents p
     WHERE $9 > 0
       AND t.hash = p.tx_hash
       AND t.preserve_until IS NULL
       AND t.unmined_since IS NULL
       AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
-      AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + p.spent_in_batch
-          = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
+      AND (SELECT count(*) FROM spends%[1]s s WHERE s.prev_tx_hash = t.hash) + p.spent_in_batch
+          = (SELECT count(*) FROM outputs%[1]s o WHERE o.tx_hash = t.hash)
       AND (t.delete_at_height IS NULL OR t.delete_at_height < $9)
     RETURNING 1
 )
@@ -516,6 +565,12 @@ FROM validated v
 LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
 ORDER BY v.batch_idx
 `
+	var out [NumPartitions]string
+	for k := 0; k < NumPartitions; k++ {
+		out[k] = fmt.Sprintf(tmpl, PartitionSuffix(k))
+	}
+	return out
+}()
 
 // diagnoseSpendFailure queries the output + txs + spends to determine
 // why a spend INSERT failed.
@@ -533,7 +588,8 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 		existingSpendBytes     []byte
 	)
 
-	err := s.pool.QueryRow(ctx, spendDiagnosticSQL,
+	rk := Route(spend.TxID)
+	err := s.pool.QueryRow(ctx, spendDiagnosticSQLByPartition[rk.Partition],
 		spend.TxID[:], // $1
 		spend.Vout,    // $2
 	).Scan(&utxoHashBytes, &outputFrozen, &spendableIn,

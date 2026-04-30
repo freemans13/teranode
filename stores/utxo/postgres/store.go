@@ -98,7 +98,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
-	pgxConfig.MaxConns = 100
+	pgxConfig.MaxConns = 250
 
 	// Full durability — financial data requires synchronous_commit = on (the default).
 	// Group commit (commit_delay + commit_siblings) is the safe way to get throughput.
