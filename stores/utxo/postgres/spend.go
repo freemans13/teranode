@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -13,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		return nil, errors.NewProcessingError("No spends provided", nil)
 	}
 
-	if s.spendBatcher != nil {
+	if s.workersStarted() {
 		return s.spendBatched(ctx, tx, spends, blockHeight, useIgnoreLocked, useIgnoreConflicting)
 	}
 
@@ -157,13 +157,15 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 		}
 		errCh := make(chan error, 1)
 		errChs[idx] = errCh
-		s.spendBatcher.Put(&batchSpendItem{
+		item := &batchSpendItem{
 			spend:             spend,
 			blockHeight:       blockHeight,
 			errCh:             errCh,
 			ignoreConflicting: ignoreConflicting,
 			ignoreLocked:      ignoreLocked,
-		})
+		}
+		rk := Route(spend.TxID)
+		s.spendWorkers[rk.Partition].input <- item
 	}
 
 	// Wait for all results.
@@ -299,86 +301,43 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 }
 
 // ---------------------------------------------------------------------------
-// sendSpendBatch — batch callback for the go-batcher
+// runSpendBatch — per-partition Spend worker callback. The worker holds a
+// pgxpool connection for life and dispatches partition-scoped bulk Spend
+// queries against outputs_pK ⋈ txs_pK ⋈ spends_pK only.
 // ---------------------------------------------------------------------------
-
-func (s *Store) sendSpendBatch(batch []*batchSpendItem) {
-	s.trySendSpendBatch(batch)
-}
-
-func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
+func (s *Store) runSpendBatch(conn *pgxpool.Conn, partition int, batch []*batchSpendItem) {
 	ctx := context.Background()
+	newDAH := s.newDAHOrZero()
 
-	// Single-item fast path: route to the spend's partition and use the
-	// direct validation CTE.
+	// Single-item fast path: direct validation CTE.
 	if len(batch) == 1 {
 		item := batch[0]
-		rk := Route(item.spend.TxID)
 		var inserted int
-		err := s.pool.QueryRow(ctx, spendValidationSQLByPartition[rk.Partition],
+		err := conn.QueryRow(ctx, spendValidationSQLByPartition[partition],
 			item.spend.TxID[:], item.spend.Vout,
 			item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
 			int64(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
-			s.newDAHOrZero(),
+			newDAH,
 		).Scan(&inserted)
 		if err == nil {
 			item.errCh <- nil
-			return false
+			return
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			item.errCh <- errors.NewStorageError("[Spend] query failed for %s:%d: %v", item.spend.TxID, item.spend.Vout, err)
-			return false
+			return
 		}
-		diagErr := s.diagnoseSpendFailure(ctx, item.spend, item.spend.SpendingData.Bytes(),
+		diagErr := s.diagnoseSpendFailureOnConn(ctx, conn, partition, item.spend, item.spend.SpendingData.Bytes(),
 			item.blockHeight, item.ignoreLocked, item.ignoreConflicting)
 		if diagErr == nil {
 			item.errCh <- nil
 		} else {
 			item.errCh <- diagErr
 		}
-		return false
-	}
-
-	// Bucket batch items by partition. Each non-empty bucket is dispatched on
-	// its own goroutine + connection, running the partition-scoped bulk
-	// query against outputs_pK ⋈ txs_pK ⋈ spends_pK only.
-	buckets := make([][]int, NumPartitions)
-	for i, item := range batch {
-		rk := Route(item.spend.TxID)
-		buckets[rk.Partition] = append(buckets[rk.Partition], i)
-	}
-
-	newDAH := s.newDAHOrZero()
-
-	var wg sync.WaitGroup
-	for partition := 0; partition < NumPartitions; partition++ {
-		idxs := buckets[partition]
-		if len(idxs) == 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(partition int, idxs []int) {
-			defer wg.Done()
-			s.spendPartitionBucket(ctx, partition, batch, idxs, newDAH)
-		}(partition, idxs)
-	}
-	wg.Wait()
-	return false
-}
-
-// spendPartitionBucket executes the partition-scoped bulk Spend query for one
-// partition's worth of items. All items in `idxs` route to `partition`.
-func (s *Store) spendPartitionBucket(ctx context.Context, partition int, batch []*batchSpendItem, idxs []int, newDAH int64) {
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		for _, i := range idxs {
-			batch[i].errCh <- errors.NewStorageError("[Spend] failed to acquire connection", err)
-		}
 		return
 	}
-	defer conn.Release()
 
-	n := len(idxs)
+	n := len(batch)
 	prevTxHashes := make([][]byte, n)
 	prevIdxs := make([]int64, n)
 	spendingDatas := make([][]byte, n)
@@ -386,19 +345,16 @@ func (s *Store) spendPartitionBucket(ctx context.Context, partition int, batch [
 	blockHeights := make([]int64, n)
 	ignLockeds := make([]bool, n)
 	ignConflictings := make([]bool, n)
-	// batchIdx in the SQL maps back to the original batch position so the
-	// caller can route results to the right errCh.
 	batchIdxs := make([]int32, n)
-	for j, i := range idxs {
-		item := batch[i]
-		prevTxHashes[j] = item.spend.TxID[:]
-		prevIdxs[j] = int64(item.spend.Vout)
-		spendingDatas[j] = item.spend.SpendingData.Bytes()
-		utxoHashes[j] = item.spend.UTXOHash[:]
-		blockHeights[j] = int64(item.blockHeight)
-		ignLockeds[j] = item.ignoreLocked
-		ignConflictings[j] = item.ignoreConflicting
-		batchIdxs[j] = int32(i)
+	for i, item := range batch {
+		prevTxHashes[i] = item.spend.TxID[:]
+		prevIdxs[i] = int64(item.spend.Vout)
+		spendingDatas[i] = item.spend.SpendingData.Bytes()
+		utxoHashes[i] = item.spend.UTXOHash[:]
+		blockHeights[i] = int64(item.blockHeight)
+		ignLockeds[i] = item.ignoreLocked
+		ignConflictings[i] = item.ignoreConflicting
+		batchIdxs[i] = int32(i)
 	}
 
 	rows, err := conn.Query(ctx, bulkSpendSQLByPartition[partition],
@@ -407,8 +363,8 @@ func (s *Store) spendPartitionBucket(ctx context.Context, partition int, batch [
 		newDAH,
 	)
 	if err != nil {
-		for _, i := range idxs {
-			batch[i].errCh <- errors.NewStorageError("[Spend] bulk query failed: %v", err)
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] bulk query failed: %v", err)
 		}
 		return
 	}
@@ -433,8 +389,8 @@ func (s *Store) spendPartitionBucket(ctx context.Context, partition int, batch [
 			&r.outputFrozen, &r.txFrozen, &r.txLocked, &r.txConflicting,
 			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock); err != nil {
 			rows.Close()
-			for _, i := range idxs {
-				batch[i].errCh <- errors.NewStorageError("[Spend] scan: %v", err)
+			for _, item := range batch {
+				item.errCh <- errors.NewStorageError("[Spend] scan: %v", err)
 			}
 			return
 		}
@@ -443,11 +399,9 @@ func (s *Store) spendPartitionBucket(ctx context.Context, partition int, batch [
 	}
 	rows.Close()
 
-	for _, i := range idxs {
-		item := batch[i]
+	for i, item := range batch {
 		spend := item.spend
 		r, found := resultMap[i]
-
 		if !found {
 			item.errCh <- errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
 			continue
@@ -573,9 +527,25 @@ ORDER BY v.batch_idx
 }()
 
 // diagnoseSpendFailure queries the output + txs + spends to determine
-// why a spend INSERT failed.
+// why a spend INSERT failed. Pool-acquiring path used by spendDirect when
+// no worker is available.
 func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spendingDataBytes []byte,
 	blockHeight uint32, ignoreLocked, ignoreConflicting bool) error {
+
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return errors.NewStorageError("[Spend] failed to acquire connection for diagnostic", err)
+	}
+	defer conn.Release()
+	rk := Route(spend.TxID)
+	return s.diagnoseSpendFailureOnConn(ctx, conn, rk.Partition, spend, spendingDataBytes,
+		blockHeight, ignoreLocked, ignoreConflicting)
+}
+
+// diagnoseSpendFailureOnConn is the worker variant of diagnoseSpendFailure
+// that uses a held connection rather than s.pool.QueryRow.
+func (s *Store) diagnoseSpendFailureOnConn(ctx context.Context, conn *pgxpool.Conn, partition int,
+	spend *utxo.Spend, spendingDataBytes []byte, blockHeight uint32, ignoreLocked, ignoreConflicting bool) error {
 
 	var (
 		utxoHashBytes          []byte
@@ -588,11 +558,8 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 		existingSpendBytes     []byte
 	)
 
-	rk := Route(spend.TxID)
-	err := s.pool.QueryRow(ctx, spendDiagnosticSQLByPartition[rk.Partition],
-		spend.TxID[:], // $1
-		spend.Vout,    // $2
-	).Scan(&utxoHashBytes, &outputFrozen, &spendableIn,
+	row := conn.QueryRow(ctx, spendDiagnosticSQLByPartition[partition], spend.TxID[:], spend.Vout)
+	err := row.Scan(&utxoHashBytes, &outputFrozen, &spendableIn,
 		&coinbaseSpendingHeight, &txLocked, &txConflicting, &txFrozen, &existingSpendBytes)
 
 	if err != nil {

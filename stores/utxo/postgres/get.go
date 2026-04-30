@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -17,6 +16,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // maxINClauseSize limits the number of hashes per IN clause to avoid exceeding
@@ -43,11 +43,15 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 		bins = requestedFields
 	}
 
-	// Use batcher for simple metadata-only gets (BlockIDs, BlockHeights — no Tx body).
-	if s.getBatcher != nil && !contains(bins, fields.Tx) && !contains(bins, fields.Outputs) &&
+	// Use partition workers for simple metadata-only gets (BlockIDs,
+	// BlockHeights — no Tx body). The item is routed to its hash's
+	// partition; that worker batches and dispatches on its owned connection.
+	if s.workersStarted() && !contains(bins, fields.Tx) && !contains(bins, fields.Outputs) &&
 		!contains(bins, fields.Utxos) && !contains(bins, fields.TxInpoints) && !contains(bins, fields.Inputs) {
 		done := make(chan batchGetResult, 1)
-		s.getBatcher.Put(&batchGetItem{hash: hash, bins: bins, done: done})
+		item := &batchGetItem{hash: hash, bins: bins, done: done}
+		rk := Route(hash)
+		s.getWorkers[rk.Partition].input <- item
 		select {
 		case result := <-done:
 			return result.Data, result.Err
@@ -59,52 +63,11 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 	return s.getInternal(ctx, hash, bins)
 }
 
-// sendGetBatch buckets the batch by partition and dispatches one goroutine
-// per non-empty bucket. Each goroutine pipelines its bucket's SELECTs against
-// the partition's child table directly (txs_pK), so the planner sees only
-// one relation per query and no Append.
-func (s *Store) sendGetBatch(batch []*batchGetItem) {
+// runGetBatch is the per-partition Get worker callback. All items in the
+// batch route to `partition`; the worker has its own pgxpool connection
+// already held. Pipelines the SELECTs against `txs_pK` via pgx SendBatch.
+func (s *Store) runGetBatch(conn *pgxpool.Conn, partition int, batch []*batchGetItem) {
 	ctx := context.Background()
-
-	// Single-item fast path: direct query, no SendBatch overhead.
-	if len(batch) == 1 {
-		result, err := s.getInternal(ctx, batch[0].hash, batch[0].bins)
-		batch[0].done <- batchGetResult{Data: result, Err: err}
-		return
-	}
-
-	buckets := make([][]int, NumPartitions)
-	for i, item := range batch {
-		rk := Route(item.hash)
-		buckets[rk.Partition] = append(buckets[rk.Partition], i)
-	}
-
-	var wg sync.WaitGroup
-	for partition := 0; partition < NumPartitions; partition++ {
-		idxs := buckets[partition]
-		if len(idxs) == 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(partition int, idxs []int) {
-			defer wg.Done()
-			s.getPartitionBucket(ctx, partition, batch, idxs)
-		}(partition, idxs)
-	}
-	wg.Wait()
-}
-
-// getPartitionBucket pipelines the partition's bucket of SELECTs against the
-// `txs_pK` child table directly via pgx SendBatch.
-func (s *Store) getPartitionBucket(ctx context.Context, partition int, batch []*batchGetItem, idxs []int) {
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		for _, i := range idxs {
-			batch[i].done <- batchGetResult{Err: errors.NewStorageError("[Get] acquire: %v", err)}
-		}
-		return
-	}
-	defer conn.Release()
 
 	q := fmt.Sprintf(`
 		SELECT version, lock_time, fee, size_in_bytes, coinbase,
@@ -113,13 +76,12 @@ func (s *Store) getPartitionBucket(ctx context.Context, partition int, batch []*
 		FROM txs%s WHERE hash = $1`, PartitionSuffix(partition))
 
 	pgxBatch := &pgx.Batch{}
-	for _, i := range idxs {
-		pgxBatch.Queue(q, batch[i].hash[:])
+	for _, item := range batch {
+		pgxBatch.Queue(q, item.hash[:])
 	}
 
 	br := conn.SendBatch(ctx, pgxBatch)
-	for _, i := range idxs {
-		item := batch[i]
+	for _, item := range batch {
 		data := &meta.Data{}
 		var version, lockTime int64
 		var unminedSince *int64

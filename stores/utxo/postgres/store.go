@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -78,14 +77,23 @@ type Store struct {
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
 
-	// batchers — nil until Start() is called.
-	createBatcher *batcher.Batcher[batchCreateItem]
-	spendBatcher  *batcher.Batcher[batchSpendItem]
-	getBatcher    *batcher.Batcher[batchGetItem]
-	unlockBatcher *batcher.Batcher[batchUnlockItem]
+	// Per-(op × partition) workers. One persistent goroutine per slot, each
+	// owns a pgxpool connection for life. Nil until Start() is called.
+	createWorkers [NumPartitions]*partitionWorker[*batchCreateItem]
+	spendWorkers  [NumPartitions]*partitionWorker[*batchSpendItem]
+	getWorkers    [NumPartitions]*partitionWorker[*batchGetItem]
+	unlockWorkers [NumPartitions]*partitionWorker[*batchUnlockItem]
+	workersWG     sync.WaitGroup
 
 	// in-process cache for recently created transactions.
 	cache *txCache
+}
+
+// workersStarted reports whether the per-partition worker grid is up.
+// Public-API methods (Get, Spend, Create, SetLocked) check this to decide
+// whether to dispatch through workers or fall back to direct paths.
+func (s *Store) workersStarted() bool {
+	return s.getWorkers[0] != nil
 }
 
 // New creates a new direct-write UTXO store.
@@ -138,10 +146,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	return s, nil
 }
 
-// Start initializes the create and spend batchers for throughput optimization.
-// Without calling Start(), Create() and Spend() work in direct (unbatched) mode.
-func (s *Store) Start(_ context.Context) {
-	// Create batcher — pipelines N creates via COPY to staging + INSERT...SELECT.
+// Start spawns the per-partition worker grid (4 ops × NumPartitions
+// workers). Each worker holds a pgxpool connection for its lifetime and
+// dispatches micro-batches of items routed to its partition. Without
+// Start(), Get/Spend/Create/SetLocked fall back to direct (unbatched) paths.
+func (s *Store) Start(ctx context.Context) {
 	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
 	if storeBatchSize <= 0 {
 		storeBatchSize = 100
@@ -150,10 +159,6 @@ func (s *Store) Start(_ context.Context) {
 	if storeBatchDuration <= 0 {
 		storeBatchDuration = 10 * time.Millisecond
 	}
-	s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
-
-	// Spend batcher — pipelines N validation CTEs via SendBatch (no transaction needed).
-	// background=true is safe because pipelined CTEs don't hold row locks across batches.
 	spendBatchSize := s.settings.UtxoStore.SpendBatcherSize
 	if spendBatchSize <= 0 {
 		spendBatchSize = 100
@@ -162,38 +167,79 @@ func (s *Store) Start(_ context.Context) {
 	if spendBatchDuration <= 0 {
 		spendBatchDuration = 10 * time.Millisecond
 	}
-	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, true)
 
-	// Get batcher — pipelines N SELECTs via SendBatch.
-	// Duration matches spend/create batcher (configured via settings).
-	getBatchSize := 500
-	getBatchDuration := storeBatchDuration
-	s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, true)
+	// Per-partition batch sizes scale down because items are split across
+	// partitions. With NumPartitions=8, each partition sees ~1/8 of the
+	// global rate, so a per-partition batch of (global/N) keeps the same
+	// dispatch cadence as the old global batchers.
+	perPartCreate := storeBatchSize / NumPartitions
+	if perPartCreate < 1 {
+		perPartCreate = 1
+	}
+	perPartSpend := spendBatchSize / NumPartitions
+	if perPartSpend < 1 {
+		perPartSpend = 1
+	}
+	perPartGet := 500 / NumPartitions
+	perPartUnlock := 500 / NumPartitions
 
-	// Unlock batcher — pipelines N UPDATEs via SendBatch.
-	unlockBatchSize := 500
-	unlockBatchDuration := storeBatchDuration
-	s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
+	// Input channel buffer per worker. Generous so callers don't block on
+	// `<- input` under bursty load.
+	const inBuf = 4096
+
+	for p := 0; p < NumPartitions; p++ {
+		cw, err := newPartitionWorker[*batchCreateItem](ctx, s.logger, s.pool, p, perPartCreate, storeBatchDuration, inBuf, s.runCreateBatch, &s.workersWG)
+		if err != nil {
+			s.logger.Errorf("[Start] failed to start create worker p=%d: %v", p, err)
+			continue
+		}
+		s.createWorkers[p] = cw
+
+		sw, err := newPartitionWorker[*batchSpendItem](ctx, s.logger, s.pool, p, perPartSpend, spendBatchDuration, inBuf, s.runSpendBatch, &s.workersWG)
+		if err != nil {
+			s.logger.Errorf("[Start] failed to start spend worker p=%d: %v", p, err)
+			continue
+		}
+		s.spendWorkers[p] = sw
+
+		gw, err := newPartitionWorker[*batchGetItem](ctx, s.logger, s.pool, p, perPartGet, storeBatchDuration, inBuf, s.runGetBatch, &s.workersWG)
+		if err != nil {
+			s.logger.Errorf("[Start] failed to start get worker p=%d: %v", p, err)
+			continue
+		}
+		s.getWorkers[p] = gw
+
+		uw, err := newPartitionWorker[*batchUnlockItem](ctx, s.logger, s.pool, p, perPartUnlock, storeBatchDuration, inBuf, s.runUnlockBatch, &s.workersWG)
+		if err != nil {
+			s.logger.Errorf("[Start] failed to start unlock worker p=%d: %v", p, err)
+			continue
+		}
+		s.unlockWorkers[p] = uw
+	}
 }
 
-// Stop closes batchers and database connections.
+// Stop signals all workers to exit and waits for them to drain & release
+// their connections, then closes the pool and DB.
 func (s *Store) Stop() {
-	if s.createBatcher != nil {
-		s.createBatcher.Close()
-		s.createBatcher = nil
+	for p := 0; p < NumPartitions; p++ {
+		if s.createWorkers[p] != nil {
+			s.createWorkers[p].Stop()
+			s.createWorkers[p] = nil
+		}
+		if s.spendWorkers[p] != nil {
+			s.spendWorkers[p].Stop()
+			s.spendWorkers[p] = nil
+		}
+		if s.getWorkers[p] != nil {
+			s.getWorkers[p].Stop()
+			s.getWorkers[p] = nil
+		}
+		if s.unlockWorkers[p] != nil {
+			s.unlockWorkers[p].Stop()
+			s.unlockWorkers[p] = nil
+		}
 	}
-	if s.spendBatcher != nil {
-		s.spendBatcher.Close()
-		s.spendBatcher = nil
-	}
-	if s.getBatcher != nil {
-		s.getBatcher.Close()
-		s.getBatcher = nil
-	}
-	if s.unlockBatcher != nil {
-		s.unlockBatcher.Close()
-		s.unlockBatcher = nil
-	}
+	s.workersWG.Wait()
 	if s.pool != nil {
 		s.pool.Close()
 	}

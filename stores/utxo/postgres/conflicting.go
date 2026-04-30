@@ -3,13 +3,13 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // GetCounterConflicting delegates to the store-agnostic implementation which
@@ -159,60 +159,26 @@ type batchUnlockItem struct {
 	done chan error
 }
 
-// sendUnlockBatch buckets the batch by partition and dispatches one UPDATE
-// per non-empty partition, each targeting its own `txs_pK` child table
-// directly. Multiple per-partition UPDATEs run in parallel so backends don't
-// share a single relation lock.
-func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
+// runUnlockBatch is the per-partition Unlock worker callback. All items
+// in `batch` route to `partition`. Single bulk UPDATE on `txs_pK` against
+// the worker's held connection.
+func (s *Store) runUnlockBatch(conn *pgxpool.Conn, partition int, batch []*batchUnlockItem) {
 	ctx := context.Background()
-
-	// Single-item fast path: direct query against the partition.
-	if len(batch) == 1 {
-		rk := Route(&batch[0].hash)
-		q := fmt.Sprintf(`UPDATE txs%s SET locked = false WHERE hash = $1`, PartitionSuffix(rk.Partition))
-		_, err := s.pool.Exec(ctx, q, batch[0].hash[:])
-		if err != nil {
-			batch[0].done <- errors.NewStorageError("[Unlock] update: %v", err)
-		} else {
-			batch[0].done <- nil
+	hashBytes := make([][]byte, len(batch))
+	for i, item := range batch {
+		hashBytes[i] = item.hash[:]
+	}
+	q := fmt.Sprintf(`UPDATE txs%s SET locked = false WHERE hash = ANY($1)`, PartitionSuffix(partition))
+	if _, err := conn.Exec(ctx, q, hashBytes); err != nil {
+		e := errors.NewStorageError("[Unlock] bulk update: %v", err)
+		for _, item := range batch {
+			item.done <- e
 		}
 		return
 	}
-
-	buckets := make([][]int, NumPartitions)
-	for i, item := range batch {
-		rk := Route(&item.hash)
-		buckets[rk.Partition] = append(buckets[rk.Partition], i)
+	for _, item := range batch {
+		item.done <- nil
 	}
-
-	var wg sync.WaitGroup
-	for partition := 0; partition < NumPartitions; partition++ {
-		idxs := buckets[partition]
-		if len(idxs) == 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(partition int, idxs []int) {
-			defer wg.Done()
-			hashBytes := make([][]byte, len(idxs))
-			for j, i := range idxs {
-				hashBytes[j] = batch[i].hash[:]
-			}
-			q := fmt.Sprintf(`UPDATE txs%s SET locked = false WHERE hash = ANY($1)`, PartitionSuffix(partition))
-			_, err := s.pool.Exec(ctx, q, hashBytes)
-			if err != nil {
-				e := errors.NewStorageError("[Unlock] bulk update: %v", err)
-				for _, i := range idxs {
-					batch[i].done <- e
-				}
-				return
-			}
-			for _, i := range idxs {
-				batch[i].done <- nil
-			}
-		}(partition, idxs)
-	}
-	wg.Wait()
 }
 
 // SetLocked marks transactions as locked or unlocked.
@@ -224,10 +190,11 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		return nil
 	}
 
-	// Single-hash unlock → use batcher.
-	if s.unlockBatcher != nil && !setValue && len(txHashes) == 1 {
+	// Single-hash unlock → route to its partition's worker.
+	if s.workersStarted() && !setValue && len(txHashes) == 1 {
 		done := make(chan error, 1)
-		s.unlockBatcher.Put(&batchUnlockItem{hash: txHashes[0], done: done})
+		rk := Route(&txHashes[0])
+		s.unlockWorkers[rk.Partition].input <- &batchUnlockItem{hash: txHashes[0], done: done}
 		select {
 		case err := <-done:
 			return err

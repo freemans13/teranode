@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -132,24 +131,31 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		opt(options)
 	}
 
-	// If batcher is active, enqueue and wait.
-	if s.createBatcher != nil {
+	// If workers are active, route the item to its partition's create worker.
+	if s.workersStarted() {
 		return s.createBatched(ctx, tx, blockHeight, options)
 	}
 
-	// No batcher — execute INSERT directly (single-item path).
+	// No workers — execute INSERT directly (single-item path).
 	return s.createDirect(ctx, tx, blockHeight, options)
 }
 
-// createBatched enqueues a Create request into the batcher for bulk processing.
+// createBatched routes a Create request to the worker for the tx's partition.
 func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
 	done := make(chan batchCreateResult, 1)
-	s.createBatcher.Put(&batchCreateItem{
+	var txHash *chainhash.Hash
+	if options.TxID != nil {
+		txHash = options.TxID
+	} else {
+		txHash = tx.TxIDChainHash()
+	}
+	rk := Route(txHash)
+	s.createWorkers[rk.Partition].input <- &batchCreateItem{
 		tx:          tx,
 		blockHeight: blockHeight,
 		options:     options,
 		done:        done,
-	})
+	}
 
 	select {
 	case result := <-done:
@@ -276,61 +282,57 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 }
 
 // ---------------------------------------------------------------------------
-// sendCreateBatch — batch callback for the go-batcher
+// runCreateBatch — per-partition Create worker callback.
+//
+// All items in `batch` are routed to `partition` (by Route on tx_hash). The
+// worker holds the connection for life — no Acquire/Release per batch. Items
+// without MinedBlockInfos / Conflicting use the UNNEST hot path (single
+// transaction wrapping INSERT INTO txs_pK + INSERT INTO outputs_pK). Items
+// with those rare options fall back to per-item createDirect (which itself
+// targets the partition table directly).
 // ---------------------------------------------------------------------------
-
-func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
-	// Single-item fast path — direct INSERT into the partition.
-	if len(batch) == 1 {
-		item := batch[0]
-		result, err := s.createDirect(context.Background(), item.tx, item.blockHeight, item.options)
-		item.done <- batchCreateResult{Data: result, Err: err}
-		return
-	}
-
+func (s *Store) runCreateBatch(conn *pgxpool.Conn, partition int, batch []*batchCreateItem) {
 	ctx := context.Background()
 
-	// Hot path: when no item carries MinedBlockInfos or Conflicting flags, use
-	// the partition-affinity UNNEST path. The validator hot path (Get →
-	// Spend → Create → Unlock) always lands here because it never sets those
-	// options on Create.
-	useUNNEST := true
+	// If any item carries MinedBlockInfos or Conflicting, the whole batch
+	// falls back to per-item createDirect (rare initial-sync path). Cheap
+	// short-circuit because the validator hot path never sets these.
 	for _, item := range batch {
 		if len(item.options.MinedBlockInfos) > 0 || item.options.Conflicting {
-			useUNNEST = false
-			break
+			for _, it := range batch {
+				result, err := s.createDirect(ctx, it.tx, it.blockHeight, it.options)
+				it.done <- batchCreateResult{Data: result, Err: err}
+			}
+			return
 		}
 	}
-	if useUNNEST {
-		s.sendCreateBatchUNNEST(ctx, batch)
-		return
-	}
 
-	// Fallback: items with MinedBlockInfos / Conflicting (rare path during
-	// initial sync of already-mined txs) — fall back to per-item createDirect.
-	// Slower than the old COPY+staging path but always correct against the
-	// list-partitioned schema, and not on the validator hot path.
-	for _, item := range batch {
-		result, err := s.createDirect(ctx, item.tx, item.blockHeight, item.options)
-		item.done <- batchCreateResult{Data: result, Err: err}
-	}
-}
+	txsTable := "txs" + PartitionSuffix(partition)
+	outputsTable := "outputs" + PartitionSuffix(partition)
 
-// ---------------------------------------------------------------------------
-// sendCreateBatchUNNEST — partition-affinity UNNEST hot path.
-//
-// Buckets the batch by RouteKey.Partition and dispatches one goroutine per
-// non-empty partition. Each goroutine acquires its own connection, BEGINs a
-// transaction, and runs two UNNEST'd INSERTs against `txs_pK` and
-// `outputs_pK` directly (no parent-table planning, no partition fanout). All
-// goroutines run concurrently — multiple Postgres backends commit to
-// different relfilenodes in parallel.
-// ---------------------------------------------------------------------------
-func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateItem) {
 	prepared := make([]preparedCreate, len(batch))
 	valid := make([]bool, len(batch))
-	// Bucket of original-batch indices per partition.
-	buckets := make([][]int, NumPartitions)
+
+	n := len(batch)
+	hashes := make([][]byte, 0, n)
+	versions := make([]int64, 0, n)
+	lockTimes := make([]int64, 0, n)
+	fees := make([]int64, 0, n)
+	sizes := make([]int64, 0, n)
+	coinbases := make([]bool, 0, n)
+	rawTxs := make([][]byte, 0, n)
+	lockeds := make([]bool, 0, n)
+	conflictings := make([]bool, 0, n)
+	frozens := make([]bool, 0, n)
+	unminedSinces := make([]int64, 0, n)
+
+	var outTxHashes [][]byte
+	var outIdxs []int64
+	var outLockingScripts [][]byte
+	var outSatoshis []int64
+	var outFrozens []bool
+	var outUtxoHashes [][]byte
+	var outCoinbaseSpendingHeights []int64
 
 	for i, item := range batch {
 		txMeta, err := util.TxMetaDataFromTx(item.tx)
@@ -367,92 +369,41 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			outArrs:    outArrs,
 		}
 		valid[i] = true
-		rk := Route(txHash)
-		buckets[rk.Partition] = append(buckets[rk.Partition], i)
-	}
 
-	// Dispatch one goroutine per non-empty partition.
-	var wg sync.WaitGroup
-	for partition := 0; partition < NumPartitions; partition++ {
-		idxs := buckets[partition]
-		if len(idxs) == 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(partition int, idxs []int) {
-			defer wg.Done()
-			s.sendCreateBatchUNNESTPartition(ctx, partition, batch, prepared, idxs)
-		}(partition, idxs)
-	}
-	wg.Wait()
-}
-
-// sendCreateBatchUNNESTPartition runs the UNNEST INSERT pair (txs + outputs)
-// for one partition's worth of items, on its own connection inside one
-// transaction. All txs in `idxs` route to `partition`.
-func (s *Store) sendCreateBatchUNNESTPartition(ctx context.Context, partition int, batch []*batchCreateItem, prepared []preparedCreate, idxs []int) {
-	txsTable := "txs" + PartitionSuffix(partition)
-	outputsTable := "outputs" + PartitionSuffix(partition)
-
-	n := len(idxs)
-	hashes := make([][]byte, 0, n)
-	versions := make([]int64, 0, n)
-	lockTimes := make([]int64, 0, n)
-	fees := make([]int64, 0, n)
-	sizes := make([]int64, 0, n)
-	coinbases := make([]bool, 0, n)
-	rawTxs := make([][]byte, 0, n)
-	lockeds := make([]bool, 0, n)
-	conflictings := make([]bool, 0, n)
-	frozens := make([]bool, 0, n)
-	unminedSinces := make([]int64, 0, n)
-
-	var outTxHashes [][]byte
-	var outIdxs []int64
-	var outLockingScripts [][]byte
-	var outSatoshis []int64
-	var outFrozens []bool
-	var outUtxoHashes [][]byte
-	var outCoinbaseSpendingHeights []int64
-
-	for _, i := range idxs {
-		p := &prepared[i]
-		item := batch[i]
-		hashes = append(hashes, p.txHash[:])
+		hashes = append(hashes, txHash[:])
 		versions = append(versions, int64(item.tx.Version))
 		lockTimes = append(lockTimes, int64(item.tx.LockTime))
-		fees = append(fees, int64(p.txMeta.Fee))
-		sizes = append(sizes, int64(p.txMeta.SizeInBytes))
-		coinbases = append(coinbases, p.isCoinbase)
+		fees = append(fees, int64(txMeta.Fee))
+		sizes = append(sizes, int64(txMeta.SizeInBytes))
+		coinbases = append(coinbases, isCoinbase)
 		rawTxs = append(rawTxs, item.tx.ExtendedBytes())
 		lockeds = append(lockeds, item.options.Locked)
-		conflictings = append(conflictings, false) // fast path excludes conflicting items
+		conflictings = append(conflictings, false)
 		frozens = append(frozens, item.options.Frozen)
 		unminedSinces = append(unminedSinces, int64(item.blockHeight))
 
-		for j := range p.outArrs.idx {
-			outTxHashes = append(outTxHashes, p.txHash[:])
-			outIdxs = append(outIdxs, p.outArrs.idx[j])
-			outLockingScripts = append(outLockingScripts, p.outArrs.lockingScript[j])
-			outSatoshis = append(outSatoshis, p.outArrs.satoshis[j])
-			outFrozens = append(outFrozens, p.outArrs.frozen[j])
-			outUtxoHashes = append(outUtxoHashes, p.outArrs.utxoHash[j])
-			outCoinbaseSpendingHeights = append(outCoinbaseSpendingHeights, p.outArrs.coinbaseSpendingHeight[j])
+		for j := range outArrs.idx {
+			outTxHashes = append(outTxHashes, txHash[:])
+			outIdxs = append(outIdxs, outArrs.idx[j])
+			outLockingScripts = append(outLockingScripts, outArrs.lockingScript[j])
+			outSatoshis = append(outSatoshis, outArrs.satoshis[j])
+			outFrozens = append(outFrozens, outArrs.frozen[j])
+			outUtxoHashes = append(outUtxoHashes, outArrs.utxoHash[j])
+			outCoinbaseSpendingHeights = append(outCoinbaseSpendingHeights, outArrs.coinbaseSpendingHeight[j])
 		}
+	}
+
+	if len(hashes) == 0 {
+		return
 	}
 
 	failAll := func(err error) {
-		for _, i := range idxs {
-			batch[i].done <- batchCreateResult{Err: err}
+		for i, item := range batch {
+			if valid[i] {
+				item.done <- batchCreateResult{Err: err}
+			}
 		}
 	}
-
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		failAll(errors.NewStorageError("failed to acquire connection", err))
-		return
-	}
-	defer conn.Release()
 
 	pgxTx, err := conn.Begin(ctx)
 	if err != nil {
@@ -517,9 +468,11 @@ func (s *Store) sendCreateBatchUNNESTPartition(ctx context.Context, partition in
 		return
 	}
 
-	for _, i := range idxs {
+	for i, item := range batch {
+		if !valid[i] {
+			continue
+		}
 		p := &prepared[i]
-		item := batch[i]
 		if _, wasNew := newHashSet[*p.txHash]; wasNew {
 			result := s.buildCreateMeta(p.txMeta, item.options, p.isCoinbase, item.blockHeight)
 			s.cache.Add(*p.txHash, result)
