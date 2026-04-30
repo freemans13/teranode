@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -216,15 +217,22 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 	defer conn.Release()
 
-	// Insert into txs.
+	// Direct partition addressing: compute the partition for this tx_hash on
+	// the Go side and target the child relation directly (txs_pK / outputs_pK).
+	// This skips the parent's planner-side partition fanout and lets ON
+	// CONFLICT (hash) work since each child has its own primary key.
+	rk := Route(txHash)
+	txsTable := "txs" + PartitionSuffix(rk.Partition)
+	outputsTable := "outputs" + PartitionSuffix(rk.Partition)
+
 	var insertedHash []byte
-	err = conn.QueryRow(ctx, `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+	err = conn.QueryRow(ctx, fmt.Sprintf(`
+		INSERT INTO %s (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`,
+		RETURNING hash`, txsTable),
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
@@ -237,15 +245,15 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		return nil, errors.NewStorageError("failed to create UTXO", err)
 	}
 
-	// Insert outputs via unnest.
+	// Insert outputs via unnest into the same partition.
 	if len(outArrs.idx) > 0 {
-		_, err = conn.Exec(ctx, `
-			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
 			SELECT $1, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
 			FROM UNNEST($2::bigint[], $3::bytea[], $4::bigint[],
 						$5::boolean[], $6::bytea[], $7::bigint[])
 				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh)
-			ON CONFLICT (tx_hash, idx) DO NOTHING`,
+			ON CONFLICT (tx_hash, idx) DO NOTHING`, outputsTable),
 			txHash[:],
 			outArrs.idx, outArrs.lockingScript, outArrs.satoshis,
 			outArrs.frozen, outArrs.utxoHash, outArrs.coinbaseSpendingHeight,
@@ -272,7 +280,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 // ---------------------------------------------------------------------------
 
 func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
-	// Single-item fast path: bypass COPY+staging overhead, use direct INSERT.
+	// Single-item fast path — direct INSERT into the partition.
 	if len(batch) == 1 {
 		item := batch[0]
 		result, err := s.createDirect(context.Background(), item.tx, item.blockHeight, item.options)
@@ -282,10 +290,10 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 
 	ctx := context.Background()
 
-	// Hot-path fast path: when no item carries MinedBlockInfos or Conflicting flags,
-	// skip the COPY+staging+merge pipeline and use two UNNEST'd INSERTs directly into
-	// the partitioned target tables. The validator hot path (Get→Spend→Create→Unlock)
-	// always lands here because it never sets those options on Create.
+	// Hot path: when no item carries MinedBlockInfos or Conflicting flags, use
+	// the partition-affinity UNNEST path. The validator hot path (Get →
+	// Spend → Create → Unlock) always lands here because it never sets those
+	// options on Create.
 	useUNNEST := true
 	for _, item := range batch {
 		if len(item.options.MinedBlockInfos) > 0 || item.options.Conflicting {
@@ -298,281 +306,31 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 		return
 	}
 
-	// Phase 1: Pre-compute all parameters (CPU only, no DB).
-	prepared := make([]preparedCreate, len(batch))
-	for i, item := range batch {
-		txMeta, err := util.TxMetaDataFromTx(item.tx)
-		if err != nil {
-			item.done <- batchCreateResult{Err: errors.NewProcessingError("failed to get tx meta data", err)}
-			continue
-		}
-
-		if item.options.Conflicting {
-			txMeta.Conflicting = true
-		}
-		if item.options.Locked {
-			txMeta.Locked = true
-		}
-
-		var unminedSince interface{}
-		if len(item.options.MinedBlockInfos) == 0 {
-			unminedSince = int64(item.blockHeight)
-		}
-
-		var txHash *chainhash.Hash
-		if item.options.TxID != nil {
-			txHash = item.options.TxID
-		} else {
-			txHash = item.tx.TxIDChainHash()
-		}
-
-		isCoinbase := item.tx.IsCoinbase()
-		if item.options.IsCoinbase != nil {
-			isCoinbase = *item.options.IsCoinbase
-		}
-
-		rawTx := item.tx.ExtendedBytes()
-
-		var blockIDs, blkHeights, subtreeIdxs []int32
-		if len(item.options.MinedBlockInfos) > 0 {
-			blockIDs = make([]int32, len(item.options.MinedBlockInfos))
-			blkHeights = make([]int32, len(item.options.MinedBlockInfos))
-			subtreeIdxs = make([]int32, len(item.options.MinedBlockInfos))
-			for j, info := range item.options.MinedBlockInfos {
-				blockIDs[j] = int32(info.BlockID)
-				blkHeights[j] = int32(info.BlockHeight)
-				subtreeIdxs[j] = int32(info.SubtreeIdx)
-			}
-		}
-
-		outArrs, err := buildOutputArrays(txHash, item.tx, isCoinbase, item.blockHeight, int(s.settings.ChainCfgParams.CoinbaseMaturity))
-		if err != nil {
-			item.done <- batchCreateResult{Err: err}
-			continue
-		}
-
-		prepared[i] = preparedCreate{
-			txHash:       txHash,
-			txMeta:       txMeta,
-			isCoinbase:   isCoinbase,
-			unminedSince: unminedSince,
-			rawTx:        rawTx,
-			blockIDs:     blockIDs,
-			blockHeights: blkHeights,
-			subtreeIdxs:  subtreeIdxs,
-			outArrs:      outArrs,
-		}
-	}
-
-	// Collect valid items (those without prep errors).
-	validIndices := make([]int, 0, len(batch))
-	for i := range batch {
-		if prepared[i].txHash != nil {
-			validIndices = append(validIndices, i)
-		}
-	}
-	if len(validIndices) == 0 {
-		return
-	}
-
-	// Phase 2: Acquire one pgx connection and use COPY + INSERT...SELECT.
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		for _, idx := range validIndices {
-			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to acquire connection", err)}
-		}
-		return
-	}
-	defer conn.Release()
-
-	// Ensure staging tables exist on this connection.
-	_, err = conn.Exec(ctx, createStagingTablesSQL)
-	if err != nil {
-		for _, idx := range validIndices {
-			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to create staging tables", err)}
-		}
-		return
-	}
-
-	// COPY tx rows into staging_txs.
-	txCols := []string{
-		"hash", "version", "lock_time", "fee", "size_in_bytes", "coinbase", "raw_tx",
-		"locked", "conflicting", "frozen", "unmined_since",
-		"delete_at_height", "preserve_until",
-		"block_ids", "block_heights", "subtree_idxs", "conflicting_children",
-		"inserted_at",
-	}
-	txSource := &copyRowSource{
-		rows: make([][]interface{}, 0, len(validIndices)),
-	}
-	for _, idx := range validIndices {
-		p := &prepared[idx]
-		item := batch[idx]
-		txSource.rows = append(txSource.rows, []interface{}{
-			p.txHash[:], int64(item.tx.Version), int64(item.tx.LockTime),
-			int64(p.txMeta.Fee), int64(p.txMeta.SizeInBytes), p.isCoinbase, p.rawTx,
-			item.options.Locked, item.options.Conflicting,
-			item.options.Frozen, p.unminedSince,
-			nil, nil, // delete_at_height, preserve_until
-			p.blockIDs, p.blockHeights, p.subtreeIdxs,
-			[][]byte(nil), // conflicting_children
-			time.Now(),    // inserted_at
-		})
-	}
-
-	// BEGIN transaction first — all COPY + INSERT...SELECT in one transaction.
-	// This prevents ON COMMIT DELETE ROWS from clearing staging data between COPY and INSERT.
-	pgxTx, err := conn.Begin(ctx)
-	if err != nil {
-		for _, idx := range validIndices {
-			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to begin transaction", err)}
-		}
-		return
-	}
-	defer pgxTx.Rollback(ctx) //nolint:errcheck
-
-	// COPY tx rows into staging_txs within the transaction.
-	_, err = pgxTx.Conn().CopyFrom(ctx, pgx.Identifier{"staging_txs"}, txCols, txSource)
-	if err != nil {
-		for _, idx := range validIndices {
-			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to COPY txs to staging", err)}
-		}
-		return
-	}
-
-	// COPY output rows into staging_outputs within the transaction.
-	outCols := []string{
-		"tx_hash", "idx", "locking_script", "satoshis", "utxo_hash",
-		"coinbase_spending_height", "frozen", "spendable_in",
-	}
-	outSource := &copyRowSource{
-		rows: make([][]interface{}, 0, len(validIndices)*3),
-	}
-	for _, idx := range validIndices {
-		p := &prepared[idx]
-		for j := range p.outArrs.idx {
-			outSource.rows = append(outSource.rows, []interface{}{
-				p.txHash[:], p.outArrs.idx[j], p.outArrs.lockingScript[j],
-				p.outArrs.satoshis[j], p.outArrs.utxoHash[j],
-				p.outArrs.coinbaseSpendingHeight[j], p.outArrs.frozen[j],
-				nil, // spendable_in
-			})
-		}
-	}
-
-	if len(outSource.rows) > 0 {
-		_, err = pgxTx.Conn().CopyFrom(ctx, pgx.Identifier{"staging_outputs"}, outCols, outSource)
-		if err != nil {
-			for _, idx := range validIndices {
-				batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to COPY outputs to staging", err)}
-			}
-			return
-		}
-	}
-
-	// INSERT from staging into final tables and get back which were new.
-	rows, err := pgxTx.Query(ctx, `
-		INSERT INTO txs SELECT * FROM staging_txs ON CONFLICT (hash) DO NOTHING RETURNING hash
-	`)
-	if err != nil {
-		for _, idx := range validIndices {
-			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to INSERT txs from staging", err)}
-		}
-		return
-	}
-
-	newHashSet := make(map[chainhash.Hash]struct{})
-	for rows.Next() {
-		var hashBytes []byte
-		if scanErr := rows.Scan(&hashBytes); scanErr != nil {
-			rows.Close()
-			for _, idx := range validIndices {
-				batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to scan inserted hash", scanErr)}
-			}
-			return
-		}
-		var h chainhash.Hash
-		copy(h[:], hashBytes)
-		newHashSet[h] = struct{}{}
-	}
-	rows.Close()
-
-	// INSERT outputs.
-	_, err = pgxTx.Exec(ctx, `
-		INSERT INTO outputs SELECT * FROM staging_outputs ON CONFLICT (tx_hash, idx) DO NOTHING
-	`)
-	if err != nil {
-		for _, idx := range validIndices {
-			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to INSERT outputs from staging", err)}
-		}
-		return
-	}
-
-	if err = pgxTx.Commit(ctx); err != nil {
-		for _, idx := range validIndices {
-			batch[idx].done <- batchCreateResult{Err: errors.NewStorageError("failed to commit create batch", err)}
-		}
-		return
-	}
-
-	// Signal callers.
-	for _, idx := range validIndices {
-		p := &prepared[idx]
-		_, wasNew := newHashSet[*p.txHash]
-		if wasNew {
-			result := s.buildCreateMeta(p.txMeta, batch[idx].options, p.isCoinbase, batch[idx].blockHeight)
-			s.cache.Add(*p.txHash, result)
-			batch[idx].done <- batchCreateResult{Data: result}
-		} else {
-			batch[idx].done <- batchCreateResult{
-				Err: errors.NewTxExistsError("transaction already exists (coinbase=%v):", p.isCoinbase),
-			}
-		}
-	}
-
-	// Phase 3: Handle conflicting children (rare path — separate round-trips only when needed).
-	for _, idx := range validIndices {
-		p := &prepared[idx]
-		if p.txMeta != nil && p.txMeta.Conflicting {
-			if _, wasNew := newHashSet[*p.txHash]; wasNew {
-				if conflictErr := s.insertConflictingChildrenDirect(ctx, conn, p.txHash, batch[idx].tx); conflictErr != nil {
-					s.logger.Warnf("[sendCreateBatch] failed to insert conflicting children for %x: %v", p.txHash[:], conflictErr)
-				}
-			}
-		}
+	// Fallback: items with MinedBlockInfos / Conflicting (rare path during
+	// initial sync of already-mined txs) — fall back to per-item createDirect.
+	// Slower than the old COPY+staging path but always correct against the
+	// list-partitioned schema, and not on the validator hot path.
+	for _, item := range batch {
+		result, err := s.createDirect(ctx, item.tx, item.blockHeight, item.options)
+		item.done <- batchCreateResult{Data: result, Err: err}
 	}
 }
 
 // ---------------------------------------------------------------------------
-// sendCreateBatchUNNEST — direct INSERT…SELECT FROM UNNEST hot path.
-// No staging tables, no COPY protocol, no merge step. Used when all items in
-// the batch are simple validator-path Creates (no MinedBlockInfos, no
-// Conflicting). Atomicity preserved by wrapping both INSERTs in a transaction.
+// sendCreateBatchUNNEST — partition-affinity UNNEST hot path.
+//
+// Buckets the batch by RouteKey.Partition and dispatches one goroutine per
+// non-empty partition. Each goroutine acquires its own connection, BEGINs a
+// transaction, and runs two UNNEST'd INSERTs against `txs_pK` and
+// `outputs_pK` directly (no parent-table planning, no partition fanout). All
+// goroutines run concurrently — multiple Postgres backends commit to
+// different relfilenodes in parallel.
 // ---------------------------------------------------------------------------
 func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateItem) {
-	n := len(batch)
-	hashes := make([][]byte, 0, n)
-	versions := make([]int64, 0, n)
-	lockTimes := make([]int64, 0, n)
-	fees := make([]int64, 0, n)
-	sizes := make([]int64, 0, n)
-	coinbases := make([]bool, 0, n)
-	rawTxs := make([][]byte, 0, n)
-	lockeds := make([]bool, 0, n)
-	conflictings := make([]bool, 0, n)
-	frozens := make([]bool, 0, n)
-	unminedSinces := make([]int64, 0, n)
-
-	prepared := make([]preparedCreate, n)
-	valid := make([]bool, n)
-
-	var outTxHashes [][]byte
-	var outIdxs []int64
-	var outLockingScripts [][]byte
-	var outSatoshis []int64
-	var outFrozens []bool
-	var outUtxoHashes [][]byte
-	var outCoinbaseSpendingHeights []int64
+	prepared := make([]preparedCreate, len(batch))
+	valid := make([]bool, len(batch))
+	// Bucket of original-batch indices per partition.
+	buckets := make([][]int, NumPartitions)
 
 	for i, item := range batch {
 		txMeta, err := util.TxMetaDataFromTx(item.tx)
@@ -609,58 +367,102 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			outArrs:    outArrs,
 		}
 		valid[i] = true
+		rk := Route(txHash)
+		buckets[rk.Partition] = append(buckets[rk.Partition], i)
+	}
 
-		hashes = append(hashes, txHash[:])
+	// Dispatch one goroutine per non-empty partition.
+	var wg sync.WaitGroup
+	for partition := 0; partition < NumPartitions; partition++ {
+		idxs := buckets[partition]
+		if len(idxs) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(partition int, idxs []int) {
+			defer wg.Done()
+			s.sendCreateBatchUNNESTPartition(ctx, partition, batch, prepared, idxs)
+		}(partition, idxs)
+	}
+	wg.Wait()
+}
+
+// sendCreateBatchUNNESTPartition runs the UNNEST INSERT pair (txs + outputs)
+// for one partition's worth of items, on its own connection inside one
+// transaction. All txs in `idxs` route to `partition`.
+func (s *Store) sendCreateBatchUNNESTPartition(ctx context.Context, partition int, batch []*batchCreateItem, prepared []preparedCreate, idxs []int) {
+	txsTable := "txs" + PartitionSuffix(partition)
+	outputsTable := "outputs" + PartitionSuffix(partition)
+
+	n := len(idxs)
+	hashes := make([][]byte, 0, n)
+	versions := make([]int64, 0, n)
+	lockTimes := make([]int64, 0, n)
+	fees := make([]int64, 0, n)
+	sizes := make([]int64, 0, n)
+	coinbases := make([]bool, 0, n)
+	rawTxs := make([][]byte, 0, n)
+	lockeds := make([]bool, 0, n)
+	conflictings := make([]bool, 0, n)
+	frozens := make([]bool, 0, n)
+	unminedSinces := make([]int64, 0, n)
+
+	var outTxHashes [][]byte
+	var outIdxs []int64
+	var outLockingScripts [][]byte
+	var outSatoshis []int64
+	var outFrozens []bool
+	var outUtxoHashes [][]byte
+	var outCoinbaseSpendingHeights []int64
+
+	for _, i := range idxs {
+		p := &prepared[i]
+		item := batch[i]
+		hashes = append(hashes, p.txHash[:])
 		versions = append(versions, int64(item.tx.Version))
 		lockTimes = append(lockTimes, int64(item.tx.LockTime))
-		fees = append(fees, int64(txMeta.Fee))
-		sizes = append(sizes, int64(txMeta.SizeInBytes))
-		coinbases = append(coinbases, isCoinbase)
+		fees = append(fees, int64(p.txMeta.Fee))
+		sizes = append(sizes, int64(p.txMeta.SizeInBytes))
+		coinbases = append(coinbases, p.isCoinbase)
 		rawTxs = append(rawTxs, item.tx.ExtendedBytes())
 		lockeds = append(lockeds, item.options.Locked)
 		conflictings = append(conflictings, false) // fast path excludes conflicting items
 		frozens = append(frozens, item.options.Frozen)
 		unminedSinces = append(unminedSinces, int64(item.blockHeight))
 
-		for j := range outArrs.idx {
-			outTxHashes = append(outTxHashes, txHash[:])
-			outIdxs = append(outIdxs, outArrs.idx[j])
-			outLockingScripts = append(outLockingScripts, outArrs.lockingScript[j])
-			outSatoshis = append(outSatoshis, outArrs.satoshis[j])
-			outFrozens = append(outFrozens, outArrs.frozen[j])
-			outUtxoHashes = append(outUtxoHashes, outArrs.utxoHash[j])
-			outCoinbaseSpendingHeights = append(outCoinbaseSpendingHeights, outArrs.coinbaseSpendingHeight[j])
+		for j := range p.outArrs.idx {
+			outTxHashes = append(outTxHashes, p.txHash[:])
+			outIdxs = append(outIdxs, p.outArrs.idx[j])
+			outLockingScripts = append(outLockingScripts, p.outArrs.lockingScript[j])
+			outSatoshis = append(outSatoshis, p.outArrs.satoshis[j])
+			outFrozens = append(outFrozens, p.outArrs.frozen[j])
+			outUtxoHashes = append(outUtxoHashes, p.outArrs.utxoHash[j])
+			outCoinbaseSpendingHeights = append(outCoinbaseSpendingHeights, p.outArrs.coinbaseSpendingHeight[j])
 		}
 	}
 
-	if len(hashes) == 0 {
-		return
+	failAll := func(err error) {
+		for _, i := range idxs {
+			batch[i].done <- batchCreateResult{Err: err}
+		}
 	}
 
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		for i, item := range batch {
-			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to acquire connection", err)}
-			}
-		}
+		failAll(errors.NewStorageError("failed to acquire connection", err))
 		return
 	}
 	defer conn.Release()
 
 	pgxTx, err := conn.Begin(ctx)
 	if err != nil {
-		for i, item := range batch {
-			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to begin transaction", err)}
-			}
-		}
+		failAll(errors.NewStorageError("failed to begin transaction", err))
 		return
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
-	rows, err := pgxTx.Query(ctx, `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+	rows, err := pgxTx.Query(ctx, fmt.Sprintf(`
+		INSERT INTO %s (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since)
 		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 		       u.locked, u.conflicting, u.frozen, u.unmined_since
@@ -670,16 +472,12 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 		          locked, conflicting, frozen, unmined_since)
 		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`,
+		RETURNING hash`, txsTable),
 		hashes, versions, lockTimes, fees, sizes, coinbases, rawTxs,
 		lockeds, conflictings, frozens, unminedSinces,
 	)
 	if err != nil {
-		for i, item := range batch {
-			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to INSERT txs via UNNEST", err)}
-			}
-		}
+		failAll(errors.NewStorageError("failed to INSERT txs via UNNEST", err))
 		return
 	}
 
@@ -688,11 +486,7 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		var hashBytes []byte
 		if scanErr := rows.Scan(&hashBytes); scanErr != nil {
 			rows.Close()
-			for i, item := range batch {
-				if valid[i] {
-					item.done <- batchCreateResult{Err: errors.NewStorageError("failed to scan inserted hash", scanErr)}
-				}
-			}
+			failAll(errors.NewStorageError("failed to scan inserted hash", scanErr))
 			return
 		}
 		var h chainhash.Hash
@@ -702,40 +496,30 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	rows.Close()
 
 	if len(outTxHashes) > 0 {
-		_, err = pgxTx.Exec(ctx, `
-			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
+		_, err = pgxTx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
 			SELECT u.tx_hash, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
 			FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
 			            $5::boolean[], $6::bytea[], $7::bigint[])
 			     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh)
-			ON CONFLICT (tx_hash, idx) DO NOTHING`,
+			ON CONFLICT (tx_hash, idx) DO NOTHING`, outputsTable),
 			outTxHashes, outIdxs, outLockingScripts, outSatoshis,
 			outFrozens, outUtxoHashes, outCoinbaseSpendingHeights,
 		)
 		if err != nil {
-			for i, item := range batch {
-				if valid[i] {
-					item.done <- batchCreateResult{Err: errors.NewStorageError("failed to INSERT outputs via UNNEST", err)}
-				}
-			}
+			failAll(errors.NewStorageError("failed to INSERT outputs via UNNEST", err))
 			return
 		}
 	}
 
 	if err := pgxTx.Commit(ctx); err != nil {
-		for i, item := range batch {
-			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to commit create batch", err)}
-			}
-		}
+		failAll(errors.NewStorageError("failed to commit create batch", err))
 		return
 	}
 
-	for i, item := range batch {
-		if !valid[i] {
-			continue
-		}
+	for _, i := range idxs {
 		p := &prepared[i]
+		item := batch[i]
 		if _, wasNew := newHashSet[*p.txHash]; wasNew {
 			result := s.buildCreateMeta(p.txMeta, item.options, p.isCoinbase, item.blockHeight)
 			s.cache.Add(*p.txHash, result)
@@ -746,29 +530,6 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			}
 		}
 	}
-}
-
-// ---------------------------------------------------------------------------
-// copyRowSource implements pgx.CopyFromSource for bulk COPY operations.
-// ---------------------------------------------------------------------------
-
-type copyRowSource struct {
-	rows [][]interface{}
-	idx  int
-}
-
-func (c *copyRowSource) Next() bool {
-	return c.idx < len(c.rows)
-}
-
-func (c *copyRowSource) Values() ([]interface{}, error) {
-	row := c.rows[c.idx]
-	c.idx++
-	return row, nil
-}
-
-func (c *copyRowSource) Err() error {
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -795,8 +556,9 @@ func (s *Store) buildCreateMeta(txMeta *meta.Data, options *utxo.CreateOptions, 
 	return txMeta
 }
 
-// insertConflictingChildrenDirect updates the parent txs rows to append this child
-// to their conflicting_children array.
+// insertConflictingChildrenDirect updates each parent tx row to append this
+// child to its conflicting_children array. Targets the parent's partition
+// directly so the UPDATE only touches one relation per parent.
 func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpool.Conn, childTxHash *chainhash.Hash, tx *bt.Tx) error {
 	seen := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
 
@@ -807,9 +569,10 @@ func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpo
 		}
 		seen[parentHash] = struct{}{}
 
-		_, err := conn.Exec(ctx, `
-			UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
-			WHERE hash = $1`,
+		rk := Route(&parentHash)
+		_, err := conn.Exec(ctx, fmt.Sprintf(`
+			UPDATE txs%s SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
+			WHERE hash = $1`, PartitionSuffix(rk.Partition)),
 			parentHash[:], [][]byte{childTxHash[:]},
 		)
 		if err != nil {

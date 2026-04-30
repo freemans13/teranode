@@ -102,7 +102,7 @@ func TestSchemaCreation(t *testing.T) {
 			WHERE parent.relname = $1
 		`, table).Scan(&partCount)
 		require.NoError(t, err, "should be able to count partitions for %s", table)
-		require.Equal(t, numPartitions, partCount, "table %s should have %d partitions", table, numPartitions)
+		require.Equal(t, NumPartitions, partCount, "table %s should have %d partitions", table, NumPartitions)
 	}
 
 	// Verify txs partial indexes exist.
