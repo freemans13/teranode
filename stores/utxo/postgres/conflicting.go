@@ -159,16 +159,16 @@ type batchUnlockItem struct {
 	done chan error
 }
 
-// runUnlockBatch is the per-partition Unlock worker callback. All items
-// in `batch` route to `partition`. Single bulk UPDATE on `txs_pK` against
-// the worker's held connection.
-func (s *Store) runUnlockBatch(conn *pgxpool.Conn, partition int, batch []*batchUnlockItem) {
+// runUnlockBatch is the per-shard Unlock worker callback. Single bulk
+// UPDATE on the `txs` parent table against the worker's held connection;
+// postgres prunes per-partition itself from the hash-keyed WHERE clause.
+func (s *Store) runUnlockBatch(conn *pgxpool.Conn, batch []*batchUnlockItem) {
 	ctx := context.Background()
 	hashBytes := make([][]byte, len(batch))
 	for i, item := range batch {
 		hashBytes[i] = item.hash[:]
 	}
-	q := fmt.Sprintf(`UPDATE txs%s SET locked = false WHERE hash = ANY($1)`, PartitionSuffix(partition))
+	const q = `UPDATE txs SET locked = false WHERE hash = ANY($1)`
 	if _, err := conn.Exec(ctx, q, hashBytes); err != nil {
 		e := errors.NewStorageError("[Unlock] bulk update: %v", err)
 		for _, item := range batch {
@@ -190,11 +190,11 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		return nil
 	}
 
-	// Single-hash unlock → route to its partition's worker.
+	// Single-hash unlock → route to its shard's worker.
 	if s.workersStarted() && !setValue && len(txHashes) == 1 {
 		done := make(chan error, 1)
 		rk := Route(&txHashes[0])
-		s.unlockSlots[rk.Shard][rk.Partition].input <- &batchUnlockItem{hash: txHashes[0], done: done}
+		s.unlockSlots[rk.Shard].input <- &batchUnlockItem{hash: txHashes[0], done: done}
 		select {
 		case err := <-done:
 			return err

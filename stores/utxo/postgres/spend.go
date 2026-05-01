@@ -3,7 +3,6 @@ package postgres
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -29,32 +28,31 @@ type batchSpendItem struct {
 }
 
 // ---------------------------------------------------------------------------
-// Direct-mode SQL (used when batcher is not active)
-// ---------------------------------------------------------------------------
-
-// spendValidationSQL templates: one cached string per partition, all
-// references to outputs/txs/spends substituted with the partition's child
-// table (e.g. outputs_p03). Each Spend call computes its target partition
-// from prev_tx_hash and uses the matching template — the resulting query
-// touches exactly one partition's relations, so the planner doesn't fan out
-// over the whole tree and LockManager only acquires one partition's locks.
+// SQL — targets parent tables; postgres prunes partitions itself given the
+// hash-keyed WHERE clause.
 //
 // $8 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH branch.
-var spendValidationSQLByPartition = func() [NumPartitions]string {
-	const tmpl = `
+// ---------------------------------------------------------------------------
+
+const spendValidationSQL = `
 WITH validation AS (
     SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
            o.coinbase_spending_height,
            t.locked AS tx_locked, t.conflicting AS tx_conflicting,
            t.frozen AS tx_frozen,
            sp.spending_data AS existing_spend
-    FROM outputs%[1]s o
-    JOIN txs%[1]s t ON t.hash = o.tx_hash
-    LEFT JOIN spends%[1]s sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+    FROM outputs o
+    JOIN txs t ON t.hash = o.tx_hash
+    LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
     WHERE o.tx_hash = $1 AND o.idx = $2
 ),
 inserted AS (
-    INSERT INTO spends%[1]s (prev_tx_hash, prev_output_idx, spending_data)
+    -- ON CONFLICT can't target a partitioned parent (no parent-level
+    -- unique constraint); the validation CTE existing_spend IS NULL
+    -- predicate filters duplicates at the snapshot, and within-shard
+    -- serialization (one worker per shard, one held connection) prevents
+    -- a concurrent insert racing this statement for the same UTXO.
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
     SELECT $1, $2, $3
     FROM validation v
     WHERE v.existing_spend IS NULL
@@ -64,50 +62,35 @@ inserted AS (
       AND ($7 OR NOT v.tx_conflicting)
       AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
       AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
-    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
     RETURNING prev_tx_hash
 ),
 dah_upd AS (
-    UPDATE txs%[1]s t SET delete_at_height = $8
+    UPDATE txs t SET delete_at_height = $8
     FROM inserted i
     WHERE $8 > 0
       AND t.hash = i.prev_tx_hash
       AND t.preserve_until IS NULL
       AND t.unmined_since IS NULL
       AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
-      AND (SELECT count(*) FROM spends%[1]s s WHERE s.prev_tx_hash = t.hash) + 1
-          = (SELECT count(*) FROM outputs%[1]s o WHERE o.tx_hash = t.hash)
+      AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + 1
+          = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
       AND (t.delete_at_height IS NULL OR t.delete_at_height < $8)
     RETURNING 1
 )
 SELECT 1 FROM inserted
 `
-	var out [NumPartitions]string
-	for k := 0; k < NumPartitions; k++ {
-		out[k] = fmt.Sprintf(tmpl, PartitionSuffix(k))
-	}
-	return out
-}()
 
-// spendDiagnosticSQL templates per partition.
-var spendDiagnosticSQLByPartition = func() [NumPartitions]string {
-	const tmpl = `
+const spendDiagnosticSQL = `
 SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
        o.coinbase_spending_height,
        t.locked AS tx_locked, t.conflicting AS tx_conflicting,
        t.frozen AS tx_frozen,
        sp.spending_data AS existing_spend
-FROM outputs%[1]s o
-JOIN txs%[1]s t ON t.hash = o.tx_hash
-LEFT JOIN spends%[1]s sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+FROM outputs o
+JOIN txs t ON t.hash = o.tx_hash
+LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
 WHERE o.tx_hash = $1 AND o.idx = $2
 `
-	var out [NumPartitions]string
-	for k := 0; k < NumPartitions; k++ {
-		out[k] = fmt.Sprintf(tmpl, PartitionSuffix(k))
-	}
-	return out
-}()
 
 // ---------------------------------------------------------------------------
 // Spend — public API
@@ -165,7 +148,7 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 			ignoreLocked:      ignoreLocked,
 		}
 		rk := Route(spend.TxID)
-		s.spendSlots[rk.Shard][rk.Partition].input <- item
+		s.spendSlots[rk.Shard].input <- item
 	}
 
 	// Wait for all results.
@@ -231,10 +214,10 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 		spendingDataBytes := spend.SpendingData.Bytes()
 		inputStart := time.Now()
 
-		// Try the atomic INSERT with validation CTE — partition-routed.
-		rk := Route(spend.TxID)
+		// Atomic INSERT with validation CTE on parent tables — postgres
+		// prunes the partition itself from `o.tx_hash = $1` and friends.
 		var inserted int
-		err := s.pool.QueryRow(ctx, spendValidationSQLByPartition[rk.Partition],
+		err := s.pool.QueryRow(ctx, spendValidationSQL,
 			spend.TxID[:],      // $1 prev_tx_hash
 			spend.Vout,         // $2 prev_output_idx
 			spendingDataBytes,  // $3 spending_data
@@ -301,11 +284,13 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 }
 
 // ---------------------------------------------------------------------------
-// runSpendBatch — per-partition Spend worker callback. The worker holds a
-// pgxpool connection for life and dispatches partition-scoped bulk Spend
-// queries against outputs_pK ⋈ txs_pK ⋈ spends_pK only.
+// runSpendBatch — per-shard Spend worker callback. The worker holds a
+// pgxpool connection for life and dispatches bulk Spend queries on the
+// parent tables; postgres prunes per-partition itself from the
+// hash-keyed JOIN/WHERE clauses. All items in `batch` were routed by
+// prev_tx_hash to this shard, so the planner can reuse the cached plan.
 // ---------------------------------------------------------------------------
-func (s *Store) runSpendBatch(conn *pgxpool.Conn, partition int, batch []*batchSpendItem) {
+func (s *Store) runSpendBatch(conn *pgxpool.Conn, batch []*batchSpendItem) {
 	ctx := context.Background()
 	newDAH := s.newDAHOrZero()
 
@@ -313,7 +298,7 @@ func (s *Store) runSpendBatch(conn *pgxpool.Conn, partition int, batch []*batchS
 	if len(batch) == 1 {
 		item := batch[0]
 		var inserted int
-		err := conn.QueryRow(ctx, spendValidationSQLByPartition[partition],
+		err := conn.QueryRow(ctx, spendValidationSQL,
 			item.spend.TxID[:], item.spend.Vout,
 			item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
 			int64(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
@@ -327,7 +312,7 @@ func (s *Store) runSpendBatch(conn *pgxpool.Conn, partition int, batch []*batchS
 			item.errCh <- errors.NewStorageError("[Spend] query failed for %s:%d: %v", item.spend.TxID, item.spend.Vout, err)
 			return
 		}
-		diagErr := s.diagnoseSpendFailureOnConn(ctx, conn, partition, item.spend, item.spend.SpendingData.Bytes(),
+		diagErr := s.diagnoseSpendFailureOnConn(ctx, conn, item.spend, item.spend.SpendingData.Bytes(),
 			item.blockHeight, item.ignoreLocked, item.ignoreConflicting)
 		if diagErr == nil {
 			item.errCh <- nil
@@ -357,7 +342,7 @@ func (s *Store) runSpendBatch(conn *pgxpool.Conn, partition int, batch []*batchS
 		batchIdxs[i] = int32(i)
 	}
 
-	rows, err := conn.Query(ctx, bulkSpendSQLByPartition[partition],
+	rows, err := conn.Query(ctx, bulkSpendSQL,
 		prevTxHashes, prevIdxs, spendingDatas, utxoHashes,
 		blockHeights, ignLockeds, ignConflictings, batchIdxs,
 		newDAH,
@@ -442,16 +427,13 @@ func (s *Store) runSpendBatch(conn *pgxpool.Conn, partition int, batch []*batchS
 	}
 }
 
-// bulkSpendSQL templates per partition. Each template's FROM/JOIN/INSERT/
-// UPDATE references are scoped to a single partition's child tables, so the
-// query touches outputs_pK ⋈ txs_pK ⋈ spends_pK and writes to spends_pK and
-// txs_pK — one relation per role per query. The Go-side caller buckets
-// inputs by RouteKey.Partition before dispatching, so each template only
-// ever sees rows whose prev_tx_hash lands in its own partition.
+// bulkSpendSQL — bulk validation+insert against parent tables. The
+// FROM/JOIN/INSERT/UPDATE references hit `outputs`, `txs`, and `spends`
+// directly; postgres prunes the relevant partitions itself from the
+// hash-keyed predicates.
 //
 // $9 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH UPDATE.
-var bulkSpendSQLByPartition = func() [NumPartitions]string {
-	const tmpl = `
+const bulkSpendSQL = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
            unnest($2::bigint[])  AS prev_idx,
@@ -470,9 +452,9 @@ validated AS (
            t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
            sp.spending_data AS existing_spend
     FROM items i
-    JOIN outputs%[1]s o ON o.tx_hash = i.prev_tx_hash AND o.idx = i.prev_idx
-    JOIN txs%[1]s t ON t.hash = i.prev_tx_hash
-    LEFT JOIN spends%[1]s sp ON sp.prev_tx_hash = i.prev_tx_hash AND sp.prev_output_idx = i.prev_idx
+    JOIN outputs o ON o.tx_hash = i.prev_tx_hash AND o.idx = i.prev_idx
+    JOIN txs t ON t.hash = i.prev_tx_hash
+    LEFT JOIN spends sp ON sp.prev_tx_hash = i.prev_tx_hash AND sp.prev_output_idx = i.prev_idx
 ),
 to_insert AS (
     SELECT prev_tx_hash, prev_idx, spending_data, batch_idx
@@ -486,9 +468,10 @@ to_insert AS (
       AND NOT (COALESCE(spendable_in, 0) > 0 AND block_height < COALESCE(spendable_in, 0))
 ),
 inserted AS (
-    INSERT INTO spends%[1]s (prev_tx_hash, prev_output_idx, spending_data)
+    -- See note in spendValidationSQL about ON CONFLICT and partitioned
+    -- parents. to_insert is already filtered by the validation CTE.
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
     SELECT prev_tx_hash, prev_idx, spending_data FROM to_insert
-    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
     RETURNING prev_tx_hash, prev_output_idx
 ),
 parents AS (
@@ -496,15 +479,15 @@ parents AS (
     FROM inserted GROUP BY prev_tx_hash
 ),
 dah_upd AS (
-    UPDATE txs%[1]s t SET delete_at_height = $9
+    UPDATE txs t SET delete_at_height = $9
     FROM parents p
     WHERE $9 > 0
       AND t.hash = p.tx_hash
       AND t.preserve_until IS NULL
       AND t.unmined_since IS NULL
       AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
-      AND (SELECT count(*) FROM spends%[1]s s WHERE s.prev_tx_hash = t.hash) + p.spent_in_batch
-          = (SELECT count(*) FROM outputs%[1]s o WHERE o.tx_hash = t.hash)
+      AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + p.spent_in_batch
+          = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
       AND (t.delete_at_height IS NULL OR t.delete_at_height < $9)
     RETURNING 1
 )
@@ -519,12 +502,6 @@ FROM validated v
 LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
 ORDER BY v.batch_idx
 `
-	var out [NumPartitions]string
-	for k := 0; k < NumPartitions; k++ {
-		out[k] = fmt.Sprintf(tmpl, PartitionSuffix(k))
-	}
-	return out
-}()
 
 // diagnoseSpendFailure queries the output + txs + spends to determine
 // why a spend INSERT failed. Pool-acquiring path used by spendDirect when
@@ -537,14 +514,13 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 		return errors.NewStorageError("[Spend] failed to acquire connection for diagnostic", err)
 	}
 	defer conn.Release()
-	rk := Route(spend.TxID)
-	return s.diagnoseSpendFailureOnConn(ctx, conn, rk.Partition, spend, spendingDataBytes,
+	return s.diagnoseSpendFailureOnConn(ctx, conn, spend, spendingDataBytes,
 		blockHeight, ignoreLocked, ignoreConflicting)
 }
 
 // diagnoseSpendFailureOnConn is the worker variant of diagnoseSpendFailure
 // that uses a held connection rather than s.pool.QueryRow.
-func (s *Store) diagnoseSpendFailureOnConn(ctx context.Context, conn *pgxpool.Conn, partition int,
+func (s *Store) diagnoseSpendFailureOnConn(ctx context.Context, conn *pgxpool.Conn,
 	spend *utxo.Spend, spendingDataBytes []byte, blockHeight uint32, ignoreLocked, ignoreConflicting bool) error {
 
 	var (
@@ -558,7 +534,7 @@ func (s *Store) diagnoseSpendFailureOnConn(ctx context.Context, conn *pgxpool.Co
 		existingSpendBytes     []byte
 	)
 
-	row := conn.QueryRow(ctx, spendDiagnosticSQLByPartition[partition], spend.TxID[:], spend.Vout)
+	row := conn.QueryRow(ctx, spendDiagnosticSQL, spend.TxID[:], spend.Vout)
 	err := row.Scan(&utxoHashBytes, &outputFrozen, &spendableIn,
 		&coinbaseSpendingHeight, &txLocked, &txConflicting, &txFrozen, &existingSpendBytes)
 

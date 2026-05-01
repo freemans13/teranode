@@ -4,31 +4,33 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 )
 
-// Two-layer routing for the UTXO store. Today the deployment has a single
-// postgres shard; the Shard field stays 0 and routing collapses to in-shard
-// partition selection. When the deployment grows to N shards the same code
-// dispatches by Shard first; only the destination resolution changes (one
-// pgxpool per shard instead of one pool total). Phase-1 commitment recorded
-// in the project memory.
+// Two-layer routing for the UTXO store. The Shard field is the key
+// abstraction: it picks which pgxpool (and ultimately which postgres
+// server) handles the item. Today NumShards=1 so it's a no-op at runtime,
+// but the dispatch shape is shard-ready: when the deployment grows to N
+// shards we just instantiate N pgxpools and the same Route() return drives
+// dispatch.
+//
+// The Partition field is informational only — it is NOT used for client
+// dispatch. Postgres prunes partitions itself via the schema's PARTITION
+// BY LIST declaration when the WHERE clause references the hash.
+// We keep the field on RouteKey so server-shard routing can be extended
+// without touching call sites.
 //
 // Disjoint bytes of tx_hash are used for the two layers so they don't
-// correlate: byte 0 reserved for future shard routing, byte 1 for in-shard
-// partition routing. With NumShards=1 today, byte 0 is unused at runtime but
-// the code path is the same.
+// correlate: byte 0 → shard, byte 1 → in-shard partition.
 
 const (
-	// NumShards is the number of independent dispatch pipelines within the
-	// Store. Each shard has its own set of batchers and partition workers
-	// (NumPartitions × WorkersPerPartition), feeding off the same pgxpool.
-	// Items are routed to a shard by byte 0 of tx_hash. With NumShards = N,
-	// total partition workers in one Store = 4 ops × N × NumPartitions.
-	// Future work: each shard could connect to its own postgres server for
-	// horizontal scale-out; today they all share one pool.
+	// NumShards is the number of independent dispatch pipelines (and,
+	// future, postgres servers) within the Store. Each shard has its own
+	// per-op slot feeding off the shard's pgxpool. Items route to a shard
+	// by byte 0 of tx_hash. Total slots = NumShards × 4 ops.
 	NumShards = 1
 
-	// NumPartitions is the number of partitions per shard. Must match the
-	// schema's PARTITION BY LIST modulus. The generated partition column on
-	// each table is `(get_byte(<key>, 1) % NumPartitions)`.
+	// NumPartitions is the schema-side partition count — must match the
+	// modulus in the schema's PARTITION BY LIST expression
+	// `(get_byte(<key>, 1) % NumPartitions)`. Used by schema.go to spawn
+	// child tables; not used for client-side dispatch.
 	NumPartitions = 8
 )
 

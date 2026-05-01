@@ -43,15 +43,15 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 		bins = requestedFields
 	}
 
-	// Use partition workers for simple metadata-only gets (BlockIDs,
+	// Use shard workers for simple metadata-only gets (BlockIDs,
 	// BlockHeights — no Tx body). The item is routed to its hash's
-	// partition; that worker batches and dispatches on its owned connection.
+	// shard; that worker batches and dispatches on its owned connection.
 	if s.workersStarted() && !contains(bins, fields.Tx) && !contains(bins, fields.Outputs) &&
 		!contains(bins, fields.Utxos) && !contains(bins, fields.TxInpoints) && !contains(bins, fields.Inputs) {
 		done := make(chan batchGetResult, 1)
 		item := &batchGetItem{hash: hash, bins: bins, done: done}
 		rk := Route(hash)
-		s.getSlots[rk.Shard][rk.Partition].input <- item
+		s.getSlots[rk.Shard].input <- item
 		select {
 		case result := <-done:
 			return result.Data, result.Err
@@ -63,17 +63,18 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 	return s.getInternal(ctx, hash, bins)
 }
 
-// runGetBatch is the per-partition Get worker callback. All items in the
-// batch route to `partition`; the worker has its own pgxpool connection
-// already held. Pipelines the SELECTs against `txs_pK` via pgx SendBatch.
-func (s *Store) runGetBatch(conn *pgxpool.Conn, partition int, batch []*batchGetItem) {
+// runGetBatch is the per-shard Get worker callback. The worker has its
+// own pgxpool connection already held. Pipelines the SELECTs against the
+// `txs` parent table via pgx SendBatch — postgres prunes the partition
+// itself given the hash-keyed WHERE clause.
+func (s *Store) runGetBatch(conn *pgxpool.Conn, batch []*batchGetItem) {
 	ctx := context.Background()
 
-	q := fmt.Sprintf(`
+	const q = `
 		SELECT version, lock_time, fee, size_in_bytes, coinbase,
 		       locked, conflicting, frozen, unmined_since,
 		       block_ids, block_heights, subtree_idxs
-		FROM txs%s WHERE hash = $1`, PartitionSuffix(partition))
+		FROM txs WHERE hash = $1`
 
 	pgxBatch := &pgx.Batch{}
 	for _, item := range batch {
