@@ -77,25 +77,27 @@ type Store struct {
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
 
-	// Per-(op × partition) slots. Each slot owns one shared input channel
-	// and WorkersPerPartition goroutines (each holding its own pgxpool
-	// connection for life). Items routed to a slot land in the shared
-	// channel; whichever worker is free picks them up. Nil until Start().
-	createSlots [NumPartitions]*partitionSlot[*batchCreateItem]
-	spendSlots  [NumPartitions]*partitionSlot[*batchSpendItem]
-	getSlots    [NumPartitions]*partitionSlot[*batchGetItem]
-	unlockSlots [NumPartitions]*partitionSlot[*batchUnlockItem]
+	// Per-(shard × op × partition) slots. Each slot is one independent
+	// pipeline: shared input channel + WorkersPerPartition goroutines, each
+	// holding its own pgxpool connection. Items are routed to a shard by
+	// byte 0 of tx_hash, then to a partition by byte 1.
+	// Total slots = NumShards × 4 ops × NumPartitions.
+	// Total workers = NumShards × 4 × NumPartitions × WorkersPerPartition.
+	createSlots [NumShards][NumPartitions]*partitionSlot[*batchCreateItem]
+	spendSlots  [NumShards][NumPartitions]*partitionSlot[*batchSpendItem]
+	getSlots    [NumShards][NumPartitions]*partitionSlot[*batchGetItem]
+	unlockSlots [NumShards][NumPartitions]*partitionSlot[*batchUnlockItem]
 	workersWG   sync.WaitGroup
 
 	// in-process cache for recently created transactions.
 	cache *txCache
 }
 
-// workersStarted reports whether the per-partition slot grid is up.
+// workersStarted reports whether the per-shard × per-partition slot grid is up.
 // Public-API methods (Get, Spend, Create, SetLocked) check this to decide
 // whether to dispatch through workers or fall back to direct paths.
 func (s *Store) workersStarted() bool {
-	return s.getSlots[0] != nil
+	return s.getSlots[0][0] != nil
 }
 
 // New creates a new direct-write UTXO store.
@@ -108,11 +110,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
-	// Pool sized for 4 ops × NumPartitions × WorkersPerPartition concurrent
-	// long-held connections, plus a small headroom for stragglers and
-	// non-worker queries. Pre-warmed at startup so the dispatch path sees
-	// no connection-open latency.
-	poolSize := int32(4*NumPartitions*WorkersPerPartition + 32)
+	// Pool sized for NumShards × 4 ops × NumPartitions × WorkersPerPartition
+	// concurrent long-held connections, plus a small headroom. Pre-warmed at
+	// startup so the dispatch path sees no connection-open latency.
+	poolSize := int32(NumShards*4*NumPartitions*WorkersPerPartition + 32)
 	pgxConfig.MaxConns = poolSize
 	pgxConfig.MinConns = poolSize
 	pgxConfig.MaxConnIdleTime = 30 * time.Minute
@@ -194,56 +195,65 @@ func (s *Store) Start(ctx context.Context) {
 	// `<- input` under bursty load.
 	const inBuf = 4096
 
-	for p := 0; p < NumPartitions; p++ {
-		cs, err := newPartitionSlot[*batchCreateItem](ctx, s.logger, s.pool, p, WorkersPerPartition, perPartCreate, storeBatchDuration, inBuf, s.runCreateBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start create slot p=%d: %v", p, err)
-			continue
-		}
-		s.createSlots[p] = cs
+	// One slot grid per shard. Each shard is an independent pipeline; bench
+	// items routed to shard A do not touch shard B's batchers, partition
+	// workers, or in-flight queries. The dispatch callbacks (runCreateBatch
+	// etc.) take a partition argument; the shard dimension is implicit
+	// because each slot's items already belong to one shard.
+	for sh := 0; sh < NumShards; sh++ {
+		for p := 0; p < NumPartitions; p++ {
+			cs, err := newPartitionSlot[*batchCreateItem](ctx, s.logger, s.pool, p, WorkersPerPartition, perPartCreate, storeBatchDuration, inBuf, s.runCreateBatch, &s.workersWG)
+			if err != nil {
+				s.logger.Errorf("[Start] failed to start create slot sh=%d p=%d: %v", sh, p, err)
+				continue
+			}
+			s.createSlots[sh][p] = cs
 
-		ss, err := newPartitionSlot[*batchSpendItem](ctx, s.logger, s.pool, p, WorkersPerPartition, perPartSpend, spendBatchDuration, inBuf, s.runSpendBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start spend slot p=%d: %v", p, err)
-			continue
-		}
-		s.spendSlots[p] = ss
+			ss, err := newPartitionSlot[*batchSpendItem](ctx, s.logger, s.pool, p, WorkersPerPartition, perPartSpend, spendBatchDuration, inBuf, s.runSpendBatch, &s.workersWG)
+			if err != nil {
+				s.logger.Errorf("[Start] failed to start spend slot sh=%d p=%d: %v", sh, p, err)
+				continue
+			}
+			s.spendSlots[sh][p] = ss
 
-		gs, err := newPartitionSlot[*batchGetItem](ctx, s.logger, s.pool, p, WorkersPerPartition, perPartGet, storeBatchDuration, inBuf, s.runGetBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start get slot p=%d: %v", p, err)
-			continue
-		}
-		s.getSlots[p] = gs
+			gs, err := newPartitionSlot[*batchGetItem](ctx, s.logger, s.pool, p, WorkersPerPartition, perPartGet, storeBatchDuration, inBuf, s.runGetBatch, &s.workersWG)
+			if err != nil {
+				s.logger.Errorf("[Start] failed to start get slot sh=%d p=%d: %v", sh, p, err)
+				continue
+			}
+			s.getSlots[sh][p] = gs
 
-		us, err := newPartitionSlot[*batchUnlockItem](ctx, s.logger, s.pool, p, WorkersPerPartition, perPartUnlock, storeBatchDuration, inBuf, s.runUnlockBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start unlock slot p=%d: %v", p, err)
-			continue
+			us, err := newPartitionSlot[*batchUnlockItem](ctx, s.logger, s.pool, p, WorkersPerPartition, perPartUnlock, storeBatchDuration, inBuf, s.runUnlockBatch, &s.workersWG)
+			if err != nil {
+				s.logger.Errorf("[Start] failed to start unlock slot sh=%d p=%d: %v", sh, p, err)
+				continue
+			}
+			s.unlockSlots[sh][p] = us
 		}
-		s.unlockSlots[p] = us
 	}
 }
 
 // Stop signals all slot workers to exit and waits for them to drain &
 // release their connections, then closes the pool and DB.
 func (s *Store) Stop() {
-	for p := 0; p < NumPartitions; p++ {
-		if s.createSlots[p] != nil {
-			s.createSlots[p].Stop()
-			s.createSlots[p] = nil
-		}
-		if s.spendSlots[p] != nil {
-			s.spendSlots[p].Stop()
-			s.spendSlots[p] = nil
-		}
-		if s.getSlots[p] != nil {
-			s.getSlots[p].Stop()
-			s.getSlots[p] = nil
-		}
-		if s.unlockSlots[p] != nil {
-			s.unlockSlots[p].Stop()
-			s.unlockSlots[p] = nil
+	for sh := 0; sh < NumShards; sh++ {
+		for p := 0; p < NumPartitions; p++ {
+			if s.createSlots[sh][p] != nil {
+				s.createSlots[sh][p].Stop()
+				s.createSlots[sh][p] = nil
+			}
+			if s.spendSlots[sh][p] != nil {
+				s.spendSlots[sh][p].Stop()
+				s.spendSlots[sh][p] = nil
+			}
+			if s.getSlots[sh][p] != nil {
+				s.getSlots[sh][p].Stop()
+				s.getSlots[sh][p] = nil
+			}
+			if s.unlockSlots[sh][p] != nil {
+				s.unlockSlots[sh][p].Stop()
+				s.unlockSlots[sh][p] = nil
+			}
 		}
 	}
 	s.workersWG.Wait()

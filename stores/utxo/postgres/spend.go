@@ -165,7 +165,7 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 			ignoreLocked:      ignoreLocked,
 		}
 		rk := Route(spend.TxID)
-		s.spendSlots[rk.Partition].input <- item
+		s.spendSlots[rk.Shard][rk.Partition].input <- item
 	}
 
 	// Wait for all results.

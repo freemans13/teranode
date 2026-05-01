@@ -17,9 +17,13 @@ import (
 // the code path is the same.
 
 const (
-	// NumShards is the number of postgres servers the store is sharded across.
-	// 1 today; bump and supply per-shard pools when introducing horizontal
-	// sharding.
+	// NumShards is the number of independent dispatch pipelines within the
+	// Store. Each shard has its own set of batchers and partition workers
+	// (NumPartitions × WorkersPerPartition), feeding off the same pgxpool.
+	// Items are routed to a shard by byte 0 of tx_hash. With NumShards = N,
+	// total partition workers in one Store = 4 ops × N × NumPartitions.
+	// Future work: each shard could connect to its own postgres server for
+	// horizontal scale-out; today they all share one pool.
 	NumShards = 1
 
 	// NumPartitions is the number of partitions per shard. Must match the

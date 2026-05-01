@@ -150,7 +150,7 @@ func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32
 		txHash = tx.TxIDChainHash()
 	}
 	rk := Route(txHash)
-	s.createSlots[rk.Partition].input <- &batchCreateItem{
+	s.createSlots[rk.Shard][rk.Partition].input <- &batchCreateItem{
 		tx:          tx,
 		blockHeight: blockHeight,
 		options:     options,

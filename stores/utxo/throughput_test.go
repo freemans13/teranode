@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,7 +24,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const throughputDSN = "postgres://teranode:teranode@localhost:5432/teranode_test"
+// throughputDSN can be overridden via the THROUGHPUT_DSN env var. Used to
+// run two benches against separate databases simultaneously to disambiguate
+// bench-side vs system-side throughput limits.
+var throughputDSN = func() string {
+	if v := os.Getenv("THROUGHPUT_DSN"); v != "" {
+		return v
+	}
+	return "postgres://teranode:teranode@localhost:5432/teranode_test"
+}()
 
 func cleanDB(t *testing.T) {
 	t.Helper()
