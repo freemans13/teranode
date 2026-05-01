@@ -749,9 +749,12 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					stp.setCurrentRunningState(StateRunning)
 
 				case <-stp.announcementTicker.C:
-					// Periodically announce the current subtree if it has transactions
-					if stp.currentSubtree.Load().Length() > 1 {
-						logger.Debugf("[SubtreeProcessor] periodic announcement of current subtree with %d transactions", stp.currentSubtree.Load().Length()-1)
+					// Periodically announce the current subtree if it has transactions.
+					// Skip if the subtree is nearly full: a complete subtree is imminent and
+					// a partial here would just duplicate the announcement that follows.
+					currentSt := stp.currentSubtree.Load()
+					if currentSt.Length() > 1 && !nearlyFullSubtree(currentSt) {
+						logger.Debugf("[SubtreeProcessor] periodic announcement of current subtree with %d transactions", currentSt.Length()-1)
 
 						incompleteSubtree, err := stp.createIncompleteSubtreeCopy()
 						if err != nil {
@@ -941,6 +944,26 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 func (stp *SubtreeProcessor) setCurrentRunningState(state State) {
 	stp.currentRunningState.Store(state)
 	prometheusSubtreeProcessorCurrentState.Set(float64(state))
+}
+
+// nearlyFullSubtreeThresholdPct is the fill percentage at or above which the periodic
+// announcement skips emitting a partial subtree, because a complete subtree is imminent.
+const nearlyFullSubtreeThresholdPct = 90
+
+// nearlyFullSubtree reports whether the subtree is at or above the threshold fill ratio,
+// indicating that natural completion is imminent and a partial announcement would just
+// duplicate the full one that is about to follow.
+func nearlyFullSubtree(st *subtreepkg.Subtree) bool {
+	if st == nil {
+		return false
+	}
+
+	capacity := st.Size()
+	if capacity <= 0 {
+		return false
+	}
+
+	return st.Length()*100 >= capacity*nearlyFullSubtreeThresholdPct
 }
 
 // resetAnnouncementTicker safely resets the announcement ticker by draining any pending ticks

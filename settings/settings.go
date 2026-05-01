@@ -84,6 +84,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 		GRPCAdminAPIKey:            getString("grpc_admin_api_key", "", alternativeContext...),
 		GlobalBlockHeightRetention: globalBlockHeightRetention,
 		BatcherDrainMode:           getBool("batcher_drainMode", false, alternativeContext...),
+		BatcherBackground:          getBool("batcher_background", true, alternativeContext...),
 
 		ChainCfgParams: params,
 		Policy: &PolicySettings{
@@ -117,6 +118,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MinConfConsolidationInput:       getInt("minconfconsolidationinput", 6, alternativeContext...),
 			MinConsolidationInputMaturity:   getInt("minconsolidationinputmaturity", 6, alternativeContext...),
 			AcceptNonStdConsolidationInput:  getBool("acceptnonstdconsolidationinput", false, alternativeContext...),
+			MaxCoinsViewCacheSize:           getUint64("maxcoinsviewcachesize", 0, alternativeContext...),
 		},
 		Kafka: KafkaSettings{
 			Blocks:                getString("KAFKA_BLOCKS", "blocks", alternativeContext...),
@@ -420,6 +422,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			LockedBatcherDurationMillis:             getInt("utxostore_lockedBatcherDurationMillis", 5, alternativeContext...),
 			LongestChainBatcherSize:                 getInt("utxostore_longestChainBatcherSize", 1024, alternativeContext...),
 			LongestChainBatcherDurationMillis:       getInt("utxostore_longestChainBatcherDurationMillis", 5, alternativeContext...),
+			GetBatcherDrainMode:                     getBool("utxostore_getBatcherDrainMode", false, alternativeContext...),
+			SpendBatcherDrainMode:                   getBool("utxostore_spendBatcherDrainMode", false, alternativeContext...),
+			StoreBatcherDrainMode:                   getBool("utxostore_storeBatcherDrainMode", false, alternativeContext...),
+			LockedBatcherDrainMode:                  getBool("utxostore_lockedBatcherDrainMode", false, alternativeContext...),
 			GetBatcherSize:                          getInt("utxostore_getBatcherSize", 1, alternativeContext...),
 			GetBatcherDurationMillis:                getInt("utxostore_getBatcherDurationMillis", 10, alternativeContext...),
 			DBTimeout:                               getDuration("utxostore_dbTimeoutDuration", 5*time.Second, alternativeContext...),
@@ -435,6 +441,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BatchSQLOperations:                      getBool("utxostore_batch_sql_operations", true, alternativeContext...),
 			DisableDAHCleaner:                       getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 			ReAssignedUtxoSpendableAfterBlocks:      getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
+			BatcherMaxConcurrent:                    getInt("utxostore_batcherMaxConcurrent", 64, alternativeContext...),
 			QueryIdleTimeoutSeconds:                 getInt("utxostore_queryIdleTimeoutSeconds", 60, alternativeContext...),
 		},
 		P2P: P2PSettings{
