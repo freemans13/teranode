@@ -246,10 +246,10 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// txs insert the row is fresh, so the outputs insert can't collide.
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING hash`,
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
@@ -265,8 +265,8 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 
 	if len(outArrs.idx) > 0 {
 		_, err = conn.Exec(ctx, `
-			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
-			SELECT $1, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
+			INSERT INTO outputs (tx_hash, partition_key, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
+			SELECT $1, get_byte($1, 1) % 8, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
 			FROM UNNEST($2::bigint[], $3::bytea[], $4::bigint[],
 						$5::boolean[], $6::bytea[], $7::bigint[])
 				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh)`,
@@ -425,9 +425,9 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 	// through this single worker connection, so there's no concurrent
 	// inserter that could race the NOT EXISTS / INSERT window.
 	const insertTxsSQL = `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since)
-		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
+		SELECT u.hash, get_byte(u.hash, 1) % 8, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 		       u.locked, u.conflicting, u.frozen, u.unmined_since
 		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
 		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
@@ -443,8 +443,8 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 	// don't trip the per-child PK. The subquery prunes by partition key
 	// on tx_hash.
 	const insertOutputsSQL = `
-		INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
-		SELECT u.tx_hash, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
+		INSERT INTO outputs (tx_hash, partition_key, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
+		SELECT u.tx_hash, get_byte(u.tx_hash, 1) % 8, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
 		FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
 		            $5::boolean[], $6::bytea[], $7::bigint[])
 		     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh)

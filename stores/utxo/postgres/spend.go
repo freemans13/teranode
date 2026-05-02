@@ -52,8 +52,8 @@ inserted AS (
     -- predicate filters duplicates at the snapshot, and within-shard
     -- serialization (one worker per shard, one held connection) prevents
     -- a concurrent insert racing this statement for the same UTXO.
-    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
-    SELECT $1, $2, $3
+    INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
+    SELECT $1, get_byte($1, 1) % 8, $2, $3
     FROM validation v
     WHERE v.existing_spend IS NULL
       AND v.utxo_hash = $4
@@ -470,8 +470,8 @@ to_insert AS (
 inserted AS (
     -- See note in spendValidationSQL about ON CONFLICT and partitioned
     -- parents. to_insert is already filtered by the validation CTE.
-    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
-    SELECT prev_tx_hash, prev_idx, spending_data FROM to_insert
+    INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
+    SELECT prev_tx_hash, get_byte(prev_tx_hash, 1) % 8, prev_idx, spending_data FROM to_insert
     RETURNING prev_tx_hash, prev_output_idx
 ),
 parents AS (
