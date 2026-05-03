@@ -47,14 +47,10 @@ WITH validation AS (
     WHERE o.tx_hash = $1 AND o.idx = $2
 ),
 inserted AS (
-    -- ON CONFLICT (prev_tx_hash, prev_output_idx, partition_key) is now
-    -- legal against the partitioned parent thanks to the parent-level
-    -- UNIQUE constraint added in the schema task. Task 3 will add the
-    -- ON CONFLICT clause back. For now, the validation CTE's
-    -- existing_spend IS NULL predicate filters duplicates at the
-    -- snapshot, and within-shard serialization (one worker per shard,
-    -- one held connection) prevents a concurrent insert racing this
-    -- statement for the same UTXO.
+    -- ON CONFLICT silently skips a duplicate (prev_tx_hash, prev_output_idx).
+    -- Combined with the validation CTE's existing_spend IS NULL predicate,
+    -- this is defense-in-depth against any race that bypasses within-shard
+    -- worker serialization.
     INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
     SELECT $1, get_byte($1, 1) % 8, $2, $3
     FROM validation v
@@ -65,6 +61,7 @@ inserted AS (
       AND ($7 OR NOT v.tx_conflicting)
       AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
       AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
+    ON CONFLICT (prev_tx_hash, prev_output_idx, partition_key) DO NOTHING
     RETURNING prev_tx_hash
 ),
 dah_upd AS (
@@ -471,11 +468,10 @@ to_insert AS (
       AND NOT (COALESCE(spendable_in, 0) > 0 AND block_height < COALESCE(spendable_in, 0))
 ),
 inserted AS (
-    -- See note in spendValidationSQL: ON CONFLICT is now legal but Task 3
-    -- adds it; for now, to_insert is already filtered by the validation
-    -- CTE.
+    -- See note in spendValidationSQL — same defense-in-depth rationale.
     INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
     SELECT prev_tx_hash, get_byte(prev_tx_hash, 1) % 8, prev_idx, spending_data FROM to_insert
+    ON CONFLICT (prev_tx_hash, prev_output_idx, partition_key) DO NOTHING
     RETURNING prev_tx_hash, prev_output_idx
 ),
 parents AS (
