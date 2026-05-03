@@ -155,10 +155,11 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 	err := s.pool.QueryRow(ctx, `
 		SELECT t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
 		       t.locked, t.conflicting, t.frozen, t.unmined_since, r.raw_tx,
-		       b.block_ids, b.block_heights, b.subtree_idxs, t.conflicting_children
+		       b.block_ids, b.block_heights, b.subtree_idxs, c.conflicting_children
 		FROM txs t
-		LEFT JOIN txs_raw    r ON r.hash = t.hash AND r.partition_key = t.partition_key
-		LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
+		LEFT JOIN txs_raw       r ON r.hash = t.hash AND r.partition_key = t.partition_key
+		LEFT JOIN txs_blocks    b ON b.hash = t.hash AND b.partition_key = t.partition_key
+		LEFT JOIN txs_conflicts c ON c.hash = t.hash AND c.partition_key = t.partition_key
 		WHERE t.hash = $1`,
 		hash[:],
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,

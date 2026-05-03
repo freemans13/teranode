@@ -27,7 +27,9 @@ import (
 //
 //   - block_ids / block_heights / subtree_idxs are INT[] arrays on the
 //     txs_blocks side table; conflicting_children is a BYTEA[] array on
-//     txs (for now). Side-table split keeps the hot txs row narrow.
+//     the txs_conflicts side table. Side-table split keeps the hot txs
+//     row narrow — these arrays are only populated during reorgs/conflict
+//     resolution and during mining updates respectively.
 //
 // Partitioning: LIST on a plain SMALLINT `partition_key` column whose value
 // is computed at INSERT time as `get_byte(<key>, 1) % NumPartitions`. We
@@ -55,6 +57,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		txsDDL,
 		txsRawDDL,
 		txsBlocksDDL,
+		txsConflictsDDL,
 		outputsDDL,
 		spendsDDL,
 	}
@@ -69,6 +72,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		{name: "txs", fillfactor: 70},
 		{name: "txs_raw", fillfactor: 100},
 		{name: "txs_blocks", fillfactor: 70},
+		{name: "txs_conflicts", fillfactor: 100},
 		{name: "outputs", fillfactor: 100},
 		{name: "spends", fillfactor: 100},
 	}
@@ -109,27 +113,27 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 // Table DDL — 3 LOGGED list-partitioned tables
 // ---------------------------------------------------------------------------
 
-// txs: consolidated transaction metadata + state + conflicting_children
-// (array). LOGGED — UTXO set is durable state. raw_tx lives in the txs_raw
-// side table; block_ids/heights/subtree_idxs live in the txs_blocks side
-// table — both keep this hot row narrow.
+// txs: consolidated transaction metadata + state. LOGGED — UTXO set is
+// durable state. raw_tx lives in the txs_raw side table;
+// block_ids/heights/subtree_idxs live in the txs_blocks side table;
+// conflicting_children lives in the txs_conflicts side table. The hot
+// row is just metadata + flags + delete_at_height/preserve_until.
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
-    hash                 BYTEA NOT NULL,
-    partition_key        SMALLINT NOT NULL,
-    version              BIGINT NOT NULL,
-    lock_time            BIGINT NOT NULL,
-    fee                  BIGINT NOT NULL,
-    size_in_bytes        BIGINT NOT NULL,
-    coinbase             BOOLEAN NOT NULL DEFAULT FALSE,
-    locked               BOOLEAN NOT NULL DEFAULT FALSE,
-    conflicting          BOOLEAN NOT NULL DEFAULT FALSE,
-    frozen               BOOLEAN NOT NULL DEFAULT FALSE,
-    unmined_since        BIGINT,
-    delete_at_height     BIGINT,
-    preserve_until       BIGINT,
-    conflicting_children BYTEA[],
-    inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    hash             BYTEA NOT NULL,
+    partition_key    SMALLINT NOT NULL,
+    version          BIGINT NOT NULL,
+    lock_time        BIGINT NOT NULL,
+    fee              BIGINT NOT NULL,
+    size_in_bytes    BIGINT NOT NULL,
+    coinbase         BOOLEAN NOT NULL DEFAULT FALSE,
+    locked           BOOLEAN NOT NULL DEFAULT FALSE,
+    conflicting      BOOLEAN NOT NULL DEFAULT FALSE,
+    frozen           BOOLEAN NOT NULL DEFAULT FALSE,
+    unmined_since    BIGINT,
+    delete_at_height BIGINT,
+    preserve_until   BIGINT,
+    inserted_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (hash, partition_key)
 ) PARTITION BY LIST (partition_key);`
 
@@ -160,6 +164,20 @@ CREATE TABLE IF NOT EXISTS txs_blocks (
     block_ids     INT[],
     block_heights INT[],
     subtree_idxs  INT[],
+    PRIMARY KEY (hash, partition_key)
+) PARTITION BY LIST (partition_key);`
+
+// txs_conflicts: side table holding the conflicting_children BYTEA[]
+// array. Split out of txs because conflicting_children is set only during
+// reorgs / conflict resolution — empty for 99.9% of txs but still costs
+// row width on the hot path. Partition-aligned 1:1 with txs by
+// (hash, partition_key); fillfactor 100 because rows are typically
+// inserted once and never updated outside conflict resolution windows.
+const txsConflictsDDL = `
+CREATE TABLE IF NOT EXISTS txs_conflicts (
+    hash                 BYTEA NOT NULL,
+    partition_key        SMALLINT NOT NULL,
+    conflicting_children BYTEA[],
     PRIMARY KEY (hash, partition_key)
 ) PARTITION BY LIST (partition_key);`
 

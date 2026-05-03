@@ -25,9 +25,9 @@ func (s *Store) GetConflictingChildren(ctx context.Context, hash chainhash.Hash)
 }
 
 // SetConflicting marks transactions as conflicting or not conflicting.
-// It updates txs.conflicting and txs.delete_at_height, appends to the
-// conflicting_children array on parent txs, and returns affected parent spends
-// and spending child tx hashes.
+// It updates txs.conflicting and txs.delete_at_height, upserts each parent
+// row in txs_conflicts to append this tx hash to the conflicting_children
+// array, and returns affected parent spends and spending child tx hashes.
 func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, setValue bool) ([]*utxo.Spend, []chainhash.Hash, error) {
 	if len(txHashes) == 0 {
 		return nil, nil, nil
@@ -76,7 +76,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", txHash, err)
 		}
 
-		// Append this tx as a conflicting child of each parent (array on txs).
+		// Append this tx as a conflicting child of each parent (array on txs_conflicts).
 		if txMeta.Tx != nil {
 			seen := make(map[chainhash.Hash]struct{}, len(txMeta.Tx.Inputs))
 			for _, input := range txMeta.Tx.Inputs {
@@ -87,8 +87,10 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 				seen[parentHash] = struct{}{}
 
 				_, insertErr := s.pool.Exec(ctx, `
-					UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
-					WHERE hash = $1`,
+					INSERT INTO txs_conflicts (hash, partition_key, conflicting_children)
+					VALUES ($1, get_byte($1, 1) % 8, $2::bytea[])
+					ON CONFLICT (hash, partition_key) DO UPDATE SET
+					    conflicting_children = COALESCE(txs_conflicts.conflicting_children, '{}') || EXCLUDED.conflicting_children`,
 					parentHash[:], [][]byte{txHash[:]},
 				)
 				if insertErr != nil {

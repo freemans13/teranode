@@ -231,14 +231,13 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
 		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase,
-			locked, conflicting, frozen, unmined_since, conflicting_children)
-		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			locked, conflicting, frozen, unmined_since)
+		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (hash, partition_key) DO NOTHING
 		RETURNING hash`,
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
-		[][]byte(nil),
 	).Scan(&insertedHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -576,8 +575,8 @@ func (s *Store) buildCreateMeta(txMeta *meta.Data, options *utxo.CreateOptions, 
 	return txMeta
 }
 
-// insertConflictingChildrenDirect updates each parent tx row to append this
-// child to its conflicting_children array.
+// insertConflictingChildrenDirect upserts each parent's row in txs_conflicts
+// to append this child to its conflicting_children array.
 func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpool.Conn, childTxHash *chainhash.Hash, tx *bt.Tx) error {
 	seen := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
 
@@ -589,8 +588,10 @@ func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpo
 		seen[parentHash] = struct{}{}
 
 		_, err := conn.Exec(ctx, `
-			UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
-			WHERE hash = $1`,
+			INSERT INTO txs_conflicts (hash, partition_key, conflicting_children)
+			VALUES ($1, get_byte($1, 1) % 8, $2::bytea[])
+			ON CONFLICT (hash, partition_key) DO UPDATE SET
+			    conflicting_children = COALESCE(txs_conflicts.conflicting_children, '{}') || EXCLUDED.conflicting_children`,
 			parentHash[:], [][]byte{childTxHash[:]},
 		)
 		if err != nil {
