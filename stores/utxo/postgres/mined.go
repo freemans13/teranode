@@ -15,6 +15,35 @@ import (
 // Larger chunks = fewer round trips. Simple array append keeps per-row cost constant.
 const minedChunkSize = 2000
 
+// SQL strings for mined operations. The `% NumPartitions` modulus is
+// substituted from the Go constant so bumping NumPartitions automatically
+// updates every partition_key derivation.
+var (
+	upsertBlocksSQL = fmt.Sprintf(`
+		INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
+		SELECT u.hash, get_byte(u.hash, 1) %% %d, ARRAY[$2::int], ARRAY[$3::int], ARRAY[$4::int]
+		FROM UNNEST($1::bytea[]) AS u(hash)
+		ON CONFLICT (hash, partition_key) DO UPDATE SET
+		    block_ids     = txs_blocks.block_ids     || EXCLUDED.block_ids,
+		    block_heights = txs_blocks.block_heights || EXCLUDED.block_heights,
+		    subtree_idxs  = txs_blocks.subtree_idxs  || EXCLUDED.subtree_idxs`, NumPartitions)
+
+	unsetMinedReadSQL = fmt.Sprintf(
+		`SELECT block_ids, block_heights, subtree_idxs FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`,
+		NumPartitions)
+
+	unsetMinedUpdateBlocksSQL = fmt.Sprintf(`
+			UPDATE txs_blocks SET block_ids = $2, block_heights = $3, subtree_idxs = $4
+			WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+
+	unsetMinedSetUnminedSinceSQL = fmt.Sprintf(`
+				UPDATE txs SET unmined_since = $2 WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+
+	fetchBlockIDsSQL = fmt.Sprintf(
+		`SELECT block_ids FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`,
+		NumPartitions)
+)
+
 // SetMinedMulti updates the block ID for multiple transactions that have been mined.
 // Normal path: single UPDATE on txs with array append.
 // UnsetMined path (reorg): read arrays, remove entry in Go, write back.
@@ -51,14 +80,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	// Combined operation: upsert array appends into txs_blocks, then
 	// update the flag/DAH columns on txs. Two sequential statements on
 	// one held connection (one round-trip per chunk per statement).
-	const upsertBlocksSQL = `
-		INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
-		SELECT u.hash, get_byte(u.hash, 1) % 8, ARRAY[$2::int], ARRAY[$3::int], ARRAY[$4::int]
-		FROM UNNEST($1::bytea[]) AS u(hash)
-		ON CONFLICT (hash, partition_key) DO UPDATE SET
-		    block_ids     = txs_blocks.block_ids     || EXCLUDED.block_ids,
-		    block_heights = txs_blocks.block_heights || EXCLUDED.block_heights,
-		    subtree_idxs  = txs_blocks.subtree_idxs  || EXCLUDED.subtree_idxs`
+	// upsertBlocksSQL is a package-level var so NumPartitions flows in.
 
 	var updateFlagsSQL string
 	switch {
@@ -150,8 +172,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 
 	for _, hash := range hashes {
 		var blockIDs, blockHeights, subtreeIdxs []int32
-		err := s.pool.QueryRow(ctx,
-			`SELECT block_ids, block_heights, subtree_idxs FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
+		err := s.pool.QueryRow(ctx, unsetMinedReadSQL,
 			hash[:],
 		).Scan(&blockIDs, &blockHeights, &subtreeIdxs)
 		if err != nil {
@@ -179,9 +200,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 			}
 		}
 
-		_, err = s.pool.Exec(ctx, `
-			UPDATE txs_blocks SET block_ids = $2, block_heights = $3, subtree_idxs = $4
-			WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
+		_, err = s.pool.Exec(ctx, unsetMinedUpdateBlocksSQL,
 			hash[:], newBlockIDs, newBlockHeights, newSubtreeIdxs,
 		)
 		if err != nil {
@@ -190,8 +209,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 
 		// If no block_ids remain after removal, set txs.unmined_since.
 		if len(newBlockIDs) == 0 {
-			_, err = s.pool.Exec(ctx, `
-				UPDATE txs SET unmined_since = $2 WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
+			_, err = s.pool.Exec(ctx, unsetMinedSetUnminedSinceSQL,
 				hash[:], currentBlockHeight,
 			)
 			if err != nil {
@@ -213,8 +231,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 // txs_blocks side table. Returns nil if no txs_blocks row exists.
 func (s *Store) fetchBlockIDs(ctx context.Context, hash *chainhash.Hash) ([]uint32, error) {
 	var blockIDs []int32
-	err := s.pool.QueryRow(ctx,
-		`SELECT block_ids FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
+	err := s.pool.QueryRow(ctx, fetchBlockIDsSQL,
 		hash[:],
 	).Scan(&blockIDs)
 	if err != nil {

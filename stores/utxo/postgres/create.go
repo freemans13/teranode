@@ -18,6 +18,69 @@ import (
 )
 
 // ---------------------------------------------------------------------------
+// SQL strings — `% NumPartitions` substituted from the Go constant so a
+// bump to NumPartitions automatically updates every partition_key derivation.
+// ---------------------------------------------------------------------------
+
+var (
+	insertTxSQL = fmt.Sprintf(`
+		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase,
+			locked, conflicting, frozen, unmined_since)
+		VALUES ($1, get_byte($1, 1) %% %d, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (hash, partition_key) DO NOTHING
+		RETURNING hash`, NumPartitions)
+
+	insertTxRawSingleSQL = fmt.Sprintf(`INSERT INTO txs_raw (hash, partition_key, raw_tx)
+		 VALUES ($1, get_byte($1, 1) %% %d, $2)
+		 ON CONFLICT (hash, partition_key) DO NOTHING`, NumPartitions)
+
+	insertTxBlocksSingleSQL = fmt.Sprintf(`INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
+			 VALUES ($1, get_byte($1, 1) %% %d, $2, $3, $4)
+			 ON CONFLICT (hash, partition_key) DO NOTHING`, NumPartitions)
+
+	insertOutputsSingleSQL = fmt.Sprintf(`
+			INSERT INTO outputs (tx_hash, partition_key, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
+			SELECT $1, get_byte($1, 1) %% %d, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
+			FROM UNNEST($2::bigint[], $3::bytea[], $4::bigint[],
+						$5::boolean[], $6::bytea[], $7::bigint[])
+				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh)
+			ON CONFLICT (tx_hash, idx, partition_key) DO NOTHING`, NumPartitions)
+
+	insertTxsBulkSQL = fmt.Sprintf(`
+		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase,
+			locked, conflicting, frozen, unmined_since)
+		SELECT u.hash, get_byte(u.hash, 1) %% %d, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase,
+		       u.locked, u.conflicting, u.frozen, u.unmined_since
+		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
+		            $6::boolean[], $7::boolean[], $8::boolean[], $9::boolean[],
+		            $10::bigint[])
+		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase,
+		          locked, conflicting, frozen, unmined_since)
+		ON CONFLICT (hash, partition_key) DO NOTHING
+		RETURNING hash`, NumPartitions)
+
+	insertTxsRawBulkSQL = fmt.Sprintf(`
+		INSERT INTO txs_raw (hash, partition_key, raw_tx)
+		SELECT u.hash, get_byte(u.hash, 1) %% %d, u.raw_tx
+		FROM UNNEST($1::bytea[], $2::bytea[]) AS u(hash, raw_tx)
+		ON CONFLICT (hash, partition_key) DO NOTHING`, NumPartitions)
+
+	insertOutputsBulkSQL = fmt.Sprintf(`
+		INSERT INTO outputs (tx_hash, partition_key, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
+		SELECT u.tx_hash, get_byte(u.tx_hash, 1) %% %d, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
+		FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
+		            $5::boolean[], $6::bytea[], $7::bigint[])
+		     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh)
+		ON CONFLICT (tx_hash, idx, partition_key) DO NOTHING`, NumPartitions)
+
+	insertConflictingChildrenSQL = fmt.Sprintf(`
+			INSERT INTO txs_conflicts (hash, partition_key, conflicting_children)
+			VALUES ($1, get_byte($1, 1) %% %d, $2::bytea[])
+			ON CONFLICT (hash, partition_key) DO UPDATE SET
+			    conflicting_children = COALESCE(txs_conflicts.conflicting_children, '{}') || EXCLUDED.conflicting_children`, NumPartitions)
+)
+
+// ---------------------------------------------------------------------------
 // Batch types
 // ---------------------------------------------------------------------------
 
@@ -229,12 +292,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// duplicate hash (returns no row); RETURNING hash returns the new row
 	// when inserted. ErrNoRows on a non-error scan means duplicate.
 	var insertedHash []byte
-	err = conn.QueryRow(ctx, `
-		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase,
-			locked, conflicting, frozen, unmined_since)
-		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (hash, partition_key) DO NOTHING
-		RETURNING hash`,
+	err = conn.QueryRow(ctx, insertTxSQL,
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
@@ -249,10 +307,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// Insert raw_tx into the side table. We always have non-empty raw_tx
 	// here (Create's caller always passes the full tx). ON CONFLICT covers
 	// retry / test paths where the txs row already existed.
-	if _, err = conn.Exec(ctx,
-		`INSERT INTO txs_raw (hash, partition_key, raw_tx)
-		 VALUES ($1, get_byte($1, 1) % 8, $2)
-		 ON CONFLICT (hash, partition_key) DO NOTHING`,
+	if _, err = conn.Exec(ctx, insertTxRawSingleSQL,
 		txHash[:], rawTx,
 	); err != nil {
 		return nil, errors.NewStorageError("failed to insert raw_tx", err)
@@ -262,10 +317,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// already has mining info (rare initial-sync path). Validator hot path
 	// never sets MinedBlockInfos.
 	if len(blockIDs) > 0 {
-		_, err = conn.Exec(ctx,
-			`INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
-			 VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4)
-			 ON CONFLICT (hash, partition_key) DO NOTHING`,
+		_, err = conn.Exec(ctx, insertTxBlocksSingleSQL,
 			txHash[:], blockIDs, blkHeights, subtreeIdxs,
 		)
 		if err != nil {
@@ -274,13 +326,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 
 	if len(outArrs.idx) > 0 {
-		_, err = conn.Exec(ctx, `
-			INSERT INTO outputs (tx_hash, partition_key, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
-			SELECT $1, get_byte($1, 1) % 8, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
-			FROM UNNEST($2::bigint[], $3::bytea[], $4::bigint[],
-						$5::boolean[], $6::bytea[], $7::bigint[])
-				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh)
-			ON CONFLICT (tx_hash, idx, partition_key) DO NOTHING`,
+		_, err = conn.Exec(ctx, insertOutputsSingleSQL,
 			txHash[:],
 			outArrs.idx, outArrs.lockingScript, outArrs.satoshis,
 			outArrs.frozen, outArrs.utxoHash, outArrs.coinbaseSpendingHeight,
@@ -429,52 +475,22 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 	// trace 2026-04-29) accounted for 61% of all bench-worker blocking
 	// time. SendBatch sends all 4 statements in one TCP write; postgres
 	// processes them in order; we read the 4 responses in one TCP read.
-	// Bulk INSERT against parents. ON CONFLICT (hash, partition_key) DO
-	// NOTHING silently skips duplicate hashes — the RETURNING hash set
-	// tells us which were actually inserted, used downstream to route
-	// per-item results back to callers.
-	const insertTxsSQL = `
-		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase,
-			locked, conflicting, frozen, unmined_since)
-		SELECT u.hash, get_byte(u.hash, 1) % 8, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase,
-		       u.locked, u.conflicting, u.frozen, u.unmined_since
-		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
-		            $6::boolean[], $7::boolean[], $8::boolean[], $9::boolean[],
-		            $10::bigint[])
-		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase,
-		          locked, conflicting, frozen, unmined_since)
-		ON CONFLICT (hash, partition_key) DO NOTHING
-		RETURNING hash`
-
-	// raw_tx lives in the txs_raw side table. Pipelined alongside the txs
-	// INSERT so one fsync covers both. ON CONFLICT covers retry paths.
-	const insertTxsRawSQL = `
-		INSERT INTO txs_raw (hash, partition_key, raw_tx)
-		SELECT u.hash, get_byte(u.hash, 1) % 8, u.raw_tx
-		FROM UNNEST($1::bytea[], $2::bytea[]) AS u(hash, raw_tx)
-		ON CONFLICT (hash, partition_key) DO NOTHING`
-
-	// outputs may include rows for txs that were filtered out by the txs
-	// ON CONFLICT (i.e., the parent tx already existed in the DB).
-	// ON CONFLICT (tx_hash, idx, partition_key) silently skips duplicate
-	// (tx_hash, idx) pairs.
-	const insertOutputsSQL = `
-		INSERT INTO outputs (tx_hash, partition_key, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
-		SELECT u.tx_hash, get_byte(u.tx_hash, 1) % 8, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
-		FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
-		            $5::boolean[], $6::bytea[], $7::bigint[])
-		     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh)
-		ON CONFLICT (tx_hash, idx, partition_key) DO NOTHING`
+	// Bulk INSERTs are package-level vars `insertTxsBulkSQL`,
+	// `insertTxsRawBulkSQL`, `insertOutputsBulkSQL` — each substitutes
+	// NumPartitions into `% NumPartitions` so a bump to NumPartitions
+	// flows through automatically. ON CONFLICT (hash, partition_key) DO
+	// NOTHING silently skips duplicate hashes; the RETURNING hash set
+	// tells us which were actually inserted.
 
 	pgxBatch := &pgx.Batch{}
 	pgxBatch.Queue("BEGIN")
-	pgxBatch.Queue(insertTxsSQL,
+	pgxBatch.Queue(insertTxsBulkSQL,
 		hashes, versions, lockTimes, fees, sizes, coinbases,
 		lockeds, conflictings, frozens, unminedSinces,
 	)
-	pgxBatch.Queue(insertTxsRawSQL, hashes, rawTxs)
+	pgxBatch.Queue(insertTxsRawBulkSQL, hashes, rawTxs)
 	if len(outTxHashes) > 0 {
-		pgxBatch.Queue(insertOutputsSQL,
+		pgxBatch.Queue(insertOutputsBulkSQL,
 			outTxHashes, outIdxs, outLockingScripts, outSatoshis,
 			outFrozens, outUtxoHashes, outCoinbaseSpendingHeights,
 		)
@@ -587,11 +603,7 @@ func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpo
 		}
 		seen[parentHash] = struct{}{}
 
-		_, err := conn.Exec(ctx, `
-			INSERT INTO txs_conflicts (hash, partition_key, conflicting_children)
-			VALUES ($1, get_byte($1, 1) % 8, $2::bytea[])
-			ON CONFLICT (hash, partition_key) DO UPDATE SET
-			    conflicting_children = COALESCE(txs_conflicts.conflicting_children, '{}') || EXCLUDED.conflicting_children`,
+		_, err := conn.Exec(ctx, insertConflictingChildrenSQL,
 			parentHash[:], [][]byte{childTxHash[:]},
 		)
 		if err != nil {

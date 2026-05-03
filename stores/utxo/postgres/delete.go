@@ -2,9 +2,54 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+)
+
+// SQL strings for delete operations. The `% NumPartitions` modulus is
+// substituted from the Go constant so bumping NumPartitions automatically
+// updates every partition_key derivation.
+//
+// deleteCascadeSQLs is ordered: children tables first, then parent table.
+// The partition_key predicate lets postgres prune to one child partition
+// at plan time (the value is constant for a given $1).
+var (
+	deleteCascadeSQLs = []string{
+		fmt.Sprintf(`DELETE FROM spends WHERE prev_tx_hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions),
+		fmt.Sprintf(`DELETE FROM outputs WHERE tx_hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions),
+		fmt.Sprintf(`DELETE FROM txs_raw WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions),
+		fmt.Sprintf(`DELETE FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions),
+		fmt.Sprintf(`DELETE FROM txs_conflicts WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions),
+		fmt.Sprintf(`DELETE FROM txs WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions),
+	}
+
+	setDAHPreserveUntilSQL = fmt.Sprintf(
+		`SELECT preserve_until FROM txs WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+
+	setDAHAllSpentSQL = fmt.Sprintf(`
+			SELECT NOT EXISTS(
+				SELECT 1 FROM outputs o
+				WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) %% %d
+				AND NOT EXISTS (SELECT 1 FROM spends sp WHERE sp.prev_tx_hash = o.tx_hash AND sp.partition_key = get_byte($1, 1) %% %d AND sp.prev_output_idx = o.idx)
+			) AS all_spent`, NumPartitions, NumPartitions)
+
+	setDAHBlockIDsSQL = fmt.Sprintf(`SELECT b.block_ids, (t.unmined_since IS NULL)
+			 FROM txs t
+			 LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
+			 WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+
+	setDAHUpdateSQL = fmt.Sprintf(`
+			UPDATE txs
+			SET delete_at_height = CASE
+				WHEN delete_at_height IS NULL OR delete_at_height < $2 THEN $2
+				ELSE delete_at_height
+			END
+			WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+
+	setDAHClearSQL = fmt.Sprintf(`
+			UPDATE txs SET delete_at_height = NULL WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions)
 )
 
 // Delete removes a transaction and all its associated data from all 3 tables
@@ -16,19 +61,7 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
-	// Delete in dependency order: children tables first, then parent table.
-	// The partition_key predicate lets postgres prune to one child partition
-	// at plan time (the value is constant for a given $1).
-	deleteStatements := []string{
-		`DELETE FROM spends WHERE prev_tx_hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-		`DELETE FROM outputs WHERE tx_hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-		`DELETE FROM txs_raw WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-		`DELETE FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-		`DELETE FROM txs_conflicts WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-		`DELETE FROM txs WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-	}
-
-	for _, stmt := range deleteStatements {
+	for _, stmt := range deleteCascadeSQLs {
 		if _, err = pgxTx.Exec(ctx, stmt, hash[:]); err != nil {
 			return errors.NewStorageError("[Delete] failed for %s: %v", hash, err)
 		}
@@ -51,10 +84,7 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 
 	// Check preserve_until first: if set, don't touch DAH.
 	var preserveUntil *int64
-	err := s.pool.QueryRow(ctx,
-		`SELECT preserve_until FROM txs WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-		hash[:],
-	).Scan(&preserveUntil)
+	err := s.pool.QueryRow(ctx, setDAHPreserveUntilSQL, hash[:]).Scan(&preserveUntil)
 	if err != nil {
 		return errors.NewStorageError("[setDAH] query preserve_until for %s: %v", hash, err)
 	}
@@ -64,14 +94,7 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 
 	// Check if all outputs are spent.
 	var allSpent bool
-	err = s.pool.QueryRow(ctx, `
-		SELECT NOT EXISTS(
-			SELECT 1 FROM outputs o
-			WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8
-			AND NOT EXISTS (SELECT 1 FROM spends sp WHERE sp.prev_tx_hash = o.tx_hash AND sp.partition_key = get_byte($1, 1) % 8 AND sp.prev_output_idx = o.idx)
-		) AS all_spent`,
-		hash[:],
-	).Scan(&allSpent)
+	err = s.pool.QueryRow(ctx, setDAHAllSpentSQL, hash[:]).Scan(&allSpent)
 	if err != nil {
 		return errors.NewStorageError("[setDAH] check all_spent for %s: %v", hash, err)
 	}
@@ -80,13 +103,7 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	// the txs_blocks side table; LEFT JOIN so a missing row scans as NULL.
 	var blockIDs []int32
 	var onLongestChain bool
-	err = s.pool.QueryRow(ctx,
-		`SELECT b.block_ids, (t.unmined_since IS NULL)
-		 FROM txs t
-		 LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
-		 WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) % 8`,
-		hash[:],
-	).Scan(&blockIDs, &onLongestChain)
+	err = s.pool.QueryRow(ctx, setDAHBlockIDsSQL, hash[:]).Scan(&blockIDs, &onLongestChain)
 	if err != nil {
 		return errors.NewStorageError("[setDAH] check block_ids for %s: %v", hash, err)
 	}
@@ -96,24 +113,13 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 
 	if allSpent && hasBlockIDs && onLongestChain {
 		// Set delete_at_height, but only bump forward (never decrease).
-		_, err = s.pool.Exec(ctx, `
-			UPDATE txs
-			SET delete_at_height = CASE
-				WHEN delete_at_height IS NULL OR delete_at_height < $2 THEN $2
-				ELSE delete_at_height
-			END
-			WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-			hash[:], newDAH,
-		)
+		_, err = s.pool.Exec(ctx, setDAHUpdateSQL, hash[:], newDAH)
 		if err != nil {
 			return errors.NewStorageError("[setDAH] set DAH for %s: %v", hash, err)
 		}
 	} else {
 		// Clear delete_at_height since conditions are not met.
-		_, err = s.pool.Exec(ctx, `
-			UPDATE txs SET delete_at_height = NULL WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
-			hash[:],
-		)
+		_, err = s.pool.Exec(ctx, setDAHClearSQL, hash[:])
 		if err != nil {
 			return errors.NewStorageError("[setDAH] clear DAH for %s: %v", hash, err)
 		}

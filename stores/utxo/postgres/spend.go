@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -34,7 +35,7 @@ type batchSpendItem struct {
 // $8 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH branch.
 // ---------------------------------------------------------------------------
 
-const spendValidationSQL = `
+var spendValidationSQL = fmt.Sprintf(`
 WITH validation AS (
     SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
            o.coinbase_spending_height,
@@ -44,7 +45,7 @@ WITH validation AS (
     FROM outputs o
     JOIN txs t ON t.hash = o.tx_hash AND t.partition_key = o.partition_key
     LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
-    WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8 AND o.idx = $2
+    WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) %% %d AND o.idx = $2
 ),
 inserted AS (
     -- ON CONFLICT silently skips a duplicate (prev_tx_hash, prev_output_idx).
@@ -52,7 +53,7 @@ inserted AS (
     -- this is defense-in-depth against any race that bypasses within-shard
     -- worker serialization.
     INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
-    SELECT $1, get_byte($1, 1) % 8, $2, $3
+    SELECT $1, get_byte($1, 1) %% %d, $2, $3
     FROM validation v
     WHERE v.existing_spend IS NULL
       AND v.utxo_hash = $4
@@ -82,9 +83,9 @@ dah_upd AS (
     RETURNING 1
 )
 SELECT 1 FROM inserted
-`
+`, NumPartitions, NumPartitions)
 
-const spendDiagnosticSQL = `
+var spendDiagnosticSQL = fmt.Sprintf(`
 SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
        o.coinbase_spending_height,
        t.locked AS tx_locked, t.conflicting AS tx_conflicting,
@@ -93,8 +94,8 @@ SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
 FROM outputs o
 JOIN txs t ON t.hash = o.tx_hash AND t.partition_key = o.partition_key
 LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
-WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8 AND o.idx = $2
-`
+WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) %% %d AND o.idx = $2
+`, NumPartitions)
 
 // ---------------------------------------------------------------------------
 // Spend — public API
@@ -437,7 +438,7 @@ func (s *Store) runSpendBatch(conn *pgxpool.Conn, batch []*batchSpendItem) {
 // hash-keyed predicates.
 //
 // $9 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH UPDATE.
-const bulkSpendSQL = `
+var bulkSpendSQL = fmt.Sprintf(`
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
            unnest($2::bigint[])  AS prev_idx,
@@ -474,7 +475,7 @@ to_insert AS (
 inserted AS (
     -- See note in spendValidationSQL — same defense-in-depth rationale.
     INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
-    SELECT prev_tx_hash, get_byte(prev_tx_hash, 1) % 8, prev_idx, spending_data FROM to_insert
+    SELECT prev_tx_hash, get_byte(prev_tx_hash, 1) %% %d, prev_idx, spending_data FROM to_insert
     ON CONFLICT (prev_tx_hash, prev_output_idx, partition_key) DO NOTHING
     RETURNING prev_tx_hash, prev_output_idx
 ),
@@ -509,7 +510,11 @@ SELECT v.batch_idx,
 FROM validated v
 LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
 ORDER BY v.batch_idx
-`
+`, NumPartitions)
+
+var unspendDeleteSQL = fmt.Sprintf(
+	`DELETE FROM spends WHERE prev_tx_hash = $1 AND partition_key = get_byte($1, 1) %% %d AND prev_output_idx = $2`,
+	NumPartitions)
 
 // diagnoseSpendFailure queries the output + txs + spends to determine
 // why a spend INSERT failed. Pool-acquiring path used by spendDirect when
@@ -629,8 +634,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		if spend == nil {
 			continue
 		}
-		_, err := s.pool.Exec(ctx,
-			`DELETE FROM spends WHERE prev_tx_hash = $1 AND partition_key = get_byte($1, 1) % 8 AND prev_output_idx = $2`,
+		_, err := s.pool.Exec(ctx, unspendDeleteSQL,
 			spend.TxID[:], spend.Vout,
 		)
 		if err != nil {
