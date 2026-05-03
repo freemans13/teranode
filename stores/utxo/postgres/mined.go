@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/jackc/pgx/v5"
 )
 
 // minedChunkSize is the maximum number of hashes per bulk UPDATE.
@@ -34,10 +35,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		return s.unsetMinedMulti(ctx, hashes, minedBlockInfo.BlockID)
 	}
 
-	// Single bulk UPDATE against parent `txs`. Postgres prunes the
-	// affected partitions itself from `hash = ANY($1)`. Future-multi-shard:
-	// bucket hashes by Route(h).Shard and dispatch one UPDATE per shard
-	// pool. Today (NumShards=1) one query covers all hashes.
 	var newDAH int64
 	var withDAH bool
 	if minedBlockInfo.OnLongestChain {
@@ -51,13 +48,22 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		}
 	}
 
-	var updateSQL string
+	// Combined operation: upsert array appends into txs_blocks, then
+	// update the flag/DAH columns on txs. Two sequential statements on
+	// one held connection (one round-trip per chunk per statement).
+	const upsertBlocksSQL = `
+		INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
+		SELECT u.hash, get_byte(u.hash, 1) % 8, ARRAY[$2::int], ARRAY[$3::int], ARRAY[$4::int]
+		FROM UNNEST($1::bytea[]) AS u(hash)
+		ON CONFLICT (hash, partition_key) DO UPDATE SET
+		    block_ids     = txs_blocks.block_ids     || EXCLUDED.block_ids,
+		    block_heights = txs_blocks.block_heights || EXCLUDED.block_heights,
+		    subtree_idxs  = txs_blocks.subtree_idxs  || EXCLUDED.subtree_idxs`
+
+	var updateFlagsSQL string
 	switch {
 	case minedBlockInfo.OnLongestChain && withDAH:
-		updateSQL = fmt.Sprintf(`UPDATE txs t SET
-			block_ids = COALESCE(block_ids, '{}') || $2::int[],
-			block_heights = COALESCE(block_heights, '{}') || $3::int[],
-			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+		updateFlagsSQL = fmt.Sprintf(`UPDATE txs t SET
 			locked = false, unmined_since = NULL,
 			delete_at_height = CASE
 				WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
@@ -69,21 +75,13 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 				ELSE t.delete_at_height END
 		WHERE t.hash = ANY($1)`, newDAH, newDAH, newDAH)
 	case minedBlockInfo.OnLongestChain:
-		updateSQL = `UPDATE txs SET
-			block_ids = COALESCE(block_ids, '{}') || $2::int[],
-			block_heights = COALESCE(block_heights, '{}') || $3::int[],
-			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+		updateFlagsSQL = `UPDATE txs SET
 			locked = false, unmined_since = NULL
 		WHERE hash = ANY($1)`
 	default:
-		updateSQL = `UPDATE txs SET
-			block_ids = COALESCE(block_ids, '{}') || $2::int[],
-			block_heights = COALESCE(block_heights, '{}') || $3::int[],
-			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
-			locked = false
-		WHERE hash = ANY($1)`
+		updateFlagsSQL = `UPDATE txs SET locked = false WHERE hash = ANY($1)`
 	}
-	const fetchSQL = `SELECT hash, block_ids FROM txs WHERE hash = ANY($1)`
+	const fetchSQL = `SELECT hash, block_ids FROM txs_blocks WHERE hash = ANY($1)`
 
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
@@ -96,19 +94,22 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		allHashBytes[i] = h[:]
 	}
 
-	// UPDATE in chunks to keep parameter sizes bounded.
 	for i := 0; i < len(allHashBytes); i += minedChunkSize {
 		end := i + minedChunkSize
 		if end > len(allHashBytes) {
 			end = len(allHashBytes)
 		}
-		if _, err := conn.Exec(ctx, updateSQL,
-			allHashBytes[i:end],
-			[]int32{int32(minedBlockInfo.BlockID)},
-			[]int32{int32(minedBlockInfo.BlockHeight)},
-			[]int32{int32(minedBlockInfo.SubtreeIdx)},
+		chunk := allHashBytes[i:end]
+		if _, err := conn.Exec(ctx, upsertBlocksSQL,
+			chunk,
+			int32(minedBlockInfo.BlockID),
+			int32(minedBlockInfo.BlockHeight),
+			int32(minedBlockInfo.SubtreeIdx),
 		); err != nil {
-			return nil, errors.NewStorageError("[SetMinedMulti] UPDATE chunk %d-%d: %v", i, end-1, err)
+			return nil, errors.NewStorageError("[SetMinedMulti] upsert txs_blocks chunk %d-%d: %v", i, end-1, err)
+		}
+		if _, err := conn.Exec(ctx, updateFlagsSQL, chunk); err != nil {
+			return nil, errors.NewStorageError("[SetMinedMulti] update txs chunk %d-%d: %v", i, end-1, err)
 		}
 	}
 
@@ -139,25 +140,29 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	return resultMap, nil
 }
 
-// unsetMinedMulti handles the reorg path: remove a block_id from the arrays.
-// If no block_ids remain after removal, sets unmined_since to current block height.
+// unsetMinedMulti handles the reorg path: remove a block_id from the arrays
+// stored in txs_blocks. If no block_ids remain after removal, sets the
+// txs.unmined_since column on the matching txs row.
 func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, blockID uint32) (map[chainhash.Hash][]uint32, error) {
 	resultMap := make(map[chainhash.Hash][]uint32, len(hashes))
 
 	currentBlockHeight := int64(s.blockHeight.Load())
 
 	for _, hash := range hashes {
-		// Read current arrays.
 		var blockIDs, blockHeights, subtreeIdxs []int32
 		err := s.pool.QueryRow(ctx,
-			`SELECT block_ids, block_heights, subtree_idxs FROM txs WHERE hash = $1`,
+			`SELECT block_ids, block_heights, subtree_idxs FROM txs_blocks WHERE hash = $1`,
 			hash[:],
 		).Scan(&blockIDs, &blockHeights, &subtreeIdxs)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// No txs_blocks row → nothing to unset for this hash.
+				resultMap[*hash] = nil
+				continue
+			}
 			return nil, errors.NewStorageError("[UnsetMined] read arrays for %s: %v", hash, err)
 		}
 
-		// Remove entry at matching index.
 		newBlockIDs := make([]int32, 0, len(blockIDs))
 		newBlockHeights := make([]int32, 0, len(blockHeights))
 		newSubtreeIdxs := make([]int32, 0, len(subtreeIdxs))
@@ -174,22 +179,26 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 			}
 		}
 
-		// Write back. If no block_ids remain, set unmined_since.
-		var unminedSince interface{}
-		if len(newBlockIDs) == 0 {
-			unminedSince = currentBlockHeight
-		}
-
 		_, err = s.pool.Exec(ctx, `
-			UPDATE txs SET block_ids = $2, block_heights = $3, subtree_idxs = $4, unmined_since = $5
+			UPDATE txs_blocks SET block_ids = $2, block_heights = $3, subtree_idxs = $4
 			WHERE hash = $1`,
-			hash[:], newBlockIDs, newBlockHeights, newSubtreeIdxs, unminedSince,
+			hash[:], newBlockIDs, newBlockHeights, newSubtreeIdxs,
 		)
 		if err != nil {
 			return nil, errors.NewStorageError("[UnsetMined] UPDATE arrays for %s: %v", hash, err)
 		}
 
-		// Build result.
+		// If no block_ids remain after removal, set txs.unmined_since.
+		if len(newBlockIDs) == 0 {
+			_, err = s.pool.Exec(ctx, `
+				UPDATE txs SET unmined_since = $2 WHERE hash = $1`,
+				hash[:], currentBlockHeight,
+			)
+			if err != nil {
+				return nil, errors.NewStorageError("[UnsetMined] UPDATE unmined_since for %s: %v", hash, err)
+			}
+		}
+
 		result := make([]uint32, len(newBlockIDs))
 		for i, bid := range newBlockIDs {
 			result[i] = uint32(bid)
@@ -200,14 +209,18 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	return resultMap, nil
 }
 
-// fetchBlockIDs returns the list of block_ids for a transaction from the txs array.
+// fetchBlockIDs returns the list of block_ids for a transaction from the
+// txs_blocks side table. Returns nil if no txs_blocks row exists.
 func (s *Store) fetchBlockIDs(ctx context.Context, hash *chainhash.Hash) ([]uint32, error) {
 	var blockIDs []int32
 	err := s.pool.QueryRow(ctx,
-		`SELECT block_ids FROM txs WHERE hash = $1`,
+		`SELECT block_ids FROM txs_blocks WHERE hash = $1`,
 		hash[:],
 	).Scan(&blockIDs)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
 		return nil, errors.NewStorageError("[fetchBlockIDs] query for %s: %v", hash, err)
 	}
 

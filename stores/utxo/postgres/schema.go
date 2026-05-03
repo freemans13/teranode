@@ -25,8 +25,9 @@ import (
 //     (no MVCC bloat on outputs) at the cost of needing a LEFT JOIN spends
 //     on every spend-validation query.
 //
-//   - block_ids / block_heights / subtree_idxs / conflicting_children are
-//     INT[] / BYTEA[] arrays on txs instead of separate tables.
+//   - block_ids / block_heights / subtree_idxs are INT[] arrays on the
+//     txs_blocks side table; conflicting_children is a BYTEA[] array on
+//     txs (for now). Side-table split keeps the hot txs row narrow.
 //
 // Partitioning: LIST on a plain SMALLINT `partition_key` column whose value
 // is computed at INSERT time as `get_byte(<key>, 1) % NumPartitions`. We
@@ -53,6 +54,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	ddlStatements := []string{
 		txsDDL,
 		txsRawDDL,
+		txsBlocksDDL,
 		outputsDDL,
 		spendsDDL,
 	}
@@ -66,6 +68,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	tables := []partitionSpec{
 		{name: "txs", fillfactor: 70},
 		{name: "txs_raw", fillfactor: 100},
+		{name: "txs_blocks", fillfactor: 70},
 		{name: "outputs", fillfactor: 100},
 		{name: "spends", fillfactor: 100},
 	}
@@ -106,9 +109,10 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 // Table DDL — 3 LOGGED list-partitioned tables
 // ---------------------------------------------------------------------------
 
-// txs: consolidated transaction metadata + state + block_ids (arrays) +
-// conflicting_children (array). LOGGED — UTXO set is durable state.
-// raw_tx lives in the txs_raw side table to keep this row narrow.
+// txs: consolidated transaction metadata + state + conflicting_children
+// (array). LOGGED — UTXO set is durable state. raw_tx lives in the txs_raw
+// side table; block_ids/heights/subtree_idxs live in the txs_blocks side
+// table — both keep this hot row narrow.
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
     hash                 BYTEA NOT NULL,
@@ -124,9 +128,6 @@ CREATE TABLE IF NOT EXISTS txs (
     unmined_since        BIGINT,
     delete_at_height     BIGINT,
     preserve_until       BIGINT,
-    block_ids            INT[],
-    block_heights        INT[],
-    subtree_idxs         INT[],
     conflicting_children BYTEA[],
     inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (hash, partition_key)
@@ -143,6 +144,22 @@ CREATE TABLE IF NOT EXISTS txs_raw (
     hash          BYTEA NOT NULL,
     partition_key SMALLINT NOT NULL,
     raw_tx        BYTEA,
+    PRIMARY KEY (hash, partition_key)
+) PARTITION BY LIST (partition_key);`
+
+// txs_blocks: side table holding mining-chain arrays. Split out of txs
+// because these arrays grow over time (reorgs, multiple-block confirmations)
+// and aren't read on the validator hot path. Keeping them off `txs` skips
+// array-rewrite WAL on every mining update touching unrelated columns.
+// Partition-aligned 1:1 with txs by (hash, partition_key). Fillfactor 70
+// because rows can grow as arrays append on mining updates.
+const txsBlocksDDL = `
+CREATE TABLE IF NOT EXISTS txs_blocks (
+    hash          BYTEA NOT NULL,
+    partition_key SMALLINT NOT NULL,
+    block_ids     INT[],
+    block_heights INT[],
+    subtree_idxs  INT[],
     PRIMARY KEY (hash, partition_key)
 ) PARTITION BY LIST (partition_key);`
 

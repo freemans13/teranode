@@ -71,10 +71,12 @@ func (s *Store) runGetBatch(conn *pgxpool.Conn, batch []*batchGetItem) {
 	ctx := context.Background()
 
 	const q = `
-		SELECT version, lock_time, fee, size_in_bytes, coinbase,
-		       locked, conflicting, frozen, unmined_since,
-		       block_ids, block_heights, subtree_idxs
-		FROM txs WHERE hash = $1`
+		SELECT t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
+		       t.locked, t.conflicting, t.frozen, t.unmined_since,
+		       b.block_ids, b.block_heights, b.subtree_idxs
+		FROM txs t
+		LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
+		WHERE t.hash = $1`
 
 	pgxBatch := &pgx.Batch{}
 	for _, item := range batch {
@@ -153,9 +155,10 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 	err := s.pool.QueryRow(ctx, `
 		SELECT t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
 		       t.locked, t.conflicting, t.frozen, t.unmined_since, r.raw_tx,
-		       t.block_ids, t.block_heights, t.subtree_idxs, t.conflicting_children
+		       b.block_ids, b.block_heights, b.subtree_idxs, t.conflicting_children
 		FROM txs t
-		LEFT JOIN txs_raw r ON r.hash = t.hash AND r.partition_key = t.partition_key
+		LEFT JOIN txs_raw    r ON r.hash = t.hash AND r.partition_key = t.partition_key
+		LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
 		WHERE t.hash = $1`,
 		hash[:],
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
@@ -421,9 +424,10 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 
 	q := `SELECT t.hash, t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
 	             t.locked, t.conflicting, t.frozen, t.unmined_since, r.raw_tx,
-	             t.block_ids, t.block_heights, t.subtree_idxs
+	             b.block_ids, b.block_heights, b.subtree_idxs
 	      FROM txs t
-	      LEFT JOIN txs_raw r ON r.hash = t.hash AND r.partition_key = t.partition_key
+	      LEFT JOIN txs_raw    r ON r.hash = t.hash AND r.partition_key = t.partition_key
+	      LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
 	      WHERE t.hash IN ` + inClause
 
 	rows, err := s.pool.Query(ctx, q, inArgs...)

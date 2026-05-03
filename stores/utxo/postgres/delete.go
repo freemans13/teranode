@@ -71,11 +71,15 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 		return errors.NewStorageError("[setDAH] check all_spent for %s: %v", hash, err)
 	}
 
-	// Check if has block_ids and is on longest chain — read from txs arrays.
+	// Check if has block_ids and is on longest chain. block_ids lives in
+	// the txs_blocks side table; LEFT JOIN so a missing row scans as NULL.
 	var blockIDs []int32
 	var onLongestChain bool
 	err = s.pool.QueryRow(ctx,
-		`SELECT block_ids, (unmined_since IS NULL) FROM txs WHERE hash = $1`,
+		`SELECT b.block_ids, (t.unmined_since IS NULL)
+		 FROM txs t
+		 LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
+		 WHERE t.hash = $1`,
 		hash[:],
 	).Scan(&blockIDs, &onLongestChain)
 	if err != nil {

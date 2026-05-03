@@ -231,15 +231,14 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
 		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase,
-			locked, conflicting, frozen, unmined_since,
-			block_ids, block_heights, subtree_idxs, conflicting_children)
-		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			locked, conflicting, frozen, unmined_since, conflicting_children)
+		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (hash, partition_key) DO NOTHING
 		RETURNING hash`,
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
-		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil),
+		[][]byte(nil),
 	).Scan(&insertedHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -258,6 +257,21 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		txHash[:], rawTx,
 	); err != nil {
 		return nil, errors.NewStorageError("failed to insert raw_tx", err)
+	}
+
+	// Insert block arrays into the txs_blocks side table only when this tx
+	// already has mining info (rare initial-sync path). Validator hot path
+	// never sets MinedBlockInfos.
+	if len(blockIDs) > 0 {
+		_, err = conn.Exec(ctx,
+			`INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
+			 VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4)
+			 ON CONFLICT (hash, partition_key) DO NOTHING`,
+			txHash[:], blockIDs, blkHeights, subtreeIdxs,
+		)
+		if err != nil {
+			return nil, errors.NewStorageError("failed to insert txs_blocks", err)
+		}
 	}
 
 	if len(outArrs.idx) > 0 {

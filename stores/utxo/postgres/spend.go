@@ -71,7 +71,11 @@ dah_upd AS (
       AND t.hash = i.prev_tx_hash
       AND t.preserve_until IS NULL
       AND t.unmined_since IS NULL
-      AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
+      AND EXISTS (
+          SELECT 1 FROM txs_blocks b
+          WHERE b.hash = t.hash AND b.partition_key = t.partition_key
+            AND b.block_ids IS NOT NULL AND array_length(b.block_ids, 1) > 0
+      )
       AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + 1
           = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
       AND (t.delete_at_height IS NULL OR t.delete_at_height < $8)
@@ -485,7 +489,11 @@ dah_upd AS (
       AND t.hash = p.tx_hash
       AND t.preserve_until IS NULL
       AND t.unmined_since IS NULL
-      AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
+      AND EXISTS (
+          SELECT 1 FROM txs_blocks b
+          WHERE b.hash = t.hash AND b.partition_key = t.partition_key
+            AND b.block_ids IS NOT NULL AND array_length(b.block_ids, 1) > 0
+      )
       AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + p.spent_in_batch
           = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
       AND (t.delete_at_height IS NULL OR t.delete_at_height < $9)
