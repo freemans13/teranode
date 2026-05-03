@@ -20,6 +20,9 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	deleteStatements := []string{
 		`DELETE FROM spends WHERE prev_tx_hash = $1`,
 		`DELETE FROM outputs WHERE tx_hash = $1`,
+		`DELETE FROM txs_raw WHERE hash = $1`,
+		`DELETE FROM txs_blocks WHERE hash = $1`,
+		`DELETE FROM txs_conflicts WHERE hash = $1`,
 		`DELETE FROM txs WHERE hash = $1`,
 	}
 
