@@ -230,14 +230,14 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// when inserted. ErrNoRows on a non-error scan means duplicate.
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
-		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children)
-		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (hash, partition_key) DO NOTHING
 		RETURNING hash`,
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
-		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
+		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
 		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil),
 	).Scan(&insertedHash)
@@ -246,6 +246,18 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
 		return nil, errors.NewStorageError("failed to create UTXO", err)
+	}
+
+	// Insert raw_tx into the side table. We always have non-empty raw_tx
+	// here (Create's caller always passes the full tx). ON CONFLICT covers
+	// retry / test paths where the txs row already existed.
+	if _, err = conn.Exec(ctx,
+		`INSERT INTO txs_raw (hash, partition_key, raw_tx)
+		 VALUES ($1, get_byte($1, 1) % 8, $2)
+		 ON CONFLICT (hash, partition_key) DO NOTHING`,
+		txHash[:], rawTx,
+	); err != nil {
+		return nil, errors.NewStorageError("failed to insert raw_tx", err)
 	}
 
 	if len(outArrs.idx) > 0 {
@@ -409,17 +421,25 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 	// tells us which were actually inserted, used downstream to route
 	// per-item results back to callers.
 	const insertTxsSQL = `
-		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase,
 			locked, conflicting, frozen, unmined_since)
-		SELECT u.hash, get_byte(u.hash, 1) % 8, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
+		SELECT u.hash, get_byte(u.hash, 1) % 8, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase,
 		       u.locked, u.conflicting, u.frozen, u.unmined_since
 		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
-		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
-		            $11::bigint[])
-		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		            $6::boolean[], $7::boolean[], $8::boolean[], $9::boolean[],
+		            $10::bigint[])
+		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase,
 		          locked, conflicting, frozen, unmined_since)
 		ON CONFLICT (hash, partition_key) DO NOTHING
 		RETURNING hash`
+
+	// raw_tx lives in the txs_raw side table. Pipelined alongside the txs
+	// INSERT so one fsync covers both. ON CONFLICT covers retry paths.
+	const insertTxsRawSQL = `
+		INSERT INTO txs_raw (hash, partition_key, raw_tx)
+		SELECT u.hash, get_byte(u.hash, 1) % 8, u.raw_tx
+		FROM UNNEST($1::bytea[], $2::bytea[]) AS u(hash, raw_tx)
+		ON CONFLICT (hash, partition_key) DO NOTHING`
 
 	// outputs may include rows for txs that were filtered out by the txs
 	// ON CONFLICT (i.e., the parent tx already existed in the DB).
@@ -436,9 +456,10 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 	pgxBatch := &pgx.Batch{}
 	pgxBatch.Queue("BEGIN")
 	pgxBatch.Queue(insertTxsSQL,
-		hashes, versions, lockTimes, fees, sizes, coinbases, rawTxs,
+		hashes, versions, lockTimes, fees, sizes, coinbases,
 		lockeds, conflictings, frozens, unminedSinces,
 	)
+	pgxBatch.Queue(insertTxsRawSQL, hashes, rawTxs)
 	if len(outTxHashes) > 0 {
 		pgxBatch.Queue(insertOutputsSQL,
 			outTxHashes, outIdxs, outLockingScripts, outSatoshis,
@@ -475,6 +496,12 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 		newHashSet[h] = struct{}{}
 	}
 	rows.Close()
+	// Drain INSERT txs_raw.
+	if _, err := br.Exec(); err != nil {
+		br.Close()
+		failAll(errors.NewStorageError("failed to INSERT txs_raw via UNNEST: %v", err))
+		return
+	}
 	// Drain INSERT outputs (if queued).
 	if len(outTxHashes) > 0 {
 		if _, err := br.Exec(); err != nil {

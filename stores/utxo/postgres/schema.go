@@ -52,6 +52,7 @@ type partitionSpec struct {
 func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	ddlStatements := []string{
 		txsDDL,
+		txsRawDDL,
 		outputsDDL,
 		spendsDDL,
 	}
@@ -64,6 +65,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 
 	tables := []partitionSpec{
 		{name: "txs", fillfactor: 70},
+		{name: "txs_raw", fillfactor: 100},
 		{name: "outputs", fillfactor: 100},
 		{name: "spends", fillfactor: 100},
 	}
@@ -87,7 +89,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	// LZ4 compression on raw_tx (faster than default pglz).
-	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`)
+	_, _ = pool.Exec(ctx, `ALTER TABLE txs_raw ALTER COLUMN raw_tx SET COMPRESSION lz4`)
 
 	// Aggressive autovacuum on hot-update table.
 	_, _ = pool.Exec(ctx, `ALTER TABLE txs SET (
@@ -104,8 +106,9 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 // Table DDL — 3 LOGGED list-partitioned tables
 // ---------------------------------------------------------------------------
 
-// txs: consolidated transaction metadata + state + inputs (raw_tx) + block_ids
-// (arrays) + conflicting_children (array). LOGGED — UTXO set is durable state.
+// txs: consolidated transaction metadata + state + block_ids (arrays) +
+// conflicting_children (array). LOGGED — UTXO set is durable state.
+// raw_tx lives in the txs_raw side table to keep this row narrow.
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
     hash                 BYTEA NOT NULL,
@@ -115,7 +118,6 @@ CREATE TABLE IF NOT EXISTS txs (
     fee                  BIGINT NOT NULL,
     size_in_bytes        BIGINT NOT NULL,
     coinbase             BOOLEAN NOT NULL DEFAULT FALSE,
-    raw_tx               BYTEA,
     locked               BOOLEAN NOT NULL DEFAULT FALSE,
     conflicting          BOOLEAN NOT NULL DEFAULT FALSE,
     frozen               BOOLEAN NOT NULL DEFAULT FALSE,
@@ -127,6 +129,20 @@ CREATE TABLE IF NOT EXISTS txs (
     subtree_idxs         INT[],
     conflicting_children BYTEA[],
     inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (hash, partition_key)
+) PARTITION BY LIST (partition_key);`
+
+// txs_raw: side table holding the serialized raw transaction bytes. Split
+// out of txs to keep the hot row narrow — raw_tx is the largest column
+// (200B–500B per typical tx, larger for batched/coinbase) and is only read
+// when the caller asks for the Tx body. Partition-aligned 1:1 with txs by
+// (hash, partition_key); LEFT JOIN on Get-with-body reads only the
+// matching child partition.
+const txsRawDDL = `
+CREATE TABLE IF NOT EXISTS txs_raw (
+    hash          BYTEA NOT NULL,
+    partition_key SMALLINT NOT NULL,
+    raw_tx        BYTEA,
     PRIMARY KEY (hash, partition_key)
 ) PARTITION BY LIST (partition_key);`
 

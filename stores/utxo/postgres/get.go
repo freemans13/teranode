@@ -151,10 +151,12 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 	)
 
 	err := s.pool.QueryRow(ctx, `
-		SELECT version, lock_time, fee, size_in_bytes, coinbase,
-		       locked, conflicting, frozen, unmined_since, raw_tx,
-		       block_ids, block_heights, subtree_idxs, conflicting_children
-		FROM txs WHERE hash = $1`,
+		SELECT t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
+		       t.locked, t.conflicting, t.frozen, t.unmined_since, r.raw_tx,
+		       t.block_ids, t.block_heights, t.subtree_idxs, t.conflicting_children
+		FROM txs t
+		LEFT JOIN txs_raw r ON r.hash = t.hash AND r.partition_key = t.partition_key
+		WHERE t.hash = $1`,
 		hash[:],
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
 		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince, &rawTx,
@@ -417,11 +419,12 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	// Query 1: Bulk fetch from txs (single table, no JOIN).
 	inClause, inArgs := buildINClauseLocal(hashes, 1)
 
-	q := `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
-	             locked, conflicting, frozen, unmined_since, raw_tx,
-	             block_ids, block_heights, subtree_idxs
-	      FROM txs
-	      WHERE hash IN ` + inClause
+	q := `SELECT t.hash, t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
+	             t.locked, t.conflicting, t.frozen, t.unmined_since, r.raw_tx,
+	             t.block_ids, t.block_heights, t.subtree_idxs
+	      FROM txs t
+	      LEFT JOIN txs_raw r ON r.hash = t.hash AND r.partition_key = t.partition_key
+	      WHERE t.hash IN ` + inClause
 
 	rows, err := s.pool.Query(ctx, q, inArgs...)
 	if err != nil {

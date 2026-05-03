@@ -24,11 +24,12 @@ const iteratorBatchSize = 1024
 
 func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 	q := `
-		SELECT hash, fee, size_in_bytes, inserted_at, coinbase,
-		       locked, unmined_since, raw_tx, block_ids
-		FROM txs
-		WHERE unmined_since IS NOT NULL AND conflicting = false
-		ORDER BY hash
+		SELECT t.hash, t.fee, t.size_in_bytes, t.inserted_at, t.coinbase,
+		       t.locked, t.unmined_since, r.raw_tx, t.block_ids
+		FROM txs t
+		LEFT JOIN txs_raw r ON r.hash = t.hash AND r.partition_key = t.partition_key
+		WHERE t.unmined_since IS NOT NULL AND t.conflicting = false
+		ORDER BY t.hash
 	`
 
 	rows, err := store.pool.Query(context.Background(), q)
@@ -41,13 +42,14 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 
 func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unminedTxIterator, error) {
 	q := `
-		SELECT hash, fee, size_in_bytes, inserted_at, coinbase,
-		       locked, unmined_since, raw_tx, block_ids
-		FROM txs
-		WHERE unmined_since IS NOT NULL
-		  AND unmined_since <= $1
-		  AND conflicting = false
-		ORDER BY hash
+		SELECT t.hash, t.fee, t.size_in_bytes, t.inserted_at, t.coinbase,
+		       t.locked, t.unmined_since, r.raw_tx, t.block_ids
+		FROM txs t
+		LEFT JOIN txs_raw r ON r.hash = t.hash AND r.partition_key = t.partition_key
+		WHERE t.unmined_since IS NOT NULL
+		  AND t.unmined_since <= $1
+		  AND t.conflicting = false
+		ORDER BY t.hash
 	`
 
 	rows, err := store.pool.Query(context.Background(), q, int64(cutoffBlockHeight))

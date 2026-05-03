@@ -168,6 +168,7 @@ func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeigh
 			deleteStatements := []string{
 				`DELETE FROM spends WHERE prev_tx_hash = $1`,
 				`DELETE FROM outputs WHERE tx_hash = $1`,
+				`DELETE FROM txs_raw WHERE hash = $1`,
 				`DELETE FROM txs WHERE hash = $1`,
 			}
 
