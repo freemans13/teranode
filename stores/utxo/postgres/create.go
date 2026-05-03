@@ -14,22 +14,8 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// pgErrUniqueViolation is the SQLSTATE for a unique constraint violation,
-// raised at the per-child PRIMARY KEY when the same hash already exists.
-const pgErrUniqueViolation = "23505"
-
-// isUniqueViolation reports whether err is a postgres unique-constraint
-// violation. Used to translate "INSERT clashed with an existing row" into
-// a TxExistsError without ON CONFLICT (which postgres can't apply to the
-// partitioned parent — see schema.go for why constraints live per-child).
-func isUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == pgErrUniqueViolation
-}
 
 // ---------------------------------------------------------------------------
 // Batch types
@@ -239,17 +225,16 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 
 	// Insert against parent tables. Postgres routes the row to the right
 	// partition itself via the schema's PARTITION BY LIST declaration on
-	// partition_key. The parent-level PK on (hash, partition_key) is
-	// available now (added in the schema task) — Task 2 will switch this
-	// path to ON CONFLICT (hash, partition_key) DO NOTHING. Until then,
-	// duplicate-hash inserts surface as the parent PK's SQLSTATE 23505 —
-	// translated below into TxExistsError.
+	// partition_key. ON CONFLICT (hash, partition_key) silently skips a
+	// duplicate hash (returns no row); RETURNING hash returns the new row
+	// when inserted. ErrNoRows on a non-error scan means duplicate.
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
 		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children)
 		VALUES ($1, get_byte($1, 1) % 8, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		ON CONFLICT (hash, partition_key) DO NOTHING
 		RETURNING hash`,
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
@@ -257,7 +242,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil),
 	).Scan(&insertedHash)
 	if err != nil {
-		if isUniqueViolation(err) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
 		return nil, errors.NewStorageError("failed to create UTXO", err)
@@ -269,7 +254,8 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 			SELECT $1, get_byte($1, 1) % 8, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
 			FROM UNNEST($2::bigint[], $3::bytea[], $4::bigint[],
 						$5::boolean[], $6::bytea[], $7::bigint[])
-				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh)`,
+				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh)
+			ON CONFLICT (tx_hash, idx, partition_key) DO NOTHING`,
 			txHash[:],
 			outArrs.idx, outArrs.lockingScript, outArrs.satoshis,
 			outArrs.frozen, outArrs.utxoHash, outArrs.coinbaseSpendingHeight,
@@ -418,13 +404,10 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 	// trace 2026-04-29) accounted for 61% of all bench-worker blocking
 	// time. SendBatch sends all 4 statements in one TCP write; postgres
 	// processes them in order; we read the 4 responses in one TCP read.
-	// Bulk INSERT against parents. ON CONFLICT (hash, partition_key) is
-	// available now via the parent-level PK; Task 2 will switch this
-	// path to use it. For now, WHERE NOT EXISTS pre-filters out rows
-	// already in the table; the RETURNING tells us which were actually
-	// inserted. Within a shard, all writes serialize through this single
-	// worker connection, so there's no concurrent inserter that could
-	// race the NOT EXISTS / INSERT window.
+	// Bulk INSERT against parents. ON CONFLICT (hash, partition_key) DO
+	// NOTHING silently skips duplicate hashes — the RETURNING hash set
+	// tells us which were actually inserted, used downstream to route
+	// per-item results back to callers.
 	const insertTxsSQL = `
 		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since)
@@ -435,24 +418,20 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 		            $11::bigint[])
 		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 		          locked, conflicting, frozen, unmined_since)
-		WHERE NOT EXISTS (SELECT 1 FROM txs t WHERE t.hash = u.hash)
+		ON CONFLICT (hash, partition_key) DO NOTHING
 		RETURNING hash`
 
 	// outputs may include rows for txs that were filtered out by the txs
-	// WHERE NOT EXISTS (i.e., the parent tx already existed in the DB).
-	// Filter at the outputs level too so duplicate (tx_hash, idx) rows
-	// don't trip the per-child PK. The subquery prunes by partition key
-	// on tx_hash.
+	// ON CONFLICT (i.e., the parent tx already existed in the DB).
+	// ON CONFLICT (tx_hash, idx, partition_key) silently skips duplicate
+	// (tx_hash, idx) pairs.
 	const insertOutputsSQL = `
 		INSERT INTO outputs (tx_hash, partition_key, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
 		SELECT u.tx_hash, get_byte(u.tx_hash, 1) % 8, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
 		FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
 		            $5::boolean[], $6::bytea[], $7::bigint[])
 		     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh)
-		WHERE NOT EXISTS (
-		    SELECT 1 FROM outputs o
-		    WHERE o.tx_hash = u.tx_hash AND o.idx = u.idx
-		)`
+		ON CONFLICT (tx_hash, idx, partition_key) DO NOTHING`
 
 	pgxBatch := &pgx.Batch{}
 	pgxBatch.Queue("BEGIN")
