@@ -47,11 +47,14 @@ WITH validation AS (
     WHERE o.tx_hash = $1 AND o.idx = $2
 ),
 inserted AS (
-    -- ON CONFLICT can't target a partitioned parent (no parent-level
-    -- unique constraint); the validation CTE existing_spend IS NULL
-    -- predicate filters duplicates at the snapshot, and within-shard
-    -- serialization (one worker per shard, one held connection) prevents
-    -- a concurrent insert racing this statement for the same UTXO.
+    -- ON CONFLICT (prev_tx_hash, prev_output_idx, partition_key) is now
+    -- legal against the partitioned parent thanks to the parent-level
+    -- UNIQUE constraint added in the schema task. Task 3 will add the
+    -- ON CONFLICT clause back. For now, the validation CTE's
+    -- existing_spend IS NULL predicate filters duplicates at the
+    -- snapshot, and within-shard serialization (one worker per shard,
+    -- one held connection) prevents a concurrent insert racing this
+    -- statement for the same UTXO.
     INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
     SELECT $1, get_byte($1, 1) % 8, $2, $3
     FROM validation v
@@ -468,8 +471,9 @@ to_insert AS (
       AND NOT (COALESCE(spendable_in, 0) > 0 AND block_height < COALESCE(spendable_in, 0))
 ),
 inserted AS (
-    -- See note in spendValidationSQL about ON CONFLICT and partitioned
-    -- parents. to_insert is already filtered by the validation CTE.
+    -- See note in spendValidationSQL: ON CONFLICT is now legal but Task 3
+    -- adds it; for now, to_insert is already filtered by the validation
+    -- CTE.
     INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
     SELECT prev_tx_hash, get_byte(prev_tx_hash, 1) % 8, prev_idx, spending_data FROM to_insert
     RETURNING prev_tx_hash, prev_output_idx

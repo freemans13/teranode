@@ -239,11 +239,11 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 
 	// Insert against parent tables. Postgres routes the row to the right
 	// partition itself via the schema's PARTITION BY LIST declaration on
-	// `(get_byte(hash, 1) % NumPartitions)`. We can't use ON CONFLICT
-	// against the partitioned parent (no parent-level unique constraint;
-	// PG limitation), so duplicate-hash inserts surface as the per-child
-	// PK's 23505 — translated below into TxExistsError. After a successful
-	// txs insert the row is fresh, so the outputs insert can't collide.
+	// partition_key. The parent-level PK on (hash, partition_key) is
+	// available now (added in the schema task) — Task 2 will switch this
+	// path to ON CONFLICT (hash, partition_key) DO NOTHING. Until then,
+	// duplicate-hash inserts surface as the parent PK's SQLSTATE 23505 —
+	// translated below into TxExistsError.
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
 		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
@@ -418,12 +418,13 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 	// trace 2026-04-29) accounted for 61% of all bench-worker blocking
 	// time. SendBatch sends all 4 statements in one TCP write; postgres
 	// processes them in order; we read the 4 responses in one TCP read.
-	// Bulk INSERT against parents: postgres can't ON CONFLICT against the
-	// partitioned parent (no parent-spanning constraint). WHERE NOT EXISTS
-	// pre-filters out rows already in the table; the RETURNING tells us
-	// which were actually inserted. Within a shard, all writes serialize
-	// through this single worker connection, so there's no concurrent
-	// inserter that could race the NOT EXISTS / INSERT window.
+	// Bulk INSERT against parents. ON CONFLICT (hash, partition_key) is
+	// available now via the parent-level PK; Task 2 will switch this
+	// path to use it. For now, WHERE NOT EXISTS pre-filters out rows
+	// already in the table; the RETURNING tells us which were actually
+	// inserted. Within a shard, all writes serialize through this single
+	// worker connection, so there's no concurrent inserter that could
+	// race the NOT EXISTS / INSERT window.
 	const insertTxsSQL = `
 		INSERT INTO txs (hash, partition_key, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since)
