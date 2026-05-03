@@ -76,7 +76,7 @@ func (s *Store) runGetBatch(conn *pgxpool.Conn, batch []*batchGetItem) {
 		       b.block_ids, b.block_heights, b.subtree_idxs
 		FROM txs t
 		LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
-		WHERE t.hash = $1`
+		WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) % 8`
 
 	pgxBatch := &pgx.Batch{}
 	for _, item := range batch {
@@ -160,7 +160,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		LEFT JOIN txs_raw       r ON r.hash = t.hash AND r.partition_key = t.partition_key
 		LEFT JOIN txs_blocks    b ON b.hash = t.hash AND b.partition_key = t.partition_key
 		LEFT JOIN txs_conflicts c ON c.hash = t.hash AND c.partition_key = t.partition_key
-		WHERE t.hash = $1`,
+		WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) % 8`,
 		hash[:],
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
 		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince, &rawTx,
@@ -196,7 +196,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		rows, err := s.pool.Query(ctx, `
 			SELECT idx, locking_script, satoshis
 			FROM outputs
-			WHERE tx_hash = $1
+			WHERE tx_hash = $1 AND partition_key = get_byte($1, 1) % 8
 			ORDER BY idx`,
 			hash[:],
 		)
@@ -251,8 +251,8 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		rows, err := s.pool.Query(ctx, `
 			SELECT o.idx, sp.spending_data, o.frozen
 			FROM outputs o
-			LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
-			WHERE o.tx_hash = $1
+			LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
+			WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8
 			ORDER BY o.idx`,
 			hash[:],
 		)
@@ -321,9 +321,9 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		SELECT o.utxo_hash, o.coinbase_spending_height, sp.spending_data,
 		       o.frozen OR t.frozen, o.spendable_in, t.conflicting, t.locked
 		FROM outputs o
-		JOIN txs t ON t.hash = o.tx_hash
-		LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
-		WHERE o.tx_hash = $1 AND o.idx = $2`,
+		JOIN txs t ON t.hash = o.tx_hash AND t.partition_key = o.partition_key
+		LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
+		WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8 AND o.idx = $2`,
 		spend.TxID[:], spend.Vout,
 	).Scan(&utxoHashBytes, &coinbaseSpendingHeight, &spendingDataBytes, &frozen, &spendableIn, &conflicting, &locked)
 	if err != nil {

@@ -42,9 +42,9 @@ WITH validation AS (
            t.frozen AS tx_frozen,
            sp.spending_data AS existing_spend
     FROM outputs o
-    JOIN txs t ON t.hash = o.tx_hash
-    LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
-    WHERE o.tx_hash = $1 AND o.idx = $2
+    JOIN txs t ON t.hash = o.tx_hash AND t.partition_key = o.partition_key
+    LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
+    WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8 AND o.idx = $2
 ),
 inserted AS (
     -- ON CONFLICT silently skips a duplicate (prev_tx_hash, prev_output_idx).
@@ -91,9 +91,9 @@ SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
        t.frozen AS tx_frozen,
        sp.spending_data AS existing_spend
 FROM outputs o
-JOIN txs t ON t.hash = o.tx_hash
-LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
-WHERE o.tx_hash = $1 AND o.idx = $2
+JOIN txs t ON t.hash = o.tx_hash AND t.partition_key = o.partition_key
+LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
+WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8 AND o.idx = $2
 `
 
 // ---------------------------------------------------------------------------
@@ -630,7 +630,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 			continue
 		}
 		_, err := s.pool.Exec(ctx,
-			`DELETE FROM spends WHERE prev_tx_hash = $1 AND prev_output_idx = $2`,
+			`DELETE FROM spends WHERE prev_tx_hash = $1 AND partition_key = get_byte($1, 1) % 8 AND prev_output_idx = $2`,
 			spend.TxID[:], spend.Vout,
 		)
 		if err != nil {

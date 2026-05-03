@@ -59,7 +59,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 				UPDATE txs SET
 				  conflicting = $2,
 				  delete_at_height = COALESCE(delete_at_height, $3)
-				WHERE hash = $1`,
+				WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
 				txHash[:], setValue, deleteAtHeight,
 			)
 		} else {
@@ -68,7 +68,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 				UPDATE txs SET
 				  conflicting = $2,
 				  delete_at_height = $3
-				WHERE hash = $1`,
+				WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
 				txHash[:], setValue, deleteAtHeight,
 			)
 		}
@@ -121,7 +121,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			rows, queryErr := s.pool.Query(ctx, `
 				SELECT sp.spending_data
 				FROM spends sp
-				WHERE sp.prev_tx_hash = $1`,
+				WHERE sp.prev_tx_hash = $1 AND sp.partition_key = get_byte($1, 1) % 8`,
 				txHash[:],
 			)
 			if queryErr != nil {

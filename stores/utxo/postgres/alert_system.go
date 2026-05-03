@@ -22,8 +22,8 @@ func (s *Store) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *settin
 		err := s.pool.QueryRow(ctx, `
 			SELECT o.frozen, sp.spending_data
 			FROM outputs o
-			LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
-			WHERE o.tx_hash = $1 AND o.idx = $2
+			LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
+			WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8 AND o.idx = $2
 		`, spend.TxID[:], spend.Vout).Scan(&outputFrozen, &spendingData)
 		if err != nil {
 			return errors.NewStorageError("[FreezeUTXOs] output lookup failed for %s:%d", spend.TxID, spend.Vout, err)
@@ -44,7 +44,7 @@ func (s *Store) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *settin
 		// Freeze the output.
 		_, err = s.pool.Exec(ctx, `
 			UPDATE outputs SET frozen = true
-			WHERE tx_hash = $1 AND idx = $2
+			WHERE tx_hash = $1 AND partition_key = get_byte($1, 1) % 8 AND idx = $2
 		`, spend.TxID[:], spend.Vout)
 		if err != nil {
 			return errors.NewStorageError("[FreezeUTXOs] failed to freeze output %s:%d", spend.TxID, spend.Vout, err)
@@ -52,7 +52,7 @@ func (s *Store) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *settin
 
 		// Set frozen on txs.
 		_, err = s.pool.Exec(ctx, `
-			UPDATE txs SET frozen = true WHERE hash = $1
+			UPDATE txs SET frozen = true WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8
 		`, spend.TxID[:])
 		if err != nil {
 			return errors.NewStorageError("[FreezeUTXOs] failed to freeze txs for %s", spend.TxID, err)
@@ -69,7 +69,7 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 		// Verify output is frozen.
 		var outputFrozen bool
 		err := s.pool.QueryRow(ctx, `
-			SELECT o.frozen FROM outputs o WHERE o.tx_hash = $1 AND o.idx = $2
+			SELECT o.frozen FROM outputs o WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8 AND o.idx = $2
 		`, spend.TxID[:], spend.Vout).Scan(&outputFrozen)
 		if err != nil {
 			return errors.NewStorageError("[UnFreezeUTXOs] output lookup failed for %s:%d", spend.TxID, spend.Vout, err)
@@ -82,7 +82,7 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 		// Unfreeze the output.
 		_, err = s.pool.Exec(ctx, `
 			UPDATE outputs SET frozen = false
-			WHERE tx_hash = $1 AND idx = $2 AND frozen = true
+			WHERE tx_hash = $1 AND partition_key = get_byte($1, 1) % 8 AND idx = $2 AND frozen = true
 		`, spend.TxID[:], spend.Vout)
 		if err != nil {
 			return errors.NewStorageError("[UnFreezeUTXOs] failed to unfreeze output %s:%d", spend.TxID, spend.Vout, err)
@@ -91,7 +91,7 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 		// Only clear txs.frozen if no other frozen outputs remain.
 		var remainingFrozen int
 		err = s.pool.QueryRow(ctx, `
-			SELECT COUNT(*) FROM outputs WHERE tx_hash = $1 AND frozen = true
+			SELECT COUNT(*) FROM outputs WHERE tx_hash = $1 AND partition_key = get_byte($1, 1) % 8 AND frozen = true
 		`, spend.TxID[:]).Scan(&remainingFrozen)
 		if err != nil {
 			return errors.NewStorageError("[UnFreezeUTXOs] failed to count frozen outputs for %s", spend.TxID, err)
@@ -99,7 +99,7 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 
 		if remainingFrozen == 0 {
 			_, err = s.pool.Exec(ctx, `
-				UPDATE txs SET frozen = false WHERE hash = $1
+				UPDATE txs SET frozen = false WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8
 			`, spend.TxID[:])
 			if err != nil {
 				return errors.NewStorageError("[UnFreezeUTXOs] failed to unfreeze txs for %s", spend.TxID, err)
@@ -116,7 +116,7 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 	// Verify source UTXO is frozen.
 	var outputFrozen bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT o.frozen FROM outputs o WHERE o.tx_hash = $1 AND o.idx = $2
+		SELECT o.frozen FROM outputs o WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) % 8 AND o.idx = $2
 	`, utxoSpend.TxID[:], utxoSpend.Vout).Scan(&outputFrozen)
 	if err != nil {
 		return errors.NewStorageError("[ReAssignUTXO] output lookup failed for %s:%d", utxoSpend.TxID, utxoSpend.Vout, err)
@@ -137,7 +137,7 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 	_, err = s.pool.Exec(ctx, `
 		UPDATE outputs
 		SET utxo_hash = $1, frozen = false, spendable_in = $2
-		WHERE tx_hash = $3 AND idx = $4 AND frozen = true
+		WHERE tx_hash = $3 AND partition_key = get_byte($3, 1) % 8 AND idx = $4 AND frozen = true
 	`, newUtxo.UTXOHash[:], int32(spendableIn), utxoSpend.TxID[:], utxoSpend.Vout)
 	if err != nil {
 		return errors.NewStorageError("[ReAssignUTXO] failed for %s:%d", utxoSpend.TxID, utxoSpend.Vout, err)

@@ -151,7 +151,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	for _, hash := range hashes {
 		var blockIDs, blockHeights, subtreeIdxs []int32
 		err := s.pool.QueryRow(ctx,
-			`SELECT block_ids, block_heights, subtree_idxs FROM txs_blocks WHERE hash = $1`,
+			`SELECT block_ids, block_heights, subtree_idxs FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
 			hash[:],
 		).Scan(&blockIDs, &blockHeights, &subtreeIdxs)
 		if err != nil {
@@ -181,7 +181,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 
 		_, err = s.pool.Exec(ctx, `
 			UPDATE txs_blocks SET block_ids = $2, block_heights = $3, subtree_idxs = $4
-			WHERE hash = $1`,
+			WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
 			hash[:], newBlockIDs, newBlockHeights, newSubtreeIdxs,
 		)
 		if err != nil {
@@ -191,7 +191,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 		// If no block_ids remain after removal, set txs.unmined_since.
 		if len(newBlockIDs) == 0 {
 			_, err = s.pool.Exec(ctx, `
-				UPDATE txs SET unmined_since = $2 WHERE hash = $1`,
+				UPDATE txs SET unmined_since = $2 WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
 				hash[:], currentBlockHeight,
 			)
 			if err != nil {
@@ -214,7 +214,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 func (s *Store) fetchBlockIDs(ctx context.Context, hash *chainhash.Hash) ([]uint32, error) {
 	var blockIDs []int32
 	err := s.pool.QueryRow(ctx,
-		`SELECT block_ids FROM txs_blocks WHERE hash = $1`,
+		`SELECT block_ids FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) % 8`,
 		hash[:],
 	).Scan(&blockIDs)
 	if err != nil {
