@@ -81,10 +81,11 @@ type Store struct {
 	// input channel + one worker goroutine holding one pgxpool connection
 	// for life. Items are routed to a shard by byte 0 of tx_hash; in-shard
 	// partition selection is left to postgres via PARTITION BY LIST.
-	// Total slots/workers = NumShards × 4 ops.
+	// Total slots/workers = NumShards × 3 ops. Get goes pool-direct
+	// (no worker) — reads have no fsync to amortize, so parallel pool
+	// connections beat per-shard SendBatch serialization.
 	createSlots [NumShards]*shardSlot[*batchCreateItem]
 	spendSlots  [NumShards]*shardSlot[*batchSpendItem]
-	getSlots    [NumShards]*shardSlot[*batchGetItem]
 	unlockSlots [NumShards]*shardSlot[*batchUnlockItem]
 	workersWG   sync.WaitGroup
 
@@ -93,10 +94,10 @@ type Store struct {
 }
 
 // workersStarted reports whether the per-shard slot array is up.
-// Public-API methods (Get, Spend, Create, SetLocked) check this to decide
+// Public-API methods (Spend, Create, SetLocked) check this to decide
 // whether to dispatch through workers or fall back to direct paths.
 func (s *Store) workersStarted() bool {
-	return s.getSlots[0] != nil
+	return s.createSlots[0] != nil
 }
 
 // New creates a new direct-write UTXO store.
@@ -109,11 +110,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
-	// Pool sized for NumShards × 4 ops concurrent long-held worker
-	// connections, plus headroom for direct-path queries (Get with body,
+	// Pool sized for NumShards × 3 ops concurrent long-held worker
+	// connections (Create, Spend, Unlock — Get is pool-direct), plus
+	// headroom for direct-path queries (Get, GetSpend with body,
 	// PreviousOutputsDecorate, mined updates, etc.). Pre-warmed so the
 	// dispatch path sees no connection-open latency.
-	poolSize := int32(NumShards*4 + 64)
+	poolSize := int32(NumShards*3 + 64)
 	pgxConfig.MaxConns = poolSize
 	pgxConfig.MinConns = poolSize
 	pgxConfig.MaxConnIdleTime = 30 * time.Minute
@@ -154,10 +156,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	return s, nil
 }
 
-// Start spawns the per-shard worker slots (4 ops × NumShards). Each
-// worker holds a pgxpool connection for its lifetime and dispatches
-// micro-batches of items routed to its shard. Without Start(),
-// Get/Spend/Create/SetLocked fall back to direct (unbatched) paths.
+// Start spawns the per-shard worker slots (3 ops × NumShards: Create,
+// Spend, Unlock). Each worker holds a pgxpool connection for its lifetime
+// and dispatches micro-batches of items routed to its shard. Without
+// Start(), Spend/Create/SetLocked fall back to direct (unbatched) paths.
+// Get is always pool-direct.
 func (s *Store) Start(ctx context.Context) {
 	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
 	if storeBatchSize <= 0 {
@@ -176,7 +179,6 @@ func (s *Store) Start(ctx context.Context) {
 		spendBatchDuration = 10 * time.Millisecond
 	}
 
-	const getBatchSize = 500
 	const unlockBatchSize = 500
 
 	// Input channel buffer per worker. Generous so callers don't block on
@@ -201,13 +203,6 @@ func (s *Store) Start(ctx context.Context) {
 		}
 		s.spendSlots[sh] = ss
 
-		gs, err := newShardSlot[*batchGetItem](ctx, s.logger, s.pool, sh, getBatchSize, storeBatchDuration, inBuf, s.runGetBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start get slot sh=%d: %v", sh, err)
-			continue
-		}
-		s.getSlots[sh] = gs
-
 		us, err := newShardSlot[*batchUnlockItem](ctx, s.logger, s.pool, sh, unlockBatchSize, storeBatchDuration, inBuf, s.runUnlockBatch, &s.workersWG)
 		if err != nil {
 			s.logger.Errorf("[Start] failed to start unlock slot sh=%d: %v", sh, err)
@@ -228,10 +223,6 @@ func (s *Store) Stop() {
 		if s.spendSlots[sh] != nil {
 			s.spendSlots[sh].Stop()
 			s.spendSlots[sh] = nil
-		}
-		if s.getSlots[sh] != nil {
-			s.getSlots[sh].Stop()
-			s.getSlots[sh] = nil
 		}
 		if s.unlockSlots[sh] != nil {
 			s.unlockSlots[sh].Stop()
