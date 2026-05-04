@@ -45,45 +45,61 @@ type shardWorker[T any] struct {
 	wg        *sync.WaitGroup
 }
 
-// newShardSlot creates one (shard × op) slot with a single worker
-// holding one connection. The input channel is buffered so callers don't
-// block under bursty load.
+// newShardSlot creates one (shard × op) slot with K worker goroutines
+// sharing the same input channel. Each worker holds its own pgxpool
+// connection for life and dispatches its own micro-batches. K parallel
+// workers give K parallel pgx.Batch streams against K postgres backends —
+// useful for read ops where per-backend serialization is the bottleneck.
+// The input channel is buffered so callers don't block under bursty load.
 func newShardSlot[T any](
 	ctx context.Context,
 	logger ulogger.Logger,
 	pool *pgxpool.Pool,
 	shard int,
+	workers int,
 	batchSize int,
 	duration time.Duration,
 	inputBuffer int,
 	dispatch func(conn *pgxpool.Conn, batch []T),
 	wg *sync.WaitGroup,
 ) (*shardSlot[T], error) {
+	if workers < 1 {
+		workers = 1
+	}
 	slot := &shardSlot[T]{
 		shard: shard,
 		input: make(chan T, inputBuffer),
 		done:  make(chan struct{}),
 	}
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		close(slot.done)
-		return nil, err
+	for i := 0; i < workers; i++ {
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			// Roll back any conns acquired so far + signal goroutines to exit.
+			close(slot.done)
+			for _, w := range slot.workers {
+				if w.conn != nil {
+					w.conn.Release()
+					w.conn = nil
+				}
+			}
+			return nil, err
+		}
+		w := &shardWorker[T]{
+			shard:     shard,
+			pool:      pool,
+			conn:      conn,
+			logger:    logger,
+			input:     slot.input,
+			batchSize: batchSize,
+			duration:  duration,
+			dispatch:  dispatch,
+			done:      slot.done,
+			wg:        wg,
+		}
+		slot.workers = append(slot.workers, w)
+		wg.Add(1)
+		go w.run()
 	}
-	w := &shardWorker[T]{
-		shard:     shard,
-		pool:      pool,
-		conn:      conn,
-		logger:    logger,
-		input:     slot.input,
-		batchSize: batchSize,
-		duration:  duration,
-		dispatch:  dispatch,
-		done:      slot.done,
-		wg:        wg,
-	}
-	slot.workers = append(slot.workers, w)
-	wg.Add(1)
-	go w.run()
 	return slot, nil
 }
 

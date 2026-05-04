@@ -21,6 +21,14 @@ var _ utxo.Store = (*Store)(nil)
 
 const txCacheMaxSize = 100_000
 
+// getWorkersPerShard is the number of parallel Get worker goroutines per
+// shard slot. Each worker holds its own pgxpool connection and runs its
+// own pgx.Batch stream — so K=8 means 8 parallel postgres backends serving
+// reads out of the same input channel. Reads scale with K; writes
+// (Create/Spend/Unlock) keep K=1 because connection affinity matters for
+// fsync amortization on the WAL side.
+const getWorkersPerShard = 8
+
 // txCache is a simple bounded in-process cache for recently created transactions.
 type txCache struct {
 	mu      sync.RWMutex
@@ -78,10 +86,11 @@ type Store struct {
 	medianBlockTime atomic.Uint32
 
 	// Per-(shard × op) slots. Each slot is one independent pipeline:
-	// input channel + one worker goroutine holding one pgxpool connection
-	// for life. Items are routed to a shard by byte 0 of tx_hash; in-shard
-	// partition selection is left to postgres via PARTITION BY LIST.
-	// Total slots/workers = NumShards × 4 ops.
+	// input channel + one or more worker goroutines, each holding one
+	// pgxpool connection for life. Items are routed to a shard by byte 0
+	// of tx_hash; in-shard partition selection is left to postgres via
+	// PARTITION BY LIST. Write slots (Create, Spend, Unlock) run with K=1;
+	// the Get slot runs with K=getWorkersPerShard for read parallelism.
 	createSlots [NumShards]*shardSlot[*batchCreateItem]
 	spendSlots  [NumShards]*shardSlot[*batchSpendItem]
 	getSlots    [NumShards]*shardSlot[*batchGetItem]
@@ -109,11 +118,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
-	// Pool sized for NumShards × 4 ops concurrent long-held worker
-	// connections, plus headroom for direct-path queries (Get with body,
-	// PreviousOutputsDecorate, mined updates, etc.). Pre-warmed so the
-	// dispatch path sees no connection-open latency.
-	poolSize := int32(NumShards*4 + 64)
+	// Pool sized for the long-held worker connections plus headroom for
+	// direct-path queries (Get with body, PreviousOutputsDecorate, mined
+	// updates, etc.). Held conns per shard = 3 write slots (Create, Spend,
+	// Unlock × 1 worker each) + getWorkersPerShard for the Get slot. Pre-
+	// warmed so the dispatch path sees no connection-open latency.
+	poolSize := int32(NumShards*(3+getWorkersPerShard) + 64)
 	pgxConfig.MaxConns = poolSize
 	pgxConfig.MinConns = poolSize
 	pgxConfig.MaxConnIdleTime = 30 * time.Minute
@@ -187,28 +197,28 @@ func (s *Store) Start(ctx context.Context) {
 	// items routed to shard A do not touch shard B's worker or its
 	// in-flight queries.
 	for sh := 0; sh < NumShards; sh++ {
-		cs, err := newShardSlot[*batchCreateItem](ctx, s.logger, s.pool, sh, storeBatchSize, storeBatchDuration, inBuf, s.runCreateBatch, &s.workersWG)
+		cs, err := newShardSlot[*batchCreateItem](ctx, s.logger, s.pool, sh, 1, storeBatchSize, storeBatchDuration, inBuf, s.runCreateBatch, &s.workersWG)
 		if err != nil {
 			s.logger.Errorf("[Start] failed to start create slot sh=%d: %v", sh, err)
 			continue
 		}
 		s.createSlots[sh] = cs
 
-		ss, err := newShardSlot[*batchSpendItem](ctx, s.logger, s.pool, sh, spendBatchSize, spendBatchDuration, inBuf, s.runSpendBatch, &s.workersWG)
+		ss, err := newShardSlot[*batchSpendItem](ctx, s.logger, s.pool, sh, 1, spendBatchSize, spendBatchDuration, inBuf, s.runSpendBatch, &s.workersWG)
 		if err != nil {
 			s.logger.Errorf("[Start] failed to start spend slot sh=%d: %v", sh, err)
 			continue
 		}
 		s.spendSlots[sh] = ss
 
-		gs, err := newShardSlot[*batchGetItem](ctx, s.logger, s.pool, sh, getBatchSize, storeBatchDuration, inBuf, s.runGetBatch, &s.workersWG)
+		gs, err := newShardSlot[*batchGetItem](ctx, s.logger, s.pool, sh, getWorkersPerShard, getBatchSize, storeBatchDuration, inBuf, s.runGetBatch, &s.workersWG)
 		if err != nil {
 			s.logger.Errorf("[Start] failed to start get slot sh=%d: %v", sh, err)
 			continue
 		}
 		s.getSlots[sh] = gs
 
-		us, err := newShardSlot[*batchUnlockItem](ctx, s.logger, s.pool, sh, unlockBatchSize, storeBatchDuration, inBuf, s.runUnlockBatch, &s.workersWG)
+		us, err := newShardSlot[*batchUnlockItem](ctx, s.logger, s.pool, sh, 1, unlockBatchSize, storeBatchDuration, inBuf, s.runUnlockBatch, &s.workersWG)
 		if err != nil {
 			s.logger.Errorf("[Start] failed to start unlock slot sh=%d: %v", sh, err)
 			continue
