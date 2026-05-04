@@ -32,18 +32,18 @@ var (
 		       t.locked, t.conflicting, t.frozen, t.unmined_since,
 		       b.block_ids, b.block_heights, b.subtree_idxs
 		FROM txs t
-		LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
-		WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+		LEFT JOIN txs_blocks b ON b.hash = $1 AND b.partition_key = get_byte($1, 1) %% %d
+		WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) %% %d`, NumPartitions, NumPartitions)
 
 	getInternalSQL = fmt.Sprintf(`
 		SELECT t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
 		       t.locked, t.conflicting, t.frozen, t.unmined_since, r.raw_tx,
 		       b.block_ids, b.block_heights, b.subtree_idxs, c.conflicting_children
 		FROM txs t
-		LEFT JOIN txs_raw       r ON r.hash = t.hash AND r.partition_key = t.partition_key
-		LEFT JOIN txs_blocks    b ON b.hash = t.hash AND b.partition_key = t.partition_key
-		LEFT JOIN txs_conflicts c ON c.hash = t.hash AND c.partition_key = t.partition_key
-		WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+		LEFT JOIN txs_raw       r ON r.hash = $1 AND r.partition_key = get_byte($1, 1) %% %d
+		LEFT JOIN txs_blocks    b ON b.hash = $1 AND b.partition_key = get_byte($1, 1) %% %d
+		LEFT JOIN txs_conflicts c ON c.hash = $1 AND c.partition_key = get_byte($1, 1) %% %d
+		WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) %% %d`, NumPartitions, NumPartitions, NumPartitions, NumPartitions)
 
 	getInternalOutputsSQL = fmt.Sprintf(`
 			SELECT idx, locking_script, satoshis
