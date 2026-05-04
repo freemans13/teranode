@@ -16,14 +16,6 @@ import (
 // Larger chunks = fewer round trips. Simple array append keeps per-row cost constant.
 const minedChunkSize = 2000
 
-// setMinedParallelism is the number of goroutines that fan out chunk dispatch
-// across the pool. Each holds its own pool connection for the lifetime of the
-// fan-out so postgres can run the upsert + UPDATE in parallel. Tuned to stay
-// well below the pool size (NumShards*(8+8+4+4) + 64 = 88 today, ~64 spare
-// after validator-held conns) so the rest of the store still has connections
-// available for BatchDecorate / Get-with-body / iterators / pruner.
-const setMinedParallelism = 32
-
 // SQL strings for mined operations. The `% NumPartitions` modulus is
 // substituted from the Go constant so bumping NumPartitions automatically
 // updates every partition_key derivation.
@@ -123,9 +115,10 @@ var (
 )
 
 // SetMinedMulti updates the block ID for multiple transactions that have been mined.
-// Normal path: one writable-CTE statement per chunk, fanned out across N pool
-// connections via errgroup. Each chunk's CTE upserts into txs_blocks and updates
-// txs flags in one round-trip.
+// Normal path: hashes are bucketed by partition_key (byte 1 % NumPartitions)
+// and one goroutine per non-empty partition runs the writable-CTE upsert.
+// Partition affinity ensures each worker writes only to one txs/txs_blocks
+// child partition, removing lwlock contention on shared-buffer pages.
 // UnsetMined path (reorg): read arrays, remove entry in Go, write back.
 // Returns a map of each hash to its list of block_ids.
 func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
@@ -169,42 +162,28 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		chunkSQL = minedChunkNotOnLongestSQL
 	}
 
+	// Bucket hashes by partition_key (byte 1 % NumPartitions) so each worker
+	// writes only to one child partition (txs_p0X / txs_blocks_p0X). This
+	// eliminates lwlock contention on shared-buffer pages — backends never
+	// touch the same heap or index pages. Natural parallelism = NumPartitions.
 	allHashBytes := make([][]byte, len(hashes))
+	buckets := make([][][]byte, NumPartitions)
 	for i, h := range hashes {
 		allHashBytes[i] = h[:]
+		p := int(h[1]) % NumPartitions
+		buckets[p] = append(buckets[p], h[:])
 	}
-
-	// Build chunk slices up front so the dispatch goroutines just consume.
-	type chunkJob struct {
-		bytes [][]byte
-	}
-	numChunks := (len(allHashBytes) + minedChunkSize - 1) / minedChunkSize
-	chunks := make([]chunkJob, 0, numChunks)
-	for i := 0; i < len(allHashBytes); i += minedChunkSize {
-		end := i + minedChunkSize
-		if end > len(allHashBytes) {
-			end = len(allHashBytes)
-		}
-		chunks = append(chunks, chunkJob{bytes: allHashBytes[i:end]})
-	}
-
-	// Fan-out: cap parallelism at min(setMinedParallelism, numChunks).
-	parallelism := setMinedParallelism
-	if parallelism > len(chunks) {
-		parallelism = len(chunks)
-	}
-	if parallelism < 1 {
-		parallelism = 1
-	}
-
-	chunkCh := make(chan chunkJob, len(chunks))
-	for _, c := range chunks {
-		chunkCh <- c
-	}
-	close(chunkCh)
 
 	g, gctx := errgroup.WithContext(ctx)
-	for w := 0; w < parallelism; w++ {
+	blockID := int32(minedBlockInfo.BlockID)
+	blockHeightArg := int32(minedBlockInfo.BlockHeight)
+	subtreeIdx := int32(minedBlockInfo.SubtreeIdx)
+
+	for p := 0; p < NumPartitions; p++ {
+		bucket := buckets[p]
+		if len(bucket) == 0 {
+			continue
+		}
 		g.Go(func() error {
 			conn, err := s.pool.Acquire(gctx)
 			if err != nil {
@@ -212,20 +191,23 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			}
 			defer conn.Release()
 
-			blockID := int32(minedBlockInfo.BlockID)
-			blockHeightArg := int32(minedBlockInfo.BlockHeight)
-			subtreeIdx := int32(minedBlockInfo.SubtreeIdx)
-
-			for c := range chunkCh {
+			// Sub-chunk if the bucket is bigger than minedChunkSize so a
+			// single huge UNNEST array doesn't dominate per-statement cost.
+			for i := 0; i < len(bucket); i += minedChunkSize {
+				end := i + minedChunkSize
+				if end > len(bucket) {
+					end = len(bucket)
+				}
+				chunk := bucket[i:end]
 				if withDAH {
 					if _, err := conn.Exec(gctx, chunkSQL,
-						c.bytes, blockID, blockHeightArg, subtreeIdx, newDAH,
+						chunk, blockID, blockHeightArg, subtreeIdx, newDAH,
 					); err != nil {
 						return errors.NewStorageError("[SetMinedMulti] chunk: %v", err)
 					}
 				} else {
 					if _, err := conn.Exec(gctx, chunkSQL,
-						c.bytes, blockID, blockHeightArg, subtreeIdx,
+						chunk, blockID, blockHeightArg, subtreeIdx,
 					); err != nil {
 						return errors.NewStorageError("[SetMinedMulti] chunk: %v", err)
 					}
