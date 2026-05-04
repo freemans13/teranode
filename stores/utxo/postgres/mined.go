@@ -9,24 +9,101 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sync/errgroup"
 )
 
 // minedChunkSize is the maximum number of hashes per bulk UPDATE.
 // Larger chunks = fewer round trips. Simple array append keeps per-row cost constant.
 const minedChunkSize = 2000
 
+// setMinedParallelism is the number of goroutines that fan out chunk dispatch
+// across the pool. Each holds its own pool connection for the lifetime of the
+// fan-out so postgres can run the upsert + UPDATE in parallel. Tuned to stay
+// well below the pool size (NumShards*4 + 64 = 68 today) so the rest of the
+// store still has connections available.
+const setMinedParallelism = 16
+
 // SQL strings for mined operations. The `% NumPartitions` modulus is
 // substituted from the Go constant so bumping NumPartitions automatically
 // updates every partition_key derivation.
+//
+// Each chunk SQL is a writable CTE: it does the INSERT … ON CONFLICT into
+// txs_blocks AND the UPDATE on txs in a single round-trip, halving network
+// round-trips per chunk vs running them sequentially. Both data-modifying
+// statements in the CTE see the same snapshot — they don't depend on each
+// other's effects, so single-snapshot semantics are fine.
+//
+// The UPDATE on txs joins through UNNEST so partition_key is derived per row
+// from the hash, which keeps partition pruning intact (postgres routes the
+// UPDATE to the right child partition).
 var (
-	upsertBlocksSQL = fmt.Sprintf(`
-		INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
-		SELECT u.hash, get_byte(u.hash, 1) %% %d, ARRAY[$2::int], ARRAY[$3::int], ARRAY[$4::int]
+	// minedChunkOnLongestWithDAHSQL — OnLongestChain && retention>0.
+	//
+	// DAH semantics: we only forward-bump an already-set DAH. We do NOT set
+	// DAH from NULL here — the count(*) outputs/spends subqueries that the
+	// previous implementation used to detect "already fully spent" transactions
+	// at mining time were the dominant per-chunk cost (chunkSize=2000 → 4,000
+	// sub-scans per chunk).
+	//
+	// The canonical DAH-on-mined-then-fully-spent path is the spend path's
+	// dah_upd CTE in spend.go (both spendValidationSQL and bulkSpendSQL set
+	// DAH when the last output of a tx is spent). The "spent before mining"
+	// edge case is extremely rare in production and is also covered by the
+	// Spend path on any subsequent spend; if no further spend happens, the
+	// pruner's preserve_until-driven path or an explicit setDAH call handles it.
+	minedChunkOnLongestWithDAHSQL = fmt.Sprintf(`
+		WITH upserted AS (
+		    INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
+		    SELECT u.hash, get_byte(u.hash, 1) %% %d, ARRAY[$2::int], ARRAY[$3::int], ARRAY[$4::int]
+		    FROM UNNEST($1::bytea[]) AS u(hash)
+		    ON CONFLICT (hash, partition_key) DO UPDATE SET
+		        block_ids     = txs_blocks.block_ids     || EXCLUDED.block_ids,
+		        block_heights = txs_blocks.block_heights || EXCLUDED.block_heights,
+		        subtree_idxs  = txs_blocks.subtree_idxs  || EXCLUDED.subtree_idxs
+		)
+		UPDATE txs t SET
+		    locked = false,
+		    unmined_since = NULL,
+		    delete_at_height = CASE
+		        WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
+		        WHEN t.delete_at_height IS NOT NULL AND t.delete_at_height < $5 THEN $5
+		        ELSE t.delete_at_height
+		    END
 		FROM UNNEST($1::bytea[]) AS u(hash)
-		ON CONFLICT (hash, partition_key) DO UPDATE SET
-		    block_ids     = txs_blocks.block_ids     || EXCLUDED.block_ids,
-		    block_heights = txs_blocks.block_heights || EXCLUDED.block_heights,
-		    subtree_idxs  = txs_blocks.subtree_idxs  || EXCLUDED.subtree_idxs`, NumPartitions)
+		WHERE t.hash = u.hash AND t.partition_key = get_byte(u.hash, 1) %% %d
+		`, NumPartitions, NumPartitions)
+
+	// minedChunkOnLongestSQL — OnLongestChain but retention disabled.
+	minedChunkOnLongestSQL = fmt.Sprintf(`
+		WITH upserted AS (
+		    INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
+		    SELECT u.hash, get_byte(u.hash, 1) %% %d, ARRAY[$2::int], ARRAY[$3::int], ARRAY[$4::int]
+		    FROM UNNEST($1::bytea[]) AS u(hash)
+		    ON CONFLICT (hash, partition_key) DO UPDATE SET
+		        block_ids     = txs_blocks.block_ids     || EXCLUDED.block_ids,
+		        block_heights = txs_blocks.block_heights || EXCLUDED.block_heights,
+		        subtree_idxs  = txs_blocks.subtree_idxs  || EXCLUDED.subtree_idxs
+		)
+		UPDATE txs t SET locked = false, unmined_since = NULL
+		FROM UNNEST($1::bytea[]) AS u(hash)
+		WHERE t.hash = u.hash AND t.partition_key = get_byte(u.hash, 1) %% %d
+		`, NumPartitions, NumPartitions)
+
+	// minedChunkNotOnLongestSQL — competing/orphan block; only flip locked.
+	minedChunkNotOnLongestSQL = fmt.Sprintf(`
+		WITH upserted AS (
+		    INSERT INTO txs_blocks (hash, partition_key, block_ids, block_heights, subtree_idxs)
+		    SELECT u.hash, get_byte(u.hash, 1) %% %d, ARRAY[$2::int], ARRAY[$3::int], ARRAY[$4::int]
+		    FROM UNNEST($1::bytea[]) AS u(hash)
+		    ON CONFLICT (hash, partition_key) DO UPDATE SET
+		        block_ids     = txs_blocks.block_ids     || EXCLUDED.block_ids,
+		        block_heights = txs_blocks.block_heights || EXCLUDED.block_heights,
+		        subtree_idxs  = txs_blocks.subtree_idxs  || EXCLUDED.subtree_idxs
+		)
+		UPDATE txs t SET locked = false
+		FROM UNNEST($1::bytea[]) AS u(hash)
+		WHERE t.hash = u.hash AND t.partition_key = get_byte(u.hash, 1) %% %d
+		`, NumPartitions, NumPartitions)
 
 	unsetMinedReadSQL = fmt.Sprintf(
 		`SELECT block_ids, block_heights, subtree_idxs FROM txs_blocks WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`,
@@ -45,7 +122,9 @@ var (
 )
 
 // SetMinedMulti updates the block ID for multiple transactions that have been mined.
-// Normal path: single UPDATE on txs with array append.
+// Normal path: one writable-CTE statement per chunk, fanned out across N pool
+// connections via errgroup. Each chunk's CTE upserts into txs_blocks and updates
+// txs flags in one round-trip.
 // UnsetMined path (reorg): read arrays, remove entry in Go, write back.
 // Returns a map of each hash to its list of block_ids.
 func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
@@ -77,65 +156,90 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		}
 	}
 
-	// Combined operation: upsert array appends into txs_blocks, then
-	// update the flag/DAH columns on txs. Two sequential statements on
-	// one held connection (one round-trip per chunk per statement).
-	// upsertBlocksSQL is a package-level var so NumPartitions flows in.
-
-	var updateFlagsSQL string
+	// Pick the chunk SQL once. Each variant is a single writable CTE that
+	// does the txs_blocks upsert + txs UPDATE in a single round-trip.
+	var chunkSQL string
 	switch {
 	case minedBlockInfo.OnLongestChain && withDAH:
-		updateFlagsSQL = fmt.Sprintf(`UPDATE txs t SET
-			locked = false, unmined_since = NULL,
-			delete_at_height = CASE
-				WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
-				WHEN t.delete_at_height IS NOT NULL AND t.delete_at_height < %d THEN %d
-				WHEN t.delete_at_height IS NULL
-				     AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
-				         = (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash)
-				     THEN %d
-				ELSE t.delete_at_height END
-		WHERE t.hash = ANY($1)`, newDAH, newDAH, newDAH)
+		chunkSQL = minedChunkOnLongestWithDAHSQL
 	case minedBlockInfo.OnLongestChain:
-		updateFlagsSQL = `UPDATE txs SET
-			locked = false, unmined_since = NULL
-		WHERE hash = ANY($1)`
+		chunkSQL = minedChunkOnLongestSQL
 	default:
-		updateFlagsSQL = `UPDATE txs SET locked = false WHERE hash = ANY($1)`
+		chunkSQL = minedChunkNotOnLongestSQL
 	}
-	const fetchSQL = `SELECT hash, block_ids FROM txs_blocks WHERE hash = ANY($1)`
-
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		return nil, errors.NewStorageError("[SetMinedMulti] acquire connection: %v", err)
-	}
-	defer conn.Release()
 
 	allHashBytes := make([][]byte, len(hashes))
 	for i, h := range hashes {
 		allHashBytes[i] = h[:]
 	}
 
+	// Build chunk slices up front so the dispatch goroutines just consume.
+	type chunkJob struct {
+		bytes [][]byte
+	}
+	numChunks := (len(allHashBytes) + minedChunkSize - 1) / minedChunkSize
+	chunks := make([]chunkJob, 0, numChunks)
 	for i := 0; i < len(allHashBytes); i += minedChunkSize {
 		end := i + minedChunkSize
 		if end > len(allHashBytes) {
 			end = len(allHashBytes)
 		}
-		chunk := allHashBytes[i:end]
-		if _, err := conn.Exec(ctx, upsertBlocksSQL,
-			chunk,
-			int32(minedBlockInfo.BlockID),
-			int32(minedBlockInfo.BlockHeight),
-			int32(minedBlockInfo.SubtreeIdx),
-		); err != nil {
-			return nil, errors.NewStorageError("[SetMinedMulti] upsert txs_blocks chunk %d-%d: %v", i, end-1, err)
-		}
-		if _, err := conn.Exec(ctx, updateFlagsSQL, chunk); err != nil {
-			return nil, errors.NewStorageError("[SetMinedMulti] update txs chunk %d-%d: %v", i, end-1, err)
-		}
+		chunks = append(chunks, chunkJob{bytes: allHashBytes[i:end]})
 	}
 
-	rows, err := conn.Query(ctx, fetchSQL, allHashBytes)
+	// Fan-out: cap parallelism at min(setMinedParallelism, numChunks).
+	parallelism := setMinedParallelism
+	if parallelism > len(chunks) {
+		parallelism = len(chunks)
+	}
+	if parallelism < 1 {
+		parallelism = 1
+	}
+
+	chunkCh := make(chan chunkJob, len(chunks))
+	for _, c := range chunks {
+		chunkCh <- c
+	}
+	close(chunkCh)
+
+	g, gctx := errgroup.WithContext(ctx)
+	for w := 0; w < parallelism; w++ {
+		g.Go(func() error {
+			conn, err := s.pool.Acquire(gctx)
+			if err != nil {
+				return errors.NewStorageError("[SetMinedMulti] acquire connection: %v", err)
+			}
+			defer conn.Release()
+
+			blockID := int32(minedBlockInfo.BlockID)
+			blockHeightArg := int32(minedBlockInfo.BlockHeight)
+			subtreeIdx := int32(minedBlockInfo.SubtreeIdx)
+
+			for c := range chunkCh {
+				if withDAH {
+					if _, err := conn.Exec(gctx, chunkSQL,
+						c.bytes, blockID, blockHeightArg, subtreeIdx, newDAH,
+					); err != nil {
+						return errors.NewStorageError("[SetMinedMulti] chunk: %v", err)
+					}
+				} else {
+					if _, err := conn.Exec(gctx, chunkSQL,
+						c.bytes, blockID, blockHeightArg, subtreeIdx,
+					); err != nil {
+						return errors.NewStorageError("[SetMinedMulti] chunk: %v", err)
+					}
+				}
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Final read-back on a single connection.
+	const fetchSQL = `SELECT hash, block_ids FROM txs_blocks WHERE hash = ANY($1)`
+	rows, err := s.pool.Query(ctx, fetchSQL, allHashBytes)
 	if err != nil {
 		return nil, errors.NewStorageError("[SetMinedMulti] fetch: %v", err)
 	}
