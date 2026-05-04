@@ -19,9 +19,10 @@ const minedChunkSize = 2000
 // setMinedParallelism is the number of goroutines that fan out chunk dispatch
 // across the pool. Each holds its own pool connection for the lifetime of the
 // fan-out so postgres can run the upsert + UPDATE in parallel. Tuned to stay
-// well below the pool size (NumShards*4 + 64 = 68 today) so the rest of the
-// store still has connections available.
-const setMinedParallelism = 16
+// well below the pool size (NumShards*(8+8+4+4) + 64 = 88 today, ~64 spare
+// after validator-held conns) so the rest of the store still has connections
+// available for BatchDecorate / Get-with-body / iterators / pruner.
+const setMinedParallelism = 32
 
 // SQL strings for mined operations. The `% NumPartitions` modulus is
 // substituted from the Go constant so bumping NumPartitions automatically
