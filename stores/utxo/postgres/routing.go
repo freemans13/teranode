@@ -21,16 +21,17 @@ import (
 // correlate: byte 0 → shard, byte 1 → in-shard partition.
 
 const (
-	// NumShards is the number of independent dispatch pipelines (and,
-	// future, postgres servers) within the Store. Each shard has its own
-	// per-op slot feeding off the shard's pgxpool. Items route to a shard
-	// by byte 0 of tx_hash. Total slots = NumShards × 4 ops.
+	// NumShards is the number of independent dispatch pipelines. Each shard
+	// has its own per-op slot grid. Dispatch routes by byte 0 of the natural
+	// key. With NumShards = 1 today, byte 0 is unused at runtime but the
+	// dispatch shape is shard-ready.
 	NumShards = 1
 
-	// NumPartitions is the schema-side partition count — must match the
-	// modulus in the schema's PARTITION BY LIST expression
-	// `(get_byte(<key>, 1) % NumPartitions)`. Used by schema.go to spawn
-	// child tables; not used for client-side dispatch.
+	// NumPartitions is the number of HASH partitions per table at the
+	// postgres level. 1 for single-SSD dev/laptop; raise (2/4/8) for
+	// multi-SSD production where partition-level parallelism on disk pays
+	// off. The Partition field on RouteKey is informational; postgres
+	// handles partition routing internally via PARTITION BY HASH.
 	NumPartitions = 8
 )
 
