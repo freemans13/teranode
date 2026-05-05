@@ -12,10 +12,12 @@ import (
 // dispatch.
 //
 // The Partition field is informational only — it is NOT used for client
-// dispatch. Postgres prunes partitions itself via the schema's PARTITION
-// BY LIST declaration when the WHERE clause references the hash.
-// We keep the field on RouteKey so server-shard routing can be extended
-// without touching call sites.
+// dispatch and not used in SQL. PostgreSQL HASH partitioning (PARTITION
+// BY HASH (hash) at the table level) handles partition routing internally
+// via its own hash function. We keep the field on RouteKey because some
+// future scenarios (e.g., partition-affined chunking in batch ops) might
+// want a client-side partition hint, but it doesn't drive correctness
+// today.
 //
 // Disjoint bytes of tx_hash are used for the two layers so they don't
 // correlate: byte 0 → shard, byte 1 → in-shard partition.
@@ -64,7 +66,8 @@ func RouteBytes(hash []byte) RouteKey {
 }
 
 // PartitionSuffix returns the suffix used in partition table names — e.g.,
-// "_p03". Centralised here so all callers format the same way.
+// "_p03". Used only by schema.go to create child partitions; not used in
+// client SQL since postgres HASH partitioning routes server-side.
 func PartitionSuffix(partition int) string {
 	return partitionSuffixes[partition]
 }
