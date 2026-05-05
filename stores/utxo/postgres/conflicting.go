@@ -12,33 +12,24 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// SQL strings for conflicting operations. The `% NumPartitions` modulus is
-// substituted from the Go constant so bumping NumPartitions automatically
-// updates every partition_key derivation.
-var (
-	conflictingSetTxSQL = fmt.Sprintf(`
-				UPDATE txs SET
-				  conflicting = $2,
-				  delete_at_height = COALESCE(delete_at_height, $3)
-				WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+// SQL strings for conflicting operations. HASH partitioning prunes
+// per-partition automatically from the hash-keyed WHERE clause.
+const conflictingSetTxSQL = `
+UPDATE txs SET
+  conflicting = $2,
+  delete_at_height = COALESCE(delete_at_height, $3)
+WHERE hash = $1`
 
-	conflictingClearTxSQL = fmt.Sprintf(`
-				UPDATE txs SET
-				  conflicting = $2,
-				  delete_at_height = $3
-				WHERE hash = $1 AND partition_key = get_byte($1, 1) %% %d`, NumPartitions)
+const conflictingClearTxSQL = `
+UPDATE txs SET
+  conflicting = $2,
+  delete_at_height = $3
+WHERE hash = $1`
 
-	conflictingInsertChildrenSQL = fmt.Sprintf(`
-					INSERT INTO txs_conflicts (hash, partition_key, conflicting_children)
-					VALUES ($1, get_byte($1, 1) %% %d, $2::bytea[])
-					ON CONFLICT (hash, partition_key) DO UPDATE SET
-					    conflicting_children = COALESCE(txs_conflicts.conflicting_children, '{}') || EXCLUDED.conflicting_children`, NumPartitions)
-
-	conflictingFindSpendingSQL = fmt.Sprintf(`
-					SELECT sp.spending_data
-					FROM spends sp
-					WHERE sp.prev_tx_hash = $1 AND sp.partition_key = get_byte($1, 1) %% %d`, NumPartitions)
-)
+const conflictingFindSpendingSQL = `
+SELECT sp.spending_data
+FROM spends sp
+WHERE sp.prev_tx_hash = $1`
 
 // GetCounterConflicting delegates to the store-agnostic implementation which
 // walks inputs to find counter-conflicting transactions.
@@ -53,9 +44,9 @@ func (s *Store) GetConflictingChildren(ctx context.Context, hash chainhash.Hash)
 }
 
 // SetConflicting marks transactions as conflicting or not conflicting.
-// It updates txs.conflicting and txs.delete_at_height, upserts each parent
-// row in txs_conflicts to append this tx hash to the conflicting_children
-// array, and returns affected parent spends and spending child tx hashes.
+// It updates txs.conflicting and txs.delete_at_height, appends to the
+// conflicting_children array on parent txs, and returns affected parent spends
+// and spending child tx hashes.
 func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, setValue bool) ([]*utxo.Spend, []chainhash.Hash, error) {
 	if len(txHashes) == 0 {
 		return nil, nil, nil
@@ -96,7 +87,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", txHash, err)
 		}
 
-		// Append this tx as a conflicting child of each parent (array on txs_conflicts).
+		// Append this tx as a conflicting child of each parent (array on txs).
 		if txMeta.Tx != nil {
 			seen := make(map[chainhash.Hash]struct{}, len(txMeta.Tx.Inputs))
 			for _, input := range txMeta.Tx.Inputs {
@@ -106,7 +97,9 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 				}
 				seen[parentHash] = struct{}{}
 
-				_, insertErr := s.pool.Exec(ctx, conflictingInsertChildrenSQL,
+				_, insertErr := s.pool.Exec(ctx, `
+					UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
+					WHERE hash = $1`,
 					parentHash[:], [][]byte{txHash[:]},
 				)
 				if insertErr != nil {
