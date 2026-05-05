@@ -3,7 +3,6 @@ package postgres
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -29,13 +28,15 @@ type batchSpendItem struct {
 }
 
 // ---------------------------------------------------------------------------
-// SQL — targets parent tables; postgres prunes partitions itself given the
-// hash-keyed WHERE clause.
-//
-// $8 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH branch.
+// Direct-mode SQL (used when batcher is not active)
 // ---------------------------------------------------------------------------
 
-var spendValidationSQL = fmt.Sprintf(`
+// spendValidationSQL is the CTE used to validate a spend attempt, insert into
+// the append-only spends table, and — if this spend drained the parent tx's
+// last unspent output — set delete_at_height so the pruner can reclaim it.
+//
+// $8 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH branch.
+const spendValidationSQL = `
 WITH validation AS (
     SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
            o.coinbase_spending_height,
@@ -43,17 +44,13 @@ WITH validation AS (
            t.frozen AS tx_frozen,
            sp.spending_data AS existing_spend
     FROM outputs o
-    JOIN txs t ON t.hash = o.tx_hash AND t.partition_key = o.partition_key
-    LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
-    WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) %% %d AND o.idx = $2
+    JOIN txs t ON t.hash = o.tx_hash
+    LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+    WHERE o.tx_hash = $1 AND o.idx = $2
 ),
 inserted AS (
-    -- ON CONFLICT silently skips a duplicate (prev_tx_hash, prev_output_idx).
-    -- Combined with the validation CTE's existing_spend IS NULL predicate,
-    -- this is defense-in-depth against any race that bypasses within-shard
-    -- worker serialization.
-    INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
-    SELECT $1, get_byte($1, 1) %% %d, $2, $3
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
+    SELECT $1, $2, $3
     FROM validation v
     WHERE v.existing_spend IS NULL
       AND v.utxo_hash = $4
@@ -62,7 +59,7 @@ inserted AS (
       AND ($7 OR NOT v.tx_conflicting)
       AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
       AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
-    ON CONFLICT (prev_tx_hash, prev_output_idx, partition_key) DO NOTHING
+    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
     RETURNING prev_tx_hash
 ),
 dah_upd AS (
@@ -72,30 +69,28 @@ dah_upd AS (
       AND t.hash = i.prev_tx_hash
       AND t.preserve_until IS NULL
       AND t.unmined_since IS NULL
-      AND EXISTS (
-          SELECT 1 FROM txs_blocks b
-          WHERE b.hash = t.hash AND b.partition_key = t.partition_key
-            AND b.block_ids IS NOT NULL AND array_length(b.block_ids, 1) > 0
-      )
+      AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
       AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + 1
           = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
       AND (t.delete_at_height IS NULL OR t.delete_at_height < $8)
     RETURNING 1
 )
 SELECT 1 FROM inserted
-`, NumPartitions, NumPartitions)
+`
 
-var spendDiagnosticSQL = fmt.Sprintf(`
+// spendDiagnosticSQL re-queries the validation CTE when the INSERT returned
+// 0 rows, so we can determine the exact reason the spend failed.
+const spendDiagnosticSQL = `
 SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
        o.coinbase_spending_height,
        t.locked AS tx_locked, t.conflicting AS tx_conflicting,
        t.frozen AS tx_frozen,
        sp.spending_data AS existing_spend
 FROM outputs o
-JOIN txs t ON t.hash = o.tx_hash AND t.partition_key = o.partition_key
-LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
-WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) %% %d AND o.idx = $2
-`, NumPartitions)
+JOIN txs t ON t.hash = o.tx_hash
+LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+WHERE o.tx_hash = $1 AND o.idx = $2
+`
 
 // ---------------------------------------------------------------------------
 // Spend — public API
@@ -432,13 +427,10 @@ func (s *Store) runSpendBatch(conn *pgxpool.Conn, batch []*batchSpendItem) {
 	}
 }
 
-// bulkSpendSQL — bulk validation+insert against parent tables. The
-// FROM/JOIN/INSERT/UPDATE references hit `outputs`, `txs`, and `spends`
-// directly; postgres prunes the relevant partitions itself from the
-// hash-keyed predicates.
+// bulkSpendSQL — bulk validation+insert against the wide-row parent tables.
 //
 // $9 = newDAH (blockHeight+1+retention). Pass 0 to no-op the DAH UPDATE.
-var bulkSpendSQL = fmt.Sprintf(`
+const bulkSpendSQL = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
            unnest($2::bigint[])  AS prev_idx,
@@ -473,10 +465,9 @@ to_insert AS (
       AND NOT (COALESCE(spendable_in, 0) > 0 AND block_height < COALESCE(spendable_in, 0))
 ),
 inserted AS (
-    -- See note in spendValidationSQL — same defense-in-depth rationale.
-    INSERT INTO spends (prev_tx_hash, partition_key, prev_output_idx, spending_data)
-    SELECT prev_tx_hash, get_byte(prev_tx_hash, 1) %% %d, prev_idx, spending_data FROM to_insert
-    ON CONFLICT (prev_tx_hash, prev_output_idx, partition_key) DO NOTHING
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data)
+    SELECT prev_tx_hash, prev_idx, spending_data FROM to_insert
+    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
     RETURNING prev_tx_hash, prev_output_idx
 ),
 parents AS (
@@ -490,11 +481,7 @@ dah_upd AS (
       AND t.hash = p.tx_hash
       AND t.preserve_until IS NULL
       AND t.unmined_since IS NULL
-      AND EXISTS (
-          SELECT 1 FROM txs_blocks b
-          WHERE b.hash = t.hash AND b.partition_key = t.partition_key
-            AND b.block_ids IS NOT NULL AND array_length(b.block_ids, 1) > 0
-      )
+      AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) > 0
       AND (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) + p.spent_in_batch
           = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
       AND (t.delete_at_height IS NULL OR t.delete_at_height < $9)
@@ -510,11 +497,9 @@ SELECT v.batch_idx,
 FROM validated v
 LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
 ORDER BY v.batch_idx
-`, NumPartitions)
+`
 
-var unspendDeleteSQL = fmt.Sprintf(
-	`DELETE FROM spends WHERE prev_tx_hash = $1 AND partition_key = get_byte($1, 1) %% %d AND prev_output_idx = $2`,
-	NumPartitions)
+const unspendDeleteSQL = `DELETE FROM spends WHERE prev_tx_hash = $1 AND prev_output_idx = $2`
 
 // diagnoseSpendFailure queries the output + txs + spends to determine
 // why a spend INSERT failed. Pool-acquiring path used by spendDirect when
