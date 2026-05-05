@@ -23,49 +23,41 @@ import (
 // Postgres parameter limits.
 const maxINClauseSize = 400
 
-// SQL strings for get operations. The `% NumPartitions` modulus is
-// substituted from the Go constant so bumping NumPartitions automatically
-// updates every partition_key derivation.
-var (
-	getBatchSQL = fmt.Sprintf(`
-		SELECT t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
-		       t.locked, t.conflicting, t.frozen, t.unmined_since,
-		       b.block_ids, b.block_heights, b.subtree_idxs
-		FROM txs t
-		LEFT JOIN txs_blocks b ON b.hash = $1 AND b.partition_key = get_byte($1, 1) %% %d
-		WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) %% %d`, NumPartitions, NumPartitions)
+// SQL strings for get operations. HASH partitioning on `txs` and `outputs`
+// prunes via `WHERE hash = $1` / `WHERE tx_hash = $1` automatically — no
+// explicit partition_key predicate needed.
+const getBatchSQL = `
+SELECT version, lock_time, fee, size_in_bytes, coinbase,
+       locked, conflicting, frozen, unmined_since,
+       block_ids, block_heights, subtree_idxs
+FROM txs WHERE hash = $1`
 
-	getInternalSQL = fmt.Sprintf(`
-		SELECT t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
-		       t.locked, t.conflicting, t.frozen, t.unmined_since, r.raw_tx,
-		       b.block_ids, b.block_heights, b.subtree_idxs, c.conflicting_children
-		FROM txs t
-		LEFT JOIN txs_raw       r ON r.hash = $1 AND r.partition_key = get_byte($1, 1) %% %d
-		LEFT JOIN txs_blocks    b ON b.hash = $1 AND b.partition_key = get_byte($1, 1) %% %d
-		LEFT JOIN txs_conflicts c ON c.hash = $1 AND c.partition_key = get_byte($1, 1) %% %d
-		WHERE t.hash = $1 AND t.partition_key = get_byte($1, 1) %% %d`, NumPartitions, NumPartitions, NumPartitions, NumPartitions)
+const getInternalSQL = `
+SELECT version, lock_time, fee, size_in_bytes, coinbase,
+       locked, conflicting, frozen, unmined_since, raw_tx,
+       block_ids, block_heights, subtree_idxs, conflicting_children
+FROM txs WHERE hash = $1`
 
-	getInternalOutputsSQL = fmt.Sprintf(`
-			SELECT idx, locking_script, satoshis
-			FROM outputs
-			WHERE tx_hash = $1 AND partition_key = get_byte($1, 1) %% %d
-			ORDER BY idx`, NumPartitions)
+const getInternalOutputsSQL = `
+SELECT idx, locking_script, satoshis
+FROM outputs
+WHERE tx_hash = $1
+ORDER BY idx`
 
-	getInternalUtxosSQL = fmt.Sprintf(`
-			SELECT o.idx, sp.spending_data, o.frozen
-			FROM outputs o
-			LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
-			WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) %% %d
-			ORDER BY o.idx`, NumPartitions)
+const getInternalUtxosSQL = `
+SELECT o.idx, sp.spending_data, o.frozen
+FROM outputs o
+LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+WHERE o.tx_hash = $1
+ORDER BY o.idx`
 
-	getSpendSQL = fmt.Sprintf(`
-		SELECT o.utxo_hash, o.coinbase_spending_height, sp.spending_data,
-		       o.frozen OR t.frozen, o.spendable_in, t.conflicting, t.locked
-		FROM outputs o
-		JOIN txs t ON t.hash = o.tx_hash AND t.partition_key = o.partition_key
-		LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.partition_key = o.partition_key AND sp.prev_output_idx = o.idx
-		WHERE o.tx_hash = $1 AND o.partition_key = get_byte($1, 1) %% %d AND o.idx = $2`, NumPartitions)
-)
+const getSpendSQL = `
+SELECT o.utxo_hash, o.coinbase_spending_height, sp.spending_data,
+       o.frozen OR t.frozen, o.spendable_in, t.conflicting, t.locked
+FROM outputs o
+JOIN txs t ON t.hash = o.tx_hash
+LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
+WHERE o.tx_hash = $1 AND o.idx = $2`
 
 // batchGetItem represents a single Get request queued into the batcher.
 type batchGetItem struct {
@@ -436,13 +428,11 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	// Query 1: Bulk fetch from txs (single table, no JOIN).
 	inClause, inArgs := buildINClauseLocal(hashes, 1)
 
-	q := `SELECT t.hash, t.version, t.lock_time, t.fee, t.size_in_bytes, t.coinbase,
-	             t.locked, t.conflicting, t.frozen, t.unmined_since, r.raw_tx,
-	             b.block_ids, b.block_heights, b.subtree_idxs
-	      FROM txs t
-	      LEFT JOIN txs_raw    r ON r.hash = t.hash AND r.partition_key = t.partition_key
-	      LEFT JOIN txs_blocks b ON b.hash = t.hash AND b.partition_key = t.partition_key
-	      WHERE t.hash IN ` + inClause
+	q := `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
+	             locked, conflicting, frozen, unmined_since, raw_tx,
+	             block_ids, block_heights, subtree_idxs
+	      FROM txs
+	      WHERE hash IN ` + inClause
 
 	rows, err := s.pool.Query(ctx, q, inArgs...)
 	if err != nil {
