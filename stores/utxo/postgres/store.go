@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	batcher "github.com/bsv-blockchain/go-batcher/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -21,23 +22,11 @@ var _ utxo.Store = (*Store)(nil)
 
 const txCacheMaxSize = 100_000
 
-// Per-op worker counts for shard slots. Each worker holds its own pgxpool
-// connection and runs its own pgx.Batch stream — so K=N means N parallel
-// postgres backends serving that op out of the same shared input channel
-// (the shared-channel multi-reader pattern). Reads scale with K; for writes
-// the WAL group-commit (commit_delay + commit_siblings) bundles concurrent
-// fsyncs across connections, so multi-worker still helps. Tuned per-op:
-//
-//	getWorkersPerShard    = 8  (reads scale linearly until WAL/locks bite)
-//	spendWorkersPerShard  = 8  (write — bench will tell us if WAL caps it)
-//	createWorkersPerShard = 4  (UNNEST batches already bigger; less return)
-//	unlockWorkersPerShard = 4  (rarely called per-tx)
-const (
-	getWorkersPerShard    = 8
-	spendWorkersPerShard  = 8
-	createWorkersPerShard = 4
-	unlockWorkersPerShard = 4
-)
+// batcherMaxConcurrent is the number of concurrent in-flight callback
+// goroutines per batcher. The batcher's internal pool dispatches up to
+// this many flushes in parallel — replaces the K-workers pattern from
+// the previous shardSlot[T] design.
+const batcherMaxConcurrent = 8
 
 // txCache is a simple bounded in-process cache for recently created transactions.
 type txCache struct {
@@ -95,27 +84,24 @@ type Store struct {
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
 
-	// Per-(shard × op) slots. Each slot is one independent pipeline:
-	// input channel + one or more worker goroutines, each holding one
-	// pgxpool connection for life. Items are routed to a shard by byte 0
-	// of tx_hash; in-shard partition selection is left to postgres via
-	// PARTITION BY LIST. Each op has its own K (see *WorkersPerShard
-	// constants) — multi-worker for both reads and writes.
-	createSlots [NumShards]*shardSlot[*batchCreateItem]
-	spendSlots  [NumShards]*shardSlot[*batchSpendItem]
-	getSlots    [NumShards]*shardSlot[*batchGetItem]
-	unlockSlots [NumShards]*shardSlot[*batchUnlockItem]
-	workersWG   sync.WaitGroup
+	// One go-batcher v2 batcher per op. The batcher's internal pool
+	// dispatches flushes to a configurable number of concurrent callback
+	// goroutines (see SetMaxConcurrent). Each callback acquires its own
+	// pgxpool.Conn for the duration of the batch.
+	createBatcher *batcher.Batcher[batchCreateItem]
+	spendBatcher  *batcher.Batcher[batchSpendItem]
+	getBatcher    *batcher.Batcher[batchGetItem]
+	unlockBatcher *batcher.Batcher[batchUnlockItem]
 
 	// in-process cache for recently created transactions.
 	cache *txCache
 }
 
-// workersStarted reports whether the per-shard slot array is up.
+// workersStarted reports whether the batchers are constructed.
 // Public-API methods (Get, Spend, Create, SetLocked) check this to decide
-// whether to dispatch through workers or fall back to direct paths.
+// whether to dispatch through batchers or fall back to direct paths.
 func (s *Store) workersStarted() bool {
-	return s.getSlots[0] != nil
+	return s.getBatcher != nil
 }
 
 // New creates a new direct-write UTXO store.
@@ -128,13 +114,14 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
-	// Pool sized for the long-held worker connections plus headroom for
+	// Pool sized for in-flight batcher callbacks plus headroom for
 	// direct-path queries (Get with body, PreviousOutputsDecorate, mined
-	// updates, etc.). Held conns per shard = sum of K across all four ops.
-	// At NumShards=1 with (8+8+4+4) that's 24 held conns + 64 headroom = 88.
-	// Below the 1000 max_connections postgres is configured for. Pre-warmed
-	// so the dispatch path sees no connection-open latency.
-	poolSize := int32(NumShards*(getWorkersPerShard+spendWorkersPerShard+createWorkersPerShard+unlockWorkersPerShard) + 64)
+	// updates, etc.). 4 batchers × MaxConcurrent callbacks each, every
+	// callback acquires its own conn for the duration of the batch.
+	// 4*8 = 32 + 64 headroom = 96. Below the 1000 max_connections postgres
+	// is configured for. Pre-warmed so the dispatch path sees no
+	// connection-open latency.
+	poolSize := int32(4*batcherMaxConcurrent + 64)
 	pgxConfig.MaxConns = poolSize
 	pgxConfig.MinConns = poolSize
 	pgxConfig.MaxConnIdleTime = 30 * time.Minute
@@ -175,11 +162,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	return s, nil
 }
 
-// Start spawns the per-shard worker slots (4 ops × NumShards). Each
-// worker holds a pgxpool connection for its lifetime and dispatches
-// micro-batches of items routed to its shard. Without Start(),
+// Start constructs the per-op batchers via go-batcher v2 NewWithPool.
+// Each batcher accumulates items up to a size or duration cap, then
+// dispatches the batch to its callback through a pool of up to
+// batcherMaxConcurrent goroutines. Each callback acquires its own
+// pgxpool.Conn for the duration of the batch. Without Start(),
 // Get/Spend/Create/SetLocked fall back to direct (unbatched) paths.
-func (s *Store) Start(ctx context.Context) {
+func (s *Store) Start(_ context.Context) {
 	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
 	if storeBatchSize <= 0 {
 		storeBatchSize = 100
@@ -200,66 +189,40 @@ func (s *Store) Start(ctx context.Context) {
 	const getBatchSize = 500
 	const unlockBatchSize = 500
 
-	// Input channel buffer per worker. Generous so callers don't block on
-	// `<- input` under bursty load.
-	const inBuf = 4096
+	// background=true: batcher runs flushes asynchronously and Put returns
+	// immediately. Same semantics as the previous shardSlot input channel.
+	s.createBatcher = batcher.NewWithPool(storeBatchSize, storeBatchDuration, s.runCreateBatch, true)
+	s.createBatcher.SetMaxConcurrent(batcherMaxConcurrent)
 
-	// One slot per (shard × op). Each shard is an independent pipeline;
-	// items routed to shard A do not touch shard B's worker or its
-	// in-flight queries.
-	for sh := 0; sh < NumShards; sh++ {
-		cs, err := newShardSlot[*batchCreateItem](ctx, s.logger, s.pool, sh, createWorkersPerShard, storeBatchSize, storeBatchDuration, inBuf, s.runCreateBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start create slot sh=%d: %v", sh, err)
-			continue
-		}
-		s.createSlots[sh] = cs
+	s.spendBatcher = batcher.NewWithPool(spendBatchSize, spendBatchDuration, s.runSpendBatch, true)
+	s.spendBatcher.SetMaxConcurrent(batcherMaxConcurrent)
 
-		ss, err := newShardSlot[*batchSpendItem](ctx, s.logger, s.pool, sh, spendWorkersPerShard, spendBatchSize, spendBatchDuration, inBuf, s.runSpendBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start spend slot sh=%d: %v", sh, err)
-			continue
-		}
-		s.spendSlots[sh] = ss
+	s.getBatcher = batcher.NewWithPool(getBatchSize, storeBatchDuration, s.runGetBatch, true)
+	s.getBatcher.SetMaxConcurrent(batcherMaxConcurrent)
 
-		gs, err := newShardSlot[*batchGetItem](ctx, s.logger, s.pool, sh, getWorkersPerShard, getBatchSize, storeBatchDuration, inBuf, s.runGetBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start get slot sh=%d: %v", sh, err)
-			continue
-		}
-		s.getSlots[sh] = gs
-
-		us, err := newShardSlot[*batchUnlockItem](ctx, s.logger, s.pool, sh, unlockWorkersPerShard, unlockBatchSize, storeBatchDuration, inBuf, s.runUnlockBatch, &s.workersWG)
-		if err != nil {
-			s.logger.Errorf("[Start] failed to start unlock slot sh=%d: %v", sh, err)
-			continue
-		}
-		s.unlockSlots[sh] = us
-	}
+	s.unlockBatcher = batcher.NewWithPool(unlockBatchSize, storeBatchDuration, s.runUnlockBatch, true)
+	s.unlockBatcher.SetMaxConcurrent(batcherMaxConcurrent)
 }
 
-// Stop signals all slot workers to exit and waits for them to drain &
-// release their connections, then closes the pool and DB.
+// Stop closes each batcher (allowing pending items to drain), then closes
+// the pool and DB.
 func (s *Store) Stop() {
-	for sh := 0; sh < NumShards; sh++ {
-		if s.createSlots[sh] != nil {
-			s.createSlots[sh].Stop()
-			s.createSlots[sh] = nil
-		}
-		if s.spendSlots[sh] != nil {
-			s.spendSlots[sh].Stop()
-			s.spendSlots[sh] = nil
-		}
-		if s.getSlots[sh] != nil {
-			s.getSlots[sh].Stop()
-			s.getSlots[sh] = nil
-		}
-		if s.unlockSlots[sh] != nil {
-			s.unlockSlots[sh].Stop()
-			s.unlockSlots[sh] = nil
-		}
+	if s.createBatcher != nil {
+		s.createBatcher.Close()
+		s.createBatcher = nil
 	}
-	s.workersWG.Wait()
+	if s.spendBatcher != nil {
+		s.spendBatcher.Close()
+		s.spendBatcher = nil
+	}
+	if s.getBatcher != nil {
+		s.getBatcher.Close()
+		s.getBatcher = nil
+	}
+	if s.unlockBatcher != nil {
+		s.unlockBatcher.Close()
+		s.unlockBatcher = nil
+	}
 	if s.pool != nil {
 		s.pool.Close()
 	}

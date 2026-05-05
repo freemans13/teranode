@@ -9,7 +9,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // SQL strings for conflicting operations. HASH partitioning prunes
@@ -167,11 +166,23 @@ type batchUnlockItem struct {
 	done chan error
 }
 
-// runUnlockBatch is the per-shard Unlock worker callback. Single bulk
-// UPDATE on the `txs` parent table against the worker's held connection;
-// postgres prunes per-partition itself from the hash-keyed WHERE clause.
-func (s *Store) runUnlockBatch(conn *pgxpool.Conn, batch []*batchUnlockItem) {
+// runUnlockBatch is the Unlock batcher callback. Acquires its own
+// pgxpool connection for the duration of the batch and runs a single
+// bulk UPDATE on the `txs` parent table; postgres prunes per-partition
+// itself from the hash-keyed WHERE clause.
+func (s *Store) runUnlockBatch(batch []*batchUnlockItem) {
 	ctx := context.Background()
+
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		e := errors.NewStorageError("[Unlock] failed to acquire conn: %v", err)
+		for _, item := range batch {
+			item.done <- e
+		}
+		return
+	}
+	defer conn.Release()
+
 	hashBytes := make([][]byte, len(batch))
 	for i, item := range batch {
 		hashBytes[i] = item.hash[:]
@@ -198,11 +209,10 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		return nil
 	}
 
-	// Single-hash unlock → route to its shard's worker.
+	// Single-hash unlock → route through the unlock batcher.
 	if s.workersStarted() && !setValue && len(txHashes) == 1 {
 		done := make(chan error, 1)
-		rk := Route(&txHashes[0])
-		s.unlockSlots[rk.Shard].input <- &batchUnlockItem{hash: txHashes[0], done: done}
+		s.unlockBatcher.Put(&batchUnlockItem{hash: txHashes[0], done: done})
 		select {
 		case err := <-done:
 			return err

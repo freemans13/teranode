@@ -167,22 +167,15 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	return s.createDirect(ctx, tx, blockHeight, options)
 }
 
-// createBatched routes a Create request to the worker for the tx's partition.
+// createBatched enqueues a Create request into the create batcher.
 func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
 	done := make(chan batchCreateResult, 1)
-	var txHash *chainhash.Hash
-	if options.TxID != nil {
-		txHash = options.TxID
-	} else {
-		txHash = tx.TxIDChainHash()
-	}
-	rk := Route(txHash)
-	s.createSlots[rk.Shard].input <- &batchCreateItem{
+	s.createBatcher.Put(&batchCreateItem{
 		tx:          tx,
 		blockHeight: blockHeight,
 		options:     options,
 		done:        done,
-	}
+	})
 
 	select {
 	case result := <-done:
@@ -304,16 +297,16 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 }
 
 // ---------------------------------------------------------------------------
-// runCreateBatch — per-shard Create worker callback.
+// runCreateBatch — Create batcher callback.
 //
-// All items in `batch` were routed by Route(tx_hash).Shard. The worker
-// holds the connection for life. Items without MinedBlockInfos /
-// Conflicting use the UNNEST hot path (single transaction wrapping
-// INSERT INTO txs + INSERT INTO outputs on the parent tables; postgres
-// routes to the right child via PARTITION BY LIST). Items with those rare
-// options fall back to per-item createDirect.
+// Acquires a pgxpool connection for the duration of the batch. Items
+// without MinedBlockInfos / Conflicting use the UNNEST hot path (single
+// transaction wrapping INSERT INTO txs + INSERT INTO outputs on the
+// parent tables; postgres routes to the right child via PARTITION BY
+// LIST). Items with those rare options fall back to per-item
+// createDirect (which acquires its own conn).
 // ---------------------------------------------------------------------------
-func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
+func (s *Store) runCreateBatch(batch []*batchCreateItem) {
 	ctx := context.Background()
 
 	// If any item carries MinedBlockInfos or Conflicting, the whole batch
@@ -328,6 +321,16 @@ func (s *Store) runCreateBatch(conn *pgxpool.Conn, batch []*batchCreateItem) {
 			return
 		}
 	}
+
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		e := errors.NewStorageError("[Create] failed to acquire conn: %v", err)
+		for _, item := range batch {
+			item.done <- batchCreateResult{Err: e}
+		}
+		return
+	}
+	defer conn.Release()
 
 	prepared := make([]preparedCreate, len(batch))
 	valid := make([]bool, len(batch))

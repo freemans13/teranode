@@ -147,8 +147,7 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 			ignoreConflicting: ignoreConflicting,
 			ignoreLocked:      ignoreLocked,
 		}
-		rk := Route(spend.TxID)
-		s.spendSlots[rk.Shard].input <- item
+		s.spendBatcher.Put(item)
 	}
 
 	// Wait for all results.
@@ -284,15 +283,24 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 }
 
 // ---------------------------------------------------------------------------
-// runSpendBatch — per-shard Spend worker callback. The worker holds a
-// pgxpool connection for life and dispatches bulk Spend queries on the
+// runSpendBatch — Spend batcher callback. Acquires a pgxpool connection
+// for the duration of the batch and dispatches bulk Spend queries on the
 // parent tables; postgres prunes per-partition itself from the
-// hash-keyed JOIN/WHERE clauses. All items in `batch` were routed by
-// prev_tx_hash to this shard, so the planner can reuse the cached plan.
+// hash-keyed JOIN/WHERE clauses.
 // ---------------------------------------------------------------------------
-func (s *Store) runSpendBatch(conn *pgxpool.Conn, batch []*batchSpendItem) {
+func (s *Store) runSpendBatch(batch []*batchSpendItem) {
 	ctx := context.Background()
 	newDAH := s.newDAHOrZero()
+
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		e := errors.NewStorageError("[Spend] failed to acquire conn: %v", err)
+		for _, item := range batch {
+			item.errCh <- e
+		}
+		return
+	}
+	defer conn.Release()
 
 	// Single-item fast path: direct validation CTE.
 	if len(batch) == 1 {

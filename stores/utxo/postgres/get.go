@@ -16,7 +16,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // maxINClauseSize limits the number of hashes per IN clause to avoid exceeding
@@ -79,15 +78,14 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 		bins = requestedFields
 	}
 
-	// Use shard workers for simple metadata-only gets (BlockIDs,
-	// BlockHeights — no Tx body). The item is routed to its hash's
-	// shard; that worker batches and dispatches on its owned connection.
+	// Use the get batcher for simple metadata-only gets (BlockIDs,
+	// BlockHeights — no Tx body). The batcher accumulates items and
+	// dispatches a flush via its pool when size or duration threshold is hit.
 	if s.workersStarted() && !contains(bins, fields.Tx) && !contains(bins, fields.Outputs) &&
 		!contains(bins, fields.Utxos) && !contains(bins, fields.TxInpoints) && !contains(bins, fields.Inputs) {
 		done := make(chan batchGetResult, 1)
 		item := &batchGetItem{hash: hash, bins: bins, done: done}
-		rk := Route(hash)
-		s.getSlots[rk.Shard].input <- item
+		s.getBatcher.Put(item)
 		select {
 		case result := <-done:
 			return result.Data, result.Err
@@ -99,12 +97,22 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 	return s.getInternal(ctx, hash, bins)
 }
 
-// runGetBatch is the per-shard Get worker callback. The worker has its
-// own pgxpool connection already held. Pipelines the SELECTs against the
-// `txs` parent table via pgx SendBatch — postgres prunes the partition
-// itself given the hash-keyed WHERE clause.
-func (s *Store) runGetBatch(conn *pgxpool.Conn, batch []*batchGetItem) {
+// runGetBatch is the Get batcher callback. Acquires its own pgxpool
+// connection for the duration of the batch and pipelines the SELECTs
+// against the `txs` parent table via pgx SendBatch — postgres prunes the
+// partition itself given the hash-keyed WHERE clause.
+func (s *Store) runGetBatch(batch []*batchGetItem) {
 	ctx := context.Background()
+
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		e := errors.NewStorageError("[Get] failed to acquire conn: %v", err)
+		for _, item := range batch {
+			item.done <- batchGetResult{Err: e}
+		}
+		return
+	}
+	defer conn.Release()
 
 	pgxBatch := &pgx.Batch{}
 	for _, item := range batch {
