@@ -165,10 +165,13 @@ func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeigh
 		}
 
 		for _, hashBytes := range batch {
-			// deleteCascadeSQLs (defined in delete.go) cascades children-first
-			// then the parent table; the partition_key predicate lets postgres
-			// prune to one child partition at plan time.
-			for _, stmt := range deleteCascadeSQLs {
+			deleteStatements := []string{
+				`DELETE FROM spends WHERE prev_tx_hash = $1`,
+				`DELETE FROM outputs WHERE tx_hash = $1`,
+				`DELETE FROM txs WHERE hash = $1`,
+			}
+
+			for _, stmt := range deleteStatements {
 				if _, err := pgxTx.Exec(ctx, stmt, hashBytes); err != nil {
 					pgxTx.Rollback(ctx) //nolint:errcheck
 					return totalDeleted, errors.NewStorageError("[pruner] delete failed: %v", err)
