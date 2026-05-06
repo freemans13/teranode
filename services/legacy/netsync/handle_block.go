@@ -953,12 +953,20 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 
 	// Phase 1: populate inputs whose parents are same-block transactions. These are
 	// served directly from the in-memory txMap, so no DB work is needed here. We run
-	// per-tx goroutines (bounded by OutpointBatcherSize) because each transaction's
-	// inputs can be populated independently from txMap lookups.
+	// per-tx goroutines (bounded by OutpointBatcherSize) because each tx's own inputs
+	// are populated independently; this phase reads same-block parent outputs
+	// immediately and does not wait for the parent transaction to be extended first.
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, outpointBatcherSize)
 
-	txs := make([]*bt.Tx, 0, len(block.Transactions())-1)
+	// Blocks always include a coinbase, but guard against 0-tx edge cases
+	// (malformed/test blocks) where len-1 would produce a negative capacity.
+	txCount := len(block.Transactions())
+	txCapacity := 0
+	if txCount > 0 {
+		txCapacity = txCount - 1
+	}
+	txs := make([]*bt.Tx, 0, txCapacity)
 
 	for idx, wireTx := range block.Transactions() {
 		if idx == 0 {
@@ -989,9 +997,9 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 		return errors.NewProcessingError("failed to extend transactions from txMap", err)
 	}
 
-	// Phase 2: for inputs whose parents are NOT same-block, batch the decoration into
-	// a single IN-clause DB query per chunk instead of issuing one per tx. For a
-	// 20k-tx block this collapses ~20k round-trips into O(N / maxINClauseSize).
+	// Phase 2: for inputs whose parents are NOT same-block, batch the decoration
+	// using the store's internal chunking instead of issuing one DB lookup per tx.
+	// For a 20k-tx block this collapses ~20k round-trips into roughly O(N / chunkSize).
 	//
 	// BatchPreviousOutputsDecorate skips inputs that already have PreviousTxScript set,
 	// so Phase 1's work is preserved. If it returns a processing/not-found error the
@@ -1009,20 +1017,23 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 }
 
 // extendFromTxMap populates a transaction's inputs whose parents are in the same
-// block (available via txMap) by reading the parent transaction's outputs
-// immediately. It does not wait for the parent transaction to become fully
-// extended, because only the parent's outputs are needed here and those are
-// available as soon as the transaction is parsed.
+// block (available via txMap). Parent Outputs are populated at wire-parse time
+// and never mutated afterwards, so they can be read immediately without waiting
+// for the parent's own inputs to be extended.
 //
 // Inputs whose parents are not in txMap are left for a later bulk DB lookup (see
 // extendTransactions phase 2).
 func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) error {
-	timeStart := time.Now()
 	defer func() {
 		prometheusLegacyNetsyncBlockTxSize.Observe(float64(tx.Size()))
 		prometheusLegacyNetsyncBlockTxNrInputs.Observe(float64(len(tx.Inputs)))
 		prometheusLegacyNetsyncBlockTxNrOutputs.Observe(float64(len(tx.Outputs)))
-		prometheusLegacyNetsyncBlockTxExtend.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
+		// NOTE: prometheusLegacyNetsyncBlockTxExtend is intentionally NOT observed here.
+		// This function is phase 1 only (same-block parents from txMap); phase 2 (bulk
+		// DB decoration via BatchPreviousOutputsDecorate) runs block-wide in
+		// extendTransactions. Observing a tx-level duration here would under-report
+		// end-to-end extend cost versus the old per-tx DB path. We could revisit by
+		// adding a block-level phase-2 histogram if dashboards need it.
 	}()
 
 	txWrapper, found := txMap.Get(*tx.TxIDChainHash())
@@ -1030,14 +1041,17 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		return errors.NewProcessingError("tx %s not found in txMap", tx.TxIDChainHash())
 	}
 
-	g := errgroup.Group{}
-	// Limit goroutines to number of CPU cores to prevent scheduler thrashing
-	// This prevents spawning thousands of goroutines for transactions with many inputs
-	util.SafeSetLimit(&g, runtime.NumCPU()*2)
-
+	// The per-input work here is trivial (bounds check + two field assignments),
+	// and extendTransactions already parallelises across transactions up to
+	// Legacy.OutpointBatcherSize (default 1024). Spawning another goroutine per
+	// input would multiply concurrency into the tens of thousands for large
+	// blocks with negligible wall-clock benefit. Process inputs synchronously.
 	for i, input := range tx.Inputs {
-		i := i         // capture the loop variable
-		input := input // capture the input variable
+		// Honour caller-initiated cancellation between inputs.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		prevTxHash := *input.PreviousTxIDChainHash()
 
 		prevTxWrapper, found := txMap.Get(prevTxHash)
@@ -1046,47 +1060,39 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 			continue
 		}
 
-		// Set once from the caller goroutine to avoid concurrent writes from
-		// the per-input goroutines below (data race under -race).
+		// Flag the child tx as having at least one in-block parent (used by
+		// downstream bookkeeping). Safe to set repeatedly from this single
+		// goroutine.
 		txWrapper.SomeParentsInBlock = true
 
-		g.Go(func() error {
-			// Parent's Outputs are populated at wire-parse time and never mutated
-			// afterwards, so we can read them immediately without waiting for the
-			// parent tx itself to finish being extended. The old implementation
-			// polled on prevTxWrapper.Tx.IsExtended(); that was unnecessary
-			// (IsExtended checks the parent's *inputs*, not its outputs) and caused
-			// a deadlock under the two-phase flow in extendTransactions, where a
-			// pure-non-local-parent tx only becomes "extended" after phase 2 runs.
-			//
-			// Validate the previous-output index is in range and the output/script
-			// are non-nil before dereferencing, so a malformed/hostile block
-			// returns a processing error instead of panicking with a slice OOB.
-			if prevTxWrapper.Tx == nil {
-				return errors.NewProcessingError("failed to extend transaction %s: previous transaction %s is missing", tx.TxIDChainHash(), prevTxHash)
-			}
+		// Defensive nil-check: a malformed/hostile block could carry a wrapper
+		// without a parsed parent transaction; fail with a processing error
+		// instead of panicking on the dereference below.
+		if prevTxWrapper.Tx == nil {
+			return errors.NewProcessingError("tx %s input %d references missing previous transaction %s",
+				tx.TxIDChainHash(), i, prevTxHash)
+		}
 
-			// Compare as uint32 so a 32-bit build can't silently overflow the
-			// int(input.PreviousTxOutIndex) cast and bypass the bounds check.
-			if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
-				return errors.NewProcessingError("failed to extend transaction %s: previous output index %d out of range for transaction %s (outputs=%d)", tx.TxIDChainHash(), input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
-			}
+		if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
+			return errors.NewProcessingError("tx %s input %d references invalid output index %d (parent %s has %d outputs)",
+				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+		}
 
-			prevOutput := prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex]
-			if prevOutput == nil || prevOutput.LockingScript == nil {
-				return errors.NewProcessingError("failed to extend transaction %s: previous output %d is nil or has nil locking script for transaction %s", tx.TxIDChainHash(), input.PreviousTxOutIndex, prevTxHash)
-			}
+		prevOutput := prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex]
+		if prevOutput == nil || prevOutput.LockingScript == nil {
+			return errors.NewProcessingError("tx %s input %d previous output %d is nil or has nil locking script (parent %s)",
+				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash)
+		}
 
-			// No lock needed — each goroutine writes to a unique input index.
-			tx.Inputs[i].PreviousTxSatoshis = prevOutput.Satoshis
-			tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevOutput.LockingScript)
-
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		return errors.NewProcessingError("failed to extend transaction %s", tx.TxIDChainHash(), err)
+		// Parent's Outputs are populated at wire-parse time and never mutated
+		// afterwards, so we can read them immediately without waiting for the
+		// parent tx itself to finish being extended. The old implementation
+		// polled on prevTxWrapper.Tx.IsExtended(); that was unnecessary
+		// (IsExtended checks the parent's *inputs*, not its outputs) and caused
+		// a deadlock under the two-phase flow in extendTransactions, where a
+		// pure-non-local-parent tx only becomes "extended" after phase 2 runs.
+		tx.Inputs[i].PreviousTxSatoshis = prevOutput.Satoshis
+		tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevOutput.LockingScript)
 	}
 
 	return nil
@@ -1102,6 +1108,10 @@ func (sm *SyncManager) extendPerTxFallback(ctx context.Context, txs []*bt.Tx) er
 			if errors.Is(err, errors.ErrProcessing) || errors.Is(err, errors.ErrTxNotFound) {
 				txMeta, metaErr := sm.utxoStore.Get(ctx, tx.TxIDChainHash(), fields.Tx)
 				if metaErr == nil && txMeta != nil && txMeta.Tx != nil {
+					if len(txMeta.Tx.Inputs) != len(tx.Inputs) {
+						return errors.NewProcessingError("recovered tx %s has %d inputs but expected %d",
+							tx.TxIDChainHash(), len(txMeta.Tx.Inputs), len(tx.Inputs))
+					}
 					for i, input := range txMeta.Tx.Inputs {
 						tx.Inputs[i].PreviousTxSatoshis = input.PreviousTxSatoshis
 						tx.Inputs[i].PreviousTxScript = input.PreviousTxScript
