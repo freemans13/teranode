@@ -460,9 +460,9 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 	).Scan(&transactionID)
 	if err != nil {
 		if pgErr := asPgUniqueViolation(err); pgErr != nil {
-			return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", tx.IsCoinbase(), err)
+			return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v)", tx.IsCoinbase(), err)
 		} else if sqliteErr, ok := err.(*sqlite.Error); ok && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
-			return nil, errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v):", tx.IsCoinbase(), sqliteErr)
+			return nil, errors.NewTxExistsError("Transaction already exists in sqlite store (coinbase=%v)", tx.IsCoinbase(), sqliteErr)
 		}
 
 		return nil, errors.NewStorageError("Failed to insert transaction", err)
@@ -714,7 +714,7 @@ func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, 
 		return nil, errors.NewStorageError("Failed to create UTXO", err)
 	}
 	if !inserted {
-		return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v):", isCoinbase)
+		return nil, errors.NewTxExistsError("Transaction already exists in postgres store (coinbase=%v)", isCoinbase)
 	}
 
 	// Handle conflicting children (rare path — separate round-trip only when needed)
