@@ -92,11 +92,14 @@ func (c Config) Validate() error {
 	if c.PessToOptHitRateThreshold < 0 || c.PessToOptHitRateThreshold > 1 {
 		return fmt.Errorf("adaptivefetch: PessToOptHitRateThreshold must be in [0,1] (got %v)", c.PessToOptHitRateThreshold)
 	}
-	if c.OptToPessMissThreshold < 0 {
-		return fmt.Errorf("adaptivefetch: OptToPessMissThreshold must be >= 0 (got %d)", c.OptToPessMissThreshold)
+	// Thresholds must be strictly positive: maybeTransition uses >=, so
+	// a threshold of 0 trips on the first observation even when no fetches
+	// missed, which collapses optimistic mode entirely.
+	if c.OptToPessMissThreshold < 1 {
+		return fmt.Errorf("adaptivefetch: OptToPessMissThreshold must be >= 1 (got %d)", c.OptToPessMissThreshold)
 	}
-	if c.OptToPessAvgMissThreshold < 0 {
-		return fmt.Errorf("adaptivefetch: OptToPessAvgMissThreshold must be >= 0 (got %v)", c.OptToPessAvgMissThreshold)
+	if c.OptToPessAvgMissThreshold <= 0 {
+		return fmt.Errorf("adaptivefetch: OptToPessAvgMissThreshold must be > 0 (got %v)", c.OptToPessAvgMissThreshold)
 	}
 	switch c.BootstrapMode {
 	case ModePessimistic, ModeOptimistic, ModeAuto:

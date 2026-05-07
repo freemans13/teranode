@@ -68,7 +68,9 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 		{"hit rate below zero", func(c *Config) { c.PessToOptHitRateThreshold = -0.1 }, "PessToOptHitRateThreshold"},
 		{"hit rate above one", func(c *Config) { c.PessToOptHitRateThreshold = 1.1 }, "PessToOptHitRateThreshold"},
 		{"negative miss threshold", func(c *Config) { c.OptToPessMissThreshold = -1 }, "OptToPessMissThreshold"},
+		{"zero miss threshold", func(c *Config) { c.OptToPessMissThreshold = 0 }, "OptToPessMissThreshold"},
 		{"negative avg miss threshold", func(c *Config) { c.OptToPessAvgMissThreshold = -1 }, "OptToPessAvgMissThreshold"},
+		{"zero avg miss threshold", func(c *Config) { c.OptToPessAvgMissThreshold = 0 }, "OptToPessAvgMissThreshold"},
 		{"invalid bootstrap mode", func(c *Config) { c.BootstrapMode = Mode(99) }, "BootstrapMode"},
 	}
 
