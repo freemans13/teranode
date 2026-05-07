@@ -367,15 +367,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupMinThroughputKBps:    getInt("blockvalidation_catchup_min_throughput_kbps", 100, alternativeContext...),
 			CatchupParallelFetchEnabled: getBool("blockvalidation_catchup_parallel_fetch_enabled", true, alternativeContext...),
 			CatchupParallelFetchWorkers: getInt("blockvalidation_catchup_parallel_fetch_workers", 3, alternativeContext...),
-			// Adaptive subtreeData fetch gate (defaults mirror tags in
-			// settings/adaptivefetch_settings.go and adaptivefetch.DefaultConfig()).
-			AdaptiveFetch: AdaptiveFetchSettings{
-				BootstrapMode:             getString("adaptive_fetch_bootstrap_mode", "auto", alternativeContext...),
-				WindowSize:                getInt("adaptive_fetch_window_size", 10, alternativeContext...),
-				PessToOptHitRateThreshold: getFloat64("adaptive_fetch_pess_to_opt_hit_rate_threshold", 0.99, alternativeContext...),
-				OptToPessMissThreshold:    getInt("adaptive_fetch_opt_to_pess_miss_threshold", 100, alternativeContext...),
-				OptToPessAvgMissThreshold: getFloat64("adaptive_fetch_opt_to_pess_avg_miss_threshold", 10, alternativeContext...),
-			},
 		},
 		Validator: ValidatorSettings{
 			GRPCAddress:               getString("validator_grpcAddress", "localhost:8081", alternativeContext...),
@@ -568,15 +559,18 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseOrderedLevelAlgorithm:                  getBool("subtreevalidation_useOrderedLevelAlgorithm", true, alternativeContext...),
 			BlocksOnly:                                getBool("subtreevalidation_blocks_only", false, alternativeContext...),
 			CheckBlockSubtreesTimeout:                 getDuration("subtreevalidation_check_block_subtrees_timeout", 30*time.Minute, alternativeContext...),
-			// Adaptive subtreeData fetch gate (defaults mirror tags in
-			// settings/adaptivefetch_settings.go and adaptivefetch.DefaultConfig()).
-			AdaptiveFetch: AdaptiveFetchSettings{
-				BootstrapMode:             getString("adaptive_fetch_bootstrap_mode", "auto", alternativeContext...),
-				WindowSize:                getInt("adaptive_fetch_window_size", 10, alternativeContext...),
-				PessToOptHitRateThreshold: getFloat64("adaptive_fetch_pess_to_opt_hit_rate_threshold", 0.99, alternativeContext...),
-				OptToPessMissThreshold:    getInt("adaptive_fetch_opt_to_pess_miss_threshold", 100, alternativeContext...),
-				OptToPessAvgMissThreshold: getFloat64("adaptive_fetch_opt_to_pess_avg_miss_threshold", 10, alternativeContext...),
-			},
+		},
+		// Adaptive subtreeData fetch gate (defaults mirror tags in
+		// settings/adaptivefetch_settings.go and adaptivefetch.DefaultConfig()).
+		// Defined once at the top level so ExportMetadata() emits each
+		// adaptive_fetch_* key exactly once. Both blockvalidation and
+		// subtreevalidation read from this single struct.
+		AdaptiveFetch: AdaptiveFetchSettings{
+			BootstrapMode:             getString("adaptive_fetch_bootstrap_mode", "auto", alternativeContext...),
+			WindowSize:                getInt("adaptive_fetch_window_size", 10, alternativeContext...),
+			PessToOptHitRateThreshold: getFloat64("adaptive_fetch_pess_to_opt_hit_rate_threshold", 0.99, alternativeContext...),
+			OptToPessMissThreshold:    getInt("adaptive_fetch_opt_to_pess_miss_threshold", 100, alternativeContext...),
+			OptToPessAvgMissThreshold: getFloat64("adaptive_fetch_opt_to_pess_avg_miss_threshold", 10, alternativeContext...),
 		},
 		Legacy: LegacySettings{
 			WorkingDir:                       getString("legacy_workingDir", "../../data", alternativeContext...),

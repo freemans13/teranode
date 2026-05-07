@@ -298,17 +298,17 @@ func New(
 	// distributor is keeping our UTXO store up to date. Transitions are
 	// driven purely by counts observed during normal work — no FSM state,
 	// no wall-clock time. See pkg/adaptivefetch for the full design.
-	bootstrap, bootstrapErr := adaptivefetch.ParseBootstrapMode(tSettings.BlockValidation.AdaptiveFetch.BootstrapMode)
+	bootstrap, bootstrapErr := adaptivefetch.ParseBootstrapMode(tSettings.AdaptiveFetch.BootstrapMode)
 	if bootstrapErr != nil {
 		logger.Warnf("[BlockValidation] unknown adaptive_fetch_bootstrap_mode %q, falling back to auto: %v",
-			tSettings.BlockValidation.AdaptiveFetch.BootstrapMode, bootstrapErr)
+			tSettings.AdaptiveFetch.BootstrapMode, bootstrapErr)
 		bootstrap = adaptivefetch.ModeAuto
 	}
 	af, afErr := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                tSettings.BlockValidation.AdaptiveFetch.WindowSize,
-		PessToOptHitRateThreshold: tSettings.BlockValidation.AdaptiveFetch.PessToOptHitRateThreshold,
-		OptToPessMissThreshold:    tSettings.BlockValidation.AdaptiveFetch.OptToPessMissThreshold,
-		OptToPessAvgMissThreshold: tSettings.BlockValidation.AdaptiveFetch.OptToPessAvgMissThreshold,
+		WindowSize:                tSettings.AdaptiveFetch.WindowSize,
+		PessToOptHitRateThreshold: tSettings.AdaptiveFetch.PessToOptHitRateThreshold,
+		OptToPessMissThreshold:    tSettings.AdaptiveFetch.OptToPessMissThreshold,
+		OptToPessAvgMissThreshold: tSettings.AdaptiveFetch.OptToPessAvgMissThreshold,
 		BootstrapMode:             bootstrap,
 	}, "blockvalidation", prometheus.DefaultRegisterer)
 	if afErr != nil {

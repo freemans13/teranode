@@ -200,17 +200,17 @@ func New(
 	var err error
 
 	// Initialize adaptive fetch state machine
-	bootstrap, bootstrapErr := adaptivefetch.ParseBootstrapMode(tSettings.SubtreeValidation.AdaptiveFetch.BootstrapMode)
+	bootstrap, bootstrapErr := adaptivefetch.ParseBootstrapMode(tSettings.AdaptiveFetch.BootstrapMode)
 	if bootstrapErr != nil {
 		logger.Warnf("[SubtreeValidation] unknown adaptive_fetch_bootstrap_mode %q, falling back to auto: %v",
-			tSettings.SubtreeValidation.AdaptiveFetch.BootstrapMode, bootstrapErr)
+			tSettings.AdaptiveFetch.BootstrapMode, bootstrapErr)
 		bootstrap = adaptivefetch.ModeAuto
 	}
 	af, afErr := adaptivefetch.New(adaptivefetch.Config{
-		WindowSize:                tSettings.SubtreeValidation.AdaptiveFetch.WindowSize,
-		PessToOptHitRateThreshold: tSettings.SubtreeValidation.AdaptiveFetch.PessToOptHitRateThreshold,
-		OptToPessMissThreshold:    tSettings.SubtreeValidation.AdaptiveFetch.OptToPessMissThreshold,
-		OptToPessAvgMissThreshold: tSettings.SubtreeValidation.AdaptiveFetch.OptToPessAvgMissThreshold,
+		WindowSize:                tSettings.AdaptiveFetch.WindowSize,
+		PessToOptHitRateThreshold: tSettings.AdaptiveFetch.PessToOptHitRateThreshold,
+		OptToPessMissThreshold:    tSettings.AdaptiveFetch.OptToPessMissThreshold,
+		OptToPessAvgMissThreshold: tSettings.AdaptiveFetch.OptToPessAvgMissThreshold,
 		BootstrapMode:             bootstrap,
 	}, "subtreevalidation", prometheus.DefaultRegisterer)
 	if afErr != nil {
