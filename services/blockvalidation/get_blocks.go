@@ -260,13 +260,15 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 			// successful pessimistic blocks — it's a "wait until the node has
 			// proven stable, then try optimistic" gate, not a real measurement.
 			//
-			// Opt→Pess is where real safety lives. In optimistic mode we skipped
-			// the fetch entirely; if txs are genuinely missing, downstream
-			// validation fails and the block errors. Operational response is to
-			// restart the node, which auto-bootstraps pessimistic. A future
-			// improvement would plumb real miss counts through the validation
-			// path so Opt→Pess can trip based on observed recovery rate without
-			// needing a restart.
+			// Opt→Pess auto-recovery is NOT yet implemented here. We hardcode
+			// MissingFetches=0 below because this code path doesn't yet know
+			// how many txs the optimistic skip caused to be missing. That means
+			// the Opt→Pess threshold cannot trip from real miss detection in
+			// this service — operator must restart the node to reset to
+			// pessimistic if optimistic mode misbehaves. The threshold logic in
+			// State.maybeTransition is wired up; it just receives no signal
+			// here. A future improvement is to plumb real miss counts through
+			// the validation path so Opt→Pess auto-trips on observed misses.
 			txCount := 0
 			if work.block != nil {
 				txCount = int(work.block.TransactionCount)
