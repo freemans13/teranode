@@ -297,7 +297,7 @@ func New(
 	// pre-fetch subtreeData during catchup or skip it because the tx
 	// distributor is keeping our UTXO store up to date. Transitions are
 	// driven purely by counts observed during normal work — no FSM state,
-	// no wall-clock time. See docs/superpowers/specs/2026-04-23-adaptive-subtreedata-fetch-design.md.
+	// no wall-clock time. See pkg/adaptivefetch for the full design.
 	bootstrap, bootstrapErr := adaptivefetch.ParseBootstrapMode(tSettings.BlockValidation.AdaptiveFetch.BootstrapMode)
 	if bootstrapErr != nil {
 		logger.Warnf("[BlockValidation] unknown adaptive_fetch_bootstrap_mode %q, falling back to auto: %v",

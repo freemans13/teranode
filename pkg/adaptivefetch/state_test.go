@@ -283,6 +283,54 @@ func TestRecord_RingBufferWraparound(t *testing.T) {
 	require.Equal(t, ModeOptimistic, s.Mode())
 }
 
+// TestRecordIfMode_DropsCrossModeObservation verifies that an observation
+// tagged with one mode is discarded when the live mode has transitioned
+// to the other before Record is called. This is the explicit guard against
+// concurrent workers writing observations from a previous mode into the
+// current mode's rolling window.
+func TestRecordIfMode_DropsCrossModeObservation(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                3,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModePessimistic,
+	}, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	// Fill window with valid pessimistic observations so the next perfect
+	// pessimistic observation will flip the state to optimistic.
+	for i := 0; i < 3; i++ {
+		s.RecordIfMode(ModePessimistic, Observation{TotalTxs: 100, LocalHits: 100})
+	}
+	require.Equal(t, ModeOptimistic, s.Mode(),
+		"three perfect pessimistic samples must trip Pess→Opt")
+
+	// Now the live mode is optimistic. A late observation tagged as
+	// pessimistic (e.g. recorded by a worker that started before the
+	// transition) must be dropped — otherwise it would contaminate the
+	// optimistic-mode window with synthetic LocalHits that bypass the
+	// real OptToPess gates.
+	s.RecordIfMode(ModePessimistic, Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	require.Equal(t, ModeOptimistic, s.Mode(),
+		"cross-mode observation must not alter mode")
+
+	// Conversely, an observation tagged with the live mode is recorded.
+	// A miss large enough to trip the immediate OptToPess threshold proves
+	// the observation actually entered the window.
+	s.RecordIfMode(ModeOptimistic, Observation{TotalTxs: 1000, LocalHits: 800, MissingFetches: 200})
+	require.Equal(t, ModePessimistic, s.Mode(),
+		"matching-mode observation with MissingFetches above threshold must trip Opt→Pess")
+}
+
+// TestRecordIfMode_NilReceiver locks in the nil-safe contract.
+func TestRecordIfMode_NilReceiver(t *testing.T) {
+	var s *State
+	require.NotPanics(t, func() {
+		s.RecordIfMode(ModePessimistic, Observation{TotalTxs: 100, LocalHits: 100})
+	})
+}
+
 // TestParseBootstrapMode covers ParseBootstrapMode's accepted input set,
 // case-insensitivity, the empty-string-as-auto convention, and the
 // error path for unknown values.

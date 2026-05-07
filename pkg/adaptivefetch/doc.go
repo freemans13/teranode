@@ -8,6 +8,5 @@
 // individually). Mode transitions are driven entirely by counts of
 // transactions hit in the local UTXO store vs transactions that had to
 // be recovered from peers. No FSM state and no wall-clock time is
-// consulted. See docs/superpowers/specs/2026-04-23-adaptive-subtreedata-fetch-design.md
-// for the full design.
+// consulted.
 package adaptivefetch

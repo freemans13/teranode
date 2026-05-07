@@ -269,7 +269,16 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				// from this subtree (subtreeTxs[subtreeIdx] stays empty). If a tx is
 				// genuinely missing, downstream validation will surface it via the
 				// existing processMissingTransactions fallback in SubtreeValidation.go.
-				optimistic := u.adaptiveFetch.ShouldSkipSubtreeData()
+				//
+				// Capture the live mode (not just the boolean) so the
+				// observation we record below can be tagged with the mode
+				// the work was actually performed in. Subtree workers run
+				// concurrently via the errgroup and the mode can transition
+				// between sample and Record; tagging the observation lets
+				// the state machine drop cross-mode samples instead of
+				// applying them to the wrong window.
+				modeAtSample := u.adaptiveFetch.Mode()
+				optimistic := modeAtSample == adaptivefetch.ModeOptimistic
 
 				if !optimistic {
 					subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
@@ -335,9 +344,11 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				// self-correct without a restart.
 				txCount := subtreeToCheck.Length()
 				if txCount > 0 {
-					// The observation is evaluated against the live state mode,
-					// so we don't tag the observation itself.
-					u.adaptiveFetch.Record(adaptivefetch.Observation{
+					// Tag the observation with the mode we sampled before
+					// the fetch decision. RecordIfMode drops it if the live
+					// mode has since transitioned, preventing cross-mode
+					// samples from contaminating the rolling window.
+					u.adaptiveFetch.RecordIfMode(modeAtSample, adaptivefetch.Observation{
 						TotalTxs:       txCount,
 						LocalHits:      txCount,
 						MissingFetches: 0,

@@ -79,6 +79,30 @@ func (s *State) ShouldSkipSubtreeData() bool {
 // metrics, and may transition modes.
 // A nil receiver is a no-op.
 func (s *State) Record(obs Observation) {
+	s.recordWithMode(obs, false, ModePessimistic)
+}
+
+// RecordIfMode is like Record but discards the observation when the
+// current mode no longer matches observedAt. It exists to close a
+// race in the validation hot paths: callers sample ShouldSkipSubtreeData
+// (or Mode) at the start of a unit of work, perform mode-specific work,
+// and then call back to record the result. With concurrent workers the
+// runtime mode can transition between sample and Record, which would
+// otherwise apply a pessimistic-mode observation to the optimistic
+// window (or vice versa) and skew transition decisions.
+//
+// observedAt is the mode the caller saw when it chose its code path.
+// If the current mode differs at Record time the observation is dropped
+// silently — losing one observation is far cheaper than corrupting the
+// rolling window. A nil receiver is a no-op.
+func (s *State) RecordIfMode(observedAt Mode, obs Observation) {
+	s.recordWithMode(obs, true, observedAt)
+}
+
+// recordWithMode is the shared body of Record and RecordIfMode. When
+// requireMode is true and the live mode differs from observedAt, the
+// observation is dropped before any window mutation or metric update.
+func (s *State) recordWithMode(obs Observation, requireMode bool, observedAt Mode) {
 	if s == nil {
 		return
 	}
@@ -98,6 +122,13 @@ func (s *State) Record(obs Observation) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Mode-snapshot guard: if the caller sampled the mode at decision time
+	// and the mode has since transitioned, the observation belongs to the
+	// previous mode's window and must not contaminate the current one.
+	if requireMode && s.mode != observedAt {
+		return
+	}
 
 	if len(s.window) < s.cfg.WindowSize {
 		s.window = append(s.window, obs)

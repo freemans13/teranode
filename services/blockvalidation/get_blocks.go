@@ -211,7 +211,15 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 
 			// Fetch subtree data for this block — adaptive-fetch state may skip it
 			// entirely when the node is receiving txs via a distributor.
-			optimistic := u.adaptiveFetch.ShouldSkipSubtreeData()
+			//
+			// Capture the live mode (not just the boolean) so we can later
+			// record the observation against the snapshot. Workers run
+			// concurrently and the mode can transition between this point
+			// and the Record call below; the snapshot lets the state machine
+			// drop any observation whose underlying work was performed in a
+			// different mode.
+			modeAtSample := u.adaptiveFetch.Mode()
+			optimistic := modeAtSample == adaptivefetch.ModeOptimistic
 
 			var contributingPeers map[string]struct{}
 			var err error
@@ -264,9 +272,11 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				txCount = int(work.block.TransactionCount)
 			}
 			if txCount > 0 {
-				// The observation is evaluated against the live state mode,
-				// so we don't tag the observation itself.
-				u.adaptiveFetch.Record(adaptivefetch.Observation{
+				// Tag the observation with the mode we sampled before the
+				// fetch decision. RecordIfMode drops it if the live mode
+				// has since transitioned, preventing cross-mode samples
+				// from contaminating the rolling window.
+				u.adaptiveFetch.RecordIfMode(modeAtSample, adaptivefetch.Observation{
 					TotalTxs:       txCount,
 					LocalHits:      txCount,
 					MissingFetches: 0,
