@@ -80,20 +80,3 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 	m.transitions.WithLabelValues(serviceName, ModeOptimistic.String(), ModePessimistic.String()).Add(0)
 	return m
 }
-
-// setMode is a test-only helper that sets the gauge for "test-service"
-// without going through State. Production code uses State.emitMode which
-// bakes in the serviceName the State was constructed with.
-func (m *metrics) setMode(mode Mode) {
-	val := 0.0
-	if mode == ModeOptimistic {
-		val = 1.0
-	}
-	m.modeGauge.WithLabelValues("test-service").Set(val)
-}
-
-// recordTransition is a test-only helper matching setMode — asserts the
-// transitions counter is wired correctly from a test's point of view.
-func (m *metrics) recordTransition(from, to Mode) {
-	m.transitions.WithLabelValues("test-service", from.String(), to.String()).Inc()
-}
