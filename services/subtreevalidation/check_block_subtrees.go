@@ -260,13 +260,10 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 				}
 
-				// PHASE 2: Exact pre-allocation
-				subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
-
 				// Adaptive-fetch gate: when optimistic, skip subtreeData entirely.
 				// The subtree's txs are already in the local UTXO store via propagation,
 				// so downstream processTransactionsInLevels processes 0 new transactions
-				// from this subtree (subtreeTxs[subtreeIdx] stays empty). If a tx is
+				// from this subtree (subtreeTxs[subtreeIdx] stays nil). If a tx is
 				// genuinely missing, downstream validation will surface it via the
 				// existing processMissingTransactions fallback in SubtreeValidation.go.
 				//
@@ -281,6 +278,13 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				optimistic := modeAtSample == adaptivefetch.ModeOptimistic
 
 				if !optimistic {
+					// PHASE 2: Exact pre-allocation. Only sized when we will actually
+					// populate the slice (pessimistic path). In optimistic mode we
+					// leave subtreeTxs[subtreeIdx] as nil to avoid allocating a
+					// large *bt.Tx-pointer backing array that would never be filled —
+					// downstream consolidation handles nil/empty entries naturally.
+					subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
+
 					subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 					if err != nil {
 						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
