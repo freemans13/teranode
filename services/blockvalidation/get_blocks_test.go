@@ -3149,15 +3149,18 @@ func TestBlockWorker_Pessimistic_CallsFetchSubtreeData(t *testing.T) {
 	workQueue := make(chan workItem, 1)
 	resultQueue := make(chan resultItem, 1)
 
-	// Minimal fake block — just needs TransactionCount > 0 to drive the observation record.
-	fakeBlock := &model.Block{TransactionCount: 100}
-	workQueue <- workItem{block: fakeBlock, index: 0}
+	// Use a real test block — blockWorker calls blockUpTo.Hash() for tracing,
+	// which dereferences b.Header. A bare &model.Block{} would panic.
+	blocks := testhelpers.CreateTestBlockChain(t, 2)
+	realBlock := blocks[1]
+	realBlock.TransactionCount = 100
+	workQueue <- workItem{block: realBlock, index: 0}
 	close(workQueue)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	require.NoError(t, server.blockWorker(ctx, 0, workQueue, resultQueue, "peer", "http://peer/", fakeBlock))
+	require.NoError(t, server.blockWorker(ctx, 0, workQueue, resultQueue, "peer", "http://peer/", realBlock))
 	require.Equal(t, int32(1), fetchCalls.Load(), "pessimistic mode must call fetchSubtreeDataForBlock")
 }
 
@@ -3180,14 +3183,17 @@ func TestBlockWorker_Optimistic_SkipsFetchSubtreeData(t *testing.T) {
 
 	workQueue := make(chan workItem, 1)
 	resultQueue := make(chan resultItem, 1)
-	fakeBlock := &model.Block{TransactionCount: 100}
-	workQueue <- workItem{block: fakeBlock, index: 0}
+	// Use a real test block — blockWorker calls blockUpTo.Hash() for tracing.
+	blocks := testhelpers.CreateTestBlockChain(t, 2)
+	realBlock := blocks[1]
+	realBlock.TransactionCount = 100
+	workQueue <- workItem{block: realBlock, index: 0}
 	close(workQueue)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	require.NoError(t, server.blockWorker(ctx, 0, workQueue, resultQueue, "peer", "http://peer/", fakeBlock))
+	require.NoError(t, server.blockWorker(ctx, 0, workQueue, resultQueue, "peer", "http://peer/", realBlock))
 	require.Zero(t, fetchCalls.Load(), "optimistic mode must not call fetchSubtreeDataForBlock")
 }
 
@@ -3269,7 +3275,7 @@ func TestBlockvalidation_AdaptiveFetch_PessToOptToPess(t *testing.T) {
 	// "fake-perfect" observations emitted by blockWorker).
 	for i := 0; i < 10; i++ {
 		af.Record(adaptivefetch.Observation{
-			TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0, Mode: adaptivefetch.ModePessimistic,
+			TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0,
 		})
 	}
 	require.Equal(t, adaptivefetch.ModeOptimistic, af.Mode(),
@@ -3277,7 +3283,7 @@ func TestBlockvalidation_AdaptiveFetch_PessToOptToPess(t *testing.T) {
 
 	// Single optimistic block with 500 missing-tx recoveries — immediate trip.
 	af.Record(adaptivefetch.Observation{
-		TotalTxs: 10000, LocalHits: 9500, MissingFetches: 500, Mode: adaptivefetch.ModeOptimistic,
+		TotalTxs: 10000, LocalHits: 9500, MissingFetches: 500,
 	})
 	require.Equal(t, adaptivefetch.ModePessimistic, af.Mode(),
 		"single 500-miss optimistic block must trip back to pessimistic")

@@ -264,15 +264,12 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				txCount = int(work.block.TransactionCount)
 			}
 			if txCount > 0 {
-				mode := adaptivefetch.ModePessimistic
-				if optimistic {
-					mode = adaptivefetch.ModeOptimistic
-				}
+				// The observation is evaluated against the live state mode,
+				// so we don't tag the observation itself.
 				u.adaptiveFetch.Record(adaptivefetch.Observation{
 					TotalTxs:       txCount,
 					LocalHits:      txCount,
 					MissingFetches: 0,
-					Mode:           mode,
 				})
 			}
 
