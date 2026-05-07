@@ -165,6 +165,49 @@ func TestRecord_OptToPess_RollingAverageTrip(t *testing.T) {
 	require.Equal(t, ModePessimistic, s.Mode())
 }
 
+// TestRecord_OptToPess_ThresholdBoundaryIsInclusive locks in the documented
+// inclusive (>=) threshold semantics for both Opt→Pess trips. A misses count
+// or rolling-average exactly equal to the configured threshold MUST trip back
+// to pessimistic; otherwise a misconfigured node could sit at threshold-value
+// forever without ever recovering. Regression guard for review-round-2.
+func TestRecord_OptToPess_ThresholdBoundaryIsInclusive(t *testing.T) {
+	t.Run("single-block boundary trips", func(t *testing.T) {
+		s, err := New(Config{
+			WindowSize:                10,
+			PessToOptHitRateThreshold: 0.99,
+			OptToPessMissThreshold:    100,
+			OptToPessAvgMissThreshold: 1000, // never trips on average
+			BootstrapMode:             ModeOptimistic,
+		}, "test", prometheus.NewRegistry())
+		require.NoError(t, err)
+
+		// MissingFetches == OptToPessMissThreshold MUST trip (inclusive).
+		s.Record(Observation{TotalTxs: 10000, LocalHits: 9900, MissingFetches: 100})
+		require.Equal(t, ModePessimistic, s.Mode(),
+			"misses == single-block threshold must trip (inclusive)")
+	})
+
+	t.Run("rolling-average boundary trips", func(t *testing.T) {
+		s, err := New(Config{
+			WindowSize:                5,
+			PessToOptHitRateThreshold: 0.99,
+			OptToPessMissThreshold:    1000, // never trips on single block
+			OptToPessAvgMissThreshold: 10,
+			BootstrapMode:             ModeOptimistic,
+		}, "test", prometheus.NewRegistry())
+		require.NoError(t, err)
+
+		// 5 observations of 10 misses each → average exactly 10 → MUST trip.
+		for i := 0; i < 4; i++ {
+			s.Record(Observation{TotalTxs: 10000, LocalHits: 9990, MissingFetches: 10})
+			require.Equal(t, ModeOptimistic, s.Mode(), "block %d: window not full yet", i)
+		}
+		s.Record(Observation{TotalTxs: 10000, LocalHits: 9990, MissingFetches: 10})
+		require.Equal(t, ModePessimistic, s.Mode(),
+			"avg-misses == avg-threshold must trip (inclusive)")
+	})
+}
+
 func TestRecord_ConcurrentIsRaceClean(t *testing.T) {
 	s, err := New(Config{
 		WindowSize:                64,

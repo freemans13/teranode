@@ -556,7 +556,9 @@ func TestServer_catchup(t *testing.T) {
 
 		testAFCfg := adaptivefetch.DefaultConfig()
 		testAFCfg.BootstrapMode = adaptivefetch.ModePessimistic
-		testAF, _ := adaptivefetch.New(testAFCfg, "test", prometheus.NewRegistry())
+		testAF, err := adaptivefetch.New(testAFCfg, "test", prometheus.NewRegistry())
+		require.NoError(t, err)
+		require.NotNil(t, testAF)
 
 		server := &Server{
 			logger:              logger,

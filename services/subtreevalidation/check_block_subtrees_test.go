@@ -1843,7 +1843,9 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 
 	afCfg := adaptivefetch.DefaultConfig()
 	afCfg.BootstrapMode = adaptivefetch.ModePessimistic
-	af, _ := adaptivefetch.New(afCfg, "test", prometheus.NewRegistry())
+	af, err := adaptivefetch.New(afCfg, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NotNil(t, af)
 
 	server := &Server{
 		logger:           logger,
@@ -1907,7 +1909,9 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 			// Create server
 			testAfCfg := adaptivefetch.DefaultConfig()
 			testAfCfg.BootstrapMode = adaptivefetch.ModePessimistic
-			testAf, _ := adaptivefetch.New(testAfCfg, "test", prometheus.NewRegistry())
+			testAf, err := adaptivefetch.New(testAfCfg, "test", prometheus.NewRegistry())
+			require.NoError(t, err)
+			require.NotNil(t, testAf)
 			server := &Server{
 				settings:         testSettings,
 				logger:           ulogger.TestLogger{},

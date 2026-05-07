@@ -133,15 +133,20 @@ func (s *State) maybeTransition() {
 		}
 
 	case ModeOptimistic:
+		// Threshold semantics are inclusive (>=): a configured threshold
+		// value is the *trip point*, not the first value above it. So
+		// MissingFetches == OptToPessMissThreshold trips, and an average
+		// equal to OptToPessAvgMissThreshold trips. This matches the
+		// natural reading of "miss-count threshold of N misses".
 		last := s.window[s.lastIndexLocked()]
-		if last.MissingFetches > s.cfg.OptToPessMissThreshold {
+		if last.MissingFetches >= s.cfg.OptToPessMissThreshold {
 			s.mode = ModePessimistic
 			return
 		}
 		if len(s.window) < s.cfg.WindowSize {
 			return
 		}
-		if s.avgMissesLocked() > s.cfg.OptToPessAvgMissThreshold {
+		if s.avgMissesLocked() >= s.cfg.OptToPessAvgMissThreshold {
 			s.mode = ModePessimistic
 		}
 	}

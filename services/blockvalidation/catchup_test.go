@@ -3105,7 +3105,9 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 
 	testAFCfg := adaptivefetch.DefaultConfig()
 	testAFCfg.BootstrapMode = adaptivefetch.ModePessimistic
-	testAF, _ := adaptivefetch.New(testAFCfg, "test", prometheus.NewRegistry())
+	testAF, err := adaptivefetch.New(testAFCfg, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NotNil(t, testAF)
 
 	server := &Server{
 		logger:              ulogger.TestLogger{},
@@ -3216,7 +3218,9 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 
 	testAFWithConfigCfg := adaptivefetch.DefaultConfig()
 	testAFWithConfigCfg.BootstrapMode = adaptivefetch.ModePessimistic
-	testAFWithConfig, _ := adaptivefetch.New(testAFWithConfigCfg, "test", prometheus.NewRegistry())
+	testAFWithConfig, err := adaptivefetch.New(testAFWithConfigCfg, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NotNil(t, testAFWithConfig)
 
 	server := &Server{
 		logger:              ulogger.TestLogger{},

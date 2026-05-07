@@ -831,7 +831,9 @@ func setupLargeTestServer(t *testing.T, cacheDir string, subtreeStore blob.Store
 	// Create server with the topological order validator
 	afCfg := adaptivefetch.DefaultConfig()
 	afCfg.BootstrapMode = adaptivefetch.ModePessimistic
-	af, _ := adaptivefetch.New(afCfg, "test", prometheus.NewRegistry())
+	af, err := adaptivefetch.New(afCfg, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NotNil(t, af)
 	server := &Server{
 		logger:           logger,
 		settings:         tSettings,

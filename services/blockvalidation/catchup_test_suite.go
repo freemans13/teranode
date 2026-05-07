@@ -130,7 +130,9 @@ func (s *CatchupTestSuite) createServer(t *testing.T) {
 	// so that blockWorker can safely call adaptiveFetch.ShouldSkipSubtreeData().
 	afCfg := adaptivefetch.DefaultConfig()
 	afCfg.BootstrapMode = adaptivefetch.ModePessimistic
-	af, _ := adaptivefetch.New(afCfg, "test", prometheus.NewRegistry())
+	af, err := adaptivefetch.New(afCfg, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NotNil(t, af)
 
 	// Create server
 	s.Server = &Server{
