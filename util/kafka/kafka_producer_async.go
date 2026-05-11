@@ -207,7 +207,25 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 		logger.Warnf("flush_bytes=%d for topic %s clamped to %d for franz-go compatibility", cfg.FlushBytes, cfg.Topic, batchMaxBytes)
 	}
 
-	// Build franz-go client options
+	// Build franz-go client options.
+	//
+	// SEMANTIC NOTE on the three URL params named after Sarama's Flush.* triggers:
+	//
+	//   flush_frequency → kgo.ProducerLinger   (PER-PARTITION linger, not "max time between flushes")
+	//   flush_messages  → kgo.MaxBufferedRecords (global back-pressure cap; blocks Produce(), NOT a flush trigger)
+	//   flush_bytes     → kgo.ProducerBatchMaxBytes (per-partition batch hard cap; clamped to ≥1MiB)
+	//
+	// flush_frequency in particular is a footgun: in Sarama it meant "flush at
+	// most every N", but in franz-go each partition independently waits up to
+	// linger for its batch to fill on size (ProducerBatchMaxBytes). At high
+	// fanout (many partitions, key-hashed records), each partition sees a thin
+	// per-partition stream and the size trigger rarely fires, so linger is the
+	// dominant flush trigger — every record pays up to `flush_frequency` of
+	// producer-side delay. Lesson learned at dev-scale-1/2 where flush_frequency=1s
+	// on the txmeta topic (256 partitions, ~5 batched msgs/s/partition) starved
+	// the subtree-validator's local cache and forced every subtree to retry.
+	// Keep flush_frequency small (≤50ms) on high-fanout topics. See
+	// util/kafka/linger_latency_regression_test.go for a reproduction.
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.BrokersURL...),
 		kgo.DefaultProduceTopic(cfg.Topic),
