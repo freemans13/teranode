@@ -16,26 +16,27 @@ import (
 )
 
 // TestLingerLatencyRegression proves that the `flush_frequency` query parameter
-// — which the franz-go switch silently re-wired to `kgo.ProducerLinger` and to
-// the outer async-batcher's per-batch linger — is responsible for the
-// producer-side latency that starves the subtree-validator's txmeta cache at
-// peak load on dev-scale-1/2.
+// — wired to franz-go's per-partition `kgo.ProducerLinger` — is responsible
+// for the producer-side latency that starves the subtree-validator's txmeta
+// cache at peak load on dev-scale-1/2.
 //
 // Setup mirrors the production pathology in miniature:
 //   - many partitions on one topic (so records spread thinly across them)
 //   - a feed rate slow enough per partition that batches don't fill on size
 //     (the franz-go default ProducerBatchMaxBytes is 1 MiB and is never reached
 //     here, so the per-partition flush is dominated by ProducerLinger)
-//   - the outer async batcher's maxBatch (= flush_messages) is also never
-//     reached, so the outer drain is dominated by its own FlushFrequency linger.
 //
 // The test publishes the same records through two producers that differ only
 // in `flush_frequency` and measures publish→consumer end-to-end latency.
 //
-// Hypothesis: with flush_frequency=1s (current scale-1/scale-2 setting), p50
-// latency will be hundreds of ms because every record waits at the outer
-// linger and/or the franz-go per-partition linger. With flush_frequency=10ms,
-// p99 latency will be a small multiple of 10 ms.
+// Hypothesis: with flush_frequency=1s (the legacy scale-1/scale-2 setting),
+// p50 latency lands near 1 s because every record waits at the franz-go
+// per-partition linger. With flush_frequency=10ms, p99 latency is a small
+// multiple of 10 ms.
+//
+// `outer_batcher_linger` is left at its default (10 ms) for both runs so this
+// test isolates ProducerLinger. Unit-level coverage that the two fields are
+// decoupled lives in TestNewKafkaAsyncProducerFromURLOuterBatcherLinger.
 //
 // Run:  go test -v -run TestLingerLatencyRegression -timeout 5m ./util/kafka/
 func TestLingerLatencyRegression(t *testing.T) {
