@@ -131,7 +131,6 @@ type Service struct {
 	partitionQueries               int     // Number of parallel partition queries (0 = auto-detect)
 	connectionPoolWarningThreshold float64 // Threshold for connection pool auto-adjustment (0.0-1.0)
 	utxoSetTTL                     bool    // Use TTL expiration instead of hard delete
-	skipParentUpdates              bool    // Skip parent update operations and input fetching
 	partitionWorkerFn              func(ctx context.Context, blockHeight uint32, partitionStart int, partitionCount int, prunedSet *PrunedTxSet) (int64, int64, error)
 
 	// Lua UDF module name
@@ -661,11 +660,11 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 	}
 
 	// Shared set tracking TXIDs scanned for pruning — used to skip wasteful parent updates.
-	// Only allocated when parent updates are enabled AND defensive mode is off.
-	// In defensive mode, records may be skipped (child not stable) after the reader registers
-	// them, which would incorrectly suppress parent updates for records still in Aerospike.
+	// Disabled when defensive mode is on: records may be skipped (child not stable) after the
+	// reader registers them, which would incorrectly suppress parent updates for records still
+	// in Aerospike.
 	var prunedSet *PrunedTxSet
-	if !s.skipParentUpdates && !s.defensiveEnabled {
+	if !s.defensiveEnabled {
 		prunedSet = NewPrunedTxSet(256)
 	}
 
