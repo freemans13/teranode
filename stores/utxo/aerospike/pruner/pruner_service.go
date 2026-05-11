@@ -663,6 +663,21 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 	// Disabled when defensive mode is on: records may be skipped (child not stable) after the
 	// reader registers them, which would incorrectly suppress parent updates for records still
 	// in Aerospike.
+	//
+	// Reused across retry attempts intentionally. The set's contract is "this TXID was scanned
+	// as a deletion candidate in this session" — so reuse is correct because:
+	//   1. Add is idempotent (duplicate keys are no-ops), so re-scanning a partition after
+	//      a timeout simply re-registers entries that were already there.
+	//   2. CheckAndRemove is destructive (one consumer per parent), which is fine: if a parent
+	//      was already consumed by a child in a prior attempt, the parent has either been
+	//      deleted (so the next child's skip is correct) or its deletion is still pending in
+	//      a retry partition (so the next child issues a real update and incurs a wasted
+	//      Aerospike op — a perf nit, not a correctness bug).
+	//   3. The skip only suppresses the deletedChildren bin update on the parent. That bin is
+	//      only consulted by the defensive-mode safety check, which is OFF whenever prunedSet
+	//      is non-nil, so a missed update has no behavioural consequence.
+	// Allocating a fresh set per attempt would break the cross-partition dedup that drove this
+	// optimisation: most parent/child pairs span partitions.
 	var prunedSet *PrunedTxSet
 	if !s.defensiveEnabled {
 		prunedSet = NewPrunedTxSet(256)
