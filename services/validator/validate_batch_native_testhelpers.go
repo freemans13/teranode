@@ -38,3 +38,24 @@ func (v *Validator) overrideBASubmitForTest(fn func(ctx context.Context, txs []*
 func (v *Validator) overrideTxMetaPublishForTest(fn func(tx *bt.Tx, m *meta.Data)) {
 	v.txMetaPublishOverride = fn
 }
+
+// OverrideCPUValidationForBench is a test/benchmark seam exposing the
+// internal cpuOverride field to external packages. Use only from
+// _test.go / bench files. Production code MUST NOT call this.
+func (v *Validator) OverrideCPUValidationForBench(fn func(*bt.Tx) error) {
+	v.overrideCPUValidationForTest(fn)
+}
+
+// OverrideBASubmitForBench is a test/benchmark seam exposing the
+// internal blockAssemblySubmitOverride field to external packages. Use only
+// from _test.go / bench files. Production code MUST NOT call this.
+func (v *Validator) OverrideBASubmitForBench(fn func(ctx context.Context, txs []*bt.Tx) map[chainhash.Hash]error) {
+	v.overrideBASubmitForTest(fn)
+}
+
+// OverrideTxMetaPublishForBench is a test/benchmark seam exposing the
+// internal txMetaPublishOverride field to external packages. Use only from
+// _test.go / bench files. Production code MUST NOT call this.
+func (v *Validator) OverrideTxMetaPublishForBench(fn func(tx *bt.Tx, m *meta.Data)) {
+	v.overrideTxMetaPublishForTest(fn)
+}
