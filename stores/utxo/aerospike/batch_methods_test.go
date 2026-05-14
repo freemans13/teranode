@@ -4,11 +4,16 @@ package aerospike_test
 
 import (
 	"context"
+	crand "crypto/rand"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	aerostore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
 	utxotesthelper "github.com/bsv-blockchain/teranode/test/longtest/stores/utxo"
 	"github.com/stretchr/testify/require"
@@ -45,6 +50,34 @@ func seedParentRecord(t *testing.T, s *aerostore.Store, numOutputs int) *chainha
 	require.NoError(t, err)
 
 	return tx.TxIDChainHash()
+}
+
+// seedParentTx creates a minimal tx with the given number of outputs, stores
+// it via s.Create, and returns the full *bt.Tx so callers can compute
+// UTXOHashes and build *utxo.Spend entries.
+func seedParentTx(t *testing.T, s *aerostore.Store, numOutputs int) *bt.Tx {
+	t.Helper()
+
+	tx, err := utxotesthelper.CreateTransaction(uint64(numOutputs)) //nolint:gosec
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	_, err = s.Create(ctx, tx, 0)
+	require.NoError(t, err)
+
+	return tx
+}
+
+// randSpendingHash returns a random 32-byte chainhash suitable for use as a
+// spending-tx hash in test SpendingData.
+func randSpendingHash(t *testing.T) *chainhash.Hash {
+	t.Helper()
+	b := make([]byte, 32)
+	_, err := crand.Read(b)
+	require.NoError(t, err)
+	h, err := chainhash.NewHash(b)
+	require.NoError(t, err)
+	return h
 }
 
 // ---------------------------------------------------------------------------
@@ -107,4 +140,85 @@ func TestBatchGetParents_EmptyInput(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, got)
 	require.Empty(t, missing)
+}
+
+// ---------------------------------------------------------------------------
+// BatchSpend tests
+// ---------------------------------------------------------------------------
+
+func TestBatchSpend_AllSucceed(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	// Seed a parent with 2 outputs and build proper spend entries.
+	parentTx := seedParentTx(t, s, 2)
+	parentHash := parentTx.TxIDChainHash()
+	spendingHash := randSpendingHash(t)
+
+	sp0Hash, err := util.UTXOHashFromOutput(parentHash, parentTx.Outputs[0], 0)
+	require.NoError(t, err)
+	sp1Hash, err := util.UTXOHashFromOutput(parentHash, parentTx.Outputs[1], 1)
+	require.NoError(t, err)
+
+	spends := []*utxo.Spend{
+		{
+			TxID:         parentHash,
+			Vout:         0,
+			UTXOHash:     sp0Hash,
+			SpendingData: spendpkg.NewSpendingData(spendingHash, 0),
+		},
+		{
+			TxID:         parentHash,
+			Vout:         1,
+			UTXOHash:     sp1Hash,
+			SpendingData: spendpkg.NewSpendingData(spendingHash, 1),
+		},
+	}
+
+	results, err := s.BatchSpend(ctx, spends, 1)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.NoError(t, results[0].Err)
+	require.NoError(t, results[1].Err)
+}
+
+func TestBatchSpend_PerRecordErrorMapsToInput(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	// Seed a parent with 1 output, then spend it with a wrong UTXOHash — the
+	// Lua will return UTXO_HASH_MISMATCH which surfaces as results[0].Err.
+	parentTx := seedParentTx(t, s, 1)
+	parentHash := parentTx.TxIDChainHash()
+	spendingHash := randSpendingHash(t)
+
+	// Build a deliberately wrong UTXOHash (all zeros).
+	wrongHash, err := chainhash.NewHash(make([]byte, 32))
+	require.NoError(t, err)
+
+	spends := []*utxo.Spend{
+		{
+			TxID:         parentHash,
+			Vout:         0,
+			UTXOHash:     wrongHash,
+			SpendingData: spendpkg.NewSpendingData(spendingHash, 0),
+		},
+	}
+
+	results, err := s.BatchSpend(ctx, spends, 1)
+	require.NoError(t, err, "whole-call err must be nil for per-record Lua failures")
+	require.Len(t, results, 1)
+	require.Error(t, results[0].Err, "expected per-record error for hash mismatch")
+}
+
+func TestBatchSpend_EmptyInput(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	got, err := s.BatchSpend(ctx, nil, 1)
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
