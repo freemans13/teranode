@@ -107,7 +107,7 @@ func (s *stubBatchStore) BatchSpend(_ context.Context, spends []*utxo.Spend, _ u
 // newNativeValidator returns a *Validator wired to a stub UTXO store so that
 // validateBatchNative takes the native path (not the fallback).
 // The UseBatchValidation flag is set to true so ValidateBatch routes to native.
-func newNativeValidator(t *testing.T) (*Validator, *stubBatchStore) {
+func newNativeValidator(t testing.TB) (*Validator, *stubBatchStore) {
 	t.Helper()
 	v := newValidatorForTest(t)
 	stub := &stubBatchStore{}
@@ -133,7 +133,7 @@ func mkParentMap(hashes ...*chainhash.Hash) map[[32]byte]*aerospike.ParentRecord
 // bscript.Script so that utxo.GetSpends (called by Phase C) can compute the
 // UTXOHash without a nil-pointer error. Actual script/satoshi values are
 // zero/empty — sufficient for the stub spend path used in unit tests.
-func minimalTxWithParent(t *testing.T, parent chainhash.Hash) *bt.Tx {
+func minimalTxWithParent(t testing.TB, parent chainhash.Hash) *bt.Tx {
 	t.Helper()
 	tx := bt.NewTx()
 	input := &bt.Input{
@@ -151,7 +151,7 @@ func minimalTxWithParent(t *testing.T, parent chainhash.Hash) *bt.Tx {
 // passes. Use this in Phase C/D/E tests that construct minimal (non-extended,
 // 0-output) transactions and want Phase B to be a no-op so the test can
 // focus on the later phase under test.
-func installNoopCPUOverride(t *testing.T, v *Validator) {
+func installNoopCPUOverride(t testing.TB, v *Validator) {
 	t.Helper()
 	v.overrideCPUValidationForTest(func(_ *bt.Tx) error { return nil })
 }

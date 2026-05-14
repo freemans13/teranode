@@ -17,7 +17,7 @@ import (
 // newValidatorForTest creates a minimal Validator suitable for unit tests.
 // It uses an in-memory SQLite UTXO store and disables block assembly so
 // that no external services need to be running.
-func newValidatorForTest(t *testing.T) *Validator {
+func newValidatorForTest(t testing.TB) *Validator {
 	t.Helper()
 	tracing.SetupMockTracer()
 
