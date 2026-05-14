@@ -38,6 +38,13 @@ type stubBatchStore struct {
 	// createPerIdx injects per-tx failures indexed against the slice passed to
 	// BatchCreate (NOT the original txs slice — use compactAlive ordering).
 	createPerIdx map[int]error
+
+	// lockedCalls is incremented each time BatchSetLocked is called.
+	lockedCalls int
+	// lockedErr causes BatchSetLocked to return a whole-batch transport error.
+	lockedErr error
+	// lockedPerHash injects per-tx failures keyed by tx hash (full 32 bytes).
+	lockedPerHash map[[32]byte]error
 }
 
 func (s *stubBatchStore) BatchGetParents(_ context.Context, hashes [][]byte) (map[[32]byte]*aerospike.ParentRecord, [][]byte, error) {
@@ -58,6 +65,21 @@ func (s *stubBatchStore) BatchCreate(_ context.Context, txs []*bt.Tx, _ uint32, 
 		h := tx.TxIDChainHash()
 		results[i].TxHash = h.CloneBytes()
 		results[i].Err = s.createPerIdx[i]
+	}
+	return results, nil
+}
+
+func (s *stubBatchStore) BatchSetLocked(_ context.Context, hashes [][]byte, _ bool) ([]aerospike.SetLockedResult, error) {
+	s.lockedCalls++
+	if s.lockedErr != nil {
+		return nil, s.lockedErr
+	}
+	results := make([]aerospike.SetLockedResult, len(hashes))
+	for i, h := range hashes {
+		results[i].TxHash = h
+		var key [32]byte
+		copy(key[:], h)
+		results[i].Err = s.lockedPerHash[key]
 	}
 	return results, nil
 }
@@ -438,4 +460,114 @@ func TestValidateBatchNative_PhaseD_MetaPopulatedOnSuccess(t *testing.T) {
 	require.True(t, results[0].Meta.Locked, "Meta.Locked must be true (BatchCreate was called with lockedTrue=true)")
 	require.Equal(t, blockHeight, results[0].Meta.UnminedSince, "Meta.UnminedSince must equal the blockHeight passed to ValidateBatch")
 	require.Equal(t, tx, results[0].Meta.Tx, "Meta.Tx must reference the original transaction")
+}
+
+// ---------------------------------------------------------------------------
+// Phase E tests
+// ---------------------------------------------------------------------------
+
+// TestValidateBatchNative_PhaseE_AllAccepted asserts that when BlockAssembly
+// accepts all txs, exactly one BatchSetLocked call is made (for the full
+// surviving set) and all results have no error.
+func TestValidateBatchNative_PhaseE_AllAccepted(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA, pB := chainhash.Hash{0xC0}, chainhash.Hash{0xC1}
+	stub.parents = mkParentMap(&pA, &pB)
+
+	txs := []*bt.Tx{minimalTxWithParent(t, pA), minimalTxWithParent(t, pB)}
+
+	v.overrideBASubmitForTest(func(_ context.Context, _ []*bt.Tx) map[chainhash.Hash]error {
+		return map[chainhash.Hash]error{} // all accepted
+	})
+
+	results, err := v.ValidateBatch(context.Background(), txs, 0)
+	require.NoError(t, err)
+	for i, r := range results {
+		require.NoError(t, r.Err, "tx[%d] must have no error when BA accepts all", i)
+	}
+	require.Equal(t, 1, stub.lockedCalls, "Phase E must fire exactly one BatchSetLocked call for the accepted subset")
+}
+
+// TestValidateBatchNative_PhaseE_BARejectionLeavesTxLocked asserts that a
+// BA-rejected tx is tagged PhaseBlockAssembly and NOT passed to
+// BatchSetLocked (it stays locked for reconciler pickup). The accepted tx IS
+// unlocked via a single BatchSetLocked call.
+func TestValidateBatchNative_PhaseE_BARejectionLeavesTxLocked(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA, pB := chainhash.Hash{0xB0}, chainhash.Hash{0xB1}
+	stub.parents = mkParentMap(&pA, &pB)
+
+	good := minimalTxWithParent(t, pA)
+	rejected := minimalTxWithParent(t, pB)
+
+	v.overrideBASubmitForTest(func(_ context.Context, _ []*bt.Tx) map[chainhash.Hash]error {
+		out := map[chainhash.Hash]error{}
+		// good is accepted (no entry); rejected has an error
+		out[*rejected.TxIDChainHash()] = terrors.NewProcessingError("BA rejection")
+		return out
+	})
+
+	results, err := v.ValidateBatch(context.Background(), []*bt.Tx{good, rejected}, 0)
+	require.NoError(t, err)
+	require.NoError(t, results[0].Err, "accepted tx must have no error")
+	require.Error(t, results[1].Err, "BA-rejected tx must have an error")
+	require.Equal(t, PhaseBlockAssembly, results[1].Phase, "BA-rejected tx must be tagged PhaseBlockAssembly")
+	// BatchSetLocked is called once — only for good (1 hash in the call).
+	require.Equal(t, 1, stub.lockedCalls, "exactly one BatchSetLocked call for the accepted subset")
+}
+
+// TestValidateBatchNative_PhaseE_SetLockedFailureTagged asserts that when
+// BatchSetLocked returns a per-tx error, the tx is tagged PhaseSetLocked
+// (distinct from PhaseBlockAssembly).
+func TestValidateBatchNative_PhaseE_SetLockedFailureTagged(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA := chainhash.Hash{0xD0}
+	stub.parents = mkParentMap(&pA)
+	tx := minimalTxWithParent(t, pA)
+
+	v.overrideBASubmitForTest(func(_ context.Context, _ []*bt.Tx) map[chainhash.Hash]error {
+		return map[chainhash.Hash]error{} // BA accepts all
+	})
+
+	// Inject a per-tx failure from BatchSetLocked
+	var txKey [32]byte
+	copy(txKey[:], tx.TxIDChainHash()[:])
+	stub.lockedPerHash = map[[32]byte]error{
+		txKey: terrors.NewProcessingError("aerospike write failed during unlock"),
+	}
+
+	results, err := v.ValidateBatch(context.Background(), []*bt.Tx{tx}, 0)
+	require.NoError(t, err)
+	require.Error(t, results[0].Err, "tx must have an error when BatchSetLocked fails")
+	require.Equal(t, PhaseSetLocked, results[0].Phase, "must be tagged PhaseSetLocked, not PhaseBlockAssembly")
+}
+
+// TestValidateBatchNative_PhaseE_SetLockedWholeBatchFailureTagged asserts
+// that a whole-batch BatchSetLocked transport error tags all affected txs
+// with PhaseSetLocked.
+func TestValidateBatchNative_PhaseE_SetLockedWholeBatchFailureTagged(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA, pB := chainhash.Hash{0xE0}, chainhash.Hash{0xE1}
+	stub.parents = mkParentMap(&pA, &pB)
+	txs := []*bt.Tx{minimalTxWithParent(t, pA), minimalTxWithParent(t, pB)}
+
+	v.overrideBASubmitForTest(func(_ context.Context, _ []*bt.Tx) map[chainhash.Hash]error {
+		return map[chainhash.Hash]error{} // BA accepts all
+	})
+	stub.lockedErr = terrors.NewProcessingError("aerospike transport failure during BatchSetLocked")
+
+	results, err := v.ValidateBatch(context.Background(), txs, 0)
+	require.NoError(t, err)
+	for i, r := range results {
+		require.Error(t, r.Err, "tx[%d] must have error on whole-batch BatchSetLocked failure", i)
+		require.Equal(t, PhaseSetLocked, r.Phase, "tx[%d] must be tagged PhaseSetLocked", i)
+	}
 }

@@ -3,8 +3,11 @@ package validator
 import (
 	"context"
 	"runtime"
+	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
@@ -19,6 +22,7 @@ type batchUtxoStore interface {
 	BatchGetParents(ctx context.Context, parentHashes [][]byte) (map[[32]byte]*aerospike.ParentRecord, [][]byte, error)
 	BatchSpend(ctx context.Context, spends []*utxo.Spend, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]aerospike.SpendResult, error)
 	BatchCreate(ctx context.Context, txs []*bt.Tx, blockHeight uint32, lockedTrue bool) ([]aerospike.CreateResult, error)
+	BatchSetLocked(ctx context.Context, txHashes [][]byte, locked bool) ([]aerospike.SetLockedResult, error)
 }
 
 // validateBatchNative runs the six-phase native pipeline. Phase wiring is
@@ -188,7 +192,49 @@ func (v *Validator) validateBatchNative(
 		}
 	}
 
-	_ = alive // consumed by Phases E–F
+	// Phase E — submit surviving txs to BlockAssembly, then unlock the
+	// BA-acknowledged subset via a single BatchSetLocked(false) call.
+	// BA-rejected txs are left locked and tagged PhaseBlockAssembly so the
+	// existing locked-tx reconciler can pick them up via the normal retry path.
+	aliveTxs, aliveIdx = compactAlive(txs, alive)
+	if len(aliveTxs) > 0 {
+		baErrs := v.submitToBlockAssemblyBatch(ctx, aliveTxs)
+		unlockHashes := make([][]byte, 0, len(aliveTxs))
+		unlockIdx := make([]int, 0, len(aliveTxs))
+		for j, tx := range aliveTxs {
+			i := aliveIdx[j]
+			h := tx.TxIDChainHash()
+			if e, rejected := baErrs[*h]; rejected {
+				results[i].Err = e
+				results[i].Phase = PhaseBlockAssembly
+				alive[i] = false
+				continue
+			}
+			unlockHashes = append(unlockHashes, h[:])
+			unlockIdx = append(unlockIdx, i)
+		}
+		if len(unlockHashes) > 0 {
+			ulResults, uErr := store.BatchSetLocked(ctx, unlockHashes, false)
+			if uErr != nil {
+				for _, i := range unlockIdx {
+					results[i].Err = uErr
+					results[i].Phase = PhaseSetLocked
+					alive[i] = false
+				}
+			} else {
+				for j, ur := range ulResults {
+					if ur.Err != nil {
+						i := unlockIdx[j]
+						results[i].Err = ur.Err
+						results[i].Phase = PhaseSetLocked
+						alive[i] = false
+					}
+				}
+			}
+		}
+	}
+
+	_ = alive // consumed by Phase F
 
 	return results, nil
 }
@@ -335,4 +381,63 @@ func buildSpendsForBatch(txs []*bt.Tx, alive []bool, results []ValidationResult)
 		}
 	}
 	return spends, spendToTxIdx
+}
+
+// submitToBlockAssemblyBatch submits a batch of txs to BlockAssembly.
+// Returns a map keyed by tx hash of per-tx errors (only present for rejected
+// txs; an absent entry means accepted). Uses the test override if set;
+// otherwise calls v.blockAssembler.Store per-tx with bounded parallelism —
+// the BA client internally batches via go-batcher so this is efficient.
+//
+// Service-level errors (e.g. blockAssembler is nil or Store returns a
+// non-nil error) are treated as per-tx rejections tagged in the result map.
+// The rationale: a transient BA unavailability should surface as
+// PhaseBlockAssembly (leaving the tx locked for reconciler pickup) rather
+// than as a whole-batch failure that would incorrectly un-spend and un-create
+// txs that were successfully written to Aerospike in Phase D.
+func (v *Validator) submitToBlockAssemblyBatch(ctx context.Context, txs []*bt.Tx) map[chainhash.Hash]error {
+	if v.blockAssemblySubmitOverride != nil {
+		return v.blockAssemblySubmitOverride(ctx, txs)
+	}
+
+	// If BlockAssembly is disabled (blockAssembler is nil), treat every tx as
+	// accepted (no error) — mirroring the existing single-tx path which skips
+	// the sendToBlockAssembler call entirely when addToBlockAssembly is false.
+	if v.blockAssembler == nil {
+		return map[chainhash.Hash]error{}
+	}
+
+	out := make(map[chainhash.Hash]error)
+	var mu sync.Mutex
+
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(runtime.NumCPU())
+	for _, tx := range txs {
+		tx := tx
+		g.Go(func() error {
+			h := tx.TxIDChainHash()
+			txInpoints, err := subtree.NewTxInpointsFromTx(tx)
+			if err != nil {
+				mu.Lock()
+				out[*h] = err
+				mu.Unlock()
+				return nil
+			}
+			fee, err := util.GetFees(tx)
+			if err != nil {
+				mu.Lock()
+				out[*h] = err
+				mu.Unlock()
+				return nil
+			}
+			if _, storeErr := v.blockAssembler.Store(gCtx, h, fee, uint64(tx.Size()), txInpoints); storeErr != nil { //nolint:gosec
+				mu.Lock()
+				out[*h] = storeErr
+				mu.Unlock()
+			}
+			return nil // never bubble per-tx errors as whole-batch errors
+		})
+	}
+	_ = g.Wait()
+	return out
 }

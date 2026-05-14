@@ -1,6 +1,11 @@
 package validator
 
-import "github.com/bsv-blockchain/go-bt/v2"
+import (
+	"context"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+)
 
 // setBatchStoreForTest installs a batchUtxoStore stub on the Validator,
 // bypassing the normal utxoStore type assertion in getBatchUtxoStore.
@@ -15,4 +20,12 @@ func (v *Validator) setBatchStoreForTest(s batchUtxoStore) {
 // extended, signed transaction. Production code never calls this method.
 func (v *Validator) overrideCPUValidationForTest(fn func(*bt.Tx) error) {
 	v.cpuOverride = fn
+}
+
+// overrideBASubmitForTest installs a function that replaces the real
+// submitToBlockAssemblyBatch implementation. Allows unit tests to control
+// per-tx BA accept/reject without a live BlockAssembly service.
+// Production code never calls this method.
+func (v *Validator) overrideBASubmitForTest(fn func(ctx context.Context, txs []*bt.Tx) map[chainhash.Hash]error) {
+	v.blockAssemblySubmitOverride = fn
 }

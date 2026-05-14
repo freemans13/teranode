@@ -182,6 +182,12 @@ type Validator struct {
 	// TxValidator CPU-validation calls inside runCPUValidation. nil in
 	// production.
 	cpuOverride func(*bt.Tx) error
+
+	// blockAssemblySubmitOverride is a test seam that, when non-nil, replaces
+	// the real submitToBlockAssemblyBatch implementation. Allows unit tests to
+	// control per-tx BA accept/reject without a live BlockAssembly service.
+	// nil in production.
+	blockAssemblySubmitOverride func(ctx context.Context, txs []*bt.Tx) map[chainhash.Hash]error
 }
 
 // New creates a new Validator instance with the provided configuration.
