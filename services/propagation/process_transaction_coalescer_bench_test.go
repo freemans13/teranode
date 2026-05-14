@@ -18,6 +18,7 @@ package propagation
 
 import (
 	"context"
+	crand "crypto/rand"
 	"fmt"
 	"net/url"
 	"sync"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	aerostore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/services/propagation/propagation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
@@ -34,8 +36,6 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	aeroTest "github.com/bsv-blockchain/testcontainers-aerospike-go"
 	"github.com/stretchr/testify/require"
-
-	utxotesthelper "github.com/bsv-blockchain/teranode/test/longtest/stores/utxo"
 )
 
 func BenchmarkProcessTransaction_FlagOffVsOn_RealAerospike(b *testing.B) {
@@ -157,16 +157,53 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 	return ps, aeroStore, cleanup
 }
 
-// seedRandomParentsForCoalescerBench creates n parent txs in the
-// Aerospike store via Create. Returns the parent txs so children can
-// reference them. Mirrors validate_batch_aerospike_bench_test.go's
-// seedRandomParentsForBench.
+// seedRandomParentsForCoalescerBench creates n parent txs directly in the Aerospike
+// store via Create (bypassing the validator). Each parent is a regular (non-coinbase)
+// extended tx with a random unique PreviousTxID so every parent gets a distinct tx
+// hash, avoiding CREATE_ONLY collisions across bench iterations.
+//
+// Parents are stored as REGULAR txs (PreviousTxOutIndex=0, non-zero PreviousTxID)
+// so the Aerospike store does NOT apply the coinbase maturity lock — children can
+// spend these outputs immediately at blockHeight=0.
+//
+// PreviousTxSatoshis is set to 2000 so GetFees sees input(2000) >= output(1000) and
+// accepts the tx. The OP_TRUE locking script gives children a trivially satisfiable
+// spend condition.
 func seedRandomParentsForCoalescerBench(b testing.TB, ctx context.Context, s *aerostore.Store, n int) []*bt.Tx {
 	b.Helper()
+	opTrue, err := bscript.NewFromHexString("51") // OP_1 / OP_TRUE (anyone-can-spend)
+	require.NoError(b, err)
+
 	parents := make([]*bt.Tx, n)
+	emptyScript := bscript.Script{}
+
 	for i := 0; i < n; i++ {
-		tx, err := utxotesthelper.CreateTransaction(1)
-		require.NoError(b, err)
+		tx := bt.NewTx()
+
+		// Unique random 32-byte PreviousTxID so every parent has a distinct tx hash.
+		// PreviousTxOutIndex=0 (not 0xFFFFFFFF) ensures IsCoinbase()==false, which
+		// prevents the Aerospike Lua script from applying the coinbase maturity lock.
+		var randBytes [32]byte
+		_, randErr := crand.Read(randBytes[:])
+		require.NoError(b, randErr)
+		uniqueHash, hashErr := chainhash.NewHash(randBytes[:])
+		require.NoError(b, hashErr)
+
+		in := &bt.Input{
+			PreviousTxOutIndex: 0,
+			PreviousTxScript:   &emptyScript,
+			PreviousTxSatoshis: 2000, // input > output so GetFees == 1000 (valid fee)
+			UnlockingScript:    &emptyScript,
+			SequenceNumber:     0xFFFFFFFF,
+		}
+		require.NoError(b, in.PreviousTxIDAdd(uniqueHash))
+		tx.Inputs = append(tx.Inputs, in)
+
+		tx.Outputs = append(tx.Outputs, &bt.Output{
+			Satoshis:      1000,
+			LockingScript: opTrue,
+		})
+
 		_, err = s.Create(ctx, tx, 0)
 		require.NoError(b, err)
 		parents[i] = tx
@@ -174,10 +211,13 @@ func seedRandomParentsForCoalescerBench(b testing.TB, ctx context.Context, s *ae
 	return parents
 }
 
-// buildChildrenForCoalescerBench builds one child tx per parent, each
-// spending output 0 of its parent. The inputs are extended so
-// utxo.GetSpends works in Phase C. Mirrors v1 bench's
-// buildChildrenSpendingParentsForBench.
+// buildChildrenForCoalescerBench builds one child tx per parent, each spending
+// output 0 of its parent. Children are deliberately NON-EXTENDED: PreviousTxSatoshis
+// and PreviousTxScript are left zero/nil, matching the wire-format shape of a tx
+// arriving from the network. The validator must hydrate these fields at Phase A from
+// the UTXO store — which is exactly the code path we want to exercise.
+// UnlockingScript is set to a non-nil empty script so Store.Create can persist the
+// child after validation succeeds (mirrors buildChildTxForParityTest).
 func buildChildrenForCoalescerBench(b testing.TB, parents []*bt.Tx) []*bt.Tx {
 	b.Helper()
 	children := make([]*bt.Tx, len(parents))
@@ -185,23 +225,18 @@ func buildChildrenForCoalescerBench(b testing.TB, parents []*bt.Tx) []*bt.Tx {
 		ph := parent.TxIDChainHash()
 		child := bt.NewTx()
 
-		var lockScript *bscript.Script
-		if parent.Outputs[0].LockingScript != nil {
-			lockScript = parent.Outputs[0].LockingScript
-		} else {
-			lockScript = &bscript.Script{}
-		}
-
-		input := &bt.Input{
+		emptyScript := bscript.Script{}
+		in := &bt.Input{
 			PreviousTxOutIndex: 0,
-			PreviousTxScript:   lockScript,
-			PreviousTxSatoshis: parent.Outputs[0].Satoshis,
+			// Deliberately leave PreviousTxSatoshis and PreviousTxScript unset
+			// to simulate a non-extended (wire-format) transaction.
+			UnlockingScript: &emptyScript,
 		}
-		require.NoError(b, input.PreviousTxIDAdd(ph))
-		child.Inputs = append(child.Inputs, input)
+		require.NoError(b, in.PreviousTxIDAdd(ph))
+		child.Inputs = append(child.Inputs, in)
 
-		require.NoError(b, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1))
-		child.SetExtended(true)
+		// Pay less than parent's 1000 satoshis so fee = 500 satoshis (valid once hydrated).
+		require.NoError(b, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 500))
 
 		children[i] = child
 	}
