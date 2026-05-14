@@ -80,6 +80,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/ordishs/gocore"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -1188,15 +1189,39 @@ func (s *Store) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error {
 }
 
 // BatchPreviousOutputsDecorate fetches previous output information for inputs across
-// multiple transactions. The Aerospike implementation delegates to per-tx PreviousOutputsDecorate
-// which already uses an internal batcher for efficiency.
+// multiple transactions. The Aerospike implementation delegates to per-tx
+// PreviousOutputsDecorate, which puts each input into the shared outpointBatcher and
+// then waits for its own inputs' results. Calling PreviousOutputsDecorate concurrently
+// for each tx lets the outpointBatcher coalesce inputs across transactions into
+// larger Aerospike batch reads, which is critical on large blocks — a sequential
+// per-tx loop would lose that cross-tx batching and regress throughput.
+//
+// Concurrency is bounded by UtxoStore.BatchPreviousOutputsDecorateConcurrency (the
+// same knob used by the SQL store). The default of 4 is conservative: each
+// goroutine submits one tx's worth of inputs into the shared outpointBatcher and
+// blocks on result channels, so a small fan-out is enough to keep the batcher
+// saturated without spawning thousands of goroutines on large blocks.
 func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
-	for _, tx := range txs {
-		if err := s.PreviousOutputsDecorate(ctx, tx); err != nil {
-			return err
-		}
+	if len(txs) == 0 {
+		return nil
 	}
-	return nil
+
+	concurrency := s.settings.UtxoStore.BatchPreviousOutputsDecorateConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(g, concurrency)
+
+	for _, tx := range txs {
+		tx := tx
+		g.Go(func() error {
+			return s.PreviousOutputsDecorate(gCtx, tx)
+		})
+	}
+
+	return g.Wait()
 }
 
 func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
