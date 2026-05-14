@@ -1344,6 +1344,17 @@ func (ps *PropagationServer) processTransactionInternal(ctx context.Context, btT
 	} else {
 		ps.logger.WithTraceContext(ctx).Debugf("[ProcessTransaction][%s] Calling validate function", btTx.TxID())
 
+		if ps.coalescer != nil {
+			result, sErr := ps.coalescer.Submit(ctx, btTx, 0)
+			if sErr != nil {
+				return errors.NewProcessingError("[ProcessTransaction][%s] coalescer submit failed", btTx.TxID(), sErr)
+			}
+			if result.Err != nil {
+				return errors.NewProcessingError("[ProcessTransaction][%s] failed to validate transaction", btTx.TxID(), result.Err)
+			}
+			return nil
+		}
+
 		// All transactions entering Teranode can be assumed to be after Genesis activation height
 		// but we pass in no block height, and just use the block height set in the utxo store
 		if _, err = ps.validator.Validate(ctx, btTx, 0); err != nil {
