@@ -492,7 +492,7 @@ func (s *Service) partitionWorker(
 		readAheadBase = 1000 // fall back to default chunk size if unset
 	}
 	// Allow modest read-ahead, but cap to avoid excessive buffered records.
-	readAheadBuffer := int(math.Min(float64(readAheadBase*2), 10000))
+	readAheadBuffer := min(readAheadBase*2, 10000)
 	if readAheadBuffer < 1 {
 		readAheadBuffer = 1
 	}
@@ -678,9 +678,16 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 	//      is non-nil, so a missed update has no behavioural consequence.
 	// Allocating a fresh set per attempt would break the cross-partition dedup that drove this
 	// optimisation: most parent/child pairs span partitions.
+	//
+	// Memory is bounded by prunedTxSetMaxEntries. In tight-chain workloads CheckAndRemove
+	// reclaims entries quickly so peak Len() stays small, but production sessions can scan
+	// hundreds of millions of records (~500M observed on dev-scale-1). Without a cap, a
+	// workload where most parents live in prior blocks would keep every TXID added,
+	// growing memory linearly with session size. The cap silently degrades the optimisation
+	// back to baseline once hit — no correctness impact, just no further skips.
 	var prunedSet *PrunedTxSet
 	if !s.defensiveEnabled {
-		prunedSet = NewPrunedTxSet(256)
+		prunedSet = NewPrunedTxSet(256, prunedTxSetMaxEntries)
 	}
 
 	// Cumulative counters persist across retry attempts

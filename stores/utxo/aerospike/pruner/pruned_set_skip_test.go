@@ -116,7 +116,7 @@ func TestProcessRecordChunk_SkipsParentsInPrunedSet(t *testing.T) {
 		parentB[i] = 0xBB
 	}
 
-	prunedSet := NewPrunedTxSet(4)
+	prunedSet := NewPrunedTxSet(4, 0)
 	prunedSet.Add(parentA)
 	prunedSet.Add(parentB)
 	require.Equal(t, 2, prunedSet.Len())
@@ -170,7 +170,7 @@ func TestProcessRecordChunk_EmptyPrunedSetIsNoOp(t *testing.T) {
 		},
 	}
 
-	prunedSet := NewPrunedTxSet(4)
+	prunedSet := NewPrunedTxSet(4, 0)
 
 	before := testutil.ToFloat64(prometheusUtxoParentsSkippedPruned)
 

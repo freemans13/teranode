@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,7 +15,7 @@ func makeHash(b byte) chainhash.Hash {
 }
 
 func TestPrunedTxSet_AddAndContains(t *testing.T) {
-	set := NewPrunedTxSet(16)
+	set := NewPrunedTxSet(16, 0)
 
 	h1 := makeHash(0x01)
 	h2 := makeHash(0x02)
@@ -25,13 +24,13 @@ func TestPrunedTxSet_AddAndContains(t *testing.T) {
 	set.Add(h1)
 	set.Add(h2)
 
-	assert.True(t, set.Contains(h1))
-	assert.True(t, set.Contains(h2))
-	assert.False(t, set.Contains(h3))
+	require.True(t, set.Contains(h1))
+	require.True(t, set.Contains(h2))
+	require.False(t, set.Contains(h3))
 }
 
 func TestPrunedTxSet_CheckAndRemove(t *testing.T) {
-	set := NewPrunedTxSet(16)
+	set := NewPrunedTxSet(16, 0)
 
 	h1 := makeHash(0x01)
 	h2 := makeHash(0x02)
@@ -40,30 +39,30 @@ func TestPrunedTxSet_CheckAndRemove(t *testing.T) {
 	set.Add(h2)
 
 	// CheckAndRemove returns true and removes
-	assert.True(t, set.CheckAndRemove(h1))
+	require.True(t, set.CheckAndRemove(h1))
 	// Second call returns false — already removed
-	assert.False(t, set.CheckAndRemove(h1))
-	assert.False(t, set.Contains(h1))
+	require.False(t, set.CheckAndRemove(h1))
+	require.False(t, set.Contains(h1))
 
 	// h2 still present
-	assert.True(t, set.Contains(h2))
+	require.True(t, set.Contains(h2))
 }
 
 func TestPrunedTxSet_Len(t *testing.T) {
-	set := NewPrunedTxSet(16)
+	set := NewPrunedTxSet(16, 0)
 
-	assert.Equal(t, 0, set.Len())
+	require.Equal(t, 0, set.Len())
 
 	set.Add(makeHash(0x01))
 	set.Add(makeHash(0x02))
-	assert.Equal(t, 2, set.Len())
+	require.Equal(t, 2, set.Len())
 
 	set.CheckAndRemove(makeHash(0x01))
-	assert.Equal(t, 1, set.Len())
+	require.Equal(t, 1, set.Len())
 }
 
 func TestPrunedTxSet_ConcurrentAccess(t *testing.T) {
-	set := NewPrunedTxSet(256)
+	set := NewPrunedTxSet(256, 0)
 	const numGoroutines = 100
 	const opsPerGoroutine = 1000
 
@@ -103,21 +102,21 @@ func TestPrunedTxSet_ConcurrentAccess(t *testing.T) {
 }
 
 func TestPrunedTxSet_ShardDistribution(t *testing.T) {
-	set := NewPrunedTxSet(256)
+	set := NewPrunedTxSet(256, 0)
 
 	// Add hashes with different first bytes to verify they go to different shards
 	for i := 0; i < 256; i++ {
 		set.Add(makeHash(byte(i)))
 	}
 
-	assert.Equal(t, 256, set.Len())
+	require.Equal(t, 256, set.Len())
 
 	// Remove all
 	for i := 0; i < 256; i++ {
 		require.True(t, set.CheckAndRemove(makeHash(byte(i))))
 	}
 
-	assert.Equal(t, 0, set.Len())
+	require.Equal(t, 0, set.Len())
 }
 
 func TestPrunedTxSet_SimulateChainPruning(t *testing.T) {
@@ -127,7 +126,7 @@ func TestPrunedTxSet_SimulateChainPruning(t *testing.T) {
 	// When processing C, B should be found (skip parent update)
 	// etc.
 
-	set := NewPrunedTxSet(16)
+	set := NewPrunedTxSet(16, 0)
 
 	txA := makeHash(0x0A)
 	txB := makeHash(0x0B)
@@ -140,43 +139,43 @@ func TestPrunedTxSet_SimulateChainPruning(t *testing.T) {
 	set.Add(txC)
 	set.Add(txD)
 
-	assert.Equal(t, 4, set.Len())
+	require.Equal(t, 4, set.Len())
 
 	// Stage 2 (processor) processes B — parent is A
-	assert.True(t, set.CheckAndRemove(txA), "parent A should be found and removed")
+	require.True(t, set.CheckAndRemove(txA), "parent A should be found and removed")
 
 	// Stage 2 processes C — parent is B
-	assert.True(t, set.CheckAndRemove(txB), "parent B should be found and removed")
+	require.True(t, set.CheckAndRemove(txB), "parent B should be found and removed")
 
 	// Stage 2 processes D — parent is C
-	assert.True(t, set.CheckAndRemove(txC), "parent C should be found and removed")
+	require.True(t, set.CheckAndRemove(txC), "parent C should be found and removed")
 
 	// D has no child in this block — stays in set as dangling
-	assert.True(t, set.Contains(txD))
-	assert.Equal(t, 1, set.Len())
+	require.True(t, set.Contains(txD))
+	require.Equal(t, 1, set.Len())
 }
 
 func TestPrunedTxSet_DuplicateAdd(t *testing.T) {
-	set := NewPrunedTxSet(16)
+	set := NewPrunedTxSet(16, 0)
 
 	h1 := makeHash(0x01)
 
 	set.Add(h1)
-	assert.Equal(t, 1, set.Len())
+	require.Equal(t, 1, set.Len())
 
 	// Adding the same TXID again should not increment the count
 	set.Add(h1)
-	assert.Equal(t, 1, set.Len())
+	require.Equal(t, 1, set.Len())
 
 	// Should still be removable exactly once
-	assert.True(t, set.CheckAndRemove(h1))
-	assert.Equal(t, 0, set.Len())
-	assert.False(t, set.CheckAndRemove(h1))
+	require.True(t, set.CheckAndRemove(h1))
+	require.Equal(t, 0, set.Len())
+	require.False(t, set.CheckAndRemove(h1))
 }
 
 func TestPrunedTxSet_ParentNotInBlock(t *testing.T) {
 	// TX_child's parent is NOT in this block — should not be found
-	set := NewPrunedTxSet(16)
+	set := NewPrunedTxSet(16, 0)
 
 	txChild := makeHash(0x01)
 	txParent := makeHash(0xFF) // parent from a previous block
@@ -184,5 +183,46 @@ func TestPrunedTxSet_ParentNotInBlock(t *testing.T) {
 	set.Add(txChild)
 
 	// Parent not in set — must not skip update
-	assert.False(t, set.CheckAndRemove(txParent))
+	require.False(t, set.CheckAndRemove(txParent))
+}
+
+func TestPrunedTxSet_SoftCap(t *testing.T) {
+	// With a cap of 3, the 4th Add must be a silent no-op
+	set := NewPrunedTxSet(16, 3)
+
+	h1 := makeHash(0x01)
+	h2 := makeHash(0x02)
+	h3 := makeHash(0x03)
+	h4 := makeHash(0x04)
+
+	set.Add(h1)
+	set.Add(h2)
+	set.Add(h3)
+	require.Equal(t, 3, set.Len())
+	require.True(t, set.Saturated())
+
+	// 4th add is dropped — entry is not stored, count does not move
+	set.Add(h4)
+	require.Equal(t, 3, set.Len())
+	require.False(t, set.Contains(h4))
+
+	// Removing an entry frees a slot but Saturated() is sticky-up-to-cap,
+	// so a subsequent Add succeeds again once we're below the cap.
+	require.True(t, set.CheckAndRemove(h1))
+	require.False(t, set.Saturated())
+	require.Equal(t, 2, set.Len())
+
+	set.Add(h4)
+	require.Equal(t, 3, set.Len())
+	require.True(t, set.Contains(h4))
+}
+
+func TestPrunedTxSet_UnlimitedWhenCapZero(t *testing.T) {
+	set := NewPrunedTxSet(16, 0)
+	for i := 0; i < 1000; i++ {
+		set.Add(makeHash(byte(i % 256)))
+	}
+	require.False(t, set.Saturated())
+	// 256 distinct first-byte values → 256 entries
+	require.Equal(t, 256, set.Len())
 }
