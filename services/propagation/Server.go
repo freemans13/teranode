@@ -50,6 +50,8 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/ordishs/gocore"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
@@ -982,6 +984,85 @@ func (ps *PropagationServer) ProcessTransactionBatch(ctx context.Context, req *p
 	)
 	defer endSpan()
 
+	if ps.settings != nil && ps.settings.Validator.UseBatchValidation {
+		return ps.processTransactionBatchNative(ctx, req)
+	}
+
+	return ps.processTransactionBatchLegacy(ctx, req)
+}
+
+// processTransactionBatchLegacy is the pre-4c029d88a implementation of ProcessTransactionBatch.
+// It preserves the original per-tx errgroup fan-out, Kafka routing via processTransaction,
+// per-tx OTEL trace context extraction, and batchWorkerPool admission semaphore.
+// This path is active when settings.Validator.UseBatchValidation is false (the default).
+func (ps *PropagationServer) processTransactionBatchLegacy(ctx context.Context, req *propagation_api.ProcessTransactionBatchRequest) (*propagation_api.ProcessTransactionBatchResponse, error) {
+	response := &propagation_api.ProcessTransactionBatchResponse{
+		Errors: make([]*errors.TError, len(req.Items)),
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	for idx, item := range req.Items {
+		idx := idx
+		tx := item.Tx
+
+		// Acquire server-wide semaphore before spawning goroutine to limit
+		// total concurrent tx-processing goroutines across all batch calls.
+		if ps.batchWorkerPool != nil {
+			select {
+			case ps.batchWorkerPool <- struct{}{}:
+			case <-ctx.Done():
+				response.Errors[idx] = errors.WrapPublic(ctx.Err())
+				continue
+			}
+		}
+
+		g.Go(func() error {
+			if ps.batchWorkerPool != nil {
+				defer func() { <-ps.batchWorkerPool }()
+			}
+
+			var txCtx context.Context
+
+			if len(item.TraceContext) > 0 {
+				// Deserialize the trace context
+				prop := otel.GetTextMapPropagator()
+				txCtx = prop.Extract(gCtx, propagation.MapCarrier(item.TraceContext))
+			} else {
+				// No trace context available, use the batch context
+				txCtx = gCtx
+			}
+
+			// just call the internal process transaction function for every transaction
+			if err := ps.processTransaction(txCtx, &propagation_api.ProcessTransactionRequest{
+				Tx: tx,
+			}); err != nil {
+				// Use context-aware logger for trace correlation
+				ps.logger.WithTraceContext(txCtx).Errorf("[ProcessTransactionBatch] failed to process transaction %d: %v", idx, err)
+
+				response.Errors[idx] = errors.WrapPublic(err)
+			} else {
+				response.Errors[idx] = nil
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		ps.logger.WithTraceContext(ctx).Errorf("[ProcessTransactionBatch] failed to process transaction batch: %v", err)
+
+		return nil, errors.WrapGRPCPublic(err)
+	}
+
+	return response, nil
+}
+
+// processTransactionBatchNative is the post-4c029d88a implementation introduced for flag-on callers.
+// It decodes all transactions upfront, stores them in parallel, then calls ps.validator.ValidateBatch
+// for all successfully stored transactions in a single call.
+// This path is active when settings.Validator.UseBatchValidation is true.
+func (ps *PropagationServer) processTransactionBatchNative(ctx context.Context, req *propagation_api.ProcessTransactionBatchRequest) (*propagation_api.ProcessTransactionBatchResponse, error) {
 	response := &propagation_api.ProcessTransactionBatchResponse{
 		Errors: make([]*errors.TError, len(req.Items)),
 	}
@@ -1095,8 +1176,6 @@ func (ps *PropagationServer) ProcessTransactionBatch(ctx context.Context, req *p
 	}
 
 	// Phase 3: single ValidateBatch call for all successfully stored transactions.
-	// With UseBatchValidation=false (default) this fans out over ValidateWithOptions,
-	// preserving per-tx semantics identical to the previous per-tx errgroup pattern.
 	results, err := ps.validator.ValidateBatch(ctx, validTxs, 0)
 	if err != nil {
 		// Whole-batch failure (e.g. context cancelled): attribute to all surviving slots.

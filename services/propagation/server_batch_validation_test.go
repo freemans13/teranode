@@ -78,3 +78,28 @@ func TestProcessTransactionBatch_EmptyBatch(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.Errors, 0)
 }
+
+// TestProcessTransactionBatch_NativePath_FlagOn exercises the flag-on code path
+// (processTransactionBatchNative), confirming it is reachable and returns per-tx
+// errors for invalid transactions just as the legacy path does.
+func TestProcessTransactionBatch_NativePath_FlagOn(t *testing.T) {
+	ctx := context.Background()
+	ps, cleanup := newPropagationServerForTest(t)
+	defer cleanup()
+	// Flag-on: take the new batch path via validator.ValidateBatch
+	ps.settings.Validator.UseBatchValidation = true
+
+	bads := []*bt.Tx{{}, {}}
+	items := make([]*propagation_api.BatchTransactionItem, len(bads))
+	for i, tx := range bads {
+		items[i] = &propagation_api.BatchTransactionItem{Tx: tx.Bytes()}
+	}
+
+	resp, err := ps.ProcessTransactionBatch(ctx, &propagation_api.ProcessTransactionBatchRequest{Items: items})
+	require.NoError(t, err)
+	require.Len(t, resp.Errors, len(bads))
+	// Both empty tx must fail (different code path, same outcome shape).
+	for i, e := range resp.Errors {
+		require.NotNil(t, e, "index %d", i)
+	}
+}
