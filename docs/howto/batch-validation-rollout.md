@@ -77,6 +77,40 @@ between Aerospike and BA. Surface to the team immediately.
 desired observability surface. Wiring them up is captured as a
 follow-up.)
 
+## Single-tx coalescer (v2 on same branch)
+
+When `validator_useBatchValidation=true` AND **no Kafka producer is
+configured**, propagation routes single-tx callers (gRPC
+`ProcessTransaction`, HTTP `/tx`) through an in-process TxCoalescer
+that gathers concurrent submissions and dispatches them to
+`validator.ValidateBatch` in batches.
+
+When Kafka IS configured, single-tx callers continue to publish to
+Kafka unchanged. The coalescer is bypassed.
+
+### Settings
+
+| Setting | Default | Effect |
+|---|---|---|
+| `validator_batchMaxSize` | 1024 | Max items in a coalescer batch before flush. |
+| `validator_batchMaxWait` | 5ms | Max time the coalescer holds a partial batch before flushing. |
+| `validator_batchMaxConcurrent` | 64 | Max concurrent in-flight ValidateBatch flush goroutines. 0 = unbounded. |
+
+### Latency floor
+
+The coalescer adds up to `validator_batchMaxWait` of additional
+latency under low load (single-tx submissions wait for a partial
+batch to time out). Tune down if low-latency single-tx is more
+important than throughput in your deployment.
+
+### When this matters
+
+- Deployments NOT using Kafka (test, dev, edge clusters) — coalescer
+  exercises the multi-tx validator op.
+- Production deployments using Kafka — no change; the coalescer is
+  inactive. Validator-side Kafka consumer batching (follow-up F1) is
+  the lever for those.
+
 ## Related follow-ups
 
 - F1 (spec section 7): switch the validator's Kafka consumer to consume
