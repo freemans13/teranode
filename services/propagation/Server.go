@@ -126,6 +126,7 @@ type PropagationServer struct {
 	validator                    validator.Interface
 	blockchainClient             blockchain.ClientI
 	validatorKafkaProducerClient kafka.KafkaAsyncProducerI
+	coalescer                    *TxCoalescer // non-nil only when Kafka is NOT configured AND validator_useBatchValidation=true
 	httpServer                   *echo.Echo
 	validatorHTTPAddr            *url.URL
 	banList                      banlist.Interface
@@ -338,6 +339,25 @@ func (ps *PropagationServer) Start(ctx context.Context, readyCh chan<- struct{})
 
 	if ps.validatorKafkaProducerClient != nil {
 		ps.validatorKafkaProducerClient.Start(ctx, make(chan *kafka.Message, 10_000))
+	}
+
+	// Single-tx coalescer: enabled only when Kafka is NOT configured
+	// AND the batch-validation flag is on. Bypassed otherwise so
+	// behaviour is identical to today.
+	if ps.validatorKafkaProducerClient == nil && ps.settings.Validator.UseBatchValidation {
+		ps.coalescer = NewTxCoalescer(
+			ctx,
+			ps.logger,
+			ps.validator,
+			ps.settings.Validator.BatchMaxSize,
+			ps.settings.Validator.BatchMaxWait,
+			ps.settings.Validator.BatchMaxConcurrent,
+		)
+		ps.logger.Infof("[Propagation] TxCoalescer enabled: maxSize=%d maxWait=%s maxConcurrent=%d",
+			ps.settings.Validator.BatchMaxSize,
+			ps.settings.Validator.BatchMaxWait,
+			ps.settings.Validator.BatchMaxConcurrent,
+		)
 	}
 
 	// start the http listener for incoming transactions
@@ -567,7 +587,14 @@ func (ps *PropagationServer) StartUDP6Listeners(ctx context.Context, ipv6Address
 //
 // Returns:
 //   - error: always returns nil in current implementation
-func (ps *PropagationServer) Stop(_ context.Context) error {
+func (ps *PropagationServer) Stop(ctx context.Context) error {
+	if ps.coalescer != nil {
+		if err := ps.coalescer.Close(ctx); err != nil {
+			ps.logger.Warnf("[Propagation] TxCoalescer close error: %v", err)
+		}
+		ps.coalescer = nil
+	}
+
 	ps.udpConnsMu.Lock()
 	defer ps.udpConnsMu.Unlock()
 	for _, conn := range ps.udpConns {
