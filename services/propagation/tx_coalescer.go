@@ -112,13 +112,32 @@ func (c *TxCoalescer) Submit(ctx context.Context, tx *bt.Tx, blockHeight uint32)
 	}
 }
 
-// flushBatch is the real per-batch user-fn (overridden in tests via
-// newTxCoalescerForTest). Wired to validator.ValidateBatch in the
-// next task. For Task 2's tests this is unreachable because tests use
-// newTxCoalescerForTest's caller-supplied flush.
+// flushBatch invokes validator.ValidateBatch for the gathered batch and
+// fans results back to each waiting Submit caller via their Done channel.
+// On a whole-batch error every caller receives the error. On success,
+// per-tx results are delivered positionally (results[i] → items[i]).
 func (c *TxCoalescer) flushBatch(ctx context.Context, v validator.Interface, items []*pendingTx) {
-	for _, p := range items {
-		p.Done <- validator.ValidationResult{TxHash: *p.Tx.TxIDChainHash()}
+	if len(items) == 0 {
+		return
+	}
+
+	txs := make([]*bt.Tx, len(items))
+	bh := items[0].BlockHeight
+	for i, p := range items {
+		txs[i] = p.Tx
+	}
+
+	results, err := v.ValidateBatch(ctx, txs, bh)
+	if err != nil {
+		c.logger.Warnf("[TxCoalescer] ValidateBatch failed for batch of %d: %v", len(items), err)
+		for _, p := range items {
+			p.Done <- validator.ValidationResult{TxHash: *p.Tx.TxIDChainHash(), Err: err}
+		}
+		return
+	}
+
+	for i, p := range items {
+		p.Done <- results[i]
 	}
 }
 

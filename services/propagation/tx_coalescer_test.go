@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -187,5 +188,127 @@ func TestTxCoalescer_Submit_WholeBatchErrFannedToAllCallers(t *testing.T) {
 	wg.Wait()
 	for i, r := range results {
 		require.ErrorIs(t, r.Err, errBatch, "index %d", i)
+	}
+}
+
+// fakeValidator implements only the subset of validator.Interface that
+// TxCoalescer calls: ValidateBatch. Other methods panic to surface
+// accidental dependencies.
+type fakeValidator struct {
+	mu        sync.Mutex
+	calls     int
+	lastSize  int
+	wholeErr  error
+	perTxErrs map[chainhash.Hash]error
+}
+
+func (f *fakeValidator) Health(context.Context, bool) (int, string, error) { return 200, "ok", nil }
+
+func (f *fakeValidator) Validate(context.Context, *bt.Tx, uint32, ...validator.Option) (*meta.Data, error) {
+	panic("TxCoalescer must not call Validate; only ValidateBatch")
+}
+
+func (f *fakeValidator) ValidateWithOptions(context.Context, *bt.Tx, uint32, *validator.Options) (*meta.Data, error) {
+	panic("TxCoalescer must not call ValidateWithOptions; only ValidateBatch")
+}
+
+func (f *fakeValidator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, _ ...validator.Option) ([]validator.ValidationResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.lastSize = len(txs)
+	if f.wholeErr != nil {
+		return nil, f.wholeErr
+	}
+	results := make([]validator.ValidationResult, len(txs))
+	for i, tx := range txs {
+		h := *tx.TxIDChainHash()
+		results[i] = validator.ValidationResult{TxHash: h, Err: f.perTxErrs[h]}
+	}
+	return results, nil
+}
+
+func (f *fakeValidator) GetBlockHeight() uint32                        { return 0 }
+func (f *fakeValidator) GetMedianBlockTime() uint32                    { return 0 }
+func (f *fakeValidator) TriggerBatcher()                               {}
+func (f *fakeValidator) EnsureMTPLoaded(context.Context, uint32) error { return nil }
+
+func TestTxCoalescer_RealFlush_HappyPath(t *testing.T) {
+	fv := &fakeValidator{}
+	logger := ulogger.TestLogger{}
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	const N = 8
+	results := make([]validator.ValidationResult, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := c.Submit(context.Background(), dummyTx(t, byte(i+1)), 0)
+			require.NoError(t, err)
+			results[i] = r
+		}()
+	}
+	wg.Wait()
+
+	require.GreaterOrEqual(t, fv.calls, 1, "ValidateBatch must be called at least once")
+	for i, r := range results {
+		require.NoError(t, r.Err, "index %d", i)
+	}
+}
+
+func TestTxCoalescer_RealFlush_PerTxErrorIsolated(t *testing.T) {
+	fv := &fakeValidator{perTxErrs: map[chainhash.Hash]error{}}
+	logger := ulogger.TestLogger{}
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	good := dummyTx(t, 0x10)
+	bad := dummyTx(t, 0x11)
+	fv.perTxErrs[*bad.TxIDChainHash()] = terrors.NewProcessingError("per-tx fail")
+
+	var wg sync.WaitGroup
+	results := make([]validator.ValidationResult, 2)
+	for i, tx := range []*bt.Tx{good, bad} {
+		i, tx := i, tx
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := c.Submit(context.Background(), tx, 0)
+			require.NoError(t, err)
+			results[i] = r
+		}()
+	}
+	wg.Wait()
+
+	require.NoError(t, results[0].Err)
+	require.Error(t, results[1].Err)
+}
+
+func TestTxCoalescer_RealFlush_WholeBatchErr(t *testing.T) {
+	fv := &fakeValidator{wholeErr: terrors.NewServiceError("aerospike unreachable")}
+	logger := ulogger.TestLogger{}
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	const N = 4
+	results := make([]validator.ValidationResult, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := c.Submit(context.Background(), dummyTx(t, byte(i+1)), 0)
+			require.NoError(t, err)
+			results[i] = r
+		}()
+	}
+	wg.Wait()
+	for i, r := range results {
+		require.Error(t, r.Err, "index %d", i)
 	}
 }
