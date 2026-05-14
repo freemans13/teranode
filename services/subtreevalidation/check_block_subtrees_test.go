@@ -2588,3 +2588,50 @@ func TestBuildParentMetadata(t *testing.T) {
 		assert.Equal(t, uint32(100), meta.BlockHeight)
 	})
 }
+
+// TestFindLocalSubtreeFile verifies that findLocalSubtreeFile locates a subtree
+// under either FileTypeSubtreeToCheck (the download-from-peer marker) or
+// FileTypeSubtree (the already-validated marker). The FileTypeSubtree case is
+// the important regression guard for the legacy catch-up / quickValidationMode
+// path, where we must not fall back to HTTP (baseURL="legacy" has no scheme).
+func TestFindLocalSubtreeFile(t *testing.T) {
+	ctx := context.Background()
+
+	var hash chainhash.Hash
+	copy(hash[:], []byte("find_local_subtree_hash_32_bytes"))
+
+	t.Run("FileTypeSubtreeToCheck present", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		require.NoError(t, server.subtreeStore.Set(ctx, hash[:], fileformat.FileTypeSubtreeToCheck, []byte("payload")))
+
+		ft, exists, err := server.findLocalSubtreeFile(ctx, hash)
+		require.NoError(t, err)
+		require.True(t, exists)
+		assert.Equal(t, fileformat.FileTypeSubtreeToCheck, ft)
+	})
+
+	t.Run("FileTypeSubtree only (quickValidationMode/legacy)", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		// Only the "already validated" marker exists — no FileTypeSubtreeToCheck.
+		require.NoError(t, server.subtreeStore.Set(ctx, hash[:], fileformat.FileTypeSubtree, []byte("payload")))
+
+		ft, exists, err := server.findLocalSubtreeFile(ctx, hash)
+		require.NoError(t, err)
+		require.True(t, exists, "must find the subtree under FileTypeSubtree so CheckBlockSubtrees does not fall back to HTTP")
+		assert.Equal(t, fileformat.FileTypeSubtree, ft)
+	})
+
+	t.Run("neither present", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		ft, exists, err := server.findLocalSubtreeFile(ctx, hash)
+		require.NoError(t, err)
+		assert.False(t, exists)
+		assert.Equal(t, fileformat.FileTypeUnknown, ft)
+	})
+}
