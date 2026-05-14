@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	terrors "github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"golang.org/x/sync/errgroup"
 )
@@ -13,10 +14,11 @@ import (
 // batchUtxoStore is the minimal UTXO store surface ValidateBatch needs.
 // The concrete *aerospike.Store satisfies it; tests use a stub.
 //
-// Phases C–F will extend this interface with BatchSpend / BatchCreate /
-// BatchSetLocked methods in Tasks 13–15.
+// Phases D–F will extend this interface with BatchCreate / BatchSetLocked
+// methods in Tasks 14–15.
 type batchUtxoStore interface {
 	BatchGetParents(ctx context.Context, parentHashes [][]byte) (map[[32]byte]*aerospike.ParentRecord, [][]byte, error)
+	BatchSpend(ctx context.Context, spends []*utxo.Spend, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]aerospike.SpendResult, error)
 }
 
 // validateBatchNative runs the six-phase native pipeline. Phase wiring is
@@ -96,9 +98,57 @@ func (v *Validator) validateBatchNative(
 	}
 	_ = g.Wait() // errgroup never returns a non-nil error here
 
-	// Phases C–F follow in subsequent tasks. For alive[i]==true entries,
-	// results[i] stays at its zero value until those phases populate it.
-	_ = alive
+	// Phase C — BatchSpend. One BatchOperate carries all surviving inputs.
+	// Per-input SpendResult.Err is attributed back to every tx that referenced
+	// the failed parent.
+	spends, spendToTxIdx := buildSpendsForBatch(txs, alive, results)
+	if len(spends) > 0 {
+		spendResults, spendErr := store.BatchSpend(ctx, spends, blockHeight)
+		if spendErr != nil {
+			// Whole-batch transport failure — mark all survivors as PhaseSpend.
+			for i, a := range alive {
+				if a {
+					results[i].Err = spendErr
+					results[i].Phase = PhaseSpend
+					alive[i] = false
+				}
+			}
+		} else {
+			// Build a map: failed parent hash → first error seen.
+			type parentKey [32]byte
+			failedParents := make(map[parentKey]error)
+			for j, sr := range spendResults {
+				if sr.Err == nil {
+					continue
+				}
+				sp := spends[j]
+				var key parentKey
+				copy(key[:], sp.TxID[:])
+				if _, already := failedParents[key]; !already {
+					failedParents[key] = sr.Err
+				}
+			}
+			// Attribute parent failures to every tx that referenced them.
+			for i, tx := range txs {
+				if !alive[i] {
+					continue
+				}
+				for _, in := range tx.Inputs {
+					ph := in.PreviousTxIDChainHash()
+					var key parentKey
+					copy(key[:], ph[:])
+					if e, bad := failedParents[key]; bad {
+						results[i].Err = e
+						results[i].Phase = PhaseSpend
+						alive[i] = false
+						break
+					}
+				}
+			}
+		}
+	}
+	_ = spendToTxIdx // reserved for Phase F metadata path
+	_ = alive        // consumed by Phases D–F
 
 	return results, nil
 }
@@ -172,4 +222,45 @@ func byteSliceSet(hashes [][]byte) map[[32]byte]struct{} {
 		set[key] = struct{}{}
 	}
 	return set
+}
+
+// buildSpendsForBatch flattens all surviving tx inputs into a single
+// []*utxo.Spend slice suitable for one BatchSpend call. It mirrors the
+// existing single-tx spend construction in utxo.GetSpends (stores/utxo/utils.go).
+//
+// spendToTxIdx[j] is the index in txs that contributed spends[j]. This allows
+// downstream phases to attribute per-spend metadata back to the originating tx.
+//
+// If GetSpends fails for a tx (e.g. missing extended input data), the tx is
+// marked failed at PhaseSpend via results/alive and excluded from the returned
+// slice so BatchSpend never receives a nil or invalid entry.
+func buildSpendsForBatch(txs []*bt.Tx, alive []bool, results []ValidationResult) (spends []*utxo.Spend, spendToTxIdx []int) {
+	// Pre-size to the total number of inputs across surviving txs.
+	total := 0
+	for i, tx := range txs {
+		if alive[i] {
+			total += len(tx.Inputs)
+		}
+	}
+	spends = make([]*utxo.Spend, 0, total)
+	spendToTxIdx = make([]int, 0, total)
+
+	for i, tx := range txs {
+		if !alive[i] {
+			continue
+		}
+		txSpends, err := utxo.GetSpends(tx)
+		if err != nil {
+			// Extended input data was unavailable — mark as PhaseSpend failure.
+			results[i].Err = err
+			results[i].Phase = PhaseSpend
+			alive[i] = false
+			continue
+		}
+		for _, sp := range txSpends {
+			spends = append(spends, sp)
+			spendToTxIdx = append(spendToTxIdx, i)
+		}
+	}
+	return spends, spendToTxIdx
 }
