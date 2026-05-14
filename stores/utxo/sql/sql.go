@@ -49,13 +49,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/bsv-blockchain/go-batcher"
+	"github.com/bsv-blockchain/go-batcher/v2"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -69,6 +70,7 @@ import (
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/batchermetrics"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/jackc/pgx/v5"
@@ -190,6 +192,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		ctx:             ctx,
 	}
 
+	otelTracer := tracing.Tracer("utxo").OTelTracer()
+	batcherOpts := func(name string) []batcher.Option {
+		return []batcher.Option{
+			batcher.WithName(name),
+			batcher.WithLogger(logger),
+			batcher.WithMetrics(batchermetrics.Provider()),
+			batcher.WithTracer(otelTracer),
+		}
+	}
+
 	// Initialize spend batcher — mirrors aerospike/aerospike.go batcher setup.
 	// Batches individual spend operations to control DB connection concurrency.
 	// Always use background=false for SQL: batch callbacks must be serialized to
@@ -198,7 +210,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// DB-level row locking.
 	spendBatchSize := tSettings.UtxoStore.SpendBatcherSize
 	spendBatchDuration := time.Duration(tSettings.UtxoStore.SpendBatcherDurationMillis) * time.Millisecond
-	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, false)
+	s.spendBatcher = batcher.NewWithPool(spendBatchSize, spendBatchDuration, s.sendSpendBatch, false, batcherOpts("sql_spend")...)
 	if tSettings.BatcherDrainMode {
 		s.spendBatcher.SetDrainMode(true)
 	}
@@ -209,7 +221,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	getBatchSize := tSettings.UtxoStore.GetBatcherSize
 	getBatchDuration := time.Duration(tSettings.UtxoStore.GetBatcherDurationMillis) * time.Millisecond
 	if getBatchSize > 1 {
-		s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, true)
+		s.getBatcher = batcher.NewWithPool(getBatchSize, getBatchDuration, s.sendGetBatch, true, batcherOpts("sql_get")...)
 		if tSettings.BatcherDrainMode {
 			s.getBatcher.SetDrainMode(true)
 		}
@@ -222,7 +234,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.StoreBatcherSize > 1 {
 		storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 		storeBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
-		s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
+		s.createBatcher = batcher.NewWithPool(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true, batcherOpts("sql_create")...)
 		if tSettings.BatcherDrainMode {
 			s.createBatcher.SetDrainMode(true)
 		}
@@ -232,7 +244,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.LockedBatcherSize > 1 {
 		unlockBatchSize := tSettings.UtxoStore.LockedBatcherSize
 		unlockBatchDuration := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
-		s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
+		s.unlockBatcher = batcher.NewWithPool(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true, batcherOpts("sql_unlock")...)
 		if tSettings.BatcherDrainMode {
 			s.unlockBatcher.SetDrainMode(true)
 		}
@@ -337,7 +349,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 // Mirrors aerospike/create.go storeBatcher.Put pattern.
 func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
 	done := make(chan batchCreateResult, 1)
-	s.createBatcher.Put(&batchCreateItem{
+	s.createBatcher.PutCtx(ctx, &batchCreateItem{
 		tx:          tx,
 		blockHeight: blockHeight,
 		options:     options,
@@ -1301,7 +1313,7 @@ func (s *Store) getBatched(ctx context.Context, hash *chainhash.Hash, bins []fie
 	done := make(chan batchGetItemData, 1)
 	item := &batchGetItem{hash: *hash, fields: bins, done: done}
 
-	s.getBatcher.Put(item)
+	s.getBatcher.PutCtx(ctx, item)
 
 	select {
 	case data := <-done:
@@ -1365,6 +1377,7 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		,conflicting
 		,locked
 		,unmined_since
+		,inserted_at
 		FROM transactions
 		WHERE hash = $1
 	`
@@ -1377,9 +1390,13 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		lockTime          uint32
 		spendingDataBytes []byte
 		unminedSince      sql.NullInt64
+		// inserted_at is TIMESTAMPTZ on postgres but TEXT on sqlite (see schema
+		// in transactions table init). Postgres driver returns time.Time;
+		// sqlite returns string. Scan into interface{} and branch on type.
+		insertedAt any
 	)
 
-	err := s.db.QueryRowContext(ctx, q, hash[:]).Scan(&id, &version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase, &data.Frozen, &data.Conflicting, &data.Locked, &unminedSince)
+	err := s.db.QueryRowContext(ctx, q, hash[:]).Scan(&id, &version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase, &data.Frozen, &data.Conflicting, &data.Locked, &unminedSince, &insertedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errors.NewTxNotFoundError("transaction %s not found", hash, err)
@@ -1395,6 +1412,12 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 			data.UnminedSince = uint32(unminedSince.Int64)
 		}
 	}
+
+	// CreatedAt mirrors the aerospike bin: Unix milliseconds, set once at insert.
+	// Always populate so callers like selectCountersForDemotedTx have it without
+	// having to add fields.CreatedAt to every Get callsite that already passes
+	// other field selectors.
+	data.CreatedAt = parseInsertedAtMillis(insertedAt)
 
 	tx := bt.Tx{
 		Version:  version,
@@ -1595,6 +1618,64 @@ func contains(slice []fields.FieldName, item fields.FieldName) bool {
 	return false
 }
 
+// parseInsertedAtMillis converts the inserted_at column value into Unix
+// milliseconds. Postgres' driver returns time.Time; the sqlite driver
+// returns a string (the layout depends on whether DEFAULT CURRENT_TIMESTAMP
+// produced a "YYYY-MM-DD HH:MM:SS[.fff]" form). Returns 0 when the value is
+// nil, an unrecognised type, or unparseable — callers treat 0 as "no
+// CreatedAt hint available" (see isOlderCounter's missing-timestamp branch).
+func parseInsertedAtMillis(v any) int64 {
+	switch t := v.(type) {
+	case nil:
+		return 0
+	case time.Time:
+		return t.UnixMilli()
+	case []byte:
+		return parseInsertedAtMillis(string(t))
+	case string:
+		// Sqlite CURRENT_TIMESTAMP emits SQL-style "YYYY-MM-DD HH:MM:SS" by
+		// default; tolerate fractional seconds and trailing 'Z' for safety.
+		layouts := []string{
+			"2006-01-02 15:04:05.999999999",
+			"2006-01-02 15:04:05",
+			time.RFC3339Nano,
+			time.RFC3339,
+		}
+
+		for _, l := range layouts {
+			if ts, err := time.Parse(l, t); err == nil {
+				return ts.UnixMilli()
+			}
+		}
+
+		return 0
+	default:
+		return 0
+	}
+}
+
+// handleSpendPanic processes a recovered value from Spend's deferred recover
+// and propagates it as an error. Without this, a panic during Spend would be
+// logged but the caller would observe (nil, nil) — a silent failure that can
+// mask UTXO state corruption.
+//
+// Uses ERR_UNKNOWN rather than ERR_PROCESSING so the block-validation retry
+// classifier (services/blockvalidation/BlockValidation.go) does not treat a
+// recovered panic as a transient infrastructure error and retry indefinitely
+// against a broken path.
+func handleSpendPanic(recovered any, err *error, logger ulogger.Logger) {
+	if recovered == nil {
+		return
+	}
+
+	prometheusUtxoErrors.WithLabelValues("Spend", "Failed Spend Cleaning").Inc()
+	logger.Errorf("ERROR panic in sql Spend: %v\n%s", recovered, debug.Stack())
+
+	if *err == nil {
+		*err = errors.NewUnknownError("panic in Spend: %v", recovered)
+	}
+}
+
 // Spend marks UTXOs as spent by updating their spending transaction ID.
 // It performs several validations:
 //   - Checks if the UTXO exists
@@ -1606,22 +1687,19 @@ func contains(slice []fields.FieldName, item fields.FieldName) bool {
 //
 // The blockHeight parameter is used for coinbase maturity checking.
 // If blockHeight is 0, the current block height is used.
-func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) (spends []*utxo.Spend, err error) {
+	defer func() {
+		handleSpendPanic(recover(), &err, s.logger)
+	}()
+
 	if blockHeight == 0 {
 		return nil, errors.NewProcessingError("blockHeight must be greater than zero")
 	}
 
-	defer func() {
-		if recoverErr := recover(); recoverErr != nil {
-			prometheusUtxoErrors.WithLabelValues("Spend", "Failed Spend Cleaning").Inc()
-			s.logger.Errorf("ERROR panic in sql Spend: %v", recoverErr)
-		}
-	}()
-
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
 	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
 
-	spends, err := utxo.GetSpends(tx)
+	spends, err = utxo.GetSpends(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -1658,8 +1736,15 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		spend := spend
 
 		g.Go(func() error {
+			// Per-worker panic recovery. The parent's defer only catches panics in the
+			// parent goroutine — errgroup propagates errors but does not recover panics
+			// inside g.Go bodies, so without this a worker panic would crash the process.
+			defer func() {
+				handleSpendPanic(recover(), &spends[idx].Err, s.logger)
+			}()
+
 			errCh := make(chan error, 1)
-			s.spendBatcher.Put(&batchSpend{
+			s.spendBatcher.PutCtx(ctx, &batchSpend{
 				spend:             spend,
 				blockHeight:       blockHeight,
 				errCh:             errCh,
@@ -3273,7 +3358,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	// Query 1: Bulk fetch from transactions table
 	inClause, inArgs := buildINClause(hashes, 1)
 
-	q := `SELECT hash, id, version, lock_time, fee, size_in_bytes, coinbase, frozen, conflicting, locked, unmined_since FROM transactions WHERE hash IN ` + inClause
+	q := `SELECT hash, id, version, lock_time, fee, size_in_bytes, coinbase, frozen, conflicting, locked, unmined_since, inserted_at FROM transactions WHERE hash IN ` + inClause
 
 	rows, err := s.db.QueryContext(ctx, q, inArgs...)
 	if err != nil {
@@ -3289,10 +3374,11 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		var (
 			hashBytes    []byte
 			unminedSince sql.NullInt64
+			insertedAt   any
 		)
 
 		row := &batchDecorateTxRow{data: &meta.Data{}}
-		if err := rows.Scan(&hashBytes, &row.id, &row.version, &row.lockTime, &row.data.Fee, &row.data.SizeInBytes, &row.data.IsCoinbase, &row.data.Frozen, &row.data.Conflicting, &row.data.Locked, &unminedSince); err != nil {
+		if err := rows.Scan(&hashBytes, &row.id, &row.version, &row.lockTime, &row.data.Fee, &row.data.SizeInBytes, &row.data.IsCoinbase, &row.data.Frozen, &row.data.Conflicting, &row.data.Locked, &unminedSince, &insertedAt); err != nil {
 			rows.Close()
 			return err
 		}
@@ -3305,6 +3391,8 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 				row.data.UnminedSince = uint32(unminedSince.Int64)
 			}
 		}
+
+		row.data.CreatedAt = parseInsertedAtMillis(insertedAt)
 
 		idToTx[row.id] = row
 		hashToTx[row.hash] = row
@@ -4074,7 +4162,7 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 			return ctx.Err()
 		}
 		done := make(chan error, 1)
-		s.unlockBatcher.Put(&batchUnlockItem{hash: txHashes[0], done: done})
+		s.unlockBatcher.PutCtx(ctx, &batchUnlockItem{hash: txHashes[0], done: done})
 		select {
 		case err := <-done:
 			return err

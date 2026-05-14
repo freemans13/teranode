@@ -511,24 +511,23 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	}
 
 	// 11. Check that there are no duplicate transactions in the block.
-	// we only check when we have a subtree store passed in, otherwise this check cannot / should not be done
-	if subtreeStore != nil {
-		// this creates the txMap for the block that is also used in the validOrderAndBlessed check
-		err = b.checkDuplicateTransactions(ctx, logger, settings.Block.CheckDuplicateTransactionsConcurrency, settings.Block.DiskMapDirs)
-		if err != nil {
-			return false, err
-		}
+	// CVE-2012-2459 guard — runs unconditionally so future callers passing nil subtreeStore
+	// don't silently skip dedup. checkDuplicateTransactions iterates SubtreeSlices in memory
+	// and does not need the subtree store directly.
+	err = b.checkDuplicateTransactions(ctx, logger, settings.Block.CheckDuplicateTransactionsConcurrency, settings.Block.DiskMapDirs)
+	if err != nil {
+		return false, err
+	}
 
-		// flush disk-backed txMap so all writes are readable before phase 2
-		if flusher, ok := b.txMap.(interface{ Flush() error }); ok {
-			if flushErr := flusher.Flush(); flushErr != nil {
-				return false, errors.NewProcessingError("[Block:Valid][%s] failed to flush txMap", b.String(), flushErr)
-			}
+	// flush disk-backed txMap so all writes are readable before phase 2
+	if flusher, ok := b.txMap.(interface{ Flush() error }); ok {
+		if flushErr := flusher.Flush(); flushErr != nil {
+			return false, errors.NewProcessingError("[Block:Valid][%s] failed to flush txMap", b.String(), flushErr)
 		}
+	}
 
-		if diskMap, ok := b.txMap.(*DiskTxMapUint64); ok {
-			ReportTxMapStats(diskMap.Stats())
-		}
+	if diskMap, ok := b.txMap.(*DiskTxMapUint64); ok {
+		ReportTxMapStats(diskMap.Stats())
 	}
 
 	// 12. Check that all transactions are in the valid order and blessed
@@ -1336,7 +1335,15 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 			return errors.NewProcessingError("[BLOCK][%s] error creating new root tree", b.String(), err)
 		}
 
+		seen := make(map[chainhash.Hash]struct{}, len(hashes))
+
 		for _, hash := range hashes {
+			if _, dup := seen[hash]; dup {
+				return errors.NewBlockInvalidError("[BLOCK][%s] duplicate subtree root hash in top-level merkle tree: %s", b.String(), hash.String())
+			}
+
+			seen[hash] = struct{}{}
+
 			err = st.AddNode(hash, 1, 0)
 			if err != nil {
 				return errors.NewProcessingError("[BLOCK][%s] error adding node to root tree", b.String(), err)
