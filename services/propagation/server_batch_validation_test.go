@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/propagation/propagation_api"
 	"github.com/bsv-blockchain/teranode/stores/blob/null"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -101,5 +102,42 @@ func TestProcessTransactionBatch_NativePath_FlagOn(t *testing.T) {
 	// Both empty tx must fail (different code path, same outcome shape).
 	for i, e := range resp.Errors {
 		require.NotNil(t, e, "index %d", i)
+	}
+}
+
+// TestProcessTransactionBatch_FlagParityWithSqlitememory asserts that
+// flag-on and flag-off produce the SAME per-tx outcomes for the same
+// inputs when the UTXO store is sqlitememory (which does not implement
+// batchUtxoStore, so flag-on still uses the fan-out fallback). This is
+// the v1 "behavior-preserving when flag is off" contract; this test
+// also confirms flag-on doesn't regress that contract through the
+// fallback path.
+func TestProcessTransactionBatch_FlagParityWithSqlitememory(t *testing.T) {
+	ctx := context.Background()
+
+	run := func(t *testing.T, useBatch bool) []*terrors.TError {
+		ps, cleanup := newPropagationServerForTest(t)
+		defer cleanup()
+		ps.settings.Validator.UseBatchValidation = useBatch
+
+		// Two empty/invalid tx — both will fail validation.
+		bads := []*bt.Tx{{}, {}}
+		items := make([]*propagation_api.BatchTransactionItem, len(bads))
+		for i, tx := range bads {
+			items[i] = &propagation_api.BatchTransactionItem{Tx: tx.Bytes()}
+		}
+		resp, err := ps.ProcessTransactionBatch(ctx, &propagation_api.ProcessTransactionBatchRequest{Items: items})
+		require.NoError(t, err)
+		require.Len(t, resp.Errors, len(bads))
+		return resp.Errors
+	}
+
+	offErrors := run(t, false)
+	onErrors := run(t, true)
+
+	// Both runs should have errors in the same positions.
+	require.Len(t, onErrors, len(offErrors))
+	for i := range offErrors {
+		require.Equal(t, offErrors[i] == nil, onErrors[i] == nil, "flag-off vs flag-on disagree at index %d", i)
 	}
 }
