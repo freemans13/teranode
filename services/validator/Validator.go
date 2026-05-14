@@ -188,6 +188,12 @@ type Validator struct {
 	// control per-tx BA accept/reject without a live BlockAssembly service.
 	// nil in production.
 	blockAssemblySubmitOverride func(ctx context.Context, txs []*bt.Tx) map[chainhash.Hash]error
+
+	// txMetaPublishOverride is a test seam that, when non-nil, replaces the
+	// real sendTxMetaToKafka call inside Phase F of validateBatchNative.
+	// Allows unit tests to capture which txs are published without a live
+	// Kafka producer. nil in production.
+	txMetaPublishOverride func(tx *bt.Tx, m *meta.Data)
 }
 
 // New creates a new Validator instance with the provided configuration.

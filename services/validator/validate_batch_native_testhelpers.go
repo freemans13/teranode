@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
 // setBatchStoreForTest installs a batchUtxoStore stub on the Validator,
@@ -28,4 +29,12 @@ func (v *Validator) overrideCPUValidationForTest(fn func(*bt.Tx) error) {
 // Production code never calls this method.
 func (v *Validator) overrideBASubmitForTest(fn func(ctx context.Context, txs []*bt.Tx) map[chainhash.Hash]error) {
 	v.blockAssemblySubmitOverride = fn
+}
+
+// overrideTxMetaPublishForTest installs a function that replaces the real
+// sendTxMetaToKafka call inside Phase F of validateBatchNative. Allows unit
+// tests to capture which txs are published without a live Kafka producer.
+// Production code never calls this method.
+func (v *Validator) overrideTxMetaPublishForTest(fn func(tx *bt.Tx, m *meta.Data)) {
+	v.txMetaPublishOverride = fn
 }

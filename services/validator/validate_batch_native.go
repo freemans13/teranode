@@ -234,7 +234,30 @@ func (v *Validator) validateBatchNative(
 		}
 	}
 
-	_ = alive // consumed by Phase F
+	// Phase F — TxMeta Kafka publish for all surviving tx. Fire-and-forget;
+	// uses the existing v.txmetaKafkaBatcher, which is a go-batcher we
+	// deliberately keep in place because Kafka batching is a different concern
+	// from the UTXO hot path. Errors are logged but do not fail the batch —
+	// mirroring the existing single-tx path (Validator.go line ~783).
+	// When SkipTxMetaPublishing is set in the opts, the publish is skipped
+	// entirely (e.g. legacy catchup / quickValidationMode).
+	processedOpts := ProcessOptions(opts...)
+	skipPublish := processedOpts.SkipTxMetaPublishing || (v.txmetaKafkaProducerClient == nil && v.txMetaPublishOverride == nil)
+	if !skipPublish {
+		for i, tx := range txs {
+			if !alive[i] {
+				continue
+			}
+			if v.txMetaPublishOverride != nil {
+				v.txMetaPublishOverride(tx, results[i].Meta)
+				continue
+			}
+			if txMetaErr := v.sendTxMetaToKafka(results[i].Meta, tx.TxIDChainHash()); txMetaErr != nil {
+				v.logger.Errorf("[ValidateBatch][%s] failed to serialize/enqueue txmeta for kafka: %v",
+					tx.TxIDChainHash().String(), txMetaErr)
+			}
+		}
+	}
 
 	return results, nil
 }

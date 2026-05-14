@@ -11,6 +11,7 @@ import (
 	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/stretchr/testify/require"
 )
 
@@ -570,4 +571,63 @@ func TestValidateBatchNative_PhaseE_SetLockedWholeBatchFailureTagged(t *testing.
 		require.Error(t, r.Err, "tx[%d] must have error on whole-batch BatchSetLocked failure", i)
 		require.Equal(t, PhaseSetLocked, r.Phase, "tx[%d] must be tagged PhaseSetLocked", i)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase F tests
+// ---------------------------------------------------------------------------
+
+// TestValidateBatchNative_PhaseF_PublishedOnlyForAliveTx asserts that Phase F
+// publishes txmeta only for txs that are still alive after Phase E (i.e.
+// Created + BA-accepted + Unlocked) and skips BA-rejected txs.
+func TestValidateBatchNative_PhaseF_PublishedOnlyForAliveTx(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA, pB := chainhash.Hash{0xD0}, chainhash.Hash{0xD1}
+	stub.parents = mkParentMap(&pA, &pB)
+
+	good := minimalTxWithParent(t, pA)
+	rejected := minimalTxWithParent(t, pB)
+
+	v.overrideBASubmitForTest(func(_ context.Context, txs []*bt.Tx) map[chainhash.Hash]error {
+		return map[chainhash.Hash]error{
+			*rejected.TxIDChainHash(): terrors.NewProcessingError("ba reject"),
+		}
+	})
+
+	var published []chainhash.Hash
+	v.overrideTxMetaPublishForTest(func(tx *bt.Tx, _ *meta.Data) {
+		published = append(published, *tx.TxIDChainHash())
+	})
+
+	_, err := v.ValidateBatch(context.Background(), []*bt.Tx{good, rejected}, 0)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{*good.TxIDChainHash()}, published,
+		"Phase F must publish only the alive (BA-accepted) tx, not the BA-rejected one")
+}
+
+// TestValidateBatchNative_PhaseF_SkipTxMetaPublishingHonoured asserts that
+// when WithSkipTxMetaPublishing(true) is passed, Phase F does not call the
+// publish override at all — even if txs are alive.
+func TestValidateBatchNative_PhaseF_SkipTxMetaPublishingHonoured(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA := chainhash.Hash{0xF0}
+	stub.parents = mkParentMap(&pA)
+	tx := minimalTxWithParent(t, pA)
+
+	v.overrideBASubmitForTest(func(_ context.Context, _ []*bt.Tx) map[chainhash.Hash]error {
+		return map[chainhash.Hash]error{}
+	})
+
+	publishCalled := false
+	v.overrideTxMetaPublishForTest(func(_ *bt.Tx, _ *meta.Data) {
+		publishCalled = true
+	})
+
+	_, err := v.ValidateBatch(context.Background(), []*bt.Tx{tx}, 0, WithSkipTxMetaPublishing(true))
+	require.NoError(t, err)
+	require.False(t, publishCalled, "Phase F must not publish when SkipTxMetaPublishing is set")
 }
