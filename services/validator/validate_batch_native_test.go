@@ -30,6 +30,14 @@ type stubBatchStore struct {
 	// spendPerParent injects per-parent failures keyed by parent tx hash.
 	// The stub returns SpendResult.Err for any spend whose TxID matches a key.
 	spendPerParent map[[32]byte]error
+
+	// createCalls is incremented each time BatchCreate is called.
+	createCalls int
+	// createErr causes BatchCreate to return a whole-batch transport error.
+	createErr error
+	// createPerIdx injects per-tx failures indexed against the slice passed to
+	// BatchCreate (NOT the original txs slice — use compactAlive ordering).
+	createPerIdx map[int]error
 }
 
 func (s *stubBatchStore) BatchGetParents(_ context.Context, hashes [][]byte) (map[[32]byte]*aerospike.ParentRecord, [][]byte, error) {
@@ -38,6 +46,20 @@ func (s *stubBatchStore) BatchGetParents(_ context.Context, hashes [][]byte) (ma
 		return nil, nil, s.parentsErr
 	}
 	return s.parents, s.missing, nil
+}
+
+func (s *stubBatchStore) BatchCreate(_ context.Context, txs []*bt.Tx, _ uint32, _ bool) ([]aerospike.CreateResult, error) {
+	s.createCalls++
+	if s.createErr != nil {
+		return nil, s.createErr
+	}
+	results := make([]aerospike.CreateResult, len(txs))
+	for i, tx := range txs {
+		h := tx.TxIDChainHash()
+		results[i].TxHash = h.CloneBytes()
+		results[i].Err = s.createPerIdx[i]
+	}
+	return results, nil
 }
 
 func (s *stubBatchStore) BatchSpend(_ context.Context, spends []*utxo.Spend, _ uint32, _ ...utxo.IgnoreFlags) ([]aerospike.SpendResult, error) {
@@ -353,4 +375,67 @@ func TestValidateBatchNative_PhaseC_PerParentFailureAttributesToChild(t *testing
 	require.NoError(t, results[0].Err, "tx referencing good parent must have no error")
 	require.Error(t, results[1].Err, "tx referencing bad parent must be tagged by Phase C")
 	require.Equal(t, PhaseSpend, results[1].Phase)
+}
+
+// ---------------------------------------------------------------------------
+// Phase D tests
+// ---------------------------------------------------------------------------
+
+// TestValidateBatchNative_PhaseD_OneBatchCreateCall asserts that exactly one
+// BatchCreate call is made for a batch of N surviving txs.
+func TestValidateBatchNative_PhaseD_OneBatchCreateCall(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA, pB := chainhash.Hash{0x80}, chainhash.Hash{0x81}
+	stub.parents = mkParentMap(&pA, &pB)
+
+	txs := []*bt.Tx{minimalTxWithParent(t, pA), minimalTxWithParent(t, pB)}
+	_, err := v.ValidateBatch(context.Background(), txs, 0)
+	require.NoError(t, err)
+	require.Equal(t, 1, stub.createCalls, "Phase D must fire exactly one BatchCreate call for the whole batch")
+}
+
+// TestValidateBatchNative_PhaseD_PerTxCreateFailureTagged asserts that a
+// per-tx CREATE_ONLY violation from BatchCreate is tagged at PhaseCreate for
+// the failing tx, while a tx that succeeds remains error-free.
+func TestValidateBatchNative_PhaseD_PerTxCreateFailureTagged(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA, pB := chainhash.Hash{0x90}, chainhash.Hash{0x91}
+	stub.parents = mkParentMap(&pA, &pB)
+	// createPerIdx is indexed into the compacted (alive) slice passed to
+	// BatchCreate. Both txs survive A–C so index 0 → pA tx, index 1 → pB tx.
+	stub.createPerIdx = map[int]error{
+		1: terrors.NewProcessingError("CREATE_ONLY collision"),
+	}
+
+	txs := []*bt.Tx{minimalTxWithParent(t, pA), minimalTxWithParent(t, pB)}
+	results, err := v.ValidateBatch(context.Background(), txs, 0)
+	require.NoError(t, err)
+	require.NoError(t, results[0].Err, "tx[0] must succeed in Phase D")
+	require.Error(t, results[1].Err, "tx[1] must be tagged by Phase D")
+	require.Equal(t, PhaseCreate, results[1].Phase)
+}
+
+// TestValidateBatchNative_PhaseD_MetaPopulatedOnSuccess asserts that
+// results[i].Meta is non-nil for a tx that Phase D creates successfully,
+// and that the Meta fields are consistent with the tx and blockHeight.
+func TestValidateBatchNative_PhaseD_MetaPopulatedOnSuccess(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	installNoopCPUOverride(t, v)
+
+	pA := chainhash.Hash{0xA0}
+	stub.parents = mkParentMap(&pA)
+	tx := minimalTxWithParent(t, pA)
+
+	const blockHeight uint32 = 100
+	results, err := v.ValidateBatch(context.Background(), []*bt.Tx{tx}, blockHeight)
+	require.NoError(t, err)
+	require.NoError(t, results[0].Err)
+	require.NotNil(t, results[0].Meta, "Phase D must populate Meta for a successfully created tx")
+	require.True(t, results[0].Meta.Locked, "Meta.Locked must be true (BatchCreate was called with lockedTrue=true)")
+	require.Equal(t, blockHeight, results[0].Meta.UnminedSince, "Meta.UnminedSince must equal the blockHeight passed to ValidateBatch")
+	require.Equal(t, tx, results[0].Meta.Tx, "Meta.Tx must reference the original transaction")
 }

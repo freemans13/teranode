@@ -8,17 +8,17 @@ import (
 	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
 	"golang.org/x/sync/errgroup"
 )
 
 // batchUtxoStore is the minimal UTXO store surface ValidateBatch needs.
 // The concrete *aerospike.Store satisfies it; tests use a stub.
-//
-// Phases D–F will extend this interface with BatchCreate / BatchSetLocked
-// methods in Tasks 14–15.
 type batchUtxoStore interface {
 	BatchGetParents(ctx context.Context, parentHashes [][]byte) (map[[32]byte]*aerospike.ParentRecord, [][]byte, error)
 	BatchSpend(ctx context.Context, spends []*utxo.Spend, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]aerospike.SpendResult, error)
+	BatchCreate(ctx context.Context, txs []*bt.Tx, blockHeight uint32, lockedTrue bool) ([]aerospike.CreateResult, error)
 }
 
 // validateBatchNative runs the six-phase native pipeline. Phase wiring is
@@ -148,9 +148,81 @@ func (v *Validator) validateBatchNative(
 		}
 	}
 	_ = spendToTxIdx // reserved for Phase F metadata path
-	_ = alive        // consumed by Phases D–F
+
+	// Phase D — BatchCreate (locked=true). One BatchOperate carries all surviving txs.
+	// Per-tx errors (CREATE_ONLY collisions, large-tx-needs-external-storage) are tagged
+	// PhaseCreate. Surviving txs have results[i].Meta populated so Phase F (Kafka) and
+	// single-tx callers can use it.
+	aliveTxs, aliveIdx := compactAlive(txs, alive)
+	if len(aliveTxs) > 0 {
+		createResults, cErr := store.BatchCreate(ctx, aliveTxs, blockHeight, true)
+		if cErr != nil {
+			// Whole-batch transport failure — mark all survivors as PhaseCreate.
+			for _, i := range aliveIdx {
+				results[i].Err = cErr
+				results[i].Phase = PhaseCreate
+				alive[i] = false
+			}
+		} else {
+			for j, cr := range createResults {
+				i := aliveIdx[j]
+				if cr.Err != nil {
+					results[i].Err = cr.Err
+					results[i].Phase = PhaseCreate
+					alive[i] = false
+					continue
+				}
+				// Populate Meta for the surviving tx. Mirrors what
+				// ValidateWithOptions / CreateInUtxoStore builds via
+				// util.TxMetaDataFromTx after a successful Create call,
+				// with Locked set to true (matching lockedTrue=true above).
+				m, metaErr := buildMetaFromTx(aliveTxs[j], blockHeight)
+				if metaErr != nil {
+					results[i].Err = metaErr
+					results[i].Phase = PhaseCreate
+					alive[i] = false
+					continue
+				}
+				results[i].Meta = m
+			}
+		}
+	}
+
+	_ = alive // consumed by Phases E–F
 
 	return results, nil
+}
+
+// compactAlive returns the subset of txs where alive[i] is true, together with
+// their original indexes. Used by Phase D to build the BatchCreate input slice
+// and map results back to the full results slice.
+func compactAlive(txs []*bt.Tx, alive []bool) ([]*bt.Tx, []int) {
+	out := make([]*bt.Tx, 0, len(txs))
+	idx := make([]int, 0, len(txs))
+	for i, tx := range txs {
+		if alive[i] {
+			out = append(out, tx)
+			idx = append(idx, i)
+		}
+	}
+	return out, idx
+}
+
+// buildMetaFromTx constructs the *meta.Data returned for a tx that was
+// successfully created in Phase D. It mirrors the construction performed by
+// util.TxMetaDataFromTx (called by Store.Create → CreateInUtxoStore) and sets
+// Locked=true to match the lockedTrue=true flag passed to BatchCreate.
+func buildMetaFromTx(tx *bt.Tx, blockHeight uint32) (*meta.Data, error) {
+	m, err := util.TxMetaDataFromTx(tx)
+	if err != nil {
+		return nil, err
+	}
+	m.Locked = true
+	// blockHeight is used by the caller for fee/UTXO-hash computation; the
+	// meta.Data struct does not have a plain BlockHeight field — unmined txs
+	// use UnminedSince to record when they entered the mempool.
+	m.UnminedSince = blockHeight
+	return m, nil
 }
 
 // runCPUValidation runs the format + script checks for a single transaction
