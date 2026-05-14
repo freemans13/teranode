@@ -7,10 +7,12 @@ import (
 	crand "crypto/rand"
 	"testing"
 
+	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	aerostore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -345,6 +347,66 @@ func TestBatchSetLocked_EmptyInput(t *testing.T) {
 	defer cleanup()
 
 	results, err := s.BatchSetLocked(ctx, nil, false)
+	require.NoError(t, err)
+	require.Empty(t, results)
+}
+
+// ---------------------------------------------------------------------------
+// BatchSetDAH tests
+// ---------------------------------------------------------------------------
+
+func TestBatchSetDAH_HappyPath(t *testing.T) {
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	client, s, ctx, cleanup := initAerospike(t, tSettings, logger)
+	defer cleanup()
+
+	// Seed one record via BatchCreate.
+	tx := buildMinimalTx(t, 1)
+	_, err := s.BatchCreate(ctx, []*bt.Tx{tx}, 100, false)
+	require.NoError(t, err)
+
+	h := tx.TxIDChainHash()
+	items := []aerostore.SetDAHItem{{TxHash: h[:], DAH: 42}}
+
+	results, err := s.BatchSetDAH(ctx, items)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.NoError(t, results[0].Err)
+
+	// Verify the raw bin via the Aerospike client — meta.Data does not expose DAH.
+	key, err := aerospike.NewKey(s.GetNamespace(), s.GetName(), h[:])
+	require.NoError(t, err)
+
+	record, err := client.Get(util.GetAerospikeReadPolicy(tSettings), key, fields.DeleteAtHeight.String())
+	require.NoError(t, err)
+	require.NotNil(t, record)
+	require.Equal(t, 42, record.Bins[fields.DeleteAtHeight.String()])
+}
+
+func TestBatchSetDAH_MissingRecordPerRecord(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	// 32 bytes that were never seeded into the store.
+	never := make([]byte, 32)
+	never[0] = 0x88
+
+	items := []aerostore.SetDAHItem{{TxHash: never, DAH: 99}}
+	results, err := s.BatchSetDAH(ctx, items)
+	require.NoError(t, err, "whole-call err must be nil for per-record key-not-found")
+	require.Len(t, results, 1)
+	require.Error(t, results[0].Err)
+}
+
+func TestBatchSetDAH_EmptyInput(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	results, err := s.BatchSetDAH(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, results)
 }
