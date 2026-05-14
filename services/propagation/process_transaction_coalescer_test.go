@@ -5,7 +5,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/services/propagation/propagation_api"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -36,8 +35,8 @@ func TestProcessTransaction_FlagOnRoutesThroughCoalescer(t *testing.T) {
 			t.Cleanup(func() { _ = ps.coalescer.Close(context.Background()) })
 		}
 
-		bad := &bt.Tx{}
-		_, err := ps.ProcessTransaction(ctx, &propagation_api.ProcessTransactionRequest{Tx: bad.Bytes()})
+		tx := dummyTx(t, 0xAA)
+		_, err := ps.ProcessTransaction(ctx, &propagation_api.ProcessTransactionRequest{Tx: tx.Bytes()})
 		return err
 	}
 
@@ -68,11 +67,12 @@ func TestProcessTransaction_FlagOnNConcurrentCallersAllRespond(t *testing.T) {
 	const N = 32
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
+		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			bad := &bt.Tx{}
-			_, _ = ps.ProcessTransaction(ctx, &propagation_api.ProcessTransactionRequest{Tx: bad.Bytes()})
+			tx := dummyTx(t, byte((i%254)+1))
+			_, _ = ps.ProcessTransaction(ctx, &propagation_api.ProcessTransactionRequest{Tx: tx.Bytes()})
 		}()
 	}
 	wg.Wait()
