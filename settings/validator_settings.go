@@ -38,4 +38,9 @@ type ValidatorSettings struct {
 	// BatchMaxWait is reserved for a future caller-side coalescer that
 	// would buffer single-tx callers into batches. Not used in v1.
 	BatchMaxWait time.Duration
+	// BatchMaxConcurrent caps the number of concurrent in-flight
+	// ValidateBatch flushes spawned by the propagation TxCoalescer.
+	// 0 = unbounded (every full batch spawns its own goroutine).
+	// Mirrors the convention from utxostore_batcherMaxConcurrent.
+	BatchMaxConcurrent int
 }
