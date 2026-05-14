@@ -1,10 +1,10 @@
 package validator
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,7 +17,7 @@ func TestValidationResult_ZeroValueIsSuccess(t *testing.T) {
 
 func TestValidationResult_WithError(t *testing.T) {
 	h := chainhash.Hash{0x01}
-	sentinel := errors.New("boom")
+	sentinel := terrors.NewProcessingError("boom")
 	r := ValidationResult{
 		TxHash: h,
 		Err:    sentinel,
@@ -36,26 +36,4 @@ func TestValidatePhase_ConstantOrdering(t *testing.T) {
 	require.Equal(t, ValidatePhase(4), PhaseCreate)
 	require.Equal(t, ValidatePhase(5), PhaseBlockAssembly)
 	require.Equal(t, ValidatePhase(6), PhaseSetLocked)
-}
-
-func TestErrParentNotFound_Is(t *testing.T) {
-	// Test that ErrParentNotFound is findable via errors.Is
-	require.ErrorIs(t, ErrParentNotFound, ErrParentNotFound)
-
-	// Test that a wrapped error preserves the target error via Unwrap
-	wrapped := wrappedParentErr{parent: ErrParentNotFound}
-	require.ErrorIs(t, wrapped, ErrParentNotFound)
-}
-
-// wrappedParentErr implements error and Unwrap for testing.
-type wrappedParentErr struct {
-	parent error
-}
-
-func (w wrappedParentErr) Error() string {
-	return "parent error: " + w.parent.Error()
-}
-
-func (w wrappedParentErr) Unwrap() error {
-	return w.parent
 }

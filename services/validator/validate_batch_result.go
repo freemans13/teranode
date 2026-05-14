@@ -1,8 +1,6 @@
 package validator
 
 import (
-	"errors"
-
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
@@ -25,14 +23,13 @@ const (
 // ValidationResult is one element of the slice returned by ValidateBatch,
 // indexed positionally against the input txs. A nil Err means success;
 // Meta is then populated. A non-nil Err means failure at Phase.
+//
+// Phase A (BatchGetParents) failures are surfaced with the existing
+// errors.ErrTxMissingParent sentinel from the teranode errors package
+// rather than introducing a new local sentinel.
 type ValidationResult struct {
 	TxHash chainhash.Hash
 	Meta   *meta.Data
 	Err    error
 	Phase  ValidatePhase
 }
-
-// ErrParentNotFound is returned for a tx whose input references a parent
-// tx that BatchGetParents could not resolve. This includes intra-batch
-// parents in v1; such tx are retried by propagation in a later batch.
-var ErrParentNotFound = errors.New("parent tx not found")
