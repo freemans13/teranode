@@ -674,14 +674,20 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 				return txMetaData, err
 			}
 		} else if errors.Is(err, errors.ErrTxNotFound) {
-			// the parent transaction was not found, this can happen when the parent tx has been DAH'd and removed from
-			// the utxo store. We can check whether the tx already exists, which means it has been validated and
-			// blessed. In this case we can just return early.
+			// The parent transaction was not found. This can legitimately happen when the parent has been DAH-evicted
+			// long after the child was mined. Only short-circuit if the stored metadata confirms prior full validation:
+			//   - tx has been included in at least one block (BlockIDs non-empty), AND
+			//   - tx is NOT marked conflicting, AND
+			//   - tx is NOT locked
+			// Otherwise, surface the original ErrTxNotFound — a "tx exists in store" alone is not proof of validation
+			// (a re-org or DAH window could expose a stale or mid-flight record).
 			txMetaData = &meta.Data{}
-			if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err == nil {
-				v.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", txID)
+			if metaErr := v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); metaErr == nil {
+				if len(txMetaData.BlockIDs) > 0 && !txMetaData.Conflicting && !txMetaData.Locked {
+					v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
 
-				return txMetaData, nil
+					return txMetaData, nil
+				}
 			}
 		}
 
