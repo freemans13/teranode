@@ -426,6 +426,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SpendBatcherDrainMode:                   getBool("utxostore_spendBatcherDrainMode", false, alternativeContext...),
 			StoreBatcherDrainMode:                   getBool("utxostore_storeBatcherDrainMode", false, alternativeContext...),
 			LockedBatcherDrainMode:                  getBool("utxostore_lockedBatcherDrainMode", false, alternativeContext...),
+			OutpointBatcherDrainMode:                getBool("utxostore_outpointBatcherDrainMode", false, alternativeContext...),
 			GetBatcherSize:                          getInt("utxostore_getBatcherSize", 1, alternativeContext...),
 			GetBatcherDurationMillis:                getInt("utxostore_getBatcherDurationMillis", 10, alternativeContext...),
 			DBTimeout:                               getDuration("utxostore_dbTimeoutDuration", 5*time.Second, alternativeContext...),

@@ -386,6 +386,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if tSettings.UtxoStore.LockedBatcherDrainMode {
 		s.lockedBatcher.SetDrainMode(true)
 	}
+	if tSettings.UtxoStore.OutpointBatcherDrainMode {
+		s.outpointBatcher.SetDrainMode(true)
+	}
 
 	logger.Infof("[Aerospike] map txmeta store initialised with namespace: %s, set: %s", namespace, setName)
 
