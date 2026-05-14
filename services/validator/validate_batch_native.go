@@ -3,12 +3,12 @@ package validator
 import (
 	"context"
 	"runtime"
-	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	terrors "github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -454,10 +454,11 @@ func buildSpendsForBatch(txs []*bt.Tx, alive []bool, results []ValidationResult)
 // submitToBlockAssemblyBatch submits a batch of txs to BlockAssembly.
 // Returns a map keyed by tx hash of per-tx errors (only present for rejected
 // txs; an absent entry means accepted). Uses the test override if set;
-// otherwise calls v.blockAssembler.Store per-tx with bounded parallelism —
-// the BA client internally batches via go-batcher so this is efficient.
+// otherwise calls v.blockAssembler.StoreBatch, which dispatches the gRPC
+// batch call immediately without routing through the BA client's internal
+// go-batcher — eliminating the gather-timeout delay on the BA side.
 //
-// Service-level errors (e.g. blockAssembler is nil or Store returns a
+// Service-level errors (e.g. blockAssembler is nil or StoreBatch returns a
 // non-nil error) are treated as per-tx rejections tagged in the result map.
 // The rationale: a transient BA unavailability should surface as
 // PhaseBlockAssembly (leaving the tx locked for reconciler pickup) rather
@@ -475,37 +476,45 @@ func (v *Validator) submitToBlockAssemblyBatch(ctx context.Context, txs []*bt.Tx
 		return map[chainhash.Hash]error{}
 	}
 
+	// Build the BA batch items. Per-tx errors (fee derivation, TxInpoints
+	// serialisation) are attributed individually and those txs excluded from
+	// the StoreBatch call.
+	items := make([]blockassembly.BatchItem, 0, len(txs))
+	hashes := make([]*chainhash.Hash, 0, len(txs))
 	out := make(map[chainhash.Hash]error)
-	var mu sync.Mutex
 
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(runtime.NumCPU())
 	for _, tx := range txs {
-		tx := tx
-		g.Go(func() error {
-			h := tx.TxIDChainHash()
-			txInpoints, err := subtree.NewTxInpointsFromTx(tx)
-			if err != nil {
-				mu.Lock()
-				out[*h] = err
-				mu.Unlock()
-				return nil
-			}
-			fee, err := util.GetFees(tx)
-			if err != nil {
-				mu.Lock()
-				out[*h] = err
-				mu.Unlock()
-				return nil
-			}
-			if _, storeErr := v.blockAssembler.Store(gCtx, h, fee, uint64(tx.Size()), txInpoints); storeErr != nil { //nolint:gosec
-				mu.Lock()
-				out[*h] = storeErr
-				mu.Unlock()
-			}
-			return nil // never bubble per-tx errors as whole-batch errors
+		h := tx.TxIDChainHash()
+		txInpoints, err := subtree.NewTxInpointsFromTx(tx)
+		if err != nil {
+			out[*h] = err
+			continue
+		}
+		fee, err := util.GetFees(tx)
+		if err != nil {
+			out[*h] = err
+			continue
+		}
+		items = append(items, blockassembly.BatchItem{
+			Hash:       h,
+			Fee:        fee,
+			SizeBytes:  uint64(tx.Size()), //nolint:gosec
+			TxInpoints: txInpoints,
 		})
+		hashes = append(hashes, h)
 	}
-	_ = g.Wait()
+
+	if len(items) == 0 {
+		return out
+	}
+
+	// StoreBatch dispatches the gRPC call directly — no go-batcher coalescing.
+	if batchErr := v.blockAssembler.StoreBatch(ctx, items); batchErr != nil {
+		// Whole-batch transport failure — attribute to all attempted txs.
+		for _, h := range hashes {
+			out[*h] = batchErr
+		}
+	}
+
 	return out
 }
