@@ -28,7 +28,7 @@ func TestValidationResult_WithError(t *testing.T) {
 	require.Equal(t, PhaseCreate, r.Phase)
 }
 
-func TestValidatePhase_StringValues(t *testing.T) {
+func TestValidatePhase_ConstantOrdering(t *testing.T) {
 	require.Equal(t, ValidatePhase(0), PhaseNone)
 	require.Equal(t, ValidatePhase(1), PhaseGetParents)
 	require.Equal(t, ValidatePhase(2), PhaseCPU)
@@ -39,7 +39,23 @@ func TestValidatePhase_StringValues(t *testing.T) {
 }
 
 func TestErrParentNotFound_Is(t *testing.T) {
-	wrapped := errors.New("parent abcd: " + ErrParentNotFound.Error())
-	_ = wrapped
+	// Test that ErrParentNotFound is findable via errors.Is
 	require.ErrorIs(t, ErrParentNotFound, ErrParentNotFound)
+
+	// Test that a wrapped error preserves the target error via Unwrap
+	wrapped := wrappedParentErr{parent: ErrParentNotFound}
+	require.ErrorIs(t, wrapped, ErrParentNotFound)
+}
+
+// wrappedParentErr implements error and Unwrap for testing.
+type wrappedParentErr struct {
+	parent error
+}
+
+func (w wrappedParentErr) Error() string {
+	return "parent error: " + w.parent.Error()
+}
+
+func (w wrappedParentErr) Unwrap() error {
+	return w.parent
 }
