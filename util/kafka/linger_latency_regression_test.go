@@ -1,3 +1,5 @@
+//go:build perf
+
 package kafka
 
 import (

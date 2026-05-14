@@ -9,15 +9,22 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.8
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
-	github.com/bitcoin-sv/bdk/module/gobdk v1.2.3
+	// Pinned to a hot-fix on top of v1.2.3 (bitcoin-sv/bdk PR #40) that adds a
+	// per-CheckSig signature-cache to the script verifier. Without it the
+	// validator stalls for hours on consensus-valid scripts that perform the
+	// same ECDSA verification many times (e.g. testnet block 1,451,505).
+	//
+	// DO NOT bump to gobdk v1.2.4 (or later) until bitcoin-sv/bdk PR #41 has
+	// merged — that PR ports the same hot-fix forward to master / v1.2.4.
+	github.com/bitcoin-sv/bdk/module/gobdk v1.2.4-0.20260511121643-5ab3fd5b627d
 	// BSV fork of aerospike-client-go-v8 (adds TeranodeModifyOp /
 	// TeranodeReadOp wire opcodes 200/201 — see
 	// github.com/bsv-blockchain/aerospike-server-private feat/
 	// teranode-native-op for the matching server-side dispatcher).
 	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv2.0.20260508103936-b18e5d80a9e4
-	github.com/bsv-blockchain/go-bt/v2 v2.6.2
-	github.com/bsv-blockchain/go-chaincfg v1.5.5
-	github.com/bsv-blockchain/go-sdk v1.2.19
+	github.com/bsv-blockchain/go-bt/v2 v2.6.3
+	github.com/bsv-blockchain/go-chaincfg v1.5.8
+	github.com/bsv-blockchain/go-sdk v1.2.23
 	github.com/bsv-blockchain/go-subtree v1.2.0
 	github.com/bsv-blockchain/testcontainers-aerospike-go v0.3.2
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
@@ -192,7 +199,7 @@ require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
 	github.com/bsv-blockchain/go-safe-conversion v1.1.2
 	github.com/bsv-blockchain/go-tx-map v1.3.4
-	github.com/bsv-blockchain/go-wire v1.2.1
+	github.com/bsv-blockchain/go-wire v1.2.3
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
@@ -206,6 +213,7 @@ require (
 	github.com/twmb/franz-go/pkg/kmsg v1.12.0
 	github.com/urfave/cli/v3 v3.8.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
+	pgregory.net/rapid v1.3.0
 )
 
 require (
