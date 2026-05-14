@@ -172,6 +172,11 @@ type Validator struct {
 	// goroutines start, and per-tx readers only contend with each other on the read lock.
 	mtpMu    sync.RWMutex
 	mtpStore []uint32
+
+	// batchStoreOverride is a test seam used by validate_batch_native_test.go
+	// to substitute the UTXO store with a stub batchUtxoStore. nil in
+	// production.
+	batchStoreOverride batchUtxoStore
 }
 
 // New creates a new Validator instance with the provided configuration.

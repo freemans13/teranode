@@ -75,14 +75,4 @@ func (v *Validator) validateBatchFallback(
 	return results, nil
 }
 
-// validateBatchNative is a placeholder until Tasks 11-16 wire the
-// six-phase native pipeline. For now it just delegates to the fallback
-// so the package builds and the flag can be enabled without effect.
-func (v *Validator) validateBatchNative(
-	ctx context.Context,
-	txs []*bt.Tx,
-	blockHeight uint32,
-	opts ...Option,
-) ([]ValidationResult, error) {
-	return v.validateBatchFallback(ctx, txs, blockHeight, opts...)
-}
+// validateBatchNative is implemented in validate_batch_native.go.
