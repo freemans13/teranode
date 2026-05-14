@@ -2,10 +2,12 @@ package validator
 
 import (
 	"context"
+	"runtime"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"golang.org/x/sync/errgroup"
 )
 
 // batchUtxoStore is the minimal UTXO store surface ValidateBatch needs.
@@ -73,11 +75,58 @@ func (v *Validator) validateBatchNative(
 		alive[i] = !parentMissing
 	}
 
-	// Phases B–F follow in subsequent tasks. For alive[i]==true entries,
+	// Phase B — per-tx CPU validation (format + scripts).
+	// Runs in an errgroup bounded by NumCPU so the goroutine count does not
+	// grow unboundedly with batch size.
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(runtime.NumCPU())
+	for i := range txs {
+		if !alive[i] {
+			continue
+		}
+		i := i // capture loop var
+		g.Go(func() error {
+			if err := v.runCPUValidation(gCtx, txs[i], blockHeight, opts...); err != nil {
+				results[i].Err = err
+				results[i].Phase = PhaseCPU
+				alive[i] = false
+			}
+			return nil // never bubble per-tx errors as whole-batch errors
+		})
+	}
+	_ = g.Wait() // errgroup never returns a non-nil error here
+
+	// Phases C–F follow in subsequent tasks. For alive[i]==true entries,
 	// results[i] stays at its zero value until those phases populate it.
 	_ = alive
 
 	return results, nil
+}
+
+// runCPUValidation runs the format + script checks for a single transaction
+// without touching the UTXO store. It calls TxValidatorI methods directly
+// (bypassing the v.validateTransaction / v.validateTransactionScripts wrappers
+// which would call extendTransaction → UTXO store). Phase A already confirmed
+// parents are present; the tx is expected to be in extended form by the time
+// Phase B runs (extension happens in an earlier step of the overall pipeline).
+//
+// In test code, v.cpuOverride intercepts the call so tests can inject
+// controlled failures without needing a fully-extended signed transaction.
+func (v *Validator) runCPUValidation(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...Option) error {
+	if v.cpuOverride != nil {
+		return v.cpuOverride(tx)
+	}
+	processedOpts := ProcessOptions(opts...)
+	// utxoHeights is nil here: we have not performed a per-tx UTXO lookup yet
+	// (that would defeat the purpose of the batch path). ValidateTransaction
+	// uses utxoHeights only in checkFees → isConsolidationTx; passing nil
+	// makes isConsolidationTx skip the confirmation check, which is the
+	// conservative/safe behaviour for a batch path that hasn't looked up
+	// individual UTXO heights.
+	if err := v.txValidator.ValidateTransaction(tx, blockHeight, nil, processedOpts); err != nil {
+		return err
+	}
+	return v.txValidator.ValidateTransactionScripts(tx, blockHeight, nil, processedOpts)
 }
 
 // getBatchUtxoStore returns the validator's UTXO store as a batchUtxoStore if

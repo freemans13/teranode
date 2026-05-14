@@ -177,6 +177,11 @@ type Validator struct {
 	// to substitute the UTXO store with a stub batchUtxoStore. nil in
 	// production.
 	batchStoreOverride batchUtxoStore
+
+	// cpuOverride is a test seam that, when non-nil, replaces the real
+	// TxValidator CPU-validation calls inside runCPUValidation. nil in
+	// production.
+	cpuOverride func(*bt.Tx) error
 }
 
 // New creates a new Validator instance with the provided configuration.

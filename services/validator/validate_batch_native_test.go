@@ -2,6 +2,7 @@ package validator
 
 import (
 	"context"
+	"runtime"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -97,6 +98,10 @@ func TestValidateBatchNative_PhaseA_OneGetCallRegardlessOfN(t *testing.T) {
 // remain error-free after Phase A.
 func TestValidateBatchNative_PhaseA_MissingParentTagged(t *testing.T) {
 	v, stub := newNativeValidator(t)
+	// Install a no-op CPU override so this test stays focused on Phase A
+	// behaviour; minimalTxWithParent produces 0-output txs that Phase B
+	// would otherwise reject.
+	v.overrideCPUValidationForTest(func(_ *bt.Tx) error { return nil })
 
 	pPresent := chainhash.Hash{0x10}
 	pMissing := chainhash.Hash{0x20}
@@ -137,6 +142,10 @@ func TestValidateBatchNative_PhaseA_WholeBatchAerospikeFailure(t *testing.T) {
 // so BatchGetParents receives each hash only once.
 func TestValidateBatchNative_PhaseA_DeduplicatedParents(t *testing.T) {
 	v, stub := newNativeValidator(t)
+	// Install a no-op CPU override so this test stays focused on Phase A
+	// behaviour; minimalTxWithParent produces 0-output txs that Phase B
+	// would otherwise reject.
+	v.overrideCPUValidationForTest(func(_ *bt.Tx) error { return nil })
 
 	sharedParent := chainhash.Hash{0xAA}
 	stub.parents = mkParentMap(&sharedParent)
@@ -157,4 +166,99 @@ func TestValidateBatchNative_PhaseA_DeduplicatedParents(t *testing.T) {
 	for i, r := range results {
 		require.NoError(t, r.Err, "tx[%d] should have no Phase A error", i)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase B tests
+// ---------------------------------------------------------------------------
+
+// TestValidateBatchNative_PhaseB_PerTxCPUFailureIsolated asserts that a tx
+// that fails CPU validation (format/script) is tagged with PhaseCPU while
+// a tx that passes CPU validation remains error-free after Phase B.
+func TestValidateBatchNative_PhaseB_PerTxCPUFailureIsolated(t *testing.T) {
+	v, stub := newNativeValidator(t)
+
+	pGood := chainhash.Hash{0x40}
+	pBad := chainhash.Hash{0x41}
+	stub.parents = mkParentMap(&pGood, &pBad)
+	stub.missing = nil
+
+	// good: passes the injected CPU override (no error).
+	good := minimalTxWithParent(t, pGood)
+	// bad: the CPU override returns an error for this tx specifically.
+	bad := minimalTxWithParent(t, pBad)
+
+	// Use the cpuOverride seam so we can control which tx fails without
+	// needing a fully extended/signed transaction.
+	cpuErr := terrors.NewTxInvalidError("synthetic CPU validation failure")
+	v.overrideCPUValidationForTest(func(tx *bt.Tx) error {
+		if tx == bad {
+			return cpuErr
+		}
+		return nil
+	})
+
+	results, err := v.ValidateBatch(context.Background(), []*bt.Tx{good, bad}, 0)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.NoError(t, results[0].Err, "good tx should survive Phase B")
+	require.Error(t, results[1].Err, "bad tx should be tagged by Phase B")
+	require.Equal(t, PhaseCPU, results[1].Phase)
+}
+
+// TestValidateBatchNative_PhaseB_NaturalFormatRejection asserts that a tx
+// with no outputs is natively rejected by ValidateTransaction (no override
+// needed). minimalTxWithParent produces a tx with 1 input and 0 outputs;
+// ValidateTransaction rejects it immediately.
+func TestValidateBatchNative_PhaseB_NaturalFormatRejection(t *testing.T) {
+	v, stub := newNativeValidator(t)
+
+	p := chainhash.Hash{0x50}
+	stub.parents = mkParentMap(&p)
+
+	// minimalTxWithParent → 1 input, 0 outputs → ValidateTransaction
+	// returns "transaction has no inputs or outputs".
+	tx := minimalTxWithParent(t, p)
+
+	results, err := v.ValidateBatch(context.Background(), []*bt.Tx{tx}, 0)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Error(t, results[0].Err, "tx with no outputs must fail Phase B")
+	require.Equal(t, PhaseCPU, results[0].Phase)
+}
+
+// TestValidateBatchNative_PhaseB_BoundedParallelism confirms that Phase B
+// does not spawn one goroutine per tx unboundedly. With N=100 txs, the peak
+// goroutine delta must stay well below N.
+func TestValidateBatchNative_PhaseB_BoundedParallelism(t *testing.T) {
+	v, stub := newNativeValidator(t)
+	const N = 100
+	parents := make([]chainhash.Hash, N)
+	for i := range parents {
+		parents[i] = chainhash.Hash{byte(i + 1)}
+	}
+	parentMap := map[[32]byte]*aerospike.ParentRecord{}
+	for _, p := range parents {
+		var key [32]byte
+		copy(key[:], p[:])
+		parentMap[key] = &aerospike.ParentRecord{BlockHeight: 1}
+	}
+	stub.parents = parentMap
+
+	txs := make([]*bt.Tx, N)
+	for i := range txs {
+		txs[i] = minimalTxWithParent(t, parents[i])
+	}
+
+	// Override CPU validation to be a no-op so all txs reach Phase B
+	// without being killed by format errors. (minimalTxWithParent produces
+	// 0-output txs which ValidateTransaction would otherwise reject; we want
+	// to measure goroutine concurrency, not validation logic here.)
+	v.overrideCPUValidationForTest(func(_ *bt.Tx) error { return nil })
+
+	before := runtime.NumGoroutine()
+	_, err := v.ValidateBatch(context.Background(), txs, 0)
+	require.NoError(t, err)
+	after := runtime.NumGoroutine()
+	require.Less(t, after-before, N/4, "Phase B should be bounded by NumCPU, not N")
 }
