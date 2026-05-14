@@ -287,3 +287,64 @@ func TestBatchCreate_EmptyInput(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, results)
 }
+
+// ---------------------------------------------------------------------------
+// BatchSetLocked tests
+// ---------------------------------------------------------------------------
+
+func TestBatchSetLocked_Unlock(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	// Seed two records with locked=true via BatchCreate.
+	txs := []*bt.Tx{buildMinimalTx(t, 1), buildMinimalTx(t, 1)}
+	createRes, err := s.BatchCreate(ctx, txs, 100, true)
+	require.NoError(t, err)
+	for i, r := range createRes {
+		require.NoError(t, r.Err, "index %d", i)
+	}
+
+	hashes := make([][]byte, len(txs))
+	for i, tx := range txs {
+		h := tx.TxIDChainHash()
+		hashes[i] = h[:]
+	}
+
+	results, err := s.BatchSetLocked(ctx, hashes, false)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	for i, r := range results {
+		require.NoError(t, r.Err, "index %d", i)
+	}
+
+	// Spot-check via Get: locked flag must now be false.
+	md, err := s.Get(ctx, txs[0].TxIDChainHash())
+	require.NoError(t, err)
+	require.False(t, md.Locked)
+}
+
+func TestBatchSetLocked_MissingRecordPerRecord(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	// 32 bytes that were never seeded into the store.
+	never := make([]byte, 32)
+	never[0] = 0x77
+
+	results, err := s.BatchSetLocked(ctx, [][]byte{never}, false)
+	require.NoError(t, err, "whole-call err must be nil for per-record key-not-found")
+	require.Len(t, results, 1)
+	require.Error(t, results[0].Err)
+}
+
+func TestBatchSetLocked_EmptyInput(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	results, err := s.BatchSetLocked(ctx, nil, false)
+	require.NoError(t, err)
+	require.Empty(t, results)
+}
