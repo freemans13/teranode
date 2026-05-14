@@ -56,12 +56,15 @@ func TestValidateBatch_ParityWithValidate_NonExtendedTx(t *testing.T) {
 	require.NoError(t, err, "seed parent into utxoStore")
 
 	// 2. Configure the stub so Phase A sees the parent as present.
-	//    The stub returns a minimal ParentRecord — no satoshi/script data.
+	//    The stub ParentRecord carries the parent's outputs so that Phase A
+	//    can hydrate PreviousTxScript and PreviousTxSatoshis in-memory without
+	//    any extra store calls — exactly the same way BatchGetParents does in
+	//    production after it decodes the Outputs bin at fetch time.
 	parentHash := parent.TxIDChainHash()
 	var parentKey [32]byte
 	copy(parentKey[:], parentHash[:])
 	stub.parents = map[[32]byte]*aerospike.ParentRecord{
-		parentKey: {BlockHeight: 1},
+		parentKey: {BlockHeight: 1, Outputs: parent.Outputs},
 	}
 
 	// 3. Build the child tx spending parent.Outputs[0].
