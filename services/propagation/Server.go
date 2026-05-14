@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -49,8 +50,6 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/ordishs/gocore"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/propagation"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
@@ -987,59 +986,134 @@ func (ps *PropagationServer) ProcessTransactionBatch(ctx context.Context, req *p
 		Errors: make([]*errors.TError, len(req.Items)),
 	}
 
-	g, gCtx := errgroup.WithContext(ctx)
+	if len(req.Items) == 0 {
+		return response, nil
+	}
 
-	for idx, item := range req.Items {
-		idx := idx
-		tx := item.Tx
+	// Phase 1: decode all transactions upfront, applying per-tx size and sanity checks.
+	// Transactions that fail decode/sanity are attributed to their slot in response.Errors
+	// and excluded from further processing.
+	type decodedTx struct {
+		tx          *bt.Tx
+		txBytes     []byte
+		originalIdx int
+	}
 
-		// Acquire server-wide semaphore before spawning goroutine to limit
-		// total concurrent tx-processing goroutines across all batch calls.
-		if ps.batchWorkerPool != nil {
-			select {
-			case ps.batchWorkerPool <- struct{}{}:
-			case <-ctx.Done():
-				response.Errors[idx] = errors.WrapPublic(ctx.Err())
+	decoded := make([]decodedTx, 0, len(req.Items))
+
+	for i, item := range req.Items {
+		// Check transaction size BEFORE parsing to avoid wasting CPU on oversized transactions
+		txSize := len(item.Tx)
+		if ps.settings != nil && ps.settings.Policy != nil {
+			maxTxSize := ps.settings.Policy.GetMaxTxSizePolicy()
+			if maxTxSize > 0 && txSize > maxTxSize {
+				prometheusInvalidTransactions.Inc()
+				err := errors.NewTxInvalidError("[ProcessTransactionBatch] transaction size %d exceeds maximum allowed size %d", txSize, maxTxSize)
+				response.Errors[i] = errors.WrapPublic(err)
 				continue
 			}
 		}
 
-		g.Go(func() error {
-			if ps.batchWorkerPool != nil {
-				defer func() { <-ps.batchWorkerPool }()
-			}
+		// Parse the raw bytes with panic recovery, matching processTransaction behaviour.
+		var (
+			btTx     *bt.Tx
+			parseErr error
+		)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					parseErr = errors.NewProcessingError("transaction parsing panic: %v", r)
+					ps.logger.WithTraceContext(ctx).Errorf("[ProcessTransactionBatch] recovered from panic in bt.NewTxFromBytes: %v", r)
+				}
+			}()
+			btTx, parseErr = bt.NewTxFromBytes(item.Tx)
+		}()
 
-			var txCtx context.Context
+		if parseErr != nil {
+			prometheusInvalidTransactions.Inc()
+			response.Errors[i] = errors.WrapPublic(errors.NewProcessingError("[ProcessTransactionBatch] failed to parse transaction from bytes", parseErr))
+			continue
+		}
 
-			if len(item.TraceContext) > 0 {
-				// Deserialize the trace context
-				prop := otel.GetTextMapPropagator()
-				txCtx = prop.Extract(gCtx, propagation.MapCarrier(item.TraceContext))
-			} else {
-				// No trace context available, use the batch context
-				txCtx = gCtx
-			}
+		// Propagation-layer sanity checks (mirrors processTransactionInternal).
+		if btTx.IsCoinbase() {
+			prometheusInvalidTransactions.Inc()
+			err := errors.NewTxInvalidError("[ProcessTransactionBatch][%s] received coinbase transaction", btTx.TxID())
+			response.Errors[i] = errors.WrapPublic(err)
+			continue
+		}
 
-			// just call the internal process transaction function for every transaction
-			if err := ps.processTransaction(txCtx, &propagation_api.ProcessTransactionRequest{
-				Tx: tx,
-			}); err != nil {
-				// Use context-aware logger for trace correlation
-				ps.logger.WithTraceContext(txCtx).Errorf("[ProcessTransactionBatch] failed to process transaction %d: %v", idx, err)
+		if err := ps.txSanityChecks(btTx); err != nil {
+			response.Errors[i] = errors.WrapPublic(err)
+			continue
+		}
 
-				response.Errors[idx] = errors.WrapPublic(err)
-			} else {
-				response.Errors[idx] = nil
-			}
-
-			return nil
+		decoded = append(decoded, decodedTx{
+			tx:          btTx,
+			txBytes:     btTx.SerializeBytes(),
+			originalIdx: i,
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		ps.logger.WithTraceContext(ctx).Errorf("[ProcessTransactionBatch] failed to process transaction batch: %v", err)
+	if len(decoded) == 0 {
+		return response, nil
+	}
 
-		return nil, errors.WrapGRPCPublic(err)
+	// Phase 2: persist raw bytes with bounded parallelism.
+	// Storage failures are attributed per-tx and exclude that tx from validation.
+	storeG, storeCtx := errgroup.WithContext(ctx)
+	storeG.SetLimit(runtime.NumCPU())
+
+	storeErrs := make([]error, len(decoded))
+
+	for j := range decoded {
+		j := j
+		storeG.Go(func() error {
+			storeErrs[j] = ps.storeTransaction(storeCtx, decoded[j].tx, decoded[j].txBytes)
+			return nil // never propagate as group error; handle per-tx below
+		})
+	}
+	_ = storeG.Wait()
+
+	// Partition decoded into valid (stored ok) and failed (store error).
+	validTxs := make([]*bt.Tx, 0, len(decoded))
+	validOrigIdx := make([]int, 0, len(decoded))
+
+	for j, d := range decoded {
+		if storeErrs[j] != nil {
+			response.Errors[d.originalIdx] = errors.WrapPublic(
+				errors.NewStorageError("[ProcessTransactionBatch][%s] failed to save transaction", d.tx.TxIDChainHash(), storeErrs[j]),
+			)
+			continue
+		}
+		validTxs = append(validTxs, d.tx)
+		validOrigIdx = append(validOrigIdx, d.originalIdx)
+	}
+
+	if len(validTxs) == 0 {
+		return response, nil
+	}
+
+	// Phase 3: single ValidateBatch call for all successfully stored transactions.
+	// With UseBatchValidation=false (default) this fans out over ValidateWithOptions,
+	// preserving per-tx semantics identical to the previous per-tx errgroup pattern.
+	results, err := ps.validator.ValidateBatch(ctx, validTxs, 0)
+	if err != nil {
+		// Whole-batch failure (e.g. context cancelled): attribute to all surviving slots.
+		ps.logger.WithTraceContext(ctx).Errorf("[ProcessTransactionBatch] ValidateBatch whole-batch error: %v", err)
+		for _, origIdx := range validOrigIdx {
+			if response.Errors[origIdx] == nil {
+				response.Errors[origIdx] = errors.WrapPublic(err)
+			}
+		}
+		return response, nil
+	}
+
+	for j, r := range results {
+		if r.Err != nil {
+			ps.logger.WithTraceContext(ctx).Errorf("[ProcessTransactionBatch] failed to process transaction %d: %v", validOrigIdx[j], r.Err)
+			response.Errors[validOrigIdx[j]] = errors.WrapPublic(r.Err)
+		}
 	}
 
 	return response, nil
