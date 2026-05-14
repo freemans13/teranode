@@ -25,12 +25,10 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	aerostore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/services/propagation/propagation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -126,15 +124,11 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 	vIface, err := validator.New(ctx, logger, tSettings, aeroStore, nil, nil, nil, nil)
 	require.NoError(b, err)
 
-	// Install test seams so the bench measures the pure propagation →
-	// coalescer → validator → Aerospike round-trip, not CPU/BA/Kafka overhead.
-	if v, ok := vIface.(*validator.Validator); ok {
-		v.OverrideCPUValidationForBench(func(*bt.Tx) error { return nil })
-		v.OverrideBASubmitForBench(func(ctx context.Context, txs []*bt.Tx) map[chainhash.Hash]error {
-			return map[chainhash.Hash]error{}
-		})
-		v.OverrideTxMetaPublishForBench(func(*bt.Tx, *meta.Data) {})
-	}
+	// NO test-only overrides — both paths (flag-off and flag-on) must run
+	// exactly the same validation logic on exactly the same input. If a
+	// tx is invalid, both paths must reject it for the same reason. If
+	// they reject for DIFFERENT reasons, that's a correctness bug in
+	// ValidateBatch as a drop-in for per-tx Validate, not a perf concern.
 
 	// Build a PropagationServer wired to the aerospike-backed validator,
 	// with Kafka producer explicitly nil (enables coalescer path when useBatch=true).
