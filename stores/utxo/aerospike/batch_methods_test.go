@@ -222,3 +222,68 @@ func TestBatchSpend_EmptyInput(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
+
+// ---------------------------------------------------------------------------
+// BatchCreate tests
+// ---------------------------------------------------------------------------
+
+// buildMinimalTx returns a minimal, self-consistent *bt.Tx with the given
+// number of outputs. Each call produces a unique transaction because
+// utxotesthelper.CreateTransaction generates a random input txid. The tx is
+// NOT seeded into the store; callers are responsible for creating it.
+func buildMinimalTx(t *testing.T, numOutputs int) *bt.Tx {
+	t.Helper()
+	tx, err := utxotesthelper.CreateTransaction(uint64(numOutputs)) //nolint:gosec
+	require.NoError(t, err)
+	return tx
+}
+
+func TestBatchCreate_AllSucceed(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	txs := []*bt.Tx{buildMinimalTx(t, 1), buildMinimalTx(t, 1), buildMinimalTx(t, 1)}
+
+	results, err := s.BatchCreate(ctx, txs, 100, true)
+	require.NoError(t, err)
+	require.Len(t, results, 3)
+	for i, r := range results {
+		require.NoError(t, r.Err, "index %d", i)
+	}
+
+	// Spot-check: Get should now return the first record with Locked=true.
+	md, err := s.Get(ctx, txs[0].TxIDChainHash())
+	require.NoError(t, err)
+	require.NotNil(t, md)
+	require.True(t, md.Locked, "expected lockedTrue")
+}
+
+func TestBatchCreate_CreateOnlyViolation(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	tx := buildMinimalTx(t, 1)
+
+	// First create succeeds.
+	r1, err := s.BatchCreate(ctx, []*bt.Tx{tx}, 100, true)
+	require.NoError(t, err)
+	require.NoError(t, r1[0].Err)
+
+	// Second create on same hash must fail per-record (not whole-call).
+	r2, err := s.BatchCreate(ctx, []*bt.Tx{tx}, 100, true)
+	require.NoError(t, err, "whole-call err must be nil for per-record CREATE_ONLY violations")
+	require.Len(t, r2, 1)
+	require.Error(t, r2[0].Err)
+}
+
+func TestBatchCreate_EmptyInput(t *testing.T) {
+	ctx := context.Background()
+	s, cleanup := newStoreForBatchTests(t)
+	defer cleanup()
+
+	results, err := s.BatchCreate(ctx, nil, 0, false)
+	require.NoError(t, err)
+	require.Empty(t, results)
+}
