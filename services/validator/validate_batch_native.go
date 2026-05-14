@@ -11,6 +11,7 @@ import (
 	terrors "github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"golang.org/x/sync/errgroup"
@@ -81,6 +82,23 @@ func (v *Validator) validateBatchNative(
 		alive[i] = !parentMissing
 	}
 
+	// Phase A hydration: populate input.PreviousTxScript and PreviousTxSatoshis
+	// from the UTXO store for every alive tx whose inputs are not already
+	// extended, and collect per-input UTXO heights for Phase B script
+	// verification. This mirrors what getTransactionInputBlockHeightsAndExtendTx
+	// does for the per-tx Validate path, so that Validate(tx) and
+	// ValidateBatch([tx]) operate on identical hydrated tx state.
+	//
+	// NOTE: This issues one v.utxoStore.Get per unique parent hash (N+1 relative
+	// to BatchGetParents). Parents are already confirmed present by the alive
+	// check above; we fetch the Tx bin to read output satoshis and scripts.
+	// A follow-up task should fold this data into BatchGetParents to eliminate
+	// the extra round-trip (tracked as a known suboptimal step).
+	utxoHeightsByTx, hydrateErr := v.hydrateInputsForBatch(ctx, txs, parents, alive, results)
+	if hydrateErr != nil {
+		return results, hydrateErr
+	}
+
 	// Phase B — per-tx CPU validation (format + scripts).
 	// Runs in an errgroup bounded by NumCPU so the goroutine count does not
 	// grow unboundedly with batch size.
@@ -92,7 +110,7 @@ func (v *Validator) validateBatchNative(
 		}
 		i := i // capture loop var
 		g.Go(func() error {
-			if err := v.runCPUValidation(gCtx, txs[i], blockHeight, opts...); err != nil {
+			if err := v.runCPUValidation(gCtx, txs[i], blockHeight, utxoHeightsByTx[i], opts...); err != nil {
 				results[i].Err = err
 				results[i].Phase = PhaseCPU
 				alive[i] = false
@@ -298,26 +316,24 @@ func buildMetaFromTx(tx *bt.Tx, blockHeight uint32) (*meta.Data, error) {
 // without touching the UTXO store. It calls TxValidatorI methods directly
 // (bypassing the v.validateTransaction / v.validateTransactionScripts wrappers
 // which would call extendTransaction → UTXO store). Phase A already confirmed
-// parents are present; the tx is expected to be in extended form by the time
-// Phase B runs (extension happens in an earlier step of the overall pipeline).
+// parents are present and hydrated the tx to extended form; utxoHeights holds
+// one block height per input derived from the ParentRecord.BlockHeight values
+// fetched in Phase A.
 //
 // In test code, v.cpuOverride intercepts the call so tests can inject
 // controlled failures without needing a fully-extended signed transaction.
-func (v *Validator) runCPUValidation(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...Option) error {
+func (v *Validator) runCPUValidation(ctx context.Context, tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, opts ...Option) error {
 	if v.cpuOverride != nil {
 		return v.cpuOverride(tx)
 	}
 	processedOpts := ProcessOptions(opts...)
-	// utxoHeights is nil here: we have not performed a per-tx UTXO lookup yet
-	// (that would defeat the purpose of the batch path). ValidateTransaction
-	// uses utxoHeights only in checkFees → isConsolidationTx; passing nil
-	// makes isConsolidationTx skip the confirmation check, which is the
-	// conservative/safe behaviour for a batch path that hasn't looked up
-	// individual UTXO heights.
-	if err := v.txValidator.ValidateTransaction(tx, blockHeight, nil, processedOpts); err != nil {
+	// ValidateTransaction uses utxoHeights only in checkFees → isConsolidationTx.
+	// ValidateTransactionScripts passes them through to the BDK script engine,
+	// which requires the slice to have exactly one entry per input.
+	if err := v.txValidator.ValidateTransaction(tx, blockHeight, utxoHeights, processedOpts); err != nil {
 		return err
 	}
-	return v.txValidator.ValidateTransactionScripts(tx, blockHeight, nil, processedOpts)
+	return v.txValidator.ValidateTransactionScripts(tx, blockHeight, utxoHeights, processedOpts)
 }
 
 // getBatchUtxoStore returns the validator's UTXO store as a batchUtxoStore if
@@ -463,4 +479,155 @@ func (v *Validator) submitToBlockAssemblyBatch(ctx context.Context, txs []*bt.Tx
 	}
 	_ = g.Wait()
 	return out
+}
+
+// hydrateInputsForBatch populates input.PreviousTxScript and
+// input.PreviousTxSatoshis from the UTXO store for every alive tx that is not
+// already extended, and derives per-input UTXO block heights from the
+// ParentRecord.BlockHeight values returned by Phase A.
+//
+// Returns utxoHeightsByTx: one []uint32 per tx (parallel to txs), where each
+// entry holds one block height per input. This is used by Phase B
+// (runCPUValidation) when calling the BDK script engine, which requires the
+// heights slice length to equal the number of inputs.
+//
+// This must produce the same tx state that
+// getTransactionInputBlockHeightsAndExtendTx produces for the per-tx Validate
+// path, so both paths operate on identical hydrated tx state.
+//
+// One v.utxoStore.Get call is made per unique parent hash (confirmed present by
+// Phase A). Concurrent fetches are bounded by runtime.NumCPU. Per-tx errors
+// mark the tx dead at PhaseGetParents and are written into results/alive.
+//
+// NOTE: This is a known suboptimal step — one Get per unique parent versus a
+// single BatchGetParents call. A follow-up task should fold the output-bin data
+// into BatchGetParents to eliminate these extra round-trips.
+func (v *Validator) hydrateInputsForBatch(
+	ctx context.Context,
+	txs []*bt.Tx,
+	parents map[[32]byte]*aerospike.ParentRecord,
+	alive []bool,
+	results []ValidationResult,
+) (utxoHeightsByTx [][]uint32, err error) {
+	// Always return a slice of the same length as txs so Phase B can index it
+	// safely regardless of whether hydration is needed.
+	utxoHeightsByTx = make([][]uint32, len(txs))
+
+	if v.utxoStore == nil {
+		return utxoHeightsByTx, nil
+	}
+
+	// Collect the unique parent hashes needed by at least one alive tx that is
+	// not already extended. Already-extended txs have their input scripts and
+	// satoshis populated; we only need the UTXO heights (from ParentRecord)
+	// for them, which we derive below without a store lookup.
+	needed := make(map[[32]byte]struct{})
+	for i, tx := range txs {
+		if !alive[i] || tx.IsExtended() {
+			continue
+		}
+		for _, in := range tx.Inputs {
+			ph := in.PreviousTxIDChainHash()
+			var key [32]byte
+			copy(key[:], ph[:])
+			if _, ok := parents[key]; ok {
+				needed[key] = struct{}{}
+			}
+		}
+	}
+
+	// Fetch full tx data for each needed parent. Store results in a map
+	// protected by a mutex so goroutines can write concurrently.
+	var fetchedMu sync.Mutex
+	fetched := make(map[[32]byte]*bt.Tx, len(needed))
+
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(runtime.NumCPU())
+	for key := range needed {
+		key := key // capture
+		hash := chainhash.Hash(key)
+		g.Go(func() error {
+			txMeta, getErr := v.utxoStore.Get(gCtx, &hash, fields.Tx)
+			if getErr != nil {
+				// Parent was confirmed present in Phase A; treat a Get failure as
+				// a whole-batch transport error (not a per-tx error) since we
+				// cannot distinguish which tx is at fault.
+				return getErr
+			}
+			if txMeta == nil || txMeta.Tx == nil {
+				// Record exists but has no Tx bin — treat as a whole-batch error.
+				return terrors.NewProcessingError(
+					"[ValidateBatch] parent %s found in Phase A but Tx bin is nil during hydration",
+					hash.String(),
+				)
+			}
+			fetchedMu.Lock()
+			fetched[key] = txMeta.Tx
+			fetchedMu.Unlock()
+			return nil
+		})
+	}
+	if waitErr := g.Wait(); waitErr != nil {
+		return utxoHeightsByTx, waitErr
+	}
+
+	// Populate inputs for each alive tx and build utxoHeights from the
+	// ParentRecord.BlockHeight values collected in Phase A.
+	for i, tx := range txs {
+		if !alive[i] {
+			continue
+		}
+		heights := make([]uint32, len(tx.Inputs))
+		hydrationFailed := false
+
+		for j, in := range tx.Inputs {
+			ph := in.PreviousTxIDChainHash()
+			var key [32]byte
+			copy(key[:], ph[:])
+
+			pr, inParents := parents[key]
+			if !inParents {
+				// Should have been caught by the alive check. Skip.
+				continue
+			}
+
+			// Derive the UTXO height for this input. Mirrors the logic in
+			// getUtxoBlockHeightAndExtendForParentTx: unmined parents use
+			// blockState.Height+1 as a sentinel; for the batch path we do
+			// not have the blockState readily available so we use the
+			// ParentRecord.BlockHeight, which is 0 for unmined txs.
+			heights[j] = pr.BlockHeight
+
+			// Hydrate script + satoshis for non-extended inputs.
+			if tx.IsExtended() {
+				continue
+			}
+			parentTx, ok := fetched[key]
+			if !ok {
+				// Parent fetched map is missing an entry — only possible when
+				// utxoStore.Get was skipped (e.g. store is nil). Should not
+				// happen when needed was populated correctly.
+				continue
+			}
+			outIdx := in.PreviousTxOutIndex
+			if parentTx.Outputs == nil || int(outIdx) >= len(parentTx.Outputs) || parentTx.Outputs[outIdx] == nil { //nolint:gosec
+				results[i].Err = terrors.NewProcessingError(
+					"[ValidateBatch] parent tx output index %d out of range or nil for input",
+					outIdx,
+				)
+				results[i].Phase = PhaseGetParents
+				alive[i] = false
+				hydrationFailed = true
+				break
+			}
+			in.PreviousTxSatoshis = parentTx.Outputs[outIdx].Satoshis
+			in.PreviousTxScript = parentTx.Outputs[outIdx].LockingScript
+		}
+
+		if !hydrationFailed && !tx.IsExtended() {
+			tx.SetExtended(true)
+		}
+		utxoHeightsByTx[i] = heights
+	}
+	return utxoHeightsByTx, nil
 }
