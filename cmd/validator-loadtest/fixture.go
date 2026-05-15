@@ -70,6 +70,7 @@ type fixtureConfig struct {
 	batchMaxSize       int
 	batchMaxWait       time.Duration
 	batchMaxConcurrent int
+	connQueueSize      int
 	parentPoolSize     int
 }
 
@@ -109,8 +110,8 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 			log.Fatalf("fixture: container port: %v", portErr)
 		}
 		aeroURL = fmt.Sprintf(
-			"aerospike://%s:%d/test?set=test&block_retention=1&externalStore=file:///tmp/loadtest-aero-external",
-			host, port,
+			"aerospike://%s:%d/test?set=test&block_retention=1&externalStore=file:///tmp/loadtest-aero-external&ConnectionQueueSize=%d",
+			host, port, cfg.connQueueSize,
 		)
 		containerFn = func() { _ = container.Terminate(ctx) }
 	}
