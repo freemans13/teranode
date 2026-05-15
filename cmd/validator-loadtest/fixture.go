@@ -89,6 +89,14 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 	tSettings.Validator.BatchMaxSize = cfg.batchMaxSize
 	tSettings.Validator.BatchMaxWait = cfg.batchMaxWait
 	tSettings.Validator.BatchMaxConcurrent = cfg.batchMaxConcurrent
+	// validator.New requires Kafka.TxMetaConfig to be non-nil even when
+	// no Kafka producer is configured. The standalone binary doesn't
+	// load settings.conf, so seed a dummy URL — it's only checked for
+	// non-nilness; no Kafka client is started when the producer is nil.
+	if tSettings.Kafka.TxMetaConfig == nil {
+		dummyURL, _ := url.Parse("kafka://localhost:0/txmeta-disabled")
+		tSettings.Kafka.TxMetaConfig = dummyURL
+	}
 
 	var (
 		aeroURL     string
