@@ -5,55 +5,77 @@ import (
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	cuckoo "github.com/seiflotfy/cuckoofilter"
 )
 
-// PrunedTxSet is a concurrent sharded set tracking TXIDs of records pruned across sessions.
-// It is used to skip wasteful parent updates for parents that have already been pruned.
-// The cap on entries is supplied by the caller (typically from settings.Pruner.UTXOPrunedSetMaxEntries).
-// At ~96 bytes per entry (32-byte hash + Go map overhead), 10M entries is ~1 GB worst case.
+// defaultPrunedTxSetCapacity is used when NewPrunedTxSet is called with maxEntries=0.
+// At ~1 byte per entry in the cuckoo filter, 2B entries ≈ 2 GiB — small relative to
+// typical pruner pod memory budgets while comfortably covering production-scale
+// sessions where parent/child gaps span many blocks.
+const defaultPrunedTxSetCapacity = 2_000_000_000
+
+// PrunedTxSet is a sharded cuckoo-filter-backed set tracking TXIDs of records pruned
+// across sessions. It is used to skip wasteful parent updates for parents that have
+// already been pruned.
 //
-// Sharding picks a bucket from h[0]&mask, so it relies on a uniform distribution of the
-// first byte of the key. SHA-256-derived TXIDs satisfy this; do not reuse for non-cryptographic
-// keys without revisiting the shard() function.
+// Memory: ~1 byte per entry effective (8-bit fingerprints × 4-slot buckets in the
+// seiflotfy/cuckoofilter implementation). A capacity of 2B entries fits in ~2 GiB,
+// roughly two orders of magnitude smaller than the exact-set implementation it
+// replaces (~130 B/entry).
 //
-// Memory is bounded by maxEntries: once Len() reaches the cap, subsequent Add() calls become
-// no-ops. This protects against workloads where most parents are from prior blocks (so the
-// CheckAndRemove churn never reclaims entries) and Len() would otherwise grow with the number
-// of TXs pruned in the session — which on production-scale workloads can be hundreds of
-// millions per session. Saturation silently degrades the skip optimisation back to baseline
-// behaviour (parent updates fire normally for any TXID added after the cap).
+// False positives: ~3% (formula: 2 × bucketSize / 2^fp_bits = 8 / 256). In our
+// context a false positive causes a child to incorrectly skip a parent update,
+// suppressing the deletedChildren bin write for that parent. That bin is only
+// consulted by the defensive-mode safety check (always off when prunedSet is
+// non-nil), so FPs are behaviourally harmless.
+//
+// CheckAndRemove uses cuckoo Delete. On rare fingerprint collisions, Delete may
+// remove the wrong entry. That manifests as a lost future skip for the
+// collision-evicted hash (i.e. its child will incur one wasted Aerospike
+// round-trip), not a correctness bug.
+//
+// Sharding picks a bucket from h[0] & mask. SHA-256-derived TXIDs have uniform
+// first bytes, so the distribution across shards is even.
 type PrunedTxSet struct {
-	shards     []prunedTxShard
-	mask       uint8 // shardCount - 1, for fast modulo via bitwise AND; uint8 is sufficient because shardCount is capped at 256
-	count      atomic.Int64
-	maxEntries int64 // soft cap on Len(); 0 means unlimited
+	shards         []prunedTxShard
+	mask           uint8
+	insertFailures atomic.Int64
+	capacity       int64
 }
 
 type prunedTxShard struct {
-	mu sync.Mutex
-	m  map[chainhash.Hash]struct{}
+	mu     sync.Mutex
+	filter *cuckoo.Filter
 }
 
-// NewPrunedTxSet creates a new PrunedTxSet with the given number of shards and a soft entry cap.
-// shardCount must be a power of 2 (will be rounded up if not) and is capped at 256.
-// maxEntries is a soft cap; Add() becomes a no-op once Len() reaches it. Pass 0 for unlimited.
+// NewPrunedTxSet creates a sharded cuckoo-filter-backed set sized to the given
+// total maxEntries (across all shards). shardCount is rounded up to the next
+// power of 2 (capped at 256). Pass maxEntries=0 to use the default capacity.
 func NewPrunedTxSet(shardCount int, maxEntries int) *PrunedTxSet {
-	// Round up to next power of 2
 	n := 1
 	for n < shardCount {
 		n <<= 1
 	}
 	if n > 256 {
-		n = 256 // cap at 256 shards (must fit in mask uint8)
+		n = 256
+	}
+
+	if maxEntries <= 0 {
+		maxEntries = defaultPrunedTxSetCapacity
+	}
+
+	perShard := uint(maxEntries / n)
+	if perShard < 1024 {
+		perShard = 1024
 	}
 
 	s := &PrunedTxSet{
-		shards:     make([]prunedTxShard, n),
-		mask:       uint8(n - 1),
-		maxEntries: int64(maxEntries),
+		shards:   make([]prunedTxShard, n),
+		mask:     uint8(n - 1),
+		capacity: int64(maxEntries),
 	}
 	for i := range s.shards {
-		s.shards[i].m = make(map[chainhash.Hash]struct{}, 64)
+		s.shards[i].filter = cuckoo.NewFilter(perShard)
 	}
 	return s
 }
@@ -62,55 +84,64 @@ func (s *PrunedTxSet) shard(h chainhash.Hash) *prunedTxShard {
 	return &s.shards[h[0]&s.mask]
 }
 
-// Add registers a TXID as pruned. Duplicate adds are idempotent and do not affect the count.
-// Once Len() reaches the configured maxEntries cap, further adds are silent no-ops.
+// Add registers a TXID. Duplicate Adds are tolerated but each successful Insert
+// increments the underlying cuckoo count — Len() may therefore overcount when
+// the same TXID is Added multiple times (e.g. a partition rescanned after a
+// timeout). When the cuckoo filter is full, Insert fails and the failure is
+// counted in insertFailures.
 func (s *PrunedTxSet) Add(h chainhash.Hash) {
-	if s.maxEntries > 0 && s.count.Load() >= s.maxEntries {
-		return
-	}
 	sh := s.shard(h)
 	sh.mu.Lock()
-	_, exists := sh.m[h]
-	if !exists {
-		sh.m[h] = struct{}{}
-	}
+	ok := sh.filter.Insert(h[:])
 	sh.mu.Unlock()
-	if !exists {
-		s.count.Add(1)
+	if !ok {
+		s.insertFailures.Add(1)
 	}
 }
 
-// Contains checks if a TXID is in the set without removing it.
+// Contains returns true if the TXID is in the set. May report false positives
+// at the cuckoo filter's standard rate (~3%).
 func (s *PrunedTxSet) Contains(h chainhash.Hash) bool {
 	sh := s.shard(h)
 	sh.mu.Lock()
-	_, ok := sh.m[h]
+	ok := sh.filter.Lookup(h[:])
 	sh.mu.Unlock()
 	return ok
 }
 
-// CheckAndRemove checks if a TXID is in the set. If found, removes it and returns true.
+// CheckAndRemove returns true and deletes the TXID's fingerprint if it appears
+// to be present. Subject to the same false-positive rate as Contains, and may
+// on collisions remove the wrong fingerprint (causing a future Contains/CheckAndRemove
+// for the collision-evicted hash to miss — see type doc).
 func (s *PrunedTxSet) CheckAndRemove(h chainhash.Hash) bool {
 	sh := s.shard(h)
 	sh.mu.Lock()
-	_, ok := sh.m[h]
-	if ok {
-		delete(sh.m, h)
-	}
+	ok := sh.filter.Delete(h[:])
 	sh.mu.Unlock()
-	if ok {
-		s.count.Add(-1)
-	}
 	return ok
 }
 
-// Len returns the approximate number of entries in the set.
+// Len returns the approximate number of fingerprints currently in the filter
+// across all shards. Duplicate Adds inflate this count.
 func (s *PrunedTxSet) Len() int {
-	return int(s.count.Load())
+	total := uint(0)
+	for i := range s.shards {
+		s.shards[i].mu.Lock()
+		total += s.shards[i].filter.Count()
+		s.shards[i].mu.Unlock()
+	}
+	return int(total)
 }
 
-// Saturated reports whether the set has reached its maxEntries cap.
-// Reads are eventually consistent under concurrent Add/Remove.
+// Saturated reports whether the cuckoo filter has rejected at least one Insert
+// since construction (i.e. capacity was hit). This is sticky — once true,
+// it stays true even if entries are removed and capacity frees up.
 func (s *PrunedTxSet) Saturated() bool {
-	return s.maxEntries > 0 && s.count.Load() >= s.maxEntries
+	return s.insertFailures.Load() > 0
+}
+
+// InsertFailures returns the cumulative number of Insert calls that failed
+// because the filter was full at the time. Useful for sizing.
+func (s *PrunedTxSet) InsertFailures() int64 {
+	return s.insertFailures.Load()
 }

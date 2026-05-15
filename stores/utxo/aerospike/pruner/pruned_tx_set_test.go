@@ -1,6 +1,7 @@
 package pruner
 
 import (
+	"crypto/rand"
 	"sync"
 	"testing"
 
@@ -8,9 +9,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// makeHash fills a chainhash.Hash with deterministic bytes derived from b.
+// We avoid putting too little entropy in the hash because the cuckoo filter
+// derives its fingerprint+index from the bytes — short-distance hashes
+// collide more often and inflate the false-positive rate in tests.
 func makeHash(b byte) chainhash.Hash {
 	var h chainhash.Hash
-	h[0] = b
+	for i := 0; i < len(h); i++ {
+		h[i] = b ^ byte(i*131)
+	}
+	return h
+}
+
+// randomHash returns a chainhash.Hash filled with cryptographically random
+// bytes — useful for tests that need to exercise the filter at scale without
+// pathological FP behaviour.
+func randomHash(t *testing.T) chainhash.Hash {
+	t.Helper()
+	var h chainhash.Hash
+	_, err := rand.Read(h[:])
+	require.NoError(t, err)
 	return h
 }
 
@@ -19,14 +37,15 @@ func TestPrunedTxSet_AddAndContains(t *testing.T) {
 
 	h1 := makeHash(0x01)
 	h2 := makeHash(0x02)
-	h3 := makeHash(0x03)
 
 	set.Add(h1)
 	set.Add(h2)
 
 	require.True(t, set.Contains(h1))
 	require.True(t, set.Contains(h2))
-	require.False(t, set.Contains(h3))
+	// We do NOT assert Contains(h3)==false: the cuckoo filter has a small
+	// chance of false positives. Correctness of "not added" lookups is best
+	// validated statistically in TestPrunedTxSet_FalsePositiveRate.
 }
 
 func TestPrunedTxSet_CheckAndRemove(t *testing.T) {
@@ -38,17 +57,12 @@ func TestPrunedTxSet_CheckAndRemove(t *testing.T) {
 	set.Add(h1)
 	set.Add(h2)
 
-	// CheckAndRemove returns true and removes
 	require.True(t, set.CheckAndRemove(h1))
-	// Second call returns false — already removed
-	require.False(t, set.CheckAndRemove(h1))
-	require.False(t, set.Contains(h1))
-
 	// h2 still present
 	require.True(t, set.Contains(h2))
 }
 
-func TestPrunedTxSet_Len(t *testing.T) {
+func TestPrunedTxSet_Len_AfterRemove(t *testing.T) {
 	set := NewPrunedTxSet(16, 0)
 
 	require.Equal(t, 0, set.Len())
@@ -69,7 +83,6 @@ func TestPrunedTxSet_ConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines * 2)
 
-	// Half the goroutines add entries
 	for g := 0; g < numGoroutines; g++ {
 		go func(base int) {
 			defer wg.Done()
@@ -83,7 +96,6 @@ func TestPrunedTxSet_ConcurrentAccess(t *testing.T) {
 		}(g)
 	}
 
-	// Other half check and remove
 	for g := 0; g < numGoroutines; g++ {
 		go func(base int) {
 			defer wg.Done()
@@ -92,40 +104,40 @@ func TestPrunedTxSet_ConcurrentAccess(t *testing.T) {
 				val := uint16(base*opsPerGoroutine + i)
 				h[0] = byte(val >> 8)
 				h[1] = byte(val)
-				set.CheckAndRemove(h) // may or may not find it — just must not panic
+				set.CheckAndRemove(h)
 			}
 		}(g)
 	}
 
 	wg.Wait()
-	// No assertion on final count — just verifying no data races or panics
+	// No assertion on final count — just verifying no data races or panics.
 }
 
 func TestPrunedTxSet_ShardDistribution(t *testing.T) {
 	set := NewPrunedTxSet(256, 0)
 
-	// Add hashes with different first bytes to verify they go to different shards
+	// Add hashes with different first bytes so they distribute across shards.
 	for i := 0; i < 256; i++ {
 		set.Add(makeHash(byte(i)))
 	}
 
-	require.Equal(t, 256, set.Len())
-
-	// Remove all
+	// Every added hash must be findable.
 	for i := 0; i < 256; i++ {
-		require.True(t, set.CheckAndRemove(makeHash(byte(i))))
+		require.True(t, set.Contains(makeHash(byte(i))))
 	}
 
-	require.Equal(t, 0, set.Len())
+	// Removing all should drop the Len to roughly zero (some collisions may
+	// leave residual fingerprints; allow a small slack).
+	for i := 0; i < 256; i++ {
+		set.CheckAndRemove(makeHash(byte(i)))
+	}
+	require.LessOrEqual(t, set.Len(), 8)
 }
 
 func TestPrunedTxSet_SimulateChainPruning(t *testing.T) {
-	// Simulate a tight chain: A -> B -> C -> D
-	// All four TXs are in the same block and will be pruned
-	// When processing B, A should be found in the set (skip parent update)
-	// When processing C, B should be found (skip parent update)
-	// etc.
-
+	// Tight chain: A -> B -> C -> D, all pruned in the same session.
+	// Reader Adds all four TXIDs before processor starts; processor's
+	// CheckAndRemove for each parent should find it.
 	set := NewPrunedTxSet(16, 0)
 
 	txA := makeHash(0x0A)
@@ -133,96 +145,71 @@ func TestPrunedTxSet_SimulateChainPruning(t *testing.T) {
 	txC := makeHash(0x0C)
 	txD := makeHash(0x0D)
 
-	// Stage 1 (reader) registers all TXIDs before processing starts
 	set.Add(txA)
 	set.Add(txB)
 	set.Add(txC)
 	set.Add(txD)
 
-	require.Equal(t, 4, set.Len())
+	require.True(t, set.CheckAndRemove(txA), "parent A should be found")
+	require.True(t, set.CheckAndRemove(txB), "parent B should be found")
+	require.True(t, set.CheckAndRemove(txC), "parent C should be found")
 
-	// Stage 2 (processor) processes B — parent is A
-	require.True(t, set.CheckAndRemove(txA), "parent A should be found and removed")
-
-	// Stage 2 processes C — parent is B
-	require.True(t, set.CheckAndRemove(txB), "parent B should be found and removed")
-
-	// Stage 2 processes D — parent is C
-	require.True(t, set.CheckAndRemove(txC), "parent C should be found and removed")
-
-	// D has no child in this block — stays in set as dangling
+	// D has no child in this session — should still be present.
 	require.True(t, set.Contains(txD))
-	require.Equal(t, 1, set.Len())
 }
 
-func TestPrunedTxSet_DuplicateAdd(t *testing.T) {
-	set := NewPrunedTxSet(16, 0)
+func TestPrunedTxSet_Saturated(t *testing.T) {
+	// Force saturation by adding far more entries than the configured cap.
+	// Cuckoo allocates power-of-two buckets, so with maxEntries=1024 the
+	// filter has ~256 buckets × 4 slots = 1024 slots. Inserting many
+	// thousand random hashes guarantees at least some Insert failures.
+	set := NewPrunedTxSet(4, 1024)
 
-	h1 := makeHash(0x01)
+	for i := 0; i < 10000; i++ {
+		set.Add(randomHash(t))
+	}
 
-	set.Add(h1)
-	require.Equal(t, 1, set.Len())
-
-	// Adding the same TXID again should not increment the count
-	set.Add(h1)
-	require.Equal(t, 1, set.Len())
-
-	// Should still be removable exactly once
-	require.True(t, set.CheckAndRemove(h1))
-	require.Equal(t, 0, set.Len())
-	require.False(t, set.CheckAndRemove(h1))
+	require.True(t, set.Saturated(), "expected at least one Insert failure")
+	require.Greater(t, set.InsertFailures(), int64(0))
 }
 
-func TestPrunedTxSet_ParentNotInBlock(t *testing.T) {
-	// TX_child's parent is NOT in this block — should not be found
-	set := NewPrunedTxSet(16, 0)
-
-	txChild := makeHash(0x01)
-	txParent := makeHash(0xFF) // parent from a previous block
-
-	set.Add(txChild)
-
-	// Parent not in set — must not skip update
-	require.False(t, set.CheckAndRemove(txParent))
-}
-
-func TestPrunedTxSet_SoftCap(t *testing.T) {
-	// With a cap of 3, the 4th Add must be a silent no-op
-	set := NewPrunedTxSet(16, 3)
-
-	h1 := makeHash(0x01)
-	h2 := makeHash(0x02)
-	h3 := makeHash(0x03)
-	h4 := makeHash(0x04)
-
-	set.Add(h1)
-	set.Add(h2)
-	set.Add(h3)
-	require.Equal(t, 3, set.Len())
-	require.True(t, set.Saturated())
-
-	// 4th add is dropped — entry is not stored, count does not move
-	set.Add(h4)
-	require.Equal(t, 3, set.Len())
-	require.False(t, set.Contains(h4))
-
-	// Removing an entry frees a slot but Saturated() is sticky-up-to-cap,
-	// so a subsequent Add succeeds again once we're below the cap.
-	require.True(t, set.CheckAndRemove(h1))
-	require.False(t, set.Saturated())
-	require.Equal(t, 2, set.Len())
-
-	set.Add(h4)
-	require.Equal(t, 3, set.Len())
-	require.True(t, set.Contains(h4))
-}
-
-func TestPrunedTxSet_UnlimitedWhenCapZero(t *testing.T) {
+func TestPrunedTxSet_DefaultCapacity(t *testing.T) {
+	// maxEntries=0 falls back to defaultPrunedTxSetCapacity — large enough
+	// that small workloads should never saturate.
 	set := NewPrunedTxSet(16, 0)
 	for i := 0; i < 1000; i++ {
-		set.Add(makeHash(byte(i % 256)))
+		set.Add(randomHash(t))
 	}
 	require.False(t, set.Saturated())
-	// 256 distinct first-byte values → 256 entries
-	require.Equal(t, 256, set.Len())
+}
+
+func TestPrunedTxSet_FalsePositiveRate(t *testing.T) {
+	// Verify the FP rate is within the documented cuckoo bound. With 8-bit
+	// fingerprints and 4-slot buckets the theoretical FP rate is ~3.1%.
+	// We allow up to 6% to keep the test stable.
+	set := NewPrunedTxSet(256, 10_000_000)
+
+	const inserted = 100_000
+	addedHashes := make([]chainhash.Hash, inserted)
+	for i := 0; i < inserted; i++ {
+		addedHashes[i] = randomHash(t)
+		set.Add(addedHashes[i])
+	}
+
+	// All inserted hashes must be present.
+	for _, h := range addedHashes {
+		require.True(t, set.Contains(h))
+	}
+
+	// Random hashes that were not added should mostly miss.
+	const trials = 100_000
+	falsePositives := 0
+	for i := 0; i < trials; i++ {
+		h := randomHash(t)
+		if set.Contains(h) {
+			falsePositives++
+		}
+	}
+	rate := float64(falsePositives) / float64(trials)
+	require.Less(t, rate, 0.06, "false-positive rate %v exceeds 6%% bound", rate)
 }
