@@ -59,6 +59,22 @@ type cuckooH32 struct {
 	buckets []cuckooBucket
 	mask    uint64
 	count   atomic.Int64
+
+	// saturated latches true the first time the eviction loop fails to
+	// place a fingerprint. Subsequent Insert calls that find both
+	// candidate buckets full will skip the eviction loop entirely and
+	// return false immediately. Without this, a saturated filter burns
+	// ~15 us of CPU per Insert (500 kicks × ~30 ns) chasing slots that
+	// can't exist — at ~1.5M Adds/sec that consumes ~22 cores' worth of
+	// CPU on a single pod (observed on dev-scale-1: pod pegged at 15
+	// cores with throughput collapsed from 2.4M to ~200K rec/sec).
+	//
+	// Sticky-once-set: even if CheckAndRemove later frees slots, we
+	// don't try eviction again. The fast path (tryInsertCAS in either
+	// bucket) still succeeds when slots open up, so the optimisation
+	// recovers automatically; we just refuse to do the expensive
+	// rebalancing work. To force a reset, restart the process.
+	saturated atomic.Bool
 }
 
 func newCuckooH32(capacity uint) *cuckooH32 {
@@ -158,6 +174,13 @@ func (cf *cuckooH32) bucketCASDelete(i uint64, fp uint8) bool {
 
 // Insert places h's fingerprint in one of its two candidate buckets,
 // performing cuckoo eviction if both are full.
+//
+// Once the filter has previously hit saturation (eviction loop exhausted
+// MaxKicks without placing the fingerprint), the eviction path is
+// permanently disabled for this filter instance: any Insert that finds
+// both candidate buckets full returns false immediately. Without this
+// short-circuit, a saturated filter at high write rates burns the host's
+// CPU on hopeless eviction churn (~15 us per failed Insert).
 func (cf *cuckooH32) Insert(h *[32]byte) bool {
 	fp, i1 := cf.extract(h)
 	if cf.tryInsertCAS(fp, i1) {
@@ -166,6 +189,14 @@ func (cf *cuckooH32) Insert(h *[32]byte) bool {
 	i2 := cf.altIndex(fp, i1)
 	if cf.tryInsertCAS(fp, i2) {
 		return true
+	}
+
+	// Both candidate buckets are full. Short-circuit if we've previously
+	// proven the filter cannot accommodate evictions — the loop would just
+	// waste CPU. The fast path above still recovers automatically when
+	// CheckAndRemove frees up slots.
+	if cf.saturated.Load() {
+		return false
 	}
 
 	// Eviction loop — race-tolerant. Concurrent inserts may displace each
@@ -190,6 +221,7 @@ func (cf *cuckooH32) Insert(h *[32]byte) bool {
 			}
 		}
 		if !swapped {
+			cf.saturated.Store(true)
 			return false
 		}
 		fp = displaced
@@ -198,6 +230,10 @@ func (cf *cuckooH32) Insert(h *[32]byte) bool {
 			return true
 		}
 	}
+	// Eviction loop exhausted — filter is saturated. Latch the flag so
+	// future Inserts that find both buckets full skip this loop and
+	// return immediately rather than re-burning ~15 us per call.
+	cf.saturated.Store(true)
 	return false
 }
 

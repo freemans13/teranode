@@ -3,6 +3,7 @@ package pruner
 import (
 	"crypto/rand"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -92,4 +93,45 @@ func TestCuckooH32_FillsUpAndFailsGracefully(t *testing.T) {
 	}
 	require.Positive(t, failures, "expected some Insert failures at heavy overload")
 	require.Positive(t, successes, "expected some Insert successes before saturation")
+}
+
+// TestCuckooH32_SaturationLatchesAndShortCircuits verifies that once the
+// eviction loop has exhausted MaxKicks, the saturated flag latches true
+// and subsequent Inserts return false without re-running eviction. This
+// is the fix for the CPU-melt observed on dev-scale-1 when a 2 GiB
+// cuckoo at 92% load fell into eviction-loop hell at 1.7M TPS.
+func TestCuckooH32_SaturationLatchesAndShortCircuits(t *testing.T) {
+	cf := newCuckooH32(64)
+
+	// Fill the filter aggressively until eviction starts failing.
+	for i := 0; i < 1024; i++ {
+		var h [32]byte
+		_, err := rand.Read(h[:])
+		require.NoError(t, err)
+		cf.Insert(&h)
+		if cf.saturated.Load() {
+			break
+		}
+	}
+	require.True(t, cf.saturated.Load(), "expected saturated flag to latch after eviction failure")
+
+	// Time a batch of Inserts that we expect to fail. Even at b.N = 1M
+	// these should all return immediately (no eviction churn), so total
+	// wall time is bounded by the fast-path overhead only.
+	start := time.Now()
+	const n = 100_000
+	for i := 0; i < n; i++ {
+		var h [32]byte
+		_, err := rand.Read(h[:])
+		require.NoError(t, err)
+		cf.Insert(&h)
+	}
+	elapsed := time.Since(start)
+
+	// Sanity bound: if the short-circuit is broken and eviction runs for
+	// every Insert, we'd see ~100K × 500 kicks × ~30 ns = ~1.5 s. With
+	// the short-circuit, this loop should complete in well under 100 ms
+	// even on a modest machine. Allow generous slack for CI variance.
+	require.Less(t, elapsed, time.Second,
+		"saturated Insert short-circuit appears broken: %d Inserts took %v", n, elapsed)
 }
