@@ -57,13 +57,17 @@ func main() {
 	log.Printf("loadtest: starting %s warm-up + %s run with %d submitters (validate-batch=%v)",
 		*warmUp, *duration, *submitters, *validateBatch)
 	h.run(ctx)
-	printSummary(h.summary(), *submitters, *validateBatch)
+	printSummary(h.summary(), *submitters, *validateBatch, *duration, *parentPoolSize)
 }
 
-func printSummary(s summary, submitters int, useBatch bool) {
+func printSummary(s summary, submitters int, useBatch bool, duration time.Duration, parentPoolSize int) {
 	fmt.Println()
 	fmt.Printf("Sustained TPS:     %.0f (after warm-up)\n", s.TPS)
 	fmt.Printf("Total submitted:   %d / acked: %d / errors: %d\n", s.Submitted, s.Acked, s.Errored)
 	fmt.Printf("Latency p50/p95/p99: %s / %s / %s\n", s.P50, s.P95, s.P99)
 	fmt.Printf("Run: %s @ %d submitters, validate-batch=%v\n", s.Duration, submitters, useBatch)
+	if s.Exhausted && s.Duration < duration {
+		fmt.Printf("WARN: parent pool exhausted before duration elapsed; consider --parent-pool-size > %d for accurate sustained-TPS measurements\n",
+			parentPoolSize)
+	}
 }

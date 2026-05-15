@@ -20,6 +20,9 @@ type harness struct {
 	acked      atomic.Int64
 	errored    atomic.Int64
 	timerStart time.Time
+	// parentIdx is an atomic counter consumed by submitters to claim unique
+	// parent indices. Each parent is used by exactly one submitter call.
+	parentIdx atomic.Int64
 }
 
 type harnessConfig struct {
@@ -73,11 +76,10 @@ func (h *harness) run(ctx context.Context) {
 }
 
 func (h *harness) submitterLoop(ctx context.Context, id int, afterWarmUp *atomic.Bool, rateLimiter <-chan time.Time) {
-	parentLen := len(h.fix.parents)
+	parentLen := int64(len(h.fix.parents))
 	if parentLen == 0 {
 		log.Fatalf("submitter %d: empty parent pool", id)
 	}
-	idx := id % parentLen
 	for {
 		select {
 		case <-ctx.Done():
@@ -92,13 +94,18 @@ func (h *harness) submitterLoop(ctx context.Context, id int, afterWarmUp *atomic
 			}
 		}
 
+		// Claim a unique parent index. When the pool is exhausted,
+		// this submitter is done.
+		idx := h.parentIdx.Add(1) - 1
+		if idx >= parentLen {
+			return
+		}
 		parent := h.fix.parents[idx]
-		idx = (idx + 1) % parentLen
 		child := buildChildSpending(parent)
 
 		// Use a per-request context with a generous per-call timeout rather
-		// than passing the measurement-window ctx (runCtx) directly.  runCtx
-		// has a 12 s deadline shared by all goroutines: when it fires every
+		// than passing the measurement-window ctx (runCtx) directly. runCtx
+		// has a deadline shared by all goroutines: when it fires every
 		// in-flight call returns context.DeadlineExceeded immediately,
 		// producing the 99% error rate seen with --validate-batch=true.
 		// The loop-exit select above already gates when we stop submitting;
@@ -131,6 +138,9 @@ type summary struct {
 	P50       time.Duration
 	P95       time.Duration
 	P99       time.Duration
+	// Exhausted is true when the parent pool ran out before the run duration
+	// elapsed — results may understate sustained TPS.
+	Exhausted bool
 }
 
 func (h *harness) summary() summary {
@@ -148,5 +158,6 @@ func (h *harness) summary() summary {
 		P50:       h.latencies.percentile(50),
 		P95:       h.latencies.percentile(95),
 		P99:       h.latencies.percentile(99),
+		Exhausted: h.parentIdx.Load() >= int64(len(h.fix.parents)),
 	}
 }

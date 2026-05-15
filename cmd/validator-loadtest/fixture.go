@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -20,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	aeroTest "github.com/bsv-blockchain/testcontainers-aerospike-go"
+	"golang.org/x/sync/errgroup"
 )
 
 // dummyT satisfies test.TestingT so CreateBaseTestSettings can be called from
@@ -169,50 +171,61 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 // seedParents creates n parent records directly via aeroStore.Create
 // (bypassing the validator). Each parent has one OP_TRUE output with
 // 2000 satoshis so children can spend it with empty unlocking scripts.
+// Parents are seeded in parallel using an errgroup bounded to NumCPU
+// workers for fast pre-seeding of large pools.
 func seedParents(ctx context.Context, s *aerostore.Store, n int) []*bt.Tx {
+	if n == 0 {
+		return nil
+	}
 	opTrue, err := bscript.NewFromHexString("51") // OP_1 / OP_TRUE (anyone-can-spend)
 	if err != nil {
 		log.Fatalf("seedParents: opTrue: %v", err)
 	}
-
-	emptyScript := bscript.Script{}
+	empty := &bscript.Script{}
 	parents := make([]*bt.Tx, n)
 
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(runtime.NumCPU())
 	for i := 0; i < n; i++ {
-		tx := bt.NewTx()
-
-		// Unique random 32-byte PreviousTxID so every parent has a distinct tx hash.
-		// PreviousTxOutIndex=0 (not 0xFFFFFFFF) ensures IsCoinbase()==false, which
-		// prevents the Aerospike Lua script from applying the coinbase maturity lock.
-		var randBytes [32]byte
-		if _, err := crand.Read(randBytes[:]); err != nil {
-			log.Fatalf("seedParents: rand: %v", err)
-		}
-		uniqueHash, hashErr := chainhash.NewHash(randBytes[:])
-		if hashErr != nil {
-			log.Fatalf("seedParents: hash: %v", hashErr)
-		}
-
-		in := &bt.Input{
-			PreviousTxOutIndex: 0,
-			PreviousTxScript:   &emptyScript,
-			PreviousTxSatoshis: 2000, // input > output so fee = 1000 (valid)
-			UnlockingScript:    &emptyScript,
-			SequenceNumber:     0xFFFFFFFF,
-		}
-		if err := in.PreviousTxIDAdd(uniqueHash); err != nil {
-			log.Fatalf("seedParents: txid add: %v", err)
-		}
-		tx.Inputs = append(tx.Inputs, in)
-		tx.Outputs = append(tx.Outputs, &bt.Output{
-			Satoshis:      1000,
-			LockingScript: opTrue,
+		i := i
+		g.Go(func() error {
+			tx := bt.NewTx()
+			// Unique random 32-byte PreviousTxID so every parent has a distinct tx
+			// hash. PreviousTxOutIndex=0 (not 0xFFFFFFFF) ensures IsCoinbase()==false,
+			// which prevents the Aerospike Lua script from applying the coinbase
+			// maturity lock.
+			var rb [32]byte
+			if _, randErr := crand.Read(rb[:]); randErr != nil {
+				return randErr
+			}
+			h, hashErr := chainhash.NewHash(rb[:])
+			if hashErr != nil {
+				return hashErr
+			}
+			in := &bt.Input{
+				PreviousTxOutIndex: 0,
+				PreviousTxScript:   empty,
+				PreviousTxSatoshis: 2000, // input > output so fee = 1000 (valid)
+				UnlockingScript:    empty,
+				SequenceNumber:     0xFFFFFFFF,
+			}
+			if err := in.PreviousTxIDAdd(h); err != nil {
+				return err
+			}
+			tx.Inputs = append(tx.Inputs, in)
+			tx.Outputs = append(tx.Outputs, &bt.Output{
+				Satoshis:      1000,
+				LockingScript: opTrue,
+			})
+			if _, err := s.Create(gCtx, tx, 0); err != nil {
+				return err
+			}
+			parents[i] = tx
+			return nil
 		})
-
-		if _, err := s.Create(ctx, tx, 0); err != nil {
-			log.Fatalf("seedParents: create %d: %v", i, err)
-		}
-		parents[i] = tx
+	}
+	if err := g.Wait(); err != nil {
+		log.Fatalf("seedParents: %v", err)
 	}
 	return parents
 }
