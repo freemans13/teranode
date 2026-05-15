@@ -39,7 +39,7 @@ import (
 )
 
 func BenchmarkProcessTransaction_FlagOffVsOn_RealAerospike(b *testing.B) {
-	for _, concurrency := range []int{32, 128, 512} {
+	for _, concurrency := range []int{32, 128, 512, 1024} {
 		concurrency := concurrency
 		for _, useBatch := range []bool{false, true} {
 			useBatch := useBatch
