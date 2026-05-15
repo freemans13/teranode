@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -21,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	aeroTest "github.com/bsv-blockchain/testcontainers-aerospike-go"
+	"github.com/testcontainers/testcontainers-go"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -67,6 +69,70 @@ type fixture struct {
 	validator     *validator.Validator // for PhaseSnapshot access; nil if type-assert fails
 }
 
+// tunedAerospikeConf is a static aerospike.conf injected into the testcontainer
+// to remove the default 5-thread ceiling and switch to in-memory storage.
+// It is mounted at /etc/aerospike/aerospike.template.conf so the container
+// entrypoint picks it up (the entrypoint copies the template → aerospike.conf
+// before starting asd). Lines without $() or {} pass through the template
+// processor unchanged, so a static config is safe here.
+//
+// Tuning rationale (for the EPYC 9554 / 125 GiB Hetzner box):
+//   - service-threads 64      : default is 5; raise to match CPU count
+//   - batch-index-threads 64  : parallel batch-index processing
+//   - proto-fd-max 50000      : default 15000; headroom for 1024 submitters
+//   - storage-engine memory   : skip device I/O; namespace fits in RAM
+//   - memory-size 4G          : 4 GiB is ample for the parent/child UTXO set
+const tunedAerospikeConf = `# aerospike.conf — tuned for loadtest (no shell variables; static file)
+service {
+	cluster-name docker
+	service-threads 64
+	batch-index-threads 64
+	proto-fd-max 50000
+}
+
+logging {
+	console {
+		context any info
+	}
+}
+
+network {
+	service {
+		address any
+		port 3000
+	}
+
+	heartbeat {
+		mode mesh
+		address local
+		port 3002
+		interval 150
+		timeout 10
+	}
+
+	fabric {
+		address local
+		port 3001
+	}
+}
+
+namespace test {
+	replication-factor 1
+	memory-size 4G
+	storage-engine memory
+}
+`
+
+// withTunedAerospikeConfig injects the tuned aerospike.conf into the container
+// by replacing the default template before the entrypoint processes it.
+func withTunedAerospikeConfig() testcontainers.CustomizeRequestOption {
+	return testcontainers.WithFiles(testcontainers.ContainerFile{
+		Reader:            strings.NewReader(tunedAerospikeConf),
+		ContainerFilePath: "/etc/aerospike/aerospike.template.conf",
+		FileMode:          0o644,
+	})
+}
+
 // fixtureConfig collects the harness-side knobs.
 type fixtureConfig struct {
 	aerospikeURL       string
@@ -110,7 +176,10 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 	if cfg.aerospikeURL != "" {
 		aeroURL = cfg.aerospikeURL
 	} else {
-		container, err := aeroTest.RunContainer(ctx, aeroTest.WithTTLSupport("test"))
+		container, err := aeroTest.RunContainer(ctx,
+			withTunedAerospikeConfig(),
+			aeroTest.WithTTLSupport("test"),
+		)
 		if err != nil {
 			log.Fatalf("fixture: aerospike container: %v", err)
 		}
