@@ -54,10 +54,14 @@ func main() {
 		targetTPS:  *targetTPS,
 	})
 
+	tel := startTelemetry(ctx, fix.validator, fix.containerName)
+	defer tel.close()
+
 	log.Printf("loadtest: starting %s warm-up + %s run with %d submitters (validate-batch=%v)",
 		*warmUp, *duration, *submitters, *validateBatch)
 	h.run(ctx)
 	printSummary(h.summary(), *submitters, *validateBatch, *duration, *parentPoolSize)
+	fmt.Println(tel.summary().format())
 }
 
 func printSummary(s summary, submitters int, useBatch bool, duration time.Duration, parentPoolSize int) {

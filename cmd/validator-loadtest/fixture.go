@@ -59,10 +59,12 @@ func (d *dummyT) cleanup() {
 // testcontainers) backing a real Validator wired into a PropagationServer
 // with the coalescer constructed.
 type fixture struct {
-	ps        *propagation.PropagationServer
-	aeroStore *aerostore.Store
-	parents   []*bt.Tx
-	cleanup   func()
+	ps            *propagation.PropagationServer
+	aeroStore     *aerostore.Store
+	parents       []*bt.Tx
+	cleanup       func()
+	containerName string               // empty when using --aerospike-url; used by the telemetry sampler
+	validator     *validator.Validator // for PhaseSnapshot access; nil if type-assert fails
 }
 
 // fixtureConfig collects the harness-side knobs.
@@ -101,8 +103,9 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 	}
 
 	var (
-		aeroURL     string
-		containerFn = func() {}
+		aeroURL       string
+		containerFn   = func() {}
+		containerName string
 	)
 	if cfg.aerospikeURL != "" {
 		aeroURL = cfg.aerospikeURL
@@ -111,6 +114,7 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 		if err != nil {
 			log.Fatalf("fixture: aerospike container: %v", err)
 		}
+		containerName = container.GetContainerID()
 		host, hostErr := container.Host(ctx)
 		if hostErr != nil {
 			log.Fatalf("fixture: container host: %v", hostErr)
@@ -142,6 +146,14 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 		log.Fatalf("fixture: validator: %v", err)
 	}
 
+	// Type-assert to *validator.Validator for PhaseSnapshot access.
+	// If the assertion fails (shouldn't happen with current implementation),
+	// we leave it nil and the telemetry sampler will skip PhaseSnapshot.
+	var v *validator.Validator
+	if concreteV, ok := vIface.(*validator.Validator); ok {
+		v = concreteV
+	}
+
 	txStore := memory.New()
 	ps := propagation.New(logger, tSettings, txStore, vIface, nil, nil, nil)
 
@@ -157,9 +169,11 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 	parents := seedParents(ctx, aeroStore, cfg.parentPoolSize)
 
 	return &fixture{
-		ps:        ps,
-		aeroStore: aeroStore,
-		parents:   parents,
+		ps:            ps,
+		aeroStore:     aeroStore,
+		parents:       parents,
+		containerName: containerName,
+		validator:     v,
 		cleanup: func() {
 			ps.CloseCoalescerForBench(context.Background())
 			containerFn()
