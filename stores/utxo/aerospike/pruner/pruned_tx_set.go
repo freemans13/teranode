@@ -7,17 +7,10 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 )
 
-// prunedTxSetMaxEntries caps the in-memory size of a PrunedTxSet for safety on workloads
-// that don't fit the tight-chain pattern this optimisation was designed for. Sessions on
-// production-scale deployments can scan hundreds of millions of records (~500M observed),
-// and a workload where most parents live in prior blocks would keep every TXID added.
-// At ~96 bytes per entry (32-byte hash + Go map overhead), 10M entries is ~1 GB worst case.
-// Once the cap is hit, Add() becomes a no-op and the skip optimisation degrades to baseline
-// for the remainder of the session.
-const prunedTxSetMaxEntries = 10_000_000
-
-// PrunedTxSet is a concurrent sharded set tracking TXIDs of records pruned during a session.
+// PrunedTxSet is a concurrent sharded set tracking TXIDs of records pruned across sessions.
 // It is used to skip wasteful parent updates for parents that have already been pruned.
+// The cap on entries is supplied by the caller (typically from settings.Pruner.UTXOPrunedSetMaxEntries).
+// At ~96 bytes per entry (32-byte hash + Go map overhead), 10M entries is ~1 GB worst case.
 //
 // Sharding picks a bucket from h[0]&mask, so it relies on a uniform distribution of the
 // first byte of the key. SHA-256-derived TXIDs satisfy this; do not reuse for non-cryptographic

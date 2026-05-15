@@ -67,6 +67,8 @@ var (
 	prometheusUtxoRetryAttempts               prometheus.Counter
 	prometheusUtxoTimeoutEvents               prometheus.Counter
 	prometheusUtxoParentsSkippedPruned        prometheus.Counter
+	prometheusUtxoPrunedSetSize               prometheus.Gauge
+	prometheusUtxoPrunedSetSaturated          prometheus.Gauge
 )
 
 // Options contains configuration options for the cleanup service
@@ -131,7 +133,13 @@ type Service struct {
 	partitionQueries               int     // Number of parallel partition queries (0 = auto-detect)
 	connectionPoolWarningThreshold float64 // Threshold for connection pool auto-adjustment (0.0-1.0)
 	utxoSetTTL                     bool    // Use TTL expiration instead of hard delete
-	partitionWorkerFn              func(ctx context.Context, blockHeight uint32, partitionStart int, partitionCount int, prunedSet *PrunedTxSet) (int64, int64, error)
+
+	// Persisted across prune sessions so that parents pruned in earlier blocks can still be
+	// recognised when their children reach the prune horizon a session or more later.
+	// Nil when defensiveEnabled is true.
+	prunedSet *PrunedTxSet
+
+	partitionWorkerFn func(ctx context.Context, blockHeight uint32, partitionStart int, partitionCount int, prunedSet *PrunedTxSet) (int64, int64, error)
 
 	// Lua UDF module name
 	luaPackage string
@@ -233,7 +241,15 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		})
 		prometheusUtxoParentsSkippedPruned = promauto.NewCounter(prometheus.CounterOpts{
 			Name: "utxo_pruner_parents_skipped_pruned_total",
-			Help: "Number of parent updates skipped because parent was already pruned in this session",
+			Help: "Number of parent updates skipped because parent was already pruned (in this or a prior session)",
+		})
+		prometheusUtxoPrunedSetSize = promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "utxo_pruner_pruned_set_size",
+			Help: "Current number of TXIDs tracked in the persistent PrunedTxSet across sessions",
+		})
+		prometheusUtxoPrunedSetSaturated = promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "utxo_pruner_pruned_set_saturated",
+			Help: "1 if the PrunedTxSet has reached its configured maxEntries cap, 0 otherwise",
 		})
 	})
 
@@ -285,6 +301,14 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		fieldTotalExtraRecs:            fields.TotalExtraRecs.String(),
 		fieldUnminedSince:              fields.UnminedSince.String(),
 		fieldBlockHeights:              fields.BlockHeights.String(),
+	}
+
+	// PrunedTxSet is persistent across prune sessions so children whose parents were pruned
+	// in earlier sessions can still skip the parent-update round-trip. Defensive mode is
+	// incompatible with the optimisation because records may be skipped after the reader
+	// registers them.
+	if !service.defensiveEnabled {
+		service.prunedSet = NewPrunedTxSet(256, settings.Pruner.UTXOPrunedSetMaxEntries)
 	}
 
 	service.partitionWorkerFn = service.partitionWorker
@@ -659,36 +683,26 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 		partitionStart += partitionCount
 	}
 
-	// Shared set tracking TXIDs scanned for pruning — used to skip wasteful parent updates.
-	// Disabled when defensive mode is on: records may be skipped (child not stable) after the
-	// reader registers them, which would incorrectly suppress parent updates for records still
-	// in Aerospike.
+	// PrunedTxSet is owned by the Service and persisted across prune sessions. This lets
+	// children whose parents were pruned in earlier sessions (the common case for chains
+	// crossing block-height boundaries) still skip the parent-update round-trip.
 	//
-	// Reused across retry attempts intentionally. The set's contract is "this TXID was scanned
-	// as a deletion candidate in this session" — so reuse is correct because:
-	//   1. Add is idempotent (duplicate keys are no-ops), so re-scanning a partition after
-	//      a timeout simply re-registers entries that were already there.
-	//   2. CheckAndRemove is destructive (one consumer per parent), which is fine: if a parent
-	//      was already consumed by a child in a prior attempt, the parent has either been
-	//      deleted (so the next child's skip is correct) or its deletion is still pending in
-	//      a retry partition (so the next child issues a real update and incurs a wasted
-	//      Aerospike op — a perf nit, not a correctness bug).
-	//   3. The skip only suppresses the deletedChildren bin update on the parent. That bin is
-	//      only consulted by the defensive-mode safety check, which is OFF whenever prunedSet
-	//      is non-nil, so a missed update has no behavioural consequence.
-	// Allocating a fresh set per attempt would break the cross-partition dedup that drove this
-	// optimisation: most parent/child pairs span partitions.
+	// Invariants:
+	//   - nil when defensiveEnabled: records may be skipped after the reader registers them,
+	//     which would incorrectly suppress parent updates for records still in Aerospike.
+	//   - Add is idempotent; re-scanning a partition after a timeout is safe.
+	//   - CheckAndRemove is destructive (one consumer per parent). For high fan-out parents
+	//     spanning sessions, only the first child to look gets the skip — subsequent children
+	//     fall back to the round-trip. This is a perf nit, not a correctness bug.
+	//   - The skip suppresses the deletedChildren bin update. That bin is only consulted by
+	//     the defensive-mode safety check (always off when prunedSet is non-nil), so a missed
+	//     update has no behavioural consequence.
 	//
-	// Memory is bounded by prunedTxSetMaxEntries. In tight-chain workloads CheckAndRemove
-	// reclaims entries quickly so peak Len() stays small, but production sessions can scan
-	// hundreds of millions of records (~500M observed on dev-scale-1). Without a cap, a
-	// workload where most parents live in prior blocks would keep every TXID added,
-	// growing memory linearly with session size. The cap silently degrades the optimisation
-	// back to baseline once hit — no correctness impact, just no further skips.
-	var prunedSet *PrunedTxSet
-	if !s.defensiveEnabled {
-		prunedSet = NewPrunedTxSet(256, prunedTxSetMaxEntries)
-	}
+	// Memory is bounded by settings.Pruner.UTXOPrunedSetMaxEntries (default 10M, ~96 B/entry).
+	// Once the cap is reached, Add() becomes a silent no-op and the optimisation degrades to
+	// baseline for any TXID added after saturation. Raise the cap for tight-chain / cross-
+	// session workloads where saturation is observed via utxo_pruner_pruned_set_saturated.
+	prunedSet := s.prunedSet
 
 	// Cumulative counters persist across retry attempts
 	var cumulativeProcessed, cumulativeSkipped int64
@@ -806,6 +820,15 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 			blockHashStr, blockHeight, elapsed, formattedTotal, formattedSkipped, tpsStr, modeStr, attemptsStr)
 
 		prometheusUtxoCleanupBatch.Observe(float64(elapsed.Microseconds()) / 1_000_000)
+
+		if prunedSet != nil {
+			prometheusUtxoPrunedSetSize.Set(float64(prunedSet.Len()))
+			if prunedSet.Saturated() {
+				prometheusUtxoPrunedSetSaturated.Set(1)
+			} else {
+				prometheusUtxoPrunedSetSaturated.Set(0)
+			}
+		}
 
 		s.notifier.NotifyPruneComplete(blockHeight, cumulativeProcessed)
 
