@@ -96,8 +96,17 @@ func (h *harness) submitterLoop(ctx context.Context, id int, afterWarmUp *atomic
 		idx = (idx + 1) % parentLen
 		child := buildChildSpending(parent)
 
+		// Use a per-request context with a generous per-call timeout rather
+		// than passing the measurement-window ctx (runCtx) directly.  runCtx
+		// has a 12 s deadline shared by all goroutines: when it fires every
+		// in-flight call returns context.DeadlineExceeded immediately,
+		// producing the 99% error rate seen with --validate-batch=true.
+		// The loop-exit select above already gates when we stop submitting;
+		// the per-call context only limits how long one call can block.
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		start := time.Now()
-		_, err := h.fix.ps.ProcessTransaction(ctx, &propagation_api.ProcessTransactionRequest{Tx: child.Bytes()})
+		_, err := h.fix.ps.ProcessTransaction(reqCtx, &propagation_api.ProcessTransactionRequest{Tx: child.Bytes()})
+		reqCancel()
 		elapsed := time.Since(start)
 
 		if afterWarmUp.Load() {
