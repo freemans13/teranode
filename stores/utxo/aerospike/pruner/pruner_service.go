@@ -542,16 +542,13 @@ func (s *Service) partitionWorker(
 				rec = r
 			}
 
-			// Register TXID in shared set before forwarding (if record is valid)
-			if rec.Err == nil && rec.Record != nil && rec.Record.Bins != nil {
-				if txIDBytes, ok := rec.Record.Bins[s.fieldTxID].([]byte); ok && len(txIDBytes) == 32 {
-					var h chainhash.Hash
-					copy(h[:], txIDBytes)
-					if prunedSet != nil {
-						prunedSet.Add(h)
-					}
-				}
-			}
+			// NOTE: prunedSet.Add is deliberately NOT called here in the read
+			// hot path. Adds are batched per chunk in processRecordChunk and
+			// executed in parallel with flushCleanupBatches' Aerospike wait
+			// (see chunkAddTxIDs collection there). Doing the Adds eagerly in
+			// the reader put cuckoo-filter cache-miss latency on every
+			// scanned record; deferring them to the I/O wait overlap makes
+			// the cost effectively free.
 
 			// Check for timeout/network errors
 			if rec.Err != nil {
@@ -978,6 +975,13 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	allExternalFiles := make([]*externalFileInfo, 0, 10) // Accumulate external files (<1%)
 	processedCount := 0
 	skippedCount := 0
+	// chunkAddTxIDs holds the TXIDs we'll Add to prunedSet AFTER kicking off
+	// the Aerospike batch. Adds run in a parallel goroutine, overlapping with
+	// the flushCleanupBatches network wait — no CPU added to the critical path.
+	var chunkAddTxIDs []chainhash.Hash
+	if prunedSet != nil {
+		chunkAddTxIDs = make([]chainhash.Hash, 0, len(chunk))
+	}
 
 	for _, rec := range chunk {
 		if rec.Err != nil {
@@ -1030,6 +1034,13 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		inputs, err := s.getTxInputsFromBins(ctx, blockHeight, rec.Record.Bins, txHash)
 		if err != nil {
 			return 0, 0, err
+		}
+
+		// Queue this record's TXID for batched Add later (during Aerospike wait).
+		// This is the moral equivalent of the old reader-side Add but with the
+		// cuckoo cache-miss latency hidden behind I/O.
+		if prunedSet != nil {
+			chunkAddTxIDs = append(chunkAddTxIDs, *txHash)
 		}
 
 		// Accumulate parent updates, skipping parents already pruned in this session
@@ -1087,9 +1098,33 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		processedCount++
 	}
 
+	// Kick off the prunedSet Adds in a parallel goroutine so the cuckoo work
+	// runs while flushCleanupBatches is blocked on Aerospike network I/O.
+	// The Adds are lock-free atomic ops, so concurrent execution across chunk
+	// goroutines is safe.
+	var addDone chan struct{}
+	if len(chunkAddTxIDs) > 0 {
+		addDone = make(chan struct{})
+		go func(txids []chainhash.Hash) {
+			defer close(addDone)
+			for i := range txids {
+				prunedSet.Add(txids[i])
+			}
+		}(chunkAddTxIDs)
+	}
+
 	// Flush all accumulated operations in one batch per chunk
-	if err := s.flushCleanupBatches(ctx, allParentUpdates, allDeletions, allExternalFiles); err != nil {
-		return 0, 0, err
+	flushErr := s.flushCleanupBatches(ctx, allParentUpdates, allDeletions, allExternalFiles)
+
+	// Wait for the parallel Adds to finish before returning so subsequent
+	// chunks see the entries (lock-free Adds typically finish well before
+	// the network wait, so this is usually a no-op).
+	if addDone != nil {
+		<-addDone
+	}
+
+	if flushErr != nil {
+		return 0, 0, flushErr
 	}
 
 	// Report record-level errors once per chunk (avoid log flooding)

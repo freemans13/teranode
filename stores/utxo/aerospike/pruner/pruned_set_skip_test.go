@@ -136,7 +136,11 @@ func TestProcessRecordChunk_SkipsParentsInPrunedSet(t *testing.T) {
 	require.Equal(t, float64(2), after-before,
 		"each input whose parent is in the set must increment the skipped-pruned metric")
 
-	require.Equal(t, 0, prunedSet.Len(), "both parents should have been removed by CheckAndRemove")
+	// Both parents removed via CheckAndRemove (Len -= 2), and the record's
+	// own TXID is now Added by the deferred-Add path that runs in parallel
+	// with flushCleanupBatches (Len += 1). Net: 1 entry (the child).
+	require.Equal(t, 1, prunedSet.Len(),
+		"parents removed, child TXID added during the parallel-Add overlap")
 }
 
 // TestProcessRecordChunk_EmptyPrunedSetIsNoOp verifies that an empty
