@@ -543,12 +543,25 @@ func (s *Service) partitionWorker(
 			}
 
 			// NOTE: prunedSet.Add is deliberately NOT called here in the read
-			// hot path. Adds are batched per chunk in processRecordChunk and
-			// executed in parallel with flushCleanupBatches' Aerospike wait
-			// (see chunkAddTxIDs collection there). Doing the Adds eagerly in
-			// the reader put cuckoo-filter cache-miss latency on every
-			// scanned record; deferring them to the I/O wait overlap makes
-			// the cost effectively free.
+			// hot path. It is called in batch at the top of processRecordChunk
+			// (per-chunk, before any CheckAndRemove). Two reasons:
+			//
+			//   1) Cache locality. Calling Add per scanned record put a cuckoo
+			//      bucket cache miss on every record, costing ~5% of total CPU
+			//      under load (measured in CPU profile on dev-scale-1). Doing
+			//      the ~30 us batch of Adds once per 1024-record chunk lets the
+			//      hardware prefetcher do its job and amortises the cost.
+			//
+			//   2) Concurrent-chunk visibility. The chunk processor takes the
+			//      ~10 ms BatchOperate wait after submitting parent updates.
+			//      Other chunk goroutines (chunkGroupLimit=4) run during that
+			//      wait and do their own CheckAndRemoves. Adding chunk N's
+			//      TXIDs UP FRONT in processRecordChunk — rather than after the
+			//      flush — means those concurrent chunks see N's TXIDs during
+			//      the entire window and can skip parents that N just queued
+			//      for deletion. This is what lifted the catch rate from ~56%
+			//      (Add-after-flush) to ~99% (Add up-front) without changing
+			//      throughput or smoothness.
 
 			// Check for timeout/network errors
 			if rec.Err != nil {
@@ -687,18 +700,21 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 	// Invariants:
 	//   - nil when defensiveEnabled: records may be skipped after the reader registers them,
 	//     which would incorrectly suppress parent updates for records still in Aerospike.
-	//   - Add is idempotent; re-scanning a partition after a timeout is safe.
-	//   - CheckAndRemove is destructive (one consumer per parent). For high fan-out parents
-	//     spanning sessions, only the first child to look gets the skip — subsequent children
-	//     fall back to the round-trip. This is a perf nit, not a correctness bug.
+	//   - Add is idempotent at the call-site level (cuckoo Insert may re-insert a duplicate
+	//     fingerprint, but Count tracks all successful inserts so re-scanning a partition
+	//     after a timeout is functionally safe).
+	//   - CheckAndRemove (cuckoo Delete) is destructive — one consumer per parent. For high
+	//     fan-out parents spanning sessions, only the first child to look gets the skip;
+	//     subsequent children fall back to the round-trip. Perf nit, not a correctness bug.
 	//   - The skip suppresses the deletedChildren bin update. That bin is only consulted by
-	//     the defensive-mode safety check (always off when prunedSet is non-nil), so a missed
-	//     update has no behavioural consequence.
+	//     the defensive-mode safety check (always off when prunedSet is non-nil), so a
+	//     missed update — including the ~3% cuckoo false-positive rate — has no
+	//     behavioural consequence.
 	//
-	// Memory is bounded by settings.Pruner.UTXOPrunedSetMaxEntries (default 10M, ~96 B/entry).
-	// Once the cap is reached, Add() becomes a silent no-op and the optimisation degrades to
-	// baseline for any TXID added after saturation. Raise the cap for tight-chain / cross-
-	// session workloads where saturation is observed via utxo_pruner_pruned_set_saturated.
+	// Memory is bounded by settings.Pruner.UTXOPrunedSetMaxEntries (default 2B entries
+	// ≈ 2 GiB at the cuckoo's ~1 byte per entry). Once the cap is reached, Insert silently
+	// fails for new entries and the optimisation degrades to baseline; the
+	// utxo_pruner_pruned_set_saturated gauge surfaces this.
 	prunedSet := s.prunedSet
 
 	// Cumulative counters persist across retry attempts

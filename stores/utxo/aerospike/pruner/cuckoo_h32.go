@@ -8,10 +8,27 @@ import (
 // cuckooH32 is a lock-free cuckoo filter specialised for 32-byte
 // cryptographic hashes (chainhash.Hash).
 //
-// Each bucket is 4 fingerprint bytes packed into a uint32. Lookup is a
-// single atomic load + SWAR byte-equality test; Insert/Delete are
-// CompareAndSwapUint32 against the packed word. No sync.Mutex on the hot
-// path.
+// Why this exists (a previous-developer FAQ):
+//
+//   - Why not use github.com/seiflotfy/cuckoofilter? We did initially. Its
+//     API takes []byte, which caused the 32-byte hash backing array to
+//     escape to the heap on every Insert/Lookup/Delete via the hasher
+//     interface dispatch. At ~1.5M ops/sec that was ~50 MB/sec of
+//     allocation churn, triggering 2 GC/sec with p99 pauses of 5 ms —
+//     enough to cause visible throughput regression on dev-scale-1.
+//
+//   - Why specialised for *[32]byte? Two reasons. (a) chainhash is already
+//     a SHA-256 digest, so the bytes are uniformly distributed and we can
+//     derive fingerprint + bucket index by reading bytes directly — no
+//     extra hash compute. (b) Taking a pointer instead of a slice avoids
+//     the heap escape that plagued the library version.
+//
+//   - Why lock-free? Each bucket is 4 fingerprint bytes packed into a
+//     uint32, naturally aligned in the bucket slice. That lets Lookup be
+//     a single atomic.LoadUint32 + SWAR byte-equality test, and
+//     Insert/Delete be CompareAndSwapUint32. Removing the per-shard
+//     sync.Mutex eliminated ~28% of total CPU spent in lock2/futex/
+//     procyield on the previous (locked) version.
 //
 // Concurrency caveats (acceptable for use as a probabilistic skip hint):
 //   - Concurrent Inserts on the same bucket can race so that two newly
@@ -24,7 +41,8 @@ import (
 // Standard cuckoo parameters: 4-slot buckets × 8-bit fingerprints → ~3.1%
 // false-positive rate. False positives in our context cause a parent
 // update to be incorrectly skipped, which only suppresses a write to the
-// `deletedChildren` bin — never read when defensive mode is off.
+// `deletedChildren` bin — never read when defensive mode is off (see the
+// invariants block in PruneWithPartitions).
 
 const (
 	cuckooBucketSize  = 4
