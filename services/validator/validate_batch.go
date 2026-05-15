@@ -485,31 +485,57 @@ func (v *Validator) submitToBlockAssemblyBatch(ctx context.Context, txs []*bt.Tx
 		return map[chainhash.Hash]error{}
 	}
 
-	// Build the BA batch items. Per-tx errors (fee derivation, TxInpoints
-	// serialisation) are attributed individually and those txs excluded from
-	// the StoreBatch call.
+	// Build BA batch items in parallel. TxInpoints+GetFees are CPU work
+	// (serialization + arithmetic) that scales linearly with len(txs); doing
+	// them serially before the single StoreBatch call would re-introduce the
+	// performance regression at high concurrency. Use a per-tx slot rather
+	// than appending under a mutex so the parallel section is lock-free.
+	type itemOrErr struct {
+		item blockassembly.BatchItem
+		err  error
+		skip bool
+	}
+	slots := make([]itemOrErr, len(txs))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(runtime.NumCPU())
+	for i, tx := range txs {
+		i, tx := i, tx
+		g.Go(func() error {
+			_ = gCtx
+			h := tx.TxIDChainHash()
+			txInpoints, err := subtree.NewTxInpointsFromTx(tx)
+			if err != nil {
+				slots[i] = itemOrErr{err: err}
+				return nil
+			}
+			fee, err := util.GetFees(tx)
+			if err != nil {
+				slots[i] = itemOrErr{err: err}
+				return nil
+			}
+			slots[i] = itemOrErr{
+				item: blockassembly.BatchItem{
+					Hash:       h,
+					Fee:        fee,
+					SizeBytes:  uint64(tx.Size()), //nolint:gosec
+					TxInpoints: txInpoints,
+				},
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
 	items := make([]blockassembly.BatchItem, 0, len(txs))
 	hashes := make([]*chainhash.Hash, 0, len(txs))
 	out := make(map[chainhash.Hash]error)
-
-	for _, tx := range txs {
-		h := tx.TxIDChainHash()
-		txInpoints, err := subtree.NewTxInpointsFromTx(tx)
-		if err != nil {
-			out[*h] = err
+	for i, slot := range slots {
+		h := txs[i].TxIDChainHash()
+		if slot.err != nil {
+			out[*h] = slot.err
 			continue
 		}
-		fee, err := util.GetFees(tx)
-		if err != nil {
-			out[*h] = err
-			continue
-		}
-		items = append(items, blockassembly.BatchItem{
-			Hash:       h,
-			Fee:        fee,
-			SizeBytes:  uint64(tx.Size()), //nolint:gosec
-			TxInpoints: txInpoints,
-		})
+		items = append(items, slot.item)
 		hashes = append(hashes, h)
 	}
 
