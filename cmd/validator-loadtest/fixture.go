@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	aeroTest "github.com/bsv-blockchain/testcontainers-aerospike-go"
+	"github.com/docker/docker/api/types/container"
 	"github.com/testcontainers/testcontainers-go"
 	"golang.org/x/sync/errgroup"
 )
@@ -76,13 +77,18 @@ type fixture struct {
 // before starting asd). Lines without $() or {} pass through the template
 // processor unchanged, so a static config is safe here.
 //
+// Aerospike 8.x syntax notes:
+//   - memory-size is obsolete; use storage-engine memory { data-size N }
+//   - storage-engine memory requires an explicit data-size block
+//
 // Tuning rationale (for the EPYC 9554 / 125 GiB Hetzner box):
-//   - service-threads 64      : default is 5; raise to match CPU count
+//   - service-threads 64      : default is ~5; raise to match CPU count
 //   - batch-index-threads 64  : parallel batch-index processing
 //   - proto-fd-max 50000      : default 15000; headroom for 1024 submitters
+//     (requires nofile ulimit >= 50000; see withTunedAerospikeConfig)
 //   - storage-engine memory   : skip device I/O; namespace fits in RAM
-//   - memory-size 4G          : 4 GiB is ample for the parent/child UTXO set
-const tunedAerospikeConf = `# aerospike.conf — tuned for loadtest (no shell variables; static file)
+//   - data-size 4G            : 4 GiB is ample for the parent/child UTXO set
+const tunedAerospikeConf = `# aerospike.conf tuned for loadtest — static file, no shell substitution
 service {
 	cluster-name docker
 	service-threads 64
@@ -118,19 +124,39 @@ network {
 
 namespace test {
 	replication-factor 1
-	memory-size 4G
-	storage-engine memory
+	storage-engine memory {
+		data-size 4G
+	}
 }
 `
 
 // withTunedAerospikeConfig injects the tuned aerospike.conf into the container
-// by replacing the default template before the entrypoint processes it.
+// by replacing the default template before the entrypoint processes it, and
+// raises the nofile ulimit so proto-fd-max 50000 doesn't get rejected.
 func withTunedAerospikeConfig() testcontainers.CustomizeRequestOption {
-	return testcontainers.WithFiles(testcontainers.ContainerFile{
-		Reader:            strings.NewReader(tunedAerospikeConf),
-		ContainerFilePath: "/etc/aerospike/aerospike.template.conf",
-		FileMode:          0o644,
-	})
+	return func(req *testcontainers.GenericContainerRequest) error {
+		// Raise the nofile ulimit so Aerospike accepts proto-fd-max 50000.
+		// The default Docker container ulimit (20480 on some hosts) would
+		// cause asd to abort at startup. 65535 is within Docker's soft cap.
+		hostCfgFn := req.HostConfigModifier
+		req.HostConfigModifier = func(hc *container.HostConfig) {
+			if hostCfgFn != nil {
+				hostCfgFn(hc)
+			}
+			hc.Ulimits = append(hc.Ulimits, &container.Ulimit{
+				Name: "nofile",
+				Soft: 65535,
+				Hard: 65535,
+			})
+		}
+		// Replace the default template so the entrypoint generates our config.
+		req.Files = append(req.Files, testcontainers.ContainerFile{
+			Reader:            strings.NewReader(tunedAerospikeConf),
+			ContainerFilePath: "/etc/aerospike/aerospike.template.conf",
+			FileMode:          0o644,
+		})
+		return nil
+	}
 }
 
 // fixtureConfig collects the harness-side knobs.
