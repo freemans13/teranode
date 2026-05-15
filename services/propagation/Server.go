@@ -606,6 +606,22 @@ func (ps *PropagationServer) Stop(ctx context.Context) error {
 	return nil
 }
 
+// SetCoalescerForBench installs a TxCoalescer on the server for
+// load-testing / benchmarking. Production code MUST NOT use this.
+// The coalescer is owned by the server after the call.
+func (ps *PropagationServer) SetCoalescerForBench(c *TxCoalescer) {
+	ps.coalescer = c
+}
+
+// CloseCoalescerForBench drains and stops the installed coalescer,
+// if any. Safe to call multiple times.
+func (ps *PropagationServer) CloseCoalescerForBench(ctx context.Context) {
+	if ps.coalescer != nil {
+		_ = ps.coalescer.Close(ctx)
+		ps.coalescer = nil
+	}
+}
+
 // handleSingleTx handles a single transaction request on the /tx endpoint.
 // This method creates and returns an HTTP handler function for processing
 // individual transactions submitted via HTTP POST. The handler:
