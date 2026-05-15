@@ -105,8 +105,8 @@ func (s *stubBatchStore) BatchSpend(_ context.Context, spends []*utxo.Spend, _ u
 }
 
 // newNativeValidator returns a *Validator wired to a stub UTXO store so that
-// validateBatchNative takes the native path (not the fallback).
-// The UseBatchValidation flag is set to true so ValidateBatch routes to native.
+// ValidateBatch runs the six-phase pipeline. The UseBatchValidation flag is set
+// to true; it no longer affects ValidateBatch internally but is harmless.
 func newNativeValidator(t testing.TB) (*Validator, *stubBatchStore) {
 	t.Helper()
 	v := newValidatorForTest(t)

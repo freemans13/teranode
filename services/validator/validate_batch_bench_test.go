@@ -10,34 +10,28 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
-// BenchmarkValidateBatch_FallbackVsNative compares the throughput of
-// ValidateBatch with the flag off vs on. Native uses a stub UTXO store
-// so the benchmark measures the validator pipeline overhead, not store
-// latency. Use this when iterating on native-path code to detect
-// regressions vs the fallback baseline. Run locally; not a CI gate.
-func BenchmarkValidateBatch_FallbackVsNative(b *testing.B) {
-	const N = 256
-
-	cases := []struct {
-		name     string
-		useBatch bool
+// BenchmarkValidateBatch measures ValidateBatch throughput at different batch
+// sizes using a stub UTXO store so the benchmark captures validator pipeline
+// overhead rather than store latency. Run locally; not a CI gate.
+func BenchmarkValidateBatch(b *testing.B) {
+	sizes := []struct {
+		name string
+		n    int
 	}{
-		{"fallback", false},
-		{"native", true},
+		{"n=1", 1},
+		{"n=256", 256},
 	}
 
-	for _, c := range cases {
-		c := c
-		b.Run(c.name, func(b *testing.B) {
+	for _, s := range sizes {
+		s := s
+		b.Run(s.name, func(b *testing.B) {
 			v, stub := newNativeValidator(b)
 			installNoopCPUOverride(b, v)
-			v.settings.Validator.UseBatchValidation = c.useBatch
 
-			// Seed parents.
-			parents := make([]chainhash.Hash, N)
+			parents := make([]chainhash.Hash, s.n)
 			parentMap := map[[32]byte]*aerospike.ParentRecord{}
-			txs := make([]*bt.Tx, N)
-			for i := 0; i < N; i++ {
+			txs := make([]*bt.Tx, s.n)
+			for i := 0; i < s.n; i++ {
 				parents[i] = chainhash.Hash{byte(i / 256), byte(i % 256), 0x99}
 				var key [32]byte
 				copy(key[:], parents[i][:])
@@ -46,11 +40,9 @@ func BenchmarkValidateBatch_FallbackVsNative(b *testing.B) {
 			}
 			stub.parents = parentMap
 
-			// Override BA to accept everything (only matters for native).
 			v.overrideBASubmitForTest(func(ctx context.Context, _ []*bt.Tx) map[chainhash.Hash]error {
 				return map[chainhash.Hash]error{}
 			})
-			// Override txmeta publish so we don't try to write to a nil kafka client.
 			v.overrideTxMetaPublishForTest(func(*bt.Tx, *meta.Data) {})
 
 			b.ResetTimer()

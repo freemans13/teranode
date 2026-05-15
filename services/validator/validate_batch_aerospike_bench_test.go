@@ -2,24 +2,18 @@
 
 package validator
 
-// BenchmarkValidateBatch_FlagOffVsOn_RealAerospike gives an honest
-// before/after comparison of ValidateBatch with UseBatchValidation=false
-// (fallback: per-tx fan-out through the existing go-batcher path) vs
-// UseBatchValidation=true (native: one BatchOperate per phase).
-//
-// Both paths hit the SAME Aerospike testcontainers instance, so the
-// comparison is apples-to-apples: same backing store, two different
-// validator code paths.
+// BenchmarkValidateBatch_RealAerospike benchmarks ValidateBatch at different
+// batch sizes against a real Aerospike testcontainer, measuring the
+// validator-to-Aerospike round-trip cost (one BatchOperate per phase).
 //
 // BA submission and TxMeta Kafka publish are overridden to no-ops so the
-// benchmark isolates the validator-to-Aerospike round-trip cost.
-// CPU validation (script verify) is overridden to a no-op so the benchmark
-// measures the UTXO store hot path rather than ECDSA/script cost.
+// benchmark isolates the UTXO store hot path. CPU validation (script verify)
+// is also a no-op to exclude ECDSA/script cost.
 //
 // Run:
 //
 //	go test -count=1 -race=false -tags aerospike \
-//	  -bench=BenchmarkValidateBatch_FlagOffVsOn_RealAerospike \
+//	  -bench=BenchmarkValidateBatch_RealAerospike \
 //	  -benchmem -benchtime=2x -run=NONE ./services/validator -v
 
 import (
@@ -43,33 +37,23 @@ import (
 	utxotesthelper "github.com/bsv-blockchain/teranode/test/longtest/stores/utxo"
 )
 
-// BenchmarkValidateBatch_FlagOffVsOn_RealAerospike runs flag-off (fallback)
-// and flag-on (native) against a real Aerospike testcontainer.
-func BenchmarkValidateBatch_FlagOffVsOn_RealAerospike(b *testing.B) {
+// BenchmarkValidateBatch_RealAerospike runs ValidateBatch at varying batch
+// sizes against a real Aerospike testcontainer.
+func BenchmarkValidateBatch_RealAerospike(b *testing.B) {
 	for _, batchSize := range []int{32, 128, 512} {
 		batchSize := batchSize
-		for _, useBatch := range []bool{false, true} {
-			useBatch := useBatch
-			name := "fallback"
-			if useBatch {
-				name = "native"
-			}
-			b.Run(fmt.Sprintf("N=%d/%s", batchSize, name), func(b *testing.B) {
-				benchValidateBatchOnAerospike(b, batchSize, useBatch)
-			})
-		}
+		b.Run(fmt.Sprintf("N=%d", batchSize), func(b *testing.B) {
+			benchValidateBatchOnAerospike(b, batchSize)
+		})
 	}
 }
 
-func benchValidateBatchOnAerospike(b *testing.B, batchSize int, useBatch bool) {
+func benchValidateBatchOnAerospike(b *testing.B, batchSize int) {
 	b.Helper()
 	ctx := context.Background()
 
 	v, aeroStore, cleanup := newValidatorBackedByAerospike(b)
 	defer cleanup()
-
-	// Set the flag under test.
-	v.settings.Validator.UseBatchValidation = useBatch
 
 	// Override CPU validation: make it a no-op so the benchmark measures
 	// the UTXO store round-trip rather than script-verification cost.

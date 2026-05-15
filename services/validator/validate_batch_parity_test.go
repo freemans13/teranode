@@ -19,8 +19,8 @@ import (
 //   - The parent tx is seeded into the real sqlitememory UTXO store (v.utxoStore)
 //     so that the direct Validate path can hydrate input fields from the store.
 //   - The validator's batch-store override is a stub whose BatchGetParents reports
-//     the parent as present — this forces validateBatchNative to run (rather than
-//     the sqlitememory fallback) and exposes the missing-hydration bug.
+//     the parent as present — this causes ValidateBatch to run the six-phase
+//     pipeline and exposes the missing-hydration bug.
 //   - The child tx is submitted NON-EXTENDED: PreviousTxSatoshis and
 //     PreviousTxScript are zero/nil, matching the wire shape.
 //
@@ -44,9 +44,9 @@ func TestValidateBatch_ParityWithValidate_NonExtendedTx(t *testing.T) {
 	ctx := context.Background()
 
 	// newNativeValidator wires a stubBatchStore so getBatchUtxoStore() returns
-	// it and validateBatchNative takes the native path instead of the
-	// sqlitememory fallback.  The validator's v.utxoStore is still the real
-	// sqlitememory store, so the direct Validate path can hydrate inputs.
+	// it and ValidateBatch runs the six-phase pipeline. The validator's
+	// v.utxoStore is still the real sqlitememory store, so the direct
+	// Validate path can hydrate inputs.
 	v, stub := newNativeValidator(t)
 
 	// 1. Build the parent tx and seed it into the REAL UTXO store (sqlitememory).

@@ -190,7 +190,7 @@ type Validator struct {
 	blockAssemblySubmitOverride func(ctx context.Context, txs []*bt.Tx) map[chainhash.Hash]error
 
 	// txMetaPublishOverride is a test seam that, when non-nil, replaces the
-	// real sendTxMetaToKafka call inside Phase F of validateBatchNative.
+	// real sendTxMetaToKafka call inside Phase F of ValidateBatch.
 	// Allows unit tests to capture which txs are published without a live
 	// Kafka producer. nil in production.
 	txMetaPublishOverride func(tx *bt.Tx, m *meta.Data)

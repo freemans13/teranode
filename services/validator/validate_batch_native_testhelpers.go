@@ -32,7 +32,7 @@ func (v *Validator) overrideBASubmitForTest(fn func(ctx context.Context, txs []*
 }
 
 // overrideTxMetaPublishForTest installs a function that replaces the real
-// sendTxMetaToKafka call inside Phase F of validateBatchNative. Allows unit
+// sendTxMetaToKafka call inside Phase F of ValidateBatch. Allows unit
 // tests to capture which txs are published without a live Kafka producer.
 // Production code never calls this method.
 func (v *Validator) overrideTxMetaPublishForTest(fn func(tx *bt.Tx, m *meta.Data)) {
