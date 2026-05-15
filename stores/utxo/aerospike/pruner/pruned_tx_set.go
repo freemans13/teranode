@@ -1,7 +1,6 @@
 package pruner
 
 import (
-	"sync"
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -48,7 +47,6 @@ type PrunedTxSet struct {
 }
 
 type prunedTxShard struct {
-	mu     sync.Mutex
 	filter *cuckooH32
 }
 
@@ -96,10 +94,7 @@ func (s *PrunedTxSet) shard(h *chainhash.Hash) *prunedTxShard {
 // *[32]byte to the cuckoo filter without allocating a slice header.
 func (s *PrunedTxSet) Add(h chainhash.Hash) {
 	sh := s.shard(&h)
-	sh.mu.Lock()
-	ok := sh.filter.Insert((*[32]byte)(&h))
-	sh.mu.Unlock()
-	if !ok {
+	if !sh.filter.Insert((*[32]byte)(&h)) {
 		s.insertFailures.Add(1)
 	}
 }
@@ -108,10 +103,7 @@ func (s *PrunedTxSet) Add(h chainhash.Hash) {
 // at the cuckoo filter's standard rate (~3%).
 func (s *PrunedTxSet) Contains(h chainhash.Hash) bool {
 	sh := s.shard(&h)
-	sh.mu.Lock()
-	ok := sh.filter.Lookup((*[32]byte)(&h))
-	sh.mu.Unlock()
-	return ok
+	return sh.filter.Lookup((*[32]byte)(&h))
 }
 
 // CheckAndRemove returns true and deletes the TXID's fingerprint if it appears
@@ -120,20 +112,15 @@ func (s *PrunedTxSet) Contains(h chainhash.Hash) bool {
 // Contains/CheckAndRemove for the collision-evicted hash to miss).
 func (s *PrunedTxSet) CheckAndRemove(h chainhash.Hash) bool {
 	sh := s.shard(&h)
-	sh.mu.Lock()
-	ok := sh.filter.Delete((*[32]byte)(&h))
-	sh.mu.Unlock()
-	return ok
+	return sh.filter.Delete((*[32]byte)(&h))
 }
 
 // Len returns the approximate number of fingerprints currently in the filter
-// across all shards. Duplicate Adds inflate this count.
+// across all shards. Eventually consistent under concurrent ops.
 func (s *PrunedTxSet) Len() int {
 	total := 0
 	for i := range s.shards {
-		s.shards[i].mu.Lock()
 		total += s.shards[i].filter.Count()
-		s.shards[i].mu.Unlock()
 	}
 	return total
 }
