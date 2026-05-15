@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,18 @@ func TestPhaseMetrics_AddAndRead(t *testing.T) {
 	require.Equal(t, int64(15_000_000), snap[PhaseGetParents].TotalNs)
 	require.Equal(t, int64(1), snap[PhaseSpend].Count)
 	require.Equal(t, int64(7_000_000), snap[PhaseSpend].TotalNs)
+}
+
+func TestPhaseSnapshot_PopulatedAfterValidateBatch(t *testing.T) {
+	v := newValidatorForTest(t)
+	v.settings.Validator.UseBatchValidation = true
+	// Empty batch is a no-op (returns immediately) — must NOT panic and
+	// must NOT populate counters because no phase runs.
+	results, err := v.ValidateBatch(context.Background(), nil, 0)
+	require.NoError(t, err)
+	require.Len(t, results, 0)
+	snap := v.PhaseSnapshot()
+	require.Equal(t, int64(0), snap[PhaseGetParents].Count)
 }
 
 func TestPhaseMetrics_ConcurrentSafe(t *testing.T) {

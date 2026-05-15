@@ -3,6 +3,7 @@ package validator
 import (
 	"context"
 	"runtime"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -56,9 +57,11 @@ func (v *Validator) ValidateBatch(
 	}
 
 	// Phase A: fetch all unique parent hashes in a single BatchGetParents call.
+	phaseAStart := time.Now()
 	parentHashes := collectUniqueParents(txs)
 	parents, _, err := store.BatchGetParents(ctx, parentHashes)
 	if err != nil {
+		v.phaseMetrics.add(PhaseGetParents, time.Since(phaseAStart))
 		return results, err
 	}
 
@@ -136,10 +139,12 @@ func (v *Validator) ValidateBatch(
 		}
 		utxoHeightsByTx[i] = heights
 	}
+	v.phaseMetrics.add(PhaseGetParents, time.Since(phaseAStart))
 
 	// Phase B — per-tx CPU validation (format + scripts).
 	// Runs in an errgroup bounded by NumCPU so the goroutine count does not
 	// grow unboundedly with batch size.
+	phaseBStart := time.Now()
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(runtime.NumCPU())
 	for i := range txs {
@@ -157,10 +162,12 @@ func (v *Validator) ValidateBatch(
 		})
 	}
 	_ = g.Wait() // errgroup never returns a non-nil error here
+	v.phaseMetrics.add(PhaseCPU, time.Since(phaseBStart))
 
 	// Phase C — BatchSpend. One BatchOperate carries all surviving inputs.
 	// Per-input SpendResult.Err is attributed back to every tx that referenced
 	// the failed parent.
+	phaseCStart := time.Now()
 	spends, spendToTxIdx := buildSpendsForBatch(txs, alive, results)
 	if len(spends) > 0 {
 		spendResults, spendErr := store.BatchSpend(ctx, spends, blockHeight)
@@ -207,12 +214,14 @@ func (v *Validator) ValidateBatch(
 			}
 		}
 	}
+	v.phaseMetrics.add(PhaseSpend, time.Since(phaseCStart))
 	_ = spendToTxIdx // reserved for Phase F metadata path
 
 	// Phase D — BatchCreate (locked=true). One BatchOperate carries all surviving txs.
 	// Per-tx errors (CREATE_ONLY collisions, large-tx-needs-external-storage) are tagged
 	// PhaseCreate. Surviving txs have results[i].Meta populated so Phase F (Kafka) and
 	// single-tx callers can use it.
+	phaseDStart := time.Now()
 	aliveTxs, aliveIdx := compactAlive(txs, alive)
 	if len(aliveTxs) > 0 {
 		createResults, cErr := store.BatchCreate(ctx, aliveTxs, blockHeight, true)
@@ -247,6 +256,7 @@ func (v *Validator) ValidateBatch(
 			}
 		}
 	}
+	v.phaseMetrics.add(PhaseCreate, time.Since(phaseDStart))
 
 	// Phase E — submit surviving txs to BlockAssembly, then unlock the
 	// BA-acknowledged subset via a single BatchSetLocked(false) call.
@@ -254,6 +264,7 @@ func (v *Validator) ValidateBatch(
 	// existing locked-tx reconciler can pick them up via the normal retry path.
 	aliveTxs, aliveIdx = compactAlive(txs, alive)
 	if len(aliveTxs) > 0 {
+		phaseEStart := time.Now()
 		baErrs := v.submitToBlockAssemblyBatch(ctx, aliveTxs)
 		unlockHashes := make([][]byte, 0, len(aliveTxs))
 		unlockIdx := make([]int, 0, len(aliveTxs))
@@ -269,7 +280,10 @@ func (v *Validator) ValidateBatch(
 			unlockHashes = append(unlockHashes, h[:])
 			unlockIdx = append(unlockIdx, i)
 		}
+		v.phaseMetrics.add(PhaseBlockAssembly, time.Since(phaseEStart))
+
 		if len(unlockHashes) > 0 {
+			phaseFStart := time.Now()
 			ulResults, uErr := store.BatchSetLocked(ctx, unlockHashes, false)
 			if uErr != nil {
 				for _, i := range unlockIdx {
@@ -287,6 +301,7 @@ func (v *Validator) ValidateBatch(
 					}
 				}
 			}
+			v.phaseMetrics.add(PhaseSetLocked, time.Since(phaseFStart))
 		}
 	}
 
