@@ -1098,33 +1098,21 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		processedCount++
 	}
 
-	// Kick off the prunedSet Adds in a parallel goroutine so the cuckoo work
-	// runs while flushCleanupBatches is blocked on Aerospike network I/O.
-	// The Adds are lock-free atomic ops, so concurrent execution across chunk
-	// goroutines is safe.
-	var addDone chan struct{}
-	if len(chunkAddTxIDs) > 0 {
-		addDone = make(chan struct{})
-		go func(txids []chainhash.Hash) {
-			defer close(addDone)
-			for i := range txids {
-				prunedSet.Add(txids[i])
-			}
-		}(chunkAddTxIDs)
-	}
-
-	// Flush all accumulated operations in one batch per chunk
+	// Flush all accumulated operations in one batch per chunk. Blocks on
+	// Aerospike network I/O (~10 ms typical).
 	flushErr := s.flushCleanupBatches(ctx, allParentUpdates, allDeletions, allExternalFiles)
-
-	// Wait for the parallel Adds to finish before returning so subsequent
-	// chunks see the entries (lock-free Adds typically finish well before
-	// the network wait, so this is usually a no-op).
-	if addDone != nil {
-		<-addDone
-	}
-
 	if flushErr != nil {
 		return 0, 0, flushErr
+	}
+
+	// Add the chunk's record TXIDs to prunedSet after the flush. The total
+	// cost is ~30 us for a 1024-record chunk (lock-free atomic CAS, each
+	// ~30 ns), trivial compared to the just-completed network wait. Doing
+	// this inline rather than in a parallel goroutine avoids per-chunk
+	// goroutine/channel allocation that was visibly destabilising
+	// throughput at ~1700 chunks/sec.
+	for i := range chunkAddTxIDs {
+		prunedSet.Add(chunkAddTxIDs[i])
 	}
 
 	// Report record-level errors once per chunk (avoid log flooding)
