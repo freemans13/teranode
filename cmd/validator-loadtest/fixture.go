@@ -71,23 +71,24 @@ type fixture struct {
 }
 
 // tunedAerospikeConf is a static aerospike.conf injected into the testcontainer
-// to remove the default 5-thread ceiling and switch to in-memory storage.
+// to remove the default service-thread ceiling.
 // It is mounted at /etc/aerospike/aerospike.template.conf so the container
 // entrypoint picks it up (the entrypoint copies the template → aerospike.conf
 // before starting asd). Lines without $() or {} pass through the template
 // processor unchanged, so a static config is safe here.
 //
-// Aerospike 8.x syntax notes:
-//   - memory-size is obsolete; use storage-engine memory { data-size N }
-//   - storage-engine memory requires an explicit data-size block
+// Storage engine choice: device (file-backed) with read-page-cache enabled.
+// Benchmarking showed storage-engine memory is ~43% slower than device+file
+// for the Lua-heavy spend path — Aerospike 8's in-memory allocator appears
+// to have higher lock contention than the device engine's warm page cache.
 //
 // Tuning rationale (for the EPYC 9554 / 125 GiB Hetzner box):
 //   - service-threads 64      : default is ~5; raise to match CPU count
 //   - batch-index-threads 64  : parallel batch-index processing
 //   - proto-fd-max 50000      : default 15000; headroom for 1024 submitters
 //     (requires nofile ulimit >= 50000; see withTunedAerospikeConfig)
-//   - storage-engine memory   : skip device I/O; namespace fits in RAM
-//   - data-size 4G            : 4 GiB is ample for the parent/child UTXO set
+//   - filesize 8G             : room for 1.5M parents + all child UTXOs
+//   - read-page-cache true    : keep hot data in OS page cache (fast)
 const tunedAerospikeConf = `# aerospike.conf tuned for loadtest — static file, no shell substitution
 service {
 	cluster-name docker
@@ -124,8 +125,10 @@ network {
 
 namespace test {
 	replication-factor 1
-	storage-engine memory {
-		data-size 4G
+	storage-engine device {
+		file /opt/aerospike/data/test.dat
+		filesize 8G
+		read-page-cache true
 	}
 }
 `
