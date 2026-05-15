@@ -194,6 +194,11 @@ type Validator struct {
 	// Allows unit tests to capture which txs are published without a live
 	// Kafka producer. nil in production.
 	txMetaPublishOverride func(tx *bt.Tx, m *meta.Data)
+
+	// phaseMetrics tracks atomic per-phase counters for ValidateBatch's
+	// six-phase pipeline. The zero value is ready to use; no explicit init
+	// required. External diagnostic tools access counters via PhaseSnapshot.
+	phaseMetrics phaseMetrics
 }
 
 // New creates a new Validator instance with the provided configuration.
