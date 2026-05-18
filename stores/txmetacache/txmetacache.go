@@ -540,8 +540,10 @@ func (t *TxMetaCache) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	return txMeta, nil
 }
 
-// setMinedInCache updates the cache with information about a transaction that has been mined in a block.
-// This internal helper method is used by both SetMined and SetMinedMulti to maintain cache consistency.
+// SetMined marks a transaction as mined in the underlying store and evicts it
+// from the cache. The cache is populated on read only for txs with no block IDs
+// and not flagged conflicting (see GetMeta), so a newly mined tx must not stay
+// in the cache; subsequent reads will go through to the store.
 //
 // Parameters:
 // - ctx: Context for the operation
@@ -549,53 +551,10 @@ func (t *TxMetaCache) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 // - minedBlockInfo: Information about the block where the transaction was mined
 //
 // Returns:
-// - Error if updating the transaction metadata fails
-func (t *TxMetaCache) setMinedInCache(ctx context.Context, hash *chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (blockIDs []uint32, err error) {
-	var txMeta *meta.Data
-
-	txMeta, err = t.Get(ctx, hash)
-	if err != nil {
-		txMeta, err = t.utxoStore.Get(ctx, hash)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	if txMeta.BlockIDs == nil {
-		txMeta.BlockIDs = []uint32{
-			minedBlockInfo.BlockID,
-		}
-	} else {
-		txMeta.BlockIDs = append(txMeta.BlockIDs, minedBlockInfo.BlockID)
-	}
-
-	// if the blockID is not set, then we need to set it
-	if len(txMeta.BlockIDs) == 0 {
-		// don't return errors from SetCache, as it is not critical if the cache fails to set
-		_ = t.SetCache(hash, txMeta)
-	}
-
-	return txMeta.BlockIDs, nil
-}
-
-// SetMined marks a transaction as mined in a specific block, updating both the
-// underlying store and the cache to maintain consistency.
-//
-// Parameters:
-// - ctx: Context for the operation
-// - hash: Hash of the transaction to mark as mined
-// - minedBlockInfo: Information about the block where the transaction was mined
-//
-// Returns:
-// - Error if updating either the underlying store or cache fails
+// - The block IDs returned by the underlying store for this tx
+// - Error if the underlying store fails
 func (t *TxMetaCache) SetMined(ctx context.Context, hash *chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) ([]uint32, error) {
-	blockIDsMap, err := t.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{hash}, minedBlockInfo)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = t.setMinedInCache(ctx, hash, minedBlockInfo)
+	blockIDsMap, err := t.SetMinedMulti(ctx, []*chainhash.Hash{hash}, minedBlockInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -603,8 +562,10 @@ func (t *TxMetaCache) SetMined(ctx context.Context, hash *chainhash.Hash, minedB
 	return blockIDsMap[*hash], nil
 }
 
-// SetMinedMulti marks multiple transactions as mined in a specific block.
-// This batch operation is more efficient than calling SetMined multiple times.
+// SetMinedMulti marks transactions as mined in the underlying store and evicts
+// them from the cache. The cache read path skips entries with block IDs (see
+// GetMeta), so mined txs must not remain in the cache; subsequent reads go to
+// the store. Eviction is best-effort: Delete never errors.
 //
 // Parameters:
 // - ctx: Context for the operation
@@ -612,17 +573,41 @@ func (t *TxMetaCache) SetMined(ctx context.Context, hash *chainhash.Hash, minedB
 // - minedBlockInfo: Information about the block where the transactions were mined
 //
 // Returns:
-// - Error if updating the cache for any transaction fails
+// - The store's blockIDsMap on success
+// - Error if the underlying store fails
 func (t *TxMetaCache) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
-	blockIDsMap := make(map[chainhash.Hash][]uint32, len(hashes))
+	blockIDsMap, err := t.utxoStore.SetMinedMulti(ctx, hashes, minedBlockInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	// Defensive postcondition (see stores/utxo/Interface.go SetMinedMulti
+	// docstring): as an implementation of utxo.Store, re-verify coverage even
+	// when the wrapped store says success. Catches regressions in any backend
+	// before the cache layer hides them.
+	if !minedBlockInfo.UnsetMined {
+		for _, h := range hashes {
+			bIDs, ok := blockIDsMap[*h]
+			if !ok {
+				return nil, errors.NewTxNotFoundError("setMinedMulti coverage gap: tx absent from store result", h.String())
+			}
+
+			found := false
+			for _, bID := range bIDs {
+				if bID == minedBlockInfo.BlockID {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				return nil, errors.NewProcessingError("setMinedMulti coverage gap: tx present but missing current blockID", h.String())
+			}
+		}
+	}
 
 	for _, hash := range hashes {
-		blockIDs, err := t.setMinedInCache(ctx, hash, minedBlockInfo)
-		if err != nil {
-			return nil, err
-		}
-
-		blockIDsMap[*hash] = blockIDs
+		_ = t.Delete(ctx, hash)
 	}
 
 	return blockIDsMap, nil
