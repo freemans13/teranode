@@ -1490,20 +1490,37 @@ func (s *Service) getTxInputsFromBins(ctx context.Context, blockHeight uint32, b
 
 // flushCleanupBatches flushes accumulated parent updates, external file deletions, and Aerospike deletions
 func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error {
-	// Execute parent updates first
-	if len(parentUpdates) > 0 {
-		if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
-			return err
+	// Combine parent updates and Aerospike record deletions into a single
+	// BatchOperate round-trip. Aerospike's batch API accepts mixed
+	// BatchRecordIfc lists (UDFs + Deletes + Writes), so the server fans
+	// them out per-node and we get one network round-trip per chunk
+	// instead of two.
+	//
+	// When defensive mode is on we keep the two-step sequence (parents
+	// first, deletions second) — the defensive safety check reads the
+	// parent's deletedChildren bin and assumes the update has landed
+	// before the child record is gone.
+	//
+	// When defensive mode is off (the dev-scale-1 default), order
+	// doesn't matter because the deletedChildren bin is never read.
+	if s.defensiveEnabled {
+		if len(parentUpdates) > 0 {
+			if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
+				return err
+			}
 		}
-	}
-
-	// Delete Aerospike records before external files (fail-safe: if file deletion fails,
-	// orphaned files are harmless; if record deletion fails, both remain consistent)
-	if !s.settings.Pruner.SkipDeletions {
-		if len(deletions) > 0 {
+		if !s.settings.Pruner.SkipDeletions && len(deletions) > 0 {
 			if err := s.executeBatchDeletions(ctx, deletions); err != nil {
 				return err
 			}
+		}
+	} else {
+		var keys []*aerospike.Key
+		if !s.settings.Pruner.SkipDeletions {
+			keys = deletions
+		}
+		if err := s.executeBatchCleanupCombined(ctx, parentUpdates, keys); err != nil {
+			return err
 		}
 	}
 
@@ -1511,6 +1528,165 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 		if err := s.executeBatchExternalFileDeletions(ctx, externalFiles); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// executeBatchCleanupCombined sends parent UDF updates and child record
+// deletions in a SINGLE Aerospike BatchOperate call. Halves the round-trip
+// count vs the two-call path. Only safe when defensive mode is off (because
+// the defensive safety check has an implicit ordering dependency between
+// parent.deletedChildren writes and child record deletions).
+func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[string]*parentUpdateInfo, keys []*aerospike.Key) error {
+	if len(updates) == 0 && len(keys) == 0 {
+		return nil
+	}
+
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates)+len(keys))
+
+	// Parent updates: prefer Lua UDF (silent on missing parents — no
+	// KEY_NOT_FOUND noise in client metrics) and fall back to a plain
+	// BatchWrite+MapPutItems if no Lua package is configured.
+	parentEnd := 0
+	useUDF := s.luaPackage != ""
+	if len(updates) > 0 {
+		if useUDF {
+			batchUDFPolicy := aerospike.NewBatchUDFPolicy()
+			for _, info := range updates {
+				childHashList := make([]interface{}, 0, len(info.childHashes))
+				for _, childHash := range info.childHashes {
+					childHashList = append(childHashList, childHash.String())
+				}
+				batchRecords = append(batchRecords, aerospike.NewBatchUDF(
+					batchUDFPolicy,
+					info.key,
+					s.luaPackage,
+					"addDeletedChildren",
+					aerospike.NewValue(childHashList),
+				))
+			}
+		} else {
+			batchWritePolicy := aerospike.NewBatchWritePolicy()
+			batchWritePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
+			mapPolicy := aerospike.DefaultMapPolicy()
+			for _, info := range updates {
+				items := make(map[interface{}]interface{}, len(info.childHashes))
+				for _, childHash := range info.childHashes {
+					items[childHash.String()] = true
+				}
+				op := aerospike.MapPutItemsOp(mapPolicy, s.fieldDeletedChildren, items)
+				batchRecords = append(batchRecords, aerospike.NewBatchWrite(batchWritePolicy, info.key, op))
+			}
+		}
+	}
+	parentEnd = len(batchRecords)
+
+	// Child deletions — TTL touch (utxoSetTTL=true) or hard delete.
+	if len(keys) > 0 {
+		if s.utxoSetTTL {
+			ttlWritePolicy := aerospike.NewBatchWritePolicy()
+			ttlWritePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
+			ttlWritePolicy.Expiration = 1
+			for _, key := range keys {
+				batchRecords = append(batchRecords, aerospike.NewBatchWrite(ttlWritePolicy, key, aerospike.TouchOp()))
+			}
+		} else {
+			batchDeletePolicy := aerospike.NewBatchDeletePolicy()
+			for _, key := range keys {
+				batchRecords = append(batchRecords, aerospike.NewBatchDelete(batchDeletePolicy, key))
+			}
+		}
+	}
+
+	if len(batchRecords) == 0 {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		s.logger.Infof("Context cancelled, skipping combined cleanup batch")
+		return ctx.Err()
+	default:
+	}
+
+	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
+		s.logger.Errorf("Combined cleanup batch failed: %v", err)
+		return errors.NewStorageError("combined cleanup batch failed", err)
+	}
+
+	// Parse results in two regions: [0, parentEnd) are parent updates,
+	// [parentEnd, end) are child deletions.
+	parentSuccess, parentNotFound, parentErrors := 0, 0, 0
+	deleteErrors := 0
+	var firstParentErr aerospike.Error
+	var firstDeleteErr aerospike.Error
+
+	for i, rec := range batchRecords {
+		batchRec := rec.BatchRec()
+		if i < parentEnd {
+			// Parent update result
+			if batchRec.Err != nil {
+				// BatchWrite path surfaces missing parents as KEY_NOT_FOUND
+				if !useUDF && batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
+					parentNotFound++
+					continue
+				}
+				if firstParentErr == nil {
+					firstParentErr = batchRec.Err
+				}
+				parentErrors++
+				continue
+			}
+			// UDF path returns a SUCCESS/ERROR map in the record bins
+			if useUDF && batchRec.Record != nil && batchRec.Record.Bins != nil {
+				if resp, ok := batchRec.Record.Bins["SUCCESS"]; ok {
+					if respMap, ok := resp.(map[interface{}]interface{}); ok {
+						if status, ok := respMap["status"].(string); ok {
+							switch status {
+							case "OK":
+								parentSuccess++
+							case "ERROR":
+								if errCode, ok := respMap["errorCode"].(string); ok && errCode == "TX_NOT_FOUND" {
+									parentNotFound++
+								} else {
+									parentErrors++
+								}
+							}
+							continue
+						}
+					}
+				}
+			}
+			parentSuccess++
+		} else {
+			// Child deletion result — KEY_NOT_FOUND is idempotent success
+			if batchRec.Err != nil {
+				if batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
+					continue
+				}
+				if firstDeleteErr == nil {
+					firstDeleteErr = batchRec.Err
+				}
+				deleteErrors++
+			}
+		}
+	}
+
+	if parentErrors > 0 {
+		s.logger.Errorf("Combined cleanup: %d parent update errors (first: %v)", parentErrors, firstParentErr)
+		return errors.NewStorageError("%d parent update operations failed", parentErrors)
+	}
+	if deleteErrors > 0 {
+		s.logger.Errorf("Combined cleanup: %d deletion errors (first: %v)", deleteErrors, firstDeleteErr)
+		return errors.NewStorageError("%d deletion operations failed", deleteErrors)
+	}
+
+	if parentSuccess > 0 {
+		prometheusUtxoParentsUpdated.Add(float64(parentSuccess))
+	}
+	if parentNotFound > 0 {
+		prometheusUtxoParentsUpdatedSkipped.Add(float64(parentNotFound))
 	}
 
 	return nil
