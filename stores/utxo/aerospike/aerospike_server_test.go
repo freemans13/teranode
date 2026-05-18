@@ -2073,6 +2073,7 @@ func TestStore_AerospikeSplitTx(t *testing.T) {
 func TestRespendSameUTXO(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.SpendBatcherSize = 1
 
 	client, store, ctx, deferFn := initAerospike(t, tSettings, logger)
 
