@@ -1,6 +1,9 @@
 package settings
 
-import "net/url"
+import (
+	"net/url"
+	"time"
+)
 
 // ValidatorSettings configures the transaction validation service.
 type ValidatorSettings struct {
@@ -23,4 +26,21 @@ type ValidatorSettings struct {
 	TxMetaKafkaBatchSize      int      `key:"validator_txmeta_kafka_batchSize" desc:"Batch size for Kafka transaction metadata" default:"1024" category:"Validator" usage:"Messages per Kafka batch" type:"int" longdesc:"### Purpose\nControls how many transaction metadata messages are batched before sending to Kafka.\n\n### How It Works\nTransaction metadata is collected in a batch. When the batch reaches this size or the timeout expires (whichever comes first), the batch is sent to Kafka.\n\n### Trade-offs\n| Setting | Benefit | Drawback |\n|---------|---------|----------|\n| Higher | Reduced Kafka overhead | Increased memory and latency |\n| Lower | Faster metadata availability | More Kafka operations |\n\n### Recommendations\n- **1024** (default) - Good balance between latency and throughput\n- Works with TxMetaKafkaBatchTimeoutMs - whichever limit is reached first triggers send"`
 	TxMetaKafkaBatchTimeoutMs int      `key:"validator_txmeta_kafka_batchTimeoutMs" desc:"Timeout for Kafka batch in milliseconds" default:"5" category:"Validator" usage:"Maximum wait for batch to fill" type:"int" longdesc:"### Purpose\nSets the maximum time in milliseconds to wait for a transaction metadata batch to fill before sending.\n\n### How It Works\nDuring low traffic, batches may not fill completely. This timeout ensures metadata is published promptly rather than waiting indefinitely.\n\n### Trade-offs\n| Setting | Benefit | Drawback |\n|---------|---------|----------|\n| Lower | Faster metadata availability | More Kafka operations |\n| Higher | Better batching efficiency | Higher latency during low traffic |\n\n### Recommendations\n- **5** (default) - Ensures prompt metadata publishing\n- Works with TxMetaKafkaBatchSize - whichever limit is reached first triggers send"`
 	TxLockedMaxRetries        int      `key:"validator_txlocked_maxRetries" desc:"Maximum retries for TX_LOCKED errors" default:"3" category:"Validator" usage:"Retries when parent tx lock not yet cleared" type:"int" longdesc:"### Purpose\nControls the number of retry attempts when a transaction encounters a TX_LOCKED error during UTXO spending.\n\n### How It Works\nTX_LOCKED occurs when a parent and child transaction arrive nearly simultaneously and the parent has not yet completed its two-phase commit (unlock). The validator retries the same transaction with exponential backoff, starting at 10ms and doubling on each retry (e.g. 10ms, 20ms, 40ms, 80ms, ...) until the configured maximum is reached or the lock clears. Values above 10 are clamped to prevent excessive backoff (2^10 * 10ms ≈ 10s max sleep).\n\n### Values\n- **3** (default) - Retries up to 3 times with 10/20/40ms backoff (70ms total)\n- **0** - Disables retry, TX_LOCKED errors are returned immediately to the caller\n\n### Recommendations\n- **3** for production deployments where parent/child tx timing races are expected\n- **0** for testing environments where TX_LOCKED should propagate to the caller"`
+	// UseBatchValidation routes ProcessTransactionBatch through the new
+	// validator.ValidateBatch path that issues one Aerospike BatchOperate
+	// per phase per batch. When false (default), the new path falls back
+	// to a fan-out over the existing ValidateWithOptions per tx.
+	UseBatchValidation bool
+	// BatchMaxSize is the hard cap on the size of a single ValidateBatch
+	// call. Propagation splits larger inbound batches into multiple
+	// ValidateBatch calls.
+	BatchMaxSize int
+	// BatchMaxWait is reserved for a future caller-side coalescer that
+	// would buffer single-tx callers into batches. Not used in v1.
+	BatchMaxWait time.Duration
+	// BatchMaxConcurrent caps the number of concurrent in-flight
+	// ValidateBatch flushes spawned by the propagation TxCoalescer.
+	// 0 = unbounded (every full batch spawns its own goroutine).
+	// Mirrors the convention from utxostore_batcherMaxConcurrent.
+	BatchMaxConcurrent int
 }

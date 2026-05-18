@@ -120,3 +120,13 @@ func (m *MockValidatorClient) TriggerBatcher() {}
 func (m *MockValidatorClient) EnsureMTPLoaded(_ context.Context, _ uint32) error {
 	return nil
 }
+
+// ValidateBatch implements mock batch validation.
+// Returns a positional result slice with no errors.
+func (m *MockValidatorClient) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...Option) ([]ValidationResult, error) {
+	results := make([]ValidationResult, len(txs))
+	for i, tx := range txs {
+		results[i].TxHash = *tx.TxIDChainHash()
+	}
+	return results, nil
+}
