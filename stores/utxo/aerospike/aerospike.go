@@ -132,9 +132,7 @@ type Store struct {
 	incrementBatcher    batcherIfc[batchIncrement]
 	setDAHBatcher       batcherIfc[batchDAH]
 	lockedBatcher       batcherIfc[batchLocked]
-	mergedOpsBatcher      batcherIfc[mixedOp]
-	mergedOpsReadBatcher  batcherIfc[mixedOp]
-	mergedOpsWriteBatcher batcherIfc[mixedOp]
+	mergedOpsBatcher    batcherIfc[mixedOp]
 	externalStore       blob.Store
 	utxoBatchSize       int
 	externalTxCache     *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
@@ -390,25 +388,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.mergedOpsBatcher = mInst
 		logger.Infof("[aerospike] merged-ops batcher enabled (mode=%s, size=%d, duration=%s, drain=%v, max_concurrent=%d)",
 			mode, mSize, mDur, tSettings.UtxoStore.MergedOpsBatcherDrainMode, mMaxConcurrent)
-
-		if tSettings.UtxoStore.MergedOpsBatcherSplitIntake {
-			rInst := batcher.NewWithPool(mSize, mDur, s.sendMergedOpsReadBatch, batcherBackground, batcherOpts("aerospike_merged_ops_read")...)
-			wInst := batcher.NewWithPool(mSize, mDur, s.sendMergedOpsWriteBatch, batcherBackground, batcherOpts("aerospike_merged_ops_write")...)
-			if mMaxConcurrent > 0 {
-				rInst.SetMaxConcurrent(mMaxConcurrent)
-				wInst.SetMaxConcurrent(mMaxConcurrent)
-			}
-			if tSettings.UtxoStore.MergedOpsBatcherDrainMode {
-				rInst.SetDrainMode(true)
-				wInst.SetDrainMode(true)
-			}
-			s.mergedOpsReadBatcher = rInst
-			s.mergedOpsWriteBatcher = wInst
-			// Disable single-intake batcher; submitOp uses mutually-exclusive routing.
-			s.mergedOpsBatcher = nil
-			logger.Infof("[aerospike] merged-ops split-intake enabled (size=%d, duration=%s, drain=%v, max_concurrent=%d)",
-				mSize, mDur, tSettings.UtxoStore.MergedOpsBatcherDrainMode, mMaxConcurrent)
-		}
 	}
 
 	// Per-batcher drain mode: each batcher can be independently configured.

@@ -29,34 +29,29 @@ func BenchmarkMergedOpsBatcher(b *testing.B) {
 		b.Skip("Skipping benchmark in short mode")
 	}
 
-	concurrencies := []int{32, 128, 512, 1024}
+	concurrencies := []int{32, 1024}
+	mergedMaxConcurrents := []int{512, 1024, 2048, 3584}
 
 	// off mode baseline (maxConcurrent inert for the merged batcher)
 	for _, conc := range concurrencies {
-		name := fmt.Sprintf("mode=off/drain=false/maxConc=0/splitIntake=false/concurrency=%d", conc)
+		name := fmt.Sprintf("mode=off/drain=false/maxConc=0/concurrency=%d", conc)
 		b.Run(name, func(b *testing.B) {
-			runMergedOpsBench(b, "off", false, conc, 0, false)
+			runMergedOpsBench(b, "off", false, conc, 0)
 		})
 	}
 
-	// split + drain=true + maxConc=1024 baseline (current winner)
-	for _, conc := range concurrencies {
-		name := fmt.Sprintf("mode=split/drain=true/maxConc=1024/splitIntake=false/concurrency=%d", conc)
-		b.Run(name, func(b *testing.B) {
-			runMergedOpsBench(b, "split", true, conc, 1024, false)
-		})
-	}
-
-	// split + drain=true + maxConc=1024 + splitIntake=true (new experiment)
-	for _, conc := range concurrencies {
-		name := fmt.Sprintf("mode=split/drain=true/maxConc=1024/splitIntake=true/concurrency=%d", conc)
-		b.Run(name, func(b *testing.B) {
-			runMergedOpsBench(b, "split", true, conc, 1024, true)
-		})
+	// split + drain=true × maxConcurrent sweep
+	for _, mc := range mergedMaxConcurrents {
+		for _, conc := range concurrencies {
+			name := fmt.Sprintf("mode=split/drain=true/maxConc=%d/concurrency=%d", mc, conc)
+			b.Run(name, func(b *testing.B) {
+				runMergedOpsBench(b, "split", true, conc, mc)
+			})
+		}
 	}
 }
 
-func runMergedOpsBench(b *testing.B, mode string, drain bool, concurrency int, mergedMaxConc int, splitIntake bool) {
+func runMergedOpsBench(b *testing.B, mode string, drain bool, concurrency int, mergedMaxConc int) {
 	logger := ulogger.NewErrorTestLogger(b)
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.UtxoStore.MergedOpsBatcherMode = mode
@@ -90,7 +85,6 @@ func runMergedOpsBench(b *testing.B, mode string, drain bool, concurrency int, m
 	tSettings.UtxoStore.BatcherMaxConcurrent = 512
 	// Merged-ops batcher dedicated max concurrent (0 = inherit BatcherMaxConcurrent)
 	tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent = mergedMaxConc
-	tSettings.UtxoStore.MergedOpsBatcherSplitIntake = splitIntake
 
 	store, ctx, deferFn := initAerospikeBench(b, tSettings, logger)
 	defer deferFn()
