@@ -158,19 +158,20 @@ func TestPrunedTxSet_SimulateChainPruning(t *testing.T) {
 	require.True(t, set.Contains(txD))
 }
 
-func TestPrunedTxSet_Saturated(t *testing.T) {
-	// Force saturation by adding far more entries than the configured cap.
-	// Cuckoo allocates power-of-two buckets, so with maxEntries=1024 the
-	// filter has ~256 buckets × 4 slots = 1024 slots. Inserting many
-	// thousand random hashes guarantees at least some Insert failures.
+func TestPrunedTxSet_RotatesUnderLoad(t *testing.T) {
+	// With the two-generation design, sustained Adds beyond the per-
+	// generation capacity should rotate generations rather than fail.
+	// We verify Rotations() climbs and InsertFailures() stays at zero.
 	set := NewPrunedTxSet(4, 1024)
 
 	for i := 0; i < 10000; i++ {
 		set.Add(randomHash(t))
 	}
 
-	require.True(t, set.Saturated(), "expected at least one Insert failure")
-	require.Greater(t, set.InsertFailures(), int64(0))
+	require.Positive(t, set.Rotations(),
+		"expected at least one generation rotation under sustained load")
+	require.Zero(t, set.InsertFailures(),
+		"two-generation design should not surface insert failures in normal operation")
 }
 
 func TestPrunedTxSet_DefaultCapacity(t *testing.T) {
