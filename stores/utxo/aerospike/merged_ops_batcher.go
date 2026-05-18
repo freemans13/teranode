@@ -269,9 +269,97 @@ func (s *Store) dispatchMixedBatchOperate(
 	}
 }
 
+// sendMergedOpsReadBatch handles the read-intake batcher (GET + Outpoint).
+// GET goes through sendGetBatch (BatchDecorate with retries); Outpoint goes
+// through its own BatchOperate. The two run in parallel.
+func (s *Store) sendMergedOpsReadBatch(items []*mixedOp) {
+	if len(items) == 0 {
+		return
+	}
+	var gets []*batchGetItem
+	var outpoints []*batchOutpoint
+	for _, it := range items {
+		switch it.kind {
+		case opGet:
+			if it.get != nil {
+				gets = append(gets, it.get)
+			}
+		case opOutpoint:
+			if it.outpoint != nil {
+				outpoints = append(outpoints, it.outpoint)
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	if len(gets) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sendGetBatch(gets)
+		}()
+	}
+	if len(outpoints) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.dispatchMixedBatchOperate(nil, nil, outpoints, nil, nil, nil)
+		}()
+	}
+	wg.Wait()
+}
+
+// sendMergedOpsWriteBatch handles the write-intake batcher
+// (SPEND + CREATE + Increment + SetDAH + SetLocked) via one mixed BatchOperate.
+func (s *Store) sendMergedOpsWriteBatch(items []*mixedOp) {
+	if len(items) == 0 {
+		return
+	}
+	var spends []*batchSpend
+	var creates []*BatchStoreItem
+	var increments []*batchIncrement
+	var setDAHs []*batchDAH
+	var setLockeds []*batchLocked
+	for _, it := range items {
+		switch it.kind {
+		case opSpend:
+			if it.spend != nil {
+				spends = append(spends, it.spend)
+			}
+		case opCreate:
+			if it.create != nil {
+				creates = append(creates, it.create)
+			}
+		case opIncrement:
+			if it.increment != nil {
+				increments = append(increments, it.increment)
+			}
+		case opSetDAH:
+			if it.setDAH != nil {
+				setDAHs = append(setDAHs, it.setDAH)
+			}
+		case opSetLocked:
+			if it.setLocked != nil {
+				setLockeds = append(setLockeds, it.setLocked)
+			}
+		}
+	}
+	s.dispatchMixedBatchOperate(spends, creates, nil, increments, setDAHs, setLockeds)
+}
+
 // submitOp routes an op to either the merged batcher (when configured) or the
 // legacy per-op batcher.
 func (s *Store) submitOp(ctx context.Context, op *mixedOp) {
+	// Split-intake path: route by op-kind to read or write batcher.
+	if s.mergedOpsReadBatcher != nil {
+		switch op.kind {
+		case opGet, opOutpoint:
+			s.mergedOpsReadBatcher.PutCtx(ctx, op)
+		default:
+			s.mergedOpsWriteBatcher.PutCtx(ctx, op)
+		}
+		return
+	}
 	if s.mergedOpsBatcher != nil {
 		s.mergedOpsBatcher.PutCtx(ctx, op)
 		return

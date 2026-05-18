@@ -1,4 +1,4 @@
-# Aerospike UTXO Store — Merged GET/SPEND/CREATE Batcher
+# Aerospike UTXO Store — Merged Ops Batcher (all 7 batchers)
 
 **Date:** 2026-05-18
 **Status:** Design — pending implementation plan
@@ -7,35 +7,45 @@
 ## Goal
 
 Increase throughput and reduce per-op latency in the Aerospike UTXO store's per-tx
-path by merging three currently-independent go-batchers (`getBatcher`,
-`spendBatcher`, `storeBatcher`) into a single shared batcher. The merged batcher
-fills ~3× faster than any individual batcher today, so the duration-timeout fires
-much less often — flushes are driven by size, not delay.
+path by merging **all seven** currently-independent go-batchers (`getBatcher`,
+`spendBatcher`, `storeBatcher`, `outpointBatcher`, `incrementBatcher`,
+`setDAHBatcher`, `lockedBatcher`) into a single shared batcher. The merged
+batcher fills proportionally faster than any individual batcher today, so the
+duration-timeout fires much less often — flushes are driven by size, not delay.
 
-This is complementary to PR #871: that PR adds a separate *batch* API for callers
-who already hold N txs; this design improves the *per-tx* path that those same
-callers (and others, e.g. Kafka-fed flows) still hit.
+An earlier draft of this design carved SetLocked (and the other "write-tail"
+ops) out of scope on the grounds that "BA must not be mixed in". On
+re-examination, that invariant is about *when* the caller invokes `SetLocked`
+(only after `BA.Store` returns), not which Aerospike `BatchOperate` the op
+rides in. Once queued, each op is records + a callback; the merged transport
+preserves callback semantics, so all seven batchers can share one intake.
+
+This is complementary to PR #871: that PR adds a separate *batch* API for
+callers who already hold N txs; this design improves the *per-tx* path that
+those same callers (and others, e.g. Kafka-fed flows) still hit.
 
 ## Non-Goals
 
-- Do not change `outpointBatcher`, `incrementBatcher`, `setDAHBatcher`, or
-  `lockedBatcher`. SetLocked in particular must not be coalesced with op flows
-  that interact with Block Assembly — that invariant is preserved.
 - Do not alter validator phase ordering. Within one tx, GET still completes
-  before SPEND, SPEND before CREATE.
+  before SPEND, SPEND before CREATE, and SetLocked still happens only after
+  the caller observes `BA.Store` success.
 - Do not change the Aerospike record schema or Lua UDFs.
+- Do not change the per-record policy semantics — each op-type keeps its own
+  per-record policy in the merged call.
 
 ## Scope (which ops merge)
 
-| Op | Current batcher | Item type | Merged? |
+All seven existing per-op batchers in `aerospike.go:127-134` merge:
+
+| Op | Current batcher | Item type | Notes |
 |----|----|----|----|
-| GET (parents/utxos) | `getBatcher` | `batchGetItem` | yes |
-| SPEND | `spendBatcher` | `batchSpend` (Lua UDF) | yes |
-| CREATE (store) | `storeBatcher` | `BatchStoreItem` | yes |
-| Outpoint decorate | `outpointBatcher` | `batchOutpoint` | no |
-| Increment | `incrementBatcher` | `batchIncrement` | no |
-| SetDAH | `setDAHBatcher` | `batchDAH` | no |
-| SetLocked | `lockedBatcher` | `batchLocked` | no |
+| GET | `getBatcher` | `batchGetItem` | Read; no UDF |
+| SPEND | `spendBatcher` | `batchSpend` | Lua UDF write; circuit breaker stays *outside* the merged path |
+| CREATE (store) | `storeBatcher` | `BatchStoreItem` | Write with fee/conflicting expressions |
+| Outpoint decorate | `outpointBatcher` | `batchOutpoint` | Read |
+| Increment | `incrementBatcher` | `batchIncrement` | Write (counter add) |
+| SetDAH | `setDAHBatcher` | `batchDAH` | Write (DAH bin) |
+| SetLocked | `lockedBatcher` | `batchLocked` | Write (locked bin); only queued after `BA.Store` returns |
 
 ## Runtime Modes
 
@@ -70,69 +80,79 @@ const (
     opGet opKind = iota
     opSpend
     opCreate
+    opOutpoint
+    opIncrement
+    opSetDAH
+    opSetLocked
 )
 
 type mixedOp struct {
-    kind   opKind
-    get    *batchGetItem    // non-nil iff kind == opGet
-    spend  *batchSpend      // non-nil iff kind == opSpend
-    create *BatchStoreItem  // non-nil iff kind == opCreate
+    kind      opKind
+    get       *batchGetItem    // non-nil iff kind == opGet
+    spend     *batchSpend      // non-nil iff kind == opSpend
+    create    *BatchStoreItem  // non-nil iff kind == opCreate
+    outpoint  *batchOutpoint
+    increment *batchIncrement
+    setDAH    *batchDAH
+    setLocked *batchLocked
 }
 ```
 
 ### Flush handler: `sendMergedOpsBatch(items []*mixedOp)`
 
-Refactor the three existing flush handlers (`sendGetBatch`,
-`sendSpendBatchLua`, `sendStoreBatch`) into pairs:
-
-- `buildGetRecords(items []*batchGetItem) []aerospike.BatchRecord`
-- `buildSpendRecords(items []*batchSpend) []aerospike.BatchRecord`
-- `buildStoreRecords(items []*BatchStoreItem) []aerospike.BatchRecord`
-
-…and matching `dispatchGetResults` / `dispatchSpendResults` /
-`dispatchStoreResults` functions that consume the post-`BatchOperate` records
-and fire each item's callback. The existing single-batcher handlers become
-thin wrappers around these.
+Refactor each of the seven existing flush handlers (`sendGetBatch`,
+`sendSpendBatchLua`, `sendStoreBatch`, `sendOutpointBatch`,
+`sendIncrementBatch`, `sendSetDAHBatch`, `sendLockedBatch`) into a
+`build<Op>Records` + dispatch-closure pair. The existing single-batcher
+handlers become thin wrappers around their pair.
 
 `sendMergedOpsBatch` then:
 
-- **`single` mode:** concatenate records from all three builders (preserving
+- **`single` mode:** concatenate records from all seven builders (preserving
   per-op slice offsets), one `client.BatchOperate`, dispatch by slice.
-- **`split` mode:** build the GET slice and the SPEND+CREATE slice; fire two
-  `BatchOperate` calls under `errgroup.Group`; dispatch.
+- **`split` mode:** partition into a **read slice** (GET + Outpoint) and a
+  **write slice** (SPEND + CREATE + Increment + SetDAH + SetLocked); fire two
+  `BatchOperate` calls under `errgroup.Group`; dispatch. Reads are pure-read
+  policies and benefit from not waiting on UDF/write latency; writes share
+  policy ergonomics.
 
 ### Submission sites
 
-Each of `get.go`, `spend.go`, `create.go` currently calls
+Each of `get.go`, `spend.go`, `create.go`, plus the four "tail" op sites
+(outpoint, increment, setDAH, setLocked) currently calls
 `s.<x>Batcher.Put(&item)`. Replace with a small helper:
 
 ```go
-func (s *Store) submitOp(op *mixedOp) {
+func (s *Store) submitOp(ctx context.Context, op *mixedOp) {
     if s.mergedOpsBatcher != nil {
-        s.mergedOpsBatcher.Put(op)
+        s.mergedOpsBatcher.PutCtx(ctx, op)
         return
     }
     switch op.kind {
-    case opGet:    s.getBatcher.Put(op.get)
-    case opSpend:  s.spendBatcher.Put(op.spend)
-    case opCreate: s.storeBatcher.Put(op.create)
+    case opGet:        s.getBatcher.PutCtx(ctx, op.get)
+    case opSpend:      s.spendBatcher.PutCtx(ctx, op.spend)
+    case opCreate:     s.storeBatcher.PutCtx(ctx, op.create)
+    case opOutpoint:   s.outpointBatcher.PutCtx(ctx, op.outpoint)
+    case opIncrement:  s.incrementBatcher.PutCtx(ctx, op.increment)
+    case opSetDAH:     s.setDAHBatcher.PutCtx(ctx, op.setDAH)
+    case opSetLocked:  s.lockedBatcher.PutCtx(ctx, op.setLocked)
     }
 }
 ```
 
 `mergedOpsBatcher` is non-nil only when mode != `off`. When non-nil, the
-per-op batchers are not constructed (saves the goroutines/timers).
+per-op batchers are left constructed (cheap; preserves runtime-toggle option
+for follow-up work).
 
 ## Settings
 
-Added to `settings/utxostore_settings.go` (matching the existing per-op
-settings):
+Added to `settings/utxostore_settings.go`:
 
 - `aerospike_mergedOpsBatcherMode` (string, default `off`).
-- `aerospike_mergedOpsBatcherSize` (int, default = max of current Get / Spend /
-  Store batcher sizes).
+- `aerospike_mergedOpsBatcherSize` (int, default = max of current per-op
+  batcher sizes).
 - `aerospike_mergedOpsBatcherDurationMillis` (int, default = min of current
-  Get / Spend / Store batcher durations).
+  per-op batcher durations).
 
 Defaults ensure the merged batcher fills no slower than today's fastest filler
 and flushes no later than today's tightest duration.
@@ -158,8 +178,10 @@ and flushes no later than today's tightest duration.
   merged batcher when configured. Assert `sendMergedOpsBatch` dispatches to
   the correct per-item callback in both modes, including partial-failure cases.
 - **Integration (testcontainers Aerospike):** parity tests that run a mixed
-  workload (concurrent Get / Spend / Create) in all three modes and assert
-  identical observable outcomes (utxo states, errors, returned values).
+  workload (concurrent Get / Spend / Create / Outpoint-decorate / Increment /
+  SetDAH / SetLocked) in all three modes and assert identical observable
+  outcomes (utxo states, errors, returned values, ordering observed by
+  callers).
 - **Bench (real Aerospike, 128-core):** mirror PR #871's concurrency sweep
   (32 / 128 / 512 / 1024). Compare `off` / `single` / `split` head-to-head.
   Report ms/op per op-type plus end-to-end `Validate` ms/op.
@@ -185,13 +207,20 @@ Plus the Aerospike-tagged integration suite and the bench sweep above.
 - **GET p99 regression in `single` mode.** Expected; that's exactly why `split`
   exists. The bench sweep makes the tradeoff visible before any rollout.
 - **Circuit breaker scope.** `circuit_breaker.go` is per-batcher today. The
-  merged batcher gets its own breaker instance; if it trips, all three op
+  merged batcher gets its own breaker instance; if it trips, all seven op
   flows are affected together. Acceptable for an experimental mode behind a
-  default-off flag.
+  default-off flag. Today's `spendCircuitBreaker` guard stays in
+  `sendSpendBatchLua`'s pre-flight (runs before `submitOp`), so an open
+  breaker still short-circuits SPEND items without affecting other op types
+  queued in the merged batcher.
 - **Backpressure interaction.** A slow downstream (Aerospike GC pause) that
   today only stalls one batcher will now stall the merged one — i.e. all
-  three op flows. Same as production reality (Aerospike is shared), but worth
+  seven op flows. Same as production reality (Aerospike is shared), but worth
   noting.
+- **SetLocked ordering.** Earlier draft excluded SetLocked. We've concluded
+  the BA-coordination invariant is enforced at the caller (don't queue
+  SetLocked until BA.Store returns), not at the transport. Verify in parity
+  tests that ordering observed by callers is unchanged.
 
 ## Rollout
 
