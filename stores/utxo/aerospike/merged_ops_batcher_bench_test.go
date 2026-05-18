@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	teranode_aerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
@@ -45,8 +46,33 @@ func runMergedOpsBench(b *testing.B, mode string, concurrency int) {
 	logger := ulogger.NewErrorTestLogger(b)
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.UtxoStore.MergedOpsBatcherMode = mode
-	tSettings.UtxoStore.MergedOpsBatcherSize = 500
-	tSettings.UtxoStore.MergedOpsBatcherDurationMillis = 10
+	// Merged-ops sized to match production timing: size=512, duration=1ms.
+	tSettings.UtxoStore.MergedOpsBatcherSize = 512
+	tSettings.UtxoStore.MergedOpsBatcherDurationMillis = 1
+
+	// Align per-op batcher config with production propagation pods on dev-scale-1.
+	// Get: size=512, dur=1ms, drain=true
+	tSettings.UtxoStore.GetBatcherSize = 512
+	tSettings.UtxoStore.GetBatcherDurationMillis = 1
+	tSettings.UtxoStore.GetBatcherDrainMode = true
+	// Store/Create: size=512, dur=1ms, drain=true. Aerospike code reads the
+	// duration from tSettings.Aerospike.StoreBatcherDuration (time.Duration),
+	// not from UtxoStore.StoreBatcherDurationMillis. Set both to be safe.
+	tSettings.UtxoStore.StoreBatcherSize = 512
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 1
+	tSettings.UtxoStore.StoreBatcherDrainMode = true
+	tSettings.Aerospike.StoreBatcherDuration = 1 * time.Millisecond
+	// Spend: size=512, dur=1ms, drain=false, concurrency=256
+	tSettings.UtxoStore.SpendBatcherSize = 512
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 1
+	tSettings.UtxoStore.SpendBatcherDrainMode = false
+	tSettings.UtxoStore.SpendBatcherConcurrency = 256
+	// Locked: size=512, dur=1ms, drain=false
+	tSettings.UtxoStore.LockedBatcherSize = 512
+	tSettings.UtxoStore.LockedBatcherDurationMillis = 1
+	tSettings.UtxoStore.LockedBatcherDrainMode = false
+	// Per-batcher in-flight cap
+	tSettings.UtxoStore.BatcherMaxConcurrent = 512
 
 	store, ctx, deferFn := initAerospikeBench(b, tSettings, logger)
 	defer deferFn()
