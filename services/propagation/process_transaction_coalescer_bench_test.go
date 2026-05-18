@@ -100,6 +100,15 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 	tSettings.BlockAssembly.Disabled = true
 	tSettings.Validator.UseBatchValidation = useBatch
 
+	// Enable merged-ops batcher (PR #887) across ALL bench variants — sits below
+	// the validator pipeline, applies equally to direct, coalescer drain=false,
+	// and coalescer drain=true paths.
+	tSettings.UtxoStore.MergedOpsBatcherMode = "single"
+	tSettings.UtxoStore.MergedOpsBatcherSize = 512
+	tSettings.UtxoStore.MergedOpsBatcherDurationMillis = 1
+	tSettings.UtxoStore.MergedOpsBatcherDrainMode = true
+	tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent = 1024
+
 	container, err := aeroTest.RunContainer(ctx, aeroTest.WithTTLSupport("test"))
 	if err != nil {
 		b.Skipf("Aerospike testcontainer unavailable: %v", err)
