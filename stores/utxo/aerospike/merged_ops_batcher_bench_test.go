@@ -30,25 +30,33 @@ func BenchmarkMergedOpsBatcher(b *testing.B) {
 	}
 
 	modes := []string{"off", "single", "split"}
-	concurrencies := []int{32, 128, 512, 1024}
+	concurrencies := []int{32, 1024}
+	drainOptions := []bool{false, true}
 
 	for _, mode := range modes {
-		for _, conc := range concurrencies {
-			name := fmt.Sprintf("mode=%s/concurrency=%d", mode, conc)
-			b.Run(name, func(b *testing.B) {
-				runMergedOpsBench(b, mode, conc)
-			})
+		for _, drain := range drainOptions {
+			// "off" mode doesn't use the merged batcher; only run drain=false for it.
+			if mode == "off" && drain {
+				continue
+			}
+			for _, conc := range concurrencies {
+				name := fmt.Sprintf("mode=%s/drain=%v/concurrency=%d", mode, drain, conc)
+				b.Run(name, func(b *testing.B) {
+					runMergedOpsBench(b, mode, drain, conc)
+				})
+			}
 		}
 	}
 }
 
-func runMergedOpsBench(b *testing.B, mode string, concurrency int) {
+func runMergedOpsBench(b *testing.B, mode string, drain bool, concurrency int) {
 	logger := ulogger.NewErrorTestLogger(b)
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.UtxoStore.MergedOpsBatcherMode = mode
 	// Merged-ops sized to match production timing: size=512, duration=1ms.
 	tSettings.UtxoStore.MergedOpsBatcherSize = 512
 	tSettings.UtxoStore.MergedOpsBatcherDurationMillis = 1
+	tSettings.UtxoStore.MergedOpsBatcherDrainMode = drain
 
 	// Align per-op batcher config with production propagation pods on dev-scale-1.
 	// Get: size=512, dur=1ms, drain=true

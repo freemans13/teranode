@@ -378,6 +378,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		if batcherMaxConcurrent > 0 {
 			mInst.SetMaxConcurrent(batcherMaxConcurrent)
 		}
+		if tSettings.UtxoStore.MergedOpsBatcherDrainMode {
+			mInst.SetDrainMode(true)
+		}
 		s.mergedOpsBatcher = mInst
 		logger.Infof("[aerospike] merged-ops batcher enabled (mode=%s, size=%d, duration=%s)", mode, mSize, mDur)
 	}
