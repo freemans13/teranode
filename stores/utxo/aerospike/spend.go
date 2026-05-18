@@ -521,21 +521,48 @@ func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
 	batchID := s.batchID.Add(1)
 	s.logSpendBatchStart(batchID, len(batch))
 
-	// Prepare and execute batch
+	records, dispatch := s.buildSpendRecords(ctx, batch, batchID)
+	if dispatch == nil {
+		return
+	}
+
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+
+	var batchErr aerospike.Error
+	if s.batchOperateFn != nil {
+		batchErr = s.batchOperateFn(batchPolicy, records)
+	} else {
+		batchErr = s.client.BatchOperate(batchPolicy, records)
+	}
+
+	dispatch(records, batchErr)
+	stat.NewStat("postBatchOperate").AddTime(start)
+}
+
+// buildSpendRecords builds the BatchUDF records for a spend batch and returns a
+// dispatch closure that processes results (including spend signals and per-record
+// errors). Returns (nil, nil) if prepareSpendBatches fails — in that case items
+// have already been notified.
+func (s *Store) buildSpendRecords(ctx context.Context, batch []*batchSpend, batchID uint64) (records []aerospike.BatchRecordIfc, dispatch func([]aerospike.BatchRecordIfc, aerospike.Error)) {
 	batchesByKey, err := s.prepareSpendBatches(batch, batchID)
 	if err != nil {
-		return
+		return nil, nil
 	}
 
 	batchRecords, batchRecordKeys := s.createBatchRecords(batchesByKey)
 
-	if err := s.executeSpendBatch(batchRecords, batch, batchID); err != nil {
-		return
+	dispatch = func(records []aerospike.BatchRecordIfc, batchErr aerospike.Error) {
+		if batchErr != nil {
+			for idx, bItem := range batch {
+				bItem.errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] failed to batch spend aerospike map utxo in batchId %d: %d - %w", bItem.spend.TxID.String(), batchID, idx, batchErr)
+			}
+			return
+		}
+
+		s.processSpendBatchResults(ctx, records, batchRecordKeys, batchesByKey, batch, batchID)
 	}
 
-	// Process results
-	s.processSpendBatchResults(ctx, batchRecords, batchRecordKeys, batchesByKey, batch, batchID)
-	stat.NewStat("postBatchOperate").AddTime(start)
+	return batchRecords, dispatch
 }
 
 // logSpendBatchStart logs the start of a spend batch if verbose debug is enabled
@@ -1085,18 +1112,33 @@ func (s *Store) IncrementSpentRecords(txid *chainhash.Hash, increment int) (inte
 }
 
 func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
-	var err error
-
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+
+	records, dispatch := s.buildIncrementRecords(s.ctx, batch)
+
+	var batchErr aerospike.Error
+	if s.batchOperateFn != nil {
+		batchErr = s.batchOperateFn(batchPolicy, records)
+	} else {
+		batchErr = s.client.BatchOperate(batchPolicy, records)
+	}
+
+	dispatch(records, batchErr)
+}
+
+// buildIncrementRecords builds the BatchUDF records for an increment batch and returns
+// a dispatch closure that processes the per-record results and notifies each item.
+func (s *Store) buildIncrementRecords(_ context.Context, batch []*batchIncrement) (records []aerospike.BatchRecordIfc, dispatch func([]aerospike.BatchRecordIfc, aerospike.Error)) {
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 
-	// Create a batch of records to read, with a max size of the batch
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(batch))
+	// recordToItem maps batchRecords index -> batch index, so dispatch can route per-record results
+	// back to the original item even when some items short-circuit on key-creation failure.
+	recordToItem := make([]int, 0, len(batch))
 
 	currentBlockHeight := s.blockHeight.Load()
 
-	// Create a batch of records to read from the txHashes
-	for _, item := range batch {
+	for itemIdx, item := range batch {
 		aeroKey, err := aerospike.NewKey(s.namespace, s.setName, item.txID[:])
 		if err != nil {
 			item.res <- incrementSpentRecordsRes{
@@ -1112,55 +1154,73 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 			aerospike.NewIntegerValue(int(currentBlockHeight)),
 			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
 		))
+		recordToItem = append(recordToItem, itemIdx)
 	}
 
-	// send the batch to aerospike
-	err = s.client.BatchOperate(batchPolicy, batchRecords)
-	if err != nil {
-		for _, item := range batch {
-			item.res <- incrementSpentRecordsRes{
-				res: nil,
-				err: errors.NewStorageError("error in aerospike send outpoint batch records", err),
+	dispatch = func(records []aerospike.BatchRecordIfc, batchErr aerospike.Error) {
+		if batchErr != nil {
+			for _, itemIdx := range recordToItem {
+				batch[itemIdx].res <- incrementSpentRecordsRes{
+					res: nil,
+					err: errors.NewStorageError("error in aerospike send outpoint batch records", batchErr),
+				}
 			}
+
+			return
 		}
 
-		return
+		// Note: the original handler passed the outer `err` (which was nil after a
+		// successful BatchOperate) into the per-record error wrapper. Preserve that
+		// behaviour by passing nil here — refactor must keep observable output unchanged.
+		for recIdx, batchRecordIfc := range records {
+			itemIdx := recordToItem[recIdx]
+			batchRecord := batchRecordIfc.BatchRec()
+			if batchRecord.Err != nil {
+				batch[itemIdx].res <- incrementSpentRecordsRes{
+					res: nil,
+					err: errors.NewStorageError("error in aerospike send outpoint batch records", nil),
+				}
+
+				continue
+			}
+
+			rawResponse := batchRecord.Record.Bins[LuaSuccess.String()]
+			if rawResponse == nil {
+				batch[itemIdx].res <- incrementSpentRecordsRes{
+					res: nil,
+					err: errors.NewProcessingError("no response from Lua"),
+				}
+				continue
+			}
+
+			batch[itemIdx].res <- incrementSpentRecordsRes{
+				res: rawResponse,
+				err: nil,
+			}
+		}
 	}
 
-	// Process the batch records
-	for idx, batchRecordIfc := range batchRecords {
-		batchRecord := batchRecordIfc.BatchRec()
-		if batchRecord.Err != nil {
-			batch[idx].res <- incrementSpentRecordsRes{
-				res: nil,
-				err: errors.NewStorageError("error in aerospike send outpoint batch records", err),
-			}
-
-			continue
-		}
-
-		// Get the raw response from Lua
-		rawResponse := batchRecord.Record.Bins[LuaSuccess.String()]
-		if rawResponse == nil {
-			batch[idx].res <- incrementSpentRecordsRes{
-				res: nil,
-				err: errors.NewProcessingError("no response from Lua"),
-			}
-			continue
-		}
-
-		// Pass through the raw response - let the caller handle parsing
-		batch[idx].res <- incrementSpentRecordsRes{
-			res: rawResponse,
-			err: nil,
-		}
-	}
+	return batchRecords, dispatch
 }
 
 func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
-	var err error
+	records, dispatch := s.buildSetDAHRecords(s.ctx, batch)
 
-	// Create batch records with individual TTLs
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+
+	var batchErr aerospike.Error
+	if s.batchOperateFn != nil {
+		batchErr = s.batchOperateFn(batchPolicy, records)
+	} else {
+		batchErr = s.client.BatchOperate(batchPolicy, records)
+	}
+
+	dispatch(records, batchErr)
+}
+
+// buildSetDAHRecords builds the BatchWrite records for a setDAH batch and returns
+// a dispatch closure that notifies each item with the per-record result.
+func (s *Store) buildSetDAHRecords(_ context.Context, batch []*batchDAH) (records []aerospike.BatchRecordIfc, dispatch func([]aerospike.BatchRecordIfc, aerospike.Error)) {
 	batchRecords := make([]aerospike.BatchRecordIfc, len(batch))
 	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
 	dahBinName := fields.DeleteAtHeight.String()
@@ -1182,25 +1242,26 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 		}
 	}
 
-	// Execute batch operation
-	err = s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords)
-	if err != nil {
-		for _, bItem := range batch {
-			bItem.errCh <- errors.NewStorageError("[SetDAHBatch][%s] failed to set DAH", err)
+	dispatch = func(records []aerospike.BatchRecordIfc, batchErr aerospike.Error) {
+		if batchErr != nil {
+			for _, bItem := range batch {
+				bItem.errCh <- errors.NewStorageError("[SetDAHBatch][%s] failed to set DAH", batchErr)
+			}
+
+			return
 		}
 
-		return
-	}
+		for batchIdx, batchRecord := range records {
+			err := batchRecord.BatchRec().Err
 
-	// batchOperate may have no errors, but some of the records may have failed
-	for batchIdx, batchRecord := range batchRecords {
-		err = batchRecord.BatchRec().Err
+			if err != nil {
+				batch[batchIdx].errCh <- err
+				continue
+			}
 
-		if err != nil {
-			batch[batchIdx].errCh <- err
-			continue
+			batch[batchIdx].errCh <- nil
 		}
-
-		batch[batchIdx].errCh <- nil
 	}
+
+	return batchRecords, dispatch
 }

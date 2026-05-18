@@ -272,22 +272,39 @@ func (s *Store) sendStoreBatch(batch []*BatchStoreItem) {
 
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 
+	if s.settings.UtxoStore.VerboseDebug {
+		s.logger.Debugf("[STORE_BATCH] sending batch of %d txMetas", len(batch))
+	}
+
+	records, dispatch := s.buildStoreRecords(ctx, batch, stat, &start)
+
+	batchID := s.batchID.Add(1)
+
+	batchOperate := s.batchOperateFn
+	if batchOperate == nil {
+		batchOperate = s.client.BatchOperate
+	}
+
+	batchErr := batchOperate(batchPolicy, records)
+
+	dispatch(records, batchErr, batchID)
+	stat.NewStat("postBatchOperate").AddTime(start)
+}
+
+// buildStoreRecords builds the BatchWrite records for a store batch (handling external
+// storage offload, oversize splits, and the resultHandledElsewhere bookkeeping) and
+// returns a dispatch closure that processes the BatchOperate result. The dispatch takes
+// an extra batchID parameter so error messages remain identical to the legacy handler.
+func (s *Store) buildStoreRecords(ctx context.Context, batch []*BatchStoreItem, stat *gocore.Stat, start *time.Time) (records []aerospike.BatchRecordIfc, dispatch func([]aerospike.BatchRecordIfc, aerospike.Error, uint64)) {
 	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
 	batchWritePolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(batch))
 	// resultHandledElsewhere[idx] = true means bItem.done has already been notified by
-	// this iteration of sendStoreBatch (either directly via SafeSend below or via a
-	// goroutine that takes ownership of the result), so subsequent error/success
-	// loops MUST NOT send a second notification on the same channel. Without this,
-	// items that were notified pre-BatchOperate would receive a duplicate from the
-	// per-record loop, and items that hit specific aerospike result codes would
-	// silently fall through unnotified.
+	// this iteration (either directly via SafeSend below or via a goroutine that takes
+	// ownership of the result), so subsequent error/success loops MUST NOT send a
+	// second notification on the same channel.
 	resultHandledElsewhere := make([]bool, len(batch))
-
-	if s.settings.UtxoStore.VerboseDebug {
-		s.logger.Debugf("[STORE_BATCH] sending batch of %d txMetas", len(batch))
-	}
 
 	var (
 		key         *aerospike.Key
@@ -342,7 +359,7 @@ func (s *Store) sendStoreBatch(batch []*BatchStoreItem) {
 			continue
 		}
 
-		start = stat.NewStat("GetBinsToStore").AddTime(start)
+		*start = stat.NewStat("GetBinsToStore").AddTime(*start)
 
 		if len(binsToStore) > 1 {
 			// Make this batch item a NOOP and persist all of these to be written via a queue
@@ -443,109 +460,78 @@ func (s *Store) sendStoreBatch(batch []*BatchStoreItem) {
 
 	}
 
-	batchID := s.batchID.Add(1)
+	dispatch = func(records []aerospike.BatchRecordIfc, batchErr aerospike.Error, batchID uint64) {
+		if batchErr != nil {
+			var aErr *aerospike.AerospikeError
 
-	batchOperate := s.batchOperateFn
-	if batchOperate == nil {
-		batchOperate = s.client.BatchOperate
-	}
-
-	err = batchOperate(batchPolicy, batchRecords)
-	if err != nil {
-		var aErr *aerospike.AerospikeError
-
-		ok := errors.As(err, &aErr)
-		if ok {
-			if aErr.ResultCode == types.KEY_EXISTS_ERROR {
-				// Send a TxExistsError to each item using ITS OWN txHash. The previous
-				// code hard-coded batch[0].txHash for the whole batch, which produced
-				// misleading error messages whenever the batcher grouped >1 item.
-				for idx, bItem := range batch {
-					if resultHandledElsewhere[idx] {
-						continue
+			ok := errors.As(batchErr, &aErr)
+			if ok {
+				if aErr.ResultCode == types.KEY_EXISTS_ERROR {
+					for idx, bItem := range batch {
+						if resultHandledElsewhere[idx] {
+							continue
+						}
+						util.SafeSend[error](bItem.done, errors.NewTxExistsError("[sendStoreBatch-1] %v already exists in store", bItem.txHash))
 					}
-					util.SafeSend[error](bItem.done, errors.NewTxExistsError("[sendStoreBatch-1] %v already exists in store", bItem.txHash))
-				}
 
-				return
+					return
+				}
 			}
+
+			s.logger.Errorf("[STORE_BATCH][batch:%d] error in aerospike map store batch records: %v", batchID, batchErr)
+
+			for idx, bItem := range batch {
+				if resultHandledElsewhere[idx] {
+					continue
+				}
+				util.SafeSend[error](bItem.done, batchErr)
+			}
+
+			return
 		}
 
-		s.logger.Errorf("[STORE_BATCH][batch:%d] error in aerospike map store batch records: %v", batchID, err)
+		*start = stat.NewStat("BatchOperate").AddTime(*start)
 
-		for idx, bItem := range batch {
+		for idx, batchRecord := range records {
 			if resultHandledElsewhere[idx] {
 				continue
 			}
-			util.SafeSend(bItem.done, err)
-		}
 
-		// MUST return here. The previous code fell through to the per-record loop
-		// after a top-level non-KEY_EXISTS error, where SafeSend(nil) was called for
-		// any record whose per-record Err happened to be unset — producing spurious
-		// success notifications on top of the real error.
-		return
-	}
-
-	start = stat.NewStat("BatchOperate").AddTime(start)
-
-	// batchOperate may have no errors, but some of the records may have failed
-	for idx, batchRecord := range batchRecords {
-		// Items that were already notified directly (key/bins errors) or that handed
-		// ownership of their done channel to a goroutine (multi-record external path)
-		// must not be touched again here. KEY_NOT_FOUND_ERROR is the expected per-record
-		// outcome for the NOOP placeholder reads — when resultHandledElsewhere is true
-		// we skip without trying to classify the error.
-		if resultHandledElsewhere[idx] {
-			continue
-		}
-
-		err = batchRecord.BatchRec().Err
-		if err != nil {
-			if aErr, ok := err.(*aerospike.AerospikeError); ok {
-				if aErr.ResultCode == types.KEY_EXISTS_ERROR {
-					util.SafeSend[error](batch[idx].done, errors.NewTxExistsError("[sendStoreBatch-2] %v already exists in store", batch[idx].txHash))
-					continue
-				}
-
-				if aErr.ResultCode == types.RECORD_TOO_BIG {
-					binsToStore, err = s.GetBinsToStore(batch[idx].tx, batch[idx].blockHeight, batch[idx].blockIDs, batch[idx].blockHeights, batch[idx].subtreeIdxs, true, batch[idx].txHash, batch[idx].isCoinbase, batch[idx].conflicting, batch[idx].locked) // true is to say this is a big record
-					if err != nil {
-						util.SafeSend[error](batch[idx].done, errors.NewProcessingError("could not get bins to store", err))
+			recErr := batchRecord.BatchRec().Err
+			if recErr != nil {
+				if aErr, ok := recErr.(*aerospike.AerospikeError); ok {
+					if aErr.ResultCode == types.KEY_EXISTS_ERROR {
+						util.SafeSend[error](batch[idx].done, errors.NewTxExistsError("[sendStoreBatch-2] %v already exists in store", batch[idx].txHash))
 						continue
 					}
 
-					// The goroutine owns the done channel from here on.
-					resultHandledElsewhere[idx] = true
-					if len(batch[idx].tx.Inputs) == 0 {
-						go s.StorePartialTransactionExternally(ctx, batch[idx], binsToStore)
-					} else {
-						go s.StoreTransactionExternally(ctx, batch[idx], binsToStore)
-					}
+					if aErr.ResultCode == types.RECORD_TOO_BIG {
+						bts, bErr := s.GetBinsToStore(batch[idx].tx, batch[idx].blockHeight, batch[idx].blockIDs, batch[idx].blockHeights, batch[idx].subtreeIdxs, true, batch[idx].txHash, batch[idx].isCoinbase, batch[idx].conflicting, batch[idx].locked)
+						if bErr != nil {
+							util.SafeSend[error](batch[idx].done, errors.NewProcessingError("could not get bins to store", bErr))
+							continue
+						}
 
-					continue
+						resultHandledElsewhere[idx] = true
+						if len(batch[idx].tx.Inputs) == 0 {
+							go s.StorePartialTransactionExternally(ctx, batch[idx], bts)
+						} else {
+							go s.StoreTransactionExternally(ctx, batch[idx], bts)
+						}
+
+						continue
+					}
 				}
+
+				util.SafeSend[error](batch[idx].done, errors.NewStorageError("[STORE_BATCH][%s:%d] error in aerospike store batch record for tx (will retry): %d", batch[idx].txHash.String(), idx, batchID, recErr))
+				continue
 			}
 
-			// Fallback: any other per-record error — including const aerospike.Error
-			// sentinels that fail the *AerospikeError type assertion (e.g. ErrTimeout)
-			// and KEY_NOT_FOUND_ERROR on a real BatchWrite (which is NOT a NOOP) — must
-			// be surfaced. Previously the SafeSend was nested inside the type-asserted
-			// branch and a non-matching error left the caller hung on <-errCh.
-			util.SafeSend[error](batch[idx].done, errors.NewStorageError("[STORE_BATCH][%s:%d] error in aerospike store batch record for tx (will retry): %d", batch[idx].txHash.String(), idx, batchID, err))
-			continue
+			util.SafeSend(batch[idx].done, nil)
 		}
-
-		// No per-record error and not handled elsewhere — the BatchWrite succeeded,
-		// so notify success. The previous code gated this on an outputs<=batchSize
-		// comparison that was supposed to be an indirect proxy for "not offloaded";
-		// the resultHandledElsewhere flag now makes that proxy redundant. If outputs
-		// > batchSize the item would already have set resultHandledElsewhere=true and
-		// been skipped above, so reaching this point means we owe the caller a result.
-		util.SafeSend(batch[idx].done, nil)
 	}
 
-	stat.NewStat("postBatchOperate").AddTime(start)
+	return batchRecords, dispatch
 }
 
 // splitIntoBatches splits a set of UTXOs into batches of the configured size.

@@ -1205,27 +1205,43 @@ func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
 		previousOutputsDecorateStat.AddTimeForRange(start, len(batch))
 	}()
 
-	var err error
-
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	// we only want to read from the master for tx metadata, due to blockIDs being updated
 	// however we still want to read from the replica for the utxos in case of aerospike failures
 	batchPolicy.ReplicaPolicy = aerospike.SEQUENCE
 
+	records, dispatch := s.buildOutpointRecords(s.ctx, batch)
+	if dispatch == nil {
+		return
+	}
+
+	var batchErr aerospike.Error
+	if s.batchOperateFn != nil {
+		batchErr = s.batchOperateFn(batchPolicy, records)
+	} else {
+		batchErr = s.client.BatchOperate(batchPolicy, records)
+	}
+
+	dispatch(records, batchErr)
+}
+
+// buildOutpointRecords builds the BatchRead records for an outpoint batch and returns
+// a dispatch closure that processes the per-record results and notifies each item.
+//
+// Returns (nil, nil) if a key-creation failure short-circuits the batch — in that case
+// all items have already been notified and the caller must not invoke BatchOperate.
+func (s *Store) buildOutpointRecords(ctx context.Context, batch []*batchOutpoint) (records []aerospike.BatchRecordIfc, dispatch func([]aerospike.BatchRecordIfc, aerospike.Error)) {
 	policy := util.GetAerospikeBatchReadPolicy(s.settings)
 
-	// Create a batch of records to read, with a max size of the batch
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(batch))
 	batchRecordHashes := make([]chainhash.Hash, 0, len(batch))
 
 	// we de-dupe the txs we need to lookup, since we may have multiple outpoints for the same tx
-	// this is done by using a map of txHashes
 	uniqueTxHashes := make(map[chainhash.Hash]struct{})
 	for _, item := range batch {
 		uniqueTxHashes[*item.outpoint.PreviousTxIDChainHash()] = struct{}{}
 	}
 
-	// Create a batch of records to read from the txHashes
 	for txHash := range uniqueTxHashes {
 		key, err := aerospike.NewKey(s.namespace, s.setName, txHash[:])
 		if err != nil {
@@ -1233,89 +1249,90 @@ func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
 				sendErrorAndClose(item.errCh, errors.NewProcessingError("failed to init new aerospike key for txMeta", err))
 			}
 
-			return
+			return nil, nil
 		}
 
 		bins := []fields.FieldName{fields.Version, fields.LockTime, fields.Inputs, fields.Outputs, fields.External}
 		record := aerospike.NewBatchRead(policy, key, fields.FieldNamesToStrings(bins))
 
-		// Add to batch records
 		batchRecords = append(batchRecords, record)
 		batchRecordHashes = append(batchRecordHashes, txHash)
 	}
 
-	// send the batch to aerospike
-	err = s.client.BatchOperate(batchPolicy, batchRecords)
-	if err != nil {
-		for _, item := range batch {
-			sendErrorAndClose(item.errCh, errors.NewStorageError("error in aerospike send outpoint batch records", err))
-		}
-
-		return
-	}
-
-	txs := make(map[chainhash.Hash]*bt.Tx, len(batchRecords))
-	txErrors := make(map[chainhash.Hash]error)
-
-	// Process the batch records
-	for idx, batchRecordIfc := range batchRecords {
-		previousTxHash := batchRecordHashes[idx]
-
-		batchRecord := batchRecordIfc.BatchRec()
-		if batchRecord.Err != nil {
-			if errors.Is(batchRecord.Err, aerospike.ErrKeyNotFound) {
-				txErrors[previousTxHash] = errors.NewTxNotFoundError("could not find transaction %s in aerospike", previousTxHash.String(), batchRecord.Err)
-			} else {
-				txErrors[previousTxHash] = errors.NewProcessingError("error in aerospike get outpoint batch record", batchRecord.Err)
+	dispatch = func(records []aerospike.BatchRecordIfc, batchErr aerospike.Error) {
+		if batchErr != nil {
+			for _, item := range batch {
+				sendErrorAndClose(item.errCh, errors.NewStorageError("error in aerospike send outpoint batch records", batchErr))
 			}
 
-			continue
+			return
 		}
 
-		bins := batchRecord.Record.Bins
+		txs := make(map[chainhash.Hash]*bt.Tx, len(records))
+		txErrors := make(map[chainhash.Hash]error)
 
-		var previousTx *bt.Tx
+		for idx, batchRecordIfc := range records {
+			previousTxHash := batchRecordHashes[idx]
 
-		external, ok := bins[fields.External.String()].(bool)
-		if ok && external {
-			if previousTx, err = s.GetOutpointsFromExternalStore(s.ctx, previousTxHash); err != nil {
-				txErrors[previousTxHash] = err
+			batchRecord := batchRecordIfc.BatchRec()
+			if batchRecord.Err != nil {
+				if errors.Is(batchRecord.Err, aerospike.ErrKeyNotFound) {
+					txErrors[previousTxHash] = errors.NewTxNotFoundError("could not find transaction %s in aerospike", previousTxHash.String(), batchRecord.Err)
+				} else {
+					txErrors[previousTxHash] = errors.NewProcessingError("error in aerospike get outpoint batch record", batchRecord.Err)
+				}
 
 				continue
 			}
-		} else {
-			previousTx, err = s.getTxFromBins(bins)
-			if err != nil {
-				txErrors[previousTxHash] = errors.NewTxInvalidError("invalid tx", err)
+
+			bins := batchRecord.Record.Bins
+
+			var previousTx *bt.Tx
+
+			external, ok := bins[fields.External.String()].(bool)
+			if ok && external {
+				var err error
+				if previousTx, err = s.GetOutpointsFromExternalStore(ctx, previousTxHash); err != nil {
+					txErrors[previousTxHash] = err
+
+					continue
+				}
+			} else {
+				var err error
+				previousTx, err = s.getTxFromBins(bins)
+				if err != nil {
+					txErrors[previousTxHash] = errors.NewTxInvalidError("invalid tx", err)
+
+					continue
+				}
+			}
+
+			txs[previousTxHash] = previousTx
+		}
+
+		for _, batchItem := range batch {
+			previousTx := txs[*batchItem.outpoint.PreviousTxIDChainHash()]
+			if previousTx == nil {
+				if err, ok := txErrors[*batchItem.outpoint.PreviousTxIDChainHash()]; ok {
+					sendErrorAndClose(batchItem.errCh, err)
+				} else {
+					sendErrorAndClose(batchItem.errCh, errors.NewTxNotFoundError("previous tx not found: %v", batchItem.outpoint.PreviousTxID))
+				}
 
 				continue
 			}
+
+			batchItem.outpoint.PreviousTxSatoshis = previousTx.Outputs[batchItem.outpoint.PreviousTxOutIndex].Satoshis
+			batchItem.outpoint.PreviousTxScript = previousTx.Outputs[batchItem.outpoint.PreviousTxOutIndex].LockingScript
+			batchItem.errCh <- nil
+			close(batchItem.errCh)
 		}
 
-		txs[previousTxHash] = previousTx
+		prometheusTxMetaAerospikeMapGetMulti.Inc()
+		prometheusTxMetaAerospikeMapGetMultiN.Add(float64(len(records)))
 	}
 
-	// Now we have all the txs, we can decorate the outpoints
-	for _, batchItem := range batch {
-		previousTx := txs[*batchItem.outpoint.PreviousTxIDChainHash()]
-		if previousTx == nil {
-			if err, ok := txErrors[*batchItem.outpoint.PreviousTxIDChainHash()]; ok {
-				sendErrorAndClose(batchItem.errCh, err)
-			} else {
-				sendErrorAndClose(batchItem.errCh, errors.NewTxNotFoundError("previous tx not found: %v", batchItem.outpoint.PreviousTxID))
-			}
-
-			continue
-		}
-
-		batchItem.outpoint.PreviousTxSatoshis = previousTx.Outputs[batchItem.outpoint.PreviousTxOutIndex].Satoshis
-		batchItem.outpoint.PreviousTxScript = previousTx.Outputs[batchItem.outpoint.PreviousTxOutIndex].LockingScript
-		batchItem.errCh <- nil
-		close(batchItem.errCh)
-	}
-
-	prometheusTxMetaAerospikeMapGetMulti.Inc()
-	prometheusTxMetaAerospikeMapGetMultiN.Add(float64(len(batchRecords)))
+	return batchRecords, dispatch
 }
 
 func (s *Store) GetOutpointsFromExternalStore(ctx context.Context, previousTxHash chainhash.Hash) (*bt.Tx, error) {
@@ -1483,6 +1500,20 @@ func (s *Store) GetTxInpointsFromExternalStore(ctx context.Context, txHash chain
 
 // sendGetBatch processes a batch of get requests efficiently
 func (s *Store) sendGetBatch(batch []*batchGetItem) {
+	records, dispatch := s.buildGetRecords(s.ctx, batch)
+
+	// sendGetBatch does not use BatchOperate directly — BatchDecorate (called inside
+	// dispatch) issues its own batched reads. We invoke dispatch with no batch-level
+	// error to keep the (records, dispatch) shape consistent with the other handlers.
+	dispatch(records, nil)
+}
+
+// buildGetRecords prepares the UnresolvedMetaData items for a get batch and returns
+// a dispatch closure that runs BatchDecorate (with retries) and forwards results.
+// sendGetBatch does not use BatchOperate, so records is always nil and the batchErr
+// argument to dispatch is unused — both parameters exist to keep the (records,
+// dispatch) signature uniform across the seven handlers.
+func (s *Store) buildGetRecords(ctx context.Context, batch []*batchGetItem) (records []aerospike.BatchRecordIfc, dispatch func([]aerospike.BatchRecordIfc, aerospike.Error)) {
 	items := make([]*utxo.UnresolvedMetaData, 0, len(batch))
 
 	for idx, item := range batch {
@@ -1493,39 +1524,41 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 		})
 	}
 
-	retries := 0
+	dispatch = func(_ []aerospike.BatchRecordIfc, _ aerospike.Error) {
+		retries := 0
 
-	for {
-		if err := s.BatchDecorate(s.ctx, items); err != nil {
-			if retries < 3 {
-				retries++
+		for {
+			if err := s.BatchDecorate(ctx, items); err != nil {
+				if retries < 3 {
+					retries++
 
-				s.logger.Errorf("failed to get batch of txmeta: %v", err)
-				time.Sleep(time.Duration(retries) * time.Second)
+					s.logger.Errorf("failed to get batch of txmeta: %v", err)
+					time.Sleep(time.Duration(retries) * time.Second)
 
-				continue
-			}
-
-			// mark all items as errored
-			for _, bItem := range batch {
-				bItem.done <- batchGetItemData{
-					Err: err,
+					continue
 				}
+
+				for _, bItem := range batch {
+					bItem.done <- batchGetItemData{
+						Err: err,
+					}
+				}
+
+				return
 			}
 
-			return
+			break
 		}
 
-		break
-	}
-
-	for _, item := range items {
-		// send the data back to the original caller
-		batch[item.Idx].done <- batchGetItemData{
-			Data: item.Data,
-			Err:  item.Err,
+		for _, item := range items {
+			batch[item.Idx].done <- batchGetItemData{
+				Data: item.Data,
+				Err:  item.Err,
+			}
 		}
 	}
+
+	return nil, dispatch
 }
 
 // sendErrorAndClose sends an error to a channel and closes it safely.

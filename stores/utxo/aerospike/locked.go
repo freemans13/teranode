@@ -49,14 +49,27 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 
 // setLockedBatch sets the locked flag on the given transactions in a batch
 func (s *Store) setLockedBatch(batch []*batchLocked) {
-	var (
-		batchUDFPolicy = aerospike.NewBatchUDFPolicy()
-		batchRecords   = make([]aerospike.BatchRecordIfc, 0, len(batch))
-	)
+	records, dispatch := s.buildSetLockedRecords(context.Background(), batch)
 
-	// Go through each batch item and set the tx to be locked
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+
+	var batchErr aerospike.Error
+	if s.batchOperateFn != nil {
+		batchErr = s.batchOperateFn(batchPolicy, records)
+	} else {
+		batchErr = s.client.BatchOperate(batchPolicy, records)
+	}
+
+	dispatch(records, batchErr)
+}
+
+// buildSetLockedRecords builds the BatchUDF records for a setLocked batch and returns
+// a dispatch closure that notifies each item, fanning out to child records when needed.
+func (s *Store) buildSetLockedRecords(_ context.Context, batch []*batchLocked) (records []aerospike.BatchRecordIfc, dispatch func([]aerospike.BatchRecordIfc, aerospike.Error)) {
+	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(batch))
+
 	for _, batchItem := range batch {
-		// We will do the master record first...
 		keySource := uaerospike.CalculateKeySourceInternal(&batchItem.txHash, batchItem.childIndex)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
@@ -64,8 +77,6 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 			fmt.Printf("Failed to create key: %s\n", err)
 			os.Exit(1)
 		}
-
-		// Now we need to get totalRecords and do all the child records if necessary...
 
 		batchRecords = append(batchRecords, aerospike.NewBatchUDF(
 			batchUDFPolicy,
@@ -76,65 +87,67 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 		))
 	}
 
-	if err := s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords); err != nil {
-		for _, batchItem := range batch {
-			batchItem.errCh <- errors.NewProcessingError("could not batch write locked flag", err)
+	dispatch = func(records []aerospike.BatchRecordIfc, batchErr aerospike.Error) {
+		if batchErr != nil {
+			for _, batchItem := range batch {
+				batchItem.errCh <- errors.NewProcessingError("could not batch write locked flag", batchErr)
+			}
+
+			return
 		}
 
-		return
-	}
-
-	// Now we need to get totalRecords and do all the child records if necessary...
-	for idx, batchRecord := range batchRecords {
-		if batchRecord.BatchRec().Err != nil {
-			batch[idx].errCh <- errors.NewProcessingError("could not batch write locked flag", batchRecord.BatchRec().Err)
-			continue
-		}
-
-		response := batchRecord.BatchRec().Record
-		if response != nil && response.Bins != nil && response.Bins[LuaSuccess.String()] != nil {
-			res, err := s.ParseLuaMapResponse(response.Bins[LuaSuccess.String()])
-			if err != nil {
-				batch[idx].errCh <- errors.NewProcessingError("could not parse response", err)
+		for idx, batchRecord := range records {
+			if batchRecord.BatchRec().Err != nil {
+				batch[idx].errCh <- errors.NewProcessingError("could not batch write locked flag", batchRecord.BatchRec().Err)
 				continue
 			}
 
-			if res.Status != LuaStatusOK {
-				if res.ErrorCode == LuaErrorCodeTxNotFound {
-					batch[idx].errCh <- errors.NewTxNotFoundError("transaction not found: %s", batch[idx].txHash.String())
-				} else {
-					batch[idx].errCh <- errors.NewProcessingError("error from setLocked: %s", res.Message)
+			response := batchRecord.BatchRec().Record
+			if response != nil && response.Bins != nil && response.Bins[LuaSuccess.String()] != nil {
+				res, err := s.ParseLuaMapResponse(response.Bins[LuaSuccess.String()])
+				if err != nil {
+					batch[idx].errCh <- errors.NewProcessingError("could not parse response", err)
+					continue
 				}
-				continue
-			}
 
-			extraRecords := res.ChildCount
-			if extraRecords == 0 {
-				batch[idx].errCh <- nil
-				continue
-			}
+				if res.Status != LuaStatusOK {
+					if res.ErrorCode == LuaErrorCodeTxNotFound {
+						batch[idx].errCh <- errors.NewTxNotFoundError("transaction not found: %s", batch[idx].txHash.String())
+					} else {
+						batch[idx].errCh <- errors.NewProcessingError("error from setLocked: %s", res.Message)
+					}
+					continue
+				}
 
-			// We need to do the child records...
-			g, _ := errgroup.WithContext(batch[idx].ctx)
+				extraRecords := res.ChildCount
+				if extraRecords == 0 {
+					batch[idx].errCh <- nil
+					continue
+				}
 
-			for i := 1; i <= extraRecords; i++ {
-				i := i
+				g, _ := errgroup.WithContext(batch[idx].ctx)
 
-				g.Go(func() error {
-					errCh := make(chan error, 1)
+				for i := 1; i <= extraRecords; i++ {
+					i := i
 
-					s.lockedBatcher.PutCtx(batch[idx].ctx, &batchLocked{
-						txHash:     batch[idx].txHash,
-						childIndex: uint32(i), // nolint:gosec
-						setValue:   batch[idx].setValue,
-						errCh:      errCh,
+					g.Go(func() error {
+						errCh := make(chan error, 1)
+
+						s.lockedBatcher.PutCtx(batch[idx].ctx, &batchLocked{
+							txHash:     batch[idx].txHash,
+							childIndex: uint32(i), // nolint:gosec
+							setValue:   batch[idx].setValue,
+							errCh:      errCh,
+						})
+
+						return <-errCh
 					})
+				}
 
-					return <-errCh
-				})
+				batch[idx].errCh <- g.Wait()
 			}
-
-			batch[idx].errCh <- g.Wait()
 		}
 	}
+
+	return batchRecords, dispatch
 }
