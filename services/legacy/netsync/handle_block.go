@@ -1059,7 +1059,7 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		txWrapper.SomeParentsInBlock = true
 
 		if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
-			return errors.NewProcessingError("tx %s input %d references invalid output index %d (parent %s has %d outputs)",
+			return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
 				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
 		}
 
@@ -1299,6 +1299,14 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 		if prevTxWrapper, found := txMap.Get(prevTxHash); found {
 			g.Go(func() error {
 				txWrapper.SomeParentsInBlock = true
+
+				// Parent Outputs are populated at wire-parse time and never mutated afterwards,
+				// so the bounds check is safe to run before WaitForParent and lets us reject
+				// malformed peer blocks without burning up to 120s on the polling loop.
+				if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
+					return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
+						tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+				}
 
 				// we do have a parent, but since everything is happening in parallel, we need to check if the parent has
 				// already been extended
