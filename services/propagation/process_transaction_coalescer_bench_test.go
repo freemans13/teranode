@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -38,26 +39,37 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// benchVariant is one cell in the 4-variant matrix: PR #887 (merged-ops batcher)
+// off/on × PR #871 (TxCoalescer + ValidateBatch) off/on.
+type benchVariant struct {
+	name          string
+	mergedOpsMode string // "off" or "single"
+	useCoalescer  bool   // also sets UseBatchValidation
+}
+
+var benchVariants = []benchVariant{
+	{"baseline", "off", false},
+	{"merged_only", "single", false},
+	{"coalescer_only", "off", true},
+	{"both", "single", true},
+}
+
 func BenchmarkProcessTransaction_FlagOffVsOn_RealAerospike(b *testing.B) {
 	for _, concurrency := range []int{32, 128, 512, 1024} {
 		concurrency := concurrency
-		for _, useBatch := range []bool{false, true} {
-			useBatch := useBatch
-			name := "direct"
-			if useBatch {
-				name = "coalescer"
-			}
-			b.Run(fmt.Sprintf("concurrency=%d/%s", concurrency, name), func(b *testing.B) {
-				benchProcessTxOnAerospike(b, concurrency, useBatch)
+		for _, v := range benchVariants {
+			v := v
+			b.Run(fmt.Sprintf("concurrency=%d/variant=%s", concurrency, v.name), func(b *testing.B) {
+				benchProcessTxOnAerospike(b, concurrency, v)
 			})
 		}
 	}
 }
 
-func benchProcessTxOnAerospike(b *testing.B, concurrency int, useBatch bool) {
+func benchProcessTxOnAerospike(b *testing.B, concurrency int, v benchVariant) {
 	b.Helper()
 	ctx := context.Background()
-	ps, aeroStore, cleanup := newPropagationBackedByAerospike(b, useBatch)
+	ps, aeroStore, cleanup := newPropagationBackedByAerospike(b, v)
 	defer cleanup()
 
 	// Pre-generate b.N rounds of `concurrency` fresh txs each so the
@@ -89,7 +101,7 @@ func benchProcessTxOnAerospike(b *testing.B, concurrency int, useBatch bool) {
 // Returns the server, the underlying aerospike store, plus a cleanup
 // function. Mirrors validate_batch_aerospike_bench_test.go's
 // newValidatorBackedByAerospike.
-func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationServer, *aerostore.Store, func()) {
+func newPropagationBackedByAerospike(b testing.TB, v benchVariant) (*PropagationServer, *aerostore.Store, func()) {
 	b.Helper()
 	tracing.SetupMockTracer()
 	initPrometheusMetrics()
@@ -98,16 +110,32 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.BlockAssembly.Disabled = true
-	tSettings.Validator.UseBatchValidation = useBatch
+	tSettings.Validator.UseBatchValidation = v.useCoalescer
 
-	// Enable merged-ops batcher (PR #887) across ALL bench variants — sits below
-	// the validator pipeline, applies equally to direct, coalescer drain=false,
-	// and coalescer drain=true paths.
-	tSettings.UtxoStore.MergedOpsBatcherMode = "single"
+	// PR #887 merged-ops batcher toggle.
+	tSettings.UtxoStore.MergedOpsBatcherMode = v.mergedOpsMode
 	tSettings.UtxoStore.MergedOpsBatcherSize = 512
 	tSettings.UtxoStore.MergedOpsBatcherDurationMillis = 1
 	tSettings.UtxoStore.MergedOpsBatcherDrainMode = true
 	tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent = 1024
+
+	// Prod-aligned per-op batcher settings — apply equally across all variants so
+	// the matrix is apples-to-apples on the underlying store layer.
+	tSettings.UtxoStore.GetBatcherSize = 512
+	tSettings.UtxoStore.GetBatcherDurationMillis = 1
+	tSettings.UtxoStore.GetBatcherDrainMode = true
+	tSettings.UtxoStore.StoreBatcherSize = 512
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 1
+	tSettings.Aerospike.StoreBatcherDuration = 1 * time.Millisecond
+	tSettings.UtxoStore.StoreBatcherDrainMode = true
+	tSettings.UtxoStore.SpendBatcherSize = 512
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 1
+	tSettings.UtxoStore.SpendBatcherDrainMode = false
+	tSettings.UtxoStore.SpendBatcherConcurrency = 256
+	tSettings.UtxoStore.LockedBatcherSize = 512
+	tSettings.UtxoStore.LockedBatcherDurationMillis = 1
+	tSettings.UtxoStore.LockedBatcherDrainMode = false
+	tSettings.UtxoStore.BatcherMaxConcurrent = 512
 
 	container, err := aeroTest.RunContainer(ctx, aeroTest.WithTTLSupport("test"))
 	if err != nil {
@@ -145,7 +173,7 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 	ps := New(logger, tSettings, txStore, vIface, nil, nil, nil)
 
 	// Manually wire the coalescer — bypassing Start() which blocks on gRPC bind.
-	if useBatch {
+	if v.useCoalescer {
 		ps.coalescer = NewTxCoalescer(
 			ctx, logger, vIface,
 			tSettings.Validator.BatchMaxSize,
