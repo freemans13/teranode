@@ -46,6 +46,13 @@ func (v *Validator) ValidateBatch(
 		return []ValidationResult{}, nil
 	}
 
+	// Mirror Validator.validateInternal: callers may pass blockHeight=0 meaning
+	// "use current chain tip + 1". Without this, BDK 1.2.4 ValidateTransaction
+	// rejects bh=0 in script validation, breaking parity with the direct path.
+	if blockHeight == 0 {
+		blockHeight = v.GetBlockState().Height + 1
+	}
+
 	store, ok := v.getBatchUtxoStore()
 	if !ok {
 		return nil, terrors.NewConfigurationError("configured UTXO store does not implement batch methods; use Validate for per-tx validation")
@@ -380,13 +387,12 @@ func (v *Validator) runCPUValidation(ctx context.Context, tx *bt.Tx, blockHeight
 		return v.cpuOverride(tx)
 	}
 	processedOpts := ProcessOptions(opts...)
-	// ValidateTransaction uses utxoHeights only in checkFees → isConsolidationTx.
-	// ValidateTransactionScripts passes them through to the BDK script engine,
-	// which requires the slice to have exactly one entry per input.
-	if err := v.txValidator.ValidateTransaction(tx, blockHeight, utxoHeights, processedOpts); err != nil {
-		return err
-	}
-	return v.txValidator.ValidateTransactionScripts(tx, blockHeight, utxoHeights, processedOpts)
+	// Post BDK 1.2.4 (upstream b61c1f87e), TxValidator.ValidateTransaction performs
+	// both Teranode-owned format checks AND BDK script validation in a single call
+	// (the old separate ValidateTransactionScripts entry point was removed). The
+	// merged call still uses utxoHeights for checkFees → isConsolidationTx and
+	// passes them through to the BDK script engine.
+	return v.txValidator.ValidateTransaction(tx, blockHeight, utxoHeights, processedOpts)
 }
 
 // getBatchUtxoStore returns the validator's UTXO store as a batchUtxoStore if
