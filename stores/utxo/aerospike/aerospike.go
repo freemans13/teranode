@@ -371,6 +371,17 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 	s.lockedBatcher = lockedBatcherInst
 
+	if mode := tSettings.UtxoStore.MergedOpsBatcherMode; mode == "single" || mode == "split" {
+		mSize := tSettings.UtxoStore.MergedOpsBatcherSize
+		mDur := time.Duration(tSettings.UtxoStore.MergedOpsBatcherDurationMillis) * time.Millisecond
+		mInst := batcher.NewWithPool(mSize, mDur, s.sendMergedOpsBatch, batcherBackground, batcherOpts("aerospike_merged_ops")...)
+		if batcherMaxConcurrent > 0 {
+			mInst.SetMaxConcurrent(batcherMaxConcurrent)
+		}
+		s.mergedOpsBatcher = mInst
+		logger.Infof("[aerospike] merged-ops batcher enabled (mode=%s, size=%d, duration=%s)", mode, mSize, mDur)
+	}
+
 	// Per-batcher drain mode: each batcher can be independently configured.
 	// Drain mode is beneficial for stages that receive bursts (Get, Create)
 	// but harmful for stages where items trickle in one-at-a-time (Spend,

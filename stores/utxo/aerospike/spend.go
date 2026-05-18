@@ -336,13 +336,13 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			}
 
 			errCh := make(chan error, 1)
-			s.spendBatcher.PutCtx(ctx, &batchSpend{
+			s.submitOp(ctx, &mixedOp{kind: opSpend, spend: &batchSpend{
 				spend:             spend,
 				blockHeight:       blockHeight,
 				errCh:             errCh,
 				ignoreConflicting: useIgnoreConflicting,
 				ignoreLocked:      useIgnoreLocked,
-			})
+			}})
 
 			// Wait for batch response with timeout to prevent indefinite blocking
 			var batchErr error
@@ -901,12 +901,12 @@ func (s *Store) SetDAHForChildRecords(txID *chainhash.Hash, childCount int, dah 
 		errCh := make(chan error)
 
 		go func() {
-			s.setDAHBatcher.Put(&batchDAH{
+			s.submitOp(context.Background(), &mixedOp{kind: opSetDAH, setDAH: &batchDAH{
 				txID:           txID,
 				childIdx:       i + 1, // We want to set DAH for child record i+1
 				deleteAtHeight: dah,
 				errCh:          errCh,
-			})
+			}})
 		}()
 
 		errs[i] = <-errCh
@@ -976,12 +976,12 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 							// Lua already set DAH on the master record inline.
 							// Clear it since children aren't actually all-spent.
 							errCh := make(chan error, 1)
-							s.setDAHBatcher.PutCtx(ctx, &batchDAH{
+							s.submitOp(ctx, &mixedOp{kind: opSetDAH, setDAH: &batchDAH{
 								txID:           txID,
 								childIdx:       0, // master record
 								deleteAtHeight: 0, // clear DAH
 								errCh:          errCh,
-							})
+							}})
 							if dahErr := <-errCh; dahErr != nil {
 								s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), dahErr)
 							}
@@ -1085,11 +1085,11 @@ func (s *Store) IncrementSpentRecords(txid *chainhash.Hash, increment int) (inte
 	res := make(chan incrementSpentRecordsRes, 1)
 
 	go func() {
-		s.incrementBatcher.Put(&batchIncrement{
+		s.submitOp(context.Background(), &mixedOp{kind: opIncrement, increment: &batchIncrement{
 			txID:      txid,
 			increment: increment,
 			res:       res,
-		})
+		}})
 	}()
 
 	spendTimeout := s.settings.UtxoStore.SpendWaitTimeout

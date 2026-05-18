@@ -218,7 +218,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		done:         errCh,
 	}
 
-	s.storeBatcher.PutCtx(ctx, item)
+	s.submitOp(ctx, &mixedOp{kind: opCreate, create: item})
 
 	err = <-errCh
 	if err != nil {

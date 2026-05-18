@@ -31,12 +31,12 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		g.Go(func() error {
 			errCh := make(chan error, 1)
 
-			s.lockedBatcher.PutCtx(ctx, &batchLocked{
+			s.submitOp(ctx, &mixedOp{kind: opSetLocked, setLocked: &batchLocked{
 				ctx:      ctx,
 				txHash:   txHash,
 				setValue: setValue,
 				errCh:    errCh,
-			})
+			}})
 
 			// Now we need to get totalRecords and do all the child records if necessary...
 
@@ -133,12 +133,12 @@ func (s *Store) buildSetLockedRecords(_ context.Context, batch []*batchLocked) (
 					g.Go(func() error {
 						errCh := make(chan error, 1)
 
-						s.lockedBatcher.PutCtx(batch[idx].ctx, &batchLocked{
+						s.submitOp(batch[idx].ctx, &mixedOp{kind: opSetLocked, setLocked: &batchLocked{
 							txHash:     batch[idx].txHash,
 							childIndex: uint32(i), // nolint:gosec
 							setValue:   batch[idx].setValue,
 							errCh:      errCh,
-						})
+						}})
 
 						return <-errCh
 					})

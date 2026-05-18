@@ -268,3 +268,28 @@ func (s *Store) dispatchMixedBatchOperate(
 		seg.dispatch(sub, batchErr)
 	}
 }
+
+// submitOp routes an op to either the merged batcher (when configured) or the
+// legacy per-op batcher.
+func (s *Store) submitOp(ctx context.Context, op *mixedOp) {
+	if s.mergedOpsBatcher != nil {
+		s.mergedOpsBatcher.PutCtx(ctx, op)
+		return
+	}
+	switch op.kind {
+	case opGet:
+		s.getBatcher.PutCtx(ctx, op.get)
+	case opSpend:
+		s.spendBatcher.PutCtx(ctx, op.spend)
+	case opCreate:
+		s.storeBatcher.PutCtx(ctx, op.create)
+	case opOutpoint:
+		s.outpointBatcher.PutCtx(ctx, op.outpoint)
+	case opIncrement:
+		s.incrementBatcher.PutCtx(ctx, op.increment)
+	case opSetDAH:
+		s.setDAHBatcher.PutCtx(ctx, op.setDAH)
+	case opSetLocked:
+		s.lockedBatcher.PutCtx(ctx, op.setLocked)
+	}
+}

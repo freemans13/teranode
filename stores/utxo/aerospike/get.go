@@ -348,7 +348,7 @@ func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.Fie
 	item := &batchGetItem{hash: *hash, fields: bins, done: done}
 
 	if s.getBatcher != nil {
-		s.getBatcher.PutCtx(ctx, item)
+		s.submitOp(ctx, &mixedOp{kind: opGet, get: item})
 	} else {
 		// if the batcher is disabled, we still want to process the request in a go routine
 		go func() {
@@ -1171,10 +1171,10 @@ func (s *Store) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error {
 		errChans = append(errChans, errChan)
 
 		// Wrap the outpoint in OutpointRequest and put it in the batcher
-		s.outpointBatcher.Put(&batchOutpoint{
+		s.submitOp(context.Background(), &mixedOp{kind: opOutpoint, outpoint: &batchOutpoint{
 			outpoint: input,
 			errCh:    errChan,
-		})
+		}})
 	}
 
 	// Wait for all error channels to receive a result
