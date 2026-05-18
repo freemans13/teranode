@@ -31,6 +31,7 @@ func TestProcessTransaction_FlagOnRoutesThroughCoalescer(t *testing.T) {
 				ps.settings.Validator.BatchMaxSize,
 				ps.settings.Validator.BatchMaxWait,
 				ps.settings.Validator.BatchMaxConcurrent,
+				false,
 			)
 			t.Cleanup(func() { _ = ps.coalescer.Close(context.Background()) })
 		}
@@ -61,6 +62,7 @@ func TestProcessTransaction_FlagOnNConcurrentCallersAllRespond(t *testing.T) {
 		ps.settings.Validator.BatchMaxSize,
 		ps.settings.Validator.BatchMaxWait,
 		ps.settings.Validator.BatchMaxConcurrent,
+		false,
 	)
 	t.Cleanup(func() { _ = ps.coalescer.Close(context.Background()) })
 

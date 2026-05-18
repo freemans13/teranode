@@ -42,12 +42,13 @@ func NewTxCoalescer(
 	maxSize int,
 	maxWait time.Duration,
 	maxConcurrent int,
+	drainMode bool,
 ) *TxCoalescer {
 	c := &TxCoalescer{logger: logger}
 	flush := func(items []*pendingTx) {
 		c.flushBatch(ctx, v, items)
 	}
-	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, flush)
+	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, drainMode, flush)
 	return c
 }
 
@@ -61,7 +62,7 @@ func newTxCoalescerForTest(
 	flush func(items []*pendingTx),
 ) *TxCoalescer {
 	c := &TxCoalescer{logger: logger}
-	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, flush)
+	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, false, flush)
 	return c
 }
 
@@ -70,6 +71,7 @@ func newBatcherInstance(
 	maxSize int,
 	maxWait time.Duration,
 	maxConcurrent int,
+	drainMode bool,
 	flush func(items []*pendingTx),
 ) *batcher.Batcher[pendingTx] {
 	b := batcher.NewWithPool(
@@ -84,6 +86,9 @@ func newBatcherInstance(
 	)
 	if maxConcurrent > 0 {
 		b.SetMaxConcurrent(maxConcurrent)
+	}
+	if drainMode {
+		b.SetDrainMode(true)
 	}
 	return b
 }

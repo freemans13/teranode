@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -41,23 +42,22 @@ import (
 func BenchmarkProcessTransaction_FlagOffVsOn_RealAerospike(b *testing.B) {
 	for _, concurrency := range []int{32, 128, 512, 1024} {
 		concurrency := concurrency
-		for _, useBatch := range []bool{false, true} {
-			useBatch := useBatch
-			name := "direct"
-			if useBatch {
-				name = "coalescer"
-			}
-			b.Run(fmt.Sprintf("concurrency=%d/%s", concurrency, name), func(b *testing.B) {
-				benchProcessTxOnAerospike(b, concurrency, useBatch)
-			})
-		}
+		b.Run(fmt.Sprintf("concurrency=%d/direct", concurrency), func(b *testing.B) {
+			benchProcessTxOnAerospike(b, concurrency, false, false)
+		})
+		b.Run(fmt.Sprintf("concurrency=%d/coalescer/drain=false", concurrency), func(b *testing.B) {
+			benchProcessTxOnAerospike(b, concurrency, true, false)
+		})
+		b.Run(fmt.Sprintf("concurrency=%d/coalescer/drain=true", concurrency), func(b *testing.B) {
+			benchProcessTxOnAerospike(b, concurrency, true, true)
+		})
 	}
 }
 
-func benchProcessTxOnAerospike(b *testing.B, concurrency int, useBatch bool) {
+func benchProcessTxOnAerospike(b *testing.B, concurrency int, useBatch bool, coalescerDrain bool) {
 	b.Helper()
 	ctx := context.Background()
-	ps, aeroStore, cleanup := newPropagationBackedByAerospike(b, useBatch)
+	ps, aeroStore, cleanup := newPropagationBackedByAerospike(b, useBatch, coalescerDrain)
 	defer cleanup()
 
 	// Pre-generate b.N rounds of `concurrency` fresh txs each so the
@@ -89,7 +89,7 @@ func benchProcessTxOnAerospike(b *testing.B, concurrency int, useBatch bool) {
 // Returns the server, the underlying aerospike store, plus a cleanup
 // function. Mirrors validate_batch_aerospike_bench_test.go's
 // newValidatorBackedByAerospike.
-func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationServer, *aerostore.Store, func()) {
+func newPropagationBackedByAerospike(b testing.TB, useBatch bool, coalescerDrain bool) (*PropagationServer, *aerostore.Store, func()) {
 	b.Helper()
 	tracing.SetupMockTracer()
 	initPrometheusMetrics()
@@ -99,6 +99,30 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.BlockAssembly.Disabled = true
 	tSettings.Validator.UseBatchValidation = useBatch
+
+	// Production-aligned per-op batcher settings (dev-scale-1 propagation pods).
+	// Without these, the direct path runs with default test settings (size=100,
+	// dur=100ms, no drain) which is not how prop pods are actually configured —
+	// making the coalescer's reported speedup an artefact of an unfair baseline.
+	tSettings.UtxoStore.GetBatcherSize = 512
+	tSettings.UtxoStore.GetBatcherDurationMillis = 1
+	tSettings.UtxoStore.GetBatcherDrainMode = true
+
+	tSettings.UtxoStore.StoreBatcherSize = 512
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 1
+	tSettings.Aerospike.StoreBatcherDuration = 1 * time.Millisecond
+	tSettings.UtxoStore.StoreBatcherDrainMode = true
+
+	tSettings.UtxoStore.SpendBatcherSize = 512
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 1
+	tSettings.UtxoStore.SpendBatcherDrainMode = false
+	tSettings.UtxoStore.SpendBatcherConcurrency = 256
+
+	tSettings.UtxoStore.LockedBatcherSize = 512
+	tSettings.UtxoStore.LockedBatcherDurationMillis = 1
+	tSettings.UtxoStore.LockedBatcherDrainMode = false
+
+	tSettings.UtxoStore.BatcherMaxConcurrent = 512
 
 	container, err := aeroTest.RunContainer(ctx, aeroTest.WithTTLSupport("test"))
 	if err != nil {
@@ -142,6 +166,7 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 			tSettings.Validator.BatchMaxSize,
 			tSettings.Validator.BatchMaxWait,
 			tSettings.Validator.BatchMaxConcurrent,
+			coalescerDrain,
 		)
 	}
 

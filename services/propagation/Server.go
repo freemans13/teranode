@@ -352,6 +352,7 @@ func (ps *PropagationServer) Start(ctx context.Context, readyCh chan<- struct{})
 			ps.settings.Validator.BatchMaxSize,
 			ps.settings.Validator.BatchMaxWait,
 			ps.settings.Validator.BatchMaxConcurrent,
+			false,
 		)
 		ps.logger.Infof("[Propagation] TxCoalescer enabled: maxSize=%d maxWait=%s maxConcurrent=%d",
 			ps.settings.Validator.BatchMaxSize,
