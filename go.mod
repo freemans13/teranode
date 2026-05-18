@@ -9,14 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.8
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
-	// Pinned to a hot-fix on top of v1.2.3 (bitcoin-sv/bdk PR #40) that adds a
-	// per-CheckSig signature-cache to the script verifier. Without it the
-	// validator stalls for hours on consensus-valid scripts that perform the
-	// same ECDSA verification many times (e.g. testnet block 1,451,505).
-	//
-	// DO NOT bump to gobdk v1.2.4 (or later) until bitcoin-sv/bdk PR #41 has
-	// merged — that PR ports the same hot-fix forward to master / v1.2.4.
-	github.com/bitcoin-sv/bdk/module/gobdk v1.2.4-0.20260511121643-5ab3fd5b627d
+	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260518042519-1ca0c6519af9
 	// BSV fork of aerospike-client-go-v8 (adds TeranodeModifyOp /
 	// TeranodeReadOp wire opcodes 200/201 — see
 	// github.com/bsv-blockchain/aerospike-server-private feat/
@@ -80,13 +73,14 @@ require (
 	modernc.org/sqlite v1.47.0
 )
 
+require github.com/aerospike/aerospike-client-go/v8 v8.4.2
+
 require (
 	bitbucket.org/simon_ordish/cryptolib v1.0.48 // indirect
 	filippo.io/bigmod v0.1.1-0.20260103110540-f8a47775ebe5 // indirect
 	filippo.io/keygen v0.0.0-20260114151900-8e2790ea4c5b // indirect
 	github.com/DefangLabs/secret-detector v0.0.0-20250403165618-22662109213e // indirect
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
-	github.com/aerospike/aerospike-client-go/v8 v8.4.2 // indirect
 	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.5 // indirect
@@ -198,7 +192,13 @@ require (
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
 	github.com/bsv-blockchain/go-safe-conversion v1.1.2
-	github.com/bsv-blockchain/go-tx-map v1.3.4
+	// Pseudo-version pins the un-released feat(synced): add SetIfNotExistsMulti
+	// commit (bsv-blockchain/go-tx-map#114). PutMultiBucketTxInpoints in
+	// services/blockassembly/subtreeprocessor relies on this bulk method to
+	// take a single per-bucket lock instead of one Lock/Unlock pair per entry,
+	// which materially reduces moveForwardBlock CPU on the hot path. Replace
+	// with the next tagged release (>= v1.3.6) once go-tx-map#114 ships.
+	github.com/bsv-blockchain/go-tx-map v1.3.6-0.20260515143932-e509e98caded
 	github.com/bsv-blockchain/go-wire v1.2.3
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
