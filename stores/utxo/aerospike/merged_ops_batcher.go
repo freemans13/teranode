@@ -1,5 +1,15 @@
 package aerospike
 
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/aerospike/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/ordishs/gocore"
+)
+
 // opKind identifies which underlying op a mixedOp carries.
 type opKind uint8
 
@@ -24,4 +34,237 @@ type mixedOp struct {
 	increment *batchIncrement
 	setDAH    *batchDAH
 	setLocked *batchLocked
+}
+
+// sendMergedOpsBatch is the flush handler for the merged ops batcher. It
+// partitions the queued items by kind, then either dispatches them through a
+// single mixed BatchOperate (single mode) or splits reads vs writes into two
+// parallel BatchOperate calls (split mode). In all cases, GET items are
+// dispatched through sendGetBatch (which uses BatchDecorate + retries) in
+// parallel with the BatchOperate path(s).
+func (s *Store) sendMergedOpsBatch(items []*mixedOp) {
+	if len(items) == 0 {
+		return
+	}
+
+	var (
+		gets       []*batchGetItem
+		spends     []*batchSpend
+		creates    []*BatchStoreItem
+		outpoints  []*batchOutpoint
+		increments []*batchIncrement
+		setDAHs    []*batchDAH
+		setLockeds []*batchLocked
+	)
+
+	for _, it := range items {
+		switch it.kind {
+		case opGet:
+			if it.get != nil {
+				gets = append(gets, it.get)
+			}
+		case opSpend:
+			if it.spend != nil {
+				spends = append(spends, it.spend)
+			}
+		case opCreate:
+			if it.create != nil {
+				creates = append(creates, it.create)
+			}
+		case opOutpoint:
+			if it.outpoint != nil {
+				outpoints = append(outpoints, it.outpoint)
+			}
+		case opIncrement:
+			if it.increment != nil {
+				increments = append(increments, it.increment)
+			}
+		case opSetDAH:
+			if it.setDAH != nil {
+				setDAHs = append(setDAHs, it.setDAH)
+			}
+		case opSetLocked:
+			if it.setLocked != nil {
+				setLockeds = append(setLockeds, it.setLocked)
+			}
+		}
+	}
+
+	mode := s.settings.UtxoStore.MergedOpsBatcherMode
+
+	if mode == "split" {
+		s.sendMergedOpsBatchSplit(s.ctx, gets, spends, creates, outpoints, increments, setDAHs, setLockeds)
+		return
+	}
+
+	// single mode (default): GET in parallel with one mixed BatchOperate over
+	// spend + create + outpoint + increment + setDAH + setLocked.
+	var wg sync.WaitGroup
+
+	if len(gets) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sendGetBatch(gets)
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.dispatchMixedBatchOperate(spends, creates, outpoints, increments, setDAHs, setLockeds)
+	}()
+
+	wg.Wait()
+}
+
+// sendMergedOpsBatchSplit fires reads (GET via sendGetBatch + outpoint via
+// BatchOperate) in parallel with writes (spend + create + increment + setDAH +
+// setLocked via a single BatchOperate). Each branch is independent.
+func (s *Store) sendMergedOpsBatchSplit(
+	_ context.Context,
+	gets []*batchGetItem,
+	spends []*batchSpend,
+	creates []*BatchStoreItem,
+	outpoints []*batchOutpoint,
+	increments []*batchIncrement,
+	setDAHs []*batchDAH,
+	setLockeds []*batchLocked,
+) {
+	var wg sync.WaitGroup
+
+	if len(gets) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sendGetBatch(gets)
+		}()
+	}
+
+	if len(outpoints) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Outpoint is a pure read — keep it isolated from writes.
+			s.dispatchMixedBatchOperate(nil, nil, outpoints, nil, nil, nil)
+		}()
+	}
+
+	if len(spends)+len(creates)+len(increments)+len(setDAHs)+len(setLockeds) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.dispatchMixedBatchOperate(spends, creates, nil, increments, setDAHs, setLockeds)
+		}()
+	}
+
+	wg.Wait()
+}
+
+// dispatchMixedBatchOperate concatenates records from each non-GET builder,
+// performs ONE BatchOperate, then routes the sub-slices back to each
+// builder's dispatch closure. Empty op-type slices are skipped entirely.
+//
+// Builder dispatch closures all accept (records []BatchRecordIfc, batchErr
+// aerospike.Error) except buildStoreRecords which takes a trailing batchID.
+// We allocate a batchID up front and apply it only to the store dispatch.
+func (s *Store) dispatchMixedBatchOperate(
+	spends []*batchSpend,
+	creates []*BatchStoreItem,
+	outpoints []*batchOutpoint,
+	increments []*batchIncrement,
+	setDAHs []*batchDAH,
+	setLockeds []*batchLocked,
+) {
+	type segment struct {
+		offset   int
+		length   int
+		dispatch func([]aerospike.BatchRecordIfc, aerospike.Error)
+	}
+
+	var (
+		all      []aerospike.BatchRecordIfc
+		segments []segment
+	)
+
+	ctx := s.ctx
+
+	// SPEND
+	if len(spends) > 0 {
+		batchID := s.batchID.Add(1)
+		recs, disp := s.buildSpendRecords(ctx, spends, batchID)
+		if disp != nil && len(recs) > 0 {
+			segments = append(segments, segment{offset: len(all), length: len(recs), dispatch: disp})
+			all = append(all, recs...)
+		}
+	}
+
+	// CREATE
+	if len(creates) > 0 {
+		stat := gocore.NewStat("sendMergedOpsBatch.create")
+		start := time.Now()
+		recs, disp := s.buildStoreRecords(ctx, creates, stat, &start)
+		if disp != nil && len(recs) > 0 {
+			batchID := s.batchID.Add(1)
+			adapter := func(rs []aerospike.BatchRecordIfc, be aerospike.Error) {
+				disp(rs, be, batchID)
+			}
+			segments = append(segments, segment{offset: len(all), length: len(recs), dispatch: adapter})
+			all = append(all, recs...)
+		}
+	}
+
+	// OUTPOINT
+	if len(outpoints) > 0 {
+		recs, disp := s.buildOutpointRecords(ctx, outpoints)
+		if disp != nil && len(recs) > 0 {
+			segments = append(segments, segment{offset: len(all), length: len(recs), dispatch: disp})
+			all = append(all, recs...)
+		}
+	}
+
+	// INCREMENT
+	if len(increments) > 0 {
+		recs, disp := s.buildIncrementRecords(ctx, increments)
+		if disp != nil && len(recs) > 0 {
+			segments = append(segments, segment{offset: len(all), length: len(recs), dispatch: disp})
+			all = append(all, recs...)
+		}
+	}
+
+	// SET DAH
+	if len(setDAHs) > 0 {
+		recs, disp := s.buildSetDAHRecords(ctx, setDAHs)
+		if disp != nil && len(recs) > 0 {
+			segments = append(segments, segment{offset: len(all), length: len(recs), dispatch: disp})
+			all = append(all, recs...)
+		}
+	}
+
+	// SET LOCKED
+	if len(setLockeds) > 0 {
+		recs, disp := s.buildSetLockedRecords(ctx, setLockeds)
+		if disp != nil && len(recs) > 0 {
+			segments = append(segments, segment{offset: len(all), length: len(recs), dispatch: disp})
+			all = append(all, recs...)
+		}
+	}
+
+	if len(all) == 0 {
+		return
+	}
+
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+
+	var batchErr aerospike.Error
+	if s.batchOperateFn != nil {
+		batchErr = s.batchOperateFn(batchPolicy, all)
+	} else {
+		batchErr = s.client.BatchOperate(batchPolicy, all)
+	}
+
+	for _, seg := range segments {
+		sub := all[seg.offset : seg.offset+seg.length]
+		seg.dispatch(sub, batchErr)
+	}
 }
