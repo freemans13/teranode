@@ -39,19 +39,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// benchVariant is one cell in the 4-variant matrix: PR #887 (merged-ops batcher)
-// off/on × PR #871 (TxCoalescer + ValidateBatch) off/on.
+// benchVariant is one cell in the 6-variant matrix: PR #887 (merged-ops batcher)
+// off / on@1024 / on@0 (unbounded) × PR #871 (TxCoalescer + ValidateBatch) off/on.
 type benchVariant struct {
-	name          string
-	mergedOpsMode string // "off" or "single"
-	useCoalescer  bool   // also sets UseBatchValidation
+	name                string
+	mergedOpsMode       string // "off" or "single"
+	mergedMaxConcurrent int    // MergedOpsBatcherMaxConcurrent; 0 = unbounded (fresh goroutine per batch)
+	useCoalescer        bool   // also sets UseBatchValidation
 }
 
 var benchVariants = []benchVariant{
-	{"baseline", "off", false},
-	{"merged_only", "single", false},
-	{"coalescer_only", "off", true},
-	{"both", "single", true},
+	{"baseline", "off", 1024, false},
+	{"merged_only", "single", 1024, false},
+	{"merged_only_unbounded", "single", 0, false},
+	{"coalescer_only", "off", 1024, true},
+	{"both", "single", 1024, true},
+	{"both_unbounded", "single", 0, true},
 }
 
 func BenchmarkProcessTransaction_FlagOffVsOn_RealAerospike(b *testing.B) {
@@ -117,7 +120,7 @@ func newPropagationBackedByAerospike(b testing.TB, v benchVariant) (*Propagation
 	tSettings.UtxoStore.MergedOpsBatcherSize = 512
 	tSettings.UtxoStore.MergedOpsBatcherDurationMillis = 1
 	tSettings.UtxoStore.MergedOpsBatcherDrainMode = true
-	tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent = 1024
+	tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent = v.mergedMaxConcurrent
 
 	// Prod-aligned per-op batcher settings — apply equally across all variants so
 	// the matrix is apples-to-apples on the underlying store layer.

@@ -40,16 +40,19 @@ import (
 )
 
 type validatorBenchVariant struct {
-	name          string
-	mergedOpsMode string // "off" or "single"
-	useBatch      bool   // false = per-tx Validate; true = ValidateBatch
+	name                string
+	mergedOpsMode       string // "off" or "single"
+	mergedMaxConcurrent int    // MergedOpsBatcherMaxConcurrent; 0 = unbounded (fresh goroutine per batch)
+	useBatch            bool   // false = per-tx Validate; true = ValidateBatch
 }
 
 var validatorBenchVariants = []validatorBenchVariant{
-	{"baseline", "off", false},
-	{"merged_only", "single", false},
-	{"coalescer_only", "off", true},
-	{"both", "single", true},
+	{"baseline", "off", 1024, false},
+	{"merged_only", "single", 1024, false},
+	{"merged_only_unbounded", "single", 0, false},
+	{"coalescer_only", "off", 1024, true},
+	{"both", "single", 1024, true},
+	{"both_unbounded", "single", 0, true},
 }
 
 func BenchmarkValidator_FlagOffVsOn_RealAerospike(b *testing.B) {
@@ -128,7 +131,7 @@ func newValidatorBackedByAerospikeForFlagMatrix(b testing.TB, v validatorBenchVa
 	tSettings.UtxoStore.MergedOpsBatcherSize = 512
 	tSettings.UtxoStore.MergedOpsBatcherDurationMillis = 1
 	tSettings.UtxoStore.MergedOpsBatcherDrainMode = true
-	tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent = 1024
+	tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent = v.mergedMaxConcurrent
 
 	// Prod-aligned per-op batcher settings — equal across all variants.
 	tSettings.UtxoStore.GetBatcherSize = 512
