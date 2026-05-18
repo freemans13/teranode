@@ -375,14 +375,19 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		mSize := tSettings.UtxoStore.MergedOpsBatcherSize
 		mDur := time.Duration(tSettings.UtxoStore.MergedOpsBatcherDurationMillis) * time.Millisecond
 		mInst := batcher.NewWithPool(mSize, mDur, s.sendMergedOpsBatch, batcherBackground, batcherOpts("aerospike_merged_ops")...)
-		if batcherMaxConcurrent > 0 {
-			mInst.SetMaxConcurrent(batcherMaxConcurrent)
+		mMaxConcurrent := tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent
+		if mMaxConcurrent == 0 {
+			mMaxConcurrent = batcherMaxConcurrent
+		}
+		if mMaxConcurrent > 0 {
+			mInst.SetMaxConcurrent(mMaxConcurrent)
 		}
 		if tSettings.UtxoStore.MergedOpsBatcherDrainMode {
 			mInst.SetDrainMode(true)
 		}
 		s.mergedOpsBatcher = mInst
-		logger.Infof("[aerospike] merged-ops batcher enabled (mode=%s, size=%d, duration=%s)", mode, mSize, mDur)
+		logger.Infof("[aerospike] merged-ops batcher enabled (mode=%s, size=%d, duration=%s, drain=%v, max_concurrent=%d)",
+			mode, mSize, mDur, tSettings.UtxoStore.MergedOpsBatcherDrainMode, mMaxConcurrent)
 	}
 
 	// Per-batcher drain mode: each batcher can be independently configured.

@@ -29,27 +29,29 @@ func BenchmarkMergedOpsBatcher(b *testing.B) {
 		b.Skip("Skipping benchmark in short mode")
 	}
 
-	modes := []string{"off", "single", "split"}
 	concurrencies := []int{32, 1024}
-	drainOptions := []bool{false, true}
+	mergedMaxConcurrents := []int{512, 1024, 2048, 3584}
 
-	for _, mode := range modes {
-		for _, drain := range drainOptions {
-			// "off" mode doesn't use the merged batcher; only run drain=false for it.
-			if mode == "off" && drain {
-				continue
-			}
-			for _, conc := range concurrencies {
-				name := fmt.Sprintf("mode=%s/drain=%v/concurrency=%d", mode, drain, conc)
-				b.Run(name, func(b *testing.B) {
-					runMergedOpsBench(b, mode, drain, conc)
-				})
-			}
+	// off mode baseline (maxConcurrent inert for the merged batcher)
+	for _, conc := range concurrencies {
+		name := fmt.Sprintf("mode=off/drain=false/maxConc=0/concurrency=%d", conc)
+		b.Run(name, func(b *testing.B) {
+			runMergedOpsBench(b, "off", false, conc, 0)
+		})
+	}
+
+	// split + drain=true × maxConcurrent sweep
+	for _, mc := range mergedMaxConcurrents {
+		for _, conc := range concurrencies {
+			name := fmt.Sprintf("mode=split/drain=true/maxConc=%d/concurrency=%d", mc, conc)
+			b.Run(name, func(b *testing.B) {
+				runMergedOpsBench(b, "split", true, conc, mc)
+			})
 		}
 	}
 }
 
-func runMergedOpsBench(b *testing.B, mode string, drain bool, concurrency int) {
+func runMergedOpsBench(b *testing.B, mode string, drain bool, concurrency int, mergedMaxConc int) {
 	logger := ulogger.NewErrorTestLogger(b)
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.UtxoStore.MergedOpsBatcherMode = mode
@@ -81,6 +83,8 @@ func runMergedOpsBench(b *testing.B, mode string, drain bool, concurrency int) {
 	tSettings.UtxoStore.LockedBatcherDrainMode = false
 	// Per-batcher in-flight cap
 	tSettings.UtxoStore.BatcherMaxConcurrent = 512
+	// Merged-ops batcher dedicated max concurrent (0 = inherit BatcherMaxConcurrent)
+	tSettings.UtxoStore.MergedOpsBatcherMaxConcurrent = mergedMaxConc
 
 	store, ctx, deferFn := initAerospikeBench(b, tSettings, logger)
 	defer deferFn()
