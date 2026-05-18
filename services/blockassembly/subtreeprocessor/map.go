@@ -1,6 +1,7 @@
 package subtreeprocessor
 
 import (
+	"runtime"
 	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -87,6 +88,59 @@ func (s *SplitSwissMap) Iter(f func(hash chainhash.Hash, v struct{}) bool) {
 	for _, swissMap := range s.m {
 		swissMap.Iter(f)
 	}
+}
+
+// Clear empties every bucket in place without reallocating bucket arrays or
+// the per-bucket swiss.Map. The underlying swiss.Map.Clear walks its existing
+// control + group arrays and zeroes them, so capacity is retained for reuse.
+// Used to recycle a pooled SplitSwissMap across blocks.
+//
+// Each per-bucket Clear is independent (the swiss.Map and its RWMutex are
+// per-bucket), so we run them in parallel: clearing a ~600 K-entry swiss.Map
+// is memory-bandwidth-bound on its key/value/ctrl arrays, and with 1024
+// buckets the work is naturally embarrassingly parallel.
+func (s *SplitSwissMap) Clear() {
+	ncpu := runtime.NumCPU()
+	if ncpu > int(s.nrOfBuckets) {
+		ncpu = int(s.nrOfBuckets)
+	}
+
+	if ncpu < 1 {
+		ncpu = 1
+	}
+
+	// numWorkers fits in uint16 because it is clamped to nrOfBuckets.
+	numWorkers := uint16(ncpu)
+
+	if numWorkers == 1 {
+		for bucket := uint16(0); bucket < s.nrOfBuckets; bucket++ {
+			s.mu[bucket].Lock()
+			s.m[bucket].Clear()
+			s.mu[bucket].Unlock()
+		}
+
+		return
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(int(numWorkers))
+
+	for w := uint16(0); w < numWorkers; w++ {
+		start := w
+
+		go func() {
+			defer wg.Done()
+
+			for bucket := start; bucket < s.nrOfBuckets; bucket += numWorkers {
+				s.mu[bucket].Lock()
+				s.m[bucket].Clear()
+				s.mu[bucket].Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 type txInpointsBucket struct {
@@ -225,4 +279,44 @@ func (s *SplitTxInpointsMap) ParallelBulkSetIfNotExists(
 		}(&s.buckets[bIdx], indices)
 	}
 	wg.Wait()
+}
+
+// Buckets returns the configured bucket count.
+func (s *SplitTxInpointsMap) Buckets() uint16 {
+	return s.nrOfBuckets
+}
+
+// BucketFor returns the destination bucket index for a given hash, matching the
+// scheme used by Get/Set/SetIfNotExists.
+func (s *SplitTxInpointsMap) BucketFor(hash chainhash.Hash) uint16 {
+	return txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)
+}
+
+// PutMultiBucketTxInpoints inserts a batch of (hash, inpoints) pairs that all
+// belong to the same bucket. Takes the per-bucket lock exactly once for the
+// whole batch instead of once per entry.
+//
+// All entries MUST belong to the named bucket; callers are expected to have
+// partitioned by BucketFor beforehand. The returned slice has length
+// min(len(keys), len(values)); wasInserted[i] is true if keys[i] was newly
+// added, false if it already existed.
+func (s *SplitTxInpointsMap) PutMultiBucketTxInpoints(bucket uint16, keys []chainhash.Hash, values []*subtreepkg.TxInpoints) []bool {
+	n := len(keys)
+	if len(values) < n {
+		n = len(values)
+	}
+	wasInserted := make([]bool, n)
+	if n == 0 {
+		return wasInserted
+	}
+	b := &s.buckets[bucket]
+	b.mu.Lock()
+	for i := 0; i < n; i++ {
+		if !b.m.Has(keys[i]) {
+			b.m.Put(keys[i], values[i])
+			wasInserted[i] = true
+		}
+	}
+	b.mu.Unlock()
+	return wasInserted
 }
