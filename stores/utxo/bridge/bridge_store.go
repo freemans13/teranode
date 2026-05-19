@@ -202,6 +202,18 @@ func (s *BridgeStore) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 	return s.inner.GetUnminedTxIterator()
 }
 
+func (s *BridgeStore) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
+	return s.inner.GetConflictingTxIterator()
+}
+
+func (s *BridgeStore) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemoval) error {
+	return s.inner.RemoveBlockIDs(ctx, removals)
+}
+
+func (s *BridgeStore) RemoveFromConflictingChildren(ctx context.Context, removals []utxo.ConflictingChildRemoval) error {
+	return s.inner.RemoveFromConflictingChildren(ctx, removals)
+}
+
 func (s *BridgeStore) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
 	return s.inner.ScanInconsistentUnminedTxs()
 }

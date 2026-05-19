@@ -285,7 +285,7 @@ func TestValidateSubtreeInternal_DuplicateTxid(t *testing.T) {
 	nilConsumer := &kafka.KafkaConsumerGroup{}
 	tSettings := test.CreateBaseTestSettings(t)
 
-	subtreeValidation, err := New(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil)
+	subtreeValidation, err := New(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil, nil)
 	require.NoError(t, err)
 
 	v := ValidateSubtree{
