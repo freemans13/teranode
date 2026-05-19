@@ -2588,3 +2588,33 @@ func TestBuildParentMetadata(t *testing.T) {
 		assert.Equal(t, uint32(100), meta.BlockHeight)
 	})
 }
+
+func TestValidateSubtreeLeafCount(t *testing.T) {
+	subtreeHash := chainhash.Hash{0x01, 0x02, 0x03}
+
+	t.Run("UnderCap", func(t *testing.T) {
+		require.NoError(t, validateSubtreeLeafCount(subtreeHash, 3, 4))
+	})
+
+	t.Run("AtCap", func(t *testing.T) {
+		require.NoError(t, validateSubtreeLeafCount(subtreeHash, 4, 4))
+	})
+
+	t.Run("OverCap", func(t *testing.T) {
+		err := validateSubtreeLeafCount(subtreeHash, 5, 4)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrProcessing))
+		require.Contains(t, err.Error(), subtreeHash.String())
+		require.Contains(t, err.Error(), "exceeds policy max")
+	})
+
+	t.Run("ZeroLeaves", func(t *testing.T) {
+		require.NoError(t, validateSubtreeLeafCount(subtreeHash, 0, 4))
+	})
+
+	t.Run("LargeOverflow", func(t *testing.T) {
+		err := validateSubtreeLeafCount(subtreeHash, 1<<30, 1<<20)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrProcessing))
+	})
+}

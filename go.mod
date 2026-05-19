@@ -12,18 +12,11 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.8
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
-	// Pinned to a hot-fix on top of v1.2.3 (bitcoin-sv/bdk PR #40) that adds a
-	// per-CheckSig signature-cache to the script verifier. Without it the
-	// validator stalls for hours on consensus-valid scripts that perform the
-	// same ECDSA verification many times (e.g. testnet block 1,451,505).
-	//
-	// DO NOT bump to gobdk v1.2.4 (or later) until bitcoin-sv/bdk PR #41 has
-	// merged — that PR ports the same hot-fix forward to master / v1.2.4.
-	github.com/bitcoin-sv/bdk/module/gobdk v1.2.4-0.20260511121643-5ab3fd5b627d
+	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260518042519-1ca0c6519af9
 	github.com/bsv-blockchain/go-bt/v2 v2.6.3
 	github.com/bsv-blockchain/go-chaincfg v1.5.8
 	github.com/bsv-blockchain/go-sdk v1.2.23
-	github.com/bsv-blockchain/go-subtree v1.2.0
+	github.com/bsv-blockchain/go-subtree v1.3.3
 	github.com/bsv-blockchain/testcontainers-aerospike-go v0.3.2
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
@@ -145,6 +138,8 @@ require (
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/nxadm/tail v1.4.11 // indirect
+	github.com/onsi/ginkgo/v2 v2.27.5 // indirect
+	github.com/onsi/gomega v1.39.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect
@@ -193,8 +188,8 @@ require (
 	github.com/bsv-blockchain/go-bn v1.1.4
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
-	github.com/bsv-blockchain/go-safe-conversion v1.1.2
-	github.com/bsv-blockchain/go-tx-map v1.3.4
+	github.com/bsv-blockchain/go-safe-conversion v1.2.0
+	github.com/bsv-blockchain/go-tx-map v1.3.7
 	github.com/bsv-blockchain/go-wire v1.2.3
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -471,5 +466,5 @@ require (
 	github.com/labstack/echo/v4 v4.13.3
 	github.com/labstack/gommon v0.4.2
 	github.com/spf13/cobra v1.10.1 // indirect
-	github.com/yuin/gopher-lua v1.1.1 // indirect
+	github.com/yuin/gopher-lua v1.1.2 // indirect
 )

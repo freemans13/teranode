@@ -223,7 +223,12 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 						}
 					}
 
-					subtreeToCheck, err = subtreepkg.NewIncompleteTreeByLeafCount(len(subtreeNodeBytes) / chainhash.HashSize)
+					leafCount := len(subtreeNodeBytes) / chainhash.HashSize
+					if err := validateSubtreeLeafCount(subtreeHash, leafCount, u.settings.BlockAssembly.MaximumMerkleItemsPerSubtree); err != nil {
+						return err
+					}
+
+					subtreeToCheck, err = subtreepkg.NewIncompleteTreeByLeafCount(leafCount)
 					if err != nil {
 						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to create subtree structure", subtreeHash.String(), err)
 					}
@@ -1017,4 +1022,17 @@ func extendTxWithInBlockParents(tx *bt.Tx, parentMap map[chainhash.Hash]*bt.Tx) 
 	}
 
 	return extendedCount
+}
+
+// validateSubtreeLeafCount rejects peer-supplied leaf counts that exceed the
+// configured policy cap before they reach allocation paths such as
+// subtreepkg.NewIncompleteTreeByLeafCount, where the capacity argument would
+// otherwise drive an unbounded make() backed by attacker-controlled bytes.
+func validateSubtreeLeafCount(subtreeHash chainhash.Hash, leafCount, policyMax int) error {
+	if leafCount > policyMax {
+		return errors.NewProcessingError("[CheckBlockSubtrees][%s] subtree response exceeds policy max %d nodes (got %d)",
+			subtreeHash.String(), policyMax, leafCount)
+	}
+
+	return nil
 }

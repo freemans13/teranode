@@ -1897,6 +1897,21 @@ func isDeadlock(err error) bool {
 // Aerospike doesn't need this because it uses optimistic single-key operations
 // without DB-level row locking.
 func (s *Store) sendSpendBatch(batch []*batchSpend) {
+	batch = utxo.FilterConflictingDuplicateSpendClaims(batch,
+		func(item *batchSpend) *utxo.Spend {
+			if item == nil {
+				return nil
+			}
+			return item.spend
+		},
+		func(item *batchSpend, err error) {
+			item.errCh <- err
+		},
+	)
+	if len(batch) == 0 {
+		return
+	}
+
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		retryable := s.trySendSpendBatch(batch)
@@ -3013,6 +3028,19 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 		existingHashes[h] = true
 	}
 	rows.Close()
+
+	// Postcondition (see stores/utxo/Interface.go SetMinedMulti docstring): when
+	// !UnsetMined every submitted hash MUST exist in the transactions table.
+	// A missing hash means the tx was never persisted (or was pruned) — mirrors
+	// the Aerospike KEY_NOT_FOUND handling so all backends fail closed identically.
+	// UnsetMined tolerates missing rows (the tx is already gone).
+	if !minedBlockInfo.UnsetMined && len(existingHashes) != len(hashes) {
+		for _, h := range hashes {
+			if !existingHashes[*h] {
+				return nil, errors.NewTxNotFoundError("transaction not found: %s", h.String())
+			}
+		}
+	}
 
 	if len(existingHashes) == 0 {
 		if err = txn.Commit(); err != nil {
