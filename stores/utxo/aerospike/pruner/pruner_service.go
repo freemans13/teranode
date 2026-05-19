@@ -250,10 +250,15 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		})
 		prometheusUtxoPrunedSetSaturated = promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "utxo_pruner_pruned_set_saturated",
-			Help: "1 if any PrunedTxSet Insert has failed even on a freshly-rotated generation (backstop / error signal — should be 0 in normal operation; use utxo_pruner_pruned_set_rotations_total for routine saturation)",
+			Help: "1 if any PrunedTxSet Insert has failed even on a freshly-rotated generation (backstop / error signal — should be 0 in normal operation; use utxo_pruner_pruned_set_rotations for routine saturation)",
 		})
+		// Tracked as a Gauge (not a Counter) because the value is sampled
+		// from PrunedTxSet.Rotations() at the end of each prune session
+		// rather than incremented per-event. The _total suffix is omitted
+		// to comply with the Prometheus convention that "_total" is
+		// reserved for Counter metrics.
 		prometheusUtxoPrunedSetRotations = promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "utxo_pruner_pruned_set_rotations_total",
+			Name: "utxo_pruner_pruned_set_rotations",
 			Help: "Cumulative number of generation rotations across all PrunedTxSet shards (each rotation drops the previous-gen entries; high rate suggests pruner_utxoPrunedSetMaxEntries is too small)",
 		})
 	})
@@ -718,12 +723,13 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 	//     missed update — including the ~3% cuckoo false-positive rate — has no
 	//     behavioural consequence.
 	//
-	// Memory is bounded by settings.Pruner.UTXOPrunedSetMaxEntries at ~1 byte per entry
-	// across both generations of the cuckoo filter (default 10M ≈ 20 MB; 0 selects the
-	// built-in 2B default ≈ 2 GiB). When the current generation saturates it rotates
-	// into the `previous` slot and a fresh `current` is allocated, so the set never
-	// freezes — older entries simply fall out of `previous` on the next rotation. The
-	// utxo_pruner_pruned_set_rotations counter surfaces rotation rate;
+	// Memory is bounded by settings.Pruner.UTXOPrunedSetMaxEntries — interpreted as a
+	// TOTAL entry budget across both generations of all shards, so memory ≈ maxEntries
+	// × ~1 byte (default 10M ≈ 10 MiB; 0 selects the built-in 2B default ≈ 2 GiB).
+	// When the current generation saturates it rotates into the `previous` slot and a
+	// fresh `current` is allocated, so the set never freezes — older entries simply
+	// fall out of `previous` on the next rotation. The
+	// utxo_pruner_pruned_set_rotations gauge surfaces rotation rate;
 	// utxo_pruner_pruned_set_saturated indicates the rare case where an Insert fails
 	// even in the freshly-rotated current generation (a backstop signal, not the
 	// normal at-capacity indicator).

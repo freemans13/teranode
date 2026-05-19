@@ -46,10 +46,12 @@ const defaultPrunedTxSetCapacity = 2_000_000_000
 //     seconds apart by the same blaster worker), parent is almost always
 //     in `current`, so the miss path is rare.
 //
-// Memory budget: total memory ≈ 2 × maxEntries × ~1 byte (both
-// generations live simultaneously). NewPrunedTxSet sizes each generation
-// at maxEntries / (2 × shardCount) so the SUM of capacity across all
-// shards and both generations equals the configured maxEntries.
+// Memory budget: maxEntries is interpreted as a TOTAL capacity across
+// both generations of all shards (not a per-generation budget). Each
+// per-shard generation is sized at maxEntries / (2 × shardCount), so
+// the SUM of capacity across all shards × 2 generations equals the
+// configured maxEntries, and total memory ≈ maxEntries × ~1 byte
+// (e.g. maxEntries=10M ⇒ ~10 MiB; maxEntries=2B ⇒ ~2 GiB).
 //
 // Sharding picks a bucket from h[9] & mask (NOT h[0] — h[0] is consumed by
 // the cuckoo fingerprint, and we want shard distribution to be independent
@@ -133,12 +135,25 @@ func (s *PrunedTxSet) Add(h chainhash.Hash) {
 // rotateShard atomically swaps the shard's `current` for a fresh filter,
 // preserving the old current as `previous` (replacing whatever was there).
 // If another goroutine already rotated, this is a no-op.
+//
+// The early-exit Load check below avoids a wasteful allocation when many
+// goroutines hit saturation simultaneously: only the goroutine that still
+// sees the stale current pointer will allocate a replacement; the others
+// observe that current has already been swapped and return immediately
+// without producing GC pressure (per-shard filters can be multi-MiB).
 func (s *PrunedTxSet) rotateShard(sh *prunedTxShard, oldCur *cuckoo.H32) {
+	if sh.current.Load() != oldCur {
+		// Another goroutine already rotated. No work, no allocation.
+		return
+	}
 	newCur := cuckoo.NewH32(s.perShardCap)
 	if sh.current.CompareAndSwap(oldCur, newCur) {
 		sh.previous.Store(oldCur)
 		s.rotations.Add(1)
 	}
+	// If the CAS failed despite the Load check, another goroutine raced
+	// us between the Load and the CAS. newCur is discarded — rare and the
+	// Load above caps how often this happens.
 }
 
 // Contains returns true if the TXID is in either generation. Checks

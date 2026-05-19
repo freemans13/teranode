@@ -15,7 +15,9 @@ func makeHashes(b *testing.B, n int) []chainhash.Hash {
 	b.Helper()
 	hashes := make([]chainhash.Hash, n)
 	for i := range hashes {
-		_, _ = rand.Read(hashes[i][:])
+		if _, err := rand.Read(hashes[i][:]); err != nil {
+			b.Fatalf("makeHashes: rand.Read: %v", err)
+		}
 	}
 	return hashes
 }
