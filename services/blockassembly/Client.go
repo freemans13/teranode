@@ -17,6 +17,8 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/batchermetrics"
 	"github.com/bsv-blockchain/teranode/util/tracing"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // batchItem represents an item in a transaction batch.
@@ -457,6 +459,18 @@ func (s *Client) sendBatchColumnar(ctx context.Context, batch []*batchItem) {
 
 	_, err = s.client.AddTxBatchColumnar(ctx, columnarReq)
 	if err != nil {
+		// Peer server predates PR #889 and doesn't implement the columnar
+		// RPC. Fall back to the row-oriented path for this call so a
+		// rolling-deploy mismatch doesn't stall tx ingestion. No
+		// connection-level stickiness: each batch re-tries columnar
+		// independently. Costs one wasted RPC per batch against a
+		// persistently-old server; acceptable for the simpler code path.
+		if status.Code(err) == codes.Unimplemented {
+			s.logger.Debugf("[blockassembly] columnar AddTxBatch unimplemented on peer; falling back to row-oriented batch (rolling deploy?): %v", err)
+			s.sendBatchRowOriented(ctx, batch)
+			return
+		}
+
 		s.logger.Errorf("%v", err)
 
 		for _, item := range batch {
