@@ -37,7 +37,7 @@ func dummyTx(t testing.TB, seed byte) *bt.Tx {
 func newCoalescerWithStubFlush(t testing.TB, maxSize int, maxWait time.Duration, maxConcurrent int, flush func(items []*pendingTx)) *TxCoalescer {
 	t.Helper()
 	logger := ulogger.TestLogger{}
-	c := newTxCoalescerForTest(logger, maxSize, maxWait, maxConcurrent, flush)
+	c := newTxCoalescerForTest(logger, maxSize, maxWait, maxConcurrent, true, flush)
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 	return c
 }
@@ -263,7 +263,7 @@ func (f *fakeValidator) EnsureMTPLoaded(context.Context, uint32) error { return 
 func TestTxCoalescer_RealFlush_HappyPath(t *testing.T) {
 	fv := &fakeValidator{}
 	logger := ulogger.TestLogger{}
-	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0, true)
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	const N = 8
@@ -290,7 +290,7 @@ func TestTxCoalescer_RealFlush_HappyPath(t *testing.T) {
 func TestTxCoalescer_RealFlush_PerTxErrorIsolated(t *testing.T) {
 	fv := &fakeValidator{perTxErrs: map[chainhash.Hash]error{}}
 	logger := ulogger.TestLogger{}
-	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0, true)
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	good := dummyTx(t, 0x10)
@@ -318,7 +318,7 @@ func TestTxCoalescer_RealFlush_PerTxErrorIsolated(t *testing.T) {
 func TestTxCoalescer_RealFlush_WholeBatchErr(t *testing.T) {
 	fv := &fakeValidator{wholeErr: terrors.NewServiceError("aerospike unreachable")}
 	logger := ulogger.TestLogger{}
-	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0, true)
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	const N = 4

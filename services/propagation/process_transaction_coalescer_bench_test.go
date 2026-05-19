@@ -114,6 +114,7 @@ func newPropagationBackedByAerospike(b testing.TB, v benchVariant) (*Propagation
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.BlockAssembly.Disabled = true
 	tSettings.Validator.UseBatchValidation = v.useCoalescer
+	tSettings.Validator.BatchCoalescerDrainMode = true
 
 	// PR #887 merged-ops batcher toggle.
 	tSettings.UtxoStore.MergedOpsBatcherMode = v.mergedOpsMode
@@ -182,6 +183,7 @@ func newPropagationBackedByAerospike(b testing.TB, v benchVariant) (*Propagation
 			tSettings.Validator.BatchMaxSize,
 			tSettings.Validator.BatchMaxWait,
 			tSettings.Validator.BatchMaxConcurrent,
+			tSettings.Validator.BatchCoalescerDrainMode,
 		)
 	}
 

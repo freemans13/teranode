@@ -395,6 +395,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BatchMaxSize:              getInt("validator_batchMaxSize", 1024, alternativeContext...),
 			BatchMaxWait:              getDuration("validator_batchMaxWait", 5*time.Millisecond, alternativeContext...),
 			BatchMaxConcurrent:        getInt("validator_batchMaxConcurrent", 64, alternativeContext...),
+			BatchCoalescerDrainMode:   getBool("validator_batchCoalescerDrainMode", true, alternativeContext...),
 		},
 		Region: RegionSettings{
 			Name: getString("regionName", "defaultRegionName", alternativeContext...),

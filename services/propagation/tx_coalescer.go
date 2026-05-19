@@ -44,6 +44,8 @@ type TxCoalescer struct {
 //
 // maxSize and maxWait control the gather thresholds; maxConcurrent
 // caps the number of in-flight flush goroutines (0 = unbounded).
+// drainMode toggles the batcher's drain-mode behaviour (see
+// newBatcherInstance for details).
 func NewTxCoalescer(
 	ctx context.Context,
 	logger ulogger.Logger,
@@ -51,12 +53,13 @@ func NewTxCoalescer(
 	maxSize int,
 	maxWait time.Duration,
 	maxConcurrent int,
+	drainMode bool,
 ) *TxCoalescer {
 	c := &TxCoalescer{logger: logger, v: v}
 	flush := func(items []*pendingTx) {
 		c.flushBatch(ctx, v, items)
 	}
-	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, flush)
+	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, drainMode, flush)
 	return c
 }
 
@@ -67,10 +70,11 @@ func newTxCoalescerForTest(
 	maxSize int,
 	maxWait time.Duration,
 	maxConcurrent int,
+	drainMode bool,
 	flush func(items []*pendingTx),
 ) *TxCoalescer {
 	c := &TxCoalescer{logger: logger}
-	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, flush)
+	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, drainMode, flush)
 	return c
 }
 
@@ -79,6 +83,7 @@ func newBatcherInstance(
 	maxSize int,
 	maxWait time.Duration,
 	maxConcurrent int,
+	drainMode bool,
 	flush func(items []*pendingTx),
 ) *batcher.Batcher[pendingTx] {
 	b := batcher.NewWithPool(
@@ -98,7 +103,9 @@ func newBatcherInstance(
 	// while a flush is in flight. With maxWait acting as a fallback timer
 	// only, this minimises latency for the common low-rate case while
 	// still coalescing under load.
-	b.SetDrainMode(true)
+	if drainMode {
+		b.SetDrainMode(true)
+	}
 	return b
 }
 
