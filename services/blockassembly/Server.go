@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -979,30 +980,34 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("no tx requests in batch"))
 	}
 
-	// Build batch arrays
+	// Build batch arrays — three allocations for the whole batch. Per-tx
+	// TxInpoints values live inline in txInpointsArr so the loop only takes
+	// a pointer (no per-tx heap escape for the TxInpoints struct itself).
 	nodes := make([]subtreepkg.Node, len(requests))
+	txInpointsArr := make([]subtreepkg.TxInpoints, len(requests))
 	txInpointsList := make([]*subtreepkg.TxInpoints, len(requests))
 
-	var err error
+	storeTxInpoints := ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta
 
 	for i, req := range requests {
-		var txInpoints subtreepkg.TxInpoints
-		if ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
-			txInpoints, err = subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
-			if err != nil {
-				return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
-			}
-		} else {
-			// Create empty TxInpoints if not storing for subtree meta
-			txInpoints = subtreepkg.TxInpoints{}
-		}
-
 		nodes[i] = subtreepkg.Node{
 			Hash:        chainhash.Hash(req.Txid),
 			Fee:         req.Fee,
 			SizeInBytes: req.Size,
 		}
-		txInpointsList[i] = &txInpoints
+
+		if storeTxInpoints {
+			ti, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
+			if err != nil {
+				return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
+			}
+
+			txInpointsArr[i] = ti
+		}
+		// else: txInpointsArr[i] stays zero-valued — the empty TxInpoints
+		// behaviour for callers that do not need parent inpoints stored.
+
+		txInpointsList[i] = &txInpointsArr[i]
 	}
 
 	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
@@ -1077,73 +1082,117 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("parent_tx_hashes_packed length must be divisible by 32"))
 	}
 
-	totalParentHashes := len(req.ParentTxHashesPacked) / 32
-	if len(req.VoutIdxOffsets) != totalParentHashes+1 {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("vout_idx_offsets must have exactly (total_parent_hashes+1) elements (got %d, expected %d)", len(req.VoutIdxOffsets), totalParentHashes+1))
+	if len(req.VoutIdxsTxOffsets) != txCount+1 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"vout_idxs_tx_offsets must have exactly txCount+1 elements (got %d, expected %d)",
+			len(req.VoutIdxsTxOffsets), txCount+1))
+	}
+
+	totalParents := len(req.ParentTxHashesPacked) / 32
+	voutIdxsLen := len(req.VoutIdxsPacked)
+
+	// Validate the two offset-array endpoints + monotonicity. Without this a
+	// malformed request triggers a slice-bounds-out-of-range panic inside
+	// the per-tx loop, and grpc-go does not recover handler panics — a
+	// single bad packet would crash the entire block-assembly process. The
+	// validator is trusted at the semantic layer, so we do NOT walk the
+	// packed voutIdxs to verify the count-prefix invariant (that walk would
+	// be O(B·P) at 1M+ TPS); we only do what is needed to make every slice
+	// expression in the per-tx loop bounds-safe.
+	//
+	// Cost: O(txCount) comparisons, ~0.1 % of a core at 1M TPS / batch 1000.
+	if req.ParentTxOffsets[0] != 0 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"parent_tx_offsets[0] must be 0, got %d", req.ParentTxOffsets[0]))
+	}
+
+	if req.VoutIdxsTxOffsets[0] != 0 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"vout_idxs_tx_offsets[0] must be 0, got %d", req.VoutIdxsTxOffsets[0]))
+	}
+
+	if int(req.ParentTxOffsets[txCount]) != totalParents {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"parent_tx_offsets[txCount]=%d must equal total parent count %d",
+			req.ParentTxOffsets[txCount], totalParents))
+	}
+
+	if int(req.VoutIdxsTxOffsets[txCount]) != voutIdxsLen {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"vout_idxs_tx_offsets[txCount]=%d must equal len(vout_idxs_packed)=%d",
+			req.VoutIdxsTxOffsets[txCount], voutIdxsLen))
+	}
+
+	for i := 1; i <= txCount; i++ {
+		if req.ParentTxOffsets[i] < req.ParentTxOffsets[i-1] {
+			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+				"parent_tx_offsets must be monotonic non-decreasing at index %d (%d < %d)",
+				i, req.ParentTxOffsets[i], req.ParentTxOffsets[i-1]))
+		}
+
+		if req.VoutIdxsTxOffsets[i] < req.VoutIdxsTxOffsets[i-1] {
+			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+				"vout_idxs_tx_offsets must be monotonic non-decreasing at index %d (%d < %d)",
+				i, req.VoutIdxsTxOffsets[i], req.VoutIdxsTxOffsets[i-1]))
+		}
 	}
 
 	if ba.settings.BlockAssembly.Disabled {
 		return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 	}
 
-	// Build batch arrays
+	// Build batch arrays — three allocations for the whole batch.
 	nodes := make([]subtreepkg.Node, txCount)
+	txInpointsArr := make([]subtreepkg.TxInpoints, txCount)
 	txInpointsList := make([]*subtreepkg.TxInpoints, txCount)
 
-	// Process each transaction using column-oriented access
+	// Reinterpret the packed parent-hash byte buffer as []chainhash.Hash once
+	// for the whole batch. chainhash.Hash is [32]byte with byte alignment, so
+	// a []byte backing is byte-aligned and safe to reinterpret. Each per-tx
+	// slice of `parents` below is just a slice header — zero allocation.
+	//
+	// Aliasing assumption: proto.Unmarshal decodes `bytes` fields into a fresh
+	// Go-heap allocation (verified for google.golang.org/protobuf v1.36.x's
+	// consumeBytes path). If a future zero-copy codec ever lands that aliases
+	// the gRPC receive buffer into `ParentTxHashesPacked`, this aliasing must
+	// be reconsidered — the receive buffer is freed after handler return,
+	// which would invalidate any TxInpoints we hand off downstream.
+	var parents []chainhash.Hash
+	if totalParents > 0 {
+		parents = unsafe.Slice(
+			(*chainhash.Hash)(unsafe.Pointer(&req.ParentTxHashesPacked[0])),
+			totalParents,
+		)
+	}
+
+	storeTxInpoints := ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta
+
 	for i := 0; i < txCount; i++ {
-		// Extract TXID (32 bytes) - no allocation, just slice reference
+		// Extract TXID (32 bytes) — no allocation, copy into the Node.
 		txidStart := i * 32
-		txid := req.TxidsPacked[txidStart : txidStart+32]
-
-		// Reconstruct TxInpoints from columnar data WITHOUT deserialization
-		// This is the key optimization - we build TxInpoints directly from pre-parsed data
-		parentHashStart := req.ParentTxOffsets[i]
-		parentHashEnd := req.ParentTxOffsets[i+1]
-		numParentHashes := parentHashEnd - parentHashStart
-
-		// Pre-allocate slices with exact capacity to avoid reallocation
-		parentTxHashes := make([]chainhash.Hash, numParentHashes)
-		idxs := make([][]uint32, numParentHashes)
-
-		for j := uint32(0); j < numParentHashes; j++ {
-			parentHashIdx := parentHashStart + j
-
-			// Extract parent hash (32 bytes) - no allocation, direct copy
-			hashOffset := parentHashIdx * 32
-			copy(parentTxHashes[j][:], req.ParentTxHashesPacked[hashOffset:hashOffset+32])
-
-			// Extract vout indices for this parent hash
-			voutIdxStart := req.VoutIdxOffsets[parentHashIdx]
-			voutIdxEnd := req.VoutIdxOffsets[parentHashIdx+1]
-
-			// Reference the vout indices slice directly - no allocation
-			idxs[j] = req.ParentVoutIndices[voutIdxStart:voutIdxEnd]
-		}
-
-		// Build node and txInpoints for this transaction
 		nodes[i] = subtreepkg.Node{
-			Hash:        chainhash.Hash(txid),
+			Hash:        chainhash.Hash(req.TxidsPacked[txidStart : txidStart+32]),
 			Fee:         req.Fees[i],
 			SizeInBytes: req.Sizes[i],
 		}
 
-		if ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
-			txInpointsList[i] = &subtreepkg.TxInpoints{
-				ParentTxHashes: parentTxHashes,
-				Idxs:           idxs,
-			}
-		} else {
-			txInpointsList[i] = &subtreepkg.TxInpoints{}
+		if storeTxInpoints {
+			// Two slice operations per tx: parent hashes and packed voutIdxs.
+			// Bounds are guaranteed by the offset-array validation above, so
+			// these slice expressions cannot panic.
+			parentSlice := parents[req.ParentTxOffsets[i]:req.ParentTxOffsets[i+1]]
+			voutSlice := req.VoutIdxsPacked[req.VoutIdxsTxOffsets[i]:req.VoutIdxsTxOffsets[i+1]]
+			txInpointsArr[i] = subtreepkg.NewTxInpointsFromPacked(parentSlice, voutSlice)
 		}
+		// else: txInpointsArr[i] is the zero-value TxInpoints, which is the
+		// desired behaviour when not storing inpoints for subtree meta.
+
+		txInpointsList[i] = &txInpointsArr[i]
 	}
 
 	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
 
-	// Add entire batch in one call
-	if !ba.settings.BlockAssembly.Disabled {
-		ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
-	}
+	ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
 
 	return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 }

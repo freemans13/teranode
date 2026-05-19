@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	teranode_aerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -602,17 +603,21 @@ func TestStore_Unspend(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		// Try to unspend a tx that hasn't been spent
+		// Unspend a never-spent UTXO is an idempotent no-op: the row's spending_data
+		// is already nil, so the ownership check naturally short-circuits and the
+		// call succeeds without modifying anything.
+		someTxHash := chainhash.HashH([]byte("some-other-tx"))
 		err = store.Unspend(ctx, []*utxo.Spend{
 			{
-				TxID:     tx.TxIDChainHash(),
-				Vout:     0,
-				UTXOHash: utxoHash,
+				TxID:         tx.TxIDChainHash(),
+				Vout:         0,
+				UTXOHash:     utxoHash,
+				SpendingData: spendpkg.NewSpendingData(&someTxHash, 0),
 			},
 		})
 		require.NoError(t, err)
 
-		// Verify we can still spend it
+		// Verify we can still spend the UTXO normally.
 		spends, err := store.Spend(ctx, spendTx, store.GetBlockHeight()+1)
 		require.NoError(t, err)
 		require.Len(t, spends, 1)
