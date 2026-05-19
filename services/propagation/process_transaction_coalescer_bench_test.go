@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -99,6 +100,24 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.BlockAssembly.Disabled = true
 	tSettings.Validator.UseBatchValidation = useBatch
+
+	// Prod-aligned per-op batcher settings — apply equally across both variants so
+	// the comparison is apples-to-apples on the underlying store layer.
+	tSettings.UtxoStore.GetBatcherSize = 512
+	tSettings.UtxoStore.GetBatcherDurationMillis = 1
+	tSettings.UtxoStore.GetBatcherDrainMode = true
+	tSettings.UtxoStore.StoreBatcherSize = 512
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 1
+	tSettings.Aerospike.StoreBatcherDuration = 1 * time.Millisecond
+	tSettings.UtxoStore.StoreBatcherDrainMode = true
+	tSettings.UtxoStore.SpendBatcherSize = 512
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 1
+	tSettings.UtxoStore.SpendBatcherDrainMode = false
+	tSettings.UtxoStore.SpendBatcherConcurrency = 256
+	tSettings.UtxoStore.LockedBatcherSize = 512
+	tSettings.UtxoStore.LockedBatcherDurationMillis = 1
+	tSettings.UtxoStore.LockedBatcherDrainMode = false
+	tSettings.UtxoStore.BatcherMaxConcurrent = 512
 
 	container, err := aeroTest.RunContainer(ctx, aeroTest.WithTTLSupport("test"))
 	if err != nil {
