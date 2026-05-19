@@ -43,4 +43,9 @@ type ValidatorSettings struct {
 	// 0 = unbounded (every full batch spawns its own goroutine).
 	// Mirrors the convention from utxostore_batcherMaxConcurrent.
 	BatchMaxConcurrent int
+	// BatchCoalescerDrainMode enables drain mode on the TxCoalescer's batcher.
+	// When true (default), the coalescer fires immediately on first arrival and
+	// accumulates during in-flight time. When false, it waits for BatchMaxSize
+	// or BatchMaxWait. Default true matches the post-#871-improvements behaviour.
+	BatchCoalescerDrainMode bool
 }

@@ -37,7 +37,7 @@ func dummyTx(t testing.TB, seed byte) *bt.Tx {
 func newCoalescerWithStubFlush(t testing.TB, maxSize int, maxWait time.Duration, maxConcurrent int, flush func(items []*pendingTx)) *TxCoalescer {
 	t.Helper()
 	logger := ulogger.TestLogger{}
-	c := newTxCoalescerForTest(logger, maxSize, maxWait, maxConcurrent, flush)
+	c := newTxCoalescerForTest(logger, maxSize, maxWait, maxConcurrent, true, flush)
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 	return c
 }
@@ -57,7 +57,14 @@ func TestTxCoalescer_Submit_SingleTxRoundTrip(t *testing.T) {
 	require.Equal(t, *tx.TxIDChainHash(), res.TxHash)
 }
 
-func TestTxCoalescer_Submit_NConcurrentTxFanInOneBatch(t *testing.T) {
+// With drain mode enabled the batcher fires immediately on first
+// arrival, so an N-item burst under no concurrency cap can produce
+// anywhere from 1 to N small batches depending on goroutine scheduling.
+// The correctness invariant is that every item is processed exactly
+// once and at least one batch fires — the precise gather size is a
+// throughput/latency tradeoff exercised by the bench, not the unit
+// test.
+func TestTxCoalescer_Submit_NConcurrentAllItemsProcessed(t *testing.T) {
 	const N = 16
 	var (
 		flushedCount atomic.Int32
@@ -87,9 +94,9 @@ func TestTxCoalescer_Submit_NConcurrentTxFanInOneBatch(t *testing.T) {
 	}
 	wg.Wait()
 
-	require.Equal(t, int32(N), seenItems.Load())
-	require.GreaterOrEqual(t, flushedCount.Load(), int32(1))
-	require.LessOrEqual(t, flushedCount.Load(), int32(3), "expected ~1 batch for an N=16 burst")
+	require.Equal(t, int32(N), seenItems.Load(), "every submitted item must reach the flush handler")
+	require.GreaterOrEqual(t, flushedCount.Load(), int32(1), "at least one flush must occur")
+	require.LessOrEqual(t, flushedCount.Load(), int32(N), "no more flushes than items")
 }
 
 func TestTxCoalescer_Submit_SizeThresholdTriggersFlush(t *testing.T) {
@@ -125,10 +132,16 @@ func TestTxCoalescer_Submit_SizeThresholdTriggersFlush(t *testing.T) {
 		}
 	}
 	require.Equal(t, N, total)
-	require.Equal(t, 2, maxSeen, "no flush should exceed maxSize=2")
+	// With drain mode each batch can be smaller than maxSize; the
+	// invariant is that no batch ever EXCEEDS the size cap.
+	require.LessOrEqual(t, maxSeen, 2, "no flush should exceed maxSize=2")
+	require.GreaterOrEqual(t, maxSeen, 1, "every flush must contain at least one item")
 }
 
-func TestTxCoalescer_Submit_TimeThresholdTriggersFlush(t *testing.T) {
+// With drain mode enabled by default the batcher fires immediately on
+// first arrival rather than waiting for maxWait. A single Submit should
+// therefore complete substantially faster than the maxWait timeout.
+func TestTxCoalescer_Submit_DrainModeFiresImmediately(t *testing.T) {
 	flushCh := make(chan int, 10)
 	flush := func(items []*pendingTx) {
 		flushCh <- len(items)
@@ -136,14 +149,14 @@ func TestTxCoalescer_Submit_TimeThresholdTriggersFlush(t *testing.T) {
 			p.Done <- validator.ValidationResult{TxHash: *p.Tx.TxIDChainHash()}
 		}
 	}
-	c := newCoalescerWithStubFlush(t, 1024, 20*time.Millisecond, 0, flush)
+	c := newCoalescerWithStubFlush(t, 1024, 500*time.Millisecond, 0, flush)
 
 	start := time.Now()
 	_, err := c.Submit(context.Background(), dummyTx(t, 0xCC), 0)
 	require.NoError(t, err)
 	elapsed := time.Since(start)
-	require.GreaterOrEqual(t, elapsed, 18*time.Millisecond, "Submit should wait at least roughly maxWait")
-	require.Less(t, elapsed, 200*time.Millisecond, "should not wait substantially longer than maxWait")
+	require.Less(t, elapsed, 100*time.Millisecond,
+		"with drain mode, Submit should fire well before the 500ms maxWait")
 }
 
 func TestTxCoalescer_Submit_CtxCancelReturnsEarly(t *testing.T) {
@@ -204,12 +217,26 @@ type fakeValidator struct {
 
 func (f *fakeValidator) Health(context.Context, bool) (int, string, error) { return 200, "ok", nil }
 
-func (f *fakeValidator) Validate(context.Context, *bt.Tx, uint32, ...validator.Option) (*meta.Data, error) {
-	panic("TxCoalescer must not call Validate; only ValidateBatch")
+// Validate is reachable via the single-tx bypass path inside TxCoalescer
+// when no other Submit is in flight. Mirror the per-tx error behaviour
+// of ValidateBatch so tests can drive either code path with the same
+// fixture (perTxErrs map).
+func (f *fakeValidator) Validate(_ context.Context, tx *bt.Tx, _ uint32, _ ...validator.Option) (*meta.Data, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.lastSize = 1
+	if f.wholeErr != nil {
+		return nil, f.wholeErr
+	}
+	if err, ok := f.perTxErrs[*tx.TxIDChainHash()]; ok && err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 func (f *fakeValidator) ValidateWithOptions(context.Context, *bt.Tx, uint32, *validator.Options) (*meta.Data, error) {
-	panic("TxCoalescer must not call ValidateWithOptions; only ValidateBatch")
+	panic("TxCoalescer must not call ValidateWithOptions; only Validate or ValidateBatch")
 }
 
 func (f *fakeValidator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, _ ...validator.Option) ([]validator.ValidationResult, error) {
@@ -236,7 +263,7 @@ func (f *fakeValidator) EnsureMTPLoaded(context.Context, uint32) error { return 
 func TestTxCoalescer_RealFlush_HappyPath(t *testing.T) {
 	fv := &fakeValidator{}
 	logger := ulogger.TestLogger{}
-	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0, true)
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	const N = 8
@@ -263,7 +290,7 @@ func TestTxCoalescer_RealFlush_HappyPath(t *testing.T) {
 func TestTxCoalescer_RealFlush_PerTxErrorIsolated(t *testing.T) {
 	fv := &fakeValidator{perTxErrs: map[chainhash.Hash]error{}}
 	logger := ulogger.TestLogger{}
-	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0, true)
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	good := dummyTx(t, 0x10)
@@ -291,7 +318,7 @@ func TestTxCoalescer_RealFlush_PerTxErrorIsolated(t *testing.T) {
 func TestTxCoalescer_RealFlush_WholeBatchErr(t *testing.T) {
 	fv := &fakeValidator{wholeErr: terrors.NewServiceError("aerospike unreachable")}
 	logger := ulogger.TestLogger{}
-	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0)
+	c := NewTxCoalescer(context.Background(), logger, fv, 1024, 5*time.Millisecond, 0, true)
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	const N = 4

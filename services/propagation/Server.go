@@ -352,11 +352,13 @@ func (ps *PropagationServer) Start(ctx context.Context, readyCh chan<- struct{})
 			ps.settings.Validator.BatchMaxSize,
 			ps.settings.Validator.BatchMaxWait,
 			ps.settings.Validator.BatchMaxConcurrent,
+			ps.settings.Validator.BatchCoalescerDrainMode,
 		)
-		ps.logger.Infof("[Propagation] TxCoalescer enabled: maxSize=%d maxWait=%s maxConcurrent=%d",
+		ps.logger.Infof("[Propagation] TxCoalescer enabled: maxSize=%d maxWait=%s maxConcurrent=%d drainMode=%t",
 			ps.settings.Validator.BatchMaxSize,
 			ps.settings.Validator.BatchMaxWait,
 			ps.settings.Validator.BatchMaxConcurrent,
+			ps.settings.Validator.BatchCoalescerDrainMode,
 		)
 	}
 

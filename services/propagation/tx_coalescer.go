@@ -2,6 +2,7 @@ package propagation
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	batcher "github.com/bsv-blockchain/go-batcher/v2"
@@ -25,9 +26,17 @@ type pendingTx struct {
 // propagation handlers and dispatches them to validator.ValidateBatch
 // in batches. Wraps go-batcher v2 with a per-item done-channel pattern
 // so each Submit caller can block on its own result.
+//
+// pending tracks the number of Submit calls currently in flight. When
+// the count is exactly 1 there are no other concurrent submitters to
+// coalesce with, so Submit takes a direct-Validate fast path and skips
+// the gather/dispatch overhead entirely. v is the validator used by
+// both the bypass path and the flush handler.
 type TxCoalescer struct {
-	logger ulogger.Logger
-	b      *batcher.Batcher[pendingTx]
+	logger  ulogger.Logger
+	b       *batcher.Batcher[pendingTx]
+	v       validator.Interface
+	pending atomic.Int32
 }
 
 // NewTxCoalescer builds a coalescer wired to the supplied validator.
@@ -35,6 +44,8 @@ type TxCoalescer struct {
 //
 // maxSize and maxWait control the gather thresholds; maxConcurrent
 // caps the number of in-flight flush goroutines (0 = unbounded).
+// drainMode toggles the batcher's drain-mode behaviour (see
+// newBatcherInstance for details).
 func NewTxCoalescer(
 	ctx context.Context,
 	logger ulogger.Logger,
@@ -42,12 +53,13 @@ func NewTxCoalescer(
 	maxSize int,
 	maxWait time.Duration,
 	maxConcurrent int,
+	drainMode bool,
 ) *TxCoalescer {
-	c := &TxCoalescer{logger: logger}
+	c := &TxCoalescer{logger: logger, v: v}
 	flush := func(items []*pendingTx) {
 		c.flushBatch(ctx, v, items)
 	}
-	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, flush)
+	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, drainMode, flush)
 	return c
 }
 
@@ -58,10 +70,11 @@ func newTxCoalescerForTest(
 	maxSize int,
 	maxWait time.Duration,
 	maxConcurrent int,
+	drainMode bool,
 	flush func(items []*pendingTx),
 ) *TxCoalescer {
 	c := &TxCoalescer{logger: logger}
-	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, flush)
+	c.b = newBatcherInstance(logger, maxSize, maxWait, maxConcurrent, drainMode, flush)
 	return c
 }
 
@@ -70,6 +83,7 @@ func newBatcherInstance(
 	maxSize int,
 	maxWait time.Duration,
 	maxConcurrent int,
+	drainMode bool,
 	flush func(items []*pendingTx),
 ) *batcher.Batcher[pendingTx] {
 	b := batcher.NewWithPool(
@@ -85,6 +99,13 @@ func newBatcherInstance(
 	if maxConcurrent > 0 {
 		b.SetMaxConcurrent(maxConcurrent)
 	}
+	// Drain mode: fire immediately on first arrival; naturally accumulate
+	// while a flush is in flight. With maxWait acting as a fallback timer
+	// only, this minimises latency for the common low-rate case while
+	// still coalescing under load.
+	if drainMode {
+		b.SetDrainMode(true)
+	}
 	return b
 }
 
@@ -97,6 +118,27 @@ func newBatcherInstance(
 // waiting for the result. This is deliberate: one caller's deadline
 // must not cascade into other callers' tx failing.
 func (c *TxCoalescer) Submit(ctx context.Context, tx *bt.Tx, blockHeight uint32) (validator.ValidationResult, error) {
+	// Single-tx fast path: if no other Submit is currently in flight,
+	// dispatch the tx directly to validator.Validate and skip the
+	// batcher entirely. The atomic.Add returns the new value, so being
+	// the first arriver means the result is 1 — every other concurrent
+	// submitter sees a value >= 2 and falls through to the gather path.
+	//
+	// pending must be decremented in both branches; using defer keeps
+	// the bookkeeping correct on every return path including panics.
+	if c.v != nil && c.pending.Add(1) == 1 {
+		defer c.pending.Add(-1)
+
+		m, err := c.v.Validate(ctx, tx, blockHeight)
+		res := validator.ValidationResult{
+			TxHash: *tx.TxIDChainHash(),
+			Meta:   m,
+			Err:    err,
+		}
+		return res, nil
+	}
+	defer c.pending.Add(-1)
+
 	p := &pendingTx{
 		Tx:          tx,
 		BlockHeight: blockHeight,

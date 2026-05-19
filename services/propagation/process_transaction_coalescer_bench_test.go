@@ -100,6 +100,7 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 	tSettings := test.CreateBaseTestSettings(b)
 	tSettings.BlockAssembly.Disabled = true
 	tSettings.Validator.UseBatchValidation = useBatch
+	tSettings.Validator.BatchCoalescerDrainMode = true
 
 	// Prod-aligned per-op batcher settings — apply equally across both variants so
 	// the comparison is apples-to-apples on the underlying store layer.
@@ -161,6 +162,7 @@ func newPropagationBackedByAerospike(b testing.TB, useBatch bool) (*PropagationS
 			tSettings.Validator.BatchMaxSize,
 			tSettings.Validator.BatchMaxWait,
 			tSettings.Validator.BatchMaxConcurrent,
+			tSettings.Validator.BatchCoalescerDrainMode,
 		)
 	}
 

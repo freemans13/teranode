@@ -261,6 +261,7 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 			tSettings.Validator.BatchMaxSize,
 			tSettings.Validator.BatchMaxWait,
 			tSettings.Validator.BatchMaxConcurrent,
+			tSettings.Validator.BatchCoalescerDrainMode,
 		))
 	}
 
