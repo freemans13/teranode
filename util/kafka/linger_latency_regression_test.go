@@ -40,7 +40,7 @@ import (
 // test isolates ProducerLinger. Unit-level coverage that the two fields are
 // decoupled lives in TestNewKafkaAsyncProducerFromURLOuterBatcherLinger.
 //
-// Run:  go test -v -run TestLingerLatencyRegression -timeout 5m ./util/kafka/
+// Run:  go test -tags perf -v -run TestLingerLatencyRegression -timeout 5m ./util/kafka/
 func TestLingerLatencyRegression(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping kafka regression test in -short mode (requires Docker)")
