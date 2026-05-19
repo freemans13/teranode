@@ -230,6 +230,78 @@ func TestSpend(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestSpendBatchRejectsDuplicateDifferentSpendersSQLite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _ := setup(ctx, t)
+	assertSpendBatchRejectsDuplicateDifferentSpenders(t, ctx, store)
+}
+
+func TestSpendBatchRejectsDuplicateDifferentSpendersPostgresBulk(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Postgres integration test in short mode")
+	}
+
+	store, ctx := setupPostgresStore(t)
+	store.settings.UtxoStore.BatchSQLOperations = true
+
+	assertSpendBatchRejectsDuplicateDifferentSpenders(t, ctx, store)
+}
+
+func assertSpendBatchRejectsDuplicateDifferentSpenders(t *testing.T, ctx context.Context, store *Store) {
+	t.Helper()
+
+	err := store.Delete(ctx, tests.Tx.TxIDChainHash())
+	require.NoError(t, err)
+
+	_, err = store.Create(ctx, tests.Tx, 0)
+	require.NoError(t, err)
+
+	winnerTx := utxo2.GetSpendingTx(tests.Tx, 0)
+	loserTx := utxo2.GetSpendingTx(tests.Tx, 0)
+	loserTx.Version = winnerTx.Version + 1
+
+	winnerSpends, err := utxo.GetSpends(winnerTx)
+	require.NoError(t, err)
+	require.Len(t, winnerSpends, 1)
+
+	loserSpends, err := utxo.GetSpends(loserTx)
+	require.NoError(t, err)
+	require.Len(t, loserSpends, 1)
+	require.NotEqual(t, winnerSpends[0].SpendingData.Bytes(), loserSpends[0].SpendingData.Bytes())
+
+	winnerErrCh := make(chan error, 1)
+	loserErrCh := make(chan error, 1)
+	store.sendSpendBatch([]*batchSpend{
+		{
+			spend:       winnerSpends[0],
+			blockHeight: store.GetBlockHeight() + 1,
+			errCh:       winnerErrCh,
+		},
+		{
+			spend:       loserSpends[0],
+			blockHeight: store.GetBlockHeight() + 1,
+			errCh:       loserErrCh,
+		},
+	})
+
+	require.NoError(t, <-winnerErrCh)
+	loserErr := <-loserErrCh
+	require.ErrorIs(t, loserErr, errors.ErrSpent)
+
+	var terr *errors.Error
+	require.ErrorAs(t, loserErr, &terr)
+	var spentData *errors.UtxoSpentErrData
+	require.True(t, errors.AsData(terr, &spentData))
+	require.Equal(t, winnerSpends[0].SpendingData.Bytes(), spentData.SpendingData.Bytes())
+
+	spendResp, err := store.GetSpend(ctx, winnerSpends[0])
+	require.NoError(t, err)
+	require.NotNil(t, spendResp.SpendingData)
+	require.Equal(t, winnerSpends[0].SpendingData.Bytes(), spendResp.SpendingData.Bytes())
+}
+
 func TestUnspend(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
