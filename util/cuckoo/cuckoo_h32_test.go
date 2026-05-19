@@ -115,16 +115,22 @@ func TestH32_SaturationLatchesAndShortCircuits(t *testing.T) {
 	}
 	require.True(t, cf.Saturated(), "expected saturated flag to latch after eviction failure")
 
-	// Time a batch of Inserts that we expect to fail. Even at b.N = 1M
-	// these should all return immediately (no eviction churn), so total
-	// wall time is bounded by the fast-path overhead only.
-	start := time.Now()
+	// Pre-generate hashes OUTSIDE the timed region so the measurement
+	// reflects the saturated-Insert fast path and not the cost of
+	// crypto/rand.Read (which dominates if it stays inside the loop and
+	// makes this assertion flaky in CI).
 	const n = 100_000
+	hashes := make([][32]byte, n)
 	for i := 0; i < n; i++ {
-		var h [32]byte
-		_, err := rand.Read(h[:])
+		_, err := rand.Read(hashes[i][:])
 		require.NoError(t, err)
-		cf.Insert(&h)
+	}
+
+	// Time a batch of Inserts that we expect to fail. With saturation
+	// latched, these should all return immediately (no eviction churn).
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		cf.Insert(&hashes[i])
 	}
 	elapsed := time.Since(start)
 

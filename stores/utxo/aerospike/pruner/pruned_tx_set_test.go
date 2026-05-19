@@ -33,7 +33,7 @@ func randomHash(t *testing.T) chainhash.Hash {
 }
 
 func TestPrunedTxSet_AddAndContains(t *testing.T) {
-	set := NewPrunedTxSet(16, 0)
+	set := NewPrunedTxSet(16, 4096)
 
 	h1 := makeHash(0x01)
 	h2 := makeHash(0x02)
@@ -49,7 +49,7 @@ func TestPrunedTxSet_AddAndContains(t *testing.T) {
 }
 
 func TestPrunedTxSet_CheckAndRemove(t *testing.T) {
-	set := NewPrunedTxSet(16, 0)
+	set := NewPrunedTxSet(16, 4096)
 
 	h1 := makeHash(0x01)
 	h2 := makeHash(0x02)
@@ -63,7 +63,7 @@ func TestPrunedTxSet_CheckAndRemove(t *testing.T) {
 }
 
 func TestPrunedTxSet_Len_AfterRemove(t *testing.T) {
-	set := NewPrunedTxSet(16, 0)
+	set := NewPrunedTxSet(16, 4096)
 
 	require.Equal(t, 0, set.Len())
 
@@ -138,7 +138,7 @@ func TestPrunedTxSet_SimulateChainPruning(t *testing.T) {
 	// Tight chain: A -> B -> C -> D, all pruned in the same session.
 	// Reader Adds all four TXIDs before processor starts; processor's
 	// CheckAndRemove for each parent should find it.
-	set := NewPrunedTxSet(16, 0)
+	set := NewPrunedTxSet(16, 4096)
 
 	txA := makeHash(0x0A)
 	txB := makeHash(0x0B)
@@ -175,13 +175,12 @@ func TestPrunedTxSet_RotatesUnderLoad(t *testing.T) {
 }
 
 func TestPrunedTxSet_DefaultCapacity(t *testing.T) {
-	// maxEntries=0 falls back to defaultPrunedTxSetCapacity — large enough
-	// that small workloads should never saturate.
-	set := NewPrunedTxSet(16, 0)
-	for i := 0; i < 1000; i++ {
-		set.Add(randomHash(t))
-	}
-	require.False(t, set.Saturated())
+	// maxEntries<=0 falls back to defaultPrunedTxSetCapacity. We don't
+	// actually construct with maxEntries=0 here — doing so would allocate
+	// ~1 GiB of cuckoo memory and OOM CI. Instead, sanity-check that the
+	// default constant is the expected order of magnitude.
+	require.Equal(t, 2_000_000_000, defaultPrunedTxSetCapacity,
+		"default capacity should be 2B entries (~2 GiB at ~1 B/entry)")
 }
 
 func TestPrunedTxSet_FalsePositiveRate(t *testing.T) {

@@ -60,6 +60,9 @@ func ensurePrometheusMetrics() {
 		prometheusUtxoPrunedSetSaturated = prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "test_utxo_pruner_pruned_set_saturated",
 		})
+		prometheusUtxoPrunedSetRotations = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "test_utxo_pruner_pruned_set_rotations_total",
+		})
 	})
 }
 

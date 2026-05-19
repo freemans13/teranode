@@ -12,7 +12,6 @@ package cuckoo
 
 import (
 	"sync/atomic"
-	"unsafe"
 )
 
 // H32 is a lock-free cuckoo filter specialised for 32-byte cryptographic
@@ -51,7 +50,11 @@ import (
 // Standard cuckoo parameters: 4-slot buckets × 8-bit fingerprints → ~3.1%
 // false-positive rate.
 type H32 struct {
-	buckets []bucketH32
+	// buckets stores 4-byte packed fingerprints as uint32 so we can use
+	// the standard sync/atomic uint32 primitives directly. uint32 has
+	// alignof(4), so atomic ops on &buckets[i] are guaranteed safe on
+	// every architecture Go supports.
+	buckets []uint32
 	mask    uint64
 	count   atomic.Int64
 
@@ -79,10 +82,6 @@ const (
 	maskMixer64 = 0xc4ceb9fe1a85ec53 // SplitMix64 mix constant
 )
 
-// bucketH32 holds 4 fingerprint bytes. Naturally 4-byte aligned in the
-// `buckets` slice, so atomic uint32 ops on the underlying memory are safe.
-type bucketH32 [bucketSize]uint8
-
 // NewH32 returns a filter sized to hold approximately the requested number
 // of entries. Actual capacity is rounded up to the next power of two of
 // buckets, so allocated memory is the next-power-of-two of (capacity / 4)
@@ -97,13 +96,13 @@ func NewH32(capacity uint) *H32 {
 		n <<= 1
 	}
 	return &H32{
-		buckets: make([]bucketH32, n),
+		buckets: make([]uint32, n),
 		mask:    n - 1,
 	}
 }
 
 func (cf *H32) bucketAddr(i uint64) *uint32 {
-	return (*uint32)(unsafe.Pointer(&cf.buckets[i][0]))
+	return &cf.buckets[i]
 }
 
 // extract derives fingerprint and primary bucket index from the hash.
@@ -231,8 +230,20 @@ func (cf *H32) Insert(h *[32]byte) bool {
 			}
 		}
 		if !swapped {
-			cf.saturated.Store(true)
+			// Mid-eviction CAS contention exhausted retries. This is
+			// transient contention, not provable saturation, so do not
+			// latch the saturated flag here — leave that to the maxKicks
+			// exhaustion path below. Just back out of this Insert.
 			return false
+		}
+		// If displaced was empty (concurrent Delete cleared the slot
+		// between bucketHas and this CAS), eviction is effectively a
+		// plain insert: our fp is now in the slot and there is nothing
+		// to relocate. Count was not incremented yet (only tryInsertCAS
+		// bumps Count), so do it here and return.
+		if displaced == nullFinger {
+			cf.count.Add(1)
+			return true
 		}
 		fp = displaced
 		i = cf.altIndex(fp, i)

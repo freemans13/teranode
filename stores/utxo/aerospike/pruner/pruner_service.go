@@ -69,6 +69,7 @@ var (
 	prometheusUtxoParentsSkippedPruned        prometheus.Counter
 	prometheusUtxoPrunedSetSize               prometheus.Gauge
 	prometheusUtxoPrunedSetSaturated          prometheus.Gauge
+	prometheusUtxoPrunedSetRotations          prometheus.Gauge
 )
 
 // Options contains configuration options for the cleanup service
@@ -245,11 +246,15 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		})
 		prometheusUtxoPrunedSetSize = promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "utxo_pruner_pruned_set_size",
-			Help: "Current number of TXIDs tracked in the persistent PrunedTxSet across sessions",
+			Help: "Approximate number of TXIDs tracked in the in-memory PrunedTxSet across prune sessions",
 		})
 		prometheusUtxoPrunedSetSaturated = promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "utxo_pruner_pruned_set_saturated",
-			Help: "1 if the PrunedTxSet has reached its configured maxEntries cap, 0 otherwise",
+			Help: "1 if any PrunedTxSet Insert has failed even on a freshly-rotated generation (backstop / error signal — should be 0 in normal operation; use utxo_pruner_pruned_set_rotations_total for routine saturation)",
+		})
+		prometheusUtxoPrunedSetRotations = promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "utxo_pruner_pruned_set_rotations_total",
+			Help: "Cumulative number of generation rotations across all PrunedTxSet shards (each rotation drops the previous-gen entries; high rate suggests pruner_utxoPrunedSetMaxEntries is too small)",
 		})
 	})
 
@@ -693,9 +698,11 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 		partitionStart += partitionCount
 	}
 
-	// PrunedTxSet is owned by the Service and persisted across prune sessions. This lets
-	// children whose parents were pruned in earlier sessions (the common case for chains
-	// crossing block-height boundaries) still skip the parent-update round-trip.
+	// PrunedTxSet is owned by the Service and reused across prune sessions within the
+	// life of this process. This lets children whose parents were pruned in an earlier
+	// session (the common case for chains crossing block-height boundaries) still skip
+	// the parent-update round-trip. The set lives only in memory — it is rebuilt from
+	// scratch on pod restart and is not persisted to disk.
 	//
 	// Invariants:
 	//   - nil when defensiveEnabled: records may be skipped after the reader registers them,
@@ -711,10 +718,15 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 	//     missed update — including the ~3% cuckoo false-positive rate — has no
 	//     behavioural consequence.
 	//
-	// Memory is bounded by settings.Pruner.UTXOPrunedSetMaxEntries (default 2B entries
-	// ≈ 2 GiB at the cuckoo's ~1 byte per entry). Once the cap is reached, Insert silently
-	// fails for new entries and the optimisation degrades to baseline; the
-	// utxo_pruner_pruned_set_saturated gauge surfaces this.
+	// Memory is bounded by settings.Pruner.UTXOPrunedSetMaxEntries at ~1 byte per entry
+	// across both generations of the cuckoo filter (default 10M ≈ 20 MB; 0 selects the
+	// built-in 2B default ≈ 2 GiB). When the current generation saturates it rotates
+	// into the `previous` slot and a fresh `current` is allocated, so the set never
+	// freezes — older entries simply fall out of `previous` on the next rotation. The
+	// utxo_pruner_pruned_set_rotations counter surfaces rotation rate;
+	// utxo_pruner_pruned_set_saturated indicates the rare case where an Insert fails
+	// even in the freshly-rotated current generation (a backstop signal, not the
+	// normal at-capacity indicator).
 	prunedSet := s.prunedSet
 
 	// Cumulative counters persist across retry attempts
@@ -836,6 +848,7 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 
 		if prunedSet != nil {
 			prometheusUtxoPrunedSetSize.Set(float64(prunedSet.Len()))
+			prometheusUtxoPrunedSetRotations.Set(float64(prunedSet.Rotations()))
 			if prunedSet.Saturated() {
 				prometheusUtxoPrunedSetSaturated.Set(1)
 			} else {
@@ -1675,11 +1688,11 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 
 	if parentErrors > 0 {
 		s.logger.Errorf("Combined cleanup: %d parent update errors (first: %v)", parentErrors, firstParentErr)
-		return errors.NewStorageError("%d parent update operations failed", parentErrors)
+		return errors.NewStorageError("%d parent update operations failed", parentErrors, firstParentErr)
 	}
 	if deleteErrors > 0 {
 		s.logger.Errorf("Combined cleanup: %d deletion errors (first: %v)", deleteErrors, firstDeleteErr)
-		return errors.NewStorageError("%d deletion operations failed", deleteErrors)
+		return errors.NewStorageError("%d deletion operations failed", deleteErrors, firstDeleteErr)
 	}
 
 	if parentSuccess > 0 {
