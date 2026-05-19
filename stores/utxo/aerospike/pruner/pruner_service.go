@@ -1638,7 +1638,12 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 	// [parentEnd, end) are child deletions.
 	parentSuccess, parentNotFound, parentErrors := 0, 0, 0
 	deleteErrors := 0
-	var firstParentErr aerospike.Error
+	// firstParentErr captures the first non-KEY_NOT_FOUND failure surfaced
+	// by either path: the aerospike SDK (batchRec.Err) or the UDF
+	// SUCCESS-map "ERROR" status. It is typed as `error` rather than
+	// `aerospike.Error` so the UDF-error branch can synthesise a
+	// descriptive sentinel without faking an aerospike.Error.
+	var firstParentErr error
 	var firstDeleteErr aerospike.Error
 
 	for i, rec := range batchRecords {
@@ -1670,6 +1675,15 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 									parentNotFound++
 								} else {
 									parentErrors++
+									// UDF-path errors don't carry an
+									// aerospike.Error; synthesise one
+									// describing the UDF response so the
+									// returned error chain isn't empty.
+									if firstParentErr == nil {
+										errCode, _ := respMap["errorCode"].(string)
+										errMsg, _ := respMap["errorMessage"].(string)
+										firstParentErr = errors.NewProcessingError("UDF parent update returned ERROR (code=%q, message=%q)", errCode, errMsg)
+									}
 								}
 							}
 							continue

@@ -112,17 +112,42 @@ func (s *PrunedTxSet) shard(h *chainhash.Hash) *prunedTxShard {
 	return &s.shards[h[9]&s.mask]
 }
 
-// Add registers a TXID. If the current generation refuses (saturated), the
-// shard rotates — current slides into previous (replacing it), a fresh
-// current is allocated, and the Add is retried.
+// Add registers a TXID. If the current generation refuses because it is
+// actually saturated, the shard rotates — current slides into previous
+// (replacing it), a fresh current is allocated, and the Add is retried.
+//
+// A cuckoo Insert can return false for two reasons: (a) provable
+// saturation (eviction loop exhausted maxKicks — Saturated() latches
+// true), or (b) transient CAS contention exhausting the inner retry
+// budget without latching saturated. We must only rotate on (a) —
+// rotating on transient contention burns a multi-MiB allocation and
+// drops the previous generation prematurely. On (b) we just retry the
+// Insert into the same current; the contending goroutine has by now
+// finished its CAS and the retry is overwhelmingly likely to succeed.
 func (s *PrunedTxSet) Add(h chainhash.Hash) {
 	sh := s.shard(&h)
 	cur := sh.current.Load()
 	if cur.Insert((*[32]byte)(&h)) {
 		return
 	}
-	// Saturated — rotate this shard. Only one goroutine wins the CAS;
-	// the others observe the new current on their retry below.
+	if !cur.Saturated() {
+		// Insert failed but the filter is NOT actually saturated —
+		// transient CAS contention. Retry once into the same current.
+		if cur.Insert((*[32]byte)(&h)) {
+			return
+		}
+		// Second attempt also failed and still not saturated: extreme
+		// contention. Treat as a backstop insert-failure rather than
+		// triggering a spurious rotation.
+		if !cur.Saturated() {
+			s.insertFailures.Add(1)
+			return
+		}
+		// Fell through to saturation between attempts — drop into the
+		// rotation path below.
+	}
+	// Provably saturated — rotate this shard. Only one goroutine wins
+	// the CAS; the others observe the new current on their retry below.
 	s.rotateShard(sh, cur)
 	if sh.current.Load().Insert((*[32]byte)(&h)) {
 		return
