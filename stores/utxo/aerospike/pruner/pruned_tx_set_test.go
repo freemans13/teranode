@@ -76,7 +76,7 @@ func TestPrunedTxSet_Len_AfterRemove(t *testing.T) {
 }
 
 func TestPrunedTxSet_ConcurrentAccess(t *testing.T) {
-	set := NewPrunedTxSet(256, 0)
+	set := NewPrunedTxSet(256, 1_048_576)
 	const numGoroutines = 100
 	const opsPerGoroutine = 1000
 
@@ -114,7 +114,7 @@ func TestPrunedTxSet_ConcurrentAccess(t *testing.T) {
 }
 
 func TestPrunedTxSet_ShardDistribution(t *testing.T) {
-	set := NewPrunedTxSet(256, 0)
+	set := NewPrunedTxSet(256, 1_048_576)
 
 	// Add hashes with different first bytes so they distribute across shards.
 	for i := 0; i < 256; i++ {

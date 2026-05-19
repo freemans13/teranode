@@ -14,15 +14,12 @@ import (
 func TestH32_BasicInsertLookupDelete(t *testing.T) {
 	cf := NewH32(1024)
 
-	var h1, h2, h3 [32]byte
+	var h1, h2 [32]byte
 	for i := range h1 {
 		h1[i] = byte(i + 1)
 	}
 	for i := range h2 {
 		h2[i] = byte(i + 100)
-	}
-	for i := range h3 {
-		h3[i] = byte(i + 200)
 	}
 
 	require.True(t, cf.Insert(&h1))
