@@ -250,7 +250,7 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		})
 		prometheusUtxoPrunedSetSaturated = promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "utxo_pruner_pruned_set_saturated",
-			Help: "1 if any PrunedTxSet Insert has failed even on a freshly-rotated generation (backstop / error signal — should be 0 in normal operation; use utxo_pruner_pruned_set_rotations for routine saturation)",
+			Help: "1 if any PrunedTxSet Insert has failed since construction without rotation recovering it (extreme CAS contention without saturation, or insertion into a freshly-rotated generation also failing — both are error/backstop signals; should be 0 in normal operation. Use utxo_pruner_pruned_set_rotations for routine cap pressure.)",
 		})
 		// Tracked as a Gauge (not a Counter) because the value is sampled
 		// from PrunedTxSet.Rotations() at the end of each prune session

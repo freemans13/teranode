@@ -89,8 +89,19 @@ func NewPrunedTxSet(shardCount int, maxEntries int) *PrunedTxSet {
 	}
 
 	// Each shard has 2 generations; total live capacity = 2 × shardCount ×
-	// perShardCap. Divide accordingly so memory budget matches the
-	// configured maxEntries. NewH32 enforces its own per-shard minimum.
+	// perShardCap. Divide accordingly so the memory budget approximately
+	// matches the configured maxEntries. Caveats that make this an
+	// upper-bound rather than an exact match:
+	//   - cuckoo.NewH32 rounds bucket count up to the next power of two,
+	//     so actual allocated slots per generation can exceed perShard
+	//     by up to ~2x (e.g. 10M budget with 256 shards rounds to ~16.8M
+	//     slots).
+	//   - Cuckoo filters run well below 100% load before saturating, so
+	//     effective stored entries are typically lower than allocated
+	//     slots.
+	// Operators should treat maxEntries as the target rather than a
+	// hard ceiling on RSS; the worst-case allocation overhead is bounded
+	// by the power-of-two rounding.
 	perShard := uint(maxEntries / n / 2)
 
 	s := &PrunedTxSet{
@@ -223,11 +234,20 @@ func (s *PrunedTxSet) Len() int {
 }
 
 // Saturated reports whether the set has experienced any insert failures
-// since construction. With the two-generation design, the only way to
-// see InsertFailures > 0 is if a freshly-allocated generation refused
-// an Insert (effectively never in normal operation), so Saturated() is
-// now best read as "something went badly wrong" rather than "we're full".
-// Use Rotations() to see how often the set is recycling.
+// since construction — i.e. insertFailures > 0. There are two paths that
+// can increment insertFailures, both of which are "something went wrong"
+// signals rather than the routine at-capacity indicator:
+//
+//   - Add observed Insert failure without cur.Saturated() after a retry
+//     (extreme CAS contention — typically transient but unexpected
+//     under normal load).
+//   - Insert failed on a freshly-rotated generation (should be
+//     impossible — the filter was just allocated).
+//
+// Either way, Saturated()==true means inserts are silently dropping at
+// the moment of observation, and operators should investigate. Use
+// Rotations() for the routine "current generation filled up and was
+// recycled" signal.
 func (s *PrunedTxSet) Saturated() bool {
 	return s.insertFailures.Load() > 0
 }
