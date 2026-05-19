@@ -316,14 +316,14 @@ func TestUnspend(t *testing.T) {
 	utxohash, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
 	require.NoError(t, err)
 
-	test1Hash := chainhash.HashH([]byte("test1"))
-	spendingData1 := spendpkg.NewSpendingData(&test1Hash, 1)
+	// Match the SpendingData populated by GetSpends inside Spend(spendTx).
+	storedSpendingData := spendpkg.NewSpendingData(spendTx.TxIDChainHash(), 0)
 
 	spend := &utxo.Spend{
 		TxID:         tx.TxIDChainHash(),
 		Vout:         0,
 		UTXOHash:     utxohash,
-		SpendingData: spendingData1,
+		SpendingData: storedSpendingData,
 	}
 
 	_, err = utxoStore.Spend(ctx, spendTx, utxoStore.GetBlockHeight()+1)
@@ -333,11 +333,7 @@ func TestUnspend(t *testing.T) {
 	err = utxoStore.Unspend(ctx, []*utxo.Spend{spend})
 	require.NoError(t, err)
 
-	// Spend again with a different spendingTxID
-	test2Hash := chainhash.HashH([]byte("test2"))
-	spendingData2 := spendpkg.NewSpendingData(&test2Hash, 2)
-	spend.SpendingData = spendingData2
-
+	// Spend again with the same spending tx — should succeed because the UTXO is now unspent.
 	_, err = utxoStore.Spend(ctx, spendTx, utxoStore.GetBlockHeight()+1)
 	require.NoError(t, err)
 }
@@ -729,7 +725,9 @@ func TestTombstoneAfterSpendAndUnspend(t *testing.T) {
 	utxohash0, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
 	require.NoError(t, err)
 
-	spendingData := spendpkg.NewSpendingData(spendTx01.TxIDChainHash(), 1)
+	// spendTx01 spends tx[0] via input vin=0 and tx[1] via input vin=1. Match the
+	// SpendingData GetSpends populates for input vin=0 (which spends tx[0]).
+	spendingData := spendpkg.NewSpendingData(spendTx01.TxIDChainHash(), 0)
 
 	// Create a spend record
 	spend0 := &utxo.Spend{
@@ -2042,7 +2040,8 @@ func TestSpendAndUnspendEdgeCases(t *testing.T) {
 	utxohash, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
 	require.NoError(t, err)
 
-	spendingData := spendpkg.NewSpendingData(spendTx.TxIDChainHash(), 1)
+	// Match the vin GetSpends used inside Spend(spendTx) — spendTx has only one input (vin=0).
+	spendingData := spendpkg.NewSpendingData(spendTx.TxIDChainHash(), 0)
 	spend := &utxo.Spend{
 		TxID:         tx.TxIDChainHash(),
 		Vout:         0,
@@ -2067,10 +2066,8 @@ func TestSpendAndUnspendEdgeCases(t *testing.T) {
 	}
 
 	err = store.Unspend(ctx, []*utxo.Spend{nonExistentSpend})
-	// This might not error, but we're testing the code path
-	if err != nil {
-		t.Logf("Unspend non-existent UTXO returned error (acceptable): %v", err)
-	}
+	require.Error(t, err, "Unspend against a non-existent output must error")
+	require.True(t, errors.Is(err, errors.ErrNotFound), "expected NotFoundError for non-existent output, got: %v", err)
 
 	// Test spending multiple outputs if transaction has them
 	if len(tx.Outputs) > 1 {
