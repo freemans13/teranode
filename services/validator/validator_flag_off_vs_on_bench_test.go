@@ -21,6 +21,7 @@ package validator
 
 import (
 	"context"
+	crand "crypto/rand"
 	"fmt"
 	"net/url"
 	"sync"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	aerostore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
@@ -74,18 +76,23 @@ func benchValidatorFlagMatrix(b *testing.B, concurrency int, v validatorBenchVar
 	val, aeroStore, cleanup := newValidatorBackedByAerospikeForFlagMatrix(b, v)
 	defer cleanup()
 
-	// Override CPU / BA / Kafka publish to isolate UTXO-store hot path.
-	val.overrideCPUValidationForTest(func(_ *bt.Tx) error { return nil })
+	// NO CPU override — both paths (per-tx Validate vs ValidateBatch) must
+	// run real script verification on the same input. BA submit and Kafka
+	// TxMeta publish are still overridden because they require external
+	// infra and are not part of the per-tx CPU/UTXO hot path we are
+	// measuring here.
 	val.overrideBASubmitForTest(func(_ context.Context, _ []*bt.Tx) map[chainhash.Hash]error {
 		return map[chainhash.Hash]error{}
 	})
 	val.overrideTxMetaPublishForTest(func(_ *bt.Tx, _ *meta.Data) {})
 
-	// Pre-generate b.N rounds of `concurrency` fresh txs each.
+	// Pre-generate b.N rounds of `concurrency` fresh txs each. Parents have
+	// OP_TRUE locking scripts so children (with an empty unlocking script)
+	// pass real script verification — see seedOpTrueParentsForFlagMatrix.
 	rounds := make([][]*bt.Tx, b.N)
 	for i := 0; i < b.N; i++ {
-		parents := seedRandomParentsForBench(b, ctx, aeroStore, concurrency)
-		rounds[i] = buildChildrenSpendingParentsForBench(b, parents)
+		parents := seedOpTrueParentsForFlagMatrix(b, ctx, aeroStore, concurrency)
+		rounds[i] = buildOpTrueChildrenForFlagMatrix(b, parents)
 	}
 
 	b.ResetTimer()
@@ -182,4 +189,91 @@ func newValidatorBackedByAerospikeForFlagMatrix(b testing.TB, v validatorBenchVa
 	}
 
 	return val, aeroStore, cleanup
+}
+
+// seedOpTrueParentsForFlagMatrix creates n parent txs in the Aerospike
+// store, each with a single OP_TRUE (anyone-can-spend) output. This is
+// the validator-bench analogue of seedRandomParentsForCoalescerBench in
+// the propagation bench, and is required when the bench runs real CPU
+// validation — children with an empty unlocking script trivially
+// satisfy the OP_TRUE locking script.
+//
+// Each parent has a random unique PreviousTxID so the tx hash is
+// distinct (avoiding CREATE_ONLY collisions) and PreviousTxOutIndex=0
+// (not 0xFFFFFFFF) so IsCoinbase()==false and the coinbase-maturity
+// lock does not apply.
+func seedOpTrueParentsForFlagMatrix(b testing.TB, ctx context.Context, s *aerostore.Store, n int) []*bt.Tx {
+	b.Helper()
+	opTrue, err := bscript.NewFromHexString("51") // OP_1 / OP_TRUE
+	require.NoError(b, err)
+
+	parents := make([]*bt.Tx, n)
+	emptyScript := bscript.Script{}
+
+	for i := 0; i < n; i++ {
+		tx := bt.NewTx()
+
+		var randBytes [32]byte
+		_, randErr := crand.Read(randBytes[:])
+		require.NoError(b, randErr)
+		uniqueHash, hashErr := chainhash.NewHash(randBytes[:])
+		require.NoError(b, hashErr)
+
+		in := &bt.Input{
+			PreviousTxOutIndex: 0,
+			PreviousTxScript:   &emptyScript,
+			PreviousTxSatoshis: 2000,
+			UnlockingScript:    &emptyScript,
+			SequenceNumber:     0xFFFFFFFF,
+		}
+		require.NoError(b, in.PreviousTxIDAdd(uniqueHash))
+		tx.Inputs = append(tx.Inputs, in)
+
+		tx.Outputs = append(tx.Outputs, &bt.Output{
+			Satoshis:      1000,
+			LockingScript: opTrue,
+		})
+
+		_, err = s.Create(ctx, tx, 0)
+		require.NoError(b, err)
+		parents[i] = tx
+	}
+	return parents
+}
+
+// buildOpTrueChildrenForFlagMatrix builds one child tx per parent, each
+// spending output 0 of its parent. PreviousTxScript is populated with
+// the parent's OP_TRUE so the child is "extended" (the validator does
+// not need to hydrate inputs from the UTXO store before CPU validation
+// — matching the existing buildChildrenSpendingParentsForBench shape).
+// UnlockingScript is a non-nil empty script, which trivially satisfies
+// OP_TRUE under real script verification.
+func buildOpTrueChildrenForFlagMatrix(b testing.TB, parents []*bt.Tx) []*bt.Tx {
+	b.Helper()
+	children := make([]*bt.Tx, len(parents))
+	for i, parent := range parents {
+		ph := parent.TxIDChainHash()
+		child := bt.NewTx()
+
+		emptyScript := bscript.Script{}
+		in := &bt.Input{
+			PreviousTxOutIndex: 0,
+			PreviousTxScript:   parent.Outputs[0].LockingScript, // OP_TRUE
+			PreviousTxSatoshis: parent.Outputs[0].Satoshis,
+			UnlockingScript:    &emptyScript,
+		}
+		require.NoError(b, in.PreviousTxIDAdd(ph))
+		child.Inputs = append(child.Inputs, in)
+
+		// Pay less than parent's 1000 satoshis so fee = 500 satoshis
+		// (valid). Output script is whatever PayToAddress produces;
+		// children aren't themselves spent in this bench.
+		require.NoError(b, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 500))
+
+		// Extended: PreviousTxScript / PreviousTxSatoshis already set,
+		// so the validator's Phase-A hydration becomes a no-op.
+		child.SetExtended(true)
+		children[i] = child
+	}
+	return children
 }
