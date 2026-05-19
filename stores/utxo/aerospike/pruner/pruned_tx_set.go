@@ -4,6 +4,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/util/cuckoo"
 )
 
 // defaultPrunedTxSetCapacity is used when NewPrunedTxSet is called with maxEntries=0.
@@ -64,8 +65,8 @@ type PrunedTxSet struct {
 }
 
 type prunedTxShard struct {
-	current  atomic.Pointer[cuckooH32]
-	previous atomic.Pointer[cuckooH32]
+	current  atomic.Pointer[cuckoo.H32]
+	previous atomic.Pointer[cuckoo.H32]
 }
 
 // NewPrunedTxSet creates a sharded two-generation cuckoo-filter-backed set
@@ -87,11 +88,8 @@ func NewPrunedTxSet(shardCount int, maxEntries int) *PrunedTxSet {
 
 	// Each shard has 2 generations; total live capacity = 2 × shardCount ×
 	// perShardCap. Divide accordingly so memory budget matches the
-	// configured maxEntries.
+	// configured maxEntries. NewH32 enforces its own per-shard minimum.
 	perShard := uint(maxEntries / n / 2)
-	if perShard < cuckooBucketSize {
-		perShard = cuckooBucketSize
-	}
 
 	s := &PrunedTxSet{
 		shards:      make([]prunedTxShard, n),
@@ -100,7 +98,7 @@ func NewPrunedTxSet(shardCount int, maxEntries int) *PrunedTxSet {
 		capacity:    int64(maxEntries),
 	}
 	for i := range s.shards {
-		s.shards[i].current.Store(newCuckooH32(perShard))
+		s.shards[i].current.Store(cuckoo.NewH32(perShard))
 		// previous stays nil until first rotation in this shard
 	}
 	return s
@@ -135,8 +133,8 @@ func (s *PrunedTxSet) Add(h chainhash.Hash) {
 // rotateShard atomically swaps the shard's `current` for a fresh filter,
 // preserving the old current as `previous` (replacing whatever was there).
 // If another goroutine already rotated, this is a no-op.
-func (s *PrunedTxSet) rotateShard(sh *prunedTxShard, oldCur *cuckooH32) {
-	newCur := newCuckooH32(s.perShardCap)
+func (s *PrunedTxSet) rotateShard(sh *prunedTxShard, oldCur *cuckoo.H32) {
+	newCur := cuckoo.NewH32(s.perShardCap)
 	if sh.current.CompareAndSwap(oldCur, newCur) {
 		sh.previous.Store(oldCur)
 		s.rotations.Add(1)

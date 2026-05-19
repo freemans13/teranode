@@ -1,4 +1,4 @@
-package pruner
+package cuckoo
 
 import (
 	"crypto/rand"
@@ -8,11 +8,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestCuckooH32_BasicInsertLookupDelete exercises the core operations on a
+// TestH32_BasicInsertLookupDelete exercises the core operations on a
 // modest filter. Probabilistic tolerance is applied where the cuckoo
 // false-positive rate could in principle affect a Lookup of an unknown key.
-func TestCuckooH32_BasicInsertLookupDelete(t *testing.T) {
-	cf := newCuckooH32(1024)
+func TestH32_BasicInsertLookupDelete(t *testing.T) {
+	cf := NewH32(1024)
 
 	var h1, h2, h3 [32]byte
 	for i := range h1 {
@@ -39,11 +39,11 @@ func TestCuckooH32_BasicInsertLookupDelete(t *testing.T) {
 	require.Equal(t, 0, cf.Count())
 }
 
-// TestCuckooH32_FalsePositiveRate verifies that the FP rate on random misses
+// TestH32_FalsePositiveRate verifies that the FP rate on random misses
 // stays within the documented cuckoo bound (~3.1% theoretical; allow 6%).
-func TestCuckooH32_FalsePositiveRate(t *testing.T) {
+func TestH32_FalsePositiveRate(t *testing.T) {
 	const capacity = 1_000_000
-	cf := newCuckooH32(capacity)
+	cf := NewH32(capacity)
 
 	// Insert 100K random hashes.
 	const inserted = 100_000
@@ -74,10 +74,10 @@ func TestCuckooH32_FalsePositiveRate(t *testing.T) {
 	require.Less(t, rate, 0.06, "false-positive rate %v exceeds 6%% bound", rate)
 }
 
-// TestCuckooH32_FillsUpAndFailsGracefully forces saturation and verifies
+// TestH32_FillsUpAndFailsGracefully forces saturation and verifies
 // Insert returns false rather than panicking or corrupting state.
-func TestCuckooH32_FillsUpAndFailsGracefully(t *testing.T) {
-	cf := newCuckooH32(64)
+func TestH32_FillsUpAndFailsGracefully(t *testing.T) {
+	cf := NewH32(64)
 
 	failures := 0
 	successes := 0
@@ -95,13 +95,13 @@ func TestCuckooH32_FillsUpAndFailsGracefully(t *testing.T) {
 	require.Positive(t, successes, "expected some Insert successes before saturation")
 }
 
-// TestCuckooH32_SaturationLatchesAndShortCircuits verifies that once the
+// TestH32_SaturationLatchesAndShortCircuits verifies that once the
 // eviction loop has exhausted MaxKicks, the saturated flag latches true
 // and subsequent Inserts return false without re-running eviction. This
 // is the fix for the CPU-melt observed on dev-scale-1 when a 2 GiB
 // cuckoo at 92% load fell into eviction-loop hell at 1.7M TPS.
-func TestCuckooH32_SaturationLatchesAndShortCircuits(t *testing.T) {
-	cf := newCuckooH32(64)
+func TestH32_SaturationLatchesAndShortCircuits(t *testing.T) {
+	cf := NewH32(64)
 
 	// Fill the filter aggressively until eviction starts failing.
 	for i := 0; i < 1024; i++ {
@@ -109,11 +109,11 @@ func TestCuckooH32_SaturationLatchesAndShortCircuits(t *testing.T) {
 		_, err := rand.Read(h[:])
 		require.NoError(t, err)
 		cf.Insert(&h)
-		if cf.saturated.Load() {
+		if cf.Saturated() {
 			break
 		}
 	}
-	require.True(t, cf.saturated.Load(), "expected saturated flag to latch after eviction failure")
+	require.True(t, cf.Saturated(), "expected saturated flag to latch after eviction failure")
 
 	// Time a batch of Inserts that we expect to fail. Even at b.N = 1M
 	// these should all return immediately (no eviction churn), so total

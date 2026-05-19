@@ -1,12 +1,22 @@
-package pruner
+// Package cuckoo provides specialised cuckoo filter implementations optimised
+// for high-throughput, low-allocation use cases inside teranode.
+//
+// Filter is currently a single variant (H32) tuned for 32-byte cryptographic
+// hashes — the common key type for SHA-256 / chainhash identifiers. Other
+// key sizes (e.g. uint64, 36-byte inpoints) have not been migrated yet and
+// continue to use the general-purpose github.com/seiflotfy/cuckoofilter
+// library directly at their call sites. The techniques here (zero-alloc
+// pointer arguments, lock-free atomic CAS on packed bucket words) are
+// reusable if you want to specialise for a different fixed key size.
+package cuckoo
 
 import (
 	"sync/atomic"
 	"unsafe"
 )
 
-// cuckooH32 is a lock-free cuckoo filter specialised for 32-byte
-// cryptographic hashes (chainhash.Hash).
+// H32 is a lock-free cuckoo filter specialised for 32-byte cryptographic
+// hashes.
 //
 // Why this exists (a previous-developer FAQ):
 //
@@ -39,24 +49,9 @@ import (
 //   - Count is approximate under contention (atomic Int64).
 //
 // Standard cuckoo parameters: 4-slot buckets × 8-bit fingerprints → ~3.1%
-// false-positive rate. False positives in our context cause a parent
-// update to be incorrectly skipped, which only suppresses a write to the
-// `deletedChildren` bin — never read when defensive mode is off (see the
-// invariants block in PruneWithPartitions).
-
-const (
-	cuckooBucketSize  = 4
-	cuckooMaxKicks    = 500
-	cuckooNullFinger  = 0
-	cuckooMaskMixer64 = 0xc4ceb9fe1a85ec53 // SplitMix64 mix constant
-)
-
-// cuckooBucket holds 4 fingerprint bytes. Naturally 4-byte aligned in the
-// `buckets` slice, so atomic uint32 ops on the underlying memory are safe.
-type cuckooBucket [cuckooBucketSize]uint8
-
-type cuckooH32 struct {
-	buckets []cuckooBucket
+// false-positive rate.
+type H32 struct {
+	buckets []bucketH32
 	mask    uint64
 	count   atomic.Int64
 
@@ -69,39 +64,54 @@ type cuckooH32 struct {
 	// CPU on a single pod (observed on dev-scale-1: pod pegged at 15
 	// cores with throughput collapsed from 2.4M to ~200K rec/sec).
 	//
-	// Sticky-once-set: even if CheckAndRemove later frees slots, we
-	// don't try eviction again. The fast path (tryInsertCAS in either
-	// bucket) still succeeds when slots open up, so the optimisation
-	// recovers automatically; we just refuse to do the expensive
-	// rebalancing work. To force a reset, restart the process.
+	// Sticky-once-set: even if Delete later frees slots, we don't try
+	// eviction again. The fast path (tryInsertCAS in either bucket) still
+	// succeeds when slots open up, so the optimisation recovers
+	// automatically; we just refuse to do the expensive rebalancing work.
+	// To force a reset, allocate a fresh filter.
 	saturated atomic.Bool
 }
 
-func newCuckooH32(capacity uint) *cuckooH32 {
+const (
+	bucketSize  = 4
+	maxKicks    = 500
+	nullFinger  = 0
+	maskMixer64 = 0xc4ceb9fe1a85ec53 // SplitMix64 mix constant
+)
+
+// bucketH32 holds 4 fingerprint bytes. Naturally 4-byte aligned in the
+// `buckets` slice, so atomic uint32 ops on the underlying memory are safe.
+type bucketH32 [bucketSize]uint8
+
+// NewH32 returns a filter sized to hold approximately the requested number
+// of entries. Actual capacity is rounded up to the next power of two of
+// buckets, so allocated memory is the next-power-of-two of (capacity / 4)
+// times 4 bytes per bucket.
+func NewH32(capacity uint) *H32 {
 	n := uint64(1)
 	target := uint64(capacity)
-	if target < cuckooBucketSize {
-		target = cuckooBucketSize
+	if target < bucketSize {
+		target = bucketSize
 	}
-	for n*cuckooBucketSize < target {
+	for n*bucketSize < target {
 		n <<= 1
 	}
-	return &cuckooH32{
-		buckets: make([]cuckooBucket, n),
+	return &H32{
+		buckets: make([]bucketH32, n),
 		mask:    n - 1,
 	}
 }
 
-func (cf *cuckooH32) bucketAddr(i uint64) *uint32 {
+func (cf *H32) bucketAddr(i uint64) *uint32 {
 	return (*uint32)(unsafe.Pointer(&cf.buckets[i][0]))
 }
 
 // extract derives fingerprint and primary bucket index from the hash.
-// chainhash is already a SHA-256 digest, so byte slices of it are
-// uniformly distributed — no extra hashing required.
-func (cf *cuckooH32) extract(h *[32]byte) (fp uint8, i uint64) {
+// The input is assumed to already be a uniformly-distributed cryptographic
+// digest, so we read bytes directly rather than re-hashing.
+func (cf *H32) extract(h *[32]byte) (fp uint8, i uint64) {
 	fp = h[0]
-	if fp == cuckooNullFinger {
+	if fp == nullFinger {
 		fp = 1
 	}
 	i = (uint64(h[1]) |
@@ -115,13 +125,13 @@ func (cf *cuckooH32) extract(h *[32]byte) (fp uint8, i uint64) {
 	return fp, i
 }
 
-func (cf *cuckooH32) altIndex(fp uint8, i uint64) uint64 {
-	return (i ^ (uint64(fp) * cuckooMaskMixer64)) & cf.mask
+func (cf *H32) altIndex(fp uint8, i uint64) uint64 {
+	return (i ^ (uint64(fp) * maskMixer64)) & cf.mask
 }
 
 // bucketHas tests whether any slot in bucket i matches fp, using a single
 // atomic load + a SWAR (SIMD-within-a-register) byte-equality test.
-func (cf *cuckooH32) bucketHas(i uint64, fp uint8) bool {
+func (cf *H32) bucketHas(i uint64, fp uint8) bool {
 	v := atomic.LoadUint32(cf.bucketAddr(i))
 	broadcast := uint32(fp) | uint32(fp)<<8 | uint32(fp)<<16 | uint32(fp)<<24
 	t := v ^ broadcast
@@ -131,14 +141,14 @@ func (cf *cuckooH32) bucketHas(i uint64, fp uint8) bool {
 
 // tryInsertCAS attempts to claim any empty slot in bucket i for fp.
 // Returns true on success.
-func (cf *cuckooH32) tryInsertCAS(fp uint8, i uint64) bool {
+func (cf *H32) tryInsertCAS(fp uint8, i uint64) bool {
 	addr := cf.bucketAddr(i)
-	for slot := 0; slot < cuckooBucketSize; slot++ {
+	for slot := 0; slot < bucketSize; slot++ {
 		shift := uint(slot * 8)
 		for retry := 0; retry < 4; retry++ {
 			cur := atomic.LoadUint32(addr)
 			b := uint8(cur >> shift)
-			if b != cuckooNullFinger {
+			if b != nullFinger {
 				break // slot occupied; advance to next slot
 			}
 			newWord := cur | (uint32(fp) << shift)
@@ -152,9 +162,9 @@ func (cf *cuckooH32) tryInsertCAS(fp uint8, i uint64) bool {
 }
 
 // bucketCASDelete clears the first slot in bucket i whose byte equals fp.
-func (cf *cuckooH32) bucketCASDelete(i uint64, fp uint8) bool {
+func (cf *H32) bucketCASDelete(i uint64, fp uint8) bool {
 	addr := cf.bucketAddr(i)
-	for slot := 0; slot < cuckooBucketSize; slot++ {
+	for slot := 0; slot < bucketSize; slot++ {
 		shift := uint(slot * 8)
 		for retry := 0; retry < 4; retry++ {
 			cur := atomic.LoadUint32(addr)
@@ -181,7 +191,7 @@ func (cf *cuckooH32) bucketCASDelete(i uint64, fp uint8) bool {
 // both candidate buckets full returns false immediately. Without this
 // short-circuit, a saturated filter at high write rates burns the host's
 // CPU on hopeless eviction churn (~15 us per failed Insert).
-func (cf *cuckooH32) Insert(h *[32]byte) bool {
+func (cf *H32) Insert(h *[32]byte) bool {
 	fp, i1 := cf.extract(h)
 	if cf.tryInsertCAS(fp, i1) {
 		return true
@@ -194,7 +204,7 @@ func (cf *cuckooH32) Insert(h *[32]byte) bool {
 	// Both candidate buckets are full. Short-circuit if we've previously
 	// proven the filter cannot accommodate evictions — the loop would just
 	// waste CPU. The fast path above still recovers automatically when
-	// CheckAndRemove frees up slots.
+	// Delete frees up slots.
 	if cf.saturated.Load() {
 		return false
 	}
@@ -205,8 +215,8 @@ func (cf *cuckooH32) Insert(h *[32]byte) bool {
 	if (uint64(fp)+i1)&1 == 1 {
 		i = i2
 	}
-	for k := 0; k < cuckooMaxKicks; k++ {
-		slot := int((uint64(fp) ^ uint64(k)) & (cuckooBucketSize - 1))
+	for k := 0; k < maxKicks; k++ {
+		slot := int((uint64(fp) ^ uint64(k)) & (bucketSize - 1))
 		shift := uint(slot * 8)
 		addr := cf.bucketAddr(i)
 		var displaced uint8
@@ -238,7 +248,7 @@ func (cf *cuckooH32) Insert(h *[32]byte) bool {
 }
 
 // Lookup returns true if h appears to be in the filter.
-func (cf *cuckooH32) Lookup(h *[32]byte) bool {
+func (cf *H32) Lookup(h *[32]byte) bool {
 	fp, i1 := cf.extract(h)
 	if cf.bucketHas(i1, fp) {
 		return true
@@ -247,7 +257,7 @@ func (cf *cuckooH32) Lookup(h *[32]byte) bool {
 }
 
 // Delete removes one occurrence of h's fingerprint from the filter.
-func (cf *cuckooH32) Delete(h *[32]byte) bool {
+func (cf *H32) Delete(h *[32]byte) bool {
 	fp, i1 := cf.extract(h)
 	if cf.bucketCASDelete(i1, fp) {
 		return true
@@ -256,4 +266,8 @@ func (cf *cuckooH32) Delete(h *[32]byte) bool {
 }
 
 // Count returns the approximate number of fingerprints stored.
-func (cf *cuckooH32) Count() int { return int(cf.count.Load()) }
+func (cf *H32) Count() int { return int(cf.count.Load()) }
+
+// Saturated reports whether the eviction loop has previously failed and
+// the filter is now in the short-circuited "no-eviction" state.
+func (cf *H32) Saturated() bool { return cf.saturated.Load() }
