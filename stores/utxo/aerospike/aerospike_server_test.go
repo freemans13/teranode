@@ -653,12 +653,12 @@ func TestAerospike(t *testing.T) {
 		// utxoSpendTxID := utxos[spends[0].Vout]
 		// require.Equal(t, spendingTxID1.String(), utxoSpendTxID)
 
-		// try to reset the utxo
+		// try to reset the utxo — must pass the SpendingData GetSpends populated during Spend(spendTx).
 		err = store.Unspend(ctx, []*utxo.Spend{{
 			TxID:         tx2.TxIDChainHash(),
 			Vout:         0,
 			UTXOHash:     utxoHash0,
-			SpendingData: spendpkg.NewSpendingData(spendingTxID2, 2),
+			SpendingData: spendpkg.NewSpendingData(spendTx.TxIDChainHash(), 0),
 		}})
 		require.NoError(t, err)
 
@@ -708,7 +708,14 @@ func TestAerospike(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, 1, spendUtxos)
 
-		err = store.Unspend(ctx, spends)
+		// Match the SpendingData populated by GetSpends inside Spend(spendTx) above.
+		luaUnspends := []*utxo.Spend{{
+			TxID:         tx.TxIDChainHash(),
+			Vout:         0,
+			UTXOHash:     utxoHash0,
+			SpendingData: spendpkg.NewSpendingData(spendTx.TxIDChainHash(), 0),
+		}}
+		err = store.Unspend(ctx, luaUnspends)
 		require.NoError(t, err)
 
 		resp, err = client.Get(nil, txKey, "utxos", "spentUtxos")
