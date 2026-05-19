@@ -925,9 +925,13 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 	url := fmt.Sprintf("%s/subtree/%s", baseURL, subtreeHash.String())
 	u.logger.Debugf("[getSubtreeTxHashes][%s] getting subtree from %s", subtreeHash.String(), url)
 
+	// Bound the body at the policy cap (MaximumMerkleItemsPerSubtree * HashSize). A peer that
+	// streams more than this is malicious — fail fast rather than ReadAll into memory.
+	maxSubtreeBytes := int64(u.settings.BlockAssembly.MaximumMerkleItemsPerSubtree) * int64(chainhash.HashSize)
+
 	// TODO add the metric for how long this takes
 	// body, err := util.DoHTTPRequestBodyReader(spanCtx, url)
-	subtreeBytes, err := util.DoHTTPRequest(spanCtx, url)
+	subtreeBytes, err := util.DoHTTPRequestBounded(spanCtx, url, maxSubtreeBytes)
 	if err != nil {
 		// check whether this is a 404 error
 		if errors.Is(err, errors.ErrNotFound) {
@@ -1233,7 +1237,9 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 			// get the whole subtree from the other peer
 			url := fmt.Sprintf("%s/subtree_data/%s", baseURL, subtreeHash.String())
 
-			body, subtreeDataErr := util.DoHTTPRequestBodyReader(ctx, url)
+			// Retry on 503 — peer's asset service may be admission-rejecting under load
+			// (asset_concurrency_subtree_data_create cap). Other errors fail through immediately.
+			body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
 			if subtreeDataErr != nil {
 				// Peer cannot provide subtree data - report as invalid subtree
 				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "peer_cannot_provide_subtree_data")
