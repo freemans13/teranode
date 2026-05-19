@@ -177,7 +177,7 @@ func (v *Validator) ValidateLevelBatch(ctx context.Context, txs []*bt.Tx, blockH
 			}
 
 			// Validate scripts and signatures
-			if err := v.validateTransactionScripts(gctx, transaction, blockHeight, utxoHeights, opts); err != nil {
+			if err := v.validateTransaction(gctx, transaction, blockHeight, utxoHeights, opts); err != nil {
 				result.err = errors.NewProcessingError("[ValidateLevelBatch][%s] error validating transaction scripts", txID, err)
 				return nil
 			}

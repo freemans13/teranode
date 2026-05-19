@@ -1,4 +1,4 @@
-// Package meta provides types and utilities for handling Bitcoin SV transaction metadata
+// Package meta provides types and utilities for handling BSV Blockchain transaction metadata
 // in the UTXO store. It includes serialization and deserialization of transaction data
 // along with associated metadata like parent transactions, block references, and fees.
 //
@@ -62,6 +62,13 @@ type Data struct {
 	// When set to a block height value, it indicates the transaction is unmined on the longest chain.
 	// When 0, it indicates the transaction has been mined on the longest chain.
 	UnminedSince uint32 `json:"unminedSince"`
+
+	// CreatedAt is the wall-clock time (Unix milliseconds) when the tx record was
+	// first inserted into the UTXO store. Set once at Create and never updated.
+	// Used by ReverseProcessConflicting as the "first-seen mempool spender" hint
+	// — the lowest-CreatedAt entry in parent.ConflictingChildren is the original
+	// canonical spender that an earlier ProcessConflicting demoted.
+	CreatedAt int64 `json:"createdAt,omitempty"`
 
 	// Frozen is a flag indicating if the transaction is frozen
 	Frozen bool `json:"frozen"`

@@ -155,14 +155,16 @@ func (it *unminedTxIterator) readOne(ctx context.Context) (*utxo.UnminedTransact
 
 	for rows.Next() {
 		input := &bt.Input{}
+		var previousTxIdx int64
 
-		if err = rows.Scan(&previousTxHashBytes, &input.PreviousTxOutIndex, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
+		if err = rows.Scan(&previousTxHashBytes, &previousTxIdx, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
 			if err = it.Close(); err != nil {
 				it.store.logger.Warnf("failed to close iterator: %v", err)
 			}
 
 			return nil, err
 		}
+		input.PreviousTxOutIndex = uint32(previousTxIdx)
 
 		previousTxHash, err = chainhash.NewHash(previousTxHashBytes)
 		if err != nil {
@@ -254,6 +256,48 @@ func (it *unminedTxIterator) Close() error {
 	return it.rows.Close()
 }
 
-func (s *Store) GetUnminedTxIterator(bool) (utxo.UnminedTxIterator, error) {
+func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 	return newUnminedTxIterator(s)
+}
+
+// ScanInconsistentUnminedTxs is a no-op for SQL — the SQL store always uses
+// index-based queries, so there's no fullScan inconsistency to fix.
+func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
+	return nil, nil
+}
+
+func (s *Store) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (utxo.UnminedTxIterator, error) {
+	return newPrunableUnminedTxIterator(s, cutoffBlockHeight)
+}
+
+func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unminedTxIterator, error) {
+	it := &unminedTxIterator{
+		store: store,
+	}
+
+	q := `
+		SELECT
+		 t.id
+		,t.hash
+		,t.fee
+		,t.size_in_bytes
+		,t.inserted_at
+		,t.locked
+		,t.coinbase
+		,t.unmined_since
+		FROM transactions t
+		WHERE t.unmined_since IS NOT NULL
+		  AND t.unmined_since <= $1
+		  AND t.conflicting = false
+		ORDER BY t.id ASC
+	`
+
+	rows, err := store.db.Query(q, cutoffBlockHeight)
+	if err != nil {
+		return nil, err
+	}
+
+	it.rows = rows
+
+	return it, nil
 }

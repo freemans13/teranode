@@ -24,7 +24,7 @@
 
   import { connectToP2PServer } from '$internal/stores/p2pStore'
 
-  onMount(async () => {
+  onMount(() => {
     connectToP2PServer()
   })
 
@@ -126,6 +126,12 @@
         path: '/admin',
         label: $i18n.t('page.admin.menu-label'),
       },
+      {
+        icon: 'icon-settings-line',
+        iconSelected: 'icon-settings-solid',
+        path: '/settings',
+        label: $i18n.t('page.settings.menu-label'),
+      },
       // {
       //   icon: 'icon-bell-line',
       //   iconSelected: 'icon-bell-solid',
@@ -144,8 +150,8 @@
       items = $pageLinks.items.map((route) => ({
         ...route,
         selected:
-          (pathname === '/' && route.path == '/') || 
-          pathname === route.path || 
+          (pathname === '/' && route.path == '/') ||
+          pathname === route.path ||
           pathname.indexOf(`${route.path}/`) === 0,
       }))
       $pageLinks.items = items

@@ -16,7 +16,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
-	"github.com/libsv/go-p2p/chaincfg/chainhash"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 )
 
 // CreateBatchDirect performs batch creation for multiple transactions in a single operation.

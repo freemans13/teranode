@@ -172,7 +172,7 @@ func (p *validationWorkerPool) processJob(job validationJob) {
 	}
 
 	// Validate scripts and signatures
-	if err := p.validator.validateTransactionScripts(p.ctx, tx, p.blockHeight, utxoHeights, p.opts); err != nil {
+	if err := p.validator.validateTransaction(p.ctx, tx, p.blockHeight, utxoHeights, p.opts); err != nil {
 		result.err = errors.NewProcessingError("[ValidateLevelBatch][%s] error validating transaction scripts", txID, err)
 		return
 	}

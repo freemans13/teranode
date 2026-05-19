@@ -141,6 +141,29 @@ func (m *MockSubtreeProcessor) SubtreeCount() int {
 	return args.Int(0)
 }
 
+func (m *MockSubtreeProcessor) GetChainedSubtreesTotalSize() uint64 {
+	args := m.Called()
+	return args.Get(0).(uint64)
+}
+
+// GetPrecomputedMiningData implements Interface.GetPrecomputedMiningData
+func (m *MockSubtreeProcessor) GetPrecomputedMiningData() *PrecomputedMiningData {
+	args := m.Called()
+	if args.Get(0) == nil {
+		return nil
+	}
+	return args.Get(0).(*PrecomputedMiningData)
+}
+
+// GetIncompleteSubtreeMiningData implements Interface.GetIncompleteSubtreeMiningData
+func (m *MockSubtreeProcessor) GetIncompleteSubtreeMiningData(_ context.Context) *PrecomputedMiningData {
+	args := m.Called()
+	if args.Get(0) == nil {
+		return nil
+	}
+	return args.Get(0).(*PrecomputedMiningData)
+}
+
 // AddBatch implements Interface.AddBatch
 func (m *MockSubtreeProcessor) AddBatch(nodes []subtree.Node, txInpoints []*subtree.TxInpoints) {
 	m.Called(nodes, txInpoints)
@@ -189,6 +212,11 @@ func (m *MockSubtreeProcessor) Reorg(moveBackBlocks []*model.Block, modeUpBlocks
 func (m *MockSubtreeProcessor) Remove(ctx context.Context, hash chainhash.Hash) error {
 	args := m.Called(ctx, hash)
 	return args.Error(0)
+}
+
+// DrainQueue implements Interface.DrainQueue
+func (m *MockSubtreeProcessor) DrainQueue(dropHashes map[chainhash.Hash]struct{}) {
+	m.Called(dropHashes)
 }
 
 // GetCompletedSubtreesForMiningCandidate implements Interface.GetCompletedSubtreesForMiningCandidate
