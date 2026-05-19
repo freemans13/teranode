@@ -86,7 +86,8 @@ type Job struct {
 
 type NewSubtreeRequest struct {
 	Subtree           *subtreepkg.Subtree                                     // The subtree to process
-	ParentTxMap       TxInpointsMap                                           // Map of parent transactions
+	ParentTxMap       TxInpointsMap                                           // Map of parent transactions (fallback for chained/incomplete subtrees)
+	ParentTxSlice     []subtreepkg.TxInpoints                                 // Slice of parent transactions (fast path - direct index access)
 	DeletedTxs        *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] // Backup map for deleted transactions
 	SkipNotification  bool                                                    // Whether to skip notification to the network
 	ErrChan           chan error                                              // Channel for error reporting
@@ -270,6 +271,9 @@ type SubtreeProcessor struct {
 
 	// queue manages the transaction processing queue
 	queue *LockFreeQueue
+
+	// currentSubtreeParents tracks parent data for SubtreeMeta creation
+	currentSubtreeParents []subtreepkg.TxInpoints
 
 	// currentTxMap tracks transactions currently held in the subtree processor
 	currentTxMap TxInpointsMap
@@ -520,6 +524,7 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 		chainedSubtrees:              make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees),
 		chainedSubtreeCount:          atomic.Int32{},
 		queue:                        queue,
+		currentSubtreeParents:        make([]subtreepkg.TxInpoints, 0, 1024),
 		currentTxMap:                 NewSplitTxInpointsMap(splitBuckets),
 		splitMapBuckets:              splitBuckets,
 		deletedTxs:                   txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints](),
@@ -656,9 +661,10 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						// store (and announce) new incomplete subtree to other miners
 						send := NewSubtreeRequest{
 							Subtree:     incompleteSubtree,
-							ParentTxMap: stp.currentTxMap,
-							DeletedTxs:  stp.deletedTxs,
-							ErrChan:     make(chan error),
+							ParentTxMap:   stp.currentTxMap,
+							ParentTxSlice: nil, // Chained/incomplete announcements use map fallback
+							DeletedTxs:    stp.deletedTxs,
+							ErrChan:       make(chan error),
 							OnStorageComplete: func() {
 								stp.cleanupDeletedTxs(incompleteSubtree)
 							},
@@ -861,9 +867,10 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 
 						send := NewSubtreeRequest{
 							Subtree:     incompleteSubtree,
-							ParentTxMap: stp.currentTxMap,
-							DeletedTxs:  stp.deletedTxs,
-							ErrChan:     make(chan error),
+							ParentTxMap:   stp.currentTxMap,
+							ParentTxSlice: nil, // Chained/incomplete announcements use map fallback
+							DeletedTxs:    stp.deletedTxs,
+							ErrChan:       make(chan error),
 							OnStorageComplete: func() {
 								stp.cleanupDeletedTxs(incompleteSubtree)
 							},
@@ -2001,6 +2008,15 @@ func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.T
 		return errors.NewProcessingError("error adding node to subtree", err)
 	}
 
+	// Track parent data for SubtreeMeta fast path
+	if parents != nil {
+		stp.currentSubtreeParents = append(stp.currentSubtreeParents, *parents)
+	} else if txInpoints, ok := stp.currentTxMap.Get(node.Hash); ok && txInpoints != nil {
+		stp.currentSubtreeParents = append(stp.currentSubtreeParents, *txInpoints)
+	} else {
+		stp.currentSubtreeParents = append(stp.currentSubtreeParents, subtreepkg.TxInpoints{})
+	}
+
 	if stp.currentSubtree.Load().IsComplete() {
 		if err = stp.processCompleteSubtree(skipNotification); err != nil {
 			return err
@@ -2040,6 +2056,13 @@ func (stp *SubtreeProcessor) addNodePreValidated(node subtreepkg.Node, skipNotif
 
 	if err = stp.currentSubtree.Load().AddSubtreeNode(node); err != nil {
 		return errors.NewProcessingError("error adding node to subtree", err)
+	}
+
+	// Track parent data for SubtreeMeta fast path
+	if txInpoints, ok := stp.currentTxMap.Get(node.Hash); ok && txInpoints != nil {
+		stp.currentSubtreeParents = append(stp.currentSubtreeParents, *txInpoints)
+	} else {
+		stp.currentSubtreeParents = append(stp.currentSubtreeParents, subtreepkg.TxInpoints{})
 	}
 
 	if stp.currentSubtree.Load().IsComplete() {
@@ -2110,6 +2133,7 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	stp.newSubtreeChan <- NewSubtreeRequest{
 		Subtree:          oldSubtree,
 		ParentTxMap:      stp.currentTxMap,
+		ParentTxSlice:    stp.currentSubtreeParents,
 		DeletedTxs:       stp.deletedTxs,
 		SkipNotification: skipNotification,
 		ErrChan:          errCh,
@@ -2124,6 +2148,9 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 			stp.logger.Errorf("[%s] error sending subtree to newSubtreeChan: %v", oldSubtreeHash.String(), err)
 		}
 	}()
+
+	// Reset slice for next subtree
+	stp.currentSubtreeParents = make([]subtreepkg.TxInpoints, 0, 1024)
 
 	// Reset the announcement timer since we just announced a complete subtree
 	if !skipNotification {
@@ -3199,10 +3226,11 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	for _, subtree := range stp.chainedSubtrees {
 		errCh := make(chan error)
 		stp.newSubtreeChan <- NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: stp.currentTxMap,
-			DeletedTxs:  stp.deletedTxs,
-			ErrChan:     errCh,
+			Subtree:       subtree,
+			ParentTxMap:   stp.currentTxMap,
+			ParentTxSlice: nil, // Chained subtrees use ParentTxMap fallback
+			DeletedTxs:    stp.deletedTxs,
+			ErrChan:       errCh,
 			OnStorageComplete: func() {
 				stp.cleanupDeletedTxs(subtree)
 			},

@@ -25,6 +25,7 @@ func CreateBaseTestSettings(t TestingT) *settings.Settings {
 	tSettings.GlobalBlockHeightRetention = 10
 	tSettings.BlockValidation.OptimisticMining = false
 	tSettings.BlockAssembly.StoreTxInpointsForSubtreeMeta = true
+	tSettings.BlockAssembly.DefensiveTxChecksEnabled = true // Enable for tests (most expect currentTxMap populated)
 
 	// We sometimes get 'hot key' errors while running the test
 	// To mitigate this, we use more aggressive retry settings with exponential backoff

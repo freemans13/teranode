@@ -668,28 +668,47 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 	allDoneCh := make(chan struct{})
 
 	// Build, serialize, and store subtree meta in background
-	if subtreeRequest.ParentTxMap != nil && ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+	// Prefer ParentTxSlice (direct index access, fast) over ParentTxMap (hash lookup, slow).
+	// Map fallback covers periodic announcements of chained/incomplete subtrees where no
+	// slice is populated.
+	useSlice := len(subtreeRequest.ParentTxSlice) > 0
+	useMap := !useSlice && subtreeRequest.ParentTxMap != nil
+
+	if (useSlice || useMap) && ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
 		go func() {
 			defer close(metaDoneCh)
 			subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
 
 			for idx, node := range subtreeRequest.Subtree.Nodes {
 				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
-					if !found && subtreeRequest.DeletedTxs != nil {
-						// Fallback: check if transaction was deleted during async storage
-						var deletedTxInpoints subtreepkg.TxInpoints
-						deletedTxInpoints, found = subtreeRequest.DeletedTxs.Get(node.Hash)
-						if found {
-							txInpoints = &deletedTxInpoints
+					var (
+						txInpoints subtreepkg.TxInpoints
+						found      bool
+					)
+
+					if useSlice {
+						if idx < len(subtreeRequest.ParentTxSlice) {
+							txInpoints = subtreeRequest.ParentTxSlice[idx]
+							found = true
+						}
+					} else {
+						var ptr *subtreepkg.TxInpoints
+						if ptr, found = subtreeRequest.ParentTxMap.Get(node.Hash); found {
+							txInpoints = *ptr
 						}
 					}
+
+					if !found && subtreeRequest.DeletedTxs != nil {
+						// Fallback: check if transaction was deleted during async storage
+						txInpoints, found = subtreeRequest.DeletedTxs.Get(node.Hash)
+					}
+
 					if !found {
-						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap or DeletedTxs", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxSlice/ParentTxMap/DeletedTxs", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
 						return
 					}
 
-					if err := subtreeMeta.SetTxInpoints(idx, *txInpoints); err != nil {
+					if err := subtreeMeta.SetTxInpoints(idx, txInpoints); err != nil {
 						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
 						return
 					}
