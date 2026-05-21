@@ -468,10 +468,20 @@ func TestGetSubtreeTxHashes_LocalFile(t *testing.T) {
 
 			require.NoError(t, server.subtreeStore.Set(context.Background(), subtreeHash[:], tc.fileType, subtreeBytes))
 
-			// No HTTP responder registered; if the implementation falls through
-			// to the network this call must fail.
+			// Activate httpmock with no responders so any unintended HTTP fallback
+			// fails fast and deterministically instead of attempting a real network
+			// call (which would hang for up to the default 60s client timeout).
+			httpmock.ActivateNonDefault(util.HTTPClient())
+			defer httpmock.DeactivateAndReset()
+
+			// Bound the test with a short context timeout as a second line of
+			// defence — if the implementation regresses past httpmock somehow,
+			// this fails fast rather than blocking the suite.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
 			stat := gocore.NewStat("test")
-			hashes, err := server.getSubtreeTxHashes(context.Background(), stat, &subtreeHash, testPeerURL)
+			hashes, err := server.getSubtreeTxHashes(ctx, stat, &subtreeHash, testPeerURL)
 
 			require.NoError(t, err)
 			require.Equal(t, []chainhash.Hash{h1, h2, h3, h4}, hashes)

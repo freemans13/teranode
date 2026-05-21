@@ -963,7 +963,11 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 
 	// Use the local subtree file (under either FileTypeSubtreeToCheck or
 	// FileTypeSubtree) instead of a network request — see findLocalSubtreeFile.
-	if localFileType, localExists, _ := u.findLocalSubtreeFile(spanCtx, *subtreeHash); localExists {
+	localFileType, localExists, err := u.findLocalSubtreeFile(spanCtx, *subtreeHash)
+	if err != nil {
+		return nil, errors.NewStorageError("[getSubtreeTxHashes][%s] failed to check local subtree store", subtreeHash.String(), err)
+	}
+	if localExists {
 		localBytes, getErr := u.subtreeStore.Get(spanCtx, subtreeHash[:], localFileType)
 		if getErr == nil && localBytes != nil {
 			u.logger.Debugf("[getSubtreeTxHashes][%s] found local subtree file in store (%s), using it instead of network request", subtreeHash.String(), localFileType.String())
