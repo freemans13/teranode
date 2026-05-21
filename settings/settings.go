@@ -575,7 +575,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 		// adaptive_fetch_* key exactly once. Both blockvalidation and
 		// subtreevalidation read from this single struct.
 		AdaptiveFetch: AdaptiveFetchSettings{
-			BootstrapMode:             getString("adaptive_fetch_bootstrap_mode", "auto", alternativeContext...),
+			BootstrapMode:             getString("adaptive_fetch_bootstrap_mode", "pessimistic", alternativeContext...),
 			WindowSize:                getInt("adaptive_fetch_window_size", 10, alternativeContext...),
 			PessToOptHitRateThreshold: getFloat64("adaptive_fetch_pess_to_opt_hit_rate_threshold", 0.99, alternativeContext...),
 			OptToPessMissThreshold:    getInt("adaptive_fetch_opt_to_pess_miss_threshold", 100, alternativeContext...),
