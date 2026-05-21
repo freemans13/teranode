@@ -35,8 +35,9 @@ type ValidatorSettings struct {
 	// call. Propagation splits larger inbound batches into multiple
 	// ValidateBatch calls.
 	BatchMaxSize int
-	// BatchMaxWait is reserved for a future caller-side coalescer that
-	// would buffer single-tx callers into batches. Not used in v1.
+	// BatchMaxWait is the maximum time the propagation TxCoalescer will
+	// gather concurrent single-tx submissions before dispatching a partial
+	// batch. Acts as the fallback timer when drain mode is enabled.
 	BatchMaxWait time.Duration
 	// BatchMaxConcurrent caps the number of concurrent in-flight
 	// ValidateBatch flushes spawned by the propagation TxCoalescer.

@@ -374,8 +374,8 @@ func buildMetaFromTx(tx *bt.Tx, blockHeight uint32) (*meta.Data, error) {
 
 // runCPUValidation runs the format + script checks for a single transaction
 // without touching the UTXO store. It calls TxValidatorI methods directly
-// (bypassing the v.validateTransaction / v.validateTransactionScripts wrappers
-// which would call extendTransaction → UTXO store). Phase A already confirmed
+// (bypassing the v.validateTransaction wrapper which would call
+// extendTransaction → UTXO store). Phase A already confirmed
 // parents are present and hydrated the tx to extended form; utxoHeights holds
 // one block height per input derived from the ParentRecord.BlockHeight values
 // fetched in Phase A.

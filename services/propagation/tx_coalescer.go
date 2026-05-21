@@ -126,9 +126,12 @@ func (c *TxCoalescer) Submit(ctx context.Context, tx *bt.Tx, blockHeight uint32)
 	//
 	// pending must be decremented in both branches; using defer keeps
 	// the bookkeeping correct on every return path including panics.
-	if c.v != nil && c.pending.Add(1) == 1 {
-		defer c.pending.Add(-1)
+	// The Add is performed unconditionally so the counter stays balanced
+	// even when v is nil (test path); the bypass itself still requires v.
+	inflight := c.pending.Add(1)
+	defer c.pending.Add(-1)
 
+	if c.v != nil && inflight == 1 {
 		m, err := c.v.Validate(ctx, tx, blockHeight)
 		res := validator.ValidationResult{
 			TxHash: *tx.TxIDChainHash(),
@@ -137,7 +140,6 @@ func (c *TxCoalescer) Submit(ctx context.Context, tx *bt.Tx, blockHeight uint32)
 		}
 		return res, nil
 	}
-	defer c.pending.Add(-1)
 
 	p := &pendingTx{
 		Tx:          tx,
