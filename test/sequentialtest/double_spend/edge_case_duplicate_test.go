@@ -288,3 +288,27 @@ func TestConcurrentDuplicateDetection(t *testing.T) {
 	// 4. Use testing.Short() to skip in non-race builds
 	// 5. Verify error handling when goroutines fail concurrently
 }
+
+func TestDuplicateAcrossSubtreeBoundarySqlQueue(t *testing.T) {
+	pg, err := postgres.RunPostgresTestContainer(t.Context(), "dup_subtree_boundary_"+t.Name())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = pg.Terminate(t.Context())
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		testDuplicateAcrossSubtreeBoundary(t, pg.ConnectionString())
+	})
+}
+
+func TestDuplicateInLastIncompleteSubtreeSqlQueue(t *testing.T) {
+	pg, err := postgres.RunPostgresTestContainer(t.Context(), "dup_incomplete_subtree_"+t.Name())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = pg.Terminate(t.Context())
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		testDuplicateInLastIncompleteSubtree(t, pg.ConnectionString())
+	})
+}

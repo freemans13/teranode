@@ -305,3 +305,53 @@ func testRaceDetectorDuplicateDetection(t *testing.T, utxoStore string) {
 	t.Logf("IMPORTANT: This test MUST be run with: go test -race")
 	t.Logf("Race detector will report any concurrency issues in duplicate detection")
 }
+
+func TestNilSubtreeStoreBypassSqlQueue(t *testing.T) {
+	pg, err := postgres.RunPostgresTestContainer(t.Context(), "nil_subtree_bypass_"+t.Name())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = pg.Terminate(t.Context())
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		testNilSubtreeStoreBypass(t, pg.ConnectionString())
+	})
+}
+
+func TestEmptySubtreeSlicesSqlQueue(t *testing.T) {
+	pg, err := postgres.RunPostgresTestContainer(t.Context(), "empty_subtrees_"+t.Name())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = pg.Terminate(t.Context())
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		testEmptySubtreeSlices(t, pg.ConnectionString())
+	})
+}
+
+func TestConcurrencyConfigurationEdgeCasesSqlQueue(t *testing.T) {
+	pg, err := postgres.RunPostgresTestContainer(t.Context(), "concurrency_config_"+t.Name())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = pg.Terminate(t.Context())
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		testConcurrencyConfigurationEdgeCases(t, pg.ConnectionString())
+	})
+}
+
+func TestRaceDetectorDuplicateDetectionSqlQueue(t *testing.T) {
+	t.Skip("Skipping due to known data race in BlockValidation.setTxMinedStatus - see issue #296")
+
+	pg, err := postgres.RunPostgresTestContainer(t.Context(), "race_detector_"+t.Name())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = pg.Terminate(t.Context())
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		testRaceDetectorDuplicateDetection(t, pg.ConnectionString())
+	})
+}

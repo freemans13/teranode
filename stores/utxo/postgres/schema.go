@@ -1,0 +1,166 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// createSchema creates the v5 turbo UTXO tables in the connected PostgreSQL
+// database: 3 LOGGED hash-partitioned tables (txs, outputs, spends).
+//
+// Schema design tradeoffs (vs. the standard stores/utxo/sql store):
+//
+//   - No foreign keys. Child rows (outputs, spends) reference txs by BYTEA
+//     hash rather than a surrogate id, and pruning explicitly cascades via
+//     DELETE FROM spends → outputs → txs inside one txn (see pruner_provider).
+//     Skips the FK check/maintenance cost on the write path but removes the
+//     DB-level safety net — any bug that deletes txs without the matching
+//     spends/outputs leaves orphans.
+//
+//   - "Is this output spent?" lives in the spends table as a row, not as a
+//     nullable spending_data column on outputs. Spends become pure INSERTs
+//     (no MVCC bloat on outputs) at the cost of needing a LEFT JOIN spends
+//     on every spend-validation query.
+//
+//   - block_ids / block_heights / subtree_idxs / conflicting_children are
+//     INT[] / BYTEA[] arrays on txs instead of separate tables. Reads are
+//     one column on one row; appends (new block_id on mine) are cheap via
+//     `|| $N::int[]`. A full reorg that touches millions of rows still
+//     has to rewrite whole arrays — heavy-reorg cost > separate-table
+//     variant that just INSERTs/DELETEs rows.
+func (s *Store) createSchema(ctx context.Context) error {
+	return createSchemaWithPool(ctx, s.pool)
+}
+
+// partitionSpec defines a partitioned table and the fillfactor for its children.
+type partitionSpec struct {
+	name       string
+	fillfactor int
+}
+
+// numPartitions is the number of hash partitions per table. Local benchmarking
+// shows a single partition outperforms a higher partition count — the partition
+// machinery is kept so we can raise this if future profiling shows contention
+// at the PK level on larger deployments.
+const numPartitions = 1
+
+// createSchemaWithPool executes all DDL statements using the provided pool.
+func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
+	ddlStatements := []string{
+		txsDDL,
+		outputsDDL,
+		spendsDDL,
+	}
+
+	for _, ddl := range ddlStatements {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			return errors.NewStorageError("schema creation failed: %v\nDDL: %s", err, ddl)
+		}
+	}
+
+	// Create numPartitions hash partitions for each table with appropriate fillfactor.
+	tables := []partitionSpec{
+		{"txs", 70},      // HOT updates — reserve 30% for in-place updates
+		{"outputs", 100}, // immutable
+		{"spends", 100},  // append-only
+	}
+	for _, spec := range tables {
+		for i := 0; i < numPartitions; i++ {
+			ddl := fmt.Sprintf(
+				"CREATE TABLE IF NOT EXISTS %s_p%02d PARTITION OF %s FOR VALUES WITH (MODULUS %d, REMAINDER %d) WITH (fillfactor = %d)",
+				spec.name, i, spec.name, numPartitions, i, spec.fillfactor,
+			)
+			if _, err := pool.Exec(ctx, ddl); err != nil {
+				return errors.NewStorageError("partition creation failed for %s_p%02d: %v", spec.name, i, err)
+			}
+		}
+	}
+
+	// Partial indexes on txs for iterator/pruner queries.
+	if _, err := pool.Exec(ctx, txsIndexesDDL); err != nil {
+		return errors.NewStorageError("index creation failed: %v", err)
+	}
+
+	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
+	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`)
+
+	// Playbook §9: aggressive autovacuum on hot-update table.
+	_, _ = pool.Exec(ctx, `ALTER TABLE txs SET (
+		autovacuum_vacuum_scale_factor = 0.01,
+		autovacuum_analyze_scale_factor = 0.005,
+		autovacuum_vacuum_cost_delay = 2,
+		autovacuum_vacuum_insert_threshold = 1000
+	)`)
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Table DDL — 3 LOGGED hash-partitioned tables
+// ---------------------------------------------------------------------------
+
+// txs: consolidated transaction metadata + state + inputs (raw_tx) + block_ids
+// (arrays) + conflicting_children (array). LOGGED — UTXO set is durable state.
+const txsDDL = `
+CREATE TABLE IF NOT EXISTS txs (
+    hash                 BYTEA PRIMARY KEY,
+    version              BIGINT NOT NULL,
+    lock_time            BIGINT NOT NULL,
+    fee                  BIGINT NOT NULL,
+    size_in_bytes        BIGINT NOT NULL,
+    coinbase             BOOLEAN NOT NULL DEFAULT FALSE,
+    raw_tx               BYTEA,
+    locked               BOOLEAN NOT NULL DEFAULT FALSE,
+    conflicting          BOOLEAN NOT NULL DEFAULT FALSE,
+    frozen               BOOLEAN NOT NULL DEFAULT FALSE,
+    unmined_since        BIGINT,
+    delete_at_height     BIGINT,
+    preserve_until       BIGINT,
+    block_ids            INT[],
+    block_heights        INT[],
+    subtree_idxs         INT[],
+    conflicting_children BYTEA[],
+    inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+) PARTITION BY HASH (hash);`
+
+// Partial indexes on txs.
+const txsIndexesDDL = `
+CREATE INDEX IF NOT EXISTS px_unmined_since ON txs (unmined_since) WHERE unmined_since IS NOT NULL;
+CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE delete_at_height IS NOT NULL;`
+
+// outputs: immutable transaction outputs. LOGGED. Spent-ness is tracked by
+// row-presence in the spends table rather than a nullable column here, so
+// these rows never have to be updated after Create.
+const outputsDDL = `
+CREATE TABLE IF NOT EXISTS outputs (
+    tx_hash                 BYTEA   NOT NULL,
+    idx                     BIGINT  NOT NULL,
+    locking_script          BYTEA   NOT NULL,
+    satoshis                BIGINT  NOT NULL,
+    utxo_hash               BYTEA   NOT NULL,
+    coinbase_spending_height BIGINT NOT NULL DEFAULT 0,
+    frozen                  BOOLEAN DEFAULT FALSE,
+    spendable_in            INT,
+    PRIMARY KEY (tx_hash, idx)
+) PARTITION BY HASH (tx_hash);`
+
+// spends: append-only spend records. LOGGED. A row here is the canonical
+// "this output was spent by that tx" marker; Unspend deletes the row, and
+// the pruner removes all rows for a parent_tx before removing the parent.
+const spendsDDL = `
+CREATE TABLE IF NOT EXISTS spends (
+    prev_tx_hash    BYTEA  NOT NULL,
+    prev_output_idx BIGINT NOT NULL,
+    spending_data   BYTEA  NOT NULL,
+    UNIQUE (prev_tx_hash, prev_output_idx)
+) PARTITION BY HASH (prev_tx_hash);`
+
+// createStagingTablesSQL is executed per-connection to ensure temp staging
+// tables exist for the COPY-based create batcher.
+const createStagingTablesSQL = `
+CREATE TEMP TABLE IF NOT EXISTS staging_txs (LIKE txs EXCLUDING ALL) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS staging_outputs (LIKE outputs EXCLUDING ALL) ON COMMIT DELETE ROWS;
+`

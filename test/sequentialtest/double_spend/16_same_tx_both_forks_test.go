@@ -210,3 +210,7 @@ func testSameTxBothForks(t *testing.T, utxoStore string) {
 
 	t.Log("Successfully verified same-tx-both-forks scenario")
 }
+
+func TestSameTxBothForksSqlQueue(t *testing.T) {
+	t.Skip("same_tx_both_forks: test disabled pending implementation")
+}
