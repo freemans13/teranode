@@ -56,7 +56,7 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 				Namespace: "teranode",
 				Subsystem: "adaptive_fetch",
 				Name:      "missing_fetches_total",
-				Help:      "Running total of transactions recovered via processMissingTransactions, by service.",
+				Help:      "Running total of transactions recovered/fetched individually after an optimistic-mode skip, by service.",
 			},
 			[]string{"service"},
 		)),

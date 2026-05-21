@@ -357,15 +357,19 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				// optimistic-mode observations stamp MissingFetches=0. The Pess→Opt
 				// transition therefore fires after WindowSize consecutive subtrees
 				// have been processed (a "wait then try" gate, not a measurement).
-				// The Opt→Pess transition will not fire from observations alone —
-				// it relies on downstream processTransactionsInLevels surfacing a
-				// validation error and the block failing. Until real
-				// MissingFetches plumbing lands, recovery from a degraded
-				// optimistic deployment requires the operator to change
-				// adaptive_fetch_bootstrap_mode to "pessimistic" (or "auto")
-				// and restart — a plain restart with bootstrap_mode pinned to
-				// "optimistic" will come back up optimistic. A future
-				// improvement would plumb real UTXO hit counts and
+				// The Opt→Pess transition cannot fire from observations today:
+				// adaptivefetch.maybeTransition() only inspects the values
+				// passed to Record/RecordIfMode, and we stamp MissingFetches=0
+				// here. Downstream processTransactionsInLevels may surface a
+				// validation error that fails the block, but that failure is
+				// not fed back into adaptivefetch, so the state machine does
+				// not self-correct from validation failures either. Until
+				// real MissingFetches plumbing lands here, recovery from a
+				// degraded optimistic deployment requires the operator to
+				// change adaptive_fetch_bootstrap_mode to "pessimistic" (or
+				// "auto") and restart — a plain restart with bootstrap_mode
+				// pinned to "optimistic" will come back up optimistic. A
+				// future improvement would plumb real UTXO hit counts and
 				// processMissingTransactions recovery counts through this
 				// path so the state machine can self-correct without a
 				// restart or config change.
