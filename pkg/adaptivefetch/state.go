@@ -162,6 +162,17 @@ func (s *State) recordWithMode(obs Observation, requireMode bool, observedAt Mod
 	prev := s.mode
 	s.maybeTransition()
 	if prev != s.mode {
+		// Reset the rolling window on every mode transition. Each mode's
+		// thresholds must be evaluated against observations collected while
+		// in that mode — leaving stale observations from the previous mode
+		// in the ring causes bouncing (e.g. an Opt→Pess trip would leave
+		// the window full of perfect-hit-rate optimistic samples, and the
+		// very next pessimistic Record would instantly satisfy the
+		// Pess→Opt threshold and flip back). See pkg/adaptivefetch/state_test.go
+		// TestTransition_ClearsWindow_NoImmediateBackflip for the
+		// regression case.
+		s.window = s.window[:0]
+		s.windowHead = 0
 		s.metrics.transitions.WithLabelValues(s.serviceName, prev.String(), s.mode.String()).Inc()
 		s.emitMode()
 	}

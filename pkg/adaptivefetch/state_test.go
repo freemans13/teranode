@@ -373,6 +373,56 @@ func TestBootstrapMode_PinnedOptimisticStillTripsOptToPess(t *testing.T) {
 		"pinned optimistic must still trip Opt→Pess on observed misses")
 }
 
+// TestTransition_ClearsWindow_NoImmediateBackflip locks in the invariant
+// that a mode transition resets the rolling window so the next mode's
+// thresholds are computed only from observations collected while in that
+// mode. Without this, an Opt→Pess trip would leave the window full of
+// optimistic-mode observations (all LocalHits=TotalTxs from the perfect-
+// hit synthetic samples) and the very next pessimistic Record would
+// instantly satisfy the Pess→Opt threshold and bounce back. Regression
+// guard for review-round-6.
+func TestTransition_ClearsWindow_NoImmediateBackflip(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                3,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeAuto,
+	}, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	// Fill window with perfect pessimistic observations → trip Pess→Opt.
+	for i := 0; i < 3; i++ {
+		s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	}
+	require.Equal(t, ModeOptimistic, s.Mode())
+
+	// Trip Opt→Pess immediately with a single big-miss observation.
+	// Note: hit-rate = 1.0 (LocalHits=TotalTxs) but MissingFetches=100 still
+	// trips the single-block threshold. Without window reset on transition
+	// this leaves the window with three hit-rate=1.0 observations.
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 100})
+	require.Equal(t, ModePessimistic, s.Mode())
+
+	// The window must be cleared on transition. A single perfect pessimistic
+	// observation must NOT immediately re-trip to optimistic, because the
+	// new pessimistic window must fill from scratch (len < WindowSize).
+	// Without the reset, the previous three hit-rate=1.0 observations would
+	// still be in the ring and the new Record would push the window to full
+	// with avgHitRate=1.0, instantly bouncing back to optimistic.
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	require.Equal(t, ModePessimistic, s.Mode(),
+		"first post-Opt→Pess observation must not back-flip; window must reset")
+
+	// Two more perfect observations to fill the new pessimistic window → flip.
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	require.Equal(t, ModePessimistic, s.Mode(),
+		"two-of-three observations must not yet flip; window must fill from scratch")
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	require.Equal(t, ModeOptimistic, s.Mode(),
+		"three perfect pessimistic observations after reset must flip Pess→Opt")
+}
+
 // TestRecordIfMode_NilReceiver locks in the nil-safe contract.
 func TestRecordIfMode_NilReceiver(t *testing.T) {
 	var s *State
