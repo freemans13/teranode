@@ -190,7 +190,7 @@ require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
 	github.com/bsv-blockchain/go-safe-conversion v1.2.0
 	github.com/bsv-blockchain/go-tx-map v1.3.7
-	github.com/bsv-blockchain/go-wire v1.2.6
+	github.com/bsv-blockchain/go-wire v1.2.5
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
@@ -468,3 +468,5 @@ require (
 	github.com/spf13/cobra v1.10.1 // indirect
 	github.com/yuin/gopher-lua v1.1.2 // indirect
 )
+
+replace github.com/bsv-blockchain/go-wire => github.com/freemans13/go-wire v1.2.6-0.20260521131832-d8cf11cb65db
