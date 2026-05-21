@@ -18,7 +18,8 @@ type State struct {
 	// pinned ModeOptimistic, having started in optimistic, also never trips
 	// Pess→Opt. The Opt→Pess safety trip is always enabled regardless of
 	// bootstrap so a degraded optimistic deployment can still self-recover.
-	// See PR #745 / Copilot review for rationale.
+	// Rationale: pinned pessimistic is the documented "always fetch
+	// subtreeData" safe default; only auto-opted operators get drift.
 	allowPessToOpt bool
 	window         []Observation // ring buffer, cap = cfg.WindowSize
 	windowHead     int           // next write position
