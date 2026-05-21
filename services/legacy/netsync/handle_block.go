@@ -1325,8 +1325,13 @@ func (sm *SyncManager) createTxMap(ctx context.Context, block *bsvutil.Block, tx
 
 		// don't add the coinbase to the txMap, we cannot process it anyway
 		if !tx.IsCoinbase() {
-			tx.SetTxHash(wireTx.Hash())
-			txMap.Set(*tx.TxIDChainHash(), &TxMapWrapper{Tx: tx})
+			// Copy the hash value out of the bsvutil.Tx wrapper. bt.Tx.SetTxHash
+			// stores the pointer, so passing wireTx.Hash() directly would keep
+			// the wrapping wire.MsgTx (and its decode arena) alive through this
+			// bt.Tx and the TxMapWrapper it lands in.
+			hashCopy := *wireTx.Hash()
+			tx.SetTxHash(&hashCopy)
+			txMap.Set(hashCopy, &TxMapWrapper{Tx: tx})
 		}
 	}
 
