@@ -109,6 +109,10 @@ type batcherIfc[T any] interface {
 	PutCtx(ctx context.Context, item *T, payloadSize ...int)
 	Trigger()
 	SetDrainMode(enabled bool)
+	// Close signals the batcher to drain any queued items, dispatch them via
+	// the configured callback, and shut down its worker goroutines. Must not
+	// be called concurrently with Put / PutCtx.
+	Close()
 }
 
 // Store implements the UTXO store interface using Aerospike.
@@ -453,6 +457,68 @@ func (s *Store) GetBlockState() utxo.BlockState {
 	return utxo.BlockState{
 		Height:     s.blockHeight.Load(),
 		MedianTime: s.medianBlockTime.Load(),
+	}
+}
+
+// Close drains all batched-write workers and releases the Aerospike client.
+//
+// Closing the batchers blocks until any items still queued have been
+// dispatched through their configured callbacks (this is the contract
+// of go-batcher's Close — see batcher.go:Close, which closes the input
+// channel, drains it, and dispatches the residual batch with reason
+// "shutdown"). Without this drain, a SIGTERM mid-flight silently loses
+// the in-channel items: the caller has already received a successful
+// Create/Spend/etc. return because background batchers ack on enqueue,
+// not on dispatch, so the parent block gets committed elsewhere but the
+// UTXO write never reaches Aerospike. On restart, blocks that spend
+// those outputs fail with missing-parent errors.
+//
+// Close honors the context for the overall drain timeout. Implementations
+// of batcherIfc.Close are expected to drain promptly; if the context
+// deadline expires first, an error is returned but draining continues
+// best-effort.
+func (s *Store) Close(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Order is intentional: stop accepting new write ops first (no-op
+		// here because Put/PutCtx don't have a separate close-gate), then
+		// drain in dependency order. setDAH/locked/outpoint/increment are
+		// best-effort metadata writers; store/spend are the durable UTXO
+		// state writers and are drained last to maximise their chance of
+		// committing before the deadline.
+		if s.setDAHBatcher != nil {
+			s.setDAHBatcher.Close()
+		}
+		if s.lockedBatcher != nil {
+			s.lockedBatcher.Close()
+		}
+		if s.outpointBatcher != nil {
+			s.outpointBatcher.Close()
+		}
+		if s.incrementBatcher != nil {
+			s.incrementBatcher.Close()
+		}
+		if s.getBatcher != nil {
+			s.getBatcher.Close()
+		}
+		if s.spendBatcher != nil {
+			s.spendBatcher.Close()
+		}
+		if s.storeBatcher != nil {
+			s.storeBatcher.Close()
+		}
+	}()
+
+	select {
+	case <-done:
+		// Drains complete; close the Aerospike client.
+		if s.client != nil {
+			s.client.Close()
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
