@@ -60,7 +60,7 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		store.Stop()
+		_ = store.Close(context.Background())
 	})
 
 	return store, ctx

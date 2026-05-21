@@ -173,29 +173,41 @@ func (s *Store) Start(_ context.Context) {
 	s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
 }
 
-// Stop closes batchers and database connections.
-func (s *Store) Stop() {
-	if s.createBatcher != nil {
-		s.createBatcher.Close()
-		s.createBatcher = nil
-	}
-	if s.spendBatcher != nil {
-		s.spendBatcher.Close()
-		s.spendBatcher = nil
-	}
-	if s.getBatcher != nil {
-		s.getBatcher.Close()
-		s.getBatcher = nil
-	}
-	if s.unlockBatcher != nil {
-		s.unlockBatcher.Close()
-		s.unlockBatcher = nil
-	}
-	if s.pool != nil {
-		s.pool.Close()
-	}
-	if s.db != nil {
-		s.db.Close()
+// Close drains the batched-write workers and releases the connection pool.
+// See utxo.Store.Close for the durability contract.
+func (s *Store) Close(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if s.unlockBatcher != nil {
+			s.unlockBatcher.Close()
+			s.unlockBatcher = nil
+		}
+		if s.getBatcher != nil {
+			s.getBatcher.Close()
+			s.getBatcher = nil
+		}
+		if s.spendBatcher != nil {
+			s.spendBatcher.Close()
+			s.spendBatcher = nil
+		}
+		if s.createBatcher != nil {
+			s.createBatcher.Close()
+			s.createBatcher = nil
+		}
+	}()
+
+	select {
+	case <-done:
+		if s.pool != nil {
+			s.pool.Close()
+		}
+		if s.db != nil {
+			_ = s.db.Close()
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
