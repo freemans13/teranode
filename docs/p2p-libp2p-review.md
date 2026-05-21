@@ -7,23 +7,19 @@ This review covers the six areas in the brief, plus one additional finding (Stat
 ## 1. Peer discovery
 
 ### DHT
-
 - DHT mode is wired correctly: `services/p2p/Server.go:332-335` passes `BootstrapPeers`, `DHTMode`, `DHTCleanupInterval` and `EnableNAT` straight through to the library config.
 - "Silent" listen mode forces `dhtMode = "off"` (`services/p2p/Server.go:322-324`) and disables address advertisement (`Server.go:288-291`). A silent node stops participating in the DHT entirely; it can still receive over already-established subscriptions but cannot be discovered. This matches the documented intent.
 - DHT "client" mode is **not** lightweight despite the name. Per the library docs (`go-p2p-message-bus/config.go:94-97`), client mode still crawls the DHT and sustains 100+ peer connections — it just doesn't write provider records. If anyone selects "client" expecting a privacy-friendly low-resource node, they will be surprised.
 
 ### Bootstrap vs. static peers
-
 - **Static peers are silently discarded.** `settings.P2P.StaticPeers` is defined in `settings/p2p_settings.go:27`, persisted from `p2p_static_peers` in config, and is consumed only by `cmd/diagnose/config_checks.go:446` and `cmd/monitor/monitor.go:1046` — both for *display*. There is no consumer in `services/p2p/`. The library exposes `Client.Connect(ctx, addr)` (go-p2p-message-bus types) but auto-reconnect is only wired for `BootstrapPeers` (library `client.go:860-894` `maintainBootstrapConnections`). Operators who configure `p2p_static_peers` get no behaviour from it, which is what bit our multinode docker-compose tests for the past several days.
 - Bootstrap peers themselves are correctly maintained — the library reconnects every 30s if they drop.
 
 ### mDNS
-
 - `EnableMDNS` defaults to false and is correctly passed through (`Server.go:337` → library `client.go:136-145`). The library prints a "production safe default" log line if disabled.
 - `settings/p2p_settings.go:62-65` warns about shared-hosting risks (mDNS multicasts on `224.0.0.251/5353` and is visible to every tenant in the same broadcast domain). There is no runtime guard — if `EnableMDNS=true` is set on a Hetzner/AWS deployment, it'll happily broadcast.
 
 ### Peer churn
-
 - `services/p2p/peer_registry.go` has no eviction policy. `Put()` (line 67) only removes via explicit `Remove()` (line 111) or via the disconnect handler in `sync_coordinator.go:218`. A peer that reconnects with a fresh peer ID adds an entry; one that goes offline forever leaves its entry behind. There is no TTL, LRU, or background sweep over the registry.
 - `BanManager` does have a background cleanup ticker (`BanManager.go:156`, runs every `decayInterval` defaulting to 1 minute) that decays scores by 1/min and removes entries with score 0 and no active ban.
 - `peer_registry.go:600` defines `ReconsiderBadPeers()` with exponential cooldown logic — but it's never called from anywhere in the codebase. Peers stuck at low reputation never recover.
@@ -31,11 +27,9 @@ This review covers the six areas in the brief, plus one additional finding (Stat
 ## 2. Pub/sub topology and relay
 
 ### Implementation
-
 - The library uses **gossipsub** (`pubsub.NewGossipSub(ctx, h, pubsub.WithPeerExchange(true))` at `go-p2p-message-bus/client.go:127`). Only `WithPeerExchange(true)` is set; every other parameter is libp2p's default. Underlying lib is `go-libp2p-pubsub v0.15.0`.
 
 ### Mesh parameters (libp2p defaults)
-
 | Parameter | Default | Note |
 |---|---|---|
 | `D` (target mesh degree) | 6 | direct gossip peers per topic per node |
@@ -48,23 +42,19 @@ This review covers the six areas in the brief, plus one additional finding (Stat
 These defaults are sensible for networks up to ~10K nodes. Latency is `O(log N)` because each node forwards to D=6 peers. Beyond ~100K nodes the constant-degree mesh is no longer adequate; that's a future-tuning concern, not a current issue.
 
 ### Are messages relayed via gossip, or fanned out via direct connections?
-
 **Gossip, confirmed.** Every publish path (`Server.go:820, 1067, 1393, 1428`) calls `s.P2PClient.Publish(ctx, topic, bytes)`, which delegates to `topic.Publish` on the gossipsub topic handle. There is exactly one place in `services/p2p/` that iterates over all known peers (`Server.go:1191`) and that's a *read* — looking up sync peer heights, not a publish loop. The reviewer's specific worry — that we hold a direct connection to every known peer — is not happening today.
 
 ### Seen-message dedup
-
 - libp2p's pubsub maintains a `seenMessages` time-cache keyed by message ID (`go-libp2p-pubsub/pubsub.go:536, 1399, 1416`). Duplicate messages by ID are dropped before being forwarded. Default TTL is 2 minutes.
 - Teranode adds an application-layer 10MB size guard (`Server.go:66, 913-914`) before JSON unmarshal.
 - A peer publishing many *different* malformed messages would still propagate them, since the dedup is by message ID, not by content. See "Validators" below.
 
 ### Validators / rate limiting
-
 - **No `RegisterTopicValidator` calls anywhere.** No `pubsub.WithValidator`. No per-topic schema check before forwarding. A malformed-but-parseable JSON payload will be relayed by the whole mesh before any node catches the schema violation. The library does not currently expose a hook for this — addressing it requires extending `go-p2p-message-bus` to surface `pubsub.RegisterTopicValidator` from libp2p.
 - Per-topic size limits are now enforced application-side (see `services/p2p/Server.go` constants `maxBlockMessageSize`, `maxSubtreeMessageSize`, `maxNodeStatusMessageSize`, `maxRejectedTxMessageSize`). A 5MB blob on `node_status` is now rejected at the topic handler instead of being parsed. This is defence in depth; gossipsub still forwards the message before the handler runs.
 - No per-peer rate limiting on inbound topic messages. A peer publishing 100 fake `node_status` messages per second produces 100 distinct message IDs and gossipsub will fan all of them out.
 
 ### NodeStatus heartbeat scaling
-
 `NodeStatusMessage` ≈ 846 bytes JSON-serialised (per `Server.go:1219-1345`). Published every 10 s on `p2p_node_status_topic` (`Server.go:1081`). Every node receives every other node's heartbeat once via gossip. So per-node ingress from the node-status topic alone is roughly:
 
 | N | heartbeats/s received | bandwidth |
@@ -76,7 +66,6 @@ These defaults are sensible for networks up to ~10K nodes. Latency is `O(log N)`
 (Connection count stays constant at D=6 — that's not the issue. The issue is that each node still sees every heartbeat at least once.) At 10K nodes the heartbeat alone is ~7 Mbps, before any block or subtree traffic, before any retransmits. That's not a hard wall but it's a real cost at scale that nobody seems to have modelled. Easy mitigations exist (back off the interval as cluster size grows; piggyback heartbeat on existing block/subtree messages; use a slower secondary topic for heartbeats).
 
 ### Topic granularity
-
 Four topics — block, subtree, node_status, rejected_tx (`Server.go:608-611`). Boundaries look reasonable. Block and subtree carry payloads, node_status is steady-state, rejected_tx is event-driven and sparse. No obvious wins from merging or splitting today.
 
 ## 3. Message handling
@@ -90,25 +79,21 @@ Already covered above:
 ## 4. Reputation, ban management, peer-map
 
 ### Reputation (`peer_registry.go`)
-
 - Hybrid model: event-driven recompute (`calculateAndUpdateReputation` at `peer_registry.go:381`) on every interaction, no time-based decay loop. Score range 0–100, starting at 50. Inputs: success rate (60% weight), recency penalties / bonuses, latency factor (0.6×–1.2×).
 - Consumed by `GetPeersByReputation()` (line 538), `GetPeersForCatchup()` (line 712), `PeerSelector.isEligible()` (peer_selector.go:202), and `isViableSyncCandidate()` (sync_coordinator.go:104) — all gate on reputation ≥ 20.
 - Score is **not persisted**. Restart resets every peer to neutral (50). Hard-won deprioritisation of misbehaving peers is lost across restarts.
 
 ### BanManager (`BanManager.go`)
-
 - Triggers add weighted scores (invalid-block/subtree +10, protocol-violation +20, spam +50). Threshold default 100 → 24-hour ban.
 - Decay –1/minute via background ticker (`BanManager.go:156`). Bans expire lazily on `IsBanned()` check (line 279) — fine.
 - **Ban state is not persisted either.** A restart wipes the ban list. Coordinated peers can time their reconnection around restarts. Bans are 24h by default so persistence is meaningful.
 - Reputation and ban score are decoupled. A peer can have reputation 5 and ban score 0, and still be selectable until reputation drops it below the eligibility threshold. Tighter coupling (e.g. very-low rep auto-applies a soft ban) would be a defensible product choice but that's tuning, not correctness.
 
 ### PeerMap settings
-
 - `PeerMapMaxSize` (100 000), `PeerMapTTL` (30 m), `PeerMapCleanupInterval` (5 m) all do what their names imply. `startPeerMapCleanup` (`server_helpers.go:949`) starts a goroutine that runs `cleanupPeerMaps` (line 733) on a ticker: TTL pass first, then LRU eviction if still over the limit.
 - 5-minute cleanup tick on a 30-min TTL is generous, but in a high-throughput period the maps can spike past `MaxSize` between ticks before LRU catches up. Spike memory pressure, not unbounded growth.
 
 ### Stale-entry growth
-
 - `PeerRegistry` itself is the unbounded one. Peers are added on first contact and never aged out. Given the registry is used in O(n) iteration paths (`GetAll`, `GetPeersForCatchup`), this becomes both a memory and a latency problem under sustained churn. This is the most operationally serious of all the findings.
 - `LastSyncAttempt` is cleared only by `ClearAllSyncAttempts()` on backoff recovery. Functionally harmless but adds to the registry-bloat picture.
 
@@ -119,9 +104,9 @@ Already covered above:
 - **Single peer at a time** — deliberate, locked behind `mu sync.RWMutex` (line 32). `TriggerSync` clears, selects, sends via Kafka. No concurrent peer changes.
 - Selection key (peer_selector.go:42): full-storage nodes first, sorted reputation desc → response time asc → ban score asc → height desc. Falls back to youngest pruned node only if `AllowPrunedNodeFallback`.
 - Stall handling (`evaluateSyncPeer` line 566) runs every `SyncCoordinatorPeriodicEvaluationInterval` (default 30s) and switches peers when:
-    - reputation drops below 20,
-    - peer disappears from registry,
-    - syncing > 5 min with no inbound message for 1 min (records `RecordCatchupFailure`).
+  - reputation drops below 20,
+  - peer disappears from registry,
+  - syncing > 5 min with no inbound message for 1 min (records `RecordCatchupFailure`).
 - Repeated failures degrade reputation; they don't auto-ban. There's commented-out malicious-detection logic at `sync_coordinator.go:390-405` that would close the loop, currently disabled.
 - **No parallel fan-out.** This is a deliberate "cooperative" choice — a single-peer model is simpler to reason about and avoids redundant block downloads — but it also means a slow but-not-failing peer can throttle the whole node's catch-up. Worth reconsidering once we're past the initial network growth phase.
 

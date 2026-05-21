@@ -21,20 +21,18 @@ go build -o subtreeanalyzer ./cmd/subtreeanalyzer/
 ## Output
 
 The tool produces a block-centric report showing:
-
 - Blocks ordered by height
 - For each block:
-    - Block height and hash
-    - List of subtrees that have scheduled deletions
-    - For each subtree:
-        - Subtree hash
-        - Deletion height range (min-max if multiple deletion schedules exist)
-        - File type (transaction or subtree)
-        - Retry count (highest retry count if multiple schedules exist)
+  - Block height and hash
+  - List of subtrees that have scheduled deletions
+  - For each subtree:
+    - Subtree hash
+    - Deletion height range (min-max if multiple deletion schedules exist)
+    - File type (transaction or subtree)
+    - Retry count (highest retry count if multiple schedules exist)
 
 Example output:
-
-```text
+```
 === Blocks with Scheduled Subtree Deletions ===
 Found 2 blocks containing subtrees scheduled for deletion
 
@@ -69,7 +67,6 @@ Block Height: 800
 The tool works with two main tables:
 
 ### scheduled_blob_deletions
-
 - `id` - Unique identifier
 - `blob_key` - Subtree hash (32 bytes)
 - `file_type` - Type of blob (e.g., "subtree", "transaction")
@@ -79,10 +76,9 @@ The tool works with two main tables:
 - `last_retry_at` - Timestamp of last retry
 
 ### blocks
-
 - Contains block headers and metadata
 - `subtrees` - Binary-encoded array of subtree hashes
-    - Format: VarInt(count) + 32-byte hash + 32-byte hash + ...
+  - Format: VarInt(count) + 32-byte hash + 32-byte hash + ...
 - `height` - Block height
 - `hash` - Block hash
 

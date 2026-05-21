@@ -29,7 +29,6 @@ Adds an [OpenRPC 1.2.6](https://open-rpc.org/) specification documenting all 31 
 ## Methods documented (31)
 
 ### Blockchain queries
-
 - `getinfo` — General node information
 - `getbestblockhash` — Hash of the chain tip
 - `getblock` — Block data by hash (hex/JSON/verbose)
@@ -41,14 +40,12 @@ Adds an [OpenRPC 1.2.6](https://open-rpc.org/) specification documenting all 31 
 - `getdifficulty` — Current mining difficulty
 
 ### Transactions
-
 - `getrawtransaction` — Raw transaction by txid (hex/JSON)
 - `sendrawtransaction` — Submit a raw transaction for broadcast
 - `createrawtransaction` — Create an unsigned raw transaction
 - `getrawmempool` — Mempool transaction IDs
 
 ### Mining
-
 - `getmininginfo` — Mining-related information
 - `getminingcandidate` — Mining candidate for block construction (BSV extension)
 - `submitminingsolution` — Submit a solved block (BSV extension)
@@ -56,7 +53,6 @@ Adds an [OpenRPC 1.2.6](https://open-rpc.org/) specification documenting all 31 
 - `generatetoaddress` — Mine blocks to an address (regtest)
 
 ### Network / Peers
-
 - `getpeerinfo` — Connected peer information
 - `setban` — Ban/unban an IP or subnet
 - `isbanned` — Check if an IP is banned
@@ -64,18 +60,15 @@ Adds an [OpenRPC 1.2.6](https://open-rpc.org/) specification documenting all 31 
 - `clearbanned` — Clear all bans
 
 ### Block validation
-
 - `invalidateblock` — Mark a block as invalid
 - `reconsiderblock` — Reconsider a previously invalidated block
 
 ### Alert system (BSV extension)
-
 - `freeze` — Freeze a UTXO
 - `unfreeze` — Unfreeze a UTXO
 - `reassign` — Reassign a frozen UTXO to a new output
 
 ### Utility
-
 - `help` — List commands or get help for a specific command
 - `stop` — Shut down the node
 - `version` — JSON-RPC API version information
@@ -92,4 +85,4 @@ The following methods are registered in `rpcHandlersBeforeInit` but map to `hand
 
 - [x] JSON is valid and parseable
 - [x] All 31 implemented methods are documented with params and result schemas
-- [ ] Verify spec renders correctly in an OpenRPC playground (<https://playground.open-rpc.org/>)
+- [ ] Verify spec renders correctly in an OpenRPC playground (https://playground.open-rpc.org/)

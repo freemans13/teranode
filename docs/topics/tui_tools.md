@@ -163,7 +163,7 @@ The log viewer tails a Teranode log file in real time, parsing each line into st
 
 Each parsed log line is displayed with the following columns:
 
-```text
+```
 HH:MM:SS  LEVEL  SERVICE   Message text...
 ```
 
@@ -219,7 +219,7 @@ All filters can be cleared at once with `c`. The current filter state is shown i
 
 Press `e` to toggle the error summary panel. This shows a 5-minute sliding window of error and warning counts per service, sorted by total count (descending). The panel displays up to 4 services plus a total, in the format:
 
-```text
+```
 ERRORS (5m): service1: 3E 2W | service2: 1E 0W | Total: 4E 2W
 ```
 

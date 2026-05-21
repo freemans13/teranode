@@ -116,7 +116,7 @@ The `isolate`/`heal` commands use `iptables` via `nsenter` to block traffic to o
 
 Each `up N` invocation generates a self-contained bundle under `compose/generated/`:
 
-```text
+```
 compose/generated/
   docker-compose-multinode.yml    # Main compose file
   settings_multinode.conf         # Per-node settings overlay

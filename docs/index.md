@@ -17,7 +17,7 @@ hide:
 
 <div class="grid cards" markdown>
 
-- :material-server-network:{ .lg .middle } **Run a Node**
+-   :material-server-network:{ .lg .middle } **Run a Node**
 
     ---
 
@@ -25,7 +25,7 @@ hide:
 
     [:octicons-arrow-right-24: Miner setup](howto/miners/docker/minersHowToInstallation.md)
 
-- :material-code-tags:{ .lg .middle } **Develop**
+-   :material-code-tags:{ .lg .middle } **Develop**
 
     ---
 
@@ -33,7 +33,7 @@ hide:
 
     [:octicons-arrow-right-24: Developer setup](howto/developerSetup.md)
 
-- :material-book-open-variant:{ .lg .middle } **Key Topics**
+-   :material-book-open-variant:{ .lg .middle } **Key Topics**
 
     ---
 
@@ -41,7 +41,7 @@ hide:
 
     [:octicons-arrow-right-24: Explore topics](topics/teranodeIntro.md)
 
-- :material-database-search:{ .lg .middle } **Reference**
+-   :material-database-search:{ .lg .middle } **Reference**
 
     ---
 
@@ -55,7 +55,7 @@ hide:
 
 <div class="grid cards" markdown>
 
-- :material-sitemap:{ .lg .middle } **Microservices Overview**
+-   :material-sitemap:{ .lg .middle } **Microservices Overview**
 
     ---
 
@@ -63,7 +63,7 @@ hide:
 
     [:octicons-arrow-right-24: Architecture](topics/architecture/teranode-microservices-overview.md)
 
-- :material-source-fork:{ .lg .middle } **Contribute**
+-   :material-source-fork:{ .lg .middle } **Contribute**
 
     ---
 
@@ -71,7 +71,7 @@ hide:
 
     [:octicons-arrow-right-24: Fork & PR guide](howto/forkAndPullRequestGuidelines.md)
 
-- :material-cog-outline:{ .lg .middle } **Configuration**
+-   :material-cog-outline:{ .lg .middle } **Configuration**
 
     ---
 
@@ -79,7 +79,7 @@ hide:
 
     [:octicons-arrow-right-24: Settings](references/settings.md)
 
-- :material-currency-btc:{ .lg .middle } **What is Teranode?**
+-   :material-currency-btc:{ .lg .middle } **What is Teranode?**
 
     ---
 

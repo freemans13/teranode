@@ -5,7 +5,6 @@ This document explains how to ensure trace context is properly propagated across
 ## Why Propagation Matters
 
 Teranode uses `ParentBased` sampling, which means:
-
 - **Root spans** (no parent): Sampled at the configured rate (e.g., 10%)
 - **Child spans** (have a parent): Inherit the parent's sampling decision
 
@@ -38,7 +37,6 @@ Kafka-based communication currently does NOT propagate trace context. This affec
 ### Impact
 
 When transactions or blocks are processed via Kafka:
-
 - A **new root span** is created instead of a child span
 - The trace appears disconnected in Jaeger/tracing UI
 - Cannot trace the full journey of a transaction from RPC → Propagation → Kafka → Validator
@@ -52,7 +50,6 @@ When transactions or blocks are processed via Kafka:
 ### Required Changes to Fix
 
 1. **Update protobuf** (`util/kafka/kafka_message/kafka_messages.proto`):
-
    ```protobuf
    message KafkaTxValidationTopicMessage {
        bytes tx = 1;
@@ -63,7 +60,6 @@ When transactions or blocks are processed via Kafka:
    ```
 
 2. **Inject on publish** (propagation server):
-
    ```go
    traceContext := make(map[string]string)
    otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(traceContext))
@@ -71,7 +67,6 @@ When transactions or blocks are processed via Kafka:
    ```
 
 3. **Extract on consume** (validator server):
-
    ```go
    if len(msg.TraceContext) > 0 {
        ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(msg.TraceContext))
@@ -87,21 +82,18 @@ gRPC trace context propagation is handled automatically by OpenTelemetry interce
 ### How It Works
 
 **Client-side** (outgoing requests):
-
 ```go
 // Configured in grpc_helper.go:146
 stats.NewClientHandler(stats.WithClientHandler(otelgrpc.NewClientHandler()))
 ```
 
 **Server-side** (incoming requests):
-
 ```go
 // Configured in grpc_helper.go:234
 stats.NewServerHandler(stats.WithServerHandler(otelgrpc.NewServerHandler()))
 ```
 
 ### Developer Action Required
-
 **None** - trace context is automatically injected into gRPC metadata on outgoing calls and extracted on incoming calls.
 
 ---
@@ -113,7 +105,6 @@ For batch operations where multiple items are sent in a single gRPC call, each i
 ### Current Implementation
 
 **Producer** (`services/propagation/Client.go`):
-
 ```go
 import "go.opentelemetry.io/otel"
 
@@ -129,7 +120,6 @@ items[i] = &propagation_api.BatchTransactionItem{
 ```
 
 **Consumer** (`services/propagation/Server.go`):
-
 ```go
 // Extract trace context from each batch item
 if len(item.TraceContext) > 0 {
@@ -141,9 +131,7 @@ if len(item.TraceContext) > 0 {
 ```
 
 ### Developer Action Required
-
 When creating new batch APIs:
-
 1. Add `map<string, string> trace_context` field to protobuf message
 2. Inject context on producer side using `otel.GetTextMapPropagator().Inject()`
 3. Extract context on consumer side using `otel.GetTextMapPropagator().Extract()`
@@ -157,7 +145,6 @@ HTTP trace context is extracted from standard W3C trace headers.
 ### Current Implementation
 
 **Server** (`services/rpc/Server.go`):
-
 ```go
 import (
     "go.opentelemetry.io/otel"
@@ -171,9 +158,7 @@ r = r.WithContext(ctx)
 ```
 
 ### Developer Action Required
-
 When making outgoing HTTP requests:
-
 ```go
 import (
     "go.opentelemetry.io/otel"
@@ -191,7 +176,6 @@ otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 **This is a gap that needs to be addressed for complete distributed tracing.**
 
 Kafka messages currently do not carry trace context, meaning traces are broken when:
-
 - Transactions are validated via Kafka
 - Block events flow through Kafka topics
 - Any async processing uses Kafka
@@ -270,7 +254,6 @@ func (v *Validator) processKafkaMessage(msg *kafkamessage.KafkaTxValidationTopic
 ## P2P Propagation (NOT IMPLEMENTED)
 
 P2P message propagation depends on the underlying transport:
-
 - Messages routed via Kafka inherit the Kafka propagation gap
 - Direct libp2p messages would need custom header handling
 
@@ -297,7 +280,6 @@ UDP multicast transactions (`services/propagation/`) currently have no trace con
 ## Testing Propagation
 
 ### Verify gRPC Propagation
-
 ```go
 // Parent service
 ctx, span, end := tracer.Start(ctx, "ParentOperation")
@@ -306,9 +288,7 @@ response, err := grpcClient.SomeMethod(ctx, request)  // Context carries trace
 ```
 
 ### Verify Trace Continuity
-
 In Jaeger UI:
-
 1. Find a sampled trace from the entry service
 2. Verify spans from all downstream services appear in the same trace
 3. Check that the trace ID is consistent across all spans
@@ -341,7 +321,6 @@ if len(message.TraceContext) > 0 {
 ## W3C Trace Context Headers
 
 The propagator uses W3C standard headers:
-
 - `traceparent`: Contains trace ID, span ID, and sampling flag
 - `tracestate`: Optional vendor-specific trace data
 

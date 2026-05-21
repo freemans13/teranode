@@ -6,7 +6,6 @@ subtrees ever reach finalised (mined-and-persisted) blocks, and a recommended ac
 strategy for the upcoming `RootHashPadded` lift.
 
 Source versions inspected:
-
 - `github.com/bsv-blockchain/go-subtree` v1.2.0 (from `go.mod`)
 - Teranode at HEAD (commit `efaeedf9c`)
 
@@ -250,7 +249,6 @@ subtree if incomplete**. The plan's "in lockstep" requirement is satisfied by pa
 
 If reviewers prefer to err on the side of caution (e.g. because Caveat 1 cannot be
 quickly cleared), a configurable activation height is cheap:
-
 - Add `SubtreeLiftActivationHeight uint32` to `settings.BlockValidation` (default
   `math.MaxUint32`).
 - In `CheckMerkleRoot`, branch on `b.Height >= settings.SubtreeLiftActivationHeight`.
@@ -270,7 +268,6 @@ it provides defence-in-depth against the Caveat 1 unknown.
 ### Final recommendation
 
 **Strategy A.** All known production paths that produce a `model.Block` in Teranode are:
-
 1. **`BlockAssembly.SubmitMiningSolution`** — audited in §2; never produces
    `len(subtrees) > 1` with an incomplete final subtree.
 2. **`services/legacy/netsync/handle_block.go:prepareSubtrees`** — audited in Caveat 1;

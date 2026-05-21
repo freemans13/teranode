@@ -13,25 +13,21 @@ The blob deletion system allows the pruner service to delete blobs at specific b
 **Use Case**: Simple scenarios, testing, backward compatibility
 
 **Methods**:
-
 - `GetPendingBlobDeletions(height, limit)` - Get deletions ready for processing
 - `RemoveBlobDeletion(deletion_id)` - Remove one completed deletion
 - `IncrementBlobDeletionRetry(deletion_id, max_retries)` - Increment retry for one failed deletion
 
 **Pros**:
-
 - Simple to understand
 - Fine-grained control
 - Good for testing
 
 **Cons**:
-
 - **N+1 gRPC calls**: For 1000 deletions = 1001 calls (1 get + 1000 removes)
 - High network overhead
 - Slower performance
 
 **Example**:
-
 ```go
 // Get pending deletions
 deletions, err := blockchainClient.GetPendingBlobDeletions(ctx, currentHeight, 100)
@@ -58,24 +54,20 @@ for _, deletion := range deletions {
 **Use Case**: Production deployments, high-throughput scenarios
 
 **Methods**:
-
 - `GetPendingBlobDeletions(height, limit)` - Get deletions ready for processing
 - `CompleteBlobDeletions(completed_ids[], failed_ids[], max_retries)` - Complete all in one call
 
 **Pros**:
-
 - **2 gRPC calls total**: 1 get + 1 batch complete
 - Much faster than individual calls
 - Simple to use
 - No state management required
 
 **Cons**:
-
 - No automatic locking (client decides when to fetch)
 - Multiple pruners might fetch same items (they'll just skip locked rows)
 
 **Example**:
-
 ```go
 // Get pending deletions
 deletions, err := blockchainClient.GetPendingBlobDeletions(ctx, currentHeight, 1000)
@@ -100,7 +92,6 @@ log.Infof("Batch completed: %d removed, %d retries incremented", removedCount, r
 ```
 
 **Performance**:
-
 - For 1000 deletions: **2 gRPC calls** (vs 1001 with individual API)
 - ~500x fewer network round trips
 
@@ -111,12 +102,10 @@ log.Infof("Batch completed: %d removed, %d retries incremented", removedCount, r
 **Use Case**: Multiple pruner instances, distributed processing, guaranteed no duplicates
 
 **Methods**:
-
 - `AcquireBlobDeletionBatch(height, limit, lock_timeout)` - Get batch with lock token
 - `CompleteBlobDeletionBatch(batch_token, completed_ids[], failed_ids[], max_retries)` - Complete batch
 
 **Pros**:
-
 - **2 gRPC calls total**: 1 acquire + 1 complete
 - **Uses `SELECT...FOR UPDATE SKIP LOCKED`**: Guarantees no duplicate processing
 - Supports multiple pruner instances safely
@@ -124,13 +113,11 @@ log.Infof("Batch completed: %d removed, %d retries incremented", removedCount, r
 - Automatic token expiry (default: 5 minutes)
 
 **Cons**:
-
 - Slightly more complex (need to track token)
 - Token state held in memory (lost on blockchain service restart)
 - Must complete within timeout or batch is released
 
 **Example**:
-
 ```go
 // Acquire batch with lock
 batchToken, deletions, err := blockchainClient.AcquireBlobDeletionBatch(
@@ -164,7 +151,6 @@ if err != nil {
 ```
 
 **Locking Behavior**:
-
 1. `AcquireBlobDeletionBatch` runs: `SELECT...FOR UPDATE SKIP LOCKED`
 2. Rows are locked for the duration of the transaction
 3. Other pruners calling `AcquireBlobDeletionBatch` skip locked rows
@@ -174,7 +160,6 @@ if err != nil {
 7. Token is deleted (single-use)
 
 **Token Expiry**:
-
 - Default: 300 seconds (5 minutes)
 - Configurable via `lock_timeout_seconds` parameter
 - Expired tokens are cleaned up every 60 seconds
@@ -199,20 +184,17 @@ if err != nil {
 ## Recommended Approach
 
 **For Most Use Cases**: Use **Option 2 (Batch Completion API)**
-
 - 500x fewer network calls
 - No state management complexity
 - Works well with single or multiple pruners
 - Simple implementation
 
 **For Guaranteed No-Duplicate Processing**: Use **Option 3 (Batch Acquisition API)**
-
 - Essential when multiple pruners run simultaneously
 - Lock guarantees no row is processed twice
 - Slightly more complex but still only 2 gRPC calls
 
 **For Testing/Development**: Use **Option 1 (Individual API)**
-
 - Easier to debug individual operations
 - Better for understanding the flow
 
@@ -232,7 +214,6 @@ FOR UPDATE SKIP LOCKED
 ```
 
 **Key behaviors**:
-
 - `LIMIT` is applied BEFORE locking
 - Only the returned rows are locked
 - Other rows remain available for other pruners
@@ -266,10 +247,10 @@ All batch operations run in a single transaction:
 func CompleteBlobDeletions(ctx, completedIDs, failedIDs, maxRetries) {
     tx := db.BeginTx()
     defer tx.Rollback()
-
+    
     // DELETE completed
     // UPDATE/DELETE failed
-
+    
     tx.Commit()
 }
 ```

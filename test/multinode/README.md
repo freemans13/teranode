@@ -89,7 +89,6 @@ stack once these baselines are stable.
 - `compose/multinode.sh status` shows container states and per-node
   RPC-reported heights.
 - For iterating locally:
-
   ```bash
   compose/multinode.sh up 5
   MULTINODE_BYOS=1 go test -tags network_chaos -v -run TestCrashRecovery ./test/multinode/

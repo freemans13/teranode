@@ -116,9 +116,9 @@ During the test, you can monitor progress by:
 - Viewing container logs: `docker compose -f compose/docker-compose-3blasters.yml logs`
 - Checking individual node APIs:
 
-    - Node 1: <http://localhost:18090/api/v1/bestblockheader/json>
-    - Node 2: <http://localhost:28090/api/v1/bestblockheader/json>
-    - Node 3: <http://localhost:38090/api/v1/bestblockheader/json>
+    - Node 1: http://localhost:18090/api/v1/bestblockheader/json
+    - Node 2: http://localhost:28090/api/v1/bestblockheader/json
+    - Node 3: http://localhost:38090/api/v1/bestblockheader/json
 
 ## Output Files
 
@@ -141,7 +141,6 @@ make show-hashes
 ```
 
 This will display output similar to:
-
 ```text
 📊 Hash Analysis Results:
 ==========================
@@ -226,4 +225,4 @@ The local invokes the same process as the GitHub workflow:
 - Uses the same Docker Compose configuration
 - Follows the same error checking logic
 - Generates the same output format
-- Can be used to reproduce CI/CD issues locally
+- Can be used to reproduce CI/CD issues locally 

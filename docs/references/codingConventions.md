@@ -188,7 +188,7 @@ The naming conventions and best practices outlined in this document provide a su
 #### Use of Descriptive Names for More Complex Interfaces
 
 - For interfaces with multiple methods, choose descriptive names that capture the overall functionality or role of the interface, rather than following the "-er" suffix rule.
-    - For example, `FileSystem` for an interface that encapsulates various file system operations or `DatabaseConnector` for an interface managing database connections.
+  - For example, `FileSystem` for an interface that encapsulates various file system operations or `DatabaseConnector` for an interface managing database connections.
 
 ---
 
@@ -197,12 +197,12 @@ The naming conventions and best practices outlined in this document provide a su
 #### Avoidance of Redundant or Tautological Names
 
 - Avoid names that repeat the package name or provide no additional information about the type.
-    - For instance, instead of `http.HttpClient`, simply use `http.Client` to prevent redundancy.
+  - For instance, instead of `http.HttpClient`, simply use `http.Client` to prevent redundancy.
 
 #### Use of Clear and Specific Names for Custom Types
 
 - Choose names that clearly and specifically describe what the custom type represents or does, ensuring they are intuitive and meaningful.
-    - For example, `Block` for a type representing block information, or `SubtreeProcessor` for a type that processes subtrees.
+  - For example, `Block` for a type representing block information, or `SubtreeProcessor` for a type that processes subtrees.
 
 ---
 
@@ -372,20 +372,20 @@ The project uses `golangci-lint` for enforcing code quality. Key [configurations
 - **Filename Conventions**: Checked via CI (separate script).
 - **Enabled Linters**:
 
-    - `depguard`: Prevents importing disallowed packages such as the standard library `errors` package; use the project's designated error-handling package/utilities instead.
-    - `forbidigo`: Disallows use of `fmt.Errorf`; use the project's preferred error-construction helpers (for example, functions from the project's `errors` package) instead. **Exception:** disabled for `pkg/` and `errors/` directories.
-    - Additional linters for style and correctness (for example, `misspell`, `asciicheck`, etc.).
+  - `depguard`: Prevents importing disallowed packages such as the standard library `errors` package; use the project's designated error-handling package/utilities instead.
+  - `forbidigo`: Disallows use of `fmt.Errorf`; use the project's preferred error-construction helpers (for example, functions from the project's `errors` package) instead. **Exception:** disabled for `pkg/` and `errors/` directories.
+  - Additional linters for style and correctness (for example, `misspell`, `asciicheck`, etc.).
 
-    - Code formatting (including import ordering) is enforced via formatters configured in `golangci-lint` such as `gci` and `goimports`.
-    - Note: `gosec`, `staticcheck`, `goconst`, `gocritic`, `unconvert`, `whitespace`, and `gocognit` are listed but currently **disabled** in the active configuration.
+  - Code formatting (including import ordering) is enforced via formatters configured in `golangci-lint` such as `gci` and `goimports`.
+  - Note: `gosec`, `staticcheck`, `goconst`, `gocritic`, `unconvert`, `whitespace`, and `gocognit` are listed but currently **disabled** in the active configuration.
 
 ###### Exceptions
 
 - Linting is **excluded** for:
 
-    - `services/legacy` (multiple linters ignored)
-    - `errors` package (for `depguard` and `forbidigo`)
-    - All files in `vendor/`
+  - `services/legacy` (multiple linters ignored)
+  - `errors` package (for `depguard` and `forbidigo`)
+  - All files in `vendor/`
 
 #### Pull Requests
 

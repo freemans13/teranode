@@ -94,7 +94,7 @@ Never introduce:
 
 Report every change in this structured format:
 
-```text
+```
 Changed:
 - <file>: <what changed>
 

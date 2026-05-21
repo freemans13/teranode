@@ -81,59 +81,30 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	// handler may still be processing. Without waiting, we'd immediately mark it as missing
 	// and fetch subtree_data from the peer's asset-cache (expensive Aerospike reconstruction),
 	// which can fail under load and cascade into CATCHINGBLOCKS mode.
-	//
-	// The existence check is bounded-parallel: on NFS-backed blob stores each Exists call is
-	// a network round-trip, so the sequential cost grows linearly with block size. Bounding
-	// concurrency at CheckBlockSubtreesConcurrency keeps the burst predictable.
-	subtreeMissing := make([]bool, len(block.Subtrees))
-	existsGroup, existsCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(existsGroup, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
-
-	for idx, subtreeHash := range block.Subtrees {
-		idx := idx
-		subtreeHash := subtreeHash
-
-		existsGroup.Go(func() error {
-			if u.quorum != nil {
-				locked, exists, release, err := u.quorum.TryLockIfNotExistsWithTimeout(existsCtx, subtreeHash, fileformat.FileTypeSubtree)
-				if err != nil {
-					return errors.NewProcessingError("[CheckBlockSubtrees] Failed to acquire quorum lock or determine subtree existence", err)
-				}
-
-				if locked {
-					// File doesn't exist and no one else is working on it — release lock and mark missing.
-					release()
-					subtreeMissing[idx] = true
-					return nil
-				}
-
-				if !exists {
-					// Timed out waiting for in-flight handler — still treat as missing.
-					subtreeMissing[idx] = true
-				}
-				// exists==true: subtree was completed by in-flight handler — no action needed.
-				return nil
-			}
-
-			subtreeExists, err := u.subtreeStore.Exists(existsCtx, subtreeHash[:], fileformat.FileTypeSubtree)
+	missingSubtrees := make([]chainhash.Hash, 0, len(block.Subtrees))
+	for _, subtreeHash := range block.Subtrees {
+		if u.quorum != nil {
+			locked, exists, release, err := u.quorum.TryLockIfNotExistsWithTimeout(ctx, subtreeHash, fileformat.FileTypeSubtree)
 			if err != nil {
-				return errors.NewProcessingError("[CheckBlockSubtrees] Failed to check if subtree exists in store", err)
+				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to acquire quorum lock or determine subtree existence", err)
+			}
+			if locked {
+				// File doesn't exist and no one else is working on it — release lock and mark missing
+				release()
+				missingSubtrees = append(missingSubtrees, *subtreeHash)
+			} else if !exists {
+				// Timed out waiting for in-flight handler — still treat as missing
+				missingSubtrees = append(missingSubtrees, *subtreeHash)
+			}
+			// exists==true: subtree was completed by in-flight handler — no action needed
+		} else {
+			subtreeExists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+			if err != nil {
+				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to check if subtree exists in store", err)
 			}
 			if !subtreeExists {
-				subtreeMissing[idx] = true
+				missingSubtrees = append(missingSubtrees, *subtreeHash)
 			}
-			return nil
-		})
-	}
-
-	if err := existsGroup.Wait(); err != nil {
-		return nil, err
-	}
-
-	missingSubtrees := make([]chainhash.Hash, 0, len(block.Subtrees))
-	for idx, subtreeHash := range block.Subtrees {
-		if subtreeMissing[idx] {
-			missingSubtrees = append(missingSubtrees, *subtreeHash)
 		}
 	}
 

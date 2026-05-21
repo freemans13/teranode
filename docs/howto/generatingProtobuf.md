@@ -85,7 +85,6 @@ This generates:
 Some services have dependencies on common `.proto` files, like `model.proto`. The `Makefile` is configured to handle these dependencies.
 
 For example:
-
 ```bash
 protoc \
 --proto_path=. \
@@ -93,7 +92,6 @@ protoc \
 --go_opt=paths=source_relative \
 model/model.proto
 ```
-
 This command generates the necessary Go files for `model.proto` and ensures that services depending on `model.proto` can compile successfully.
 
 ### Step 4: Cleaning Generated Files
@@ -114,6 +112,7 @@ More information on available `make` commands, including options for customizati
 
 1. **`protoc` not found**: Ensure that the `protoc` tool is installed and available in your system’s PATH.
 2. **Missing dependencies**: If a `.proto` file depends on another file (e.g., `model.proto`), ensure that all required `.proto` files are included in the `proto_path` during compilation.
+
 
 ## Conclusion
 

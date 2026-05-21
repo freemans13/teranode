@@ -41,6 +41,7 @@ Here’s an example of how to run the node with the environment variables enable
 GRPC_VERBOSITY=debug GRPC_TRACE=client_channel,round_robin go run .
 ```
 
+
 ## Step 4: Interpreting the Logs
 
 After enabling gRPC logs, you will see more detailed output related to the gRPC client channels and round-robin load balancing. Some of the key log entries to watch for include:

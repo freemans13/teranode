@@ -71,7 +71,7 @@ Checks connectivity to each gRPC service by creating a client and calling its `H
 
 If a service address is empty, the check is skipped. If the service is disabled in settings (e.g. `startValidator=false` for the current context), the skip message says so explicitly:
 
-```text
+```
 Validator gRPC  -  SKIP  -  disabled (startValidator=false)
 ```
 
@@ -123,7 +123,7 @@ These catch subtle problems where services silently fall out of sync:
 
 ### Example Output
 
-```text
+```
 Service Health Checks
 =====================
 SERVICE                  ADDRESS                STATUS  LATENCY  MESSAGE
@@ -232,7 +232,7 @@ Checks that the data folder exists, is a directory, and is writable. Catches per
 
 ### Example Output
 
-```text
+```
 Configuration Checks
 ====================
 SEVERITY  CHECK                       VALUE                                       RECOMMENDED
