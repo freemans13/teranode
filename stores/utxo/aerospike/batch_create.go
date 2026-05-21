@@ -33,10 +33,12 @@ type CreateResult struct {
 // blockHeight is passed through to GetBinsToStore (and onward to fee/UTXO-hash
 // calculation). Pass 0 for unmined transactions, exactly as Store.Create does.
 //
-// If txs is nil or empty, (nil, nil) is returned immediately.
+// If txs is nil or empty, ([]CreateResult{}, nil) is returned immediately so
+// callers can range over the result without a nil-check, matching the empty-
+// batch convention used by BatchSpend / BatchSetDAH / BatchSetLocked.
 func (s *Store) BatchCreate(ctx context.Context, txs []*bt.Tx, blockHeight uint32, lockedTrue bool) ([]CreateResult, error) {
 	if len(txs) == 0 {
-		return nil, nil
+		return []CreateResult{}, nil
 	}
 
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)

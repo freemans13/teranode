@@ -175,7 +175,7 @@ func (v *Validator) ValidateBatch(
 	// Per-input SpendResult.Err is attributed back to every tx that referenced
 	// the failed parent.
 	phaseCStart := time.Now()
-	spends, spendToTxIdx := buildSpendsForBatch(txs, alive, results)
+	spends := buildSpendsForBatch(txs, alive, results)
 	if len(spends) > 0 {
 		spendResults, spendErr := store.BatchSpend(ctx, spends, blockHeight)
 		if spendErr != nil {
@@ -222,7 +222,6 @@ func (v *Validator) ValidateBatch(
 		}
 	}
 	v.phaseMetrics.add(PhaseSpend, time.Since(phaseCStart))
-	_ = spendToTxIdx // reserved for Phase F metadata path
 
 	// Phase D — BatchCreate (locked=true). One BatchOperate carries all surviving txs.
 	// Per-tx errors (CREATE_ONLY collisions, large-tx-needs-external-storage) are tagged
@@ -444,13 +443,10 @@ func byteSliceSet(hashes [][]byte) map[[32]byte]struct{} {
 // []*utxo.Spend slice suitable for one BatchSpend call. It mirrors the
 // existing single-tx spend construction in utxo.GetSpends (stores/utxo/utils.go).
 //
-// spendToTxIdx[j] is the index in txs that contributed spends[j]. This allows
-// downstream phases to attribute per-spend metadata back to the originating tx.
-//
 // If GetSpends fails for a tx (e.g. missing extended input data), the tx is
 // marked failed at PhaseSpend via results/alive and excluded from the returned
 // slice so BatchSpend never receives a nil or invalid entry.
-func buildSpendsForBatch(txs []*bt.Tx, alive []bool, results []ValidationResult) (spends []*utxo.Spend, spendToTxIdx []int) {
+func buildSpendsForBatch(txs []*bt.Tx, alive []bool, results []ValidationResult) []*utxo.Spend {
 	// Pre-size to the total number of inputs across surviving txs.
 	total := 0
 	for i, tx := range txs {
@@ -458,8 +454,7 @@ func buildSpendsForBatch(txs []*bt.Tx, alive []bool, results []ValidationResult)
 			total += len(tx.Inputs)
 		}
 	}
-	spends = make([]*utxo.Spend, 0, total)
-	spendToTxIdx = make([]int, 0, total)
+	spends := make([]*utxo.Spend, 0, total)
 
 	for i, tx := range txs {
 		if !alive[i] {
@@ -473,12 +468,9 @@ func buildSpendsForBatch(txs []*bt.Tx, alive []bool, results []ValidationResult)
 			alive[i] = false
 			continue
 		}
-		for _, sp := range txSpends {
-			spends = append(spends, sp)
-			spendToTxIdx = append(spendToTxIdx, i)
-		}
+		spends = append(spends, txSpends...)
 	}
-	return spends, spendToTxIdx
+	return spends
 }
 
 // submitToBlockAssemblyBatch submits a batch of txs to BlockAssembly.

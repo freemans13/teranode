@@ -27,7 +27,6 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -229,16 +228,13 @@ func (c *Client) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight ui
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(runtime.NumCPU())
 
-	var mu sync.Mutex
-
 	for i, tx := range txs {
 		i, tx := i, tx
 		g.Go(func() error {
 			m, err := c.ValidateWithOptions(gCtx, tx, blockHeight, processedOpts)
-			mu.Lock()
+			// Distinct indices in a pre-sized slice — no synchronisation needed.
 			results[i].Meta = m
 			results[i].Err = err
-			mu.Unlock()
 			return nil
 		})
 	}

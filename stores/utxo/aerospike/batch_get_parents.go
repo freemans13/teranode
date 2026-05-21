@@ -117,7 +117,11 @@ func (s *Store) BatchGetParents(ctx context.Context, parentHashes [][]byte) (map
 	var missing [][]byte
 
 	for i, r := range records {
-		rec := r.(*as.BatchRead).Record
+		br, ok := r.(*as.BatchRead)
+		if !ok {
+			return nil, nil, terrors.NewProcessingError("[batchGetParents] unexpected batch record type %T at index %d", r, i)
+		}
+		rec := br.Record
 		if rec == nil {
 			missing = append(missing, parentHashes[i])
 			continue
