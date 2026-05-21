@@ -3333,8 +3333,13 @@ func TestFetchBlocksConcurrently_BlockHeightIsSet(t *testing.T) {
 }
 
 func TestBlockvalidation_AdaptiveFetch_PessToOptToPess(t *testing.T) {
+	// Exercises the full Auto lifecycle (start pessimistic, transition to
+	// optimistic on perfect window, trip back to pessimistic on observed
+	// misses). Pinned ModePessimistic no longer transitions — that
+	// invariant is covered by TestBootstrapMode_PinnedPessimisticDoesNotTransition
+	// in pkg/adaptivefetch.
 	afE2ECfg := adaptivefetch.DefaultConfig()
-	afE2ECfg.BootstrapMode = adaptivefetch.ModePessimistic
+	afE2ECfg.BootstrapMode = adaptivefetch.ModeAuto
 	af, err := adaptivefetch.New(afE2ECfg, "test-e2e", prometheus.NewRegistry())
 	require.NoError(t, err)
 

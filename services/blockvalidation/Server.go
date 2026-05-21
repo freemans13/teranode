@@ -300,9 +300,11 @@ func New(
 	// no wall-clock time. See pkg/adaptivefetch for the full design.
 	bootstrap, bootstrapErr := adaptivefetch.ParseBootstrapMode(tSettings.AdaptiveFetch.BootstrapMode)
 	if bootstrapErr != nil {
-		logger.Warnf("[BlockValidation] unknown adaptive_fetch_bootstrap_mode %q, falling back to auto: %v",
+		// Fall back to pessimistic (always fetch, no auto-transition) rather
+		// than auto — a config typo must not silently enable optimistic mode.
+		logger.Warnf("[BlockValidation] unknown adaptive_fetch_bootstrap_mode %q, falling back to pessimistic: %v",
 			tSettings.AdaptiveFetch.BootstrapMode, bootstrapErr)
-		bootstrap = adaptivefetch.ModeAuto
+		bootstrap = adaptivefetch.ModePessimistic
 	}
 	af, afErr := adaptivefetch.New(adaptivefetch.Config{
 		WindowSize:                tSettings.AdaptiveFetch.WindowSize,

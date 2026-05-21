@@ -569,11 +569,15 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CheckBlockSubtreesTimeout:                 getDuration("subtreevalidation_check_block_subtrees_timeout", 30*time.Minute, alternativeContext...),
 			MaxIncomingSubtreeBytes:                   int64(getInt("subtreevalidation_max_incoming_subtree_bytes", 128*1024*1024, alternativeContext...)),
 		},
-		// Adaptive subtreeData fetch gate (defaults mirror tags in
-		// settings/adaptivefetch_settings.go and adaptivefetch.DefaultConfig()).
-		// Defined once at the top level so ExportMetadata() emits each
-		// adaptive_fetch_* key exactly once. Both blockvalidation and
-		// subtreevalidation read from this single struct.
+		// Adaptive subtreeData fetch gate. Defaults here mirror the struct
+		// tags in settings/adaptivefetch_settings.go (the operator-facing
+		// surface). Note these intentionally diverge from
+		// adaptivefetch.DefaultConfig(): the settings layer defaults
+		// BootstrapMode to "pessimistic" (safe by default), while
+		// adaptivefetch.DefaultConfig() keeps ModeAuto for direct package
+		// callers / tests. Defined once at the top level so ExportMetadata()
+		// emits each adaptive_fetch_* key exactly once. Both blockvalidation
+		// and subtreevalidation read from this single struct.
 		AdaptiveFetch: AdaptiveFetchSettings{
 			BootstrapMode:             getString("adaptive_fetch_bootstrap_mode", "pessimistic", alternativeContext...),
 			WindowSize:                getInt("adaptive_fetch_window_size", 10, alternativeContext...),

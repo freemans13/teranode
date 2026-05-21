@@ -8,13 +8,23 @@ import (
 
 // State is the adaptive fetch state machine. Safe for concurrent use.
 type State struct {
-	mu          sync.Mutex
-	mode        Mode
-	window      []Observation // ring buffer, cap = cfg.WindowSize
-	windowHead  int           // next write position
-	cfg         Config
-	serviceName string
-	metrics     *metrics
+	mu sync.Mutex
+	// mode is the current live mode (pessimistic or optimistic). Auto is a
+	// bootstrap-only value and never appears here once New returns.
+	mode Mode
+	// allowPessToOpt records whether the operator opted into automatic
+	// Pess→Opt transitions. Only BootstrapMode=ModeAuto sets this true;
+	// pinned ModePessimistic stays pessimistic forever ("always fetch") and
+	// pinned ModeOptimistic, having started in optimistic, also never trips
+	// Pess→Opt. The Opt→Pess safety trip is always enabled regardless of
+	// bootstrap so a degraded optimistic deployment can still self-recover.
+	// See PR #745 / Copilot review for rationale.
+	allowPessToOpt bool
+	window         []Observation // ring buffer, cap = cfg.WindowSize
+	windowHead     int           // next write position
+	cfg            Config
+	serviceName    string
+	metrics        *metrics
 }
 
 // New constructs a State with the given Config, a label used for metrics, and
@@ -26,16 +36,19 @@ func New(cfg Config, serviceName string, reg prometheus.Registerer) (*State, err
 		return nil, err
 	}
 	initial := cfg.BootstrapMode
+	allowPessToOpt := false
 	if initial == ModeAuto {
 		initial = ModePessimistic
+		allowPessToOpt = true
 	}
 	m := newMetrics(serviceName, reg)
 	s := &State{
-		mode:        initial,
-		window:      make([]Observation, 0, cfg.WindowSize),
-		cfg:         cfg,
-		serviceName: serviceName,
-		metrics:     m,
+		mode:           initial,
+		allowPessToOpt: allowPessToOpt,
+		window:         make([]Observation, 0, cfg.WindowSize),
+		cfg:            cfg,
+		serviceName:    serviceName,
+		metrics:        m,
 	}
 	s.emitMode()
 	return s, nil
@@ -156,6 +169,13 @@ func (s *State) recordWithMode(obs Observation, requireMode bool, observedAt Mod
 func (s *State) maybeTransition() {
 	switch s.mode {
 	case ModePessimistic:
+		// Pess→Opt is only allowed when the operator chose BootstrapMode=auto.
+		// Pinned ModePessimistic means "always fetch subtreeData" and must
+		// never drift to optimistic. The Opt→Pess safety trip below remains
+		// always-on so a degraded optimistic deployment can still recover.
+		if !s.allowPessToOpt {
+			return
+		}
 		if len(s.window) < s.cfg.WindowSize {
 			return
 		}

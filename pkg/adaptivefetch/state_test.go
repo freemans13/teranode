@@ -86,12 +86,14 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 }
 
 func TestRecord_PessToOpt_HighHitRateFullWindow(t *testing.T) {
+	// BootstrapMode=Auto enables transitions; pinned pessimistic would not
+	// transition and is covered by TestBootstrapMode_PinnedDoesNotTransition.
 	s, err := New(Config{
 		WindowSize:                5,
 		PessToOptHitRateThreshold: 0.99,
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             ModePessimistic,
+		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
@@ -105,12 +107,14 @@ func TestRecord_PessToOpt_HighHitRateFullWindow(t *testing.T) {
 }
 
 func TestRecord_PessStays_WhenHitRateBelowThreshold(t *testing.T) {
+	// BootstrapMode=Auto so transitions are enabled; the test verifies the
+	// threshold gates the transition (hit rate < threshold = no transition).
 	s, err := New(Config{
 		WindowSize:                3,
 		PessToOptHitRateThreshold: 0.99,
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             ModePessimistic,
+		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
@@ -216,7 +220,7 @@ func TestRecord_ConcurrentIsRaceClean(t *testing.T) {
 		PessToOptHitRateThreshold: 0.99,
 		OptToPessMissThreshold:    1000,
 		OptToPessAvgMissThreshold: 100,
-		BootstrapMode:             ModePessimistic,
+		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
@@ -246,7 +250,7 @@ func TestRecord_IgnoresInvalidObservations(t *testing.T) {
 		PessToOptHitRateThreshold: 0.99,
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             ModePessimistic,
+		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
@@ -296,7 +300,7 @@ func TestRecordIfMode_DropsCrossModeObservation(t *testing.T) {
 		PessToOptHitRateThreshold: 0.99,
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
-		BootstrapMode:             ModePessimistic,
+		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
 
@@ -323,6 +327,50 @@ func TestRecordIfMode_DropsCrossModeObservation(t *testing.T) {
 	s.RecordIfMode(ModeOptimistic, Observation{TotalTxs: 1000, LocalHits: 800, MissingFetches: 200})
 	require.Equal(t, ModePessimistic, s.Mode(),
 		"matching-mode observation with MissingFetches above threshold must trip Opt→Pess")
+}
+
+// TestBootstrapMode_PinnedPessimisticDoesNotTransition pins the design
+// invariant that an explicitly-configured ModePessimistic stays pessimistic
+// regardless of how many perfect observations arrive. Only BootstrapMode=Auto
+// enables the Pess→Opt transition. See PR #745 Copilot review for rationale.
+func TestBootstrapMode_PinnedPessimisticDoesNotTransition(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                3,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModePessimistic,
+	}, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.Equal(t, ModePessimistic, s.Mode())
+
+	// Many full windows of perfect observations must NOT trip Pess→Opt.
+	for i := 0; i < 30; i++ {
+		s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+		require.Equal(t, ModePessimistic, s.Mode(),
+			"pinned pessimistic must stay pessimistic at observation %d", i)
+	}
+}
+
+// TestBootstrapMode_PinnedOptimisticStillTripsOptToPess pins the design
+// invariant that pinned optimistic deployments retain the Opt→Pess safety
+// trip — only Pess→Opt is gated on Auto. A degraded optimistic deployment
+// must still self-recover when misses are observed.
+func TestBootstrapMode_PinnedOptimisticStillTripsOptToPess(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeOptimistic,
+	}, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.Equal(t, ModeOptimistic, s.Mode())
+
+	// A single observation at or above OptToPessMissThreshold trips immediately.
+	s.Record(Observation{TotalTxs: 10000, LocalHits: 9900, MissingFetches: 100})
+	require.Equal(t, ModePessimistic, s.Mode(),
+		"pinned optimistic must still trip Opt→Pess on observed misses")
 }
 
 // TestRecordIfMode_NilReceiver locks in the nil-safe contract.
