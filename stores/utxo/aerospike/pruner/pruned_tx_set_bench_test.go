@@ -24,24 +24,31 @@ func makeHashes(b *testing.B, n int) []chainhash.Hash {
 
 // --- Cuckoo (sharded, the deployed implementation) ---
 //
-// Tests use a deliberately small per-shard capacity (4096 buckets × 4 slots =
-// 16K slots per shard) so the bench can run on a developer machine without
-// allocating multi-GB filters. The per-op cost we're measuring (hash extract,
-// bucket access, lock acquire) is independent of total capacity.
+// Tests construct NewPrunedTxSet(256, 64_000_000) — 256 shards × ~250K
+// entries/shard. After 4 slots/bucket and power-of-two rounding that
+// yields ~65,536 buckets per shard, totalling ~64 MiB of fingerprint
+// storage — small enough to run on a developer machine. The per-op cost
+// we're measuring (hash extract, bucket access, atomic CAS) is
+// independent of total capacity.
 
-// BenchmarkCuckoo_Add measures fresh inserts into an unloaded filter. Using
-// b.N unique hashes ensures we measure first-time inserts (the production
-// case), not eviction loops from re-inserting duplicate fingerprints.
+// BenchmarkCuckoo_Add measures inserts into a lightly-loaded filter.
+// We pre-generate a bounded pool of random hashes and cycle through it
+// — keeping memory bounded regardless of b.N. Once the pool is consumed
+// (typically after the first b.N=1M iterations), subsequent Adds will
+// hit fingerprints already present and the cuckoo's idempotent fast
+// path applies; that still exercises the same hash-extract → bucket
+// access → atomic-CAS code path we care about, just without an
+// eviction. Capping the pool avoids the OOM risk of pre-generating
+// b.N × 32 B hashes on a CI runner when go test bumps b.N very high.
 func BenchmarkCuckoo_Add(b *testing.B) {
-	// Pre-generate enough hashes for b.N iterations so each Add is unique.
-	// We allocate them outside the timed region.
 	const cap_ = 64_000_000
-	hashes := makeHashes(b, min(b.N, cap_/2))
+	const poolSize = 1 << 20 // 1M hashes ≈ 32 MiB pool
+	hashes := makeHashes(b, poolSize)
 	set := NewPrunedTxSet(256, cap_)
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		set.Add(hashes[i%len(hashes)])
+		set.Add(hashes[i&(poolSize-1)])
 	}
 }
 
